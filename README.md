@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/figures/kvcr-masthead.jpg" alt="KV Cache Runner — Data Plane Architecture" width="100%">
+</p>
+
 > [!WARNING]
 > **Under Active Development.** This project is incomplete and may contain breaking changes. It is not yet recommended for production use.
 > 
