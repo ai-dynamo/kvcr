@@ -58,17 +58,35 @@ router. The list below summarizes framework integrations that are complete or
 in progress. We plan to extend support to additional frameworks and routers in
 the future.
 
-### Engines
+### KV Hint Protocol
 
-- TRT-LLM [TODO: add RFC]
+- TRT-LLM
+  - [[RFC] Versioned KV Hints Protocol for TRT-LLM #18153](https://github.com/NVIDIA/TensorRT-LLM/issues/18153)
 
 - vLLM
-  - [[kv_offload] Establish tier-owned KV event handling #46544](https://github.com/vllm-project/vllm/pull/46544)
-  - [[kv_offload] Emit tier-owned BlockStored events from FS/OBJ secondary tiers #47923](https://github.com/vllm-project/vllm/pull/47923)
-  - [[KV Offload] Support self-describing KV events with TieringOffloadingSpec #48679](https://github.com/vllm-project/vllm/pull/48679)
+  - [[RFC]: First-Class, Orchestrator-Agnostic KV Hint Envelope for Agentic Workloads #53421](https://github.com/vllm-project/vllm/issues/53421)
+  - [[Feature] Add first-class KV hints request envelope for programmatic KV management #53423](https://github.com/vllm-project/vllm/pull/53423)
+
+- SGLang
+  - [[RFC] First-Class, Versioned KV Hint Envelope for SGLang #36224](https://github.com/sgl-project/sglang/issues/36224)
+
+- Dynamo KV Router
+  - [Refactor(router): define typed KV hint contract #13134](https://github.com/ai-dynamo/dynamo/pull/13134)
+
+### Engine support
+
+- TRT-LLM
+  - [[RFC]: Router Hint initiated P2P KV Cache Transfer Between TRT-LLM Workers #18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)
+  - [Router Hint initiated P2P KV Cache Transfer Between TRT-LLM Workers #18158](https://github.com/NVIDIA/TensorRT-LLM/pull/18158)
+
+- vLLM
+  - [[KV Offload] Add KVCR secondary-tier adapter #53624](https://github.com/vllm-project/vllm/pull/53624)
+  - [[KV Offload] Preserve KV event metadata until final residency removal #52068](https://github.com/vllm-project/vllm/pull/52068)
+  - [[KV Offload] Forward ownership in KV cache events ##52067](https://github.com/vllm-project/vllm/pull/52067)
 
 - SGLang
   - [[RFC] KVCR as a HiCacheStorage backend for peer-to-peer KV reuse #32903](https://github.com/sgl-project/sglang/issues/32903)
+  
 
 ### Routers
 
