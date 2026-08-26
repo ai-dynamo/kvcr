@@ -102,12 +102,19 @@ def test_startup_timeout_retains_nonquiescent_resources(
     )
     monkeypatch.setattr(kvcr_api, "_KVCRCore", create_core)
     monkeypatch.setattr(kvcr_api, "_NONQUIESCENT_STARTUP_RESOURCES", retained)
+    monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
+    # The agent stays blocked until the assertions below finish, so close()
+    # must not spend its full join budget waiting for a thread parked on
+    # purpose.
     monkeypatch.setattr(kvcr_progress, "_JOIN_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(kvcr_progress, "nixl_agent", create_agent)
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
 
     try:
-        with pytest.raises(RuntimeError, match="progress thread did not start"):
+        with pytest.raises(
+            RuntimeError,
+            match="did not finish startup .*'NIXL agent initialization'",
+        ):
             KVCR(
                 KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
                 KVCRBindings(Mock(), Mock(), Mock()),
