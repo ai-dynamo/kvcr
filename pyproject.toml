@@ -6,7 +6,7 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "kvcr"
+name = "nvidia-kvcr"
 version = "0.1.0"
 description = "Framework-neutral KV Cache Runner"
 readme = "README.md"
