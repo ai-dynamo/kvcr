@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class _G3Residency:
     slot: int
     claim_count: int = 0
@@ -486,7 +486,7 @@ class _G3:
             residency = record.g3 if record is not None else None
             if record is None or residency is None or residency.claim_count:
                 raise RuntimeError(f"invalid G3 eviction candidate {key!r}")
-            if any(op_id[0] == "fetch" for op_id in record.in_flight_ops):
+            if any(op_id[0] == "fetch" for op_id in record.in_flight_ops or ()):
                 skipped.add(key)
                 continue
             decision = self._kvcr._policy.decide_eviction(

@@ -38,7 +38,7 @@ class _LocalDramState(Enum):
     DISCARDING = auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class _LocalDramResidency:
     slot: int
     state: _LocalDramState
@@ -448,7 +448,7 @@ class _LocalDram:
             ):
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             residency.state = _LocalDramState.DISCARDING
-            for op_id in tuple(record.in_flight_ops):
+            for op_id in record.active_op_ids:
                 residency_op = self._pending_residency_ops.get(op_id)
                 if (
                     residency_op is not None
@@ -540,7 +540,7 @@ class _LocalDram:
                 record.local_dram = None
                 self._free_slots.append(slot)
 
-            for op_id in tuple(record.in_flight_ops):
+            for op_id in record.active_op_ids:
                 residency_op = self._pending_residency_ops.get(op_id)
                 if residency_op is not None and key in residency_op.keys:
                     if success and (

@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 _MEM_DESCRIPTORS_TYPE = tuple[MemDescriptor, ...]
 
 
-@dataclass
+@dataclass(slots=True)
 class _FwMemResidency:
     descriptor: MemDescriptor
     pin_handle: PinHandle
