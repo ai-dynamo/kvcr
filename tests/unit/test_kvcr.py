@@ -15,6 +15,7 @@ from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
     FakeTelemetryStats,
+    _mem_descriptor,
     _new_kvcr,
 )
 
@@ -28,6 +29,10 @@ from kvcr.config import (
     KVCRGuardConfig,
     LocalDramInfo,
 )
+from kvcr.core import _BlockRecord
+from kvcr.local_disk import _G3Residency
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.remote_fw_dram import _FwMemResidency
 
 _GUARD_CONFIG = KVCRGuardConfig(
     kvcr_service_socket_path="/tmp/kvcr.sock",
@@ -289,3 +294,43 @@ def test_close_preserves_backends_when_progress_is_not_quiescent(
         with pytest.raises(RuntimeError, match=expected):
             kvcr.close()
     assert cleaned == []
+
+
+def test_block_record_holds_no_set_while_no_operation_is_in_flight() -> None:
+    """Pin the storage, not just the behaviour.
+
+    Every observable use of these helpers behaves identically if the empty set
+    is kept instead of dropped, so only an explicit check keeps the record from
+    quietly growing an allocation per resident block again.
+    """
+    record = _BlockRecord()
+    assert record.in_flight_ops is None
+    assert record.active_op_ids == ()
+
+    record.discard_in_flight_op(("target", 1))
+    assert record.in_flight_ops is None
+
+    record.add_in_flight_op(("target", 1))
+    record.add_in_flight_op(("source", 2))
+    assert record.in_flight_ops == {("target", 1), ("source", 2)}
+
+    # The snapshot is what lets a caller retire ops while iterating.
+    snapshot = record.active_op_ids
+    record.discard_in_flight_op(("target", 1))
+    assert set(snapshot) == {("target", 1), ("source", 2)}
+    assert record.in_flight_ops == {("source", 2)}
+
+    record.discard_in_flight_op(("source", 2))
+    assert record.in_flight_ops is None
+    assert record.active_op_ids == ()
+
+
+def test_resident_records_carry_no_instance_dictionary() -> None:
+    """Every record a resident block can hold, so none of them grows one back."""
+    for residency in (
+        _BlockRecord(),
+        _LocalDramResidency(0, _LocalDramState.READY),
+        _G3Residency(0),
+        _FwMemResidency(_mem_descriptor(), object()),
+    ):
+        assert not hasattr(residency, "__dict__"), type(residency).__name__

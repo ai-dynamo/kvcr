@@ -117,7 +117,7 @@ def _block_op_ids(kvcr: KVCR) -> set[tuple[str, Any]]:
     return {
         op_id
         for record in kvcr._core._block_record_map.values()
-        for op_id in record.in_flight_ops
+        for op_id in record.active_op_ids
     }
 
 

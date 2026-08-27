@@ -6,7 +6,7 @@ import functools
 import logging
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import ceil
 from typing import TYPE_CHECKING
 
@@ -72,16 +72,35 @@ def _noop_record_transfer(
     return None
 
 
-@dataclass
+@dataclass(slots=True)
 class _BlockRecord:
     # Locally pinned framework-owned G2 memory. This is never remote
     # KVCR residency and exists only while KVCR controls the pin.
     fw_mem: "_FwMemResidency | None" = None
     local_dram: _LocalDramResidency | None = None
     g3: _G3Residency | None = None
-    in_flight_ops: set[_OpId] = field(default_factory=set)
+    in_flight_ops: set[_OpId] | None = None
     access_count: int = 0
     last_access: float | None = None
+
+    def add_in_flight_op(self, op_id: _OpId) -> None:
+        if self.in_flight_ops is None:
+            self.in_flight_ops = {op_id}
+        else:
+            self.in_flight_ops.add(op_id)
+
+    def discard_in_flight_op(self, op_id: _OpId) -> None:
+        ops = self.in_flight_ops
+        if ops is not None:
+            ops.discard(op_id)
+            if not ops:
+                self.in_flight_ops = None
+
+    @property
+    def active_op_ids(self) -> tuple[_OpId, ...]:
+        """Snapshot of in-flight op ids, safe to iterate while mutating."""
+        ops = self.in_flight_ops
+        return () if ops is None else tuple(ops)
 
 
 class _KVCRCore:
@@ -564,14 +583,14 @@ class _KVCRCore:
         if new_operation:
             self._outstanding_operations += 1
         for key in op.keys:
-            self._block_record(key).in_flight_ops.add(op.op_id)
+            self._block_record(key).add_in_flight_op(op.op_id)
 
     def _remove_block_dependencies(self, op: _Op) -> None:
         self._outstanding_operations -= 1
         for key in op.keys:
             record = self._block_record_map.get(key)
             if record is not None:
-                record.in_flight_ops.discard(op.op_id)
+                record.discard_in_flight_op(op.op_id)
                 self._prune_block_record(key)
 
     # Cross-backend DRAM coordination.
