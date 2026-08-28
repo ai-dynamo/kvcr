@@ -25,7 +25,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .core import _KVCRCore
+    from .core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +166,65 @@ class _LocalDram:
         ] = {}
         self._next_copy_id = 1
         self._next_release_handle = 1
+        # A no-op until something attaches: the tiers publish residency
+        # changes unconditionally, and only recovery cares to hear them.
+        self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
+            lambda key, record: None
+        )
 
     @property
     def memory_region(self) -> tuple[int, int]:
         return self._address, self._length
 
+    @property
+    def _total_slots(self) -> int:
+        return self._length // self._slot_size
+
+    def observe_residency(
+        self, observer: Callable[[BlockKey, "_BlockRecord"], None]
+    ) -> None:
+        self._residency_observer = observer
+
+    def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
+        """Take the rows already-recovered records name, before the core starts.
+
+        The records carry the residencies; this only makes the allocator agree
+        with them. Ranking them is rank_recovered, which needs the policy to have
+        seen every block first.
+        """
+        slot_count = self._total_slots
+        occupied: set[int] = set()
+        for record in records.values():
+            residency = record.local_dram
+            if residency is None:
+                continue
+            slot = residency.slot
+            if (
+                residency.state is not _LocalDramState.READY
+                or type(slot) is not int
+                or not 0 <= slot < slot_count
+                or slot in occupied
+            ):
+                raise ValueError("invalid local DRAM recovery slots")
+            occupied.add(slot)
+        self._free_slots = deque(
+            slot for slot in range(slot_count) if slot not in occupied
+        )
+
+    def rank_recovered(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
+        """Make recovered rows evictable, once the policy can score them.
+
+        Separate from adopt_recovery_slots because a score is asked of the policy,
+        and the policy only knows a block once it has been admitted. Without this a
+        pool recovered full has no free row and no victim, so it refuses every
+        deposit until a reader happens to release one of the recovered rows.
+        """
+        for key, record in records.items():
+            if record.local_dram is not None:
+                self._make_evictable(key)
+
     def telemetry_state(self) -> dict[str, int]:
-        total_slots = self._length // self._slot_size
+        total_slots = self._total_slots
         return {
             "local_g2_total_slots": total_slots,
             "local_g2_free_slots": len(self._free_slots),
@@ -423,10 +475,9 @@ class _LocalDram:
     def abandon_capacity_eviction(self, key: BlockKey) -> None:
         """Stop blocking local admission on an eviction that will not land.
 
-        Waiters queue behind the slot a MOVE_TO eviction is about to free, so
-        the block stays reserved until its final claim is released. When the
-        move is abandoned instead, that reservation has to be dropped or every
-        later admission is refused for the lifetime of the process.
+        Waiters queue behind the slot a MOVE_TO eviction is about to free. When the
+        move is abandoned, that reservation has to be dropped or every later admission
+        is refused for the life of the process.
         """
         if self._capacity_eviction_key == key:
             self._capacity_eviction_key = None
@@ -532,6 +583,7 @@ class _LocalDram:
             if success:
                 record.last_access = now
                 residency.state = _LocalDramState.READY
+                self._residency_observer(key, record)
                 meta = self._kvcr._block_meta(key, record, self._slot_size)
                 self._kvcr._on_ingest(meta, source)
                 self._make_evictable(key)
@@ -879,6 +931,7 @@ class _LocalDram:
         if residency.claim_count == 0:
             if residency.retire_on_release:
                 record.local_dram = None
+                self._residency_observer(key, record)
                 self._free_slots.append(residency.slot)
                 self.abandon_capacity_eviction(key)
                 self._kvcr._on_remove(
@@ -924,6 +977,7 @@ class _LocalDram:
                 continue
             self._evictable.remove(key)
             record.local_dram = None
+            self._residency_observer(key, record)
             self._kvcr._on_remove(self._kvcr._block_meta(key, record, self._slot_size))
             self._kvcr._prune_block_record(key)
             return residency.slot, key, False

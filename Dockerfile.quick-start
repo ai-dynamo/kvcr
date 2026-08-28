@@ -61,6 +61,12 @@ FROM ${VLLM_IMAGE}
 USER root
 ARG NCCL_VERSION=2.30.7
 
+# KVCR's recovery journal reaches libatomic for the 8-byte acquire/release
+# cursor operations CPython does not expose. The runtime image needs it even
+# though it is not a Python distribution and cannot be a pyproject dependency.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+
 # Install the compatible Dynamo router-hint build.
 COPY --from=dynamo-builder /wheels /tmp/dynamo-wheels
 RUN python3 -m pip install --no-cache-dir \

@@ -17,7 +17,13 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr.core import _BlockRecord
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
+from kvcr.recovery_journal import (
+    RecoveryMirrorError,
+    install_recovery_records,
+)
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -405,3 +411,95 @@ def test_local_initialize_failure_completes_without_failing_progress() -> None:
     assert kvcr._core._progress._active_transfers == {}
     assert policy.ingested == []
     assert policy.removed == []
+
+
+def _g2_recovered(**slots: int) -> dict[BlockKey, _BlockRecord]:
+    return {
+        BlockKey(name.encode()): _BlockRecord(
+            local_dram=_LocalDramResidency(slot, _LocalDramState.READY)
+        )
+        for name, slot in slots.items()
+    }
+
+
+def test_adopt_recovery_slots_rebuilds_ready_allocator_state() -> None:
+    local = ctypes.create_string_buffer(64)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+    records = _g2_recovered(first=2, second=0)
+
+    assert kvcr._core._local_dram is not None
+    local_dram = kvcr._core._local_dram
+    kvcr._core._block_record_map.update(records)
+    local_dram.adopt_recovery_slots(records)
+
+    assert list(local_dram._free_slots) == [1, 3]
+    del first, second
+
+
+def test_a_pool_recovered_full_still_admits_a_new_deposit() -> None:
+    """A cache worth recovering is usually a full one, so it has to stay writable."""
+    local = ctypes.create_string_buffer(32)
+    primary = ctypes.create_string_buffer(16)
+    primary.raw = b"n" * 16
+    agent = FakeNixlAgent()
+    kvcr = _new_local_kvcr(agent, local, 2)
+    local_dram = kvcr._core._local_dram
+    assert local_dram is not None
+
+    recovered = install_recovery_records(kvcr._core, _g2_recovered(first=0, second=1))
+
+    # The returned keys are the only route from a recovered block to a router.
+    assert set(recovered) == {BlockKey(b"first"), BlockKey(b"second")}
+
+    # Every row the pool has came back occupied, so the deposit below can only
+    # land by evicting one of them.
+    assert not local_dram._free_slots
+
+    fresh = BlockKey(b"fresh")
+    operation = kvcr.deposit({fresh: _mem_descriptor(ctypes.addressof(primary))})
+    agent.state = "DONE"
+    completed = dict(_poll_until(kvcr, lambda results: bool(results)))
+
+    assert completed[operation] == _op_entries({fresh: True})
+    assert kvcr._core._block_record_map[fresh].local_dram is not None
+    # One recovered block gave up its row; the other kept it.
+    assert len(kvcr._core._block_record_map) == 2
+
+
+def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
+    """It replaces the table wholesale and rebuilds the free list from it."""
+    local = ctypes.create_string_buffer(64)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
+    kvcr._core._block_record_map[BlockKey(b"held")] = _BlockRecord(
+        local_dram=_LocalDramResidency(1, _LocalDramState.READY)
+    )
+
+    with pytest.raises(RecoveryMirrorError, match="holds none"):
+        install_recovery_records(kvcr._core, _g2_recovered(first=2, second=0))
+
+
+@pytest.mark.parametrize("slots", [(0, 0), (0, 4)])
+def test_adopt_recovery_slots_rejects_invalid_slots(slots: tuple[int, int]) -> None:
+    local = ctypes.create_string_buffer(64)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
+    local_dram = kvcr._core._local_dram
+    assert local_dram is not None
+
+    with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
+        local_dram.adopt_recovery_slots(_g2_recovered(first=slots[0], second=slots[1]))
+
+
+def test_adopt_recovery_slots_rejects_a_row_that_never_settled() -> None:
+    local = ctypes.create_string_buffer(64)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
+    local_dram = kvcr._core._local_dram
+    assert local_dram is not None
+    unsettled = {
+        BlockKey(b"first"): _BlockRecord(
+            local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)
+        )
+    }
+
+    with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
+        local_dram.adopt_recovery_slots(unsettled)

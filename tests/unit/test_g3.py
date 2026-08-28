@@ -33,8 +33,11 @@ from kvcr.config import (
     LocalDramInfo,
     RemoteFWDramOptions,
 )
+from kvcr.core import _BlockRecord
+from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
+from kvcr.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -196,6 +199,36 @@ def _metric_totals(stats):
     return totals
 
 
+def test_g3_observer_reports_commits_and_evictions_before_exposure(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    primary = ctypes.create_string_buffer(page_size * 3)
+    local = ctypes.create_string_buffer(page_size)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        policy=_MoveLocalToG3Policy(),
+        g3_slot_count=1,
+    )
+    g3 = kvcr._core._g3
+    assert g3 is not None
+    observed: list[tuple[BlockKey, int | None]] = []
+
+    def observe(key: BlockKey, record: _BlockRecord) -> None:
+        observed.append((key, None if record.g3 is None else record.g3.slot))
+
+    g3.observe_residency(observe)
+    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    address = ctypes.addressof(primary)
+    for index, key in enumerate(keys):
+        assert _deposit(kvcr, key, address + index * page_size, page_size).success
+
+    assert observed == [
+        (keys[0], 0),
+        (keys[0], None),
+        (keys[1], 0),
+    ]
+
+
 @pytest.mark.parametrize(
     ("policy", "moved_index"),
     [(G3FIFOPolicy(), 1), (G3LRUPolicy(), 0), (None, 0)],
@@ -297,8 +330,7 @@ def test_g3_rejects_hard_linked_paths_and_releases_the_first_lock(
     with pytest.raises(ValueError, match="must not alias the same file"):
         _new_g3_kvcr(tmp_path, local, g3_paths=(path, alias))
 
-    # Construction opened and sized the first path before finding the alias.
-    # A new controller can lock it only if failure cleanup closed that owner FD.
+    # A new controller can lock it only if failure cleanup closed the owner FD.
     assert _new_g3_kvcr(tmp_path, local, g3_paths=(path,))._core._g3 is not None
 
 
@@ -390,6 +422,68 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     )[replacement_deliver][keys[4]]
     assert replacement_result.success
     assert replacement_destination.raw == payloads[4]
+
+
+def test_a_g3_tier_recovered_full_can_still_free_a_slot(tmp_path) -> None:
+    """Recovered slots are ranked, so a spill still has somewhere to go."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size)
+    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=2)
+    g3 = kvcr._core._g3
+    assert g3 is not None
+
+    install_recovery_records(
+        kvcr._core,
+        {
+            BlockKey(b"first"): _BlockRecord(g3=_G3Residency(0)),
+            BlockKey(b"second"): _BlockRecord(g3=_G3Residency(1)),
+        },
+    )
+
+    assert not g3._free_slots
+    # Scored, not parked in _unscored: a slot nothing can name is a slot the
+    # tier has lost for the life of the process.
+    assert g3._unscored == set()
+    assert g3._evictable.select(set()) == BlockKey(b"first")
+
+
+def test_g3_recovery_rebuilds_free_slots(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size)
+    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=4)
+    g3 = kvcr._core._g3
+    assert g3 is not None
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+
+    records = {
+        first: _BlockRecord(g3=_G3Residency(1)),
+        second: _BlockRecord(g3=_G3Residency(3)),
+    }
+    kvcr._core._block_record_map.update(records)
+    g3.adopt_recovery_slots(records)
+
+    assert tuple(g3._free_slots) == (0, 2)
+    assert kvcr._core._block_record_map[first].g3 == _G3Residency(1)
+    assert kvcr._core._block_record_map[second].g3 == _G3Residency(3)
+
+
+@pytest.mark.parametrize("slots", [(0, 0), (0, 4)])
+def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size)
+    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=4)
+    g3 = kvcr._core._g3
+    assert g3 is not None
+
+    with pytest.raises(ValueError, match="invalid G3 recovery slots"):
+        g3.adopt_recovery_slots(
+            {
+                BlockKey(b"first"): _BlockRecord(g3=_G3Residency(slots[0])),
+                BlockKey(b"second"): _BlockRecord(g3=_G3Residency(slots[1])),
+            }
+        )
+
+    assert kvcr._core._block_record_map == {}
 
 
 def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
@@ -778,8 +872,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     assert record.g3 is not None
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
-    # The abandoned fill still owns the slot, so the retry waits for it
-    # instead of failing a block G3 can still serve.
+    # The abandoned fill still owns the slot, so the retry waits for it.
     retry = kvcr.fetch((first,))
     assert retry not in dict(kvcr.poll_completed())
     agent.stuck = False

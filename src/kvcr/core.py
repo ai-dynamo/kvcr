@@ -169,9 +169,11 @@ class _KVCRCore:
         self._joined_completions: dict[
             OpHandle, tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
         ] = {}
-        # IDs allocated by this KVCR instance.
-        self._next_op_handle: OpHandle = 1
-        self._next_fill_handle: OpHandle = -1
+        # Both seeded from the clock rather than a constant, so a refusal sent before a
+        # restart cannot complete a different operation that reused the number.
+        handle_seed = time.monotonic_ns()
+        self._next_op_handle: OpHandle = OpHandle(handle_seed)
+        self._next_fill_handle: OpHandle = OpHandle(-handle_seed)
 
         # Operational clock and optional telemetry clock.
         self._clock: _Clock = time.monotonic
