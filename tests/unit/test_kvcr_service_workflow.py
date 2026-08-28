@@ -4,6 +4,7 @@
 
 import ctypes
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -14,7 +15,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from _kvcr_test_utils import FakeNixlAgent, FakePrimaryPinning, _use_nixl_agent
+from _kvcr_test_utils import (
+    FakeNixlAgent,
+    FakePrimaryPinning,
+    _use_nixl_agent,
+    free_port,
+)
 
 from kvcr import (
     KVCR,
@@ -25,13 +31,36 @@ from kvcr import (
     KVCRSocketError,
 )
 from kvcr.config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
-from kvcr.kvcr_service import _KVCRService
+from kvcr.control_channels import ZmqPeerControlChannel
+from kvcr.kvcr_service import _DEFAULT_JOURNAL_BYTES, _KVCRService
 
 _ROW_STRIDE = 1024
 _DIGEST = "opaque workflow digest: Preserve-Me EXACTLY"
-_POOL_SIZE_BYTES = 8192
+_JOURNAL_BYTES = 8192
+_POOL_SIZE_BYTES = _JOURNAL_BYTES + 8192
+_CLI_POOL_SIZE_BYTES = _DEFAULT_JOURNAL_BYTES + 8192
+_CLI_POOL_SIZE_GB = str(_CLI_POOL_SIZE_BYTES / (1 << 30))
 _STOP_TIMEOUT_SECONDS = 5.0
 _START_TIMEOUT_SECONDS = 60.0
+
+
+_POOL_BINDS: dict[int, tuple[str, int]] = {}
+
+
+def _control_bind(pool_index: int) -> tuple[str, int]:
+    """One address per pool, stable across the claims that reuse it."""
+    bind = _POOL_BINDS.get(pool_index)
+    if bind is None:
+        bind = _POOL_BINDS[pool_index] = ("127.0.0.1", free_port())
+    return bind
+
+
+@pytest.fixture(autouse=True)
+def _fresh_pool_binds() -> Iterator[None]:
+    """One address per pool per test; the service holding it is gone by the next."""
+    _POOL_BINDS.clear()
+    yield
+    _POOL_BINDS.clear()
 
 
 def _socket_path() -> Path:
@@ -46,7 +75,9 @@ def _claim_when_ready(
     deadline = time.monotonic() + _START_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
-            return client.claim(pool_index, _ROW_STRIDE, _DIGEST)
+            return client.claim(
+                pool_index, _ROW_STRIDE, _DIGEST, _control_bind(pool_index)
+            )
         except KVCRSocketError:
             if process.poll() is not None:
                 output = process.stdout.read().decode() if process.stdout else ""
@@ -70,7 +101,7 @@ def _running_daemon(pool_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], P
             "--pool-count",
             "2",
             "--pool-size-gb",
-            "0.001",
+            _CLI_POOL_SIZE_GB,
             "--compatibility-digest",
             _DIGEST,
         ],
@@ -102,6 +133,7 @@ def _running_service(
         pool_count=pool_count,
         pool_size_bytes=_POOL_SIZE_BYTES,
         compatibility_digest=_DIGEST,
+        journal_bytes=_JOURNAL_BYTES,
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -122,14 +154,14 @@ def test_multi_pool_claim_release_and_persistent_reclaim(tmp_path: Path) -> None
 
     with _running_service(pool_dir) as socket_path:
         client = KVCRClient(socket_path)
-        first = client.claim(0, _ROW_STRIDE, _DIGEST)
-        second = client.claim(1, _ROW_STRIDE, _DIGEST)
+        first = client.claim(0, _ROW_STRIDE, _DIGEST, _control_bind(0))
+        second = client.claim(1, _ROW_STRIDE, _DIGEST, _control_bind(1))
         try:
             assert first.local_dram.address != second.local_dram.address
             ctypes.memmove(first.local_dram.address, payload, len(payload))
 
             first.release()
-            replacement = client.claim(0, _ROW_STRIDE, _DIGEST)
+            replacement = client.claim(0, _ROW_STRIDE, _DIGEST, _control_bind(0))
             try:
                 assert (
                     ctypes.string_at(replacement.local_dram.address, len(payload))
@@ -147,29 +179,47 @@ def test_kvcr_uses_releases_and_reclaims_service_pool(tmp_path: Path) -> None:
 
     with _running_service(pool_dir, pool_count=1) as socket_path:
         pinning = FakePrimaryPinning()
-        with _use_nixl_agent(FakeNixlAgent()):
-            controller = KVCR(
-                KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
-                KVCRBindings(
-                    pinning.request_pin,
-                    pinning.poll_pin_results,
-                    pinning.release_pin,
-                ),
-                KVCRBackendConfigs(),
-                KVCRGuardConfig(
-                    kvcr_service_socket_path=str(socket_path),
-                    pool_index=0,
-                    row_stride=_ROW_STRIDE,
-                    compatibility_digest=_DIGEST,
-                ),
-            )
+        # The service binds this port later, so another test can take it first.
+        for attempt in range(5):
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = int(probe.getsockname()[1])
+            control = ZmqPeerControlChannel("127.0.0.1", port, "127.0.0.1")
+            try:
+                with _use_nixl_agent(FakeNixlAgent()):
+                    controller = KVCR(
+                        KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
+                        KVCRBindings(
+                            pinning.request_pin,
+                            pinning.poll_pin_results,
+                            pinning.release_pin,
+                            framework_control=control,
+                        ),
+                        KVCRBackendConfigs(),
+                        KVCRGuardConfig(
+                            kvcr_service_socket_path=str(socket_path),
+                            pool_index=0,
+                            row_stride=_ROW_STRIDE,
+                            compatibility_digest=_DIGEST,
+                        ),
+                    )
+                break
+            except KVCRServiceError as error:
+                control.close()
+                if "unavailable" not in str(error) or attempt == 4:
+                    raise
         try:
             with pytest.raises(KVCRServiceError, match="held"):
-                KVCRClient(socket_path).claim(0, _ROW_STRIDE, _DIGEST)
+                KVCRClient(socket_path).claim(
+                    0, _ROW_STRIDE, _DIGEST, ("127.0.0.1", port)
+                )
         finally:
             controller.close()
+            control.close()
 
-        replacement = KVCRClient(socket_path).claim(0, _ROW_STRIDE, _DIGEST)
+        replacement = KVCRClient(socket_path).claim(
+            0, _ROW_STRIDE, _DIGEST, ("127.0.0.1", port)
+        )
         replacement.release()
 
 
@@ -214,7 +264,7 @@ def test_restart_reclaims_only_unattached_pools(tmp_path: Path) -> None:
 
 
 def test_cli_configures_data_geometry(tmp_path: Path) -> None:
-    """The deployed flags produce exactly the requested data-only pools."""
+    """The deployed flags produce the requested pool and data geometry."""
     pool_dir = tmp_path / "pools"
     pool_dir.mkdir()
     with _running_daemon(pool_dir) as (daemon, socket_path):
@@ -223,10 +273,12 @@ def test_cli_configures_data_geometry(tmp_path: Path) -> None:
             hold = _claim_when_ready(daemon, socket_path, 1)
             pools = list(pool_dir.iterdir())
             assert len(pools) == 2, "--pool-count pools at startup"
-            requested = int(0.001 * (1 << 30))
+            requested = int(float(_CLI_POOL_SIZE_GB) * (1 << 30))
+            client_rows = (requested - _DEFAULT_JOURNAL_BYTES) // _ROW_STRIDE
+            data_bytes = client_rows * _ROW_STRIDE
             assert all(path.stat().st_size == requested for path in pools)
-            assert hold.local_dram.length == requested // _ROW_STRIDE * _ROW_STRIDE
-            assert hold.local_dram.slot_count == hold.local_dram.length // _ROW_STRIDE
+            assert hold.local_dram.length == data_bytes
+            assert hold.local_dram.slot_count == client_rows
             hold.release()
             hold = None
         finally:

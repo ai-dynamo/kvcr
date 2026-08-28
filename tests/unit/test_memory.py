@@ -15,24 +15,27 @@ import pytest
 
 from kvcr import memory as kvcr_memory
 from kvcr.memory import (
+    _JOURNAL_HEADER_BYTES,
     KVCRPoolAttachment,
     KVCRPoolSpec,
     _compute_pool_geometry,
     _KVCRPoolOwner,
     _populate_pages,
+    _snapshot_offset,
 )
 
 _TEST_GENERATION = "0123456789abcdef0123456789abcdef"
+_TEST_JOURNAL_BYTES = 8192
 
 
 @pytest.fixture
 def pool_owner(tmp_path: Path) -> Iterator[_KVCRPoolOwner]:
     owner = _KVCRPoolOwner.allocate(
         pool_id="engine",
-        pool_size_bytes=4096,
+        pool_size_bytes=12288,
+        journal_bytes=_TEST_JOURNAL_BYTES,
         pool_dir=tmp_path,
     )
-    owner.finalize(row_stride=1024)
     try:
         yield owner
     finally:
@@ -77,7 +80,7 @@ def test_pool_geometry_rejects_invalid_values(
         _compute_pool_geometry(requested_bytes, row_stride)  # type: ignore[arg-type]
 
 
-def test_pool_is_data_only_private_and_page_populated(tmp_path: Path) -> None:
+def test_pool_is_raw_private_and_page_populated(tmp_path: Path) -> None:
     with (
         patch("kvcr.memory.uuid.uuid4") as uuid4,
         patch("kvcr.memory._populate_pages", wraps=_populate_pages) as populate,
@@ -85,11 +88,12 @@ def test_pool_is_data_only_private_and_page_populated(tmp_path: Path) -> None:
         uuid4.return_value.hex = _TEST_GENERATION
         owner = _KVCRPoolOwner.allocate(
             pool_id="engine_dp0",
-            pool_size_bytes=8193,
+            pool_size_bytes=12289,
+            journal_bytes=_TEST_JOURNAL_BYTES,
             pool_dir=tmp_path,
         )
         try:
-            spec = owner.finalize(row_stride=4096)
+            spec = owner.spec
             path = Path(spec.path)
             file_stat = path.stat()
             assert spec == KVCRPoolSpec(
@@ -98,36 +102,66 @@ def test_pool_is_data_only_private_and_page_populated(tmp_path: Path) -> None:
                 generation=_TEST_GENERATION,
                 device=file_stat.st_dev,
                 inode=file_stat.st_ino,
-                effective_bytes=8192,
-                rows=2,
-                row_stride=4096,
+                mapping_bytes=12289,
+                journal_bytes=_TEST_JOURNAL_BYTES,
             )
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
-            assert path.stat().st_size == 8193
+            assert path.stat().st_size == spec.mapping_bytes
             populate.assert_called_once()
-            assert populate.call_args.args[1] == 8193
+            assert populate.call_args.args[1:] == (0, spec.mapping_bytes)
 
-            marker = b"data starts at byte zero"
+            journal_marker = b"journal starts at byte zero"
+            data_marker = b"data starts after the journal"
             with path.open("r+b") as pool_file:
-                pool_file.write(marker)
+                pool_file.write(journal_marker)
+                pool_file.seek(spec.journal_bytes)
+                pool_file.write(data_marker)
             with patch("kvcr.memory.mmap.mmap", wraps=mmap.mmap) as map_file:
                 attachment = KVCRPoolAttachment.attach(spec)
             map_file.assert_called_once()
-            assert map_file.call_args.args[1:] == (spec.effective_bytes,)
+            assert map_file.call_args.args[1:] == (spec.mapping_bytes,)
             assert map_file.call_args.kwargs == {"access": mmap.ACCESS_WRITE}
             try:
-                assert ctypes.string_at(attachment.address, len(marker)) == marker
+                assert (
+                    ctypes.string_at(attachment.address, len(journal_marker))
+                    == journal_marker
+                )
+                assert (
+                    ctypes.string_at(
+                        attachment.address + spec.journal_bytes, len(data_marker)
+                    )
+                    == data_marker
+                )
             finally:
                 attachment.close()
             with pytest.raises(FileExistsError):
                 _KVCRPoolOwner.allocate(
                     pool_id="engine_dp0",
-                    pool_size_bytes=8192,
+                    pool_size_bytes=12288,
+                    journal_bytes=_TEST_JOURNAL_BYTES,
                     pool_dir=tmp_path,
                 )
         finally:
             owner.close()
     assert not path.exists()
+
+
+def test_pool_creation_initializes_the_journal_header(tmp_path: Path) -> None:
+    def dirty_header(file_descriptor: int, _offset: int, _length: int) -> None:
+        os.pwrite(file_descriptor, b"\xff" * _JOURNAL_HEADER_BYTES, 0)
+
+    with patch("kvcr.memory._populate_pages", side_effect=dirty_header):
+        owner = _KVCRPoolOwner.allocate(
+            pool_id="engine",
+            pool_size_bytes=12288,
+            journal_bytes=_TEST_JOURNAL_BYTES,
+            pool_dir=tmp_path,
+        )
+    try:
+        with open(owner._path, "rb") as pool_file:
+            assert pool_file.read(_JOURNAL_HEADER_BYTES) == bytes(_JOURNAL_HEADER_BYTES)
+    finally:
+        owner.close()
 
 
 def test_attachment_close_does_not_unlink(pool_owner: _KVCRPoolOwner) -> None:
@@ -147,9 +181,8 @@ def test_attachment_close_does_not_unlink(pool_owner: _KVCRPoolOwner) -> None:
     [
         ("device", True),
         ("inode", 1.0),
-        ("effective_bytes", 4096.0),
-        ("rows", 4.0),
-        ("row_stride", 1024.0),
+        ("mapping_bytes", 4096.0),
+        ("journal_bytes", 8192.0),
     ],
 )
 def test_pool_spec_rejects_non_integer_fields(
@@ -164,7 +197,7 @@ def test_pool_spec_rejects_non_integer_fields(
 
 
 def test_attachment_rejects_wrong_size(pool_owner: _KVCRPoolOwner) -> None:
-    os.truncate(pool_owner.spec.path, pool_owner.spec.effective_bytes // 2)
+    os.truncate(pool_owner.spec.path, pool_owner.spec.mapping_bytes // 2)
     with pytest.raises(ValueError, match="smaller than the grant"):
         KVCRPoolAttachment.attach(pool_owner.spec)
 
@@ -203,7 +236,7 @@ def test_attachment_rejects_replaced_pool_identity(
 def test_creation_failure_does_not_unlink_replacement(tmp_path: Path) -> None:
     replacement = b"replacement"
 
-    def replace_then_fail(file_descriptor: object, length: int) -> None:
+    def replace_then_fail(file_descriptor: object, _offset: int, length: int) -> None:
         del file_descriptor, length
         [path] = tmp_path.iterdir()
         path.unlink()
@@ -218,7 +251,8 @@ def test_creation_failure_does_not_unlink_replacement(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="page population failed"):
             _KVCRPoolOwner.allocate(
                 pool_id="engine",
-                pool_size_bytes=4096,
+                pool_size_bytes=12288,
+                journal_bytes=_TEST_JOURNAL_BYTES,
                 pool_dir=tmp_path,
             )
     [path] = tmp_path.iterdir()
@@ -236,7 +270,7 @@ def test_page_population_propagates_enospc_without_mapping() -> None:
         patch("kvcr.memory.mmap.mmap") as map_file,
         pytest.raises(OSError) as raised,
     ):
-        _populate_pages(3, mmap.PAGESIZE)
+        _populate_pages(3, 0, mmap.PAGESIZE)
 
     assert raised.value is error
     map_file.assert_not_called()
@@ -266,17 +300,18 @@ def test_page_population_falls_back(
 
     path = tmp_path / "pool"
     with path.open("w+b") as pool_file:
-        pool_file.truncate(mmap.PAGESIZE)
-        with patch("kvcr.memory.mmap.mmap", wraps=mmap.mmap) as map_file:
-            _populate_pages(pool_file.fileno(), mmap.PAGESIZE)
+        pool_file.truncate(2 * mmap.PAGESIZE)
+        # Written, not mapped: a store that cannot be backed raises SIGBUS.
+        with (
+            patch("kvcr.memory.mmap.mmap", wraps=mmap.mmap) as map_file,
+            patch("kvcr.memory.os.pwrite", wraps=os.pwrite) as write,
+        ):
+            _populate_pages(pool_file.fileno(), mmap.PAGESIZE, mmap.PAGESIZE)
 
-        map_file.assert_called_once_with(
-            pool_file.fileno(),
-            mmap.PAGESIZE,
-            access=mmap.ACCESS_WRITE,
-        )
+        map_file.assert_not_called()
+        assert [call.args[2] for call in write.call_args_list] == [mmap.PAGESIZE]
         pool_file.seek(0)
-        assert pool_file.read() == bytes(mmap.PAGESIZE)
+        assert pool_file.read() == bytes(2 * mmap.PAGESIZE)
 
 
 def test_attachment_rejects_wrong_permissions(
@@ -308,3 +343,55 @@ def test_pool_lock_distinguishes_contention_from_lock_failure(
             with pytest.raises(OSError) as raised:
                 kvcr_memory._try_lock_pool(0, exclusive=False)
             assert raised.value is error
+
+
+def test_a_snapshot_region_that_cannot_be_backed_leaves_no_tail(
+    pool_owner: _KVCRPoolOwner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tail with no header reads as a region, and nothing ever retires one."""
+    spec = pool_owner.spec
+    attachment = KVCRPoolAttachment.attach(spec)
+    try:
+        monkeypatch.setattr(
+            "kvcr.memory._populate_pages",
+            Mock(side_effect=OSError(errno.ENOSPC, "no space left on device")),
+        )
+
+        with pytest.raises(OSError):
+            with attachment.snapshot_region(4096):
+                pass
+
+        # Truncated back, so the next claimant finds nothing rather than a
+        # region it can neither replay nor get rid of.
+        assert os.fstat(attachment._file_descriptor).st_size == _snapshot_offset(
+            spec.mapping_bytes
+        )
+        with attachment.mapped_snapshot() as region:
+            assert region is None
+    finally:
+        attachment.close()
+
+
+def test_reserving_a_snapshot_region_does_not_touch_the_live_pool(
+    pool_owner: _KVCRPoolOwner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reservation fallback writes, so its range has to be the tail only."""
+    spec = pool_owner.spec
+    attachment = KVCRPoolAttachment.attach(spec)
+    try:
+        marker = bytes(range(1, 129))
+        mapping = attachment._mapping
+        assert mapping is not None
+        mapping[: len(marker)] = marker
+        tail_start = spec.mapping_bytes - len(marker)
+        mapping[tail_start:] = marker
+
+        # Force the fallback: the path that writes rather than reserves.
+        monkeypatch.delattr(os, "posix_fallocate", raising=False)
+        with attachment.snapshot_region(4096) as region:
+            region[:8] = b"snapshot"
+
+        assert bytes(mapping[: len(marker)]) == marker
+        assert bytes(mapping[tail_start:]) == marker
+    finally:
+        attachment.close()

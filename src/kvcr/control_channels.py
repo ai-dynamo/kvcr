@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Control and framing channels used by KVCR."""
+"""Control and framing channels used by KVCR.
+
+A pool's control endpoint outlives the worker holding it. The service binds
+the port once and passes the listening socket itself, as a descriptor over the
+claim connection, so the address is never reopened and no other process can
+take it in between.
+"""
 
 import logging
 import os
 import socket
 import struct
+from array import array
 from typing import TypeVar
 
 import msgspec
@@ -67,13 +74,76 @@ class FramedConnection:
         self._connection.close()
 
     def send(self, message: object) -> None:
+        frame = self._encode_frame(message)
+        self._connection.sendall(frame)
+
+    def send_with_fd(self, message: object, file_descriptor: int) -> None:
+        """Send one frame carrying one descriptor on its first byte."""
+        frame = self._encode_frame(message)
+        sent = socket.send_fds(self._connection, [frame], [file_descriptor])
+        if sent == 0:
+            raise EOFError
+        if sent < len(frame):
+            self._connection.sendall(frame[sent:])
+
+    @staticmethod
+    def _encode_frame(message: object) -> bytes:
         payload = _ENCODER.encode(message)
         if len(payload) > _MAX_FRAME_BYTES:
             raise KVCRMsgFramingError("frame is too large")
-        self._connection.sendall(_FRAME_HEADER.pack(len(payload)) + payload)
+        return _FRAME_HEADER.pack(len(payload)) + payload
 
     def receive(self, decoder: msgspec.msgpack.Decoder[_T]) -> _T:
         header = self._receive_exact(_FRAME_HEADER.size)
+        return self._receive_after_header(header, decoder)
+
+    def receive_with_fd(
+        self, decoder: msgspec.msgpack.Decoder[_T]
+    ) -> tuple[_T, int | None]:
+        """Receive one frame and at most one descriptor attached to it."""
+        # Not socket.recv_fds: it drops the flags it is given, so MSG_CMSG_CLOEXEC
+        # would never reach recvmsg.
+        header, ancillary, flags, _ = self._connection.recvmsg(
+            _FRAME_HEADER.size,
+            socket.CMSG_SPACE(array("i").itemsize * 2),
+            socket.MSG_CMSG_CLOEXEC,
+        )
+        if not header:
+            raise EOFError
+
+        descriptors: list[int] = []
+        try:
+            unexpected_ancillary = False
+            for level, kind, data in ancillary:
+                if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                    unexpected_ancillary = True
+                    continue
+                received = array("i")
+                received.frombytes(data[: len(data) - len(data) % received.itemsize])
+                descriptors.extend(received)
+            if flags & socket.MSG_CTRUNC:
+                raise KVCRMsgFramingError("truncated ancillary data")
+            if unexpected_ancillary:
+                raise KVCRMsgFramingError("unexpected ancillary data")
+            if len(descriptors) > 1:
+                raise KVCRMsgFramingError("multiple file descriptors received")
+            if len(header) < _FRAME_HEADER.size:
+                try:
+                    header += self._receive_exact(_FRAME_HEADER.size - len(header))
+                except EOFError as error:
+                    raise KVCRMsgFramingError("truncated frame") from error
+            message = self._receive_after_header(header, decoder)
+            return message, descriptors.pop() if descriptors else None
+        except BaseException:
+            for file_descriptor in descriptors:
+                os.close(file_descriptor)
+            raise
+
+    def _receive_after_header(
+        self,
+        header: bytes,
+        decoder: msgspec.msgpack.Decoder[_T],
+    ) -> _T:
         (length,) = _FRAME_HEADER.unpack(header)
         if length == 0 or length > _MAX_FRAME_BYTES:
             raise KVCRMsgFramingError(f"invalid frame length: {length}")
@@ -100,12 +170,17 @@ class FramedConnection:
 class ZmqPeerControlChannel:
     """Nonblocking peer channel.
 
-    ``send`` returns immediately when the ZMQ queue cannot accept data;
-    KVCR operation deadlines handle retry and failure decisions.
-
-    KVCR constructs the channel on main but initializes and uses its sockets
-    only from the progress thread.
+    ``send`` returns immediately when the ZMQ queue cannot accept data; KVCR
+    operation deadlines handle retry and failure. Constructed on main, but its
+    sockets are only touched from the progress thread.
     """
+
+    endpoint: str | None
+    _bind_endpoint: str
+    _listener: socket.socket | None
+    _ctx: zmq.Context | None
+    _socket: zmq.Socket | None
+    _outgoing: dict[str, zmq.Socket]
 
     def __init__(
         self,
@@ -113,20 +188,113 @@ class ZmqPeerControlChannel:
         bind_port: int,
         advertise_host: str,
     ) -> None:
-        self._bind_host = bind_host
-        self._bind_port = bind_port
         if bind_port <= 0:
             raise ValueError("KVCR control_port must be configured")
-        self.endpoint = f"tcp://{advertise_host}:{bind_port}"
-        self._ctx: zmq.Context | None = None
-        self._socket: zmq.Socket | None = None
-        self._outgoing: dict[str, zmq.Socket] = {}
+        self._bind_host = bind_host
+        self._bind_port = bind_port
+        self._advertise_host = advertise_host
+        self._adopt_listener(
+            None,
+            f"tcp://{bind_host}:{bind_port}",
+            f"tcp://{advertise_host}:{bind_port}",
+        )
+
+    def _ensure_listener(self) -> socket.socket:
+        """Bind the configured port the first time a listener is needed."""
+        listener = self._listener
+        if listener is not None:
+            return listener
+        listener = socket.create_server((self._bind_host, self._bind_port))
+        self._listener = listener
+        return listener
+
+    def _adopt_listener(
+        self,
+        listener: socket.socket | None,
+        bind_endpoint: str,
+        endpoint: str | None,
+    ) -> None:
+        """Take ownership of a bound listener and reset per-channel socket state."""
+        self.endpoint = endpoint
+        self._bind_endpoint = bind_endpoint
+        self._listener = listener
+        self._ctx = None
+        self._socket = None
+        self._outgoing = {}
+
+    @classmethod
+    def from_shared_listener(
+        cls,
+        listener: socket.socket,
+    ) -> "ZmqPeerControlChannel":
+        """Take ownership of a pre-bound TCP listener received by the service."""
+        if listener.family != socket.AF_INET:
+            raise ValueError("KVCR control listener must use TCP")
+        if listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+            raise ValueError("KVCR control listener must be a stream socket")
+        if listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
+            raise ValueError("KVCR control listener must already be listening")
+        address = listener.getsockname()
+        host, port = address[0], int(address[1])
+
+        # Constructed normally: __new__ alone left _bind_host and _bind_port unset.
+        channel = cls(host, port, host)
+        # The service cannot reconstruct the primary's advertised host; the
+        # Guard replies using routes reflected in incoming requests.
+        channel._adopt_listener(
+            socket.socket(fileno=listener.detach()),
+            f"tcp://{host}:{port}",
+            None,
+        )
+        return channel
+
+    def control_bind_address(self) -> tuple[str, int]:
+        return self._bind_host, self._bind_port
+
+    def adopt_listener(self, listener_fd: int) -> None:
+        """Take over a listener bound elsewhere instead of binding one.
+
+        The service owns a pool's control endpoint across the death of the
+        worker holding it, so a worker adopts that listener rather than
+        competing for the port the service is about to hand it.
+        """
+        if self._listener is not None:
+            raise RuntimeError("KVCR control channel already owns a listener")
+        listener = socket.socket(fileno=listener_fd)
+        try:
+            host, port = listener.getsockname()[:2]
+            port = int(port)
+        except BaseException:
+            listener.detach()
+            raise
+        self._adopt_listener(
+            listener,
+            f"tcp://{host}:{port}",
+            f"tcp://{self._advertise_host}:{port}",
+        )
 
     def initialize(self) -> None:
+        listener = self._ensure_listener()
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.PULL)
         self._socket.linger = 0
-        self._socket.bind(f"tcp://{self._bind_host}:{self._bind_port}")
+        adopted_fd = os.dup(listener.fileno())
+        try:
+            self._socket.setsockopt(zmq.USE_FD, adopted_fd)
+        except BaseException:
+            os.close(adopted_fd)
+            self._socket.close()
+            self._socket = None
+            raise
+        try:
+            self._socket.bind(self._bind_endpoint)
+        except BaseException:
+            # libzmq takes the descriptor at bind, so one that failed to bind
+            # leaves it ours -- and it holds the pool's control address.
+            os.close(adopted_fd)
+            self._socket.close()
+            self._socket = None
+            raise
 
     def send(self, endpoint: str, message: bytes) -> bool:
         if self._ctx is None:
@@ -179,3 +347,6 @@ class ZmqPeerControlChannel:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
+        if self._listener is not None:
+            self._listener.close()
+            self._listener = None
