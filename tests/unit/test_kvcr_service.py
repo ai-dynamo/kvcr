@@ -1029,12 +1029,23 @@ def test_a_release_racing_death_wins_and_a_failed_release_stops_the_service() ->
     handler.server.fail.assert_called_once_with(error)
 
 
-@pytest.mark.parametrize("failure", ["setup", "poll", "pidfd", "promotion"])
+@pytest.mark.parametrize(
+    ("failure", "registry_closed"),
+    [
+        ("setup", False),
+        ("poll", False),
+        ("pidfd", False),
+        ("promotion", False),
+        ("closed-fileno", True),
+        ("closed-poll", True),
+    ],
+)
 def test_hold_failures_stop_the_service_and_retain_the_binding(
     tmp_path: Path,
     failure: str,
+    registry_closed: bool,
 ) -> None:
-    """The first fatal hold failure shuts the service down, binding intact."""
+    """Fatal hold failures stop the service, binding kept; shutdown latches nothing."""
     liveness = Mock()
     liveness.fileno.return_value = 11
     with _new_registry(tmp_path, 1) as registry:
@@ -1055,16 +1066,28 @@ def test_hold_failures_stop_the_service_and_retain_the_binding(
             poller.register.side_effect = OSError("setup failed")
         elif failure == "poll":
             poller.poll.side_effect = OSError("poll failed")
-        elif failure == "pidfd":
+        elif failure in ("pidfd", "closed-poll"):
             poller.poll.return_value = [(11, select.POLLERR | select.POLLNVAL)]
+        elif failure == "closed-fileno":
+            # What an already-closed pidfd raises when _hold first asks for it.
+            liveness.fileno.side_effect = ValueError("pidfd is closed")
         else:
             # A Guard that cannot be promoted is fatal, on purpose.
             promotion_failure = RuntimeError("promotion failed")
             registry.holder_died = Mock(side_effect=promotion_failure)
             poller.poll.return_value = [(11, select.POLLIN)]
 
+        if registry_closed:
+            registry.close()
         with patch("kvcr.kvcr_service.select.poll", return_value=poller):
             handler._hold(0, liveness)
+
+        if registry_closed:
+            # Whichever end noticed, the shutdown is the cause and already
+            # under way; neither end may latch a failure.
+            assert server._fatal_error is None
+            server.shutdown.assert_not_called()
+            return
 
         fatal_error = server._fatal_error
         if promotion_failure is not None:
@@ -1090,42 +1113,6 @@ def test_hold_failures_stop_the_service_and_retain_the_binding(
         with pytest.raises((OSError, RuntimeError)) as raised:
             service.serve_forever()
         assert raised.value is fatal_error
-
-
-@pytest.mark.parametrize("noticed_by", ["setup", "poll"])
-def test_shutdown_closing_a_watched_pidfd_is_not_a_failure(
-    tmp_path: Path,
-    noticed_by: str,
-) -> None:
-    """close() breaks the descriptors _hold watches; neither end may latch a cause."""
-    liveness = Mock()
-    liveness.fileno.return_value = 11
-    with _new_registry(tmp_path, 1) as registry:
-        registry.claim(0, _TEST_TIER_CONFIG, liveness, _control_bind(0))
-
-        server = object.__new__(_ThreadingUnixServer)
-        server.registry = registry
-        server._fatal_error = None
-        server._fatal_lock = threading.Lock()
-        server.shutdown = Mock()
-        handler = object.__new__(_RequestHandler)
-        handler.request = Mock()
-        handler.request.fileno.return_value = 10
-        handler.server = server
-        poller = Mock()
-        if noticed_by == "setup":
-            # What an already-closed pidfd raises when _hold first asks for it.
-            liveness.fileno.side_effect = ValueError("pidfd is closed")
-        else:
-            poller.poll.return_value = [(11, select.POLLERR | select.POLLNVAL)]
-
-        registry.close()
-        with patch("kvcr.kvcr_service.select.poll", return_value=poller):
-            handler._hold(0, liveness)
-
-        # Whichever end noticed, the shutdown is the cause and already under way.
-        assert server._fatal_error is None
-        server.shutdown.assert_not_called()
 
 
 def test_a_pool_no_bigger_than_its_journal_is_rejected_at_the_flag() -> None:

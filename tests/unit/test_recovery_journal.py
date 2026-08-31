@@ -25,6 +25,8 @@ from kvcr.recovery_journal import (
     RecoveryJournal,
     RecoveryJournalError,
     RecoveryJournalTornError,
+    _attach_journal,
+    _decode_recovery_record,
     _recovery_frames,
     _RecoveryMirror,
     canonical_pool_terms,
@@ -224,6 +226,73 @@ def test_a_frame_the_ring_cannot_carry_invalidates_it_until_reset(
     assert journal.read_next() == (_RECORD_BLOCK, b"key", b"payload")
 
 
+class _Source:
+    def __init__(self) -> None:
+        self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
+
+    def observe_residency(
+        self, observer: Callable[[BlockKey, _BlockRecord], None]
+    ) -> None:
+        self._observer = observer
+
+    def emit(self, key: BlockKey, record: _BlockRecord) -> None:
+        assert self._observer is not None
+        self._observer(key, record)
+
+
+def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
+    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stable mutations stream through the ring; a refusal or failure stops all."""
+    journal, _ = journal_and_mapping
+    local_dram, g3 = _Source(), _Source()
+    key = BlockKey(b"block")
+    _attach_journal(local_dram, journal, g3)
+    caplog.set_level("WARNING", logger="kvcr.recovery_journal")
+
+    # Stable G2/G3 mutations from either tier publish whole under the block's key.
+    local_dram.emit(key, _recovered_record(g2=2))
+    g3.emit(key, _recovered_record(g2=2, g3=7))
+    local_dram.emit(key, _recovered_record(g3=7))
+    g3.emit(key, _BlockRecord())
+
+    frames = [journal.read_next() for _ in range(4)]
+    assert journal.read_next() is None
+    assert [frame_key for _, frame_key, _ in frames] == [bytes(key)] * 4
+    assert [_decode_recovery_record(payload) for _, _, payload in frames] == [
+        _recovered_record(g2=2),
+        _recovered_record(g2=2, g3=7),
+        _recovered_record(g3=7),
+        _BlockRecord(),
+    ]
+    assert caplog.messages == []
+
+    # One refused attempt, then publication stays off with no second warning.
+    journal.invalidate()
+    caplog.clear()
+    with patch.object(journal, "publish", wraps=journal.publish) as publish:
+        local_dram.emit(key, _recovered_record(g2=0))
+        local_dram.emit(key, _recovered_record(g2=1))
+    assert publish.call_count == 1
+    assert caplog.messages == [
+        "KVCR recovery publication disabled after the journal rejected a frame"
+    ]
+
+    # A publish that raises invalidates recovery; the mutation itself survives.
+    with mmap.mmap(-1, _TEST_JOURNAL_BYTES + mmap.PAGESIZE) as fresh_mapping:
+        fresh = RecoveryJournal(_attachment(fresh_mapping, _TEST_JOURNAL_BYTES))
+        fresh.reset()
+        source = _Source()
+        _attach_journal(source, fresh)
+        assert not fresh.is_invalid()
+        with patch.object(
+            fresh, "publish", side_effect=RuntimeError("publish failed")
+        ):
+            source.emit(BlockKey(b"still-serving"), _recovered_record(g2=0))
+        assert fresh.is_invalid()
+
+
 def _pool(tmp_path: Path, pool_id: str = "pool_0") -> _KVCRPoolOwner:
     return _KVCRPoolOwner.allocate(
         pool_id=pool_id,
@@ -286,52 +355,10 @@ def test_a_handback_region_round_trips_and_replays_nothing_once_released(
         assert list(read_recovery_snapshot(pool, terms)) == []
 
 
-@pytest.mark.parametrize(
-    "digest,row_stride",
-    [(_TEST_DIGEST, 8192), ("another-digest", 4096)],
-    ids=["stride", "digest"],
-)
-def test_handback_region_is_refused_across_a_change_of_terms(
-    tmp_path: Path, digest: str, row_stride: int
-) -> None:
-    """A slot number only means the same bytes under the same geometry."""
-    with _attached(tmp_path) as pool:
-        write_recovery_snapshot(
-            pool,
-            canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec),
-            _recovery_frames({BlockKey(b"k" * 32): _recovered_record(g2=1)}),
-        )
-
-        other = canonical_pool_terms(digest, row_stride, pool._spec)
-        with pytest.raises(RecoveryJournalError, match="other terms"):
-            list(read_recovery_snapshot(pool, other))
-
-
-def test_an_unfinished_handback_region_is_refused(tmp_path: Path) -> None:
-    """The header lands last, so a torn region never reads as a whole one."""
-    with _attached(tmp_path) as pool:
-        terms = canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec)
-        write_recovery_snapshot(
-            pool,
-            terms,
-            _recovery_frames({BlockKey(b"k" * 32): _recovered_record(g2=1)}),
-        )
-        # A byte of the digest, as a region whose last write never finished.
-        offset = _snapshot_offset(pool._spec.mapping_bytes)
-        with open(pool._spec.path, "r+b") as pool_file:
-            pool_file.seek(offset)
-            byte = pool_file.read(1)[0]
-            pool_file.seek(offset)
-            pool_file.write(bytes([byte ^ 0xFF]))
-
-        with pytest.raises(RecoveryJournalError, match="unfinished"):
-            list(read_recovery_snapshot(pool, terms))
-
-
 def test_an_interrupted_rewrite_reads_as_unfinished_rather_than_as_other_terms(
     tmp_path: Path,
 ) -> None:
-    """A rewrite that dies mid-way must be discardable, not poison for every claim."""
+    """Changed terms are refused forever; an unfinished write is thrown away."""
     with _attached(tmp_path) as pool:
         terms = canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec)
         write_recovery_snapshot(
@@ -341,7 +368,14 @@ def test_an_interrupted_rewrite_reads_as_unfinished_rather_than_as_other_terms(
         )
         assert list(read_recovery_snapshot(pool, terms))
 
-        # Stopped once the replacing body has landed but before its header has.
+        # A slot number only means the same bytes under the same geometry.
+        for digest, row_stride in [(_TEST_DIGEST, 8192), ("another-digest", 4096)]:
+            other = canonical_pool_terms(digest, row_stride, pool._spec)
+            with pytest.raises(RecoveryJournalError, match="other terms"):
+                list(read_recovery_snapshot(pool, other))
+
+        # A rewrite that dies once the replacing body has landed but before its
+        # header has must be discardable, not poison for every later claim.
         interrupted = Mock(
             size=_SNAPSHOT_HEADER.size, pack=Mock(side_effect=OSError("interrupted"))
         )
@@ -353,9 +387,25 @@ def test_an_interrupted_rewrite_reads_as_unfinished_rather_than_as_other_terms(
                     _recovery_frames({BlockKey(b"b" * 32): _recovered_record(g2=2)}),
                 )
 
-        # Unfinished, not written-for-other-terms: the first is thrown away, the
-        # second would refuse every later claim on this pool.
+        # Unfinished, not written-for-other-terms: read_handback discards it.
         with pytest.raises(RecoveryJournalTornError, match="unfinished"):
             list(read_recovery_snapshot(pool, terms))
         assert read_handback(pool, _TEST_DIGEST, 4096)._records == {}
         assert list(read_recovery_snapshot(pool, terms)) == []
+
+        # The header lands last, so a region whose last write never finished --
+        # here a flipped digest byte -- never reads as a whole one either.
+        write_recovery_snapshot(
+            pool,
+            terms,
+            _recovery_frames({BlockKey(b"k" * 32): _recovered_record(g2=1)}),
+        )
+        offset = _snapshot_offset(pool._spec.mapping_bytes)
+        with open(pool._spec.path, "r+b") as pool_file:
+            pool_file.seek(offset)
+            byte = pool_file.read(1)[0]
+            pool_file.seek(offset)
+            pool_file.write(bytes([byte ^ 0xFF]))
+
+        with pytest.raises(RecoveryJournalError, match="unfinished"):
+            list(read_recovery_snapshot(pool, terms))

@@ -582,20 +582,35 @@ def test_a_failed_claim_is_fatal_only_once_the_pool_has_changed_hands(
     control.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize("writer", ["hand_back", "release"])
+@pytest.mark.parametrize(
+    ("writer", "err"),
+    [
+        ("hand_back", errno.ENOSPC),
+        ("release", errno.ENOSPC),
+        ("hand_back", errno.EIO),
+    ],
+    ids=["hand_back-enospc", "release-enospc", "hand_back-eio"],
+)
 def test_a_recovery_write_without_space_leaves_a_cold_pool_not_a_dead_guard(
-    writer: str,
+    writer: str, err: int
 ) -> None:
-    """ENOSPC at the pool tail is the ring-full precedent, not a dead service."""
+    """ENOSPC is the ring-full precedent, cold not fatal; other errnos fail loudly."""
     guard = _configurable_guard()
     guard._mirror = _RecoveryMirror()
-    guard._write_handback = Mock(
-        side_effect=OSError(errno.ENOSPC, "No space left on device")
-    )
+    error = OSError(err, os.strerror(err))
+    guard._write_handback = Mock(side_effect=error)
 
     if writer == "hand_back":
         guard._core = Mock(_block_record_map={BlockKey(b"warm"): object()})
         guard._serving = True
+
+        if err not in (errno.ENOSPC, errno.EDQUOT):
+            # EIO is a broken pool, not a full one: the hand-back fails loudly
+            # with the original error, before any state is torn down.
+            with pytest.raises(OSError) as raised:
+                guard._hand_back(16)
+            assert raised.value is error
+            return
 
         guard._hand_back(16)
 
@@ -614,21 +629,6 @@ def test_a_recovery_write_without_space_leaves_a_cold_pool_not_a_dead_guard(
     # Recovery is gone either way: the next claimant is told nothing rather
     # than half of something.
     assert guard._mirror is None
-
-
-def test_a_handback_with_an_unexpected_storage_error_fails() -> None:
-    """EIO is a broken pool, not a full one, so the hand-back fails loudly."""
-    guard = _configurable_guard()
-    guard._mirror = _RecoveryMirror()
-    guard._core = Mock(_block_record_map={BlockKey(b"warm"): object()})
-    guard._serving = True
-    error = OSError(errno.EIO, "I/O error")
-    guard._write_handback = Mock(side_effect=error)
-
-    with pytest.raises(OSError) as raised:
-        guard._hand_back(16)
-
-    assert raised.value is error
 
 
 def test_a_clean_release_hands_its_cache_on_instead_of_keeping_it() -> None:

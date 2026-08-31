@@ -8,7 +8,6 @@ import queue
 import select
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -22,6 +21,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _use_nixl_agent,
     _wait_until,
     free_port,
 )
@@ -30,156 +30,21 @@ from kvcr import KVCR, KVCRBindings
 from kvcr import progress as kvcr_progress
 from kvcr.config import (
     FrameworkDramInput,
+    G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
+    KVCRGuardConfig,
     RemoteFWDramOptions,
 )
 from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.guard import _Guard
 from kvcr.kvcr_service import _KVCRService
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, CacheTier, QueryStatus
 
 _TIMEOUT_SECONDS = 5
 # A real NIXL agent and its UCX backend dominate a child's startup.
 _REAL_NIXL_TIMEOUT_SECONDS = 60
 _DIGEST = "01" * 32
-
-
-def _claiming_child(
-    socket_path: Path,
-    g3_path: Path,
-    slot_bytes: int,
-    control_port: int,
-    agent_name: str,
-) -> str:
-    """The source every child shares: claim a service pool and serve from it."""
-    test_utils = str(Path(__file__).parent)
-    return textwrap.dedent(
-        f"""
-        import ctypes
-        import sys
-        import time
-        from pathlib import Path
-
-        sys.path.insert(0, {test_utils!r})
-        from test_guard_integration import _FileBackedNixlAgent
-        from _kvcr_test_utils import (
-            FakePrimaryPinning,
-            _mem_descriptor,
-            _poll_until,
-            _use_nixl_agent,
-        )
-        from kvcr import KVCR, KVCRBindings
-        from kvcr.config import (
-            G3Options,
-            KVCRBackendConfigs,
-            KVCRConfig,
-            KVCRGuardConfig,
-            RemoteFWDramOptions,
-        )
-        from kvcr.control_channels import ZmqPeerControlChannel
-        from kvcr.types import BlockKey, CacheTier, QueryStatus
-
-        first_key = BlockKey(b"resident-a")
-        second_key = BlockKey(b"resident-b")
-        agent = _FileBackedNixlAgent()
-        agent.state = "DONE"
-        pinning = FakePrimaryPinning()
-        with _use_nixl_agent(agent):
-            kvcr = KVCR(
-                KVCRConfig(
-                    nixl_agent_name={agent_name!r},
-                    nixl_listen_port=0,
-                    inventory_report_interval_ms=0,
-                ),
-                KVCRBindings(
-                    pinning.request_pin,
-                    pinning.poll_pin_results,
-                    pinning.release_pin,
-                    framework_control=ZmqPeerControlChannel(
-                        "127.0.0.1", {control_port}, "127.0.0.1"
-                    ),
-                ),
-                KVCRBackendConfigs(
-                    g3=G3Options(
-                        paths=(Path({str(g3_path)!r}),),
-                        capacity_bytes_per_file={slot_bytes},
-                        backend="MOCK",
-                    ),
-                    remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
-                ),
-                KVCRGuardConfig(
-                    kvcr_service_socket_path={str(socket_path)!r},
-                    pool_index=0,
-                    row_stride={slot_bytes},
-                    compatibility_digest={_DIGEST!r},
-                ),
-            )
-        """
-    )
-
-
-def _deposit_source(first_payload: bytes, second_payload: bytes) -> str:
-    """Fill the pool, leaving one block in G2 and one spilled to G3."""
-    return textwrap.dedent(
-        f"""
-        for key, payload in (
-            (first_key, {first_payload!r}),
-            (second_key, {second_payload!r}),
-        ):
-            source = ctypes.create_string_buffer({len(first_payload)})
-            source.raw = payload
-            operation = kvcr.deposit(
-                {{key: _mem_descriptor(ctypes.addressof(source), len(payload))}}
-            )
-            assert dict(_poll_until(kvcr, bool))[operation][key].success
-        assert kvcr.query((first_key,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
-        """
-    )
-
-
-def _primary_program(
-    socket_path: Path,
-    g3_path: Path,
-    first_payload: bytes,
-    second_payload: bytes,
-    control_port: int,
-) -> str:
-    """A primary that fills the pool and then stalls a write mid-flight."""
-    return (
-        _claiming_child(
-            socket_path, g3_path, len(first_payload), control_port, "primary"
-        )
-        + textwrap.dedent(
-            r"""
-        print("claimed", flush=True)
-        assert sys.stdin.readline() == "deposit\n"
-        """
-        )
-        + _deposit_source(first_payload, second_payload)
-        + textwrap.dedent(
-            """
-        agent.block_remote_writes = True
-        agent.state = "PROC"
-        print("stable", flush=True)
-        while not agent.blocked_remote_writes:
-            kvcr.poll_completed()
-            time.sleep(0.001)
-        print("in-flight", flush=True)
-        time.sleep(60)
-        """
-        )
-    )
-
-
-def _expect_child_line(child: subprocess.Popen[str], expected: str) -> None:
-    assert child.stdout is not None
-    if not select.select([child.stdout], [], [], _TIMEOUT_SECONDS)[0]:
-        child.kill()
-        child.wait(timeout=_TIMEOUT_SECONDS)
-        assert child.stderr is not None
-        pytest.fail(f"child did not report {expected!r}: {child.stderr.read()}")
-    assert child.stdout.readline() == f"{expected}\n"
 
 
 class _FileBackedNixlAgent(FakeNixlAgent):
@@ -255,10 +120,110 @@ class _FileBackedNixlAgent(FakeNixlAgent):
         return "DONE"
 
 
+def _claim_kvcr(
+    agent: FakeNixlAgent,
+    socket_path: str,
+    g3_path: str,
+    slot_bytes: int,
+    control_port: int,
+    agent_name: str,
+) -> KVCR:
+    """The prologue every fake-agent role shares: claim a service pool."""
+    pinning = FakePrimaryPinning()
+    with _use_nixl_agent(agent):
+        return KVCR(
+            KVCRConfig(
+                nixl_agent_name=agent_name,
+                nixl_listen_port=0,
+                inventory_report_interval_ms=0,
+            ),
+            KVCRBindings(
+                pinning.request_pin,
+                pinning.poll_pin_results,
+                pinning.release_pin,
+                framework_control=ZmqPeerControlChannel(
+                    "127.0.0.1", control_port, "127.0.0.1"
+                ),
+            ),
+            KVCRBackendConfigs(
+                g3=G3Options(
+                    paths=(Path(g3_path),),
+                    capacity_bytes_per_file=slot_bytes,
+                    backend="MOCK",
+                ),
+                remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+            ),
+            KVCRGuardConfig(
+                kvcr_service_socket_path=socket_path,
+                pool_index=0,
+                row_stride=slot_bytes,
+                compatibility_digest=_DIGEST,
+            ),
+        )
+
+
+def _deposit_two_blocks(kvcr: KVCR, source: int, block_bytes: int) -> None:
+    """Fill the pool, leaving resident-b in G2 and resident-a spilled to G3."""
+    for key, payload in (
+        (BlockKey(b"resident-a"), b"A" * block_bytes),
+        (BlockKey(b"resident-b"), b"B" * block_bytes),
+    ):
+        ctypes.memmove(source, payload, block_bytes)
+        operation = kvcr.deposit({key: _mem_descriptor(source, block_bytes)})
+        assert dict(_poll_until(kvcr, bool))[operation][key].success, key
+    assert kvcr.query((BlockKey(b"resident-a"),)) == [
+        (QueryStatus.FETCHABLE, CacheTier.G3)
+    ]
+
+
+def _stalling_primary_child(socket_path: str, g3_path: str, control_port: str) -> None:
+    """Fill the pool, then hold a peer write stalled mid-flight until killed."""
+    slot_bytes = os.sysconf("SC_PAGE_SIZE")
+    agent = _FileBackedNixlAgent()
+    agent.state = "DONE"
+    kvcr = _claim_kvcr(
+        agent, socket_path, g3_path, slot_bytes, int(control_port), "primary"
+    )
+    source = ctypes.create_string_buffer(slot_bytes)
+    _deposit_two_blocks(kvcr, ctypes.addressof(source), slot_bytes)
+    agent.block_remote_writes = True
+    agent.state = "PROC"
+    print("stable", flush=True)
+    while not agent.blocked_remote_writes:
+        kvcr.poll_completed()
+        time.sleep(0.001)
+    print("in-flight", flush=True)
+    time.sleep(60)
+
+
+def _handback_primary_child(socket_path: str, g3_path: str, control_port: str) -> None:
+    """Fill the pool, then hold the claim until killed."""
+    slot_bytes = os.sysconf("SC_PAGE_SIZE")
+    agent = _FileBackedNixlAgent()
+    agent.state = "DONE"
+    kvcr = _claim_kvcr(
+        agent, socket_path, g3_path, slot_bytes, int(control_port), "primary"
+    )
+    source = ctypes.create_string_buffer(slot_bytes)
+    _deposit_two_blocks(kvcr, ctypes.addressof(source), slot_bytes)
+    print("ready", flush=True)
+    time.sleep(60)
+
+
+def _expect_child_line(child: subprocess.Popen[str], expected: str) -> None:
+    assert child.stdout is not None
+    if not select.select([child.stdout], [], [], _TIMEOUT_SECONDS)[0]:
+        child.kill()
+        child.wait(timeout=_TIMEOUT_SECONDS)
+        assert child.stderr is not None
+        pytest.fail(f"child did not report {expected!r}: {child.stderr.read()}")
+    assert child.stdout.readline() == f"{expected}\n"
+
+
 @pytest.fixture
 def live_service(
     tmp_path: Path,
-) -> Iterator[tuple[_KVCRService, Callable[[str], subprocess.Popen[str]]]]:
+) -> Iterator[tuple[_KVCRService, Callable[..., subprocess.Popen[str]]]]:
     """A one-pool service on its own thread; children it spawns die with it."""
     pool_dir = tmp_path / "pools"
     pool_dir.mkdir()
@@ -274,9 +239,21 @@ def live_service(
     server_thread.start()
     children: list[subprocess.Popen[str]] = []
 
-    def spawn(program: str) -> subprocess.Popen[str]:
+    def spawn(child_function: str, *args: object) -> subprocess.Popen[str]:
+        bootstrap = (
+            "import sys; "
+            "sys.path.insert(0, sys.argv[1]); "
+            f"from test_guard_integration import {child_function}; "
+            f"{child_function}(*sys.argv[2:])"
+        )
         child = subprocess.Popen(
-            [sys.executable, "-c", program],
+            [
+                sys.executable,
+                "-c",
+                bootstrap,
+                str(Path(__file__).parent),
+                *(str(arg) for arg in args),
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -304,11 +281,10 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     recovery: str,
-    live_service: tuple[_KVCRService, Callable[[str], subprocess.Popen[str]]],
+    live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
 ) -> None:
     """A retry after promotion is served warm or refused cold, never left hanging."""
     page_size = os.sysconf("SC_PAGE_SIZE")
-    first_payload = b"A" * page_size
     second_payload = b"B" * page_size
     g3_path = tmp_path / "g3.data"
     primary_port = free_port()
@@ -337,19 +313,11 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
     service, spawn = live_service
     target = None
     try:
+        # The stalled write must die with its process: only a SIGKILL mid-flight
+        # leaves the journal the way a crashed primary would.
         child = spawn(
-            _primary_program(
-                service.socket_path,
-                g3_path,
-                first_payload,
-                second_payload,
-                primary_port,
-            )
+            "_stalling_primary_child", service.socket_path, g3_path, primary_port
         )
-        _expect_child_line(child, "claimed")
-        assert child.stdin is not None
-        child.stdin.write("deposit\n")
-        child.stdin.flush()
         _expect_child_line(child, "stable")
 
         target_control = ZmqPeerControlChannel(
@@ -455,60 +423,13 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
             target.close()
 
 
-def _handback_program(
-    socket_path: Path,
-    g3_path: Path,
-    first_payload: bytes,
-    second_payload: bytes,
-    control_port: int,
-    agent_name: str,
-    deposit: bool,
-) -> str:
-    """A primary that fills the pool, or one that takes it back from a Guard."""
-    child = _claiming_child(
-        socket_path, g3_path, len(first_payload), control_port, agent_name
-    )
-    if deposit:
-        return (
-            child
-            + _deposit_source(first_payload, second_payload)
-            + textwrap.dedent(
-                """
-        print("ready", flush=True)
-        time.sleep(60)
-        """
-            )
-        )
-    return child + textwrap.dedent(
-        f"""
-        for key, payload in (
-            (first_key, {first_payload!r}),
-            (second_key, {second_payload!r}),
-        ):
-            destination = ctypes.create_string_buffer(len(payload))
-            operation = kvcr.deliver(
-                {{key: _mem_descriptor(
-                    ctypes.addressof(destination), len(payload)
-                )}}
-            )
-            result = dict(_poll_until(kvcr, bool))[operation][key]
-            assert result.success, key
-            assert destination.raw == payload, key
-        print("adopted", flush=True)
-        time.sleep(60)
-        """
-    )
-
-
 def test_replacement_primary_takes_the_cache_back_from_a_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    live_service: tuple[_KVCRService, Callable[[str], subprocess.Popen[str]]],
+    live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
 ) -> None:
     """A Guard serves the dead primary's G2 block until a replacement adopts it."""
     page_size = os.sysconf("SC_PAGE_SIZE")
-    first_payload = b"A" * page_size
-    second_payload = b"B" * page_size
     g3_path = tmp_path / "g3.data"
     control_port = free_port()
     guard_agent = _FileBackedNixlAgent()
@@ -517,20 +438,9 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
     service, spawn = live_service
 
-    def start(agent_name: str, deposit: bool) -> subprocess.Popen[str]:
-        return spawn(
-            _handback_program(
-                service.socket_path,
-                g3_path,
-                first_payload,
-                second_payload,
-                control_port,
-                agent_name,
-                deposit,
-            )
-        )
-
-    primary = start("primary", deposit=True)
+    primary = spawn(
+        "_handback_primary_child", service.socket_path, g3_path, control_port
+    )
     _expect_child_line(primary, "ready")
     first_guard = service._registry._pools[0].guard
 
@@ -540,8 +450,32 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # The G2 half is what a Guard serves; resident-a is spilled to G3.
     assert set(first_guard._core._block_record_map) == {BlockKey(b"resident-b")}
 
-    replacement = start("replacement", deposit=False)
-    _expect_child_line(replacement, "adopted")
+    # Inline, not a child: adoption only claims and reads, and the service's
+    # pidfd on our own live pid never fires.
+    replacement_agent = _FileBackedNixlAgent()
+    replacement_agent.state = "DONE"
+    replacement = _claim_kvcr(
+        replacement_agent,
+        str(service.socket_path),
+        str(g3_path),
+        page_size,
+        control_port,
+        "replacement",
+    )
+    try:
+        for key, payload in (
+            (BlockKey(b"resident-a"), b"A" * page_size),
+            (BlockKey(b"resident-b"), b"B" * page_size),
+        ):
+            destination = ctypes.create_string_buffer(len(payload))
+            operation = replacement.deliver(
+                {key: _mem_descriptor(ctypes.addressof(destination), len(payload))}
+            )
+            result = dict(_poll_until(replacement, bool))[operation][key]
+            assert result.success, key
+            assert destination.raw == payload, key
+    finally:
+        replacement.close()
 
 
 def _await_marker(
@@ -596,142 +530,82 @@ def _real_nixl_available() -> bool:
     return True
 
 
-def _real_nixl_program(
-    socket_path: Path,
-    g3_path: Path,
-    slot_bytes: int,
-    g3_bytes: int,
+def _real_nixl_kvcr(
+    socket_path: str,
+    g3_path: str,
     control_port: int,
     agent_name: str,
-    first_payload: bytes,
-    second_payload: bytes,
-    deposit: bool,
-) -> str:
-    """A primary that talks to a real NIXL agent over a real G3 file."""
-    test_utils = str(Path(__file__).parent)
-    body = (
-        """
-        for key, payload in ((first_key, FIRST), (second_key, SECOND)):
-            ctypes.memmove(source, payload, len(payload))
-            operation = kvcr.deposit({key: _mem_descriptor(source, len(payload))})
-            assert dict(_poll_until(kvcr, bool))[operation][key].success, key
-        assert kvcr.query((first_key,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
-        print("ready", flush=True)
-        """
-        if deposit
-        else """
-        for key, payload in ((first_key, FIRST), (second_key, SECOND)):
-            ctypes.memset(destination, 0, len(payload))
-            operation = kvcr.deliver({key: _mem_descriptor(destination, len(payload))})
-            result = dict(_poll_until(kvcr, bool))[operation][key]
-            assert result.success, key
-            assert ctypes.string_at(destination, len(payload)) == payload, key
-        print("adopted", flush=True)
-        """
+    framework: ctypes.Array,
+) -> KVCR:
+    """A claiming KVCR over a real NIXL agent and a real POSIX-backed G3 file."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    pinning = FakePrimaryPinning()
+    return KVCR(
+        KVCRConfig(
+            nixl_agent_name=agent_name,
+            nixl_listen_port=0,
+            inventory_report_interval_ms=0,
+        ),
+        KVCRBindings(
+            pinning.request_pin,
+            pinning.poll_pin_results,
+            pinning.release_pin,
+            framework_control=ZmqPeerControlChannel(
+                "127.0.0.1", control_port, "127.0.0.1"
+            ),
+        ),
+        KVCRBackendConfigs(
+            framework_dram=FrameworkDramInput(
+                ctypes.addressof(framework), len(framework)
+            ),
+            g3=G3Options(
+                paths=(Path(g3_path),),
+                capacity_bytes_per_file=page_size * 2,
+                backend="POSIX",
+            ),
+            remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+        ),
+        KVCRGuardConfig(
+            kvcr_service_socket_path=socket_path,
+            pool_index=0,
+            row_stride=page_size,
+            compatibility_digest=_DIGEST,
+        ),
     )
-    return textwrap.dedent(
-        f"""
-        import ctypes
-        import sys
-        import time
-        from pathlib import Path
 
-        sys.path.insert(0, {test_utils!r})
-        from _kvcr_test_utils import FakePrimaryPinning, _mem_descriptor, _poll_until
-        from kvcr import KVCR, KVCRBindings
-        from kvcr.config import (
-            FrameworkDramInput,
-            G3Options,
-            KVCRBackendConfigs,
-            KVCRConfig,
-            KVCRGuardConfig,
-            RemoteFWDramOptions,
-        )
-        from kvcr.control_channels import ZmqPeerControlChannel
-        from kvcr.types import BlockKey, CacheTier, QueryStatus
 
-        FIRST = {first_payload!r}
-        SECOND = {second_payload!r}
-        first_key = BlockKey(b"resident-a")
-        second_key = BlockKey(b"resident-b")
-
-        # Registered with NIXL, and every descriptor this child hands KVCR
-        # points inside it: a real agent refuses a transfer that names memory
-        # it was never told about.
-        framework = ctypes.create_string_buffer({slot_bytes} * 2)
-        source = ctypes.addressof(framework)
-        destination = ctypes.addressof(framework) + {slot_bytes}
-
-        pinning = FakePrimaryPinning()
-        kvcr = KVCR(
-            KVCRConfig(
-                nixl_agent_name={agent_name!r},
-                nixl_listen_port=0,
-                inventory_report_interval_ms=0,
-            ),
-            KVCRBindings(
-                pinning.request_pin,
-                pinning.poll_pin_results,
-                pinning.release_pin,
-                framework_control=ZmqPeerControlChannel(
-                    "127.0.0.1", {control_port}, "127.0.0.1"
-                ),
-            ),
-            KVCRBackendConfigs(
-                framework_dram=FrameworkDramInput(
-                    ctypes.addressof(framework), len(framework)
-                ),
-                g3=G3Options(
-                    paths=(Path({str(g3_path)!r}),),
-                    capacity_bytes_per_file={g3_bytes},
-                    backend="POSIX",
-                ),
-                remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
-            ),
-            KVCRGuardConfig(
-                kvcr_service_socket_path={str(socket_path)!r},
-                pool_index=0,
-                row_stride={slot_bytes},
-                compatibility_digest={_DIGEST!r},
-            ),
-        )
-        {textwrap.indent(textwrap.dedent(body), " " * 8).strip()}
-        time.sleep(60)
-        """
+def _real_nixl_primary_child(socket_path: str, g3_path: str, control_port: str) -> None:
+    """Fill the pool through a real agent, then hold the claim until killed."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    # Registered with NIXL, and every descriptor this child hands KVCR points
+    # inside it: a real agent refuses a transfer that names memory it was
+    # never told about.
+    framework = ctypes.create_string_buffer(page_size * 2)
+    kvcr = _real_nixl_kvcr(
+        socket_path, g3_path, int(control_port), "real-primary", framework
     )
+    _deposit_two_blocks(kvcr, ctypes.addressof(framework), page_size)
+    print("ready", flush=True)
+    time.sleep(60)
 
 
 def test_a_promoted_guard_serves_real_nixl_transfers(
     tmp_path: Path,
-    live_service: tuple[_KVCRService, Callable[[str], subprocess.Popen[str]]],
+    live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
 ) -> None:
     """With nothing faked, a promoted Guard serves a real UCX read then stands down."""
     # Not a decorator: children import this module, and NIXL logs to their stdout.
     if not _real_nixl_available():
         pytest.skip("no runnable NIXL agent on this machine")
     page_size = os.sysconf("SC_PAGE_SIZE")
-    first_payload = b"A" * page_size
     second_payload = b"B" * page_size
     g3_path = tmp_path / "g3.data"
     control_port = free_port()
     service, spawn = live_service
 
-    def start(agent_name: str, deposit: bool) -> subprocess.Popen[str]:
-        return spawn(
-            _real_nixl_program(
-                service.socket_path,
-                g3_path,
-                page_size,
-                page_size * 2,
-                control_port,
-                agent_name,
-                first_payload,
-                second_payload,
-                deposit,
-            )
-        )
-
-    primary = start("real-primary", deposit=True)
+    primary = spawn(
+        "_real_nixl_primary_child", service.socket_path, g3_path, control_port
+    )
     _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
     guard = service._registry._pools[0].guard
 
@@ -791,6 +665,31 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         target.close()
 
     # Only then does a replacement take the pool back and stand the Guard down.
-    replacement = start("real-replacement", deposit=False)
-    _await_marker(replacement, "adopted", _REAL_NIXL_TIMEOUT_SECONDS)
-    assert guard._serving is False
+    # Inline, not a child: adoption only claims and reads, and this process
+    # already runs real agents beside the Guard's own.
+    framework = ctypes.create_string_buffer(page_size * 2)
+    replacement = _real_nixl_kvcr(
+        str(service.socket_path),
+        str(g3_path),
+        control_port,
+        "real-replacement",
+        framework,
+    )
+    try:
+        destination = ctypes.addressof(framework) + page_size
+        for key, payload in (
+            (BlockKey(b"resident-a"), b"A" * page_size),
+            (BlockKey(b"resident-b"), second_payload),
+        ):
+            ctypes.memset(destination, 0, len(payload))
+            operation = replacement.deliver(
+                {key: _mem_descriptor(destination, len(payload))}
+            )
+            result = dict(
+                _poll_until(replacement, bool, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
+            )[operation][key]
+            assert result.success, key
+            assert ctypes.string_at(destination, len(payload)) == payload, key
+        assert guard._serving is False
+    finally:
+        replacement.close()

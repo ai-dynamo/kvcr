@@ -10,7 +10,6 @@ from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.recovery_journal import (
     _RECORD_BLOCK,
-    _RECOVERY_DECODER,
     _RECOVERY_ENCODER,
     RecoveryMirrorError,
     _decode_recovery_record,
@@ -130,6 +129,8 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     """Adoption keeps the served table in place, pruned to what frames would carry."""
     ready, spilled = BlockKey(b"ready"), BlockKey(b"spilled")
     filling, forgotten = BlockKey(b"filling"), BlockKey(b"forgotten")
+    filling_spill = BlockKey(b"filling-spill")
+    discarding_spill = BlockKey(b"discarding-spill")
     served = {
         ready: _BlockRecord(
             local_dram=_LocalDramResidency(
@@ -144,13 +145,22 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
             local_dram=_LocalDramResidency(1, _LocalDramState.FILLING)
         ),
         forgotten: _BlockRecord(),
+        # A good G3 residency must not carry a half-written G2 slot with it.
+        filling_spill: _BlockRecord(
+            local_dram=_LocalDramResidency(7, _LocalDramState.FILLING),
+            g3=_G3Residency(4),
+        ),
+        discarding_spill: _BlockRecord(
+            local_dram=_LocalDramResidency(8, _LocalDramState.DISCARDING),
+            g3=_G3Residency(5),
+        ),
     }
     # A kept mirror must match exactly what the handback frames carry.
     framed = {
         BlockKey(key): _decode_recovery_record(payload)
         for _, key, payload in _recovery_frames(served)
     }
-    assert set(framed) == {ready, spilled}
+    assert set(framed) == {ready, spilled, filling_spill, discarding_spill}
 
     mirror = _RecoveryMirror()
     mirror.adopt(served)
@@ -160,25 +170,6 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records == {
         ready: _recovered_record(g2=0),
         spilled: _recovered_record(g3=3),
+        filling_spill: _recovered_record(g3=4),
+        discarding_spill: _recovered_record(g3=5),
     }
-
-
-@pytest.mark.parametrize("state", [_LocalDramState.FILLING, _LocalDramState.DISCARDING])
-def test_mirror_adoption_drops_a_g2_slot_that_never_settled(state) -> None:
-    """A good G3 residency must not carry a half-written G2 slot with it."""
-    spilled = BlockKey(b"spilled")
-    served = {
-        spilled: _BlockRecord(
-            local_dram=_LocalDramResidency(7, state), g3=_G3Residency(3)
-        )
-    }
-    framed = _RECOVERY_DECODER.decode(
-        next(payload for _, _, payload in _recovery_frames(dict(served)))
-    )
-
-    mirror = _RecoveryMirror()
-    mirror.adopt(served)
-
-    # What is kept and what the region would carry have to agree exactly.
-    assert framed.g2 is None
-    assert mirror._records == {spilled: _recovered_record(g3=3)}
