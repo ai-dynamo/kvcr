@@ -72,16 +72,10 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
 ) -> None:
     """A pool is 0600, fully backed, attachable, and unlinked only by its owner."""
 
-    def populate_then_dirty_header(
-        file_descriptor: int, offset: int, length: int
-    ) -> None:
-        _populate_pages(file_descriptor, offset, length)
-        os.pwrite(file_descriptor, b"\xff" * _JOURNAL_HEADER_BYTES, 0)
-
     with patch("kvcr.memory.uuid.uuid4") as uuid4:
         uuid4.return_value.hex = _TEST_GENERATION
         with patch(
-            "kvcr.memory._populate_pages", side_effect=populate_then_dirty_header
+            "kvcr.memory._populate_pages", wraps=_populate_pages
         ) as populate:
             owner = _KVCRPoolOwner.allocate(
                 pool_id="engine_dp0",
@@ -106,8 +100,8 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
             assert file_stat.st_size == spec.mapping_bytes
             populate.assert_called_once()
             assert populate.call_args.args[1:] == (0, spec.mapping_bytes)
-            # Zeroed after page population dirtied it: the journal header is
-            # written last, so a crash mid-creation cannot leave a stale one.
+            # A fresh pool's journal header reads empty: exclusive creation,
+            # truncation and population all leave only zeros behind.
             with path.open("rb") as pool_file:
                 assert pool_file.read(_JOURNAL_HEADER_BYTES) == bytes(
                     _JOURNAL_HEADER_BYTES

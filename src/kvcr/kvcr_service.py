@@ -155,6 +155,8 @@ class _PoolRegistry:
     def _release_pools_locked(self) -> None:
         """Give back every pool built so far, for a startup that cannot finish."""
         for entry in self._pools.values():
+            # Even an interrupt must not stop the sweep: the startup failure is
+            # already propagating, and every pool left behind is committed RAM.
             with contextlib.suppress(BaseException):
                 entry.guard.close()
             try:
@@ -444,7 +446,7 @@ class _PoolRegistry:
     ) -> None:
         """A Guard has stopped being one, which the service cannot survive.
 
-        ponytail: no per-pool containment. Its pool can no longer be recovered and may
+        TODO: no per-pool containment. Its pool can no longer be recovered and may
         still hold an endpoint the service cannot reach. One pool takes the others'
         workers with it; add isolation back if that stops being acceptable.
         """
@@ -498,7 +500,10 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         assert liveness is not None
         try:
             self._deliver_grant(pool_index, response)
+        # The lease is already granted: whatever escapes delivery, revoke it
+        # or the pool stays held by a claimant that never heard it won.
         except BaseException:
+            logger.exception("KVCR grant delivery failed; revoking the lease")
             self._release_or_fail(pool_index, liveness)
             return
         self._hold(pool_index, liveness)

@@ -8,6 +8,7 @@ import logging
 import os
 import socket
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
@@ -153,6 +154,14 @@ class KVCRPoolHold:
     _control_listener_fd: int | None = None
     _release_attempted: bool = field(default=False, init=False, repr=False)
 
+    def hand_listener_to(self, adopt: Callable[[int], None]) -> None:
+        """Adopt-then-disown: a failed adoption leaves this hold owning the fd,
+        which is what closes it on release."""
+        if self._control_listener_fd is None:
+            return
+        adopt(self._control_listener_fd)
+        self._control_listener_fd = None
+
     def release(self) -> None:
         """Stop local access before releasing the connection-scoped lease."""
         if self._release_attempted:
@@ -261,8 +270,12 @@ def _abandon_claim(
         try:
             attachment.close()
         except BaseException:
+            # BaseException: even an interrupt mid-close must gate the release;
+            # the claim error re-raises above.
             local_access_stopped = False
     if release_needed and local_access_stopped:
+        # Best-effort during unwind: nothing raised here may mask the claim
+        # error re-raised by the caller.
         with contextlib.suppress(BaseException):
             _send_release(connection)
     _close_quietly(connection)
@@ -331,5 +344,7 @@ def _send_release(connection: FramedConnection) -> None:
 
 
 def _close_quietly(connection: FramedConnection) -> None:
+    # Only called while an original error is unwinding; a close failure
+    # (even an interrupt) must not mask it.
     with contextlib.suppress(BaseException):
         connection.close()

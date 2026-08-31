@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Private journal-backed Guard for one service-owned pool."""
+"""Private journal-backed Guard for one service-owned pool.
+
+Asserts in this module are Optional-narrowing only: each names a field the
+phase machine established before that line can run. Under ``python -O`` a
+violated one would surface as an AttributeError on None -- a worse message,
+never a different outcome.
+"""
 
 import errno
 import logging
@@ -591,6 +597,8 @@ class _Guard:
         try:
             if self._core is not None:
                 self._core.close()
+        # BaseException: even an interrupt must not skip giving the pool back
+        # once the core is quiescent.
         except BaseException:
             assert self._core is not None
             if not self._core.is_quiescent():

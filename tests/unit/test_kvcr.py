@@ -6,6 +6,7 @@ import ctypes
 import logging
 import threading
 from contextlib import nullcontext, suppress
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -36,11 +37,19 @@ from kvcr.config import (
     LocalDramInfo,
 )
 from kvcr.core import _BlockRecord
+from kvcr.guard_protocol import KVCRPoolHold
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.memory import KVCRPoolSpec
 from kvcr.remote_fw_dram import _FwMemResidency
 from kvcr.types import BlockKey
+
+
+def _fake_hold(**fields: Any) -> SimpleNamespace:
+    """A hold double that hands its listener over exactly like the real one."""
+    hold = SimpleNamespace(**fields)
+    hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
+    return hold
 
 
 def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
@@ -149,7 +158,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
 ) -> None:
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
-    hold = SimpleNamespace(
+    hold = _fake_hold(
         local_dram=LocalDramInfo(1234, 8192, 8),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
@@ -228,7 +237,7 @@ def test_startup_timeout_retains_nonquiescent_resources(
     guarded_control.control_bind_address.return_value = ("127.0.0.1", 5555)
     entered = threading.Event()
     unblock = threading.Event()
-    hold = SimpleNamespace(
+    hold = _fake_hold(
         local_dram=LocalDramInfo(1234, 8192, 8),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
@@ -297,7 +306,7 @@ def test_service_journal_is_attached_before_primary_start(
     """Journal, records, and listener are wired in before the core may start."""
     events: list[str] = []
     attachment = _UNSERVED_POOL
-    hold = SimpleNamespace(
+    hold = _fake_hold(
         local_dram=LocalDramInfo(1234, 8192, 8),
         _attachment=attachment,
         _control_listener_fd=7,

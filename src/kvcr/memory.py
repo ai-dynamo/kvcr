@@ -231,7 +231,6 @@ class _KVCRPoolOwner:
         Created and locked under the directory guard, which a purge takes
         exclusively, so a pool under construction cannot be reclaimed.
         """
-        _validate_positive_int("pool_size_bytes", pool_size_bytes)
         _validate_pool_layout(pool_size_bytes, journal_bytes)
         generation = uuid.uuid4().hex
         directory = Path(pool_dir).resolve()
@@ -266,9 +265,6 @@ class _KVCRPoolOwner:
             os.fchmod(file_descriptor, _POOL_MODE)
             os.ftruncate(file_descriptor, pool_size_bytes)
             _populate_pages(file_descriptor, 0, pool_size_bytes)
-            header = bytes(_JOURNAL_HEADER_BYTES)
-            if os.pwrite(file_descriptor, header, 0) != len(header):
-                raise OSError(errno.EIO, "short write initializing KVCR journal")
         except BaseException:
             os.close(file_descriptor)
             # Identity-guarded: something may have replaced the file since it

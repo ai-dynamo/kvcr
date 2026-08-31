@@ -23,7 +23,7 @@ from .guard_protocol import KVCRClient, KVCRPoolHold
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, CacheTier
+from .types import BlockKey, RecoveryMirrorError
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
@@ -337,10 +337,6 @@ class RecoveryJournal:
         return data
 
 
-class RecoveryMirrorError(RuntimeError):
-    """The recovery stream cannot describe a valid cache state."""
-
-
 class _RecoveryMirror:
     def __init__(self) -> None:
         self._records: dict[BlockKey, _BlockRecord] = {}
@@ -438,40 +434,10 @@ def install_recovery_records(
 ) -> None:
     """Seed a core that has not started with recovered residencies.
 
-    Admission runs once per block, and ranking runs after all of them.
+    The mechanics live on the core: seeding, admission and ranking touch
+    invariants only the core owns.
     """
-    if not records:
-        return
-    local_dram = core._local_dram
-    if local_dram is None:
-        raise RecoveryMirrorError("recovered records need a local DRAM tier")
-    g3 = core._g3
-    if g3 is None and any(record.g3 is not None for record in records.values()):
-        raise RecoveryMirrorError("recovered G3 residency has no configured G3")
-    if core._block_record_map:
-        raise RecoveryMirrorError("recovered records need a core that holds none")
-
-    # Transfer, not copy: rebuilding costs a second population of the set.
-    core._block_record_map = records
-
-    local_dram.adopt_recovery_slots(records)
-    if g3 is not None:
-        g3.adopt_recovery_slots(records)
-
-    # One admission per block: _on_ingest fires only for a single-tier block, so
-    # routing through it would skip everything recovered into both.
-    for key, record in records.items():
-        if record.local_dram is not None or g3 is None:
-            source, slot_size = CacheTier.LOCAL_G2, local_dram._slot_size
-        else:
-            source, slot_size = CacheTier.G3, g3._slot_size
-        core._policy.on_ingest(core._block_meta(key, record, slot_size), source)
-
-    # After every admission: a block resident in both tiers must not be ranked in
-    # one of them while the policy still has half of its record.
-    local_dram.rank_recovered(records)
-    if g3 is not None:
-        g3.rank_recovered(records)
+    core.adopt_recovery_records(records)
 
 
 @dataclass
@@ -524,6 +490,7 @@ def claim_guarded_pool(
             guard_config.row_stride,
         )
     except BaseException:
+        # A failing release must not mask the error that made the claim unusable.
         with suppress(BaseException):
             hold.release()
         raise
@@ -561,10 +528,7 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
     _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
     install_recovery_records(core, claimed.recovered.take_records())
-    listener_fd = hold._control_listener_fd
-    if listener_fd is not None:
-        claimed.adopt_listener(listener_fd)
-        hold._control_listener_fd = None
+    hold.hand_listener_to(claimed.adopt_listener)
 
 
 def commit_claimed_pool(claimed: ClaimedPool | None) -> None:

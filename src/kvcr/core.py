@@ -33,6 +33,7 @@ from .types import (
     PinHandle,
     PlacementDecision,
     QueryStatus,
+    RecoveryMirrorError,
     ReleaseHandle,
     ReleaseResult,
 )
@@ -252,6 +253,44 @@ class _KVCRCore:
     def is_quiescent(self) -> bool:
         """Report whether native progress can still access backend resources."""
         return self._progress.is_quiescent()
+
+    def adopt_recovery_records(self, records: dict[BlockKey, _BlockRecord]) -> None:
+        """Seed a core that has not started with recovered residencies.
+
+        Admission runs once per block, and ranking runs after all of them.
+        """
+        if not records:
+            return
+        local_dram = self._local_dram
+        if local_dram is None:
+            raise RecoveryMirrorError("recovered records need a local DRAM tier")
+        g3 = self._g3
+        if g3 is None and any(record.g3 is not None for record in records.values()):
+            raise RecoveryMirrorError("recovered G3 residency has no configured G3")
+        if self._block_record_map:
+            raise RecoveryMirrorError("recovered records need a core that holds none")
+
+        # Transfer, not copy: rebuilding costs a second population of the set.
+        self._block_record_map = records
+
+        local_dram.adopt_recovery_slots(records)
+        if g3 is not None:
+            g3.adopt_recovery_slots(records)
+
+        # One admission per block: _on_ingest fires only for a single-tier block,
+        # so routing through it would skip everything recovered into both.
+        for key, record in records.items():
+            if record.local_dram is not None or g3 is None:
+                source, slot_size = CacheTier.LOCAL_G2, local_dram._slot_size
+            else:
+                source, slot_size = CacheTier.G3, g3._slot_size
+            self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
+
+        # After every admission: a block resident in both tiers must not be
+        # ranked in one of them while the policy still has half of its record.
+        local_dram.rank_recovered(records)
+        if g3 is not None:
+            g3.rank_recovered(records)
 
     # Public API.
 

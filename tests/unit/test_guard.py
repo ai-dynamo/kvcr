@@ -10,13 +10,14 @@ import socket
 import time
 import uuid
 from contextlib import nullcontext
+from functools import partial
 from unittest.mock import Mock
 
 import pytest
 
 from kvcr.config import LocalDramInfo
 from kvcr.control_channels import ZmqPeerControlChannel
-from kvcr.core import _BlockRecord
+from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.guard import (
     _Command,
     _ConfiguredTier,
@@ -262,6 +263,10 @@ def test_guard_prepares_promotes_and_closes_in_ownership_order(
         return adopted
 
     local_dram.adopt_recovery_slots.side_effect = adopt("g2")
+    # The double routes adoption through the real mechanics it stands in for.
+    core.adopt_recovery_records.side_effect = partial(
+        _KVCRCore.adopt_recovery_records, core
+    )
     core._policy.on_ingest.side_effect = lambda *_: order.append("ingest")
     core.start.side_effect = lambda: order.append("start")
     monkeypatch.setattr(
