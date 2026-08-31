@@ -7,6 +7,7 @@ import errno
 import logging
 import os
 import socket
+import threading
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
@@ -101,6 +102,7 @@ class PidfdLiveness:
 
     def __init__(self, pidfd: int) -> None:
         self._pidfd = pidfd
+        self._close_lock = threading.Lock()
 
     @classmethod
     def from_peer_socket(cls, connection: socket.socket) -> "PidfdLiveness":
@@ -127,7 +129,11 @@ class PidfdLiveness:
         This stops representing a live holder either way, so a failure here is worth a
         log line and nothing else.
         """
-        pidfd, self._pidfd = self._pidfd, -1
+        # Under a lock: shutdown can race a failed claim's cleanup here, and
+        # an unsynchronized swap lets both threads close -- the second close
+        # can reach a descriptor number the process has since reused.
+        with self._close_lock:
+            pidfd, self._pidfd = self._pidfd, -1
         if pidfd >= 0:
             try:
                 os.close(pidfd)

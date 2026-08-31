@@ -333,9 +333,10 @@ class _Guard:
                 self._write_handback(
                     self._mirror.take_records(), self._configured.row_stride
                 )
-            except RecoveryJournalError as error:
-                # Reached before _poll noticed the same thing. Nothing is written,
-                # so the pool comes back cold rather than partly described.
+            except (RecoveryJournalError, OSError) as error:
+                # Reached before _poll noticed the same thing -- or the tail
+                # would not fit (ENOSPC). Nothing is written, so the pool
+                # comes back cold rather than partly described.
                 self._drop_recovery(error)
         self._mirror = None
         if self._control is not None:
@@ -412,7 +413,7 @@ class _Guard:
             self._record_background_failure(error)
         return False
 
-    def _drop_recovery(self, error: RecoveryJournalError) -> None:
+    def _drop_recovery(self, error: RecoveryJournalError | OSError) -> None:
         """Lose this pool's recovery without losing the service.
 
         The primary outran this mirror, or the ring went bad under it. What is left
@@ -539,8 +540,18 @@ class _Guard:
             raise RecoveryMirrorError("a serving Guard has no state to hand back")
         core.close()
         records = _with_g3(core._block_record_map, self._g3_records)
-        self._write_handback(records, row_stride)
-        mirror.adopt(records)
+        try:
+            self._write_handback(records, row_stride)
+        except OSError as error:
+            # The ring-full precedent: a pool whose state will not fit at the
+            # tail (ENOSPC) is cold, not fatal. The region's error path
+            # truncated what it started, so the next claimant is told nothing
+            # rather than half of something -- and the mirror is dropped with
+            # it, because a claimant told the pool is empty must not race a
+            # mirror that still names slots.
+            self._drop_recovery(error)
+        else:
+            mirror.adopt(records)
         self._g3_records = {}
         self._core = None
         self._serving = False

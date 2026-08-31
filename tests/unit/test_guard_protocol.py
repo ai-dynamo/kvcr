@@ -45,8 +45,7 @@ _TIER_CONFIG = _TierConfig(_ROW_STRIDE, None)
 
 def test_a_pidfd_that_will_not_close_is_given_up_anyway() -> None:
     """The holder is gone whether or not the kernel agrees."""
-    liveness = object.__new__(PidfdLiveness)
-    liveness._pidfd = 999_999  # never a live descriptor in this process
+    liveness = PidfdLiveness(999_999)  # never a live descriptor in this process
 
     liveness.close()
 

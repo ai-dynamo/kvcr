@@ -724,6 +724,36 @@ def test_a_refused_claim_leaves_the_pool_choosable_for_the_next_one(
     guard._refuse_incompatible(_TierConfig(32, None))
 
 
+def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
+    """ENOSPC at the pool tail is the ring-full precedent, not a dead service."""
+    guard = _configurable_guard()
+    guard._mirror = _RecoveryMirror()
+    guard._core = Mock(_block_record_map={BlockKey(b"warm"): object()})
+    guard._serving = True
+    guard._write_handback = Mock(side_effect=OSError(28, "No space left on device"))
+
+    guard._hand_back(16)
+
+    assert guard._serving is False
+    assert guard._core is None
+    assert guard._mirror is None
+
+
+def test_a_release_the_filesystem_refuses_still_releases() -> None:
+    guard = _configurable_guard()
+    control = Mock()
+    guard._control = control
+    guard._configured = _ConfiguredTier.derive(_TEST_SPEC, _TierConfig(16, None))
+    guard._mirror = _RecoveryMirror()
+    guard._journal = _Journal()
+    guard._write_handback = Mock(side_effect=OSError(28, "No space left on device"))
+
+    guard._release()
+
+    assert guard._mirror is None
+    control.close.assert_called_once()
+
+
 def test_a_clean_release_hands_its_cache_on_instead_of_keeping_it() -> None:
     """A mirror the next primary is never told about is a mirror that lies."""
     guard = _configurable_guard()
