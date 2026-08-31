@@ -438,8 +438,7 @@ def install_recovery_records(
 ) -> tuple[BlockKey, ...]:
     """Seed a core that has not started with recovered residencies.
 
-    Admission runs once per block, and ranking runs after all of them. Inventory is
-    published by the caller once the core has started, not here.
+    Admission runs once per block, and ranking runs after all of them.
     """
     if not records:
         return ()
@@ -477,23 +476,6 @@ def install_recovery_records(
     return tuple(records)
 
 
-def publish_recovery_inventory(core: _KVCRCore, keys: Iterable[BlockKey]) -> None:
-    """Announce recovered blocks, once this process is really serving them.
-
-    Publishing before the core starts would leave a router holding inventory
-    for a worker that never became operational: a failed startup flushes the
-    additions on its way out and never sends the matching removals.
-    """
-    records = core._block_record_map
-    resident = [(key, records[key]) for key in keys if key in records]
-    g2 = tuple(key for key, record in resident if record.local_dram is not None)
-    g3 = tuple(key for key, record in resident if record.g3 is not None)
-    if g2:
-        core._publish_inventory(g2, CacheTier.LOCAL_G2, removed=False)
-    if g3:
-        core._publish_inventory(g3, CacheTier.G3, removed=False)
-
-
 @dataclass
 class ClaimedPool:
     """A pool leased from the KVCR-Service and whatever was left in it."""
@@ -501,7 +483,6 @@ class ClaimedPool:
     hold: KVCRPoolHold
     recovered: _RecoveryMirror
     adopt_listener: Callable[[int], None]
-    recovered_keys: tuple[BlockKey, ...] = ()
 
 
 def claim_guarded_pool(
@@ -581,9 +562,7 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
     _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
-    claimed.recovered_keys = install_recovery_records(
-        core, claimed.recovered.take_records()
-    )
+    install_recovery_records(core, claimed.recovered.take_records())
     listener_fd = hold._control_listener_fd
     if listener_fd is not None:
         claimed.adopt_listener(listener_fd)
@@ -593,14 +572,13 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
 def commit_claimed_pool(core: _KVCRCore, claimed: ClaimedPool | None) -> None:
     """Take ownership of the recovered slots, now that the core is serving them.
 
-    Dropping the region before start would strand the cache if start failed. It
-    is consumed before anything is announced, so a failure here still leaves a
-    router that was never told about these blocks.
+    Dropping the region before start would strand the cache if start failed.
+    No inventory is announced for recovered blocks: the router learned them
+    from the primary that stored them, on a control endpoint that never moves.
     """
     if claimed is None:
         return
     clear_recovery_snapshot(claimed.hold._attachment)
-    publish_recovery_inventory(core, claimed.recovered_keys)
 
 
 def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> bytearray:

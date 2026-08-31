@@ -351,11 +351,6 @@ def test_service_journal_is_attached_before_primary_start(
         "clear_recovery_snapshot",
         lambda _pool: events.append("clear"),
     )
-
-    def publish(_core, keys) -> None:
-        events.append(f"publish:{len(keys)}")
-
-    monkeypatch.setattr(kvcr_recovery, "publish_recovery_inventory", publish)
     primary_control = Mock()
     primary_control.control_bind_address.return_value = ("127.0.0.1", 5555)
     primary_control.adopt_listener.side_effect = lambda fd: events.append(f"adopt:{fd}")
@@ -393,7 +388,6 @@ def test_service_journal_is_attached_before_primary_start(
         "adopt:7",
         "core.start",
         "clear",
-        "publish:1",
     ]
     # Disowned once the channel has it, so nothing closes the fd twice.
     assert hold._control_listener_fd is None
