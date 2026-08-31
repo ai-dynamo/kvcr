@@ -612,6 +612,7 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
         _remote_agents_by_target={},
+        _route_generation={},
     )
     payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
 
@@ -628,6 +629,8 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
 
     assert agent.remote_agents == [b"gen-1", b"gen-2"]
     assert replaced[1] != first[1]
+    # The bump is what fences queued predecessor operations off the new route.
+    assert tier._route_generation == {"worker-a": 1}
     # A payload carrying no metadata still reuses whatever route is cached.
     named_only = {"target_agent": "worker-a"}
     assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
@@ -651,6 +654,7 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
         _remote_agents_by_target={},
+        _route_generation={},
     )
     _, first = _RemoteFWDram._remote_agent(
         tier,
@@ -671,6 +675,7 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
     sticky = StickyAgent()
     progress = SimpleNamespace(nixl_agent=sticky)
     tier._remote_agents_by_target = {}
+    tier._route_generation = {}
     _, kept = _RemoteFWDram._remote_agent(
         tier,
         progress,
@@ -682,6 +687,8 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
             progress,
             {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
         )
+    # No bump: the route was not replaced, so queued operations stay valid.
+    assert tier._route_generation == {}
     # Retained: matching metadata still reuses the cached route.
     assert _RemoteFWDram._remote_agent(
         tier,

@@ -272,6 +272,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     assert msgspec.to_builtins(connection.sent[-1]) == {
         "type": "release",
         "version": 1,
+        "activated": True,
     }
     assert msgspec.to_builtins(_Released(1)) == {
         "type": "released",
@@ -364,7 +365,8 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     assert attach.call_count == (1 if mapping_error else 0)
     assert connection.sent == [
         _Claim(_POOL_INDEX, _DIGEST, _TIER_CONFIG, "127.0.0.1", 5555, 1),
-        _Release(1),
+        # Unactivated: this claim never served, so the Guard may resume.
+        _Release(1, activated=False),
     ]
     assert connection.closed is True
 

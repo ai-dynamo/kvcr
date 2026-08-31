@@ -869,7 +869,10 @@ Verify that:
 
 - the socket parent and pool directory exist and are writable;
 - the pool directory has capacity for every pool at its full
-  `--pool-size-gb`, which already includes that pool's journal;
+  `--pool-size-gb`, which already includes that pool's journal. A pool
+  changing hands briefly appends its handback snapshot past that size;
+  where there is no room for it, that handover comes back cold and the
+  service carries on;
 - another process is not listening on the socket;
 - `--pool-count` is at least one; and
 - `--pool-size-gb` is positive, finite, and larger than the 100 MiB journal.

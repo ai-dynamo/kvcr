@@ -89,6 +89,10 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim"):
 
 class _Release(msgspec.Struct, frozen=True, tag="release"):
     version: ProtocolVersion
+    # False when the claimant never served this lease: the grant arrived but
+    # mapping, adoption, or startup failed. Local access has already stopped
+    # by the time any release is sent, so the service may act on it.
+    activated: bool = True
 
 
 class _Granted(msgspec.Struct, frozen=True, tag="granted"):
@@ -177,8 +181,12 @@ class KVCRPoolHold:
         adopt(self._control_listener_fd)
         self._control_listener_fd = None
 
-    def release(self) -> None:
-        """Stop local access before releasing the connection-scoped lease."""
+    def release(self, *, activated: bool = True) -> None:
+        """Stop local access before releasing the connection-scoped lease.
+
+        ``activated=False`` tells the service this lease never served: the
+        Guard it stood down may resume instead of leaving the pool idle.
+        """
         if self._release_attempted:
             return
         self._attachment.close()
@@ -189,7 +197,7 @@ class KVCRPoolHold:
         self._release_attempted = True
 
         try:
-            _send_release(self._connection)
+            _send_release(self._connection, activated=activated)
             self._connection.close()
         except BaseException as error:
             _close_quietly(self._connection)
@@ -292,7 +300,7 @@ def _abandon_claim(
         # Best-effort during unwind: nothing raised here may mask the claim
         # error re-raised by the caller.
         with contextlib.suppress(BaseException):
-            _send_release(connection)
+            _send_release(connection, activated=False)
     _close_quietly(connection)
 
 
@@ -351,8 +359,8 @@ def _grant_spec(
     return response.spec
 
 
-def _send_release(connection: FramedConnection) -> None:
-    connection.send(_Release(_PROTOCOL_VERSION))
+def _send_release(connection: FramedConnection, *, activated: bool = True) -> None:
+    connection.send(_Release(_PROTOCOL_VERSION, activated))
     response = connection.receive(_RELEASE_RESPONSE_DECODER)
     if isinstance(response, _Error):
         raise KVCRServiceError(response.message)

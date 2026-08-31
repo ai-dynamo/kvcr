@@ -160,7 +160,16 @@ class KVCRPoolAttachment:
             raise
         try:
             yield region
-        finally:
+        except BaseException:
+            # A write that did not finish must not leave the previous snapshot
+            # readable: the Guard that failed here dropped its mirror, and a
+            # claimant replaying old frames would diverge from it. The mapping
+            # closes before the truncate; shrinking under it would fault.
+            region.close()
+            with contextlib.suppress(OSError):
+                os.ftruncate(self._file_descriptor, offset)
+            raise
+        else:
             region.close()
 
     @contextlib.contextmanager

@@ -455,6 +455,16 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         assert harness.server._registry._pools[1].guard is guard
         assert harness.server._registry._pools[1].listener is not None
 
+        # A claimant that never served says so; the service routes its
+        # release through the Guard's abort, which may resume serving.
+        aborted = harness.client.claim(
+            1, g3_stride, _TEST_DIGEST, _control_address(), g3
+        )
+        aborted.release(activated=False)
+        guard.abort_grant.assert_called_once_with()
+        guard.release.assert_called_once_with()
+        assert _holders_of(harness.server._registry) == {}
+
 
 def test_uncontained_guard_failures_stop_the_service_before_freeing_the_pool(
     tmp_path: Path,
@@ -1001,10 +1011,21 @@ def test_grant_send_failure_rolls_back_the_exact_binding(tmp_path: Path) -> None
     accepted, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
 
     class _Channel:
+        def __init__(self) -> None:
+            self.receives = 0
+
         def receive(self, _decoder: object) -> _Claim:
-            return _claim_request()
+            # First the claim; after the failed delivery the handler holds the
+            # lease, and the closed peer reads as EOF -- the claimant is gone.
+            self.receives += 1
+            if self.receives == 1:
+                return _claim_request()
+            raise EOFError
 
         def send(self, response: object) -> None:
+            raise AssertionError("a guarded grant travels with its descriptor")
+
+        def send_with_fd(self, response: object, _descriptor: int) -> None:
             assert isinstance(response, _Granted)
             raise RuntimeError("grant could not be delivered")
 
@@ -1023,6 +1044,9 @@ def test_grant_send_failure_rolls_back_the_exact_binding(tmp_path: Path) -> None
         handler.channel = _Channel()
         handler.server = _Server()
         try:
+            # The peer's end is closed first: an undelivered grant holds the
+            # lease until the connection or the claimant dies.
+            peer.close()
             handler.handle()
             assert _holders_of(registry) == {}
             replacement = _FakeLiveness()

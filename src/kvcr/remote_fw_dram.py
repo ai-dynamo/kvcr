@@ -203,6 +203,7 @@ class _SourcePinOp(_Op):
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[MemDescriptor, ...]
+    route: tuple[str, int] = ("", 0)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -231,6 +232,7 @@ class _SourceWriteOp(_RemoteOp):
     transfer_id: int | None = None
     success: bool = False
     completed_count: int = 0
+    route: tuple[str, int] = ("", 0)
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -253,6 +255,16 @@ class _SourceWriteOp(_RemoteOp):
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
+            route_name, route_generation = self.route
+            if route_name and (
+                backend._route_generation.get(route_name, 0) != route_generation
+            ):
+                # Re-checked here, on the thread that submits: the route can be
+                # replaced between queueing and this write, and NIXL hands the
+                # same handle back for a reused name. The target hears a
+                # refusal instead of receiving the dead generation's bytes.
+                self.state = _SourceWriteState.NOTIFY_FAILURE
+                return False, True
             submit_started_at = backend._kvcr._timer()
             try:
                 transfer_id, submitted = progress.submit_transfer(
@@ -260,6 +272,7 @@ class _SourceWriteOp(_RemoteOp):
                     self.src_descriptors,
                     self.dst_descriptors[: self.completed_count],
                     remote_side_agent=self.remote_agent,
+                    backend=backend._kvcr.config.nixl_dram_backend,
                     notif_msg=_write_done_notif(
                         self.op_handle,
                         True,
@@ -397,6 +410,10 @@ class _RemoteFWDram:
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
         self._remote_agents_by_target: dict[str, tuple[bytes, bytes]] = {}
+        # Bumped whenever a name's route is replaced: NIXL hands the same
+        # handle back for a reused name, so queued operations from the dead
+        # generation must be fenced by number, not by handle.
+        self._route_generation: dict[str, int] = {}
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
@@ -846,22 +863,11 @@ class _RemoteFWDram:
             "sender_control_endpoint": source_control_endpoint,
         }
         if not self._send_control(progress, target_control_endpoint, response):
-            # Unload before forgetting: NIXL still holds the route, and a bare
-            # cache drop would make the next add of this name fail permanently.
-            cached = self._remote_agents_by_target.get(target_agent)
-            remove = getattr(progress.nixl_agent, "remove_remote_agent", None)
-            if cached is not None and remove is not None:
-                try:
-                    remove(cached[1])
-                except Exception:
-                    # Kept in the cache, so the next refresh retries the unload.
-                    logger.warning(
-                        "Failed to unload NIXL route for %s",
-                        target_agent,
-                        exc_info=True,
-                    )
-                    return
-            self._remote_agents_by_target.pop(target_agent, None)
+            # Kept, route and cache both: an operation this start_write queued
+            # still transfers over this route, and the peer re-sends its
+            # metadata until the ack lands -- matching bytes reuse the entry,
+            # changed bytes replace it through the refresh path.
+            return
 
     # -------------------------------------------------------------------------
     # Source side: progress parses, main pins, then progress writes to the target.
@@ -929,6 +935,7 @@ class _RemoteFWDram:
                 op_handle=op_handle,
                 ordered_keys=keys,
                 dst_descriptors=dst_descriptors,
+                route=(target_agent, self._route_generation.get(target_agent, 0)),
             )
         )
 
@@ -940,6 +947,14 @@ class _RemoteFWDram:
         force_failure: bool = False,
     ) -> None:
         kvcr = self._kvcr
+        route_name, route_generation = source_pin.route
+        if route_name and (
+            self._route_generation.get(route_name, 0) != route_generation
+        ):
+            # The name was re-routed while this operation queued. NIXL hands
+            # the same handle back for a reused name, so submitting would
+            # write the dead generation's destinations through the new route.
+            force_failure = True
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.ordered_keys
         )
@@ -990,6 +1005,7 @@ class _RemoteFWDram:
             op_handle=source_pin.op_handle,
             ordered_keys=source_pin.ordered_keys,
             dst_descriptors=source_pin.dst_descriptors,
+            route=source_pin.route,
             _backend=self,
             framework_pins=framework_pins,
             src_descriptors=tuple(sources[key] for key in completed_keys),
@@ -1424,6 +1440,9 @@ class _RemoteFWDram:
             if remove is not None:
                 remove(remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)
+            self._route_generation[target_agent] = (
+                self._route_generation.get(target_agent, 0) + 1
+            )
         started_at = kvcr._timer()
         try:
             if not isinstance(target_metadata, bytes):

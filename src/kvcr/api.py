@@ -102,14 +102,21 @@ class KVCR:
             core.start()
             _recovery.commit_claimed_pool(claimed)
         except BaseException:
+            close_failed = False
             if core is not None:
-                with contextlib.suppress(BaseException):
+                try:
                     core.close()
-            if core is not None and not core.is_quiescent():
+                except BaseException:
+                    close_failed = True
+            if core is not None and (close_failed or not core.is_quiescent()):
+                # A close that raised may have kept the adopted listener even
+                # though NIXL went quiescent; a Guard resumed beside it would
+                # split the endpoint. Retained until this process dies, when
+                # the pidfd frees the pool.
                 _NONQUIESCENT_STARTUP_RESOURCES.append((core, pool_hold))
             elif pool_hold is not None:
                 with contextlib.suppress(BaseException):
-                    pool_hold.release()
+                    pool_hold.release(activated=False)
             raise
         self._core = core
         self._pool_hold = pool_hold

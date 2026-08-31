@@ -162,7 +162,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         local_dram=LocalDramInfo(1234, 8192, 8),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
-        release=lambda: events.append("hold.release"),
+        release=lambda **_kwargs: events.append("hold.release"),
     )
 
     def claim(*_args, **_kwargs) -> SimpleNamespace:
@@ -310,7 +310,7 @@ def test_service_journal_is_attached_before_primary_start(
         local_dram=LocalDramInfo(1234, 8192, 8),
         _attachment=attachment,
         _control_listener_fd=7,
-        release=lambda: events.append("hold.release"),
+        release=lambda **_kwargs: events.append("hold.release"),
     )
     claim = Mock(return_value=hold)
     local_dram = object()

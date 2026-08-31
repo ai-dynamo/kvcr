@@ -528,11 +528,14 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         assert liveness is not None
         try:
             self._deliver_grant(pool_index, response)
-        # The lease is already granted: whatever escapes delivery, revoke it
-        # or the pool stays held by a claimant that never heard it won.
+        # The lease is already granted and the send may have partially
+        # crossed: releasing now could double-grant a pool a claimant just
+        # mapped. Hold it instead. A claimant that took the grant keeps this
+        # connection for the lease; one that did not closes it, and the EOF
+        # frees the pool -- as does the claimant's death, either way.
         except BaseException:
-            logger.exception("KVCR grant delivery failed; revoking the lease")
-            self._abort_or_fail(pool_index, liveness)
+            logger.exception("KVCR grant delivery failed; holding the lease")
+            self._hold(pool_index, liveness, abandoned_on_eof=True)
             return
         self._hold(pool_index, liveness)
 
@@ -558,7 +561,13 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 with contextlib.suppress(OSError):
                     os.close(listener_fd)
 
-    def _hold(self, pool_index: int, liveness: PidfdLiveness) -> None:
+    def _hold(
+        self,
+        pool_index: int,
+        liveness: PidfdLiveness,
+        *,
+        abandoned_on_eof: bool = False,
+    ) -> None:
         try:
             socket_fd = self.request.fileno()
             pidfd = liveness.fileno()
@@ -584,14 +593,22 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             socket_flags = ready.get(socket_fd, 0)
             if socket_flags & select.POLLIN:
                 try:
-                    self.channel.receive(_RELEASE_DECODER)
+                    release = self.channel.receive(_RELEASE_DECODER)
                 except (EOFError, OSError):
+                    if abandoned_on_eof:
+                        # This grant's delivery failed. A claimant that took
+                        # it anyway would be holding this connection open, so
+                        # its end closing says nobody serves this lease.
+                        self._release_or_fail(pool_index, liveness)
+                        return
                     poller.unregister(socket_fd)
                     socket_flags = 0
                 except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                     self._send_error(error)
                 else:
-                    if not self._release_or_fail(pool_index, liveness):
+                    if not self._release_or_fail(
+                        pool_index, liveness, activated=release.activated
+                    ):
                         return
                     with contextlib.suppress(OSError):
                         self.channel.send(_Released(_PROTOCOL_VERSION))
@@ -623,19 +640,20 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
         self.server.fail(error)
 
-    def _abort_or_fail(self, pool_index: int, liveness: PidfdLiveness) -> None:
-        try:
-            self.server.registry.abort_grant(pool_index, liveness)
-        except BaseException as error:  # noqa: BLE001 - post-grant failure
-            self.server.fail(error)
-
     def _release_or_fail(
         self,
         pool_index: int,
         liveness: PidfdLiveness,
+        *,
+        activated: bool = True,
     ) -> bool:
         try:
-            self.server.registry.release(pool_index, liveness)
+            if activated:
+                self.server.registry.release(pool_index, liveness)
+            else:
+                # The claimant declared it never served this lease; the Guard
+                # it stood down may resume serving.
+                self.server.registry.abort_grant(pool_index, liveness)
         except BaseException as error:
             self.server.fail(error)
             return False

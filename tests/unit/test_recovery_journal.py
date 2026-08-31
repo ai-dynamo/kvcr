@@ -385,7 +385,21 @@ def test_an_interrupted_rewrite_reads_as_unfinished_rather_than_as_other_terms(
                     _recovery_frames({BlockKey(b"b" * 32): _recovered_record(g2=2)}),
                 )
 
-        # Unfinished, not written-for-other-terms: read_handback discards it.
+        # The failed rewrite took the tail with it -- including the previous
+        # snapshot. Old frames must not replay against a Guard whose mirror
+        # already gave up on this handover.
+        assert list(read_recovery_snapshot(pool, terms)) == []
+
+        # A crash leaves torn bytes no exception path can truncate: a region
+        # whose header never landed reads as unfinished, and read_handback
+        # discards it rather than serving it as another handover's terms.
+        write_recovery_snapshot(
+            pool,
+            terms,
+            _recovery_frames({BlockKey(b"c" * 32): _recovered_record(g2=3)}),
+        )
+        with pool.snapshot_region(_SNAPSHOT_HEADER.size + 64) as region:
+            region[: _SNAPSHOT_HEADER.size] = bytes(_SNAPSHOT_HEADER.size)
         with pytest.raises(RecoveryJournalTornError, match="unfinished"):
             list(read_recovery_snapshot(pool, terms))
         assert read_handback(pool, _TEST_DIGEST, 4096)._records == {}

@@ -492,7 +492,7 @@ def claim_guarded_pool(
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
         with suppress(BaseException):
-            hold.release()
+            hold.release(activated=False)
         raise
     return ClaimedPool(hold, recovered, adopt_listener)
 

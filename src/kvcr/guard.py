@@ -190,11 +190,12 @@ class _Guard:
         self._submit(_Command("release"))
 
     def abort_grant(self) -> None:
-        """Roll back a grant the claimant provably never received.
+        """Roll back a lease its claimant declared it never served.
 
-        A failed send of the length-prefixed grant means the claimant cannot
-        decode it, so it can never map the pool: if this claim stood a serving
-        Guard down, the Guard resumes; otherwise this is an ordinary release.
+        The claimant sends this only after stopping local access, so if this
+        claim stood a serving Guard down, the Guard may resume; otherwise it
+        is an ordinary release. Ambiguous cases -- a grant whose delivery
+        failed mid-send -- never come here; those release, fenced.
         """
         self._submit(_Command("abort"))
 
