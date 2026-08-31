@@ -51,34 +51,9 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-No private-repository credentials are required. Keep the immutable commit
-unless another revision has been validated with the base image and Dynamo
-revision in this Dockerfile; do not replace it with the moving PR branch head.
-
-Only PR #53624 is selected by the build. It is stacked on the already-merged
-KV-event prerequisites
-[#52067](https://github.com/vllm-project/vllm/pull/52067) and
-[#52068](https://github.com/vllm-project/vllm/pull/52068), and the pinned tree
-already contains both, so do not fetch or apply those PRs separately. PR #53624
-provides the in-process KVCR adapter used by this configuration. The two merged
-prerequisites provide the ownership and final-residency event semantics needed
-when KVCR-owned local G2 or G3 inventory is enabled.
-
-The first build pulls the large vLLM runtime and compiles Dynamo's Rust
-bindings, so it can take several minutes even on a fast host.
-
-The build starts from the pinned vLLM nightly, overlays the three adapter files
-from PR #53624 and the three prerequisite KV-event files contained in the same
-tree, installs the local KVCR checkout, and builds Dynamo at the revision that
-supports one KVCR control endpoint per data-parallel rank. The public adapter
-revision, base image, and Dynamo revision must be treated as one compatibility
-set.
-
-The last build steps import all four components, verify `nixl==1.3.2`, preserve
-the base image's validated NCCL 2.30.7, guard its NumPy and protobuf ABI
-families, and confirm that Dynamo contains the required `control_ports`
-router-hint support. A failure there means the image is not usable; do not
-continue to the launch steps.
+No private-repository credentials are required. The first build uses pinned,
+tested vLLM and Dynamo revisions and may take several minutes. Continue only if
+its final compatibility checks pass.
 
 ---
 
@@ -217,73 +192,66 @@ target, the generic primary-to-secondary cascade may increment
 result. Use the terminal source and destination telemetry in the verification
 section below to judge the transfer itself.
 
-For multiple hosts, replace `127.0.0.1` with an address reachable from every
-peer and bind or advertise the KV-events endpoint appropriately. NIXL and its
-UCX transport must also be configured for the intended interconnect.
-
 ---
 
-## 5. Verify with real requests
+## 5. Verify a KVCR peer transfer
 
-Do not treat a liveness response as proof that a backend is ready. Wait for a
-real inference request through the Dynamo frontend to return HTTP 200 with a
-non-empty `choices` array:
+First make a real inference request and read the registered worker ID shared by
+the two DP ranks from the response:
 
 ```bash
 export MODEL=Qwen/Qwen3-0.6B
 
-curl -sS http://127.0.0.1:8000/v1/completions \
-  -H 'content-type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"prompt\":\"Reply with the word ready.\",\"max_tokens\":8}"
-```
-
-Then send at least two prompts that share several full blocks. vLLM publishes
-stored events for full blocks, so a very short shared prefix may never become
-visible to the router:
-
-```bash
-PREFIX=$(python3 -c 'print(" ".join(f"section{i} cache routing data" for i in range(80)))')
-
-for QUESTION in \
-  'Summarize the design.' \
-  'List two failure modes.'
-do
-  curl -sS http://127.0.0.1:8000/v1/completions \
+WORKER_ID=$(
+  curl --fail --silent --show-error \
+    http://127.0.0.1:8000/v1/completions \
     -H 'content-type: application/json' \
-    -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX $QUESTION\",\"max_tokens\":32,\"temperature\":0}"
-done
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"worker identity probe\",\"max_tokens\":1,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}" \
+  | python3 -c 'import json, sys; response = json.load(sys.stdin); assert response["choices"]; print(response["nvext"]["worker_id"]["decode_worker_id"])'
+)
+export WORKER_ID
 ```
 
-Confirm all of the following before calling the stack healthy:
-
-1. Both DP ranks initialized a KVCR tier and distinct control endpoints.
-2. Dynamo consumed self-describing KV events from the workers.
-3. Repeated-prefix requests completed correctly through port 8000.
-4. A delivered block was exposed to vLLM only after a terminal KVCR completion.
-
-Normal deterministic KV routing prefers the worker that already owns the
-prefix, so a healthy run may use local reuse without performing a peer
-transfer. To exercise the peer-transfer mechanics, stop only the frontend with
-Ctrl-C, restart it in the same terminal, and repeat the shared-prefix requests:
+Use a fresh prefix spanning several complete blocks. Send it first to DP rank 0,
+then send the shared prefix to DP rank 1:
 
 ```bash
-env -u NATS_SERVER python3 -m dynamo.frontend \
-  --router-mode kv \
-  --router-temperature 1 \
-  --http-port 8000
+PREFIX=$(python3 -c 'import uuid; tag = uuid.uuid4().hex; print(" ".join(f"{tag} section{i} cache routing data" for i in range(80)))')
+
+curl --fail --silent --show-error \
+  http://127.0.0.1:8000/v1/completions \
+  -H 'content-type: application/json' \
+  -H "x-dynamo-worker-instance-id: $WORKER_ID" \
+  -H 'x-dynamo-dp-rank: 0' \
+  -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX seed source\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
+
+# Allow the asynchronous full-block KV events to reach the local router.
+sleep 2
+
+curl --fail --silent --show-error \
+  http://127.0.0.1:8000/v1/completions \
+  -H 'content-type: application/json' \
+  -H "x-dynamo-worker-instance-id: $WORKER_ID" \
+  -H 'x-dynamo-dp-rank: 1' \
+  -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX retrieve on target\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
 ```
 
-This deliberately trades locality for cross-rank traffic and is for mechanism
-validation, not a performance comparison. Selection is probabilistic: repeat
-the shared-prefix request until the frontend log shows that a different
-`dp_rank` was selected with zero local overlap.
+These headers constrain the KV router to a specific DP rank; they do not bypass
+it. For the second request, the router can still identify rank 0 as the source
+and provide its source hint to rank 1. The two responses should report
+`decode_dp_rank` 0 and 1, respectively, under `nvext.worker_id`.
 
-Wait for the periodic `KV Transfer metrics` log. A successful transfer reports
-`transfer` with result `success`, plus `source_write` block and byte counters,
-on the source. The destination reports `remote_deliver` with result `success`
-and the same block count; its `kv_offload_tiering_read_bytes` value must equal
-the source's `source_write` byte count. Verify this terminal telemetry rather
-than relying only on cached-token accounting or the router's overlap score.
+Compare the periodic `KV Transfer metrics` immediately before and after the
+second request. The source must report successful `transfer` and `source_write`
+operations with positive block and byte deltas. The destination must report a
+successful, not partial, `remote_deliver` with the same block delta, and its
+`kv_offload_tiering_read_bytes` delta must equal the source byte delta.
+
+The explicit rank selection is only for this deterministic mechanism test. In
+a normal deployment, omit the two routing headers. KVCR transfers can occur
+when load, availability, or routing constraints cause the KV router to select a
+target other than the cache-owning worker; observe them with the same terminal
+source and destination metrics.
 
 ---
 
