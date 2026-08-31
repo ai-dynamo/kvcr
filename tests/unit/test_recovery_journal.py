@@ -286,9 +286,7 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
         source = _Source()
         _attach_journal(source, fresh)
         assert not fresh.is_invalid()
-        with patch.object(
-            fresh, "publish", side_effect=RuntimeError("publish failed")
-        ):
+        with patch.object(fresh, "publish", side_effect=RuntimeError("publish failed")):
             source.emit(BlockKey(b"still-serving"), _recovered_record(g2=0))
         assert fresh.is_invalid()
 

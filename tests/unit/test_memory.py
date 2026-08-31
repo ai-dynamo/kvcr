@@ -74,9 +74,7 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
 
     with patch("kvcr.memory.uuid.uuid4") as uuid4:
         uuid4.return_value.hex = _TEST_GENERATION
-        with patch(
-            "kvcr.memory._populate_pages", wraps=_populate_pages
-        ) as populate:
+        with patch("kvcr.memory._populate_pages", wraps=_populate_pages) as populate:
             owner = _KVCRPoolOwner.allocate(
                 pool_id="engine_dp0",
                 pool_size_bytes=12289,

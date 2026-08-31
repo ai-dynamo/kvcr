@@ -5,6 +5,7 @@
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
@@ -600,3 +601,33 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     assert backend._fw_pins_by_op[submitted.op_id] == {borrowed}
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
+
+
+def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> None:
+    """Same peer name with new metadata re-adds the NIXL route; identical
+    metadata keeps reusing the cached one."""
+    agent = FakeNixlAgent()
+    progress = SimpleNamespace(nixl_agent=agent)
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+    )
+    payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
+
+    first = _RemoteFWDram._remote_agent(tier, progress, payload)
+
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == first
+    assert agent.remote_agents == [b"gen-1"]
+
+    replaced = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+    )
+
+    assert agent.remote_agents == [b"gen-1", b"gen-2"]
+    assert replaced[1] != first[1]
+    # A payload carrying no metadata still reuses whatever route is cached.
+    named_only = {"target_agent": "worker-a"}
+    assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced

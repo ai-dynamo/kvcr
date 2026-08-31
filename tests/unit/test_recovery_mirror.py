@@ -55,9 +55,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
             _BlockRecord(),
         ),
         (
-            _BlockRecord(
-                local_dram=_LocalDramResidency(0, _LocalDramState.DISCARDING)
-            ),
+            _BlockRecord(local_dram=_LocalDramResidency(0, _LocalDramState.DISCARDING)),
             [None, None],
             _BlockRecord(),
         ),

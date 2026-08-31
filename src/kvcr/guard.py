@@ -297,6 +297,11 @@ class _Guard:
         try:
             if self._serving:
                 self._hand_back(served_under)
+                if self._mirror is None:
+                    # The handback did not fit, so the claimant was told cold:
+                    # this lease's baseline is empty, not absent. A lease with
+                    # no mirror would never be read again.
+                    self._mirror = _RecoveryMirror()
             assert self._journal is not None
             self._journal.reset()
         except BaseException as error:

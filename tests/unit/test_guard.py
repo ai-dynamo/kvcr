@@ -568,9 +568,7 @@ def test_a_failed_claim_is_fatal_only_once_the_pool_has_changed_hands(
         else:
             expected = RecoveryJournalError
             tier_config = _TierConfig(16, None)
-            handback = Mock(
-                side_effect=RecoveryJournalError("written for other terms")
-            )
+            handback = Mock(side_effect=RecoveryJournalError("written for other terms"))
         monkeypatch.setattr("kvcr.guard.read_handback", handback)
 
         with pytest.raises(expected):
@@ -634,6 +632,36 @@ def test_a_recovery_write_without_space_leaves_a_cold_pool_not_a_dead_guard(
     # Recovery is gone either way: the next claimant is told nothing rather
     # than half of something.
     assert guard._mirror is None
+
+
+def test_a_dropped_handback_still_leaves_the_new_lease_mirrored() -> None:
+    """ENOSPC at adopt-time handback costs one generation, not every one after."""
+    guard = _configurable_guard()
+    guard._control = None
+    guard._failure_callback = lambda *_args: None
+    guard._configured = _ConfiguredTier.derive(_TEST_SPEC, _TierConfig(16, None))
+    guard._mirror = _RecoveryMirror()
+    guard._core = Mock(
+        _block_record_map={
+            BlockKey(b"warm"): _BlockRecord(
+                local_dram=_LocalDramResidency(0, _LocalDramState.READY)
+            )
+        }
+    )
+    guard._serving = True
+    guard._journal = _Journal()
+    guard._write_handback = Mock(side_effect=OSError(28, "No space left on device"))
+
+    guard._adopt(Mock(), _TierConfig(16, None))
+
+    # The claimant was told cold; the new lease is still mirrored, so this
+    # primary's deposits survive its own death.
+    assert guard._mirror is not None
+    guard._journal.pending = [
+        (_RECORD_BLOCK, b"fresh", _RECOVERY_ENCODER.encode(_RecoveryBlock(g2=1)))
+    ]
+    guard._poll()
+    assert BlockKey(b"fresh") in guard._mirror._records
 
 
 def test_a_clean_release_hands_its_cache_on_instead_of_keeping_it() -> None:

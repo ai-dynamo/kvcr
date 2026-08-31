@@ -11,6 +11,7 @@ Target: hint/query -> fetch/deliver -> start_write -> write_done.
 Source: start_write -> local claim/framework pin -> write -> write_done.
 """
 
+import contextlib
 import math
 import time
 from collections.abc import Collection, Iterator, Mapping
@@ -396,7 +397,7 @@ class _RemoteFWDram:
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
-        self._remote_agents_by_target: dict[str, bytes] = {}
+        self._remote_agents_by_target: dict[str, tuple[bytes, bytes]] = {}
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
@@ -1391,14 +1392,25 @@ class _RemoteFWDram:
         target_agent = payload.get("target_agent", fallback_target)
         if not isinstance(target_agent, str) or not target_agent:
             raise TypeError("missing target agent")
-        remote_agent = self._remote_agents_by_target.get(target_agent)
-        if remote_agent is not None:
-            reused_at = kvcr._timer()
-            self._record_progress_duration("peer_setup", reused_at, "reused")
-            return target_agent, remote_agent
+        target_metadata = payload.get("target_agent_metadata")
+        cached = self._remote_agents_by_target.get(target_agent)
+        if cached is not None:
+            cached_metadata, remote_agent = cached
+            if not isinstance(target_metadata, bytes) or (
+                target_metadata == cached_metadata
+            ):
+                reused_at = kvcr._timer()
+                self._record_progress_duration("peer_setup", reused_at, "reused")
+                return target_agent, remote_agent
+            # Same name, new metadata: the process behind the name was replaced,
+            # and the cached route still points at the dead one.
+            remove = getattr(agent, "remove_remote_agent", None)
+            if remove is not None:
+                with contextlib.suppress(Exception):
+                    remove(remote_agent)
+            self._remote_agents_by_target.pop(target_agent, None)
         started_at = kvcr._timer()
         try:
-            target_metadata = payload.get("target_agent_metadata")
             if not isinstance(target_metadata, bytes):
                 raise TypeError("missing target agent metadata")
             remote_agent = agent.add_remote_agent(target_metadata)
@@ -1408,7 +1420,7 @@ class _RemoteFWDram:
             self._record_progress_duration("peer_setup", started_at, "failed")
             raise
         self._record_progress_duration("peer_setup", started_at, "connected")
-        self._remote_agents_by_target[target_agent] = remote_agent
+        self._remote_agents_by_target[target_agent] = (target_metadata, remote_agent)
         return target_agent, remote_agent
 
     # Progress notifications, telemetry, and resource cleanup.
