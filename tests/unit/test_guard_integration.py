@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import msgspec
 import pytest
 from _kvcr_test_utils import (
     FakeNixlAgent,
@@ -210,6 +211,53 @@ def _handback_primary_child(socket_path: str, g3_path: str, control_port: str) -
     time.sleep(60)
 
 
+def _idle_primary_child(socket_path: str, g3_path: str, control_port: str) -> None:
+    """Claim the pool and hold it, storing nothing, until killed."""
+    agent = _FileBackedNixlAgent()
+    agent.state = "DONE"
+    _claim_kvcr(
+        agent,
+        socket_path,
+        g3_path,
+        os.sysconf("SC_PAGE_SIZE"),
+        int(control_port),
+        "idle",
+    )
+    print("ready", flush=True)
+    time.sleep(60)
+
+
+def _stale_peer_child(control_port: str, probe_port: str) -> None:
+    """A dead primary's peer: it sends into the pool's endpoint and must get
+    a terminal refusal back, not silence until its operation deadline."""
+    import zmq
+
+    context = zmq.Context()
+    pull = context.socket(zmq.PULL)
+    pull.setsockopt(zmq.RCVTIMEO, int(_TIMEOUT_SECONDS * 1000))
+    pull.bind(f"tcp://127.0.0.1:{probe_port}")
+    push = context.socket(zmq.PUSH)
+    push.connect(f"tcp://127.0.0.1:{control_port}")
+    push.send(
+        msgspec.msgpack.encode(
+            {
+                "type": "start_write",
+                "op_handle": 7,
+                "remaining_timeout_ms": 1000,
+                "keys": [],
+                "dst_descriptors": [],
+                "sender_control_endpoint": f"tcp://127.0.0.1:{probe_port}",
+                "source_control_endpoint": f"tcp://127.0.0.1:{control_port}",
+            }
+        )
+    )
+    while True:
+        decoded = msgspec.msgpack.decode(pull.recv())
+        if decoded.get("type") == "write_refused" and decoded["op_handle"] == 7:
+            print("refused", flush=True)
+            return
+
+
 def _expect_child_line(child: subprocess.Popen[str], expected: str) -> None:
     assert child.stdout is not None
     if not select.select([child.stdout], [], [], _TIMEOUT_SECONDS)[0]:
@@ -274,6 +322,117 @@ def live_service(
     server_thread.join(timeout=_TIMEOUT_SECONDS)
     service.close()
     assert not server_thread.is_alive()
+
+
+# First in the file, deliberately: this scenario builds real NIXL agents in
+# this process, and real createXferReq starts failing with
+# NIXL_ERR_INVALID_PARAM when fake-agent/ZMQ scenarios have run here first.
+# Pre-existing sensitivity, reproduced without any of the surrounding tests'
+# recent changes; worth its own investigation.
+def test_a_promoted_guard_serves_real_nixl_transfers(
+    tmp_path: Path,
+    live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
+) -> None:
+    """With nothing faked, a promoted Guard serves a real UCX read then stands down."""
+    # Not a decorator: children import this module, and NIXL logs to their stdout.
+    if not _real_nixl_available():
+        pytest.skip("no runnable NIXL agent on this machine")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    second_payload = b"B" * page_size
+    g3_path = tmp_path / "g3.data"
+    control_port = free_port()
+    service, spawn = live_service
+
+    primary = spawn(
+        "_real_nixl_primary_child", service.socket_path, g3_path, control_port
+    )
+    _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
+    guard = service._registry._pools[0].guard
+
+    primary.kill()
+    primary.wait(timeout=_TIMEOUT_SECONDS)
+    # Promotion builds a real agent under a new name over the same pool.
+    _wait_until(lambda: guard._serving, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
+    assert set(guard._core._block_record_map) == {BlockKey(b"resident-b")}
+
+    # A real UCX read through the Guard: the agent did not exist at write time.
+    source_endpoint = f"tcp://127.0.0.1:{control_port}"
+    target_memory = ctypes.create_string_buffer(page_size)
+    target_pinning = FakePrimaryPinning()
+    target = KVCR(
+        KVCRConfig(
+            nixl_agent_name="real-target",
+            nixl_listen_port=0,
+            inventory_report_interval_ms=0,
+            operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
+        ),
+        KVCRBindings(
+            target_pinning.request_pin,
+            target_pinning.poll_pin_results,
+            target_pinning.release_pin,
+            framework_control=ZmqPeerControlChannel(
+                "127.0.0.1", free_port(), "127.0.0.1"
+            ),
+        ),
+        KVCRBackendConfigs(
+            framework_dram=FrameworkDramInput(
+                ctypes.addressof(target_memory), len(target_memory)
+            ),
+            remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+        ),
+    )
+    try:
+        served_key = BlockKey(b"resident-b")
+        target.submit_hint((served_key,), src=source_endpoint, request_id="from-guard")
+        operation = target.deliver(
+            {served_key: _mem_descriptor(ctypes.addressof(target_memory), page_size)},
+            request_id="from-guard",
+        )
+        deadline = time.monotonic() + _REAL_NIXL_TIMEOUT_SECONDS
+        results: dict = {}
+        while time.monotonic() < deadline and not results:
+            results = dict(target.poll_completed())
+            time.sleep(0.01)
+        assert results, "the Guard never answered the target"
+        assert results[operation][served_key].success
+        assert (
+            ctypes.string_at(ctypes.addressof(target_memory), page_size)
+            == second_payload
+        )
+        # _serving stands for "answering peers": a served read must not end it.
+        assert guard._serving is True
+    finally:
+        target.close()
+
+    # Only then does a replacement take the pool back and stand the Guard down.
+    # Inline, not a child: adoption only claims and reads, and this process
+    # already runs real agents beside the Guard's own.
+    framework = ctypes.create_string_buffer(page_size * 2)
+    replacement = _real_nixl_kvcr(
+        str(service.socket_path),
+        str(g3_path),
+        control_port,
+        "real-replacement",
+        framework,
+    )
+    try:
+        destination = ctypes.addressof(framework) + page_size
+        for key, payload in (
+            (BlockKey(b"resident-a"), b"A" * page_size),
+            (BlockKey(b"resident-b"), second_payload),
+        ):
+            ctypes.memset(destination, 0, len(payload))
+            operation = replacement.deliver(
+                {key: _mem_descriptor(destination, len(payload))}
+            )
+            result = dict(
+                _poll_until(replacement, bool, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
+            )[operation][key]
+            assert result.success, key
+            assert ctypes.string_at(destination, len(payload)) == payload, key
+        assert guard._serving is False
+    finally:
+        replacement.close()
 
 
 @pytest.mark.parametrize("recovery", ["kept", "given-up"])
@@ -438,11 +597,29 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
     service, spawn = live_service
 
+    # Generation zero: a primary that stored nothing dies. An empty Guard
+    # must still serve -- one that declined would leave the dead primary's
+    # peers sending into an endpoint nobody reads, stalling them until their
+    # operation deadline instead of failing them now.
+    idle = spawn("_idle_primary_child", service.socket_path, g3_path, control_port)
+    _expect_child_line(idle, "ready")
+    first_guard = service._registry._pools[0].guard
+    idle.kill()
+    idle.wait(timeout=_TIMEOUT_SECONDS)
+    _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
+    assert first_guard._core._block_record_map == {}
+
+    # A stale peer's request gets a terminal refusal, not silence. In its own
+    # process, as a real peer is -- and because a ZMQ probe in this process
+    # destabilizes the real-NIXL test that follows.
+    peer = spawn("_stale_peer_child", control_port, free_port())
+    _expect_child_line(peer, "refused")
+    peer.wait(timeout=_TIMEOUT_SECONDS)
+
     primary = spawn(
         "_handback_primary_child", service.socket_path, g3_path, control_port
     )
     _expect_child_line(primary, "ready")
-    first_guard = service._registry._pools[0].guard
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -587,109 +764,3 @@ def _real_nixl_primary_child(socket_path: str, g3_path: str, control_port: str) 
     _deposit_two_blocks(kvcr, ctypes.addressof(framework), page_size)
     print("ready", flush=True)
     time.sleep(60)
-
-
-def test_a_promoted_guard_serves_real_nixl_transfers(
-    tmp_path: Path,
-    live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
-) -> None:
-    """With nothing faked, a promoted Guard serves a real UCX read then stands down."""
-    # Not a decorator: children import this module, and NIXL logs to their stdout.
-    if not _real_nixl_available():
-        pytest.skip("no runnable NIXL agent on this machine")
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    second_payload = b"B" * page_size
-    g3_path = tmp_path / "g3.data"
-    control_port = free_port()
-    service, spawn = live_service
-
-    primary = spawn(
-        "_real_nixl_primary_child", service.socket_path, g3_path, control_port
-    )
-    _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
-    guard = service._registry._pools[0].guard
-
-    primary.kill()
-    primary.wait(timeout=_TIMEOUT_SECONDS)
-    # Promotion builds a real agent under a new name over the same pool.
-    _wait_until(lambda: guard._serving, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
-    assert set(guard._core._block_record_map) == {BlockKey(b"resident-b")}
-
-    # A real UCX read through the Guard: the agent did not exist at write time.
-    source_endpoint = f"tcp://127.0.0.1:{control_port}"
-    target_memory = ctypes.create_string_buffer(page_size)
-    target_pinning = FakePrimaryPinning()
-    target = KVCR(
-        KVCRConfig(
-            nixl_agent_name="real-target",
-            nixl_listen_port=0,
-            inventory_report_interval_ms=0,
-            operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
-        ),
-        KVCRBindings(
-            target_pinning.request_pin,
-            target_pinning.poll_pin_results,
-            target_pinning.release_pin,
-            framework_control=ZmqPeerControlChannel(
-                "127.0.0.1", free_port(), "127.0.0.1"
-            ),
-        ),
-        KVCRBackendConfigs(
-            framework_dram=FrameworkDramInput(
-                ctypes.addressof(target_memory), len(target_memory)
-            ),
-            remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
-        ),
-    )
-    try:
-        served_key = BlockKey(b"resident-b")
-        target.submit_hint((served_key,), src=source_endpoint, request_id="from-guard")
-        operation = target.deliver(
-            {served_key: _mem_descriptor(ctypes.addressof(target_memory), page_size)},
-            request_id="from-guard",
-        )
-        deadline = time.monotonic() + _REAL_NIXL_TIMEOUT_SECONDS
-        results: dict = {}
-        while time.monotonic() < deadline and not results:
-            results = dict(target.poll_completed())
-            time.sleep(0.01)
-        assert results, "the Guard never answered the target"
-        assert results[operation][served_key].success
-        assert (
-            ctypes.string_at(ctypes.addressof(target_memory), page_size)
-            == second_payload
-        )
-        # _serving stands for "answering peers": a served read must not end it.
-        assert guard._serving is True
-    finally:
-        target.close()
-
-    # Only then does a replacement take the pool back and stand the Guard down.
-    # Inline, not a child: adoption only claims and reads, and this process
-    # already runs real agents beside the Guard's own.
-    framework = ctypes.create_string_buffer(page_size * 2)
-    replacement = _real_nixl_kvcr(
-        str(service.socket_path),
-        str(g3_path),
-        control_port,
-        "real-replacement",
-        framework,
-    )
-    try:
-        destination = ctypes.addressof(framework) + page_size
-        for key, payload in (
-            (BlockKey(b"resident-a"), b"A" * page_size),
-            (BlockKey(b"resident-b"), second_payload),
-        ):
-            ctypes.memset(destination, 0, len(payload))
-            operation = replacement.deliver(
-                {key: _mem_descriptor(destination, len(payload))}
-            )
-            result = dict(
-                _poll_until(replacement, bool, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
-            )[operation][key]
-            assert result.success, key
-            assert ctypes.string_at(destination, len(payload)) == payload, key
-        assert guard._serving is False
-    finally:
-        replacement.close()
