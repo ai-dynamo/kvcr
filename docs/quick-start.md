@@ -7,7 +7,7 @@ without editing source code in any of those projects.
 > [!IMPORTANT]
 > This guide uses the public, still-open vLLM
 > [KVCR secondary-tier adapter PR #53624](https://github.com/vllm-project/vllm/pull/53624)
-> at an immutable commit. Treat this as a pinned public preview until the PR is
+> at a specific pinned commit SHA. Treat this as a public preview until the PR is
 > merged and released in vLLM.
 
 For source builds, editable installs, API development, or test workflows, use
@@ -182,19 +182,9 @@ The important relationships are:
 | `control_ports` | Contains one unique port per local DP rank, in rank order |
 | `control_advertise_host` | Is reachable by peer workers; loopback is valid only on one host |
 | KV events endpoint | Does not overlap the control-port range |
-
-This example leaves `secondary_g2_slots` at its default of zero. It exercises
-direct remote framework-DRAM mode: vLLM owns the 2 GB primary host tier, while
-KVCR registers and pins those blocks for a peer transfer. It does not allocate
-a separate KVCR-owned local G2 pool. Because there is no local KVCR deposit
-target, the generic primary-to-secondary cascade may increment
-`kv_offload_tiering_cascade_job_failures`; that counter is not a peer-transfer
-result. Use the terminal source and destination telemetry in the verification
-section below to judge the transfer itself.
-
 ---
 
-## 5. Verify a KVCR peer transfer
+## 5. Verify a KVCR peer to peer transfer
 
 First make a real inference request and read the registered worker ID shared by
 the two DP ranks from the response:
@@ -250,8 +240,10 @@ successful, not partial, `remote_deliver` with the same block delta, and its
 The explicit rank selection is only for this deterministic mechanism test. In
 a normal deployment, omit the two routing headers. KVCR transfers can occur
 when load, availability, or routing constraints cause the KV router to select a
-target other than the cache-owning worker; observe them with the same terminal
-source and destination metrics.
+target other than the cache-owning worker. Confirm each such transfer in the
+post-request `KV Transfer metrics`: the source reports `transfer=success` and
+`source_write=success`, the destination reports `remote_deliver=success`, and 
+their transferred block and byte counts match.
 
 ---
 
@@ -262,7 +254,7 @@ source and destination metrics.
 - Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach
   the public vLLM source, Dynamo's GitHub repository, and PyPI.
 - Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and
-  `KVCR_VLLM_REF` is the immutable PR #53624 commit shown above.
+  `KVCR_VLLM_REF` is the pinned PR #53624 commit SHA shown above.
 - Read the final compatibility-check output. It identifies whether the Dynamo
   router build, the vLLM adapter, or KVCR failed.
 - Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together. Overriding

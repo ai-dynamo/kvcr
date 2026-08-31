@@ -22,7 +22,7 @@ ARG KVCR_VLLM_REF=PUBLIC_VLLM_PR_COMMIT_PENDING
 RUN if [ "${KVCR_VLLM_REPO}" = "PUBLIC_VLLM_PR_REPOSITORY_PENDING" ] \
       || [ "${KVCR_VLLM_REF}" = "PUBLIC_VLLM_PR_COMMIT_PENDING" ]; then \
       echo "Set KVCR_VLLM_REPO to the public vLLM repository." >&2; \
-      echo "Set KVCR_VLLM_REF to an immutable KVCR adapter commit." >&2; \
+      echo "Set KVCR_VLLM_REF to a specific pinned KVCR adapter commit SHA." >&2; \
       exit 1; \
     fi \
  && git init /src/vllm-kvcr \
