@@ -314,6 +314,34 @@ def test_page_population_falls_back(
         assert pool_file.read() == bytes(2 * mmap.PAGESIZE)
 
 
+def test_page_population_survives_partial_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """os.pwrite may legally write less than asked; the remainder must follow."""
+    monkeypatch.delattr(os, "posix_fallocate", raising=False)
+    path = tmp_path / "pool"
+    with path.open("w+b") as pool_file:
+        pool_file.truncate(mmap.PAGESIZE)
+        half = mmap.PAGESIZE // 2
+        real_pwrite = os.pwrite
+
+        def half_pwrite(fd: int, data: bytes, position: int) -> int:
+            return real_pwrite(fd, data[:half], position)
+
+        with patch("kvcr.memory.os.pwrite", side_effect=half_pwrite):
+            _populate_pages(pool_file.fileno(), 0, mmap.PAGESIZE)
+
+        pool_file.seek(0)
+        assert pool_file.read() == bytes(mmap.PAGESIZE)
+
+        with (
+            patch("kvcr.memory.os.pwrite", return_value=0),
+            pytest.raises(OSError, match="zero-length"),
+        ):
+            _populate_pages(pool_file.fileno(), 0, mmap.PAGESIZE)
+
+
 def test_attachment_rejects_wrong_permissions(
     pool_owner: _KVCRPoolOwner,
 ) -> None:

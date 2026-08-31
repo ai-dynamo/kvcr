@@ -265,6 +265,9 @@ class ZmqPeerControlChannel:
             host, port = listener.getsockname()[:2]
             port = int(port)
         except BaseException:
+            # Detached, not closed: the hold owns this descriptor until the
+            # adoption returns, and closes it on release; closing here would
+            # have the release double-close it.
             listener.detach()
             raise
         self._adopt_listener(

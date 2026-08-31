@@ -406,10 +406,11 @@ def _populate_pages(file_descriptor: int, offset: int, length: int) -> None:
     # time, so a filesystem with sub-page blocks does not leave every block but the
     # first sparse.
     end = offset + length
-    written = 0
     chunk = bytes(mmap.PAGESIZE)
-    for position in range(offset, end, mmap.PAGESIZE):
+    position = offset
+    while position < end:
         span = min(mmap.PAGESIZE, end - position)
-        written += os.pwrite(file_descriptor, chunk[:span], position)
-    if written != length:
-        raise OSError(errno.EIO, "short write reserving KVCR pool pages")
+        count = os.pwrite(file_descriptor, chunk[:span], position)
+        if count == 0:
+            raise OSError(errno.EIO, "zero-length write reserving KVCR pool pages")
+        position += count
