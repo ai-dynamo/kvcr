@@ -721,6 +721,8 @@ def _real_nixl_kvcr(
         KVCRConfig(
             nixl_agent_name=agent_name,
             nixl_listen_port=0,
+            # Both UCX and POSIX are loaded here; DRAM must not ride the file plugin.
+            nixl_dram_backend="UCX",
             inventory_report_interval_ms=0,
         ),
         KVCRBindings(

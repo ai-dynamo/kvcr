@@ -108,6 +108,11 @@ class KVCRConfig:
     inventory_report_interval_ms: int = 10
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
+    # The plugin DRAM transfers are pinned to, when set. Loading a file
+    # backend for G3 puts two plugins in one agent, and an unpinned DRAM copy
+    # is then NIXL's choice -- which can land on the file backend, which
+    # cannot carry it. None keeps NIXL's own selection.
+    nixl_dram_backend: str | None = None
 
 
 @dataclass(frozen=True)

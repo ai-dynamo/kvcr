@@ -84,6 +84,7 @@ class _LocalCopyOp(_ProgressOp):
     transfer_id: int | None = None
     success: bool = False
     cancellation_requested: bool = False
+    backend: str | None = None
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -100,6 +101,7 @@ class _LocalCopyOp(_ProgressOp):
                     self.src_descriptors,
                     self.dst_descriptors,
                     remote_side_agent=progress.nixl_agent_name,
+                    backend=self.backend,
                 )
                 self.transfer_id = transfer_id
                 self.cancellation_requested = not submitted
@@ -308,6 +310,7 @@ class _LocalDram:
         if copy_keys:
             self._kvcr._progress.submit(
                 _LocalCopyOp(
+                    backend=self._kvcr.config.nixl_dram_backend,
                     op_id=("local_copy", self._next_copy_id),
                     keys=set(copy_keys),
                     deliver_op_id=None,
@@ -710,6 +713,7 @@ class _LocalDram:
         if copy_keys:
             self._kvcr._progress.submit(
                 _LocalCopyOp(
+                    backend=self._kvcr.config.nixl_dram_backend,
                     op_id=("local_copy", self._next_copy_id),
                     keys=set(copy_keys),
                     deliver_op_id=op.op_id,
@@ -883,6 +887,7 @@ class _LocalDram:
                 else:
                     self._kvcr._progress.submit(
                         _LocalCopyOp(
+                            backend=self._kvcr.config.nixl_dram_backend,
                             op_id=("local_copy", self._next_copy_id),
                             keys={waiter.key},
                             deliver_op_id=None,
