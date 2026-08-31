@@ -340,11 +340,10 @@ def test_service_journal_is_attached_before_primary_start(
     monkeypatch.setattr(kvcr_recovery, "_KVCRCore", constructor)
     monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", make_journal)
     monkeypatch.setattr(kvcr_recovery, "_attach_journal", attach_journal)
-    recovered = (BlockKey(b"recovered"),)
     monkeypatch.setattr(
         kvcr_recovery,
         "install_recovery_records",
-        lambda _core, _records: (events.append("install"), recovered)[1],
+        lambda _core, _records: events.append("install"),
     )
     monkeypatch.setattr(
         kvcr_recovery,
@@ -379,8 +378,8 @@ def test_service_journal_is_attached_before_primary_start(
     )
     assert constructor.call_args.args[1].framework_control is primary_control
     assert constructor.call_args.args[2].g3 is g3_config
-    # The region is consumed before anything is announced, and the listener is
-    # taken last -- a failure before that leaves the hold owning the descriptor.
+    # The region is consumed after the core starts, and the listener is taken last
+    # during adoption -- a failure before that leaves the hold owning the descriptor.
     assert events == [
         "journal",
         "attach",

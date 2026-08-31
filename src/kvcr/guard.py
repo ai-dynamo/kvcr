@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Private journal-backed Guard for one service-owned pool."""
 
+import errno
 import logging
 import queue
 import threading
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 _POLL_SECONDS = 0.001
 _POLL_BATCH = 64
 _LIFECYCLE_TIMEOUT_SECONDS = 30.0
+_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
 
 
 @dataclass
@@ -333,10 +335,14 @@ class _Guard:
                 self._write_handback(
                     self._mirror.take_records(), self._configured.row_stride
                 )
-            except (RecoveryJournalError, OSError) as error:
+            except RecoveryJournalError as error:
                 # Reached before _poll noticed the same thing -- or the tail
-                # would not fit (ENOSPC). Nothing is written, so the pool
-                # comes back cold rather than partly described.
+                # was already bad. The pool comes back cold rather than partly
+                # described.
+                self._drop_recovery(error)
+            except OSError as error:
+                if error.errno not in _RECOVERY_CAPACITY_ERRORS:
+                    raise
                 self._drop_recovery(error)
         self._mirror = None
         if self._control is not None:
@@ -543,8 +549,10 @@ class _Guard:
         try:
             self._write_handback(records, row_stride)
         except OSError as error:
+            if error.errno not in _RECOVERY_CAPACITY_ERRORS:
+                raise
             # The ring-full precedent: a pool whose state will not fit at the
-            # tail (ENOSPC) is cold, not fatal. The region's error path
+            # tail (ENOSPC or EDQUOT) is cold, not fatal. The region's error path
             # truncated what it started, so the next claimant is told nothing
             # rather than half of something -- and the mirror is dropped with
             # it, because a claimant told the pool is empty must not race a

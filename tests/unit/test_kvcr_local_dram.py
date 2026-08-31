@@ -447,10 +447,7 @@ def test_a_pool_recovered_full_still_admits_a_new_deposit() -> None:
     local_dram = kvcr._core._local_dram
     assert local_dram is not None
 
-    recovered = install_recovery_records(kvcr._core, _g2_recovered(first=0, second=1))
-
-    # The returned keys are the only route from a recovered block to a router.
-    assert set(recovered) == {BlockKey(b"first"), BlockKey(b"second")}
+    install_recovery_records(kvcr._core, _g2_recovered(first=0, second=1))
 
     # Every row the pool has came back occupied, so the deposit below can only
     # land by evicting one of them.

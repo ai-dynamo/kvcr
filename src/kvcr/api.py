@@ -100,7 +100,7 @@ class KVCR:
                 )
                 _recovery.adopt_claimed_pool(core, claimed)
             core.start()
-            _recovery.commit_claimed_pool(core, claimed)
+            _recovery.commit_claimed_pool(claimed)
         except BaseException:
             if core is not None:
                 with contextlib.suppress(BaseException):

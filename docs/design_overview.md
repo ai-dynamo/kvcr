@@ -104,7 +104,7 @@ A KVCR-owned DRAM pool may be allocated by the framework and passed to KVCR, or 
 
 `KVLayoutManifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible. Matching TP layouts are sufficient for most prefill-to-prefill, decode-to-decode, and aggregated deployments. A TP-independent host representation further removes that constraint as well.
 
-If the engine or GPU fails, KVCR-Guard fences the failed owner before activating its backup KVCR. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
+If the engine or GPU fails, KVCR-Guard fences the failed owner before activating its backup KVCR. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
 
 ### State Model
 

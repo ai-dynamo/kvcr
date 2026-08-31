@@ -435,13 +435,13 @@ def _attach_journal(
 
 def install_recovery_records(
     core: _KVCRCore, records: dict[BlockKey, _BlockRecord]
-) -> tuple[BlockKey, ...]:
+) -> None:
     """Seed a core that has not started with recovered residencies.
 
     Admission runs once per block, and ranking runs after all of them.
     """
     if not records:
-        return ()
+        return
     local_dram = core._local_dram
     if local_dram is None:
         raise RecoveryMirrorError("recovered records need a local DRAM tier")
@@ -472,8 +472,6 @@ def install_recovery_records(
     local_dram.rank_recovered(records)
     if g3 is not None:
         g3.rank_recovered(records)
-
-    return tuple(records)
 
 
 @dataclass
@@ -569,8 +567,8 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
         hold._control_listener_fd = None
 
 
-def commit_claimed_pool(core: _KVCRCore, claimed: ClaimedPool | None) -> None:
-    """Take ownership of the recovered slots, now that the core is serving them.
+def commit_claimed_pool(claimed: ClaimedPool | None) -> None:
+    """Take ownership of the recovered slots once the replacement is serving.
 
     Dropping the region before start would strand the cache if start failed.
     No inventory is announced for recovered blocks: the router learned them

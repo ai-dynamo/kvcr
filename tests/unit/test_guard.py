@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Private Guard lifecycle tests."""
 
+import errno
 import logging
 import os
 import queue
@@ -730,13 +731,29 @@ def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
     guard._mirror = _RecoveryMirror()
     guard._core = Mock(_block_record_map={BlockKey(b"warm"): object()})
     guard._serving = True
-    guard._write_handback = Mock(side_effect=OSError(28, "No space left on device"))
+    guard._write_handback = Mock(
+        side_effect=OSError(errno.ENOSPC, "No space left on device")
+    )
 
     guard._hand_back(16)
 
     assert guard._serving is False
     assert guard._core is None
     assert guard._mirror is None
+
+
+def test_a_handback_with_an_unexpected_storage_error_fails() -> None:
+    guard = _configurable_guard()
+    guard._mirror = _RecoveryMirror()
+    guard._core = Mock(_block_record_map={BlockKey(b"warm"): object()})
+    guard._serving = True
+    error = OSError(errno.EIO, "I/O error")
+    guard._write_handback = Mock(side_effect=error)
+
+    with pytest.raises(OSError) as raised:
+        guard._hand_back(16)
+
+    assert raised.value is error
 
 
 def test_a_release_the_filesystem_refuses_still_releases() -> None:
@@ -746,7 +763,9 @@ def test_a_release_the_filesystem_refuses_still_releases() -> None:
     guard._configured = _ConfiguredTier.derive(_TEST_SPEC, _TierConfig(16, None))
     guard._mirror = _RecoveryMirror()
     guard._journal = _Journal()
-    guard._write_handback = Mock(side_effect=OSError(28, "No space left on device"))
+    guard._write_handback = Mock(
+        side_effect=OSError(errno.ENOSPC, "No space left on device")
+    )
 
     guard._release()
 
