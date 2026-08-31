@@ -3,7 +3,7 @@
 
 import mmap
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -69,34 +69,20 @@ def journal_and_mapping() -> Iterator[tuple[RecoveryJournal, mmap.mmap]]:
         mapping.close()
 
 
-def test_journal_wraps_without_losing_records(
+def test_a_journal_round_trips_wraps_and_dies_by_invalidation(
     journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
 ) -> None:
-    journal, _ = journal_and_mapping
-    for index in range(400):
-        key = index.to_bytes(4, "little")
-        payload = bytes([index % 256]) * 9
-        assert journal.publish(_RECORD_BLOCK, key, payload)
-        assert journal.read_next() == (_RECORD_BLOCK, key, payload)
-
-    assert journal._published.load_acquire() > journal._capacity
-    assert journal._consumed.load_acquire() == journal._published.load_acquire()
-    assert not journal.is_invalid()
-
-
-def test_round_trip_variable_width_keys_and_opaque_payloads(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-) -> None:
+    """Publish/read, drain, wrap, then invalidation stops current and future roles."""
     journal, mapping = journal_and_mapping
+
+    # Variable-width keys and opaque payloads land in the documented layout.
     records = [
         (b"", b"serialized block record"),
         (b"k", b""),
         (b"variable-width-key", bytes(range(31))),
     ]
-
     for key, payload in records:
         assert journal.publish(_RECORD_BLOCK, key, payload)
-
     assert struct.unpack_from("<Q", mapping, _INVALID_OFFSET) == (0,)
     assert struct.unpack_from("<Q", mapping, _PUBLISHED_OFFSET) == (
         sum((6 + len(key) + len(payload) + 7) // 8 * 8 for key, payload in records),
@@ -112,31 +98,71 @@ def test_round_trip_variable_width_keys_and_opaque_payloads(
     ]
     assert journal.read_next() is None
 
+    # Drain streams, so a promotion does not hold a second copy of the ring:
+    # _consumed/_published are the ring's byte cursors, and after one item the
+    # read cursor sits strictly between where it started and the write cursor.
+    for index in range(3):
+        assert journal.publish(_RECORD_BLOCK, bytes([index]), bytes([index + 3]))
+    consumed = journal._consumed.load_acquire()
+    published = journal._published.load_acquire()
+    drained = journal.drain()
+    assert next(drained) == (_RECORD_BLOCK, b"\x00", b"\x03")
+    assert consumed < journal._consumed.load_acquire() < published
+    assert list(drained) == [
+        (_RECORD_BLOCK, b"\x01", b"\x04"),
+        (_RECORD_BLOCK, b"\x02", b"\x05"),
+    ]
+    assert journal._consumed.load_acquire() == published
 
-def test_frame_larger_than_uint16_invalidates_without_publication(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-    caplog: pytest.LogCaptureFixture,
+    # The ring wraps without losing records: the write cursor passes capacity.
+    for index in range(400):
+        key = index.to_bytes(4, "little")
+        payload = bytes([index % 256]) * 9
+        assert journal.publish(_RECORD_BLOCK, key, payload)
+        assert journal.read_next() == (_RECORD_BLOCK, key, payload)
+    assert journal._published.load_acquire() > journal._capacity
+    assert journal._consumed.load_acquire() == journal._published.load_acquire()
+    assert not journal.is_invalid()
+
+    # A caught-up mirror looks finished; only re-reading the shared flag tells
+    # it the journal was invalidated by a role other than itself.
+    consumer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
+    assert journal.publish(_RECORD_BLOCK, b"key", b"payload")
+    assert consumer.read_next() is not None
+    assert consumer.read_next() is None
+    assert journal.invalidate() is False
+    with pytest.raises(RecoveryJournalError, match="invalid"):
+        consumer.read_next()
+
+    # Roles that attach after the death never start at all.
+    late_producer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
+    late_consumer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
+    assert not late_producer.publish(_RECORD_BLOCK, b"key", b"payload")
+    with pytest.raises(RecoveryJournalError, match="invalid"):
+        late_consumer.read_next()
+
+
+def _publish_oversize_frame(
+    journal: RecoveryJournal, mapping: mmap.mmap, caplog: pytest.LogCaptureFixture
 ) -> None:
-    journal, _ = journal_and_mapping
-    caplog.set_level("WARNING", logger="kvcr.recovery_journal")
+    """A frame over uint16 is refused whole: _published, the write cursor, holds."""
     assert journal.publish(_RECORD_BLOCK, b"key0", b"record")
     published = journal._published.load_acquire()
 
     assert not journal.publish(_RECORD_BLOCK, b"key", bytes(1 << 16))
+
     assert journal._published.load_acquire() == published
-    assert journal.is_invalid()
     assert caplog.messages == [
         "KVCR recovery journal invalidated: frame is 65545 bytes; "
         "maximum is 65535 bytes"
     ]
 
 
-def test_full_ring_invalidates_without_partial_publication(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
+def _fill_ring(
+    journal: RecoveryJournal, mapping: mmap.mmap, caplog: pytest.LogCaptureFixture
 ) -> None:
-    journal, _ = journal_and_mapping
+    """The frame that finds the ring full is refused whole: the cursor holds."""
     published = 0
-
     while True:
         before = journal._published.load_acquire()
         if not journal.publish(_RECORD_BLOCK, b"key", bytes(1000)):
@@ -145,91 +171,57 @@ def test_full_ring_invalidates_without_partial_publication(
 
     assert published > 0
     assert journal._published.load_acquire() == before
-    assert journal.is_invalid()
-    with pytest.raises(RecoveryJournalError, match="invalid"):
+
+
+def _tear_frame_key_size(
+    journal: RecoveryJournal, mapping: mmap.mmap, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A published frame whose key size no longer fits its frame size."""
+    assert journal.publish(_RECORD_BLOCK, b"key", b"payload")
+    struct.pack_into("<HH", mapping, _JOURNAL_HEADER_BYTES, 2, 0)
+
+
+def _tear_frame_padding(
+    journal: RecoveryJournal, mapping: mmap.mmap, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A published frame whose padding is no longer zero."""
+    assert journal.publish(_RECORD_BLOCK, b"keys", b"x")
+    mapping[_JOURNAL_HEADER_BYTES + 12] = 1
+
+
+@pytest.mark.parametrize(
+    "provoke,error",
+    [
+        (_publish_oversize_frame, "invalid"),
+        (_fill_ring, "invalid"),
+        (_tear_frame_key_size, "key size"),
+        (_tear_frame_padding, "padding"),
+    ],
+    ids=["oversize-frame", "full-ring", "torn-key-size", "torn-padding"],
+)
+def test_a_frame_the_ring_cannot_carry_invalidates_it_until_reset(
+    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
+    caplog: pytest.LogCaptureFixture,
+    provoke: Callable[[RecoveryJournal, mmap.mmap, pytest.LogCaptureFixture], None],
+    error: str,
+) -> None:
+    """Any frame the ring cannot carry invalidates it wholesale, until a reset."""
+    journal, mapping = journal_and_mapping
+    caplog.set_level("WARNING", logger="kvcr.recovery_journal")
+    provoke(journal, mapping, caplog)
+
+    with pytest.raises(RecoveryJournalError, match=error):
         journal.read_next()
+    assert journal.is_invalid()
     with pytest.raises(RecoveryJournalError, match="invalid"):
         list(journal.drain())
 
     journal.reset()
 
-    assert journal._published.load_acquire() == 0
-    assert journal._consumed.load_acquire() == 0
     assert not journal.is_invalid()
-
-
-def test_a_mirroring_consumer_notices_an_invalidation_it_did_not_make(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-) -> None:
-    """Caught up and finished look identical unless the shared flag is re-read."""
-    producer, mapping = journal_and_mapping
-    consumer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
-
-    assert producer.publish(_RECORD_BLOCK, b"key", b"payload")
-    assert consumer.read_next() is not None
-    assert consumer.read_next() is None
-
-    assert producer.invalidate() is False
-
-    with pytest.raises(RecoveryJournalError, match="invalid"):
-        consumer.read_next()
-
-
-def test_a_role_that_attaches_to_a_finished_journal_never_starts(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-) -> None:
-    """The other test covers noticing later; this one covers never starting."""
-    owner, mapping = journal_and_mapping
-    producer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
-    consumer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
-    owner.invalidate()
-
-    assert not producer.publish(_RECORD_BLOCK, b"key", b"payload")
-    with pytest.raises(RecoveryJournalError, match="invalid"):
-        consumer.read_next()
-
-
-def test_noncanonical_frame_invalidates_the_consumer(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-) -> None:
-    journal, mapping = journal_and_mapping
+    assert journal.read_next() is None
     assert journal.publish(_RECORD_BLOCK, b"key", b"payload")
-    struct.pack_into("<HH", mapping, _JOURNAL_HEADER_BYTES, 2, 0)
-
-    with pytest.raises(RecoveryJournalError, match="key size"):
-        journal.read_next()
-    assert journal.is_invalid()
-
-
-def test_nonzero_frame_padding_invalidates_the_consumer(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-) -> None:
-    journal, mapping = journal_and_mapping
-    assert journal.publish(_RECORD_BLOCK, b"keys", b"x")
-    mapping[_JOURNAL_HEADER_BYTES + 12] = 1
-
-    with pytest.raises(RecoveryJournalError, match="padding"):
-        journal.read_next()
-    assert journal.is_invalid()
-
-
-def test_drain_is_streaming_and_takes_everything(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-) -> None:
-    """Streaming, so a promotion does not hold a second copy of the ring."""
-    journal, _ = journal_and_mapping
-    for index in range(3):
-        assert journal.publish(_RECORD_BLOCK, bytes([index]), bytes([index + 3]))
-    published = journal._published.load_acquire()
-
-    records = journal.drain()
-    assert next(records) == (_RECORD_BLOCK, b"\x00", b"\x03")
-    assert 0 < journal._consumed.load_acquire() < published
-    assert list(records) == [
-        (_RECORD_BLOCK, b"\x01", b"\x04"),
-        (_RECORD_BLOCK, b"\x02", b"\x05"),
-    ]
-    assert journal._consumed.load_acquire() == published
+    assert journal.read_next() == (_RECORD_BLOCK, b"key", b"payload")
 
 
 def _pool(tmp_path: Path, pool_id: str = "pool_0") -> _KVCRPoolOwner:
@@ -255,43 +247,43 @@ def _attached(tmp_path: Path, pool_id: str = "pool_0") -> Iterator:
         owner.close()
 
 
-def test_a_handback_region_lives_past_the_pool_it_describes(tmp_path: Path) -> None:
-    """Inside the pool file, so it has no name of its own to be found under."""
+def test_a_handback_region_round_trips_and_replays_nothing_once_released(
+    tmp_path: Path,
+) -> None:
+    """A snapshot hides inside the pool file, round trips, and dies with release."""
     with _attached(tmp_path) as pool:
+        # Inside the pool file, so it has no name of its own to be found under.
         path = Path(pool._spec.path)
         assert path.stat().st_size == pool._spec.mapping_bytes
         assert set(tmp_path.iterdir()) == {path}
 
-        write_recovery_snapshot(
-            pool,
-            canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec),
-            _recovery_frames({BlockKey(b"k" * 32): _recovered_record(g2=1)}),
-        )
-
-        assert set(tmp_path.iterdir()) == {path}
-        assert path.stat().st_size > pool._spec.mapping_bytes
-
-
-def test_handback_region_round_trips_through_the_ring_mirror(tmp_path: Path) -> None:
-    with _attached(tmp_path) as pool:
         terms = canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec)
+        assert list(read_recovery_snapshot(pool, terms)) == []
+
         records = {
             BlockKey(b"a" * 32): _recovered_record(g2=3),
             BlockKey(b"b" * 32): _recovered_record(g2=4, g3=9),
             BlockKey(b"gone"): _BlockRecord(),
         }
-
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
 
+        assert set(tmp_path.iterdir()) == {path}
+        assert path.stat().st_size > pool._spec.mapping_bytes
+
         # The mirror the ring feeds, unchanged: one record format, two carriers.
+        # Its _records table is the recovered state a claimant would start from.
         mirror = _RecoveryMirror()
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)
-
         recovered = mirror._records
         assert set(recovered) == {BlockKey(b"a" * 32), BlockKey(b"b" * 32)}
         assert recovered[BlockKey(b"a" * 32)].local_dram.slot == 3
         assert recovered[BlockKey(b"b" * 32)].g3.slot == 9
+
+        # A released region is truncated away, so it replays nothing.
+        clear_recovery_snapshot(pool)
+
+        assert list(read_recovery_snapshot(pool, terms)) == []
 
 
 @pytest.mark.parametrize(
@@ -334,24 +326,6 @@ def test_an_unfinished_handback_region_is_refused(tmp_path: Path) -> None:
 
         with pytest.raises(RecoveryJournalError, match="unfinished"):
             list(read_recovery_snapshot(pool, terms))
-
-
-def test_a_released_handback_region_replays_nothing(tmp_path: Path) -> None:
-    """A released region is truncated away, so it replays nothing."""
-    with _attached(tmp_path) as pool:
-        terms = canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec)
-        assert list(read_recovery_snapshot(pool, terms)) == []
-
-        write_recovery_snapshot(
-            pool,
-            terms,
-            _recovery_frames({BlockKey(b"k" * 32): _recovered_record(g2=1)}),
-        )
-        assert list(read_recovery_snapshot(pool, terms))
-
-        clear_recovery_snapshot(pool)
-
-        assert list(read_recovery_snapshot(pool, terms)) == []
 
 
 def test_an_interrupted_rewrite_reads_as_unfinished_rather_than_as_other_terms(

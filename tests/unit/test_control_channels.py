@@ -110,20 +110,8 @@ def channel() -> Iterator[ZmqPeerControlChannel]:
         yield ready
 
 
-def test_adopting_a_listener_advertises_the_adopted_port() -> None:
-    with listening_socket() as owner:
-        port = int(owner.getsockname()[1])
-        with _channel(port, "advertised-host") as channel:
-            channel.adopt_listener(owner.detach())
-
-            # A primary needs a real advertised endpoint; a Guard reflects routes.
-            assert channel.endpoint == f"tcp://advertised-host:{port}"
-            channel.initialize()
-            with pytest.raises(RuntimeError):
-                channel.adopt_listener(-1)
-
-
 def test_construction_does_not_claim_the_port_until_it_is_needed() -> None:
+    """A channel constructs while its port is held; the conflict surfaces at use."""
     port = free_port()
     # A returning primary must construct its channel while a Guard holds the port.
     with (
@@ -150,17 +138,23 @@ def test_messages_keep_their_boundaries(pair: Pair) -> None:
     assert incoming.receive(_MESSAGE_DECODER) == _Message("ping")
 
 
-def test_one_file_descriptor_can_accompany_a_frame(pair: Pair) -> None:
+def test_a_frame_carries_at_most_one_descriptor(
+    pair: Pair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frame carries one cloexec fd; refused deliveries close every received fd."""
     sender, receiver = pair
+    receiver.settimeout(1)
+    incoming = FramedConnection(receiver)
+
+    # One descriptor accompanies its frame and arrives non-inheritable.
     received_fd: int | None = None
     with _pipe() as (read_fd, _write_fd):
         try:
             message = _Message("claim", {"pool_index": 3})
             FramedConnection(sender).send_with_fd(message, read_fd)
 
-            received, received_fd = FramedConnection(receiver).receive_with_fd(
-                _MESSAGE_DECODER
-            )
+            received, received_fd = incoming.receive_with_fd(_MESSAGE_DECODER)
 
             assert received == message
             assert received_fd is not None
@@ -170,12 +164,7 @@ def test_one_file_descriptor_can_accompany_a_frame(pair: Pair) -> None:
             if received_fd is not None:
                 os.close(received_fd)
 
-
-def test_multiple_received_descriptors_are_closed(
-    pair: Pair,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sender, receiver = pair
+    # More than one descriptor on a frame is refused, and every one is closed.
     with _pipe() as (first, _first_peer), _pipe() as (second, _second_peer):
         payload = msgspec.msgpack.encode(_Message("claim"))
         frame = _FRAME_HEADER.pack(len(payload)) + payload
@@ -186,26 +175,22 @@ def test_multiple_received_descriptors_are_closed(
 
         with _recorded_closes(monkeypatch) as closed:
             with pytest.raises(KVCRMsgFramingError, match="multiple"):
-                FramedConnection(receiver).receive_with_fd(_MESSAGE_DECODER)
+                incoming.receive_with_fd(_MESSAGE_DECODER)
 
         assert len(closed) == 2
+        receiver.recv(len(payload))  # Drain the body of the refused frame.
 
-
-def test_ancillary_frame_header_that_stops_early_is_a_truncation(
-    pair: Pair,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sender, receiver = pair
-    with _pipe() as (read_fd, _write_fd):
+    # A frame header that stops early is a truncation; its descriptor is closed.
+    with _pipe() as (late_fd, _late_peer):
         sender.sendmsg(
             [_FRAME_HEADER.pack(64)[:2]],
-            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array("i", [read_fd]))],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array("i", [late_fd]))],
         )
         sender.close()
 
         with _recorded_closes(monkeypatch) as closed:
             with pytest.raises(KVCRMsgFramingError, match="truncated"):
-                FramedConnection(receiver).receive_with_fd(_MESSAGE_DECODER)
+                incoming.receive_with_fd(_MESSAGE_DECODER)
 
         assert len(closed) == 1
 
@@ -279,7 +264,8 @@ def test_recv_checks_for_data_without_blocking() -> None:
         fake_socket.poll.assert_called_once_with(0)
 
 
-def test_shared_listener_is_adopted_after_primary_close() -> None:
+def test_an_adopted_listener_advertises_its_port_and_outlives_the_primary() -> None:
+    """An adopted listener advertises its port, serves the primary, then the Guard."""
     # The service owns the endpoint; the worker adopts it, a Guard duplicates it.
     with listening_socket() as owner:
         port = int(owner.getsockname()[1])
@@ -287,18 +273,21 @@ def test_shared_listener_is_adopted_after_primary_close() -> None:
             socket.socket(fileno=os.dup(owner.fileno()))
         )
         with (
-            _channel(port) as primary,
+            _channel(port, "advertised-host") as primary,
             closing(guarded) as guard,
             _push_socket() as sender,
         ):
             primary.adopt_listener(os.dup(owner.fileno()))
-            endpoint = primary.endpoint
+            # A primary needs a real advertised endpoint; a Guard reflects routes.
+            assert primary.endpoint == f"tcp://advertised-host:{port}"
             # A whole instance, not one assembled by __new__.
             assert guard.control_bind_address() == ("127.0.0.1", port)
             owner.close()
 
             primary.initialize()
-            sender.connect(endpoint)
+            with pytest.raises(RuntimeError):
+                primary.adopt_listener(-1)
+            sender.connect(f"tcp://127.0.0.1:{port}")
             sender.send(b"primary")
             assert _recv_until(primary, 1) == [b"primary"]
 

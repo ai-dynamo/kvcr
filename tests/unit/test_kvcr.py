@@ -44,6 +44,7 @@ from kvcr.types import BlockKey
 
 
 def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
+    """Observers see only stable transitions: bytes READY in a slot, then gone."""
     block_size = 16
     primary = ctypes.create_string_buffer(block_size * 3)
     primary.raw = b"a" * block_size + b"b" * block_size + b"c" * block_size
@@ -118,31 +119,92 @@ _UNSERVED_POOL = SimpleNamespace(
 )
 
 
-def test_a_claim_that_cannot_read_its_handback_gives_the_pool_back(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("stage", "error", "match", "expected_events"),
+    [
+        ("control-absent", ValueError, "share its control endpoint", []),
+        ("control-cannot-share", ValueError, "share its control endpoint", []),
+        (
+            "handback-unreadable",
+            RuntimeError,
+            "region unreadable",
+            ["claim", "hold.release"],
+        ),
+        (
+            "install-fails",
+            RuntimeError,
+            "install failed",
+            ["claim", "core.close", "hold.release"],
+        ),
+    ],
+    ids=[
+        "control-absent",
+        "control-cannot-share",
+        "handback-unreadable",
+        "install-fails",
+    ],
+)
+def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
+    monkeypatch, stage, error, match, expected_events
 ) -> None:
-    """The lease is live well before the caller is handed anything."""
-    released: list[str] = []
+    """Refused before the claim, or unwound after it: core closed, pool returned."""
+    events: list[str] = []
     hold = SimpleNamespace(
         local_dram=LocalDramInfo(1234, 8192, 8),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
-        release=lambda: released.append("release"),
+        release=lambda: events.append("hold.release"),
     )
-    monkeypatch.setattr(
-        kvcr_recovery,
-        "KVCRClient",
-        Mock(return_value=Mock(claim=Mock(return_value=hold))),
-    )
-    monkeypatch.setattr(
-        kvcr_recovery,
-        "read_handback",
-        Mock(side_effect=RuntimeError("region unreadable")),
-    )
-    control = Mock()
-    control.control_bind_address.return_value = ("127.0.0.1", 5555)
 
-    with pytest.raises(RuntimeError, match="region unreadable"):
+    def claim(*_args, **_kwargs) -> SimpleNamespace:
+        events.append("claim")
+        return hold
+
+    monkeypatch.setattr(
+        kvcr_recovery, "KVCRClient", Mock(return_value=Mock(claim=claim))
+    )
+    # Supplying a guard_config opts into both the service pool and the Guard, so
+    # a control that cannot share its endpoint is refused before anything is
+    # taken.
+    control: Any = Mock()
+    control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    if stage == "control-absent":
+        control = None
+    elif stage == "control-cannot-share":
+        control = SimpleNamespace(control_bind_address=None, adopt_listener=None)
+    elif stage == "handback-unreadable":
+        # The lease is live well before the caller is handed anything.
+        monkeypatch.setattr(
+            kvcr_recovery,
+            "read_handback",
+            Mock(side_effect=RuntimeError("region unreadable")),
+        )
+    elif stage == "install-fails":
+        # The core exists before wiring can fail, and it maps the pool's bytes,
+        # so it has to close before the pool goes back.
+
+        class _Core:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self._local_dram = Mock()
+                self._g3 = None
+                self._block_record_map: dict = {}
+
+            def close(self) -> None:
+                events.append("core.close")
+
+            def is_quiescent(self) -> bool:
+                return True
+
+        monkeypatch.setattr(kvcr_recovery, "_KVCRCore", _Core)
+        monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", Mock())
+        monkeypatch.setattr(kvcr_recovery, "_attach_journal", Mock())
+        monkeypatch.setattr(
+            kvcr_recovery,
+            "install_recovery_records",
+            Mock(side_effect=RuntimeError("install failed")),
+        )
+
+    with pytest.raises(error, match=match):
         KVCR(
             KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
@@ -150,83 +212,7 @@ def test_a_claim_that_cannot_read_its_handback_gives_the_pool_back(
             _GUARD_CONFIG,
         )
 
-    assert released == ["release"]
-
-
-@pytest.mark.parametrize(
-    "framework_control",
-    [None, SimpleNamespace(control_bind_address=None, adopt_listener=None)],
-    ids=["absent", "not-callable"],
-)
-def test_a_guard_config_is_refused_without_a_control_that_can_share(
-    monkeypatch, framework_control
-) -> None:
-    """Supplying one opts into both the service pool and the Guard."""
-    claim = Mock()
-    monkeypatch.setattr(
-        kvcr_recovery, "KVCRClient", Mock(return_value=Mock(claim=claim))
-    )
-
-    with pytest.raises(ValueError, match="share its control endpoint"):
-        KVCR(
-            KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
-            KVCRBindings(Mock(), Mock(), Mock(), framework_control=framework_control),
-            KVCRBackendConfigs(),
-            _GUARD_CONFIG,
-        )
-
-    claim.assert_not_called()
-
-
-def test_a_claim_that_fails_while_wiring_still_closes_its_core(monkeypatch) -> None:
-    """The core exists before anything can fail, so a failure can still close it."""
-    guarded_control = Mock()
-    guarded_control.control_bind_address.return_value = ("127.0.0.1", 5555)
-    hold = SimpleNamespace(
-        local_dram=LocalDramInfo(1234, 8192, 8),
-        _attachment=_UNSERVED_POOL,
-        _control_listener_fd=None,
-        release=Mock(),
-    )
-    closed: list[object] = []
-
-    class _Core:
-        def __init__(self, *_args, **_kwargs) -> None:
-            self._local_dram = Mock()
-            self._g3 = None
-            self._block_record_map: dict = {}
-
-        def close(self) -> None:
-            closed.append(self)
-
-        def is_quiescent(self) -> bool:
-            return True
-
-    monkeypatch.setattr(
-        kvcr_recovery,
-        "KVCRClient",
-        Mock(return_value=Mock(claim=Mock(return_value=hold))),
-    )
-    monkeypatch.setattr(kvcr_recovery, "_KVCRCore", _Core)
-    monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", Mock())
-    monkeypatch.setattr(kvcr_recovery, "_attach_journal", Mock())
-    monkeypatch.setattr(
-        kvcr_recovery,
-        "install_recovery_records",
-        Mock(side_effect=RuntimeError("install failed")),
-    )
-
-    with pytest.raises(RuntimeError, match="install failed"):
-        KVCR(
-            KVCRConfig(nixl_agent_name="target"),
-            KVCRBindings(Mock(), Mock(), Mock(), framework_control=guarded_control),
-            KVCRBackendConfigs(),
-            _GUARD_CONFIG,
-        )
-
-    # Closed before the pool went back: it was still mapping the pool's bytes.
-    assert len(closed) == 1
-    hold.release.assert_called_once_with()
+    assert events == expected_events
 
 
 @pytest.mark.parametrize(
@@ -308,6 +294,7 @@ def test_startup_timeout_retains_nonquiescent_resources(
 def test_service_journal_is_attached_before_primary_start(
     tmp_path, monkeypatch
 ) -> None:
+    """Journal, records, and listener are wired in before the core may start."""
     events: list[str] = []
     attachment = _UNSERVED_POOL
     hold = SimpleNamespace(
@@ -596,16 +583,20 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
         assert not hasattr(residency, "__dict__"), type(residency).__name__
 
 
-def test_close_reports_the_core_error_when_the_pool_release_also_fails(
-    monkeypatch, new_kvcr, caplog
+@pytest.mark.parametrize(
+    "release_fails", [False, True], ids=["release-works", "release-also-fails"]
+)
+def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
+    monkeypatch, new_kvcr, caplog, release_fails
 ) -> None:
-    """The release failure is a consequence of the core's; the cause is raised."""
+    """A quiesced core's close error is raised, but the pool release still runs."""
     kvcr = new_kvcr()
     core_error = RuntimeError("core close failed")
     monkeypatch.setattr(kvcr._core, "close", Mock(side_effect=core_error))
     monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: True)
     hold = Mock()
-    hold.release.side_effect = RuntimeError("release failed")
+    if release_fails:
+        hold.release.side_effect = RuntimeError("release failed")
     kvcr._pool_hold = hold
 
     with caplog.at_level(logging.ERROR):
@@ -614,23 +605,9 @@ def test_close_reports_the_core_error_when_the_pool_release_also_fails(
 
     assert raised.value is core_error
     hold.release.assert_called_once_with()
-    assert "Failed to release the KVCR pool after close" in caplog.text
-
-
-def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
-    monkeypatch, new_kvcr
-) -> None:
-    """Released and forgotten, even though the core's error is what is raised."""
-    kvcr = new_kvcr()
-    core_error = RuntimeError("core close failed")
-    monkeypatch.setattr(kvcr._core, "close", Mock(side_effect=core_error))
-    monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: True)
-    hold = Mock()
-    kvcr._pool_hold = hold
-
-    with pytest.raises(RuntimeError) as raised:
-        kvcr.close()
-
-    assert raised.value is core_error
-    hold.release.assert_called_once_with()
-    assert kvcr._pool_hold is None
+    if release_fails:
+        # The release failure is a consequence of the core's; it is only logged.
+        assert "Failed to release the KVCR pool after close" in caplog.text
+    else:
+        # Forgotten as well as released, so nothing can give the pool back twice.
+        assert kvcr._pool_hold is None

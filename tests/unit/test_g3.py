@@ -199,36 +199,6 @@ def _metric_totals(stats):
     return totals
 
 
-def test_g3_observer_reports_commits_and_evictions_before_exposure(tmp_path) -> None:
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    primary = ctypes.create_string_buffer(page_size * 3)
-    local = ctypes.create_string_buffer(page_size)
-    kvcr = _new_g3_kvcr(
-        tmp_path,
-        local,
-        policy=_MoveLocalToG3Policy(),
-        g3_slot_count=1,
-    )
-    g3 = kvcr._core._g3
-    assert g3 is not None
-    observed: list[tuple[BlockKey, int | None]] = []
-
-    def observe(key: BlockKey, record: _BlockRecord) -> None:
-        observed.append((key, None if record.g3 is None else record.g3.slot))
-
-    g3.observe_residency(observe)
-    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
-    address = ctypes.addressof(primary)
-    for index, key in enumerate(keys):
-        assert _deposit(kvcr, key, address + index * page_size, page_size).success
-
-    assert observed == [
-        (keys[0], 0),
-        (keys[0], None),
-        (keys[1], 0),
-    ]
-
-
 @pytest.mark.parametrize(
     ("policy", "moved_index"),
     [(G3FIFOPolicy(), 1), (G3LRUPolicy(), 0), (None, 0)],
@@ -424,51 +394,74 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     assert replacement_destination.raw == payloads[4]
 
 
-def test_a_g3_tier_recovered_full_can_still_free_a_slot(tmp_path) -> None:
-    """Recovered slots are ranked, so a spill still has somewhere to go."""
+def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
+    tmp_path,
+) -> None:
+    """Recovery rebuilds free slots and spills observably evict recovered blocks."""
     page_size = os.sysconf("SC_PAGE_SIZE")
+    primary = ctypes.create_string_buffer(page_size * 3)
     local = ctypes.create_string_buffer(page_size)
-    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=2)
-    g3 = kvcr._core._g3
-    assert g3 is not None
-
-    install_recovery_records(
-        kvcr._core,
-        {
-            BlockKey(b"first"): _BlockRecord(g3=_G3Residency(0)),
-            BlockKey(b"second"): _BlockRecord(g3=_G3Residency(1)),
-        },
-    )
-
-    assert not g3._free_slots
-    # Scored, not parked in _unscored: a slot nothing can name is a slot the
-    # tier has lost for the life of the process.
-    assert g3._unscored == set()
-    assert g3._evictable.select(set()) == BlockKey(b"first")
-
-
-def test_g3_recovery_rebuilds_free_slots(tmp_path) -> None:
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    local = ctypes.create_string_buffer(page_size)
-    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=4)
+    destination = ctypes.create_string_buffer(page_size)
+    agent = _FakeG3Agent()
+    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, g3_slot_count=3)
     g3 = kvcr._core._g3
     assert g3 is not None
     first, second = BlockKey(b"first"), BlockKey(b"second")
 
-    records = {
-        first: _BlockRecord(g3=_G3Residency(1)),
-        second: _BlockRecord(g3=_G3Residency(3)),
-    }
-    kvcr._core._block_record_map.update(records)
-    g3.adopt_recovery_slots(records)
+    install_recovery_records(
+        kvcr._core,
+        {
+            first: _BlockRecord(g3=_G3Residency(0)),
+            second: _BlockRecord(g3=_G3Residency(2)),
+        },
+    )
+    # _free_slots is the allocator's free list: recovery must rebuild it as the
+    # complement of the adopted slots without disturbing the records themselves.
+    assert tuple(g3._free_slots) == (1,)
+    assert kvcr._core._block_record_map[first].g3 == _G3Residency(0)
+    assert kvcr._core._block_record_map[second].g3 == _G3Residency(2)
+    survivor = g3._descriptor(2)
+    agent._file_data[(survivor.device_Id, survivor.addr)] = b"s" * page_size
 
-    assert tuple(g3._free_slots) == (0, 2)
-    assert kvcr._core._block_record_map[first].g3 == _G3Residency(1)
-    assert kvcr._core._block_record_map[second].g3 == _G3Residency(3)
+    observed: list[tuple[BlockKey, int | None]] = []
+
+    def observe(key: BlockKey, record: _BlockRecord) -> None:
+        observed.append((key, None if record.g3 is None else record.g3.slot))
+
+    g3.observe_residency(observe)
+
+    # The first spill lands in the rebuilt free slot; the next can only land by
+    # evicting a recovered block, and every move is reported before exposure.
+    spilled, fresh, last = (
+        BlockKey(b"spilled"),
+        BlockKey(b"fresh"),
+        BlockKey(b"last"),
+    )
+    primary_addr = ctypes.addressof(primary)
+    for index, key in enumerate((spilled, fresh, last)):
+        address = primary_addr + index * page_size
+        assert _deposit(kvcr, key, address, page_size).success
+    assert observed == [
+        (spilled, 1),
+        (first, None),
+        (fresh, 0),
+    ]
+    assert kvcr.query((spilled, first, second)) == [
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+        (QueryStatus.MISS, None),
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+    ]
+
+    deliver = kvcr.deliver(
+        {second: _mem_descriptor(ctypes.addressof(destination), page_size)}
+    )
+    assert dict(_poll_until(kvcr, bool))[deliver][second].success
+    assert destination.raw == b"s" * page_size
 
 
 @pytest.mark.parametrize("slots", [(0, 0), (0, 4)])
 def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> None:
+    """Duplicate or out-of-range recovered slots are refused and none adopted."""
     page_size = os.sysconf("SC_PAGE_SIZE")
     local = ctypes.create_string_buffer(page_size)
     kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=4)

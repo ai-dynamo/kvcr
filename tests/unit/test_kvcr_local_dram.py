@@ -422,46 +422,59 @@ def _g2_recovered(**slots: int) -> dict[BlockKey, _BlockRecord]:
     }
 
 
-def test_adopt_recovery_slots_rebuilds_ready_allocator_state() -> None:
-    local = ctypes.create_string_buffer(64)
-    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
-    first, second = BlockKey(b"first"), BlockKey(b"second")
-    records = _g2_recovered(first=2, second=0)
-
-    assert kvcr._core._local_dram is not None
-    local_dram = kvcr._core._local_dram
-    kvcr._core._block_record_map.update(records)
-    local_dram.adopt_recovery_slots(records)
-
-    assert list(local_dram._free_slots) == [1, 3]
-    del first, second
-
-
-def test_a_pool_recovered_full_still_admits_a_new_deposit() -> None:
-    """A cache worth recovering is usually a full one, so it has to stay writable."""
-    local = ctypes.create_string_buffer(32)
-    primary = ctypes.create_string_buffer(16)
-    primary.raw = b"n" * 16
+def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() -> None:
+    """New data fills the rows recovery left free; once full, a recovered row goes."""
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 3)
+    primary.raw = b"x" * block_size + b"y" * block_size + b"n" * block_size
+    local = ctypes.create_string_buffer(block_size * 4)
+    local[0:block_size] = b"s" * block_size
+    local[2 * block_size : 3 * block_size] = b"f" * block_size
     agent = FakeNixlAgent()
-    kvcr = _new_local_kvcr(agent, local, 2)
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(agent, local, 4)
     local_dram = kvcr._core._local_dram
     assert local_dram is not None
 
-    install_recovery_records(kvcr._core, _g2_recovered(first=0, second=1))
+    install_recovery_records(kvcr._core, _g2_recovered(first=2, second=0))
 
-    # Every row the pool has came back occupied, so the deposit below can only
-    # land by evicting one of them.
-    assert not local_dram._free_slots
-
-    fresh = BlockKey(b"fresh")
-    operation = kvcr.deposit({fresh: _mem_descriptor(ctypes.addressof(primary))})
-    agent.state = "DONE"
+    fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
+    operation = kvcr.deposit(
+        {
+            key: _mem_descriptor(ctypes.addressof(primary) + index * block_size)
+            for index, key in enumerate(fresh)
+        }
+    )
     completed = dict(_poll_until(kvcr, lambda results: bool(results)))
 
-    assert completed[operation] == _op_entries({fresh: True})
-    assert kvcr._core._block_record_map[fresh].local_dram is not None
-    # One recovered block gave up its row; the other kept it.
-    assert len(kvcr._core._block_record_map) == 2
+    assert completed[operation] == _op_entries({fresh[0]: True, fresh[1]: True})
+    # Nothing recovered was evicted or overwritten.
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+    keys = (first, second, *fresh)
+    assert kvcr.query(keys) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 4
+    assert local.raw[:block_size] == b"s" * block_size
+    assert local.raw[2 * block_size : 3 * block_size] == b"f" * block_size
+
+    # Every row is now occupied, so the deposit below can only land by evicting
+    # a recovered row -- a pool recovered full has to stay writable.
+    assert not local_dram._free_slots
+    extra = BlockKey(b"extra")
+    operation = kvcr.deposit(
+        {extra: _mem_descriptor(ctypes.addressof(primary) + 2 * block_size)}
+    )
+    completed = dict(_poll_until(kvcr, lambda results: bool(results)))
+
+    assert completed[operation] == _op_entries({extra: True})
+    # One recovered block gave up its row to the new bytes; the rest kept theirs.
+    assert kvcr.query((first, second, *fresh, extra)) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+    assert local.raw[:block_size] == b"s" * block_size
+    assert local.raw[2 * block_size : 3 * block_size] == b"n" * block_size
 
 
 def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
@@ -476,27 +489,27 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         install_recovery_records(kvcr._core, _g2_recovered(first=2, second=0))
 
 
-@pytest.mark.parametrize("slots", [(0, 0), (0, 4)])
-def test_adopt_recovery_slots_rejects_invalid_slots(slots: tuple[int, int]) -> None:
+@pytest.mark.parametrize(
+    "records",
+    [
+        _g2_recovered(first=0, second=0),
+        _g2_recovered(first=0, second=4),
+        {
+            BlockKey(b"first"): _BlockRecord(
+                local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)
+            )
+        },
+    ],
+    ids=["duplicate-row", "row-out-of-range", "row-never-settled"],
+)
+def test_adopt_recovery_slots_rejects_invalid_or_unsettled_rows(
+    records: dict[BlockKey, _BlockRecord],
+) -> None:
+    """Duplicate, out-of-range, or still-filling recovered rows are refused."""
     local = ctypes.create_string_buffer(64)
     kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
     local_dram = kvcr._core._local_dram
     assert local_dram is not None
 
     with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
-        local_dram.adopt_recovery_slots(_g2_recovered(first=slots[0], second=slots[1]))
-
-
-def test_adopt_recovery_slots_rejects_a_row_that_never_settled() -> None:
-    local = ctypes.create_string_buffer(64)
-    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
-    local_dram = kvcr._core._local_dram
-    assert local_dram is not None
-    unsettled = {
-        BlockKey(b"first"): _BlockRecord(
-            local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)
-        )
-    }
-
-    with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
-        local_dram.adopt_recovery_slots(unsettled)
+        local_dram.adopt_recovery_slots(records)
