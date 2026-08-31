@@ -48,6 +48,18 @@ _TEST_SPEC = KVCRPoolSpec(
     journal_bytes=8192,
 )
 _TEST_DIGEST = "opaque digest: Preserve-Me EXACTLY"
+# G3 terms are refused at decode unless a real claimant could open them, so
+# tests that carry G3 use page-aligned strides over a page-sized pool.
+_PAGE_STRIDE = os.sysconf("SC_PAGE_SIZE")
+_PAGE_SPEC = KVCRPoolSpec(
+    pool_id="pool_0",
+    path="/tmp/kvcr-pool_0-" + "a" * 32,
+    generation="a" * 32,
+    device=0,
+    inode=0,
+    mapping_bytes=8192 + 2 * _PAGE_STRIDE,
+    journal_bytes=8192,
+)
 
 
 def _fake_attachment(**overrides) -> Mock:
@@ -284,16 +296,16 @@ def test_guard_prepares_promotes_and_closes_in_ownership_order(
     monkeypatch.setattr("kvcr.guard.KVCRPoolAttachment.attach", attach)
     monkeypatch.setattr("kvcr.guard.RecoveryJournal", Mock(return_value=journal))
     monkeypatch.setattr("kvcr.guard._KVCRCore", new_core)
-    spec = _TEST_SPEC
+    spec = _PAGE_SPEC
     g3_config = _G3Config(
         paths=(str(tmp_path / "g3.data"),),
-        capacity_bytes_per_file=40960,
+        capacity_bytes_per_file=10 * _PAGE_STRIDE,
         backend="FILE",
         backend_options={},
     )
     guard = _Guard(spec, compatibility_digest=_TEST_DIGEST)
     guard.start()
-    guard.adopt(channel, _TierConfig(16, g3_config))
+    guard.adopt(channel, _TierConfig(_PAGE_STRIDE, g3_config))
     try:
         attach.assert_called_once_with(spec)
         assert journal.reset_called
@@ -308,7 +320,7 @@ def test_guard_prepares_promotes_and_closes_in_ownership_order(
         uuid.UUID(config.nixl_agent_name.removeprefix(prefix))
         assert config.nixl_listen_port == 0
         assert bindings.framework_control is channel
-        assert backends.local_dram == LocalDramInfo(1234 + 8192, 32, 2)
+        assert backends.local_dram == LocalDramInfo(1234 + 8192, 2 * _PAGE_STRIDE, 2)
         # A Guard opens no G3: it serves the G2 half and keeps the rest for the
         # primary that takes the pool back.
         assert backends.g3 is None
@@ -495,7 +507,7 @@ def test_only_the_first_committed_claim_chooses_the_tiers_a_pool_accepts(
     """Only the first committed claim fixes a pool's tiers; refusals fix nothing."""
     g3 = _G3Config(
         paths=(str(tmp_path / "g3.data"),),
-        capacity_bytes_per_file=4096,
+        capacity_bytes_per_file=_PAGE_STRIDE,
         backend="FILE",
         backend_options={},
     )
@@ -510,20 +522,21 @@ def test_only_the_first_committed_claim_chooses_the_tiers_a_pool_accepts(
         assert guard._configured is None
 
     # Unclaimed, so any shape is still available.
-    guard._refuse_incompatible(_TierConfig(16, g3))
+    guard._refuse_incompatible(_TierConfig(_PAGE_STRIDE, g3))
     guard._configure(_TierConfig(32, None))
 
     guard._refuse_incompatible(_TierConfig(32, None))
     with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
-        guard._refuse_incompatible(_TierConfig(16, g3))
+        guard._refuse_incompatible(_TierConfig(_PAGE_STRIDE, g3))
 
     # A slot names its file by position, so reordering renames every slot.
     guard._configured = _ConfiguredTier.derive(
-        _TEST_SPEC, _TierConfig(16, _G3Config(("/a", "/b"), 4096, "MOCK", {}))
+        _PAGE_SPEC,
+        _TierConfig(_PAGE_STRIDE, _G3Config(("/a", "/b"), _PAGE_STRIDE, "MOCK", {})),
     )
     with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
         guard._refuse_incompatible(
-            _TierConfig(16, _G3Config(("/b", "/a"), 4096, "MOCK", {}))
+            _TierConfig(_PAGE_STRIDE, _G3Config(("/b", "/a"), _PAGE_STRIDE, "MOCK", {}))
         )
 
 
@@ -657,11 +670,31 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored() -> None:
     # The claimant was told cold; the new lease is still mirrored, so this
     # primary's deposits survive its own death.
     assert guard._mirror is not None
+    # And the grant is retractable: the Guard it stood down can resume.
+    assert guard._resumable is True
     guard._journal.pending = [
         (_RECORD_BLOCK, b"fresh", _RECOVERY_ENCODER.encode(_RecoveryBlock(g2=1)))
     ]
     guard._poll()
     assert BlockKey(b"fresh") in guard._mirror._records
+
+
+def test_a_grant_that_never_arrived_resumes_the_guard_it_stood_down() -> None:
+    """An aborted grant re-promotes after a hand-back; otherwise it releases."""
+    guard = _configurable_guard()
+    guard._resumable = True
+    guard._serving = False
+    guard._mirror = _RecoveryMirror()
+    outcomes: list[str] = []
+    guard._promote = lambda: outcomes.append("promote")
+    guard._release = lambda: outcomes.append("release")
+
+    guard._abort()
+    assert outcomes == ["promote"]
+
+    guard._resumable = False
+    guard._abort()
+    assert outcomes == ["promote", "release"]
 
 
 def test_a_clean_release_hands_its_cache_on_instead_of_keeping_it() -> None:

@@ -157,8 +157,19 @@ class _PoolRegistry:
         for entry in self._pools.values():
             # Even an interrupt must not stop the sweep: the startup failure is
             # already propagating, and every pool left behind is committed RAM.
-            with contextlib.suppress(BaseException):
+            try:
                 entry.guard.close()
+            except BaseException:
+                # The Guard's thread may still hold this pool's mapping, and
+                # unlinking under it would fault the process. Leave the file;
+                # the next start's purge reclaims it once the process is gone.
+                logger.warning(
+                    "Failed to close KVCR Guard for %s during rollback; "
+                    "leaving its pool in place",
+                    entry.owner.spec.path,
+                    exc_info=True,
+                )
+                continue
             try:
                 entry.owner.close()
             except (BufferError, OSError):
@@ -318,6 +329,23 @@ class _PoolRegistry:
         except BaseException as error:
             # Escalated before the pool is exposed: a Guard that failed here may
             # have left a partial handback, and the next claimant could take it.
+            self._guard_failed(pool_index, pool.guard, error)
+            raise
+        finally:
+            liveness.close()
+            with self._condition:
+                if pool.holder is liveness:
+                    pool.holder = None
+                self._finish_transition_locked(pool_index)
+
+    def abort_grant(self, pool_index: int, liveness: PidfdLiveness) -> None:
+        """Take back a grant whose delivery failed; the claimant never saw it."""
+        if not self._begin_holder_transition(pool_index, liveness):
+            return
+        pool = self._pools[pool_index]
+        try:
+            pool.guard.abort_grant()
+        except BaseException as error:
             self._guard_failed(pool_index, pool.guard, error)
             raise
         finally:
@@ -504,7 +532,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         # or the pool stays held by a claimant that never heard it won.
         except BaseException:
             logger.exception("KVCR grant delivery failed; revoking the lease")
-            self._release_or_fail(pool_index, liveness)
+            self._abort_or_fail(pool_index, liveness)
             return
         self._hold(pool_index, liveness)
 
@@ -594,6 +622,12 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         if self.server.registry.is_closed():
             return
         self.server.fail(error)
+
+    def _abort_or_fail(self, pool_index: int, liveness: PidfdLiveness) -> None:
+        try:
+            self.server.registry.abort_grant(pool_index, liveness)
+        except BaseException as error:  # noqa: BLE001 - post-grant failure
+            self.server.fail(error)
 
     def _release_or_fail(
         self,

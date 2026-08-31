@@ -178,24 +178,45 @@ def _connect_with(
     )
 
 
+def test_g3_terms_no_claimant_could_open_are_refused_at_decode() -> None:
+    """The first claim fixes a pool's tiers forever, so terms the claimant's
+    G3 would reject must be refused before they bind."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    good = {
+        "paths": ("/g3/a",),
+        "capacity_bytes_per_file": page,
+        "backend": "FILE",
+        "backend_options": {},
+    }
+    with pytest.raises(ValueError, match="page aligned"):
+        _TierConfig(page // 2, _G3Config(**good))
+    with pytest.raises(ValueError, match="complete slots"):
+        _TierConfig(page, _G3Config(**{**good, "capacity_bytes_per_file": page + 1}))
+    with pytest.raises(ValueError, match="unique"):
+        _TierConfig(page, _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")}))
+    _TierConfig(page, _G3Config(**good))
+
+
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """A claim/release round-trips typed wire messages, geometry, and g3 terms."""
+    # G3 terms a real claimant could open: page-aligned stride, whole slots.
+    g3_stride = os.sysconf("SC_PAGE_SIZE")
     g3 = G3Options(
         paths=(tmp_path / "g3",),
-        capacity_bytes_per_file=8192,
+        capacity_bytes_per_file=g3_stride * 2,
         backend="FILE",
         backend_options={"mode": "direct"},
     )
     encoded_g3 = _G3Config(
         paths=(str(g3.paths[0]),),
-        capacity_bytes_per_file=8192,
+        capacity_bytes_per_file=g3_stride * 2,
         backend="FILE",
         backend_options={"mode": "direct"},
     )
-    g3_tier_config = _TierConfig(_ROW_STRIDE, encoded_g3)
+    g3_tier_config = _TierConfig(g3_stride, encoded_g3)
     events: list[str] = []
     connection = _RecordingConnection(
         [_grant(), _Released(1), _grant(tier_config=g3_tier_config), _Released(1)],
@@ -266,13 +287,13 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     # with every grant; this claim carries g3 terms across the wire.
     connection.received_fd = os.open(os.devnull, os.O_RDONLY)
     KVCRClient("/unused").claim(
-        _POOL_INDEX, _ROW_STRIDE, _DIGEST, ("127.0.0.1", 5555), g3
+        _POOL_INDEX, g3_stride, _DIGEST, ("127.0.0.1", 5555), g3
     ).release()
 
     assert connection.sent[2].tier_config == g3_tier_config
     assert msgspec.to_builtins(connection.sent[2])["tier_config"]["g3"] == {
         "paths": (str(g3.paths[0]),),
-        "capacity_bytes_per_file": 8192,
+        "capacity_bytes_per_file": g3_stride * 2,
         "backend": "FILE",
         "backend_options": {"mode": "direct"},
     }

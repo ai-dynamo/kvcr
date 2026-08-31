@@ -5,6 +5,7 @@
 import contextlib
 import errno
 import logging
+import mmap
 import os
 import socket
 import threading
@@ -49,6 +50,20 @@ class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     row_stride: Annotated[int, msgspec.Meta(gt=0)]
     g3: _G3Config | None
+
+    def __post_init__(self) -> None:
+        # Mirrors what the claimant's _G3 will enforce. The first claim fixes
+        # the pool's tiers forever, so a config no claimant could ever open
+        # must be refused here, before it binds.
+        if self.g3 is None:
+            return
+        if self.row_stride % mmap.PAGESIZE:
+            raise ValueError("G3 slot size must be page aligned")
+        if self.g3.capacity_bytes_per_file % self.row_stride:
+            raise ValueError("G3 file capacity must contain complete slots")
+        resolved = {os.path.realpath(path) for path in self.g3.paths}
+        if len(resolved) != len(self.g3.paths):
+            raise ValueError("G3 file paths must be unique")
 
 
 class _Claim(msgspec.Struct, frozen=True, tag="claim"):

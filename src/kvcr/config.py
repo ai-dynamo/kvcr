@@ -92,19 +92,6 @@ class FrameworkControl(Protocol):
     def recv(self) -> list[bytes]: ...
 
 
-class ShareableFrameworkControl(FrameworkControl, Protocol):
-    """A control whose endpoint outlives this worker.
-
-    Guarded construction requires both methods: the service binds the pool's
-    endpoint once, this worker adopts it, and the Guard answers on it after
-    this worker dies.
-    """
-
-    def control_bind_address(self) -> tuple[str, int]: ...
-
-    def adopt_listener(self, listener_fd: int) -> None: ...
-
-
 class KeyHintAdapter(Protocol):
     """Framework-specific key and router-hint interpretation."""
 

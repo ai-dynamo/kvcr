@@ -151,6 +151,7 @@ class _Guard:
         self._started = False
         self._closed = False
         self._serving = False
+        self._resumable = False
         self._failure: BaseException | None = None
         self._failure_callback = failure_callback or (lambda guard, error: None)
         self._attachment: KVCRPoolAttachment | None = None
@@ -187,6 +188,15 @@ class _Guard:
     def release(self) -> None:
         """Let the current primary go, keeping what it left for the next one."""
         self._submit(_Command("release"))
+
+    def abort_grant(self) -> None:
+        """Roll back a grant the claimant provably never received.
+
+        A failed send of the length-prefixed grant means the claimant cannot
+        decode it, so it can never map the pool: if this claim stood a serving
+        Guard down, the Guard resumes; otherwise this is an ordinary release.
+        """
+        self._submit(_Command("abort"))
 
     def close(self) -> None:
         if self._closed:
@@ -246,6 +256,8 @@ class _Guard:
                     self._adopt(command.control, command.tier_config)
                 elif command.operation == "release":
                     self._release()
+                elif command.operation == "abort":
+                    self._abort()
                 elif command.operation == "close":
                     self._close_resources()
                     self._closed = True
@@ -297,6 +309,7 @@ class _Guard:
         try:
             if self._serving:
                 self._hand_back(served_under)
+                self._resumable = True
                 if self._mirror is None:
                     # The handback did not fit, so the claimant was told cold:
                     # this lease's baseline is empty, not absent. A lease with
@@ -329,6 +342,7 @@ class _Guard:
         and dropped. Keeping it would map keys to slots a claimant, told the pool was
         empty, has since allocated over.
         """
+        self._resumable = False
         if self._failure is not None:
             raise self._failure
         assert self._configured is not None
@@ -463,7 +477,19 @@ class _Guard:
         except BaseException:  # noqa: BLE001 - retain the original failure
             logger.exception("Failed to notify KVCR-Service of Guard failure")
 
+    def _abort(self) -> None:
+        """Undo a grant that never arrived: resume serving, or release.
+
+        Resuming is safe exactly because the claimant could not decode the
+        grant -- it can never map the pool this Guard re-serves.
+        """
+        if self._resumable and not self._serving and self._mirror is not None:
+            self._promote()
+            return
+        self._release()
+
     def _promote(self) -> None:
+        self._resumable = False
         """Take the pool over from the dead primary, warm if anything survived."""
         if self._failure is not None:
             raise self._failure

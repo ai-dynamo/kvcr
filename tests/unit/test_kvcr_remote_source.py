@@ -631,3 +631,60 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     # A payload carrying no metadata still reuses whatever route is cached.
     named_only = {"target_agent": "worker-a"}
     assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
+
+
+def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
+    """NIXL must drop the dead route before the name is reused -- and a route
+    it will not drop stays cached so the unload is retried, not forgotten."""
+
+    class RemovingAgent(FakeNixlAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.removed: list[bytes] = []
+
+        def remove_remote_agent(self, handle: bytes) -> None:
+            self.removed.append(handle)
+
+    agent = RemovingAgent()
+    progress = SimpleNamespace(nixl_agent=agent)
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+    )
+    _, first = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    )
+    _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+    )
+    assert agent.removed == [first]
+
+    class StickyAgent(RemovingAgent):
+        def remove_remote_agent(self, handle: bytes) -> None:
+            raise RuntimeError("route busy")
+
+    sticky = StickyAgent()
+    progress = SimpleNamespace(nixl_agent=sticky)
+    tier._remote_agents_by_target = {}
+    _, kept = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    )
+    with pytest.raises(RuntimeError, match="route busy"):
+        _RemoteFWDram._remote_agent(
+            tier,
+            progress,
+            {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+        )
+    # Retained: matching metadata still reuses the cached route.
+    assert _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    ) == ("worker-a", kept)

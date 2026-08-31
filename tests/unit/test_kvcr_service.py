@@ -401,9 +401,11 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         duplicate.close()
         return control
 
+    # G3 terms a real claimant could open: page-aligned stride, whole slots.
+    g3_stride = os.sysconf("SC_PAGE_SIZE")
     g3 = G3Options(
         paths=((tmp_path / "g3").resolve(),),
-        capacity_bytes_per_file=8192,
+        capacity_bytes_per_file=g3_stride * 2,
         backend="FILE",
         backend_options={"mode": "direct"},
     )
@@ -419,13 +421,11 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         guard.start.assert_called_with()
         guard.adopt.assert_not_called()
 
-        hold = harness.client.claim(
-            1, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_address(), g3
-        )
+        hold = harness.client.claim(1, g3_stride, _TEST_DIGEST, _control_address(), g3)
         assert guard.adopt.call_args.args == (
             control,
             _TierConfig(
-                _TEST_ROW_STRIDE,
+                g3_stride,
                 _G3Config(
                     paths=(str(g3.paths[0]),),
                     capacity_bytes_per_file=g3.capacity_bytes_per_file,
@@ -545,6 +545,46 @@ def test_a_claim_that_cannot_give_its_endpoint_back_frees_the_pool_and_is_fatal(
         finally:
             for listener in bound:
                 listener.close()
+
+
+def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> None:
+    """The Guard decides whether a dead grant resumes serving or releases."""
+    guard = Mock()
+    liveness = _FakeLiveness()
+    with _new_registry(tmp_path, guards=[guard]) as registry:
+        registry.claim(0, _TEST_TIER_CONFIG, liveness, _control_bind(0))
+
+        registry.abort_grant(0, liveness)
+
+        guard.abort_grant.assert_called_once_with()
+        guard.release.assert_not_called()
+        assert _holders_of(registry) == {}
+        assert liveness.closed is True
+
+
+def test_a_rollback_that_cannot_stop_a_guard_leaves_its_pool_in_place(
+    tmp_path: Path,
+) -> None:
+    """Unlinking under a Guard that would not close would fault the mapping."""
+    wedged, failing = Mock(), Mock()
+    wedged.close.side_effect = RuntimeError("still holding the mapping")
+    failing.start.side_effect = RuntimeError("attach failed")
+
+    with (
+        patch("kvcr.kvcr_service._Guard", side_effect=[wedged, failing]),
+        pytest.raises(RuntimeError, match="attach failed"),
+    ):
+        _PoolRegistry(
+            tmp_path,
+            2,
+            _TEST_POOL_SIZE_BYTES,
+            _TEST_JOURNAL_BYTES,
+            _TEST_DIGEST,
+        )
+
+    # The wedged pool's file is left for the next start's purge; the pool
+    # whose Guard closed is gone with its owner.
+    assert len(list(tmp_path.iterdir())) == 1
 
 
 def test_a_dead_holder_stays_busy_until_its_watcher_promotes_the_guard(

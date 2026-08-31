@@ -11,7 +11,6 @@ Target: hint/query -> fetch/deliver -> start_write -> write_done.
 Source: start_write -> local claim/framework pin -> write -> write_done.
 """
 
-import contextlib
 import math
 import time
 from collections.abc import Collection, Iterator, Mapping
@@ -847,6 +846,21 @@ class _RemoteFWDram:
             "sender_control_endpoint": source_control_endpoint,
         }
         if not self._send_control(progress, target_control_endpoint, response):
+            # Unload before forgetting: NIXL still holds the route, and a bare
+            # cache drop would make the next add of this name fail permanently.
+            cached = self._remote_agents_by_target.get(target_agent)
+            remove = getattr(progress.nixl_agent, "remove_remote_agent", None)
+            if cached is not None and remove is not None:
+                try:
+                    remove(cached[1])
+                except Exception:
+                    # Kept in the cache, so the next refresh retries the unload.
+                    logger.warning(
+                        "Failed to unload NIXL route for %s",
+                        target_agent,
+                        exc_info=True,
+                    )
+                    return
             self._remote_agents_by_target.pop(target_agent, None)
 
     # -------------------------------------------------------------------------
@@ -1403,11 +1417,12 @@ class _RemoteFWDram:
                 self._record_progress_duration("peer_setup", reused_at, "reused")
                 return target_agent, remote_agent
             # Same name, new metadata: the process behind the name was replaced,
-            # and the cached route still points at the dead one.
+            # and the cached route still points at the dead one. A route that
+            # cannot be unloaded propagates: the retained entry retries next
+            # time instead of silently keeping the dead destination.
             remove = getattr(agent, "remove_remote_agent", None)
             if remove is not None:
-                with contextlib.suppress(Exception):
-                    remove(remote_agent)
+                remove(remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)
         started_at = kvcr._timer()
         try:
