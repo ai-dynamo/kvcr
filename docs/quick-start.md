@@ -5,10 +5,10 @@ Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack
 without editing source code in any of those projects.
 
 > [!IMPORTANT]
-> Public end-to-end availability is pending an upcoming vLLM PR containing the
-> KVCR integration. Until that PR is available, this guide is a preview and the
-> image build intentionally stops at the public-source placeholders. Once the
-> PR is public, users can supply its repository and commit to try KVCR E2E.
+> This guide uses the public, still-open vLLM
+> [KVCR secondary-tier adapter PR #53624](https://github.com/vllm-project/vllm/pull/53624)
+> at an immutable commit. Treat this as a pinned public preview until the PR is
+> merged and released in vLLM.
 
 For source builds, editable installs, API development, or test workflows, use
 the [developer guide](dev-guide.md).
@@ -35,13 +35,13 @@ Run the commands below from the KVCR repository root.
 
 ## 1. Build the integration image
 
-The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start),
-which is prepared to assemble the required integration environment after the
-public PR is available:
+The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start).
+Pin the public adapter source used by this guide, then build the integration
+image:
 
 ```bash
-export KVCR_VLLM_REPO=PUBLIC_VLLM_PR_REPOSITORY_PENDING
-export KVCR_VLLM_REF=PUBLIC_VLLM_PR_COMMIT_PENDING
+export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
+export KVCR_VLLM_REF=35ab7457aafa89d6849e40d01401c69ffff8e33a
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \
@@ -51,18 +51,28 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-Do not run this command with the placeholder values. After the public vLLM PR
-is available, replace both values with its public repository URL and immutable
-commit. No private-repository credentials should be required.
+No private-repository credentials are required. Keep the immutable commit
+unless another revision has been validated with the base image and Dynamo
+revision in this Dockerfile; do not replace it with the moving PR branch head.
+
+Only PR #53624 is selected by the build. It is stacked on the already-merged
+KV-event prerequisites
+[#52067](https://github.com/vllm-project/vllm/pull/52067) and
+[#52068](https://github.com/vllm-project/vllm/pull/52068), and the pinned tree
+already contains both, so do not fetch or apply those PRs separately. PR #53624
+provides the in-process KVCR adapter used by this configuration. The two merged
+prerequisites provide the ownership and final-residency event semantics needed
+when KVCR-owned local G2 or G3 inventory is enabled.
 
 The first build pulls the large vLLM runtime and compiles Dynamo's Rust
 bindings, so it can take several minutes even on a fast host.
 
-The build starts from the pinned vLLM nightly, fetches and applies the matching
-six-file KVCR integration from the public PR, installs the local KVCR checkout,
-and builds Dynamo at the revision that supports one KVCR control endpoint per
-data-parallel rank. Once published, the public integration revision and base
-image must be treated as one compatibility set.
+The build starts from the pinned vLLM nightly, overlays the three adapter files
+from PR #53624 and the three prerequisite KV-event files contained in the same
+tree, installs the local KVCR checkout, and builds Dynamo at the revision that
+supports one KVCR control endpoint per data-parallel rank. The public adapter
+revision, base image, and Dynamo revision must be treated as one compatibility
+set.
 
 The last build steps import all four components, verify `nixl==1.3.2`, preserve
 the base image's validated NCCL 2.30.7, guard its NumPy and protobuf ABI
@@ -198,6 +208,15 @@ The important relationships are:
 | `control_advertise_host` | Is reachable by peer workers; loopback is valid only on one host |
 | KV events endpoint | Does not overlap the control-port range |
 
+This example leaves `secondary_g2_slots` at its default of zero. It exercises
+direct remote framework-DRAM mode: vLLM owns the 2 GB primary host tier, while
+KVCR registers and pins those blocks for a peer transfer. It does not allocate
+a separate KVCR-owned local G2 pool. Because there is no local KVCR deposit
+target, the generic primary-to-secondary cascade may increment
+`kv_offload_tiering_cascade_job_failures`; that counter is not a peer-transfer
+result. Use the terminal source and destination telemetry in the verification
+section below to judge the transfer itself.
+
 For multiple hosts, replace `127.0.0.1` with an address reachable from every
 peer and bind or advertise the KV-events endpoint appropriately. NIXL and its
 UCX transport must also be configured for the intended interconnect.
@@ -255,11 +274,16 @@ env -u NATS_SERVER python3 -m dynamo.frontend \
 ```
 
 This deliberately trades locality for cross-rank traffic and is for mechanism
-validation, not a performance comparison. Wait for the periodic `KV Transfer
-metrics` log. A successful transfer reports `transfer` with result `success`
-on the source and `remote_deliver` with result `success` on the destination;
-their block and byte counts must agree. Verify this telemetry rather than
-relying only on the router's overlap score.
+validation, not a performance comparison. Selection is probabilistic: repeat
+the shared-prefix request until the frontend log shows that a different
+`dp_rank` was selected with zero local overlap.
+
+Wait for the periodic `KV Transfer metrics` log. A successful transfer reports
+`transfer` with result `success`, plus `source_write` block and byte counters,
+on the source. The destination reports `remote_deliver` with result `success`
+and the same block count; its `kv_offload_tiering_read_bytes` value must equal
+the source's `source_write` byte count. Verify this terminal telemetry rather
+than relying only on cached-token accounting or the router's overlap score.
 
 ---
 
@@ -268,9 +292,9 @@ relying only on the router's overlap score.
 ### The image does not build
 
 - Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach
-  the public KVCR-vLLM source, Dynamo's GitHub repository, and PyPI.
-- Confirm that the public vLLM PR is available and that `KVCR_VLLM_REPO` and
-  `KVCR_VLLM_REF` identify its public repository and immutable commit.
+  the public vLLM source, Dynamo's GitHub repository, and PyPI.
+- Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and
+  `KVCR_VLLM_REF` is the immutable PR #53624 commit shown above.
 - Read the final compatibility-check output. It identifies whether the Dynamo
   router build, the vLLM adapter, or KVCR failed.
 - Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together. Overriding
