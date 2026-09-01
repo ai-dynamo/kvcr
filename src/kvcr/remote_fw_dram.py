@@ -272,7 +272,6 @@ class _SourceWriteOp(_RemoteOp):
                     self.src_descriptors,
                     self.dst_descriptors[: self.completed_count],
                     remote_side_agent=self.remote_agent,
-                    backend=backend._kvcr.config.nixl_dram_backend,
                     notif_msg=_write_done_notif(
                         self.op_handle,
                         True,

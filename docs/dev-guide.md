@@ -213,13 +213,7 @@ from kvcr import KVCR, KVCRBindings
 from kvcr.config import KVCRBackendConfigs, KVCRConfig
 
 runner = KVCR(
-    config=KVCRConfig(
-        nixl_agent_name="worker-0",
-        # Pin DRAM transfers to one NIXL plugin whenever G3 loads a file
-        # backend into the same agent; unpinned, the copy is NIXL's choice,
-        # which can land on the file plugin and fail.
-        nixl_dram_backend="UCX",
-    ),
+    config=KVCRConfig(nixl_agent_name="worker-0"),
     bindings=KVCRBindings(
         request_pin=request_pin,
         poll_pin_results=poll_pin_results,

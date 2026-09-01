@@ -488,7 +488,6 @@ def _new_local_kvcr(
     capacity_low_watermark_percent=0,
     capacity_needed_callback=None,
     policy=None,
-    nixl_dram_backend=None,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -498,7 +497,6 @@ def _new_local_kvcr(
                 nixl_listen_port=1,
                 inventory_report_interval_ms=0,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
-                nixl_dram_backend=nixl_dram_backend,
             ),
             KVCRBindings(
                 pinning.request_pin,
