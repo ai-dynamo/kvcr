@@ -6,7 +6,7 @@ import fcntl
 import logging
 import os
 from collections import deque
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -28,7 +28,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .core import _KVCRCore
+    from .core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
 
@@ -156,11 +156,47 @@ class _G3:
         self._active: dict[_OpId, _G3TransferOp] = {}
         self._file_registration: Any | None = None
         self._nixl_agent: Any | None = None
+        # A no-op until something attaches: the tiers publish residency
+        # changes unconditionally, and only recovery cares to hear them.
+        self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
+            lambda key, record: None
+        )
         try:
             self._open_files()
         except Exception:
             self._close_files()
             raise
+
+    def observe_residency(
+        self, observer: Callable[[BlockKey, "_BlockRecord"], None]
+    ) -> None:
+        self._residency_observer = observer
+
+    @property
+    def _total_slots(self) -> int:
+        return len(self._paths) * self._bytes_per_file // self._slot_size
+
+    def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
+        """Take the slots already-recovered records name, before the core starts."""
+        total_slots = self._total_slots
+        occupied: set[int] = set()
+        for record in records.values():
+            residency = record.g3
+            if residency is None:
+                continue
+            slot = residency.slot
+            if type(slot) is not int or not 0 <= slot < total_slots or slot in occupied:
+                raise ValueError("invalid G3 recovery slots")
+            occupied.add(slot)
+        self._free_slots = deque(
+            slot for slot in range(total_slots) if slot not in occupied
+        )
+
+    def rank_recovered(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
+        """Make recovered slots evictable, once the policy can score them."""
+        for key, record in records.items():
+            if record.g3 is not None:
+                self._make_evictable(key)
 
     def initialize_progress(self, progress: _KVCRProgress) -> None:
         agent = progress.nixl_agent
@@ -222,7 +258,7 @@ class _G3:
         return record is not None and record.g3 is not None
 
     def telemetry_state(self) -> dict[str, int]:
-        total_slots = len(self._paths) * self._bytes_per_file // self._slot_size
+        total_slots = self._total_slots
         return {
             "g3_total_slots": total_slots,
             "g3_free_slots": len(self._free_slots),
@@ -498,6 +534,7 @@ class _G3:
                 continue
             self._remove_evictable(key)
             record.g3 = None
+            self._residency_observer(key, record)
             self._kvcr._on_remove(self._kvcr._block_meta(key, record, self._slot_size))
             self._kvcr._publish_inventory((key,), CacheTier.G3, removed=True)
             self._kvcr._prune_block_record(key)
@@ -510,6 +547,7 @@ class _G3:
         if record.g3 is not None:
             raise RuntimeError("G3 destination became resident before commit")
         record.g3 = _G3Residency(reservation.slot)
+        self._residency_observer(reservation.key, record)
         self._make_evictable(reservation.key)
         self._kvcr._publish_inventory((reservation.key,), CacheTier.G3, removed=False)
 

@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Core KVCR API, lifecycle, and close-contract tests."""
 
+import ctypes
+import logging
 import threading
-from contextlib import suppress
+from contextlib import nullcontext, suppress
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -17,22 +20,91 @@ from _kvcr_test_utils import (
     FakeTelemetryStats,
     _mem_descriptor,
     _new_kvcr,
+    _new_local_kvcr,
+    _poll_until,
 )
 
 from kvcr import KVCR, KVCRBindings
 from kvcr import api as kvcr_api
 from kvcr import progress as kvcr_progress
+from kvcr import recovery_journal as kvcr_recovery
 from kvcr.config import (
     FrameworkDramInput,
+    G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
     KVCRGuardConfig,
     LocalDramInfo,
 )
 from kvcr.core import _BlockRecord
+from kvcr.guard_protocol import KVCRPoolHold
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.memory import KVCRPoolSpec
 from kvcr.remote_fw_dram import _FwMemResidency
+from kvcr.types import BlockKey
+
+
+def _fake_hold(**fields: Any) -> SimpleNamespace:
+    """A hold double that hands its listener over exactly like the real one."""
+    hold = SimpleNamespace(**fields)
+    hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
+    return hold
+
+
+def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
+    """Observers see only stable transitions: bytes READY in a slot, then gone."""
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 3)
+    primary.raw = b"a" * block_size + b"b" * block_size + b"c" * block_size
+    local = ctypes.create_string_buffer(block_size)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(agent, local, 1)
+    backend = kvcr._core._local_dram
+    assert backend is not None
+    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    observed: list[tuple[BlockKey, int | None]] = []
+
+    def observe(key: BlockKey, record: _BlockRecord) -> None:
+        residency = record.local_dram
+        if residency is None:
+            assert 0 not in backend._free_slots
+        else:
+            assert residency.state is _LocalDramState.READY
+            assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
+        observed.append((key, None if residency is None else residency.slot))
+
+    backend.observe_residency(observe)
+    address = ctypes.addressof(primary)
+
+    first = kvcr.deposit({keys[0]: _mem_descriptor(address, block_size)})
+    _poll_until(kvcr, lambda done: first in dict(done))
+    assert observed == [(keys[0], 0)]
+
+    agent.state = "ERR"
+    failed = kvcr.deposit({keys[1]: _mem_descriptor(address + block_size, block_size)})
+    failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[failed]
+    assert not failed_result[keys[1]].success
+    assert observed == [
+        (keys[0], 0),
+        (keys[0], None),
+    ]
+
+    agent.state = "DONE"
+    third = kvcr.deposit(
+        {keys[2]: _mem_descriptor(address + 2 * block_size, block_size)}
+    )
+    _poll_until(kvcr, lambda done: third in dict(done))
+    backend.acquire_sources((keys[2],))
+    backend.retire_sources((keys[2],))
+    assert len(observed) == 3
+    backend.release_sources((keys[2],))
+    assert observed[2:] == [
+        (keys[2], 0),
+        (keys[2], None),
+    ]
+
 
 _GUARD_CONFIG = KVCRGuardConfig(
     kvcr_service_socket_path="/tmp/kvcr.sock",
@@ -40,36 +112,116 @@ _GUARD_CONFIG = KVCRGuardConfig(
     row_stride=1024,
     compatibility_digest="Opaque-Digest",
 )
+# No Guard has handed anything back, so nothing is at its handback path.
+_UNSERVED_POOL = SimpleNamespace(
+    mapped_snapshot=lambda: nullcontext(None),
+    release_snapshot_region=lambda: None,
+    _spec=KVCRPoolSpec(
+        pool_id="pool_3",
+        path="/tmp/kvcr-pool_3-" + "b" * 32,
+        generation="b" * 32,
+        device=0,
+        inode=0,
+        mapping_bytes=8192 + 32,
+        journal_bytes=8192,
+    ),
+)
 
 
-def test_service_dram_is_resolved_and_released_after_core(monkeypatch) -> None:
-    events: list[str] = []
-    hold = SimpleNamespace(
-        local_dram=LocalDramInfo(1234, 8192, 8),
-        release=lambda: events.append("hold.release"),
-    )
-    claim = Mock(return_value=hold)
-    core = Mock()
-    core.start.side_effect = lambda: events.append("core.start")
-    core.close.side_effect = lambda: events.append("core.close")
-    constructor = Mock(return_value=core)
-
-    monkeypatch.setattr(kvcr_api, "KVCRClient", Mock(return_value=Mock(claim=claim)))
-    monkeypatch.setattr(kvcr_api, "_KVCRCore", constructor)
-    controller = KVCR(
-        KVCRConfig(
-            nixl_agent_name="target",
-            nixl_listen_port=1,
+@pytest.mark.parametrize(
+    ("stage", "error", "match", "expected_events"),
+    [
+        ("control-absent", ValueError, "share its control endpoint", []),
+        ("control-cannot-share", ValueError, "share its control endpoint", []),
+        (
+            "handback-unreadable",
+            RuntimeError,
+            "region unreadable",
+            ["claim", "hold.release"],
         ),
-        KVCRBindings(Mock(), Mock(), Mock()),
-        KVCRBackendConfigs(),
-        _GUARD_CONFIG,
+        (
+            "install-fails",
+            RuntimeError,
+            "install failed",
+            ["claim", "core.close", "hold.release"],
+        ),
+    ],
+    ids=[
+        "control-absent",
+        "control-cannot-share",
+        "handback-unreadable",
+        "install-fails",
+    ],
+)
+def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
+    monkeypatch, stage, error, match, expected_events
+) -> None:
+    """Refused before the claim, or unwound after it: core closed, pool returned."""
+    events: list[str] = []
+    hold = _fake_hold(
+        local_dram=LocalDramInfo(1234, 8192, 8),
+        _attachment=_UNSERVED_POOL,
+        _control_listener_fd=None,
+        release=lambda **_kwargs: events.append("hold.release"),
     )
 
-    claim.assert_called_once_with(3, 1024, "Opaque-Digest")
-    assert constructor.call_args.args[2].local_dram is hold.local_dram
-    controller.close()
-    assert events == ["core.start", "core.close", "hold.release"]
+    def claim(*_args, **_kwargs) -> SimpleNamespace:
+        events.append("claim")
+        return hold
+
+    monkeypatch.setattr(
+        kvcr_recovery, "KVCRClient", Mock(return_value=Mock(claim=claim))
+    )
+    # Supplying a guard_config opts into both the service pool and the Guard, so
+    # a control that cannot share its endpoint is refused before anything is
+    # taken.
+    control: Any = Mock()
+    control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    if stage == "control-absent":
+        control = None
+    elif stage == "control-cannot-share":
+        control = SimpleNamespace(control_bind_address=None, adopt_listener=None)
+    elif stage == "handback-unreadable":
+        # The lease is live well before the caller is handed anything.
+        monkeypatch.setattr(
+            kvcr_recovery,
+            "read_handback",
+            Mock(side_effect=RuntimeError("region unreadable")),
+        )
+    elif stage == "install-fails":
+        # The core exists before wiring can fail, and it maps the pool's bytes,
+        # so it has to close before the pool goes back.
+
+        class _Core:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self._local_dram = Mock()
+                self._g3 = None
+                self._block_record_map: dict = {}
+
+            def close(self) -> None:
+                events.append("core.close")
+
+            def is_quiescent(self) -> bool:
+                return True
+
+        monkeypatch.setattr(kvcr_recovery, "_KVCRCore", _Core)
+        monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", Mock())
+        monkeypatch.setattr(kvcr_recovery, "_attach_journal", Mock())
+        monkeypatch.setattr(
+            kvcr_recovery,
+            "install_recovery_records",
+            Mock(side_effect=RuntimeError("install failed")),
+        )
+
+    with pytest.raises(error, match=match):
+        KVCR(
+            KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
+            KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
+            KVCRBackendConfigs(),
+            _GUARD_CONFIG,
+        )
+
+    assert events == expected_events
 
 
 @pytest.mark.parametrize(
@@ -80,10 +232,15 @@ def test_service_dram_is_resolved_and_released_after_core(monkeypatch) -> None:
 def test_startup_timeout_retains_nonquiescent_resources(
     monkeypatch, guard_config
 ) -> None:
+    # A guard_config now requires a control that can hand its endpoint over.
+    guarded_control = Mock()
+    guarded_control.control_bind_address.return_value = ("127.0.0.1", 5555)
     entered = threading.Event()
     unblock = threading.Event()
-    hold = SimpleNamespace(
+    hold = _fake_hold(
         local_dram=LocalDramInfo(1234, 8192, 8),
+        _attachment=_UNSERVED_POOL,
+        _control_listener_fd=None,
         release=Mock(),
     )
     retained: list[tuple[object, object | None]] = []
@@ -101,11 +258,14 @@ def test_startup_timeout_retains_nonquiescent_resources(
         return FakeNixlAgent()
 
     monkeypatch.setattr(
-        kvcr_api,
+        kvcr_recovery,
         "KVCRClient",
         Mock(return_value=Mock(claim=Mock(return_value=hold))),
     )
+    # Either path may build it: a plain core in api, a claimed one in recovery.
     monkeypatch.setattr(kvcr_api, "_KVCRCore", create_core)
+    monkeypatch.setattr(kvcr_recovery, "_KVCRCore", create_core)
+    monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", Mock())
     monkeypatch.setattr(kvcr_api, "_NONQUIESCENT_STARTUP_RESOURCES", retained)
     monkeypatch.setattr(kvcr_progress, "_JOIN_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(kvcr_progress, "nixl_agent", create_agent)
@@ -115,7 +275,12 @@ def test_startup_timeout_retains_nonquiescent_resources(
         with pytest.raises(RuntimeError, match="progress thread did not start"):
             KVCR(
                 KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
-                KVCRBindings(Mock(), Mock(), Mock()),
+                KVCRBindings(
+                    Mock(),
+                    Mock(),
+                    Mock(),
+                    framework_control=None if guard_config is None else guarded_control,
+                ),
                 KVCRBackendConfigs(),
                 guard_config,
             )
@@ -135,9 +300,100 @@ def test_startup_timeout_retains_nonquiescent_resources(
     assert cores[0].is_quiescent()
 
 
+def test_service_journal_is_attached_before_primary_start(
+    tmp_path, monkeypatch
+) -> None:
+    """Journal, records, and listener are wired in before the core may start."""
+    events: list[str] = []
+    attachment = _UNSERVED_POOL
+    hold = _fake_hold(
+        local_dram=LocalDramInfo(1234, 8192, 8),
+        _attachment=attachment,
+        _control_listener_fd=7,
+        release=lambda **_kwargs: events.append("hold.release"),
+    )
+    claim = Mock(return_value=hold)
+    local_dram = object()
+    g3 = object()
+    core = Mock(_local_dram=local_dram, _g3=g3)
+    core.start.side_effect = lambda: events.append("core.start")
+    core.close.side_effect = lambda: events.append("core.close")
+    constructor = Mock(return_value=core)
+    journal = object()
+
+    def make_journal(pool) -> object:
+        assert pool is attachment
+        events.append("journal")
+        return journal
+
+    def attach_journal(local, configured_journal, disk) -> None:
+        assert (local, configured_journal, disk) == (local_dram, journal, g3)
+        events.append("attach")
+
+    monkeypatch.setattr(
+        kvcr_recovery, "KVCRClient", Mock(return_value=Mock(claim=claim))
+    )
+    monkeypatch.setattr(kvcr_recovery, "_KVCRCore", constructor)
+    monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", make_journal)
+    monkeypatch.setattr(kvcr_recovery, "_attach_journal", attach_journal)
+    monkeypatch.setattr(
+        kvcr_recovery,
+        "install_recovery_records",
+        lambda _core, _records: events.append("install"),
+    )
+    monkeypatch.setattr(
+        kvcr_recovery,
+        "clear_recovery_snapshot",
+        lambda _pool: events.append("clear"),
+    )
+    primary_control = Mock()
+    primary_control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    primary_control.adopt_listener.side_effect = lambda fd: events.append(f"adopt:{fd}")
+    g3_config = G3Options(
+        paths=(tmp_path / "g3",),
+        capacity_bytes_per_file=8192,
+    )
+    controller = KVCR(
+        KVCRConfig(nixl_agent_name="target"),
+        KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
+        KVCRBackendConfigs(g3=g3_config),
+        KVCRGuardConfig(
+            kvcr_service_socket_path="/tmp/kvcr.sock",
+            pool_index=3,
+            row_stride=1024,
+            compatibility_digest="Opaque-Digest",
+        ),
+    )
+
+    claim.assert_called_once_with(
+        3,
+        1024,
+        "Opaque-Digest",
+        ("127.0.0.1", 5555),
+        g3_config,
+    )
+    assert constructor.call_args.args[1].framework_control is primary_control
+    assert constructor.call_args.args[2].g3 is g3_config
+    # The region is consumed after the core starts, and the listener is taken last
+    # during adoption -- a failure before that leaves the hold owning the descriptor.
+    assert events == [
+        "journal",
+        "attach",
+        "install",
+        "adopt:7",
+        "core.start",
+        "clear",
+    ]
+    # Disowned once the channel has it, so nothing closes the fd twice.
+    assert hold._control_listener_fd is None
+    controller.close()
+    assert events[-2:] == ["core.close", "hold.release"]
+    assert controller._pool_hold is None
+
+
 def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> None:
     client = Mock()
-    monkeypatch.setattr(kvcr_api, "KVCRClient", client)
+    monkeypatch.setattr(kvcr_recovery, "KVCRClient", client)
 
     with pytest.raises(ValueError, match="local_dram"):
         KVCR(
@@ -334,3 +590,33 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
         _FwMemResidency(_mem_descriptor(), object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__
+
+
+@pytest.mark.parametrize(
+    "release_fails", [False, True], ids=["release-works", "release-also-fails"]
+)
+def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
+    monkeypatch, new_kvcr, caplog, release_fails
+) -> None:
+    """A quiesced core's close error is raised, but the pool release still runs."""
+    kvcr = new_kvcr()
+    core_error = RuntimeError("core close failed")
+    monkeypatch.setattr(kvcr._core, "close", Mock(side_effect=core_error))
+    monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: True)
+    hold = Mock()
+    if release_fails:
+        hold.release.side_effect = RuntimeError("release failed")
+    kvcr._pool_hold = hold
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError) as raised:
+            kvcr.close()
+
+    assert raised.value is core_error
+    hold.release.assert_called_once_with()
+    if release_fails:
+        # The release failure is a consequence of the core's; it is only logged.
+        assert "Failed to release the KVCR pool after close" in caplog.text
+    else:
+        # Forgotten as well as released, so nothing can give the pool back twice.
+        assert kvcr._pool_hold is None

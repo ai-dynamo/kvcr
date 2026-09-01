@@ -16,8 +16,11 @@ Use a Linux development environment with:
 
 - Python 3.10 or newer;
 - [`uv`](https://docs.astral.sh/uv/);
-- a C/C++ runtime compatible with the NIXL wheel selected by the project; and
-- enough local memory and disk space for the tests you intend to run.
+- a C/C++ runtime compatible with the NIXL wheel selected by the project;
+- enough local memory and disk space for the tests you intend to run; and
+- for service-backed recovery, in the daemon and in every claimant: Linux 6.5
+  or newer, and the system libatomic runtime (`libatomic1` on Debian and
+  Ubuntu). Importing `kvcr` needs neither.
 
 KVCR declares its Python dependencies in `pyproject.toml`. In particular, it
 pins a compatible NIXL version. Let `uv` resolve that dependency instead of
@@ -311,8 +314,8 @@ IDs, or raw endpoints.
 ### KVCR service daemon
 
 The KVCR service daemon owns pool lifecycle. It pre-allocates `--pool-count`
-data-only pools before exposing its socket. A worker claims a pool by index; the
-pool outlives that worker but not the service:
+fixed-size pools before exposing its socket. A worker claims a pool by index;
+the pool outlives that worker but not the service:
 
 ```bash
 python -m kvcr.kvcr_service \
@@ -328,32 +331,111 @@ python -m kvcr.kvcr_service \
 | `--socket-path` | *(required)* | Unix socket the workers connect to |
 | `--pool-dir` | *(required)* | Writable directory holding the pool files |
 | `--pool-count` | *(required)* | Number of pools available by index |
-| `--pool-size-gb` | *(required)* | Data-only size of each pool |
+| `--pool-size-gb` | *(required)* | Total mapped size of each pool |
 | `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
 
+Each pool reserves a fixed 100 MiB journal, taken out of `--pool-size-gb`
+rather than added to it: a 64 GiB pool caches 64 GiB minus 100 MiB.
+
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(pool_index, row_stride, compatibility_digest)`. The digest must
-match the service exactly. The first successful claim fixes the service's row
-stride; later claims with a different stride are rejected. The returned
-`KVCRPoolHold` contains the mapped local-DRAM description and owns an exclusive
-lease on that pool.
+`KVCRClient.claim(pool_index, row_stride, compatibility_digest, control_bind)`,
+naming the address its Guard will answer on. The digest must match the service
+exactly, and callers must change it whenever the row stride or any other
+KV-cache layout term changes. The returned `KVCRPoolHold` describes the mapped
+local DRAM and owns an exclusive lease on the pool. Each claim is measured
+against its own pool only; pools do not have to agree on a stride.
+
+**A pool's configuration is fixed by its first claim.** Every later claim on
+that pool must name the same row stride and, when G3 is configured, the same
+G3 paths in the same order, the same per-file capacity, and the same backend
+and backend options; one that does not is refused for the life of the
+service, because a different layout renames the rows and slots the recovered
+records describe. Change the layout by
+restarting the service, which recreates the pools.
 
 The service grants a pool to one live claimant at a time, and pool mappings are
 not inherited by forked children. The `KVCRPoolHold` remains owned by the
-claiming process and must not be used by a forked child. A second claim is
-rejected while the claimant's pidfd reports it alive. The lease socket is
-close-on-exec, and the service continues fencing the pool by that pidfd until the
-process exits. Closing the claim connection, including an EOF, does not release a
-live claimant's lease. `KVCRPoolHold.release()` first unmaps the pool locally,
-then explicitly releases the lease and waits for the service's acknowledgement.
-If the claimant exits without releasing, the service observes its pidfd and
-makes the pool claimable again.
+claiming process and must not be used by a forked child. Applications must also
+create the shareable framework-control listener after their final fork. A second
+claim is rejected while the claimant's pidfd reports it alive. The lease socket
+is close-on-exec, and the service continues fencing the pool by that pidfd until
+the process exits. Closing the claim connection, including an EOF, does not
+release a live claimant's lease. `KVCRPoolHold.release()` first unmaps the pool
+locally, then explicitly releases the lease and waits for the service's
+acknowledgement.
 
-The same segment is reused across claims while the service runs, but this slice
-does not recover cache records, so every claimant starts cold. Service shutdown
-closes and removes all of that service's pool files. On startup, the service
-also reclaims files orphaned by a crashed service; file locks prevent it from
-removing pools that a live service or attached worker still uses.
+#### Recovery across a claimant's death
+
+A `KVCRGuardConfig` opts into the service pool and its Guard together. A
+claimant whose framework control cannot share a listener is refused rather than
+granted an unguarded pool -- recovery asked for and silently not provided is
+worse than a failed startup. Without a `KVCRGuardConfig`, KVCR neither contacts
+the service nor builds a Guard.
+
+The service binds the pool's control endpoint and hands the claimant a
+duplicate of it. When that claimant dies, the pool's Guard takes over the same
+address with the cache still in place; no second port is configured, and the
+pool stays busy to any claimant that cannot inherit the endpoint. A clean
+release instead returns the Guard to standby and the pool to claimable, and a
+replacement primary takes a served pool back keeping the recovered records
+rather than rebuilding them. Either handover costs time linear in the number of
+recovered blocks, so size it against how much cache a pool actually holds.
+
+Recovered blocks are ranked for eviction as they are installed, so a pool
+recovered full still accepts new deposits. They carry no access history, so a
+recovered block ranks below anything this process has served and is evicted
+first.
+
+Recovery covers new requests only. An operation already active when the
+claimant dies is not resumed, and may fail or remain incomplete; caller-level
+recovery has to retry it. A promoted Guard always answers a stale request --
+serving it, or failing it, even when it was promoted with nothing to serve --
+so the peer retries instead of waiting on a completion nobody will send.
+
+Every pool has a Guard for its whole life, and there is no per-pool
+containment. Any Guard failure stops the service, on the grounds that a pool
+which can no longer be recovered, and may still hold an endpoint the service
+cannot reach, is not something to limp on with.
+
+One case is deliberately not a Guard failure: a primary publishing faster than
+its Guard can mirror fills the ring. Both sides treat that as survivable -- the
+primary stops publishing, the Guard drops what it holds -- and the pool becomes
+claimable but cold if that primary dies. Recovery is lost for that pool only.
+Watch for `KVCR pool recovery disabled` if failovers stop coming back warm. The
+journal is a fixed 100 MiB whatever `--pool-size-gb` is, so the only levers are
+larger blocks, which publish fewer residency changes, or accepting a cold
+failover for that pool.
+
+A Guard serves only the recovered G2 half; it opens no G3. A block that lived
+only on disk is unavailable until a replacement primary claims the pool. The
+records naming it are carried across, so the replacement reopens the tier with
+its disk cache rather than a cold one -- the files themselves are not held in
+the meantime, which is the limitation described below.
+
+**Deployment prerequisite.** Run the service with the same NIXL backend and
+plugin environment as the engines that claim its pools. Nothing checks this for
+you; a mismatch surfaces when a replacement primary opens G3.
+
+**G3 files are not verified across a failover.** A Guard hands a replacement
+primary the G3 records it inherited without checking that the files still hold
+what those records name. Nothing holds those files while the Guard serves
+either -- a tier's exclusive lock lives with the tier, and a Guard opens no
+G3. Pointing a second KVCR at the same G3 paths is therefore not a supported
+configuration: it is not detected, and the replacement will serve whatever is
+in the slots. The intended first step -- having the service refuse two pools
+that name the same paths -- is not implemented.
+
+The same applies to a file that is simply gone. A tier recreates a missing G3
+file at its configured size, so a replacement primary that finds one deleted
+gets a zero-filled file, seats the inherited slot numbers into it, and serves
+those blocks as hits whose contents are zeros. Nothing reports it. Do not
+remove G3 files under a running service; to discard a disk cache, restart the
+service, which drops the records naming it.
+
+Service shutdown closes and removes all of that service's pool files. On
+startup, the service also reclaims files orphaned by a crashed service; file
+locks prevent it from removing pools that a live service or attached worker
+still uses.
 
 Run the focused service tests after changing this subsystem:
 
@@ -788,11 +870,14 @@ release may need to wait for NIXL quiescence even after caller-visible timeout.
 Verify that:
 
 - the socket parent and pool directory exist and are writable;
-- the pool directory has capacity for every pool plus 100 MiB metadata per
-  pool;
+- the pool directory has capacity for every pool at its full
+  `--pool-size-gb`, which already includes that pool's journal. A pool
+  changing hands briefly appends its handback snapshot past that size;
+  where there is no room for it, that handover comes back cold and the
+  service carries on;
 - another process is not listening on the socket;
 - `--pool-count` is at least one; and
-- `--pool-size-gb` is positive and finite.
+- `--pool-size-gb` is positive, finite, and larger than the 100 MiB journal.
 
 The service removes a stale socket only after confirming no live service is
 listening. It refuses to replace a socket owned by another live service.

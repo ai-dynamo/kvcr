@@ -17,6 +17,10 @@ dependencies = [
   "pyzmq>=25.0.0,<28",
   "nixl==1.3.2",
 ]
+# Not installable from here: KVCR's recovery journal loads the system libatomic
+# (Debian/Ubuntu "libatomic1", RHEL "libatomic") for 8-byte acquire/release
+# cursor operations. It is loaded on first use, so importing kvcr without it
+# works; running a KVCR-Service or claiming one of its pools does not.
 
 [dependency-groups]
 dev = [

@@ -17,7 +17,13 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr.core import _BlockRecord
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
+from kvcr.recovery_journal import (
+    RecoveryMirrorError,
+    install_recovery_records,
+)
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -223,7 +229,18 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     destination = ctypes.create_string_buffer(block_size * 2)
     primary_addr = ctypes.addressof(primary)
     primary.raw = b"a" * block_size + b"b" * block_size
-    agent = FakeNixlAgent()
+
+    class _PluginAwareAgent(FakeNixlAgent):
+        """An agent that created a backend that cannot carry DRAM."""
+
+        backend_mems = {
+            "UCX": ["DRAM_SEG", "VRAM_SEG"],
+            # A file backend advertises DRAM for its memory side too; that
+            # must not qualify it for memory-to-memory copies.
+            "POSIX": ["FILE_SEG", "DRAM_SEG"],
+        }
+
+    agent = _PluginAwareAgent()
     policy = _RecordingFIFOPolicy()
     capacity_requests: list[int] = []
     kvcr = _new_local_kvcr(
@@ -288,6 +305,11 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         (deliver, _op_entries({first_key: True, second_key: False}))
     ]
     assert destination.raw[:block_size] == b"a" * block_size
+    # Derived, not configured: every DRAM copy is pinned to the plugins that
+    # can carry it, so a file plugin loaded for G3 is never NIXL's choice.
+    assert agent.xfer_backends and all(
+        backends == ["UCX"] for backends in agent.xfer_backends
+    )
     assert [
         (meta.access_count, meta.last_access)
         for meta, _ in policy.scored
@@ -405,3 +427,105 @@ def test_local_initialize_failure_completes_without_failing_progress() -> None:
     assert kvcr._core._progress._active_transfers == {}
     assert policy.ingested == []
     assert policy.removed == []
+
+
+def _g2_recovered(**slots: int) -> dict[BlockKey, _BlockRecord]:
+    return {
+        BlockKey(name.encode()): _BlockRecord(
+            local_dram=_LocalDramResidency(slot, _LocalDramState.READY)
+        )
+        for name, slot in slots.items()
+    }
+
+
+def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() -> None:
+    """New data fills the rows recovery left free; once full, a recovered row goes."""
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 3)
+    primary.raw = b"x" * block_size + b"y" * block_size + b"n" * block_size
+    local = ctypes.create_string_buffer(block_size * 4)
+    local[0:block_size] = b"s" * block_size
+    local[2 * block_size : 3 * block_size] = b"f" * block_size
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(agent, local, 4)
+    local_dram = kvcr._core._local_dram
+    assert local_dram is not None
+
+    install_recovery_records(kvcr._core, _g2_recovered(first=2, second=0))
+
+    fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
+    operation = kvcr.deposit(
+        {
+            key: _mem_descriptor(ctypes.addressof(primary) + index * block_size)
+            for index, key in enumerate(fresh)
+        }
+    )
+    completed = dict(_poll_until(kvcr, lambda results: bool(results)))
+
+    assert completed[operation] == _op_entries({fresh[0]: True, fresh[1]: True})
+    # Nothing recovered was evicted or overwritten.
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+    keys = (first, second, *fresh)
+    assert kvcr.query(keys) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 4
+    assert local.raw[:block_size] == b"s" * block_size
+    assert local.raw[2 * block_size : 3 * block_size] == b"f" * block_size
+
+    # Every row is now occupied, so the deposit below can only land by evicting
+    # a recovered row -- a pool recovered full has to stay writable.
+    assert not local_dram._free_slots
+    extra = BlockKey(b"extra")
+    operation = kvcr.deposit(
+        {extra: _mem_descriptor(ctypes.addressof(primary) + 2 * block_size)}
+    )
+    completed = dict(_poll_until(kvcr, lambda results: bool(results)))
+
+    assert completed[operation] == _op_entries({extra: True})
+    # One recovered block gave up its row to the new bytes; the rest kept theirs.
+    assert kvcr.query((first, second, *fresh, extra)) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+    assert local.raw[:block_size] == b"s" * block_size
+    assert local.raw[2 * block_size : 3 * block_size] == b"n" * block_size
+
+
+def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
+    """It replaces the table wholesale and rebuilds the free list from it."""
+    local = ctypes.create_string_buffer(64)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
+    kvcr._core._block_record_map[BlockKey(b"held")] = _BlockRecord(
+        local_dram=_LocalDramResidency(1, _LocalDramState.READY)
+    )
+
+    with pytest.raises(RecoveryMirrorError, match="holds none"):
+        install_recovery_records(kvcr._core, _g2_recovered(first=2, second=0))
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        _g2_recovered(first=0, second=0),
+        _g2_recovered(first=0, second=4),
+        {
+            BlockKey(b"first"): _BlockRecord(
+                local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)
+            )
+        },
+    ],
+    ids=["duplicate-row", "row-out-of-range", "row-never-settled"],
+)
+def test_adopt_recovery_slots_rejects_invalid_or_unsettled_rows(
+    records: dict[BlockKey, _BlockRecord],
+) -> None:
+    """Duplicate, out-of-range, or still-filling recovered rows are refused."""
+    local = ctypes.create_string_buffer(64)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
+    local_dram = kvcr._core._local_dram
+    assert local_dram is not None
+
+    with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
+        local_dram.adopt_recovery_slots(records)

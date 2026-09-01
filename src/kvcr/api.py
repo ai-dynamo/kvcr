@@ -3,10 +3,12 @@
 """Public northbound API for the KV Cache Runner."""
 
 import contextlib
+import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from . import recovery_journal as _recovery
 from .config import (
     FrameworkControl,
     InventorySink,
@@ -23,7 +25,7 @@ from .core import (  # noqa: F401 - public re-exports
     TRANSFER_BYTES_METRIC,
     _KVCRCore,
 )
-from .guard_protocol import KVCRClient, KVCRPoolHold
+from .guard_protocol import KVCRPoolHold
 from .types import (
     BlockKey,
     CacheTier,
@@ -40,6 +42,9 @@ from .types import (
 
 if TYPE_CHECKING:
     from .policy import KVCachePolicy
+
+
+logger = logging.getLogger(__name__)
 
 
 # Startup failure is terminal for the process. Retain native resources until exit
@@ -79,33 +84,39 @@ class KVCR:
         backend_configs: KVCRBackendConfigs,
         guard_config: KVCRGuardConfig | None = None,
     ) -> None:
+        claimed: _recovery.ClaimedPool | None = None
         pool_hold: KVCRPoolHold | None = None
         core: _KVCRCore | None = None
         try:
-            if guard_config is not None:
-                if backend_configs.local_dram is not None:
-                    raise ValueError(
-                        "guard_config conflicts with backend_configs.local_dram"
-                    )
-                pool_hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
-                    guard_config.pool_index,
-                    guard_config.row_stride,
-                    guard_config.compatibility_digest,
+            if guard_config is None:
+                core = _KVCRCore(config, bindings, backend_configs)
+            else:
+                claimed = _recovery.claim_guarded_pool(
+                    guard_config, bindings, backend_configs
                 )
-                backend_configs = replace(
-                    backend_configs, local_dram=pool_hold.local_dram
+                pool_hold = claimed.hold
+                core = _recovery.claimed_core(
+                    config, bindings, backend_configs, claimed
                 )
-            core = _KVCRCore(config, bindings, backend_configs)
+                _recovery.adopt_claimed_pool(core, claimed)
             core.start()
+            _recovery.commit_claimed_pool(claimed)
         except BaseException:
+            close_failed = False
             if core is not None:
-                with contextlib.suppress(BaseException):
+                try:
                     core.close()
-            if core is not None and not core.is_quiescent():
+                except BaseException:
+                    close_failed = True
+            if core is not None and (close_failed or not core.is_quiescent()):
+                # A close that raised may have kept the adopted listener even
+                # though NIXL went quiescent; a Guard resumed beside it would
+                # split the endpoint. Retained until this process dies, when
+                # the pidfd frees the pool.
                 _NONQUIESCENT_STARTUP_RESOURCES.append((core, pool_hold))
             elif pool_hold is not None:
                 with contextlib.suppress(BaseException):
-                    pool_hold.release()
+                    pool_hold.release(activated=False)
             raise
         self._core = core
         self._pool_hold = pool_hold
@@ -193,8 +204,25 @@ class KVCR:
         return self._core.get_stats()
 
     def close(self) -> None:
-        """Stop progress and release controller-held resources."""
-        self._core.close()
+        """Stop progress and release controller-held resources.
+
+        A core that failed to close but reached quiescence still gives the pool
+        back: nothing is moving through it.
+        """
+        try:
+            self._core.close()
+        except BaseException:
+            if not self._core.is_quiescent():
+                raise
+            try:
+                self._release_pool_hold()
+            except BaseException:
+                # The core failure is the cause; this is its consequence.
+                logger.exception("Failed to release the KVCR pool after close")
+            raise
+        self._release_pool_hold()
+
+    def _release_pool_hold(self) -> None:
         pool_hold = self._pool_hold
         if pool_hold is not None:
             pool_hold.release()

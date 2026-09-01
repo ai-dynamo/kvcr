@@ -111,3 +111,7 @@ class PlacementFailure:
     source: CacheTier
     reason: str
     failure_count: int
+
+
+class RecoveryMirrorError(RuntimeError):
+    """The recovery stream cannot describe a valid cache state."""

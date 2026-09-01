@@ -349,6 +349,67 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert target_control.sent == []
 
 
+def _acked_deliver(control, kvcr, source, key):
+    """Drive a deliver whose start_write carries no metadata, and return it."""
+    kvcr.submit_hint((), src=source, request_id="metadata")
+    _wait_until(lambda: len(control.sent) == 1)
+    control.incoming.append(
+        msgspec.msgpack.encode(
+            {"type": "target_metadata_ack", "sender_control_endpoint": source}
+        )
+    )
+    _wait_until(lambda: not control.incoming)
+    control.sent = []
+
+    kvcr.submit_hint([key], src=source, request_id="load")
+    op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
+    _wait_until(lambda: len(control.sent) == 1)
+    sent = _decode_control_message(control.sent[-1][1])
+    assert sent["type"] == "start_write"
+    assert "target_agent_metadata" not in sent
+    return op_handle, sent["op_handle"]
+
+
+def test_only_a_refusal_from_this_operation_s_source_finishes_it():
+    """A deliver has no other way out, and no other sender may take it."""
+    control = FakeBytesControl()
+    kvcr = _new_kvcr(
+        FakeNixlAgent(metadata=b"target-md"),
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target"),
+    )
+    now = [0.0]
+    kvcr._core._clock = lambda: now[0]
+    source = "tcp://source:1"
+    key = BlockKey(b"k0")
+    handle, op_handle = _acked_deliver(control, kvcr, source, key)
+
+    def refuse(sender: str) -> None:
+        control.incoming.append(
+            msgspec.msgpack.encode(
+                {
+                    "type": "write_refused",
+                    "sender_control_endpoint": sender,
+                    "op_handle": op_handle,
+                }
+            )
+        )
+        _wait_until(lambda: not control.incoming)
+
+    refuse("tcp://stranger:9999")
+    completed = []
+    for _ in range(50):
+        completed.extend(kvcr.poll_completed())
+        time.sleep(0.002)
+    assert completed == []
+
+    refuse(source)
+    assert _poll_until(kvcr, lambda done: bool(done)) == [
+        (handle, _op_entries({key: False}))
+    ]
+
+
 def test_kvcr_metadata_ack_retry_lifecycle():
     agent = FakeNixlAgent(metadata=b"target-md")
     pinning = FakePrimaryPinning()
@@ -393,6 +454,9 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     assert _poll_until(kvcr, lambda completed: bool(completed)) == [
         (op_handle, _op_entries({key: False}))
     ]
+    acked_start_write = _decode_control_message(control.sent[-1][1])
+    assert acked_start_write["type"] == "start_write"
+    assert "target_agent_metadata" not in acked_start_write
 
     control.send_result = True
     control.sent = []
@@ -449,8 +513,7 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
 
 
 def test_kvcr_target_ignores_unknown_op_handle_notification():
-    """A NIXL write_done notif carrying an op_handle we never issued is
-    dropped without corrupting state."""
+    """A write_done for an op_handle we never issued is dropped, not applied."""
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl()
     kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)

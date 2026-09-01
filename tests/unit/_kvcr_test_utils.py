@@ -3,10 +3,13 @@
 """Shared fakes and builders for KVCR integration-style unit tests."""
 
 import ctypes
+import random
+import socket
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -16,12 +19,16 @@ import msgspec
 from kvcr import KVCR, KVCRBindings
 from kvcr import progress as kvcr_progress
 from kvcr.config import (
+    FrameworkDramInput,
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
     LocalDramInfo,
     RemoteFWDramOptions,
 )
+from kvcr.core import _BlockRecord
+from kvcr.local_disk import _G3Residency
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
 from kvcr.types import (
     BlockKey,
@@ -33,6 +40,43 @@ from kvcr.types import (
 )
 
 _OPEN_KVCRS: list[KVCR] = []
+
+
+_HANDED_OUT: set[int] = set()
+
+
+def _ephemeral_floor() -> int:
+    """The lowest port the kernel hands out for a bind to port 0."""
+    try:
+        text = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text()
+        return int(text.split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+
+
+@contextmanager
+def listening_socket(port: int = 0) -> Iterator[socket.socket]:
+    with socket.create_server(("127.0.0.1", port)) as listener:
+        yield listener
+
+
+def free_port() -> int:
+    """A port this suite can bind now and still find free in a moment."""
+    ceiling = _ephemeral_floor() - 1
+    floor = max(1024, ceiling // 2)
+    for _ in range(50):
+        port = random.randint(floor, ceiling)
+        # Picking a port can repeat; a test that asks twice must not get one twice.
+        if port in _HANDED_OUT:
+            continue
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        _HANDED_OUT.add(port)
+        return port
+    raise RuntimeError(f"no free port in [{floor}, {ceiling}]")
 
 
 class FakeTelemetryStats:
@@ -226,6 +270,7 @@ class FakeNixlAgent:
         self.deregistered: list[Any] = []
         self.remote_agents: list[bytes] = []
         self.xfers: list[tuple[Any, ...]] = []
+        self.xfer_backends: list[list[str] | None] = []
         self.transfers: list[int] = []
         self.sent_notifs: list[tuple[bytes, bytes]] = []
         self.released_xfers: list[int] = []
@@ -271,6 +316,7 @@ class FakeNixlAgent:
                 notif_msg,
             )
         )
+        self.xfer_backends.append(backends)
         return len(self.xfers)
 
     def transfer(self, handle):
@@ -398,6 +444,7 @@ def _new_kvcr(
     name: str = "target",
     key_hint_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
+    framework_dram: FrameworkDramInput | None = None,
     local_dram: LocalDramInfo | None = None,
     g3: G3Options | None = None,
     inventory_sink=None,
@@ -423,6 +470,7 @@ def _new_kvcr(
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),
             KVCRBackendConfigs(
+                framework_dram=framework_dram,
                 local_dram=local_dram,
                 g3=g3,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
@@ -493,3 +541,13 @@ class _RecordingFIFOPolicy(FIFOPolicy):
 class _MatchingHintAdapter:
     def matches(self, key, hint):
         return hint == "hint"
+
+
+def _recovered_record(*, g2: int | None = None, g3: int | None = None) -> _BlockRecord:
+    """A block record as recovery rebuilds one: settled residencies, nothing live."""
+    return _BlockRecord(
+        local_dram=(
+            None if g2 is None else _LocalDramResidency(g2, _LocalDramState.READY)
+        ),
+        g3=None if g3 is None else _G3Residency(g3),
+    )

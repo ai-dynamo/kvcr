@@ -5,7 +5,8 @@
 import logging
 import threading
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
@@ -26,7 +27,9 @@ from _kvcr_test_utils import (
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig
-from kvcr.types import BlockKey, PinRequestId
+from kvcr.core import _BlockRecord, _KVCRCore
+from kvcr.remote_fw_dram import _FwMemResidency, _RemoteFWDram, _SourcePinOp
+from kvcr.types import BlockKey, PinHandle, PinRequestId
 
 
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
@@ -241,8 +244,7 @@ def test_kvcr_source_async_transfer_error_notifies_failure():
 
 
 def test_kvcr_source_ignores_malformed_control_messages():
-    """Garbage bytes or unknown payloads on the control PULL socket must not
-    crash the scheduler thread and must not trigger side effects."""
+    """Malformed control payloads never crash the scheduler or cause effects."""
     source_agent = FakeNixlAgent(metadata=b"source-md")
     pinning = FakePrimaryPinning()
     control = FakeBytesControl()
@@ -549,3 +551,147 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
         1,
         ("source_write",),
     ) in stats.records
+
+
+def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
+    """fw_mem belongs to the block, so two writes can want the same pin."""
+    backend = object.__new__(_RemoteFWDram)
+    kvcr = object.__new__(_KVCRCore)
+    kvcr._block_record_map = {}
+    kvcr._framework_pin_keys = {}
+    kvcr._local_dram_sources_by_op = {}
+    kvcr._progress = Mock()
+    kvcr._add_block_dependencies = Mock()
+    kvcr._remove_block_dependencies = Mock()
+    kvcr._claim_local_dram_sources = Mock(return_value={})
+    kvcr._release_local_dram_sources = Mock()
+    backend._kvcr = kvcr
+    backend._source_pin_ops = {}
+    backend._fw_pins_by_op = {}
+    released: list[PinHandle] = []
+    backend._release_framework_pins = released.extend
+
+    key = BlockKey(b"shared")
+    borrowed = PinHandle("pinned-by-the-other-operation")
+    kvcr._block_record_map[key] = _BlockRecord(
+        fw_mem=_FwMemResidency(_mem_descriptor(), borrowed)
+    )
+
+    # This operation acquired a pin of its own for a key it no longer needs.
+    stale = PinHandle("acquired-here")
+    waiting = _SourcePinOp(
+        started_at=0.0,
+        deadline=10.0,
+        remote_agent=b"peer",
+        op_handle=1,
+        ordered_keys=(key,),
+        dst_descriptors=(_mem_descriptor(),),
+        op_id=("source", 1),
+        keys={key},
+        framework_pins={stale},
+    )
+    backend._source_pin_ops[("source", 1)] = waiting
+
+    backend._submit_prepared_source_write(("source", 1), waiting)
+
+    submitted = kvcr._progress.submit.call_args.args[0]
+    assert borrowed in submitted.framework_pins, (
+        "the resumed write reads through this pin but does not hold it"
+    )
+    assert backend._fw_pins_by_op[submitted.op_id] == {borrowed}
+    # And the one it acquired but does not read through is handed back.
+    assert released == [stale]
+
+
+def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> None:
+    """Same peer name with new metadata re-adds the NIXL route; identical
+    metadata keeps reusing the cached one."""
+    agent = FakeNixlAgent()
+    progress = SimpleNamespace(nixl_agent=agent)
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+        _route_generation={},
+    )
+    payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
+
+    first = _RemoteFWDram._remote_agent(tier, progress, payload)
+
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == first
+    assert agent.remote_agents == [b"gen-1"]
+
+    replaced = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+    )
+
+    assert agent.remote_agents == [b"gen-1", b"gen-2"]
+    assert replaced[1] != first[1]
+    # The bump is what fences queued predecessor operations off the new route.
+    assert tier._route_generation == {"worker-a": 1}
+    # A payload carrying no metadata still reuses whatever route is cached.
+    named_only = {"target_agent": "worker-a"}
+    assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
+
+
+def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
+    """NIXL must drop the dead route before the name is reused -- and a route
+    it will not drop stays cached so the unload is retried, not forgotten."""
+
+    class RemovingAgent(FakeNixlAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.removed: list[bytes] = []
+
+        def remove_remote_agent(self, handle: bytes) -> None:
+            self.removed.append(handle)
+
+    agent = RemovingAgent()
+    progress = SimpleNamespace(nixl_agent=agent)
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+        _route_generation={},
+    )
+    _, first = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    )
+    _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+    )
+    assert agent.removed == [first]
+
+    class StickyAgent(RemovingAgent):
+        def remove_remote_agent(self, handle: bytes) -> None:
+            raise RuntimeError("route busy")
+
+    sticky = StickyAgent()
+    progress = SimpleNamespace(nixl_agent=sticky)
+    tier._remote_agents_by_target = {}
+    tier._route_generation = {}
+    _, kept = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    )
+    with pytest.raises(RuntimeError, match="route busy"):
+        _RemoteFWDram._remote_agent(
+            tier,
+            progress,
+            {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+        )
+    # No bump: the route was not replaced, so queued operations stay valid.
+    assert tier._route_generation == {}
+    # Retained: matching metadata still reuses the cached route.
+    assert _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    ) == ("worker-a", kept)

@@ -175,6 +175,10 @@ class _TargetPullOp(_RemoteOp):
         if now >= self.deadline:
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 return False, False
+            # TODO: Safely retry operations that span primary-to-Guard promotion. A
+            # deadline says the write has not been reported, not that the source cannot
+            # still make it, so the destination is held rather than handed back. Until
+            # then, callers must submit a new request.
             self.state = _TargetPullState.WAITING_TERMINAL
             if self.local_fill:
                 backend._progress_outbound.append(
@@ -199,8 +203,10 @@ class _SourcePinOp(_Op):
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[MemDescriptor, ...]
+    route: tuple[str, int] = ("", 0)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
+    framework_acquire_attempted: bool = False
 
 
 @dataclass
@@ -226,6 +232,7 @@ class _SourceWriteOp(_RemoteOp):
     transfer_id: int | None = None
     success: bool = False
     completed_count: int = 0
+    route: tuple[str, int] = ("", 0)
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -248,6 +255,16 @@ class _SourceWriteOp(_RemoteOp):
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
+            route_name, route_generation = self.route
+            if route_name and (
+                backend._route_generation.get(route_name, 0) != route_generation
+            ):
+                # Re-checked here, on the thread that submits: the route can be
+                # replaced between queueing and this write, and NIXL hands the
+                # same handle back for a reused name. The target hears a
+                # refusal instead of receiving the dead generation's bytes.
+                self.state = _SourceWriteState.NOTIFY_FAILURE
+                return False, True
             submit_started_at = backend._kvcr._timer()
             try:
                 transfer_id, submitted = progress.submit_transfer(
@@ -391,10 +408,15 @@ class _RemoteFWDram:
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
-        self._remote_agents_by_target: dict[str, bytes] = {}
+        self._remote_agents_by_target: dict[str, tuple[bytes, bytes]] = {}
+        # Bumped whenever a name's route is replaced: NIXL hands the same
+        # handle back for a reused name, so queued operations from the dead
+        # generation must be fenced by number, not by handle.
+        self._route_generation: dict[str, int] = {}
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
+        self._refused_writes: dict[_OpId, dict[str, bool]] = {}
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
 
@@ -674,7 +696,9 @@ class _RemoteFWDram:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
         observed_work |= self._process_control_messages(progress)
-        events = self._poll_notifications(progress)
+        # A real notification outranks a refusal for the same operation.
+        events = {**self._refused_writes, **self._poll_notifications(progress)}
+        self._refused_writes.clear()
         observed_work |= bool(events)
         return events, observed_work
 
@@ -723,6 +747,8 @@ class _RemoteFWDram:
                 self._handle_target_metadata(progress, payload)
             elif message_type == "target_metadata_ack":
                 self._handle_target_metadata_ack(payload)
+            elif message_type == "write_refused":
+                self._handle_write_refused(progress, payload)
             elif message_type == "start_write":
                 self._handle_start_write(progress, payload)
             else:
@@ -747,10 +773,12 @@ class _RemoteFWDram:
         payload["target_agent"] = kvcr.nixl_agent_name
         sender_endpoint = getattr(self._control, "endpoint", None)
         if isinstance(sender_endpoint, str):
-            payload["sender_control_endpoint"] = sender_endpoint
+            payload.setdefault("sender_control_endpoint", sender_endpoint)
         message_type = payload.get("type")
+        if message_type != "target_metadata_ack":
+            payload["source_control_endpoint"] = endpoint
         includes_metadata = (
-            message_type != "target_metadata_ack"
+            message_type not in ("target_metadata_ack", "write_refused")
             and endpoint not in self._metadata_acked_sources
             and (
                 message_type in ("target_metadata", "start_write")
@@ -789,6 +817,25 @@ class _RemoteFWDram:
         except Exception:
             return
 
+    def _handle_write_refused(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        endpoint = payload.get("sender_control_endpoint")
+        op_handle = payload.get("op_handle")
+        if not isinstance(endpoint, str) or type(op_handle) is not int:
+            return
+        op = progress._in_flight_ops.get(("target", op_handle))
+        if getattr(op, "remote_ctrl_ep", None) != endpoint:
+            return
+        # Whatever answered is not the process our metadata was loaded into, so
+        # drop the snapshot and let the next request republish it.
+        self._invalidate_control_peer(endpoint)
+        # A refusal is only sent before a write is submitted, so it is as terminal as a
+        # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
+        # unauthenticated: a "resend it" signal on a channel already trusted to let a
+        # start_write make a source write.
+        self._refused_writes[("target", op_handle)] = {"success": False}
+
     def _handle_target_metadata_ack(self, payload: dict[str, Any]) -> None:
         source_endpoint = payload.get("sender_control_endpoint")
         if not isinstance(source_endpoint, str) or not source_endpoint:
@@ -807,12 +854,19 @@ class _RemoteFWDram:
         target_control_endpoint = payload.get("sender_control_endpoint")
         if not isinstance(target_control_endpoint, str) or not target_control_endpoint:
             return
-        if not self._send_control(
-            progress,
-            target_control_endpoint,
-            {"type": "target_metadata_ack"},
-        ):
-            self._remote_agents_by_target.pop(target_agent, None)
+        source_control_endpoint = payload.get("source_control_endpoint")
+        if not isinstance(source_control_endpoint, str) or not source_control_endpoint:
+            return
+        response: dict[str, Any] = {
+            "type": "target_metadata_ack",
+            "sender_control_endpoint": source_control_endpoint,
+        }
+        if not self._send_control(progress, target_control_endpoint, response):
+            # Kept, route and cache both: an operation this start_write queued
+            # still transfers over this route, and the peer re-sends its
+            # metadata until the ack lands -- matching bytes reuse the entry,
+            # changed bytes replace it through the refresh path.
+            return
 
     # -------------------------------------------------------------------------
     # Source side: progress parses, main pins, then progress writes to the target.
@@ -880,6 +934,7 @@ class _RemoteFWDram:
                 op_handle=op_handle,
                 ordered_keys=keys,
                 dst_descriptors=dst_descriptors,
+                route=(target_agent, self._route_generation.get(target_agent, 0)),
             )
         )
 
@@ -891,6 +946,14 @@ class _RemoteFWDram:
         force_failure: bool = False,
     ) -> None:
         kvcr = self._kvcr
+        route_name, route_generation = source_pin.route
+        if route_name and (
+            self._route_generation.get(route_name, 0) != route_generation
+        ):
+            # The name was re-routed while this operation queued. NIXL hands
+            # the same handle back for a reused name, so submitting would
+            # write the dead generation's destinations through the new route.
+            force_failure = True
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.ordered_keys
         )
@@ -918,7 +981,10 @@ class _RemoteFWDram:
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
-        framework_pins = source_pin.framework_pins & relevant_pins
+        # Every pin the write reads through, not just the ones this operation acquired:
+        # fw_mem is per block, so holding another operation's pin is what stops its
+        # release from unpinning it mid-read.
+        framework_pins = set(relevant_pins)
         unused_pins = source_pin.framework_pins - framework_pins
         source_pin.framework_pins.clear()
         self._source_pin_ops.pop(op_id, None)
@@ -938,6 +1004,7 @@ class _RemoteFWDram:
             op_handle=source_pin.op_handle,
             ordered_keys=source_pin.ordered_keys,
             dst_descriptors=source_pin.dst_descriptors,
+            route=source_pin.route,
             _backend=self,
             framework_pins=framework_pins,
             src_descriptors=tuple(sources[key] for key in completed_keys),
@@ -957,11 +1024,23 @@ class _RemoteFWDram:
         try:
             _, remote_agent = self._remote_agent(progress, payload)
         except Exception:
-            logger.warning(
-                "KVCR could not notify malformed start_write op=%d",
-                op_handle,
-                exc_info=True,
-            )
+            # A promoted Guard adopts the dead primary's control endpoint but
+            # not its peer table, so there is no NIXL route home to report on.
+            # Refusing over the control channel is the only way this operation
+            # ever reaches a terminal.
+            logger.warning("KVCR refusing unresolvable start_write op=%d", op_handle)
+            reply_to = payload.get("sender_control_endpoint")
+            reflected_self = payload.get("source_control_endpoint")
+            if isinstance(reply_to, str) and isinstance(reflected_self, str):
+                self._send_control(
+                    progress,
+                    reply_to,
+                    {
+                        "type": "write_refused",
+                        "sender_control_endpoint": reflected_self,
+                        "op_handle": op_handle,
+                    },
+                )
             return
         self._send_write_done(progress, remote_agent, op_handle, False)
 
@@ -1042,7 +1121,7 @@ class _RemoteFWDram:
         unused_pins = op.framework_pins - relevant_pins
         op.framework_pins = relevant_pins
         self._release_framework_pins(unused_pins)
-        self._submit_prepared_source_write(op_id, op)
+        self._resume_source_pin(op_id, op)
 
     def _expire_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         self._cancel_pending_pin_for_op(op_id, op, result="timeout")
@@ -1050,10 +1129,15 @@ class _RemoteFWDram:
 
     def _start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
-        now = kvcr._clock()
         kvcr._add_block_dependencies(op, new_operation=True)
         self._source_pin_ops[op.op_id] = op
-        if now >= op.deadline:
+        self._resume_source_pin(op.op_id, op)
+
+    def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
+        if self._source_pin_ops.get(op_id) is not op:
+            return
+        kvcr = self._kvcr
+        if kvcr._clock() >= op.deadline:
             self._submit_prepared_source_write(op.op_id, op, force_failure=True)
             return
 
@@ -1061,20 +1145,19 @@ class _RemoteFWDram:
         unresolved_keys = tuple(
             key for key in op.ordered_keys if key not in local_sources
         )
-        framework_sources = (
-            self._acquire_framework_sources(unresolved_keys)
-            if unresolved_keys
-            else ({}, set())
-        )
-        if isinstance(framework_sources, _PendingFrameworkSources):
-            op.framework_pins.update(framework_sources.framework_pins)
-            for request in framework_sources.pending_pins:
-                self._register_pending_pin(request, op.op_id)
-            return
-        if framework_sources is not None:
-            _, framework_pins = framework_sources
-            op.framework_pins.update(framework_pins)
-        self._submit_prepared_source_write(op.op_id, op)
+        if unresolved_keys and not op.framework_acquire_attempted:
+            op.framework_acquire_attempted = True
+            framework_sources = self._acquire_framework_sources(unresolved_keys)
+            if isinstance(framework_sources, _PendingFrameworkSources):
+                op.framework_pins.update(framework_sources.framework_pins)
+                for request in framework_sources.pending_pins:
+                    self._register_pending_pin(request, op.op_id)
+                return
+            if framework_sources is not None:
+                _, framework_pins = framework_sources
+                op.framework_pins.update(framework_pins)
+
+        self._submit_prepared_source_write(op_id, op)
 
     def _remove_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         self._cancel_pending_pin_for_op(op_id, op)
@@ -1278,22 +1361,15 @@ class _RemoteFWDram:
 
         descriptors: dict[BlockKey, MemDescriptor] = {}
         framework_pins: set[PinHandle] = set()
-        all_pins: set[PinHandle] = set()
-        prefix_complete = True
         for key in keys:
             record = kvcr._block_record_map.get(key)
             residency = record.fw_mem if record is not None else None
             if residency is None:
-                prefix_complete = False
                 continue
-            all_pins.add(residency.pin_handle)
-            if prefix_complete:
-                descriptors[key] = residency.descriptor
-                framework_pins.add(residency.pin_handle)
+            descriptors[key] = residency.descriptor
+            framework_pins.add(residency.pin_handle)
         if not descriptors:
-            self._release_framework_pins(all_pins)
             return None
-        self._release_framework_pins(all_pins - framework_pins)
         return descriptors, framework_pins
 
     def _release_framework_pins(self, framework_pins: Collection[PinHandle]) -> None:
@@ -1345,14 +1421,29 @@ class _RemoteFWDram:
         target_agent = payload.get("target_agent", fallback_target)
         if not isinstance(target_agent, str) or not target_agent:
             raise TypeError("missing target agent")
-        remote_agent = self._remote_agents_by_target.get(target_agent)
-        if remote_agent is not None:
-            reused_at = kvcr._timer()
-            self._record_progress_duration("peer_setup", reused_at, "reused")
-            return target_agent, remote_agent
+        target_metadata = payload.get("target_agent_metadata")
+        cached = self._remote_agents_by_target.get(target_agent)
+        if cached is not None:
+            cached_metadata, remote_agent = cached
+            if not isinstance(target_metadata, bytes) or (
+                target_metadata == cached_metadata
+            ):
+                reused_at = kvcr._timer()
+                self._record_progress_duration("peer_setup", reused_at, "reused")
+                return target_agent, remote_agent
+            # Same name, new metadata: the process behind the name was replaced,
+            # and the cached route still points at the dead one. A route that
+            # cannot be unloaded propagates: the retained entry retries next
+            # time instead of silently keeping the dead destination.
+            remove = getattr(agent, "remove_remote_agent", None)
+            if remove is not None:
+                remove(remote_agent)
+            self._remote_agents_by_target.pop(target_agent, None)
+            self._route_generation[target_agent] = (
+                self._route_generation.get(target_agent, 0) + 1
+            )
         started_at = kvcr._timer()
         try:
-            target_metadata = payload.get("target_agent_metadata")
             if not isinstance(target_metadata, bytes):
                 raise TypeError("missing target agent metadata")
             remote_agent = agent.add_remote_agent(target_metadata)
@@ -1362,7 +1453,7 @@ class _RemoteFWDram:
             self._record_progress_duration("peer_setup", started_at, "failed")
             raise
         self._record_progress_duration("peer_setup", started_at, "connected")
-        self._remote_agents_by_target[target_agent] = remote_agent
+        self._remote_agents_by_target[target_agent] = (target_metadata, remote_agent)
         return target_agent, remote_agent
 
     # Progress notifications, telemetry, and resource cleanup.
