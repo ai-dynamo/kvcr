@@ -5,7 +5,6 @@
 import ctypes
 import os
 import queue
-import select
 import subprocess
 import sys
 import threading
@@ -259,13 +258,10 @@ def _stale_peer_child(control_port: str, probe_port: str) -> None:
 
 
 def _expect_child_line(child: subprocess.Popen[str], expected: str) -> None:
-    assert child.stdout is not None
-    if not select.select([child.stdout], [], [], _TIMEOUT_SECONDS)[0]:
-        child.kill()
-        child.wait(timeout=_TIMEOUT_SECONDS)
-        assert child.stderr is not None
-        pytest.fail(f"child did not report {expected!r}: {child.stderr.read()}")
-    assert child.stdout.readline() == f"{expected}\n"
+    # Through the drain thread, never select() on a buffered text stream: a
+    # prior readline can prefetch the next marker, and select would then wait
+    # on an fd whose data already sits in the buffer.
+    _await_marker(child, expected)
 
 
 @pytest.fixture
@@ -655,16 +651,28 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
         replacement.close()
 
 
+def _marker_lines(child: subprocess.Popen[str]) -> "queue.Queue[str]":
+    """One drain thread per child, however many markers are awaited.
+
+    A thread, not select(): TextIOWrapper may already hold the next line
+    buffered. One per child, not per wait: a second drain thread would race
+    the first for the stream and eat the marker it was started to find.
+    """
+    lines = getattr(child, "_marker_lines", None)
+    if lines is None:
+        assert child.stdout is not None
+        lines = child._marker_lines = queue.Queue()
+        reader = threading.Thread(target=_drain_lines, args=(child.stdout, lines))
+        reader.daemon = True
+        reader.start()
+    return lines
+
+
 def _await_marker(
     child: subprocess.Popen[str], marker: str, timeout: float = _TIMEOUT_SECONDS
 ) -> None:
     """Wait for a line the child meant to send, ignoring what NIXL logs."""
-    assert child.stdout is not None
-    lines: queue.Queue[str] = queue.Queue()
-    # A thread, not select(): TextIOWrapper may already hold the line buffered.
-    reader = threading.Thread(target=_drain_lines, args=(child.stdout, lines))
-    reader.daemon = True
-    reader.start()
+    lines = _marker_lines(child)
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()

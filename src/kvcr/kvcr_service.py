@@ -529,14 +529,13 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         try:
             self._deliver_grant(pool_index, response)
         # The lease is already granted and the send may have partially
-        # crossed: releasing now could double-grant a pool a claimant just
-        # mapped. Hold it instead. A claimant that took the grant keeps this
-        # connection for the lease; one that did not closes it, and the EOF
-        # frees the pool -- as does the claimant's death, either way.
+        # crossed: releasing could double-grant a pool a claimant just mapped.
+        # Hold it instead, under the same fencing as any lease: the claimant's
+        # death frees it, and a claimant that never saw the grant says so with
+        # an unactivated release. EOF alone frees nothing -- a claimant that
+        # DID map the pool can drop its connection while still alive.
         except BaseException:
             logger.exception("KVCR grant delivery failed; holding the lease")
-            self._hold(pool_index, liveness, abandoned_on_eof=True)
-            return
         self._hold(pool_index, liveness)
 
     def _deliver_grant(self, pool_index: int, response: "_Granted | _Error") -> None:
@@ -561,13 +560,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 with contextlib.suppress(OSError):
                     os.close(listener_fd)
 
-    def _hold(
-        self,
-        pool_index: int,
-        liveness: PidfdLiveness,
-        *,
-        abandoned_on_eof: bool = False,
-    ) -> None:
+    def _hold(self, pool_index: int, liveness: PidfdLiveness) -> None:
         try:
             socket_fd = self.request.fileno()
             pidfd = liveness.fileno()
@@ -595,12 +588,6 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 try:
                     release = self.channel.receive(_RELEASE_DECODER)
                 except (EOFError, OSError):
-                    if abandoned_on_eof:
-                        # This grant's delivery failed. A claimant that took
-                        # it anyway would be holding this connection open, so
-                        # its end closing says nobody serves this lease.
-                        self._release_or_fail(pool_index, liveness)
-                        return
                     poller.unregister(socket_fd)
                     socket_flags = 0
                 except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:

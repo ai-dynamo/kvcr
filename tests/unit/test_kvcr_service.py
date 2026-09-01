@@ -1014,16 +1014,19 @@ def test_grant_send_failure_rolls_back_the_exact_binding(tmp_path: Path) -> None
         def __init__(self) -> None:
             self.receives = 0
 
-        def receive(self, _decoder: object) -> _Claim:
-            # First the claim; after the failed delivery the handler holds the
-            # lease, and the closed peer reads as EOF -- the claimant is gone.
+        def receive(self, _decoder: object):
+            # First the claim; then, with the delivery failed and the lease
+            # held, the claimant's own word that it never served -- the one
+            # signal besides death that may free this pool.
             self.receives += 1
             if self.receives == 1:
                 return _claim_request()
-            raise EOFError
+            return _Release(1, activated=False)
 
         def send(self, response: object) -> None:
-            raise AssertionError("a guarded grant travels with its descriptor")
+            if isinstance(response, _Granted):
+                raise AssertionError("a guarded grant travels with its descriptor")
+            assert isinstance(response, _Released)
 
         def send_with_fd(self, response: object, _descriptor: int) -> None:
             assert isinstance(response, _Granted)
@@ -1044,8 +1047,8 @@ def test_grant_send_failure_rolls_back_the_exact_binding(tmp_path: Path) -> None
         handler.channel = _Channel()
         handler.server = _Server()
         try:
-            # The peer's end is closed first: an undelivered grant holds the
-            # lease until the connection or the claimant dies.
+            # The peer's end is closed so the held socket polls ready; what
+            # frees the pool is the unactivated release, never the EOF.
             peer.close()
             handler.handle()
             assert _holders_of(registry) == {}
@@ -1054,6 +1057,68 @@ def test_grant_send_failure_rolls_back_the_exact_binding(tmp_path: Path) -> None
             registry.release(0, replacement)
         finally:
             peer.close()
+            accepted.close()
+
+
+def test_an_undelivered_grants_lease_survives_its_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOF is not a release: a claimant that mapped the pool may have dropped
+    its connection while alive, so only its word or its death frees the lease."""
+    accepted, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+    with _new_registry(tmp_path) as registry:
+
+        class _Server:
+            def __init__(self) -> None:
+                self.registry = registry
+                self.compatibility_digest = _TEST_DIGEST
+
+            def dispatch(self, request, liveness):
+                return _ThreadingUnixServer.dispatch(self, request, liveness)
+
+        monkeypatch.setattr(
+            PidfdLiveness,
+            "from_peer_socket",
+            classmethod(lambda _cls, _sock: PidfdLiveness(os.pidfd_open(child.pid))),
+        )
+        handler = object.__new__(_RequestHandler)
+        handler.request = accepted
+        handler.server = _Server()
+        handler.channel = Mock()
+        handler.channel.receive.side_effect = [_claim_request(), EOFError()]
+        delivery_attempted = threading.Event()
+
+        def undelivered(_response: object, _descriptor: int) -> None:
+            # The lease is committed before delivery is attempted, so this is
+            # the moment the rival's refusal becomes the property under test.
+            delivery_attempted.set()
+            raise RuntimeError("undelivered")
+
+        handler.channel.send_with_fd.side_effect = undelivered
+        held = threading.Thread(target=handler.handle)
+        try:
+            peer.close()
+            held.start()
+            assert delivery_attempted.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+            # The connection died; the lease did not. A rival is still refused.
+            rival = _FakeLiveness()
+            with pytest.raises(KVCRServiceError, match="busy|held"):
+                registry.claim(0, _TEST_TIER_CONFIG, rival, _control_bind(0))
+
+            child.kill()
+            child.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+            held.join(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+            assert not held.is_alive()
+            # Death freed it: the pool is claimable again.
+            assert _holders_of(registry) == {}
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+            if held.is_alive():
+                held.join(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
             accepted.close()
 
 

@@ -270,6 +270,7 @@ class FakeNixlAgent:
         self.deregistered: list[Any] = []
         self.remote_agents: list[bytes] = []
         self.xfers: list[tuple[Any, ...]] = []
+        self.xfer_backends: list[list[str] | None] = []
         self.transfers: list[int] = []
         self.sent_notifs: list[tuple[bytes, bytes]] = []
         self.released_xfers: list[int] = []
@@ -315,6 +316,7 @@ class FakeNixlAgent:
                 notif_msg,
             )
         )
+        self.xfer_backends.append(backends)
         return len(self.xfers)
 
     def transfer(self, handle):
@@ -486,6 +488,7 @@ def _new_local_kvcr(
     capacity_low_watermark_percent=0,
     capacity_needed_callback=None,
     policy=None,
+    nixl_dram_backend=None,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -495,6 +498,7 @@ def _new_local_kvcr(
                 nixl_listen_port=1,
                 inventory_report_interval_ms=0,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
+                nixl_dram_backend=nixl_dram_backend,
             ),
             KVCRBindings(
                 pinning.request_pin,

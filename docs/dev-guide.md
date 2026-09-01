@@ -213,7 +213,13 @@ from kvcr import KVCR, KVCRBindings
 from kvcr.config import KVCRBackendConfigs, KVCRConfig
 
 runner = KVCR(
-    config=KVCRConfig(nixl_agent_name="worker-0"),
+    config=KVCRConfig(
+        nixl_agent_name="worker-0",
+        # Pin DRAM transfers to one NIXL plugin whenever G3 loads a file
+        # backend into the same agent; unpinned, the copy is NIXL's choice,
+        # which can land on the file plugin and fail.
+        nixl_dram_backend="UCX",
+    ),
     bindings=KVCRBindings(
         request_pin=request_pin,
         poll_pin_results=poll_pin_results,
@@ -346,9 +352,11 @@ local DRAM and owns an exclusive lease on the pool. Each claim is measured
 against its own pool only; pools do not have to agree on a stride.
 
 **A pool's configuration is fixed by its first claim.** Every later claim on
-that pool must name the same row stride and the same G3 paths; one that does
-not is refused for the life of the service, because a different layout renames
-the rows and slots the recovered records describe. Change the layout by
+that pool must name the same row stride and, when G3 is configured, the same
+G3 paths in the same order, the same per-file capacity, and the same backend
+and backend options; one that does not is refused for the life of the
+service, because a different layout renames the rows and slots the recovered
+records describe. Change the layout by
 restarting the service, which recreates the pools.
 
 The service grants a pool to one live claimant at a time, and pool mappings are

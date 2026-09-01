@@ -239,6 +239,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         capacity_low_watermark_percent=100,
         capacity_needed_callback=capacity_requests.append,
         policy=policy,
+        nixl_dram_backend="UCX",
     )
     now = 0.0
     kvcr._core._clock = lambda: now
@@ -294,6 +295,11 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         (deliver, _op_entries({first_key: True, second_key: False}))
     ]
     assert destination.raw[:block_size] == b"a" * block_size
+    # The configured DRAM backend rides every local copy down to NIXL, so a
+    # file plugin loaded for G3 can never be chosen for it.
+    assert agent.xfer_backends and all(
+        backends == ["UCX"] for backends in agent.xfer_backends
+    )
     assert [
         (meta.access_count, meta.last_access)
         for meta, _ in policy.scored

@@ -230,14 +230,11 @@ class KVCRClient:
         connection = FramedConnection.connect(self._socket_path)
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
-        release_needed = False
         grant_received = False
         try:
             connection.send(request)
-            release_needed = True
             response, listener_fd = connection.receive_with_fd(_CLAIM_RESPONSE_DECODER)
             if isinstance(response, _Error):
-                release_needed = False
                 raise KVCRServiceError(response.message)
             grant_received = True
             spec = _grant_spec(response, pool_index, tier_config)
@@ -267,7 +264,7 @@ class KVCRClient:
                 _control_listener_fd=listener_fd,
             )
         except BaseException as error:
-            _abandon_claim(connection, attachment, listener_fd, release_needed)
+            _abandon_claim(connection, attachment, listener_fd)
             if not grant_received and isinstance(error, (OSError, EOFError)):
                 raise KVCRSocketError(f"KVCR-Service claim failed: {error}") from error
             raise
@@ -277,7 +274,6 @@ def _abandon_claim(
     connection: FramedConnection,
     attachment: KVCRPoolAttachment | None,
     listener_fd: int | None,
-    release_needed: bool,
 ) -> None:
     """Give back everything a claim took before it failed.
 
@@ -296,9 +292,13 @@ def _abandon_claim(
             # BaseException: even an interrupt mid-close must gate the release;
             # the claim error re-raises above.
             local_access_stopped = False
-    if release_needed and local_access_stopped:
-        # Best-effort during unwind: nothing raised here may mask the claim
-        # error re-raised by the caller.
+    if local_access_stopped:
+        # Sent whether or not a grant was seen: the service may hold a lease
+        # this claimant never learned it won, and only this explicit message
+        # -- or the claimant's death -- may roll such a lease back. EOF alone
+        # must not, because a claimant that DID map the pool can drop its
+        # connection while still alive. Best-effort during unwind: nothing
+        # raised here may mask the claim error re-raised by the caller.
         with contextlib.suppress(BaseException):
             _send_release(connection, activated=False)
     _close_quietly(connection)
