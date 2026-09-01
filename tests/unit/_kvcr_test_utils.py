@@ -27,6 +27,7 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
@@ -540,7 +541,10 @@ class _RecordingFIFOPolicy(FIFOPolicy):
 
 class _MatchingHintAdapter:
     def matches(self, key, hint):
-        return hint == "hint"
+        return (
+            isinstance(hint, KvSourceLocationsHint)
+            and b"test-hash" in hint.block_hashes
+        )
 
 
 def _recovered_record(*, g2: int | None = None, g3: int | None = None) -> _BlockRecord:

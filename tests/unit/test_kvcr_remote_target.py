@@ -29,6 +29,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import KVCRConfig, LocalDramInfo, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
@@ -61,9 +62,8 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     requested_key = BlockKey(b"k1")
     target.submit_hint(
         [hinted_key],
-        src="tcp://source:1",
         request_id="req",
-        hints="not-matching",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"not-matching"})),
     )
 
     assert target.query((requested_key,), "req") == [
@@ -128,9 +128,8 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
 
     target.submit_hint(
         keys,
-        src="tcp://source:1",
         request_id="req",
-        hints="hint",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
     )
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -223,7 +222,11 @@ def test_remote_staging_commits_available_prefix() -> None:
         local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 2),
         inventory_sink=events.append,
     )
-    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    target.submit_hint(
+        (),
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
+    )
     fetch = target.fetch(keys, request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
@@ -267,7 +270,11 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
         local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 1),
     )
     target._core._clock = lambda: now
-    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    target.submit_hint(
+        (),
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
+    )
     fetch = target.fetch((key,), request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
@@ -311,7 +318,11 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     )
     key = BlockKey(b"k0")
 
-    target.submit_hint([key], src="tcp://source:1", request_id="req")
+    target.submit_hint(
+        [key],
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
+    )
     op_handle = target.deliver(
         {key: _mem_descriptor()},
         request_id="req",
@@ -351,7 +362,11 @@ def test_kvcr_deliver_propagates_source_pin_miss():
 
 def _acked_deliver(control, kvcr, source, key):
     """Drive a deliver whose start_write carries no metadata, and return it."""
-    kvcr.submit_hint((), src=source, request_id="metadata")
+    kvcr.submit_hint(
+        (),
+        request_id="metadata",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     _wait_until(lambda: len(control.sent) == 1)
     control.incoming.append(
         msgspec.msgpack.encode(
@@ -361,7 +376,11 @@ def _acked_deliver(control, kvcr, source, key):
     _wait_until(lambda: not control.incoming)
     control.sent = []
 
-    kvcr.submit_hint([key], src=source, request_id="load")
+    kvcr.submit_hint(
+        [key],
+        request_id="load",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
     _wait_until(lambda: len(control.sent) == 1)
     sent = _decode_control_message(control.sent[-1][1])
@@ -424,15 +443,27 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     kvcr._core._clock = lambda: now[0]
     source = "tcp://source:1"
 
-    kvcr.submit_hint((), src=source, request_id="metadata")
+    kvcr.submit_hint(
+        (),
+        request_id="metadata",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     _wait_until(lambda: len(control.sent) == 1)
-    kvcr.submit_hint((), src=source, request_id="duplicate")
+    kvcr.submit_hint(
+        (),
+        request_id="duplicate",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     time.sleep(0.005)
     assert [
         _decode_control_message(message)["type"] for _, message in control.sent
     ] == ["target_metadata"]
     now[0] = 0.1
-    kvcr.submit_hint((), src=source, request_id="retry")
+    kvcr.submit_hint(
+        (),
+        request_id="retry",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     _wait_until(lambda: len(control.sent) == 2)
     assert len(control.sent) == 2
     control.sent = []
@@ -443,12 +474,20 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     )
     _wait_until(lambda: not control.incoming)
 
-    kvcr.submit_hint((), src=source, request_id="acked")
+    kvcr.submit_hint(
+        (),
+        request_id="acked",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     time.sleep(0.005)
     assert control.sent == []
 
     key = BlockKey(b"k0")
-    kvcr.submit_hint([key], src=source, request_id="load")
+    kvcr.submit_hint(
+        [key],
+        request_id="load",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     control.send_result = False
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
     assert _poll_until(kvcr, lambda completed: bool(completed)) == [
@@ -460,7 +499,11 @@ def test_kvcr_metadata_ack_retry_lifecycle():
 
     control.send_result = True
     control.sent = []
-    kvcr.submit_hint((), src=source, request_id="reconnect")
+    kvcr.submit_hint(
+        (),
+        request_id="reconnect",
+        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
+    )
     _wait_until(lambda: bool(control.sent))
     assert [
         _decode_control_message(message)["type"] for _, message in control.sent
@@ -483,7 +526,7 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
 
-    kvcr.submit_hint([key], src="tcp://source:1", request_id="req")
+    kvcr.submit_hint([key], request_id="req", hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})))
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="req")
     _wait_until(
         lambda: any(
@@ -569,8 +612,16 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
     )
     key_a = _make_block_key(b"block-A", 0)
     key_b = _make_block_key(b"block-B", 0)
-    kvcr.submit_hint([key_a], src="tcp://source-A:1", request_id="req")
-    kvcr.submit_hint([key_b], src="tcp://source-B:1", request_id="req")
+    kvcr.submit_hint(
+        [key_a],
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source-A:1", frozenset({b"test-hash"})),
+    )
+    kvcr.submit_hint(
+        [key_b],
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source-B:1", frozenset({b"test-hash"})),
+    )
 
     op_handle = kvcr.deliver(
         {key_a: _mem_descriptor(), key_b: _mem_descriptor()}, request_id="req"
@@ -606,8 +657,16 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
     )
     key = _make_block_key(b"shared-block", 0)
 
-    kvcr.submit_hint([key], src="tcp://source-A:1", request_id="req-a")
-    kvcr.submit_hint([key], src="tcp://source-B:1", request_id="req-b")
+    kvcr.submit_hint(
+        [key],
+        request_id="req-a",
+        hints=KvSourceLocationsHint("tcp://source-A:1", frozenset({b"test-hash"})),
+    )
+    kvcr.submit_hint(
+        [key],
+        request_id="req-b",
+        hints=KvSourceLocationsHint("tcp://source-B:1", frozenset({b"test-hash"})),
+    )
     op_a = kvcr.deliver({key: _mem_descriptor()}, request_id="req-a")
     op_b = kvcr.deliver({key: _mem_descriptor()}, request_id="req-b")
 
@@ -657,7 +716,11 @@ def test_remote_framework_dram_transfers_available_prefix(
     source._core._clock = lambda: 0.0
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
 
-    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    target.submit_hint(
+        (),
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
+    )
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),

@@ -27,6 +27,7 @@ from kvcr import (
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
 )
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import (
     G3Options,
     KVCRConfig,
@@ -591,7 +592,11 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
             ctypes.addressof(primary) + index * page_size,
             page_size,
         ).success
-    kvcr.submit_hint(remotes, src="tcp://source:1", request_id="req", hints="hint")
+    kvcr.submit_hint(
+        remotes,
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
+    )
     fetch = kvcr.fetch(remotes, request_id="req")
 
     _poll_until(

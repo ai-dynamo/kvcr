@@ -29,6 +29,7 @@ from _kvcr_test_utils import (
 
 from kvcr import KVCR, KVCRBindings
 from kvcr import progress as kvcr_progress
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import (
     FrameworkDramInput,
     G3Options,
@@ -353,7 +354,11 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
     )
     try:
         served_key = BlockKey(b"resident-b")
-        target.submit_hint((served_key,), src=source_endpoint, request_id="from-guard")
+        target.submit_hint(
+            (served_key,),
+            request_id="from-guard",
+            hints=KvSourceLocationsHint(source_endpoint, frozenset({b"test-hash"})),
+        )
         operation = target.deliver(
             {served_key: _mem_descriptor(ctypes.addressof(target_memory), page_size)},
             request_id="from-guard",
@@ -467,7 +472,11 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # The G2 block: a Guard serves what the pool holds and opens no G3.
         key = BlockKey(b"resident-b")
         stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
-        target.submit_hint((), src=source_endpoint, request_id="stalled")
+        target.submit_hint(
+            (),
+            request_id="stalled",
+            hints=KvSourceLocationsHint(source_endpoint, frozenset({b"test-hash"})),
+        )
         target.deliver(
             {key: _mem_descriptor(ctypes.addressof(stalled_destination), page_size)},
             request_id="stalled",
@@ -502,7 +511,11 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # A real core either way, answering on the endpoint it inherited.
         assert guard._core is not None
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
-        target.submit_hint((), src=source_endpoint, request_id="retry")
+        target.submit_hint(
+            (),
+            request_id="retry",
+            hints=KvSourceLocationsHint(source_endpoint, frozenset({b"test-hash"})),
+        )
         operation = target.deliver(
             {key: _mem_descriptor(ctypes.addressof(destination), len(destination))},
             request_id="retry",

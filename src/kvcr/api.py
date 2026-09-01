@@ -26,6 +26,7 @@ from .core import (  # noqa: F401 - public re-exports
     _KVCRCore,
 )
 from .guard_protocol import KVCRPoolHold
+from .kv_hints import KvSourceLocationsHint
 from .types import (
     BlockKey,
     CacheTier,
@@ -128,12 +129,16 @@ class KVCR:
     def submit_hint(
         self,
         block_key_list: Collection[BlockKey],
-        src: str | None = None,
         mode: str = "copy",
         hints: object | None = None,
         request_id: str | None = None,
     ) -> None:
         """Submit request-scoped router hints."""
+        src = (
+            hints.source_control_endpoint
+            if isinstance(hints, KvSourceLocationsHint)
+            else None
+        )
         self._core.submit_hint(
             block_key_list,
             src=src,
