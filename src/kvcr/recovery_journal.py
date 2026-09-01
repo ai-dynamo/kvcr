@@ -519,7 +519,9 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
     frame = bytearray(size)
     frame_size = _FRAME_HEADER.size + len(key) + len(payload)
     _FRAME_HEADER.pack_into(frame, 0, frame_size, record_type, len(key))
-    frame[_FRAME_HEADER.size : frame_size] = key + payload
+    body_start = _FRAME_HEADER.size + len(key)
+    frame[_FRAME_HEADER.size : body_start] = key
+    frame[body_start:frame_size] = payload
     return frame
 
 
