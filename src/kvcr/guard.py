@@ -490,8 +490,8 @@ class _Guard:
         self._release()
 
     def _promote(self) -> None:
-        self._resumable = False
         """Take the pool over from the dead primary, warm if anything survived."""
+        self._resumable = False
         if self._failure is not None:
             raise self._failure
         assert self._journal is not None
