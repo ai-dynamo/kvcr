@@ -343,7 +343,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         "_real_nixl_primary_child", service.socket_path, g3_path, control_port
     )
     _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
-    guard = service._registry._pools[0].guard
+    guard = service._registry._pools[0]
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -527,7 +527,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         child.kill()
         child.wait(timeout=_TIMEOUT_SECONDS)
         assert promotion_started.wait(timeout=_TIMEOUT_SECONDS)
-        guard = service._registry._pools[0].guard
+        guard = service._registry._pools[0]
 
         now[0] = 6.0
         _wait_until(
@@ -599,7 +599,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # operation deadline instead of failing them now.
     idle = spawn("_idle_primary_child", service.socket_path, g3_path, control_port)
     _expect_child_line(idle, "ready")
-    first_guard = service._registry._pools[0].guard
+    first_guard = service._registry._pools[0]
     idle.kill()
     idle.wait(timeout=_TIMEOUT_SECONDS)
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)

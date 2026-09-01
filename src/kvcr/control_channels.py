@@ -13,6 +13,7 @@ import os
 import socket
 import struct
 from array import array
+from contextlib import ExitStack
 from typing import TypeVar
 
 import msgspec
@@ -344,12 +345,20 @@ class ZmqPeerControlChannel:
         return messages
 
     def close(self) -> None:
-        for outgoing_socket in self._outgoing.values():
-            outgoing_socket.close()
-        self._outgoing.clear()
-        if self._socket is not None:
-            self._socket.close()
+        """Give up every socket, whatever any one of them does about it.
+
+        Stopping at the first failure would leave the listener behind, and with
+        it the pool's control address: bound, unreachable, and unclaimable.
+        """
+        with ExitStack() as sockets:
+            for outgoing_socket in self._outgoing.values():
+                sockets.callback(outgoing_socket.close)
+            if self._socket is not None:
+                sockets.callback(self._socket.close)
+            if self._listener is not None:
+                sockets.callback(self._listener.close)
+            # Given up before any of them is asked, so a close that raises is
+            # not one a second close has to attempt again.
+            self._outgoing = {}
             self._socket = None
-        if self._listener is not None:
-            self._listener.close()
             self._listener = None

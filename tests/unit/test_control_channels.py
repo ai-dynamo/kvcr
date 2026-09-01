@@ -264,6 +264,31 @@ def test_recv_checks_for_data_without_blocking() -> None:
         fake_socket.poll.assert_called_once_with(0)
 
 
+def test_close_gives_up_every_socket_even_when_one_will_not_go() -> None:
+    """Stopping at the first failure would leave the pool's address bound."""
+    with listening_socket() as owner:
+        port = int(owner.getsockname()[1])
+        channel = ZmqPeerControlChannel("127.0.0.1", port, "127.0.0.1")
+        channel.adopt_listener(os.dup(owner.fileno()))
+        channel.initialize()
+        listener = channel._listener
+        pull = channel._socket
+        assert listener is not None and pull is not None
+        stubborn = Mock()
+        stubborn.close.side_effect = OSError("outgoing will not close")
+        channel._outgoing = {"tcp://peer": stubborn}
+
+        with pytest.raises(OSError, match="will not close"):
+            channel.close()
+
+        # The address has to be free whatever the outgoing socket did.
+        stubborn.close.assert_called_once_with()
+        assert listener.fileno() == -1
+        assert pull.closed
+        # And a second close finds nothing left to do.
+        channel.close()
+
+
 def test_an_adopted_listener_advertises_its_port_and_outlives_the_primary() -> None:
     """An adopted listener advertises its port, serves the primary, then the Guard."""
     # The service owns the endpoint; the worker adopts it, a Guard duplicates it.
