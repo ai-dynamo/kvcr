@@ -82,8 +82,7 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim"):
             socket.inet_pton(socket.AF_INET, self.control_host)
         except OSError as error:
             raise ValueError(
-                f"KVCR control address must be a literal IPv4 address: "
-                f"{self.control_host}"
+                f"not a literal IPv4 address: {self.control_host}"
             ) from error
 
 
@@ -144,11 +143,7 @@ class PidfdLiveness:
         return self._pidfd
 
     def close(self) -> None:
-        """Give the descriptor up, whether or not the kernel agrees.
-
-        This stops representing a live holder either way, so a failure here is worth a
-        log line and nothing else.
-        """
+        """Give the descriptor up either way; a close failure is only logged."""
         # Under a lock: shutdown can race a failed claim's cleanup here, and
         # an unsynchronized swap lets both threads close -- the second close
         # can reach a descriptor number the process has since reused.
@@ -223,10 +218,25 @@ class KVCRClient:
         g3: G3Options | None = None,
     ) -> KVCRPoolHold:
         """Claim and map one service-owned pool."""
-        request = _claim_request(
-            pool_index, row_stride, compatibility_digest, g3, control_bind
+        g3_config = g3 and {
+            "paths": [str(path.expanduser().resolve()) for path in g3.paths],
+            "capacity_bytes_per_file": g3.capacity_bytes_per_file,
+            "backend": g3.backend,
+            "backend_options": dict(g3.backend_options),
+        }
+        # msgspec.convert validates where __init__ would not: bad stride,
+        # port or G3 path fails here, not at the service.
+        request = msgspec.convert(
+            {
+                "pool_index": pool_index,
+                "compatibility_digest": compatibility_digest,
+                "tier_config": {"row_stride": row_stride, "g3": g3_config},
+                "control_host": control_bind[0],
+                "control_port": control_bind[1],
+                "version": _PROTOCOL_VERSION,
+            },
+            type=_Claim,
         )
-        tier_config = request.tier_config
         connection = FramedConnection.connect(self._socket_path)
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
@@ -237,7 +247,7 @@ class KVCRClient:
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
             grant_received = True
-            spec = _grant_spec(response, pool_index, tier_config)
+            spec = _grant_spec(response, pool_index, request.tier_config)
             if listener_fd is None:
                 # Every pool has a Guard, and a Guard answers on the endpoint
                 # this claimant named. A grant without it means the two sides
@@ -247,12 +257,11 @@ class KVCRClient:
                 )
             try:
                 effective_bytes, rows = _compute_pool_geometry(
-                    spec.data_bytes, tier_config.row_stride
+                    spec.data_bytes, request.tier_config.row_stride
                 )
             except ValueError as geometry_error:
                 raise KVCRGuardProtocolError(
-                    "invalid pool grant: mapping must contain the journal and at "
-                    "least one complete KV row"
+                    "invalid pool grant: no room for the journal and one KV row"
                 ) from geometry_error
             attachment = KVCRPoolAttachment.attach(spec)
             return KVCRPoolHold(
@@ -264,83 +273,28 @@ class KVCRClient:
                 _control_listener_fd=listener_fd,
             )
         except BaseException as error:
-            _abandon_claim(connection, attachment, listener_fd)
+            # Release the lease only after local access has stopped, or the
+            # next claimant could map bytes this process can still reach.
+            if listener_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(listener_fd)
+            local_access_stopped = True
+            if attachment is not None:
+                try:
+                    attachment.close()
+                except BaseException:
+                    # Even an interrupt mid-close must gate the release.
+                    local_access_stopped = False
+            if local_access_stopped:
+                # Sent even without a grant seen: the service may hold a lease
+                # this claimant never learned it won; only this message or death
+                # -- never bare EOF -- rolls it back. Must not mask the claim error.
+                with contextlib.suppress(BaseException):
+                    _send_release(connection, activated=False)
+            _close_quietly(connection)
             if not grant_received and isinstance(error, (OSError, EOFError)):
                 raise KVCRSocketError(f"KVCR-Service claim failed: {error}") from error
             raise
-
-
-def _abandon_claim(
-    connection: FramedConnection,
-    attachment: KVCRPoolAttachment | None,
-    listener_fd: int | None,
-) -> None:
-    """Give back everything a claim took before it failed.
-
-    The lease is only released once local access has actually stopped: telling
-    the service the pool is free while this process can still reach its bytes
-    is what would let the next claimant map them underneath us.
-    """
-    if listener_fd is not None:
-        with contextlib.suppress(OSError):
-            os.close(listener_fd)
-    local_access_stopped = True
-    if attachment is not None:
-        try:
-            attachment.close()
-        except BaseException:
-            # BaseException: even an interrupt mid-close must gate the release;
-            # the claim error re-raises above.
-            local_access_stopped = False
-    if local_access_stopped:
-        # Sent whether or not a grant was seen: the service may hold a lease
-        # this claimant never learned it won, and only this explicit message
-        # -- or the claimant's death -- may roll such a lease back. EOF alone
-        # must not, because a claimant that DID map the pool can drop its
-        # connection while still alive. Best-effort during unwind: nothing
-        # raised here may mask the claim error re-raised by the caller.
-        with contextlib.suppress(BaseException):
-            _send_release(connection, activated=False)
-    _close_quietly(connection)
-
-
-def _claim_request(
-    pool_index: int,
-    row_stride: int,
-    compatibility_digest: str,
-    g3: G3Options | None,
-    control_bind: tuple[str, int],
-) -> _Claim:
-    """Build the wire form of a claim, validating it before it is sent.
-
-    msgspec validates on convert and not on __init__, so a bad stride, port or G3
-    path is caught here rather than on the service's side of the socket.
-    """
-    return msgspec.convert(
-        {
-            "pool_index": pool_index,
-            "compatibility_digest": compatibility_digest,
-            "tier_config": {
-                "row_stride": row_stride,
-                "g3": (
-                    None
-                    if g3 is None
-                    else {
-                        "paths": [
-                            str(path.expanduser().resolve()) for path in g3.paths
-                        ],
-                        "capacity_bytes_per_file": g3.capacity_bytes_per_file,
-                        "backend": g3.backend,
-                        "backend_options": dict(g3.backend_options),
-                    }
-                ),
-            },
-            "control_host": control_bind[0],
-            "control_port": control_bind[1],
-            "version": _PROTOCOL_VERSION,
-        },
-        type=_Claim,
-    )
 
 
 def _grant_spec(

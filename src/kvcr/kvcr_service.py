@@ -18,7 +18,6 @@ import socketserver
 import stat
 import threading
 import time
-from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -61,17 +60,11 @@ _DEFAULT_JOURNAL_BYTES = 100 * (1 << 20)
 _ORPHANED_POOL_NAME = re.compile(rf"{re.escape(_POOL_PREFIX)}-.+-[0-9a-f]{{32}}")
 
 
-def _log_uncontained_failure(error: BaseException) -> None:
-    """Stand-in until a server claims this registry."""
-    logger.critical("Uncontained KVCR pool failure: %s", error)
-
-
 class _PoolRegistry:
     """A directory of pools, each owned end to end by its own Guard thread.
 
-    Nothing here is locked. One pool's claims, releases and deaths are ordered
-    by that pool's mailbox, and no two pools share anything but the refusal
-    flag that stops the whole service granting more.
+    No locks: each pool's mailbox orders its claims, releases and deaths;
+    pools share nothing but the refusal flag.
     """
 
     def __init__(
@@ -88,9 +81,9 @@ class _PoolRegistry:
         self._pool_count = pool_count
         self._pools: dict[int, _Guard] = {}
         self._refusing = threading.Event()
-        # Replaced by the owning server: only it can stop the service.
-        self.on_uncontained_failure: Callable[[BaseException], None] = (
-            _log_uncontained_failure
+        # Stand-in until the owning server takes over; only it can stop the service.
+        self.on_uncontained_failure = functools.partial(
+            logger.critical, "Uncontained KVCR pool failure: %s"
         )
         self._purge_orphaned_pools()
         for rank in range(pool_count):
@@ -134,12 +127,10 @@ class _PoolRegistry:
                 guard.close()
             except BaseException:
                 # The Guard's thread may still hold this pool's mapping, and
-                # unlinking under it would fault the process. Leave the file --
-                # the next start's purge reclaims it once the process is gone --
-                # and keep the pool visible with whatever it still holds.
+                # unlinking under it would fault the process. Leave the file
+                # for the next start's purge, and keep the pool visible.
                 logger.warning(
-                    "Failed to close KVCR Guard for %s during rollback; "
-                    "leaving its pool in place",
+                    "Failed to close KVCR Guard for %s; leaving its pool in place",
                     guard._spec.path,
                     exc_info=True,
                 )
@@ -149,7 +140,7 @@ class _PoolRegistry:
     def _purge_orphaned_pools(self) -> None:
         """Remove pool files no live daemon owns.
 
-        A pool left by a crash fills a fixed-size directory and fails the next eager
+        Crash leftovers fill the fixed-size directory and fail the next eager
         allocation. Use is decided by the shared flock, never the filename.
         """
         with _pool_dir_guard(self._pool_dir, exclusive=True):
@@ -182,7 +173,7 @@ class _PoolRegistry:
             )
         guard = self._pools.get(pool_index)
         if guard is None:
-            raise KVCRServiceError("KVCR pool registry is closed")
+            raise KVCRServiceError(f"no claimable KVCR pool {pool_index}")
         return guard
 
     def claim(
@@ -194,9 +185,8 @@ class _PoolRegistry:
     ) -> "tuple[KVCRPoolSpec, int, _Lease]":
         """Give a pool to a primary, and hand back the endpoint it answers on.
 
-        This check is a fast path only; the grant is committed on the pool's
-        actor thread under the same lock refuse_claims is read under, so no
-        grant can be produced after a refusal has returned.
+        The refusal check is a fast path only; the grant commits on the pool's
+        actor under the same lock refuse_claims reads, so no grant follows it.
         """
         if self._refusing.is_set():
             raise KVCRServiceError("KVCR pool registry is closed")
@@ -212,33 +202,24 @@ class _PoolRegistry:
     def refuse_claims(self) -> None:
         """Stop granting pools without waiting for the close path to run.
 
-        Passing each pool's phase lock is the barrier that makes the promise
-        exact: a claim that read the flag before it was set has committed by
-        the time its lock is released, so once this returns, no grant can be
-        produced anywhere -- not even by a commit already in flight. Delivery
-        of a grant committed before the barrier may still complete after it;
-        that lease is fenced like any other, so refusal never double-grants.
+        Each pool's phase lock is the barrier: after this returns, no grant can
+        commit. Pre-barrier grants may still deliver; those leases are fenced.
         """
         self._refusing.set()
-        for guard in self._pools.values():
+        # Snapshot: close() deletes pools from the dict on other threads.
+        for guard in list(self._pools.values()):
             with guard._phase_lock:
                 pass
-
-    def is_closed(self) -> bool:
-        """Whether this registry has stopped granting pools."""
-        return self._refusing.is_set()
 
     def close(self) -> None:
         """Give every pool back, keeping the first reason one would not go.
 
-        Pools are independent, so one that will not close keeps only its own file
-        and endpoint. Nothing retries this: the flock dies with the process, and
-        the next service to start reclaims what is left.
+        A pool that will not close keeps only its own file and endpoint. No
+        retries: the flock dies with the process; the next start reclaims.
         """
         self._refusing.set()
         failure: BaseException | None = None
-        # Told before waited on: a wedged pool must not keep its neighbours
-        # from being told to close.
+        # Tell all pools before waiting on any: a wedged one must not block the rest.
         for guard in self._pools.values():
             try:
                 guard.begin_close()
@@ -255,19 +236,19 @@ class _PoolRegistry:
             except BaseException as error:  # noqa: BLE001 - raised below
                 failure = failure or error
                 kept.add(pool_index)
-        # A pool that would not go stays visible, with whatever it still holds.
+        # Wedged pools stay visible; drained ones stay listed until the whole
+        # drain finished, so a release racing shutdown is absorbed.
         for pool_index in [index for index in self._pools if index not in kept]:
             del self._pools[pool_index]
         if failure is not None:
             raise failure
         if wedged:
             raise TimeoutError(
-                "timed out waiting for KVCR pool transitions: "
-                f"pools {wedged} were left unclosed and leaked their resources"
+                f"timed out waiting for KVCR pool transitions: pools {wedged} leaked"
             )
 
     def _guard_failed(
-        self, pool_index: int, guard: "_Guard", error: BaseException
+        self, pool_index: int, _guard: "_Guard", error: BaseException
     ) -> None:
         """A Guard has stopped being one, which the service cannot survive.
 
@@ -275,7 +256,6 @@ class _PoolRegistry:
         still hold an endpoint the service cannot reach. One pool takes the others'
         workers with it; add isolation back if that stops being acceptable.
         """
-        del guard
         logger.critical("KVCR pool %d Guard failed", pool_index)
         self.on_uncontained_failure(error)
 
@@ -316,11 +296,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 
         pool_index, listener_fd, lease = grant
         try:
-            # The accept-time idle timeout has done its job once a claim
-            # arrived; a held connection waits as long as the lease lives, and
-            # a timeout here would sever a healthy claimant's only clean-release
-            # path. Inside the try: a socket shutdown can already have landed,
-            # and the duplicated endpoint below must be closed either way.
+            # No timeout: a held connection must wait as long as the lease lives.
+            # Inside the try: shutdown may have landed; listener_fd closes either way.
             self.request.settimeout(None)
             self.channel.send_with_fd(response, listener_fd)
         # The lease is already granted and the send may have partially
@@ -339,9 +316,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
     def _await_release(self, pool_index: int, lease: "_Lease") -> None:
         """Wait for the one message a held connection may send: its release.
 
-        Nothing here watches the pidfd -- the pool's own actor does. An EOF
-        merely ends this connection; the lease outlives it, and a death still
-        promotes without any thread of ours in the loop.
+        The pool's actor watches the pidfd, not this thread. EOF only ends the
+        connection; the lease outlives it, and a death still promotes.
         """
         while True:
             try:
@@ -351,20 +327,13 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                 self._send_error(error)
                 continue
-            if not self._release_or_fail(
-                pool_index, lease, activated=release.activated
-            ):
-                return
-            with contextlib.suppress(OSError):
-                self.channel.send(_Released(_PROTOCOL_VERSION))
+            if self._release_or_fail(pool_index, lease, release.activated):
+                with contextlib.suppress(OSError):
+                    self.channel.send(_Released(_PROTOCOL_VERSION))
             return
 
     def _release_or_fail(
-        self,
-        pool_index: int,
-        lease: "_Lease",
-        *,
-        activated: bool = True,
+        self, pool_index: int, lease: "_Lease", activated: bool = True
     ) -> bool:
         try:
             if activated:
@@ -374,8 +343,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 # it stood down may resume serving.
                 self.server.registry.abort_grant(pool_index, lease)
         except KVCRServiceError as error:
-            # The registry is closing under this release. The claimant still
-            # learns its release did not commit; nothing here is service-fatal.
+            # Registry closing: claimant learns the release did not commit; not fatal.
             self._send_error(error)
             return False
         except BaseException as error:  # noqa: BLE001 - post-grant failure
@@ -429,7 +397,6 @@ class _ThreadingUnixServer(
         request: _Claim,
         liveness: PidfdLiveness,
     ) -> "tuple[_Granted, tuple[int, int, _Lease]]":
-        """Claim a pool, returning the grant and the endpoint it promises."""
         if request.compatibility_digest != self.compatibility_digest:
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
@@ -441,21 +408,14 @@ class _ThreadingUnixServer(
             (request.control_host, request.control_port),
         )
         return (
-            _Granted(
-                request.pool_index,
-                spec,
-                request.tier_config,
-                _PROTOCOL_VERSION,
-            ),
+            _Granted(request.pool_index, spec, request.tier_config, _PROTOCOL_VERSION),
             (request.pool_index, listener_fd, lease),
         )
 
     def fail(self, error: BaseException) -> None:
-        """Stop the service, keeping the failure that started it.
+        """Stop the service, keeping only the first failure.
 
-        A fatal failure cascades and the endings it triggers report failures of their
-        own. The first explains the rest, so it is kept -- under a lock, because Guard
-        and request threads both arrive here.
+        Locked: Guard and request threads race here; the first explains the rest.
         """
         with self._fatal_lock:
             if self._fatal_error is None:
@@ -504,11 +464,7 @@ class _KVCRService:
         # per pod and clears the path before starting it.
         _unlink_stale_socket(self.socket_path)
         self._registry = _PoolRegistry(
-            pool_dir,
-            pool_count,
-            pool_size_bytes,
-            journal_bytes,
-            compatibility_digest,
+            pool_dir, pool_count, pool_size_bytes, journal_bytes, compatibility_digest
         )
         try:
             self._server = _ThreadingUnixServer(

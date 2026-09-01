@@ -110,23 +110,6 @@ def channel() -> Iterator[ZmqPeerControlChannel]:
         yield ready
 
 
-def test_construction_does_not_claim_the_port_until_it_is_needed() -> None:
-    """A channel constructs while its port is held; the conflict surfaces at use."""
-    port = free_port()
-    # A returning primary must construct its channel while a Guard holds the port.
-    with (
-        listening_socket(port) as holder,
-        _channel(port) as channel,
-    ):
-        # A real conflict is still reported, just at the point of use.
-        with pytest.raises(OSError):
-            channel.initialize()
-
-        holder.close()
-
-        channel.initialize()
-
-
 def test_messages_keep_their_boundaries(pair: Pair) -> None:
     sender, receiver = pair
     claim = _Message("claim", {"pool_index": 3})
@@ -264,33 +247,8 @@ def test_recv_checks_for_data_without_blocking() -> None:
         fake_socket.poll.assert_called_once_with(0)
 
 
-def test_close_gives_up_every_socket_even_when_one_will_not_go() -> None:
-    """Stopping at the first failure would leave the pool's address bound."""
-    with listening_socket() as owner:
-        port = int(owner.getsockname()[1])
-        channel = ZmqPeerControlChannel("127.0.0.1", port, "127.0.0.1")
-        channel.adopt_listener(os.dup(owner.fileno()))
-        channel.initialize()
-        listener = channel._listener
-        pull = channel._socket
-        assert listener is not None and pull is not None
-        stubborn = Mock()
-        stubborn.close.side_effect = OSError("outgoing will not close")
-        channel._outgoing = {"tcp://peer": stubborn}
-
-        with pytest.raises(OSError, match="will not close"):
-            channel.close()
-
-        # The address has to be free whatever the outgoing socket did.
-        stubborn.close.assert_called_once_with()
-        assert listener.fileno() == -1
-        assert pull.closed
-        # And a second close finds nothing left to do.
-        channel.close()
-
-
-def test_an_adopted_listener_advertises_its_port_and_outlives_the_primary() -> None:
-    """An adopted listener advertises its port, serves the primary, then the Guard."""
+def test_an_adopted_listener_serves_conflicts_primary_and_guard() -> None:
+    """An adopted endpoint outlives bind conflicts, the primary, and a bad close."""
     # The service owns the endpoint; the worker adopts it, a Guard duplicates it.
     with listening_socket() as owner:
         port = int(owner.getsockname()[1])
@@ -302,6 +260,10 @@ def test_an_adopted_listener_advertises_its_port_and_outlives_the_primary() -> N
             closing(guarded) as guard,
             _push_socket() as sender,
         ):
+            # A returning primary constructs while a Guard holds its port; a
+            # real conflict is still reported, but only at the point of use.
+            with pytest.raises(OSError):
+                primary.initialize()
             primary.adopt_listener(os.dup(owner.fileno()))
             # A primary needs a real advertised endpoint; a Guard reflects routes.
             assert primary.endpoint == f"tcp://advertised-host:{port}"
@@ -316,7 +278,18 @@ def test_an_adopted_listener_advertises_its_port_and_outlives_the_primary() -> N
             sender.send(b"primary")
             assert _recv_until(primary, 1) == [b"primary"]
 
+            # Stopping at the first close failure would leave the address bound.
+            listener, pull = primary._listener, primary._socket
+            stubborn = Mock()
+            stubborn.close.side_effect = OSError("outgoing will not close")
+            primary._outgoing = {"tcp://peer": stubborn}
+            with pytest.raises(OSError, match="will not close"):
+                primary.close()
+            stubborn.close.assert_called_once_with()
+            assert listener.fileno() == -1 and pull.closed
+            # A second close finds nothing left to do.
             primary.close()
+
             guard.initialize()
             deadline = time.monotonic() + 2
             received: list[bytes] = []

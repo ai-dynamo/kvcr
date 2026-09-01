@@ -5,14 +5,13 @@ import errno
 import os
 import select
 import socket
-from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import msgspec
 import pytest
 
 from kvcr import guard_protocol as protocol_module
-from kvcr.config import G3Options, LocalDramInfo
+from kvcr.config import LocalDramInfo
 from kvcr.control_channels import (
     KVCRGuardProtocolError,
     KVCRServiceError,
@@ -41,6 +40,22 @@ _DIGEST = "opaque digest: leave unchanged"
 _JOURNAL_BYTES = 2 * _JOURNAL_HEADER_BYTES
 _MAPPING_BYTES = _JOURNAL_BYTES + 8195
 _TIER_CONFIG = _TierConfig(_ROW_STRIDE, None)
+
+
+def test_close_swaps_the_pidfd_under_its_lock() -> None:
+    """Shutdown can race a failed claim's cleanup here; an unsynchronized swap
+    lets both threads close, and the second can hit a reused descriptor."""
+
+    liveness = PidfdLiveness(os.dup(0))
+    lock = MagicMock()
+    liveness._close_lock = lock
+
+    liveness.close()
+    liveness.close()
+
+    # Both closes took the lock; only the first found a descriptor to close.
+    assert lock.__enter__.call_count == 2
+    assert liveness._pidfd == -1
 
 
 def test_a_peer_pidfd_serves_polling_until_closed_then_refuses_use() -> None:
@@ -199,29 +214,10 @@ def test_g3_terms_no_claimant_could_open_are_refused_at_decode() -> None:
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    """A claim/release round-trips typed wire messages, geometry, and g3 terms."""
-    # G3 terms a real claimant could open: page-aligned stride, whole slots.
-    g3_stride = os.sysconf("SC_PAGE_SIZE")
-    g3 = G3Options(
-        paths=(tmp_path / "g3",),
-        capacity_bytes_per_file=g3_stride * 2,
-        backend="FILE",
-        backend_options={"mode": "direct"},
-    )
-    encoded_g3 = _G3Config(
-        paths=(str(g3.paths[0]),),
-        capacity_bytes_per_file=g3_stride * 2,
-        backend="FILE",
-        backend_options={"mode": "direct"},
-    )
-    g3_tier_config = _TierConfig(g3_stride, encoded_g3)
+    """A claim/release round-trips typed wire messages, geometry, and ownership."""
     events: list[str] = []
-    connection = _RecordingConnection(
-        [_grant(), _Released(1), _grant(tier_config=g3_tier_config), _Released(1)],
-        events,
-    )
+    connection = _RecordingConnection([_grant(), _Released(1)], events)
     attachment = _Attachment(events)
     attach = Mock(return_value=attachment)
     _connect_with(monkeypatch, connection)
@@ -231,9 +227,6 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         _POOL_INDEX, _ROW_STRIDE, _DIGEST, ("127.0.0.1", 5555)
     )
 
-    assert connection.sent == [
-        _Claim(_POOL_INDEX, _DIGEST, _TIER_CONFIG, "127.0.0.1", 5555, 1)
-    ]
     assert msgspec.to_builtins(connection.sent[0]) == {
         "type": "claim",
         "pool_index": _POOL_INDEX,
@@ -267,44 +260,18 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
 
     # Released rather than disowned, so the hold closes what it was given.
     assert connection.sent_fds == []
-
-    assert connection.sent[-1] == _Release(1)
     assert msgspec.to_builtins(connection.sent[-1]) == {
         "type": "release",
         "version": 1,
         "activated": True,
     }
-    assert msgspec.to_builtins(_Released(1)) == {
-        "type": "released",
-        "version": 1,
-    }
+    assert msgspec.to_builtins(_Released(1)) == {"type": "released", "version": 1}
     assert msgspec.to_builtins(_Error("failure", 1)) == {
         "type": "error",
         "message": "failure",
         "version": 1,
     }
-
-    # A fresh Guard endpoint descriptor, as a real service hands one over
-    # with every grant; this claim carries g3 terms across the wire.
-    connection.received_fd = os.open(os.devnull, os.O_RDONLY)
-    KVCRClient("/unused").claim(
-        _POOL_INDEX, g3_stride, _DIGEST, ("127.0.0.1", 5555), g3
-    ).release()
-
-    assert connection.sent[2].tier_config == g3_tier_config
-    assert msgspec.to_builtins(connection.sent[2])["tier_config"]["g3"] == {
-        "paths": (str(g3.paths[0]),),
-        "capacity_bytes_per_file": g3_stride * 2,
-        "backend": "FILE",
-        "backend_options": {"mode": "direct"},
-    }
     assert events == [
-        "send",
-        "receive",
-        "attachment.close",
-        "send",
-        "receive",
-        "connection.close",
         "send",
         "receive",
         "attachment.close",

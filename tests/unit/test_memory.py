@@ -7,7 +7,7 @@ import mmap
 import os
 import stat
 from collections.abc import Iterator
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -45,8 +45,8 @@ def pool_owner(tmp_path: Path) -> Iterator[_KVCRPoolOwner]:
 @pytest.mark.parametrize(
     ("requested_bytes", "row_stride", "expected"),
     [
-        (4096, 1024, (4096, 4)),
-        (4097, 1024, (4096, 4)),
+        (4096, 1024, nullcontext((4096, 4))),
+        (4097, 1024, nullcontext((4096, 4))),
         (1023, 1024, pytest.raises(ValueError, match="one complete KV row")),
         (True, 1, pytest.raises(TypeError)),
         (0, 1, pytest.raises(ValueError)),
@@ -57,14 +57,11 @@ def pool_owner(tmp_path: Path) -> Iterator[_KVCRPoolOwner]:
 def test_pool_geometry_is_row_aligned_and_validated(
     requested_bytes: int,
     row_stride: int,
-    expected: tuple[int, int] | AbstractContextManager[object],
+    expected: AbstractContextManager[tuple[int, int] | None],
 ) -> None:
     """Geometry snaps down to whole KV rows and refuses non-positive or bool input."""
-    if isinstance(expected, tuple):
-        assert _compute_pool_geometry(requested_bytes, row_stride) == expected
-    else:
-        with expected:
-            _compute_pool_geometry(requested_bytes, row_stride)
+    with expected as geometry:
+        assert _compute_pool_geometry(requested_bytes, row_stride) == geometry
 
 
 def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
@@ -100,10 +97,8 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
             assert populate.call_args.args[1:] == (0, spec.mapping_bytes)
             # A fresh pool's journal header reads empty: exclusive creation,
             # truncation and population all leave only zeros behind.
-            with path.open("rb") as pool_file:
-                assert pool_file.read(_JOURNAL_HEADER_BYTES) == bytes(
-                    _JOURNAL_HEADER_BYTES
-                )
+            header = path.read_bytes()[:_JOURNAL_HEADER_BYTES]
+            assert header == bytes(_JOURNAL_HEADER_BYTES)
 
             journal_marker = b"journal starts at byte zero"
             data_marker = b"data starts after the journal"
@@ -117,16 +112,10 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
             assert map_file.call_args.args[1:] == (spec.mapping_bytes,)
             assert map_file.call_args.kwargs == {"access": mmap.ACCESS_WRITE}
             try:
-                assert (
-                    ctypes.string_at(attachment.address, len(journal_marker))
-                    == journal_marker
-                )
-                assert (
-                    ctypes.string_at(
-                        attachment.address + spec.journal_bytes, len(data_marker)
-                    )
-                    == data_marker
-                )
+                address = attachment.address
+                assert ctypes.string_at(address, len(journal_marker)) == journal_marker
+                data_address = address + spec.journal_bytes
+                assert ctypes.string_at(data_address, len(data_marker)) == data_marker
             finally:
                 attachment.close()
             # Detaching unmaps but never unlinks the server-owned file.

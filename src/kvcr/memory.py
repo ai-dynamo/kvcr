@@ -149,28 +149,17 @@ class KVCRPoolAttachment:
         os.ftruncate(self._file_descriptor, offset + size)
         try:
             _populate_pages(self._file_descriptor, offset, size)
-            region = mmap.mmap(
+            # Mapping must close before the truncate; shrinking under it would fault.
+            with mmap.mmap(
                 self._file_descriptor, size, offset=offset, access=mmap.ACCESS_WRITE
-            )
+            ) as region:
+                yield region
         except BaseException:
-            # Back to the pool: an unusable tail still reads as a region, and
-            # the next claimant would try to replay it.
+            # Truncate back: a partial or stale tail still reads as a region; a
+            # claimant replaying it would diverge from the failed Guard's mirror.
             with contextlib.suppress(OSError):
                 os.ftruncate(self._file_descriptor, offset)
             raise
-        try:
-            yield region
-        except BaseException:
-            # A write that did not finish must not leave the previous snapshot
-            # readable: the Guard that failed here dropped its mirror, and a
-            # claimant replaying old frames would diverge from it. The mapping
-            # closes before the truncate; shrinking under it would fault.
-            region.close()
-            with contextlib.suppress(OSError):
-                os.ftruncate(self._file_descriptor, offset)
-            raise
-        else:
-            region.close()
 
     @contextlib.contextmanager
     def mapped_snapshot(self) -> Iterator[mmap.mmap | None]:
@@ -180,13 +169,10 @@ class KVCRPoolAttachment:
         if size <= 0:
             yield None
             return
-        region = mmap.mmap(
+        with mmap.mmap(
             self._file_descriptor, size, offset=offset, access=mmap.ACCESS_READ
-        )
-        try:
+        ) as region:
             yield region
-        finally:
-            region.close()
 
     def release_snapshot_region(self) -> None:
         """Give the region back once its records have been installed.
@@ -250,17 +236,14 @@ class _KVCRPoolOwner:
             file_stat = os.fstat(file_descriptor)
             file_identity = (file_stat.st_dev, file_stat.st_ino)
             try:
-                spec = msgspec.convert(
-                    {
-                        "pool_id": pool_id,
-                        "path": str(path),
-                        "generation": generation,
-                        "device": file_identity[0],
-                        "inode": file_identity[1],
-                        "mapping_bytes": pool_size_bytes,
-                        "journal_bytes": journal_bytes,
-                    },
-                    type=KVCRPoolSpec,
+                spec = KVCRPoolSpec(
+                    pool_id=pool_id,
+                    path=str(path),
+                    generation=generation,
+                    device=file_identity[0],
+                    inode=file_identity[1],
+                    mapping_bytes=pool_size_bytes,
+                    journal_bytes=journal_bytes,
                 )
                 # Dropped by the kernel on death, which is how another
                 # daemon tells a live pool from a crashed one's.
@@ -391,7 +374,7 @@ def _populate_pages(file_descriptor: int, offset: int, length: int) -> None:
     """Commit backing blocks so a later mapping touch cannot fault on ENOSPC.
 
     The range is explicit because the fallback writes: reserving past a live pool
-    must not touch the pool itself.
+    must not touch the pool itself. The pwrite fallback is O(pages), latent on Linux.
     """
     posix_fallocate = getattr(os, "posix_fallocate", None)
     if posix_fallocate is not None:
@@ -410,9 +393,7 @@ def _populate_pages(file_descriptor: int, offset: int, length: int) -> None:
     # where the same write through the descriptor reports ENOSPC. A whole page at a
     # time, so a filesystem with sub-page blocks does not leave every block but the
     # first sparse.
-    end = offset + length
-    chunk = bytes(mmap.PAGESIZE)
-    position = offset
+    chunk, position, end = bytes(mmap.PAGESIZE), offset, offset + length
     while position < end:
         span = min(mmap.PAGESIZE, end - position)
         count = os.pwrite(file_descriptor, chunk[:span], position)

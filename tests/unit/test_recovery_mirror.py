@@ -75,6 +75,24 @@ def test_recovery_wire_round_trip_keeps_only_settled_slots(
     assert _decode_recovery_record(encoded) == recovered
 
 
+def test_recovery_encoding_accepts_a_field_appended_later() -> None:
+    """Appending is the one change this format allows, and it has to work."""
+
+    class _RecoveryBlockV2(msgspec.Struct, frozen=True, array_like=True):
+        g2: int | None = None
+        g3: int | None = None
+        appended: int = 0
+
+    today = _RECOVERY_ENCODER.encode(
+        _project_recovery_record(_recovered_record(g2=3, g3=5))
+    )
+
+    upgraded = msgspec.msgpack.Decoder(_RecoveryBlockV2).decode(today)
+    assert upgraded.g2 == 3
+    assert upgraded.g3 == 5
+    assert upgraded.appended == 0
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -30,8 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ACQUIRE = 2
-_RELEASE = 3
+_ACQUIRE, _RELEASE = 2, 3
 
 
 @cache
@@ -42,21 +41,11 @@ def _atomics() -> tuple[Any, Any]:
     importing kvcr must not require what only recovery uses.
     """
     library = ctypes.CDLL(ctypes.util.find_library("atomic") or "libatomic.so.1")
-
-    def bind(name: str, argtypes: list[object], restype: object) -> Any:
-        function = getattr(library, name)
-        function.argtypes = argtypes
-        function.restype = restype
-        return function
-
-    return (
-        bind("__atomic_load_8", [ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64),
-        bind(
-            "__atomic_store_8",
-            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int],
-            None,
-        ),
-    )
+    load, store = library["__atomic_load_8"], library["__atomic_store_8"]
+    load.argtypes, load.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64
+    store.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+    store.restype = None
+    return load, store
 
 
 class _AtomicU64:
@@ -71,13 +60,9 @@ class _AtomicU64:
         self._store(self._address, value, _RELEASE)
 
 
-_INVALID_OFFSET = 0
-_PUBLISHED_OFFSET = 128
-_CONSUMED_OFFSET = 192
-_VALID = 0
-_INVALID = 1
+_INVALID_OFFSET, _PUBLISHED_OFFSET, _CONSUMED_OFFSET = 0, 128, 192
+_VALID, _INVALID = 0, 1
 _ALIGNMENT = 8
-_MAX_U64 = (1 << 64) - 1
 _MAX_FRAME_SIZE = (1 << 16) - 1
 # Size, record type, key size. Per frame because BlockKey has no declared
 # width, so nothing would make a lease-wide key size true.
@@ -92,13 +77,10 @@ _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 # filling ends recovery. 3 bytes a record instead of 21.
 #
 # Field order is the format. Append only -- never reorder or remove.
-_NonNegativeInt = Annotated[int, msgspec.Meta(ge=0)]
-
-
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     # A slot per tier, or nothing. Bare ints: wrapping one costs a byte each.
-    g2: _NonNegativeInt | None = None
-    g3: _NonNegativeInt | None = None
+    g2: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
@@ -169,10 +151,9 @@ class RecoveryJournal:
     """
 
     def __init__(self, pool: KVCRPoolAttachment) -> None:
-        mapping = pool._require_mapping()
         self._pool = pool
         self._capacity = pool._spec.journal_bytes - _JOURNAL_HEADER_BYTES
-        base = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+        base = pool.address
         self._published = _AtomicU64(base + _PUBLISHED_OFFSET)
         self._consumed = _AtomicU64(base + _CONSUMED_OFFSET)
         self._invalid = _AtomicU64(base + _INVALID_OFFSET)
@@ -187,8 +168,7 @@ class RecoveryJournal:
         self._consumed.store_release(0)
         self._published.store_release(0)
         self._invalid.store_release(_VALID)
-        self._published_local = 0
-        self._consumed_local = 0
+        self._published_local = self._consumed_local = 0
         self._invalid_local = False
 
     def publish(self, record_type: int, key: bytes, payload: bytes) -> bool:
@@ -196,10 +176,6 @@ class RecoveryJournal:
         mapping = self._pool._require_mapping()
         if record_type not in _RECORD_TYPES:
             raise ValueError(f"unknown journal record type: {record_type}")
-        if not isinstance(key, bytes):
-            raise TypeError("journal key must be bytes")
-        if not isinstance(payload, bytes):
-            raise TypeError("journal payload must be bytes")
         if self._invalid_local:
             return False
 
@@ -208,7 +184,7 @@ class RecoveryJournal:
             return self._invalidate(
                 f"frame is {frame_size} bytes; maximum is {_MAX_FRAME_SIZE} bytes"
             )
-        stored_size = _align_up(frame_size)
+        stored_size = frame_size + (-frame_size % _ALIGNMENT)
         published = self._published_local
         if published is None:
             if self.is_invalid():
@@ -266,9 +242,8 @@ class RecoveryJournal:
             raise self._fail("journal frame has an invalid key size")
         if record_type not in _RECORD_TYPES:
             raise self._fail(f"journal frame has an unknown type: {record_type}")
-        stored_size = _align_up(frame_size)
-        available = published - consumed
-        if stored_size > self._capacity or stored_size > available:
+        stored_size = frame_size + (-frame_size % _ALIGNMENT)
+        if stored_size > self._capacity or stored_size > published - consumed:
             raise self._fail("journal frame exceeds the published bytes")
 
         frame = self._read_ring(mapping, position, stored_size)
@@ -320,20 +295,16 @@ class RecoveryJournal:
         start = _JOURNAL_HEADER_BYTES + position
         mapping[start : start + first] = data[:first]
         if first < len(data):
-            remaining = len(data) - first
-            mapping[_JOURNAL_HEADER_BYTES : _JOURNAL_HEADER_BYTES + remaining] = data[
-                first:
-            ]
+            end = _JOURNAL_HEADER_BYTES + len(data) - first
+            mapping[_JOURNAL_HEADER_BYTES:end] = data[first:]
 
     def _read_ring(self, mapping: object, position: int, length: int) -> bytes:
         first = min(length, self._capacity - position)
         start = _JOURNAL_HEADER_BYTES + position
         data = bytes(mapping[start : start + first])
         if first < length:
-            remaining = length - first
-            data += bytes(
-                mapping[_JOURNAL_HEADER_BYTES : _JOURNAL_HEADER_BYTES + remaining]
-            )
+            end = _JOURNAL_HEADER_BYTES + length - first
+            data += bytes(mapping[_JOURNAL_HEADER_BYTES:end])
         return data
 
 
@@ -395,9 +366,7 @@ class _RecoveryMirror:
 
 
 def _attach_journal(
-    local_dram: _LocalDram,
-    journal: RecoveryJournal,
-    g3: _G3 | None = None,
+    local_dram: _LocalDram, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
     enabled = True
@@ -409,8 +378,7 @@ def _attach_journal(
         try:
             if not journal.publish(record_type, key, payload):
                 logger.warning(
-                    "KVCR recovery publication disabled after the journal "
-                    "rejected a frame"
+                    "KVCR recovery publication disabled after a rejected frame"
                 )
                 enabled = False
         except Exception:
@@ -472,12 +440,11 @@ def claim_guarded_pool(
             "guard_config needs a framework control that can share its control "
             "endpoint, so that a Guard can answer on it after this worker dies"
         )
-    control_bind = bind_address()
     hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
         guard_config.pool_index,
         guard_config.row_stride,
         guard_config.compatibility_digest,
-        control_bind,
+        bind_address(),
         backend_configs.g3,
     )
     # The lease is live from here, and the caller cannot release what it has not
@@ -552,14 +519,8 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
     frame = bytearray(size)
     frame_size = _FRAME_HEADER.size + len(key) + len(payload)
     _FRAME_HEADER.pack_into(frame, 0, frame_size, record_type, len(key))
-    key_end = _FRAME_HEADER.size + len(key)
-    frame[_FRAME_HEADER.size : key_end] = key
-    frame[key_end:frame_size] = payload
+    frame[_FRAME_HEADER.size : frame_size] = key + payload
     return frame
-
-
-def _align_up(value: int) -> int:
-    return value + (-value % _ALIGNMENT)
 
 
 def _recovery_frames(
@@ -591,31 +552,21 @@ def canonical_pool_terms(
         + b"\0"
         + bytes.fromhex(spec.generation)
         + _SNAPSHOT_TERMS.pack(
-            row_stride,
-            spec.journal_bytes,
-            spec.mapping_bytes,
-            spec.device,
-            spec.inode,
+            row_stride, spec.journal_bytes, spec.mapping_bytes, spec.device, spec.inode
         )
     )
 
 
-# A slice at a time: hashing whole would copy a tier's worth of records, and
-# a memoryview would keep the mmap exported so it could not be closed.
-_DIGEST_CHUNK_BYTES = 1 << 20
-
-
 def _snapshot_digest(terms: bytes, mapping: mmap.mmap, start: int, size: int) -> bytes:
     digest = hashlib.sha256(terms)
-    for offset in range(start, start + size, _DIGEST_CHUNK_BYTES):
-        digest.update(mapping[offset : min(offset + _DIGEST_CHUNK_BYTES, start + size)])
+    # memoryview avoids a tier-sized copy; an exported view blocks mmap close.
+    with memoryview(mapping) as view, view[start : start + size] as window:
+        digest.update(window)
     return digest.digest()
 
 
 def write_recovery_snapshot(
-    pool: KVCRPoolAttachment,
-    terms: bytes,
-    frames: Iterable[tuple[int, bytes, bytes]],
+    pool: KVCRPoolAttachment, terms: bytes, frames: Iterable[tuple[int, bytes, bytes]]
 ) -> None:
     """Publish this pool's state as a handback region past the pool itself.
 
@@ -693,11 +644,8 @@ def read_recovery_snapshot(
                 )
             key_start = offset + _FRAME_HEADER.size
             key_end = key_start + key_size
-            yield (
-                record_type,
-                bytes(region[key_start:key_end]),
-                bytes(region[key_end : offset + frame_size]),
-            )
+            payload = bytes(region[key_end : offset + frame_size])
+            yield record_type, bytes(region[key_start:key_end]), payload
             offset += frame_size
 
 
@@ -719,10 +667,9 @@ def read_handback(
             mirror.apply(*frame)
     except RecoveryJournalTornError:
         logger.warning(
-            "KVCR discarding a handback region that was never finished",
-            exc_info=True,
+            "KVCR discarding a handback region that was never finished", exc_info=True
         )
-        clear_recovery_snapshot(pool)
+        pool.release_snapshot_region()
         return _RecoveryMirror()
     return mirror
 
