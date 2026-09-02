@@ -207,6 +207,77 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     )
 
 
+def test_remote_multi_arena_source_stops_at_destination_size_mismatch() -> None:
+    source_primary = ctypes.create_string_buffer(24)
+    source_primary.raw = b"a" * 8 + b"b" * 16
+    source_local_8 = ctypes.create_string_buffer(8)
+    source_local_16 = ctypes.create_string_buffer(16)
+    source_agent = FakeNixlAgent(metadata=b"source-md")
+    target_agent = FakeNixlAgent(metadata=b"target-md")
+    source_pinning = FakePrimaryPinning()
+    source_control = FakeBytesControl("tcp://source:1")
+    target_control = FakeBytesControl("tcp://target:1")
+    keys = (BlockKey(b"k0"), BlockKey(b"k1"))
+    source = _new_kvcr(
+        source_agent,
+        source_pinning,
+        source_control,
+        name="source",
+        local_dram_arenas=(
+            LocalDramInfo(ctypes.addressof(source_local_8), 8, 1),
+            LocalDramInfo(ctypes.addressof(source_local_16), 16, 1),
+        ),
+    )
+    target = _new_kvcr(
+        target_agent,
+        FakePrimaryPinning(),
+        target_control,
+        key_hint_adapter=_MatchingHintAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+
+    deposit = source.deposit(
+        {
+            keys[0]: _mem_descriptor(ctypes.addressof(source_primary), 8),
+            keys[1]: _mem_descriptor(ctypes.addressof(source_primary) + 8, 16),
+        }
+    )
+    source_agent.state = "DONE"
+    assert dict(_poll_until(source, bool))[deposit] == _op_entries(
+        {keys[0]: True, keys[1]: True}
+    )
+    source_agent.state = "PROC"
+
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    deliver = target.deliver(
+        {
+            keys[0]: _mem_descriptor(addr=8192, size=8),
+            keys[1]: _mem_descriptor(addr=8200, size=8),
+        },
+        request_id="req",
+    )
+    _wait_until(lambda: bool(target_control.sent))
+    source_control.incoming.extend(message for _, message in target_control.sent)
+
+    assert _poll_until(source, lambda _: len(source_agent.xfers) == 3) == []
+    source_write = source_agent.xfers[2]
+    assert source_write[1] == [(ctypes.addressof(source_local_8), 8, 0)]
+    assert source_write[3] == [(8192, 8, 0)]
+    assert _decode_notif(source_write[5])["completed_count"] == 1
+    assert source_pinning.searches == []
+    assert source._core._block_record_map[keys[0]].local_dram.claim_count == 1
+    assert source._core._block_record_map[keys[1]].local_dram.claim_count == 0
+
+    source_agent.state = "DONE"
+    assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
+    assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
+
+    target_agent.notifs["source"] = [source_write[5]]
+    assert _poll_until(target, bool) == [
+        (deliver, _op_entries({keys[0]: True, keys[1]: False}))
+    ]
+
+
 def test_remote_staging_commits_available_prefix() -> None:
     block_size = 16
     local = ctypes.create_string_buffer(block_size * 2)

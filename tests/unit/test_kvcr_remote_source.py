@@ -28,7 +28,12 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig
 from kvcr.core import _BlockRecord, _KVCRCore
-from kvcr.remote_fw_dram import _FwMemResidency, _RemoteFWDram, _SourcePinOp
+from kvcr.remote_fw_dram import (
+    _FwMemResidency,
+    _RemoteFWDram,
+    _SourcePinOp,
+    _SourceWriteState,
+)
 from kvcr.types import BlockKey, PinHandle, PinRequestId
 
 
@@ -601,6 +606,72 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     assert backend._fw_pins_by_op[submitted.op_id] == {borrowed}
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
+
+
+@pytest.mark.parametrize(
+    ("destination_sizes", "completed_count"),
+    [
+        ((8, 16, 8), 3),
+        ((8, 8, 8), 1),
+        ((4, 16, 8), 0),
+    ],
+)
+def test_source_prefix_stops_at_descriptor_size_mismatch(
+    destination_sizes: tuple[int, ...], completed_count: int
+) -> None:
+    backend = object.__new__(_RemoteFWDram)
+    kvcr = object.__new__(_KVCRCore)
+    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    sources = {
+        key: _mem_descriptor(addr=128 + index * 32, size=size)
+        for index, (key, size) in enumerate(zip(keys, (8, 16, 8)))
+    }
+    kvcr._block_record_map = {}
+    kvcr._framework_pin_keys = {}
+    kvcr._local_dram_sources_by_op = {}
+    kvcr._progress = Mock()
+    kvcr._add_block_dependencies = Mock()
+    kvcr._remove_block_dependencies = Mock()
+    kvcr._claim_local_dram_sources = Mock(return_value=sources)
+    kvcr._release_local_dram_sources = Mock()
+    backend._kvcr = kvcr
+    backend._source_pin_ops = {}
+    backend._fw_pins_by_op = {}
+    backend._route_generation = {}
+    backend._release_framework_pins = Mock()
+
+    op_id = ("source", 1)
+    waiting = _SourcePinOp(
+        started_at=0.0,
+        deadline=10.0,
+        remote_agent=b"peer",
+        op_handle=1,
+        ordered_keys=keys,
+        dst_descriptors=tuple(
+            _mem_descriptor(addr=4096 + index * 32, size=size)
+            for index, size in enumerate(destination_sizes)
+        ),
+        op_id=op_id,
+        keys=set(keys),
+    )
+    backend._source_pin_ops[op_id] = waiting
+
+    backend._submit_prepared_source_write(op_id, waiting)
+
+    submitted = kvcr._progress.submit.call_args.args[0]
+    assert submitted.completed_count == completed_count
+    assert submitted.src_descriptors == tuple(
+        sources[key] for key in keys[:completed_count]
+    )
+    assert submitted.state is (
+        _SourceWriteState.READY_TO_WRITE
+        if completed_count
+        else _SourceWriteState.NOTIFY_FAILURE
+    )
+    assert kvcr._release_local_dram_sources.call_args.args == (
+        op_id,
+        set(keys[completed_count:]),
+    )
 
 
 def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> None:

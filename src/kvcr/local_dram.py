@@ -594,11 +594,6 @@ class _LocalDram:
     def acquire_sources(
         self, keys: Collection[BlockKey]
     ) -> dict[BlockKey, MemDescriptor]:
-        if self._single_arena is None:
-            # Source-side peer writes need to compare each selected arena with
-            # the target descriptor before NIXL submission. Keep that remote
-            # path disabled until the wire-side prefix check is arena-aware.
-            return {}
         sources: dict[BlockKey, MemDescriptor] = {}
         for key in keys:
             if key in sources:

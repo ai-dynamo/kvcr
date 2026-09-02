@@ -967,7 +967,17 @@ class _RemoteFWDram:
         sources = {} if force_failure else {**framework_sources, **local_sources}
         completed_keys: tuple[BlockKey, ...] = ()
         for index, key in enumerate(source_pin.ordered_keys):
-            if key not in sources:
+            source = sources.get(key)
+            if source is None:
+                break
+            destination = source_pin.dst_descriptors[index]
+            if source.size != destination.size:
+                logger.warning(
+                    "KVCR source/destination size mismatch for %r: %d != %d",
+                    key,
+                    source.size,
+                    destination.size,
+                )
                 break
             completed_keys = source_pin.ordered_keys[: index + 1]
 

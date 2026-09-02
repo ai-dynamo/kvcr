@@ -129,7 +129,20 @@ def test_two_local_arenas_deposit_deliver_and_reject_size_mismatches() -> None:
     assert len(agent.xfers) == 2
     assert local_8.raw == b"a" * 8
     assert local_16.raw == b"b" * 16
-    assert kvcr._core._local_dram.acquire_sources((key_8, key_16)) == {}
+    sources = kvcr._core._local_dram.acquire_sources((key_8, key_16))
+    assert {key: descriptor.size for key, descriptor in sources.items()} == {
+        key_8: 8,
+        key_16: 16,
+    }
+    assert {key: descriptor.addr for key, descriptor in sources.items()} == {
+        key_8: ctypes.addressof(local_8),
+        key_16: ctypes.addressof(local_16),
+    }
+    assert all(
+        kvcr._core._block_record_map[key].local_dram.claim_count == 1
+        for key in (key_8, key_16)
+    )
+    kvcr._core._local_dram.release_sources((key_8, key_16))
     assert all(
         kvcr._core._block_record_map[key].local_dram.claim_count == 0
         for key in (key_8, key_16)
