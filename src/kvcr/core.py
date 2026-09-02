@@ -131,6 +131,10 @@ class _KVCRCore:
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
+        framework_dram = backend_configs.framework_dram
+        framework_dram_regions = backend_configs.framework_dram_regions
+        if framework_dram is not None:
+            framework_dram_regions = (framework_dram,)
         g3_config = backend_configs.g3
         policy = bindings.policy
         if policy is None:
@@ -218,10 +222,10 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        framework_dram = backend_configs.framework_dram
         memory_regions: list[tuple[int, int]] = []
-        if framework_dram is not None:
-            memory_regions.append((framework_dram.address, framework_dram.length))
+        memory_regions.extend(
+            (region.address, region.length) for region in framework_dram_regions
+        )
         if self._local_dram is not None:
             memory_regions.append(self._local_dram.memory_region)
 

@@ -420,7 +420,28 @@ def test_get_stats_emits_public_state_metric_name() -> None:
     assert {record[1] for record in stats.records} == {"kvcr_state"}
 
 
-def test_nixl_lifecycle_stays_on_progress_thread(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("framework_config", "expected_framework_regions"),
+    [
+        (
+            {"framework_dram": FrameworkDramInput(128, 256)},
+            [(128, 256)],
+        ),
+        (
+            {
+                "framework_dram_regions": (
+                    FrameworkDramInput(128, 64),
+                    FrameworkDramInput(256, 128),
+                )
+            },
+            [(128, 64), (256, 128)],
+        ),
+    ],
+    ids=["singular-compatible", "plural"],
+)
+def test_nixl_lifecycle_stays_on_progress_thread(
+    monkeypatch, framework_config, expected_framework_regions
+) -> None:
     main_thread = threading.get_ident()
     lifecycle_threads: list[int] = []
     agents: list[Any] = []
@@ -456,8 +477,8 @@ def test_nixl_lifecycle_stays_on_progress_thread(monkeypatch) -> None:
             pinning.release_pin,
         ),
         KVCRBackendConfigs(
-            framework_dram=FrameworkDramInput(128, 256),
             local_dram=LocalDramInfo(384, 128, 2),
+            **framework_config,
         ),
     )
     kvcr.close()
@@ -470,10 +491,25 @@ def test_nixl_lifecycle_stays_on_progress_thread(monkeypatch) -> None:
     assert len(set(lifecycle_threads)) == 1
     assert lifecycle_threads[0] != main_thread
     assert agent.registrations == [
-        ([(128, 256, 0, "")], "DRAM"),
+        *[
+            ([(address, length, 0, "")], "DRAM")
+            for address, length in expected_framework_regions
+        ],
         ([(384, 128, 0, "")], "DRAM"),
     ]
-    assert agent.deregistered == [2, 1]
+    assert agent.deregistered == list(range(len(expected_framework_regions) + 1, 0, -1))
+
+
+def test_singular_and_plural_framework_dram_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="framework_dram"):
+        KVCR(
+            KVCRConfig(nixl_agent_name="target"),
+            KVCRBindings(Mock(), Mock(), Mock()),
+            KVCRBackendConfigs(
+                framework_dram=FrameworkDramInput(128, 64),
+                framework_dram_regions=(FrameworkDramInput(256, 128),),
+            ),
+        )
 
 
 @pytest.fixture
