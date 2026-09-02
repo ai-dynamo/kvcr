@@ -786,16 +786,6 @@ def test_startup_allocation_failure_rolls_back_before_listener(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_shutdown_unlinks_eager_pools_and_socket(tmp_path: Path) -> None:
-    with _running_server(tmp_path) as harness:
-        pool_paths = list((tmp_path / "pools").glob("kvcr-pool_*-*"))
-        socket_path = harness.server.socket_path
-        assert len(pool_paths) == _TEST_POOL_COUNT
-        harness.stop()
-        assert all(not path.exists() for path in pool_paths)
-        assert not socket_path.exists()
-
-
 def test_claim_after_shutdown_is_rejected(tmp_path: Path) -> None:
     request = _claim_request()
 
@@ -820,7 +810,8 @@ def test_shutdown_does_not_unlink_replaced_socket_path(tmp_path: Path) -> None:
 
 def test_idle_client_does_not_block_shutdown_cleanup(tmp_path: Path) -> None:
     with _running_server(tmp_path) as harness:
-        pool_path = next((tmp_path / "pools").glob("kvcr-pool_0-*"))
+        pool_paths = list((tmp_path / "pools").glob("kvcr-pool_*-*"))
+        assert len(pool_paths) == _TEST_POOL_COUNT
         socket_path = harness.server.socket_path
         _wait_for_connection_state(harness.server, connected=False)
         idle_connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -830,7 +821,7 @@ def test_idle_client_does_not_block_shutdown_cleanup(tmp_path: Path) -> None:
         harness.stop()
         idle_connection.close()
 
-        assert not pool_path.exists()
+        assert all(not path.exists() for path in pool_paths)
         assert not socket_path.exists()
 
 

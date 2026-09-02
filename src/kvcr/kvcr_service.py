@@ -214,8 +214,9 @@ class _PoolRegistry:
     def close(self) -> None:
         """Give every pool back, keeping the first reason one would not go.
 
-        A pool that will not close keeps only its own file and endpoint. No
-        retries: the flock dies with the process; the next start reclaims.
+        A pool that will not close keeps only its own file and endpoint and
+        stays listed, so a later close can try it again; failing that, the
+        flock dies with the process and the next start reclaims.
         """
         self._refusing.set()
         failure: BaseException | None = None

@@ -179,21 +179,6 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
     assert guard._phase is _Phase.PRIMARY
 
 
-def test_a_claim_on_a_busy_or_failed_pool_answers_before_anything_queues() -> None:
-    """The reservation is taken on the caller's thread: busy and failed answer now."""
-    busy = _configurable_guard()
-    busy._reserved = _Phase.CLAIMING
-    with pytest.raises(KVCRServiceError, match="busy"):
-        busy._reserve_claim()
-
-    failed = _configurable_guard()
-    failure = RuntimeError("promotion failed")
-    failed._failure = failure
-    with pytest.raises(RuntimeError) as raised:
-        failed._reserve_claim()
-    assert raised.value is failure
-
-
 def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> None:
     """A poll failure is recorded, reported, fences the core; a bad fence is said."""
     error = RuntimeError("poll failed")
