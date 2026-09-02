@@ -29,7 +29,6 @@ from _kvcr_test_utils import (
 
 from kvcr import KVCR, KVCRBindings
 from kvcr import progress as kvcr_progress
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import (
     FrameworkDramInput,
     G3Options,
@@ -40,6 +39,7 @@ from kvcr.config import (
 )
 from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.guard import _Guard
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.kvcr_service import _KVCRService
 from kvcr.types import BlockKey, CacheTier, QueryStatus
 

@@ -29,8 +29,8 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import KVCRConfig, LocalDramInfo, RemoteFWDramOptions
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -526,7 +526,11 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
 
-    kvcr.submit_hint([key], request_id="req", hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})))
+    kvcr.submit_hint(
+        [key],
+        request_id="req",
+        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
+    )
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="req")
     _wait_until(
         lambda: any(

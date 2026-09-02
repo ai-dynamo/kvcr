@@ -27,7 +27,6 @@ from kvcr import (
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
 )
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import (
     G3Options,
     KVCRConfig,
@@ -35,6 +34,7 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
