@@ -18,19 +18,19 @@ from _kvcr_test_utils import (
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
-    _MatchingHintAdapter,
+    _ConstantHashAdapter,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
     _poll_until,
     _RecordingFIFOPolicy,
+    _router_hint,
     _wait_until,
     _write_done_notification,
 )
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig, LocalDramInfo, RemoteFWDramOptions
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -46,25 +46,53 @@ def _make_block_key(block_hash: bytes, group_idx: int) -> BlockKey:
     return BlockKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
 
 
+def test_submit_hint_filters_unlisted_hash():
+    target = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl("tcp://target:1"),
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    target.submit_hint(_router_hint("tcp://source:1", (999,)), request_id="req")
+
+    assert target.query((BlockKey(b"k"),), "req") == [(QueryStatus.MISS, None)]
+
+
+def test_submit_hint_handles_source_less_protocol_hint():
+    target = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl("tcp://target:1"),
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    hint = {"block_hashes": [1], "no_retain": True}
+
+    target.submit_hint(hint, request_id="req")
+
+    stored = target._core._remote_fw_dram._request_hints["req"]
+    assert stored.source is None
+    assert target.query((BlockKey(b"k"),), "req") == [(QueryStatus.MISS, None)]
+
+    with pytest.raises(ValueError, match="only copy mode is currently supported"):
+        target.submit_hint({"block_hashes": [1], "mode": "move"})
+
+
 def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
         FakeNixlAgent(),
         FakePrimaryPinning(),
         control,
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False,
             opportunistic_query=True,
         ),
     )
-    hinted_key = BlockKey(b"k0")
     requested_key = BlockKey(b"k1")
-    target.submit_hint(
-        [hinted_key],
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"not-matching"})),
-    )
+    target.submit_hint(_router_hint("tcp://source:1", (999,)), request_id="req")
 
     assert target.query((requested_key,), "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
@@ -107,7 +135,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         target_agent,
         FakePrimaryPinning(),
         target_control,
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False,
         ),
@@ -126,11 +154,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     ]
     source_agent.state = "PROC"
 
-    target.submit_hint(
-        keys,
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
-    )
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -217,16 +241,12 @@ def test_remote_staging_commits_available_prefix() -> None:
         agent,
         FakePrimaryPinning(),
         control,
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 2),
         inventory_sink=events.append,
     )
-    target.submit_hint(
-        (),
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
-    )
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch(keys, request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
@@ -265,16 +285,12 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
             nixl_agent_name="target",
             operation_timeout_ms=10,
         ),
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 1),
     )
     target._core._clock = lambda: now
-    target.submit_hint(
-        (),
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
-    )
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch((key,), request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
@@ -318,11 +334,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     )
     key = BlockKey(b"k0")
 
-    target.submit_hint(
-        [key],
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
-    )
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     op_handle = target.deliver(
         {key: _mem_descriptor()},
         request_id="req",
@@ -362,11 +374,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
 
 def _acked_deliver(control, kvcr, source, key):
     """Drive a deliver whose start_write carries no metadata, and return it."""
-    kvcr.submit_hint(
-        (),
-        request_id="metadata",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="metadata")
     _wait_until(lambda: len(control.sent) == 1)
     control.incoming.append(
         msgspec.msgpack.encode(
@@ -376,11 +384,7 @@ def _acked_deliver(control, kvcr, source, key):
     _wait_until(lambda: not control.incoming)
     control.sent = []
 
-    kvcr.submit_hint(
-        [key],
-        request_id="load",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="load")
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
     _wait_until(lambda: len(control.sent) == 1)
     sent = _decode_control_message(control.sent[-1][1])
@@ -443,27 +447,15 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     kvcr._core._clock = lambda: now[0]
     source = "tcp://source:1"
 
-    kvcr.submit_hint(
-        (),
-        request_id="metadata",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="metadata")
     _wait_until(lambda: len(control.sent) == 1)
-    kvcr.submit_hint(
-        (),
-        request_id="duplicate",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="duplicate")
     time.sleep(0.005)
     assert [
         _decode_control_message(message)["type"] for _, message in control.sent
     ] == ["target_metadata"]
     now[0] = 0.1
-    kvcr.submit_hint(
-        (),
-        request_id="retry",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="retry")
     _wait_until(lambda: len(control.sent) == 2)
     assert len(control.sent) == 2
     control.sent = []
@@ -474,20 +466,12 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     )
     _wait_until(lambda: not control.incoming)
 
-    kvcr.submit_hint(
-        (),
-        request_id="acked",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="acked")
     time.sleep(0.005)
     assert control.sent == []
 
     key = BlockKey(b"k0")
-    kvcr.submit_hint(
-        [key],
-        request_id="load",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="load")
     control.send_result = False
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
     assert _poll_until(kvcr, lambda completed: bool(completed)) == [
@@ -499,11 +483,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
 
     control.send_result = True
     control.sent = []
-    kvcr.submit_hint(
-        (),
-        request_id="reconnect",
-        hints=KvSourceLocationsHint(source, frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint(source), request_id="reconnect")
     _wait_until(lambda: bool(control.sent))
     assert [
         _decode_control_message(message)["type"] for _, message in control.sent
@@ -526,11 +506,7 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
 
-    kvcr.submit_hint(
-        [key],
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="req")
     _wait_until(
         lambda: any(
@@ -616,16 +592,8 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
     )
     key_a = _make_block_key(b"block-A", 0)
     key_b = _make_block_key(b"block-B", 0)
-    kvcr.submit_hint(
-        [key_a],
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source-A:1", frozenset({b"test-hash"})),
-    )
-    kvcr.submit_hint(
-        [key_b],
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source-B:1", frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint("tcp://source-A:1"), request_id="req")
+    kvcr.submit_hint(_router_hint("tcp://source-B:1"), request_id="req")
 
     op_handle = kvcr.deliver(
         {key_a: _mem_descriptor(), key_b: _mem_descriptor()}, request_id="req"
@@ -661,16 +629,8 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
     )
     key = _make_block_key(b"shared-block", 0)
 
-    kvcr.submit_hint(
-        [key],
-        request_id="req-a",
-        hints=KvSourceLocationsHint("tcp://source-A:1", frozenset({b"test-hash"})),
-    )
-    kvcr.submit_hint(
-        [key],
-        request_id="req-b",
-        hints=KvSourceLocationsHint("tcp://source-B:1", frozenset({b"test-hash"})),
-    )
+    kvcr.submit_hint(_router_hint("tcp://source-A:1"), request_id="req-a")
+    kvcr.submit_hint(_router_hint("tcp://source-B:1"), request_id="req-b")
     op_a = kvcr.deliver({key: _mem_descriptor()}, request_id="req-a")
     op_b = kvcr.deliver({key: _mem_descriptor()}, request_id="req-b")
 
@@ -705,7 +665,7 @@ def test_remote_framework_dram_transfers_available_prefix(
         FakePrimaryPinning(),
         target_control,
         KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=eager_ctrl_connect,
         ),
@@ -720,11 +680,7 @@ def test_remote_framework_dram_transfers_available_prefix(
     source._core._clock = lambda: 0.0
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
 
-    target.submit_hint(
-        (),
-        request_id="req",
-        hints=KvSourceLocationsHint("tcp://source:1", frozenset({b"test-hash"})),
-    )
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),

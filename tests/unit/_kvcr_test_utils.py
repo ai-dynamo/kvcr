@@ -27,7 +27,6 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
@@ -44,6 +43,15 @@ _OPEN_KVCRS: list[KVCR] = []
 
 
 _HANDED_OUT: set[int] = set()
+
+
+def _router_hint(
+    source: str, block_hashes: Collection[int] = (123,)
+) -> dict[str, object]:
+    return {
+        "source_control_endpoint": source,
+        "block_hashes": list(block_hashes),
+    }
 
 
 def _ephemeral_floor() -> int:
@@ -443,7 +451,7 @@ def _new_kvcr(
     control: FakeBytesControl,
     config: KVCRConfig | None = None,
     name: str = "target",
-    key_hint_adapter: object | None = None,
+    key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
     framework_dram: FrameworkDramInput | None = None,
     local_dram: LocalDramInfo | None = None,
@@ -465,7 +473,7 @@ def _new_kvcr(
                 release_pin=pinning.release_pin,
                 cancel_pin_request=getattr(pinning, "cancel_pin_request", None),
                 framework_control=control,
-                key_hint_adapter=key_hint_adapter,
+                key_adapter=key_adapter,
                 inventory_sink=inventory_sink,
                 policy=policy,
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
@@ -539,12 +547,9 @@ class _RecordingFIFOPolicy(FIFOPolicy):
         self.removed.append(meta)
 
 
-class _MatchingHintAdapter:
-    def matches(self, key, hint):
-        return (
-            isinstance(hint, KvSourceLocationsHint)
-            and b"test-hash" in hint.block_hashes
-        )
+class _ConstantHashAdapter:
+    def decode(self, key):
+        return 123
 
 
 def _recovered_record(*, g2: int | None = None, g3: int | None = None) -> _BlockRecord:

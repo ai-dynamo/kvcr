@@ -22,6 +22,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _router_hint,
     _use_nixl_agent,
     _wait_until,
     free_port,
@@ -39,7 +40,6 @@ from kvcr.config import (
 )
 from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.guard import _Guard
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.kvcr_service import _KVCRService
 from kvcr.types import BlockKey, CacheTier, QueryStatus
 
@@ -354,11 +354,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
     )
     try:
         served_key = BlockKey(b"resident-b")
-        target.submit_hint(
-            (served_key,),
-            request_id="from-guard",
-            hints=KvSourceLocationsHint(source_endpoint, frozenset({b"test-hash"})),
-        )
+        target.submit_hint(_router_hint(source_endpoint), request_id="from-guard")
         operation = target.deliver(
             {served_key: _mem_descriptor(ctypes.addressof(target_memory), page_size)},
             request_id="from-guard",
@@ -472,11 +468,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # The G2 block: a Guard serves what the pool holds and opens no G3.
         key = BlockKey(b"resident-b")
         stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
-        target.submit_hint(
-            (),
-            request_id="stalled",
-            hints=KvSourceLocationsHint(source_endpoint, frozenset({b"test-hash"})),
-        )
+        target.submit_hint(_router_hint(source_endpoint), request_id="stalled")
         target.deliver(
             {key: _mem_descriptor(ctypes.addressof(stalled_destination), page_size)},
             request_id="stalled",
@@ -511,11 +503,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # A real core either way, answering on the endpoint it inherited.
         assert guard._core is not None
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
-        target.submit_hint(
-            (),
-            request_id="retry",
-            hints=KvSourceLocationsHint(source_endpoint, frozenset({b"test-hash"})),
-        )
+        target.submit_hint(_router_hint(source_endpoint), request_id="retry")
         operation = target.deliver(
             {key: _mem_descriptor(ctypes.addressof(destination), len(destination))},
             request_id="retry",

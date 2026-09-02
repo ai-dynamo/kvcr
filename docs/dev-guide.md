@@ -795,7 +795,7 @@ Check the contract in this order:
 
 Do not infer hint delivery solely from a high router overlap score. Record the
 hint payload at the framework boundary and verify that `submit_hint()` receives
-the expected source endpoint, request ID, mode, and keys.
+a protocol-conforming hint and the expected request ID.
 
 ### Peer control connection fails
 

@@ -15,6 +15,7 @@ from .config import (
     KVCRConfig,
     TelemetryStats,
 )
+from .hint_parser import _parse_kv_hint
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
@@ -207,7 +208,7 @@ class _KVCRCore:
         self._remote_fw_dram = _RemoteFWDram(
             self,
             backend_configs.remote_fw_dram,
-            bindings.key_hint_adapter,
+            bindings.key_adapter,
         )
         self._g3 = (
             _G3(
@@ -296,24 +297,14 @@ class _KVCRCore:
 
     def submit_hint(
         self,
-        block_key_list: Collection[BlockKey],
-        src: str | None = None,
-        mode: str = "copy",
-        hints: object | None = None,
+        hints: Mapping[str, object],
         request_id: str | None = None,
     ) -> None:
+        src, block_hashes, mode = _parse_kv_hint(hints)
         # TODO: Let policy consume mode="move" and no_retain hints.
         if mode != "copy":
             raise ValueError("only copy mode is currently supported")
-        if block_key_list and request_id is None:
-            logger.warning(
-                "KVCR submit_hint requires request_id; dropping %d keys",
-                len(block_key_list),
-            )
-        # Only the request-scoped source and opaque hint are currently used by
-        # remote-G2 query, fetch, and deliver. Proactive copy or move using the
-        # block list is not implemented.
-        self._remote_fw_dram.submit_hint(src, hints, request_id)
+        self._remote_fw_dram.submit_hint(src, block_hashes, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)

@@ -21,11 +21,7 @@ from .guard_protocol import (
     KVCRClient,
     KVCRPoolHold,
 )
-from .kv_hints import (
-    ROUTER_HINT_CAPABILITIES,
-    KvSourceLocationsHint,
-    extract_kv_hint,
-)
+from .hint_parser import ROUTER_HINT_CAPABILITIES
 
 __all__ = [
     "DURATION_METRIC",
@@ -40,7 +36,5 @@ __all__ = [
     "KVCRPoolHold",
     "KVCRServiceError",
     "ROUTER_HINT_CAPABILITIES",
-    "KvSourceLocationsHint",
-    "extract_kv_hint",
     "KVCRSocketError",
 ]

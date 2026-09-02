@@ -217,7 +217,7 @@ class InventoryEvent:
 inventory_sink(event: InventoryEvent)
 
 # Router → KVCR, directly or through the framework
-kvcr.submit_hint(block_key_list, src=None, mode=copy|move, hints=None, request_id=None) # src includes node and KVCR control endpoint; default mode=copy
+kvcr.submit_hint(hints, request_id=None) # hints must conform to the defined hint protocol
 kvcr.discard_hint(request_id) # request is over or its hints should be discarded early
 ```
 
@@ -233,7 +233,7 @@ KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_
 
 For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
 
-KVCR-to-KVCR movement is destination-initiated. A router hint gives the destination the source node and KVCR control endpoint. `mode=copy` retains the source copy, while `mode=move` permits source eviction only after successful completion. Timeout or cancellation keeps the source copy. When the router sends `src=None`, the destination uses its local storage information or checks object storage when enabled. The router does not need object-store inventory for locality decisions, but may track object presence to issue source hints.
+KVCR-to-KVCR movement is destination-initiated. A router hint gives the destination the source node and KVCR control endpoint. `mode=copy` retains the source copy, while `mode=move` permits source eviction only after successful completion. Timeout or cancellation keeps the source copy. When the hint has no source control endpoint, the destination uses its local storage information or checks object storage when enabled. The router does not need object-store inventory for locality decisions, but may track object presence to issue source hints.
 
 `submit_hint` may establish the peer connection, but does not start data movement or remote pinning; proactive fetching, staging, or pinning may be added later if useful. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole `BlockKeyList` from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
 

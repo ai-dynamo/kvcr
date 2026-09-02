@@ -12,7 +12,7 @@ from . import recovery_journal as _recovery
 from .config import (
     FrameworkControl,
     InventorySink,
-    KeyHintAdapter,
+    KeyAdapter,
     KVCRBackendConfigs,
     KVCRConfig,
     KVCRGuardConfig,
@@ -26,7 +26,6 @@ from .core import (  # noqa: F401 - public re-exports
     _KVCRCore,
 )
 from .guard_protocol import KVCRPoolHold
-from .kv_hints import KvSourceLocationsHint
 from .types import (
     BlockKey,
     CacheTier,
@@ -65,7 +64,7 @@ class KVCRBindings:
 
     # Control, key translation, and inventory reporting.
     framework_control: FrameworkControl | None = None
-    key_hint_adapter: KeyHintAdapter | None = None
+    key_adapter: KeyAdapter | None = None
     inventory_sink: InventorySink | None = None
 
     # Capacity pressure, telemetry, and placement policy.
@@ -128,24 +127,11 @@ class KVCR:
 
     def submit_hint(
         self,
-        block_key_list: Collection[BlockKey],
-        mode: str = "copy",
-        hints: object | None = None,
+        hints: Mapping[str, object],
         request_id: str | None = None,
     ) -> None:
-        """Submit request-scoped router hints."""
-        src = (
-            hints.source_control_endpoint
-            if isinstance(hints, KvSourceLocationsHint)
-            else None
-        )
-        self._core.submit_hint(
-            block_key_list,
-            src=src,
-            mode=mode,
-            hints=hints,
-            request_id=request_id,
-        )
+        """Submit a hint conforming to the hint protocol."""
+        self._core.submit_hint(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         """Discard request-scoped router hints."""
