@@ -5,24 +5,24 @@
 ARG VLLM_IMAGE=vllm/vllm-openai:nightly-8efa13b700f1836657699cae2503dc2feab27fa0@sha256:83be0b4f532c5a851c655e914dc3a276e52265e4045402d2e36316a11e4b5dc9
 
 # The pinned vLLM image is the compatibility base used by the KVCR adapter. The
-# released Dynamo 1.4.0 image predates vLLM's Medium and tier-filter APIs and
-# cannot load this adapter.
+# latest released Dynamo vLLM runtime image (1.4.2) pins vLLM 0.26.0 and also
+# predates Dynamo's per-DP-rank `control_ports` contract, so using it would
+# still require patching both vLLM and Dynamo.
 FROM rust:1.93-bookworm AS build-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libudev-dev pkg-config \
     protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
 
-# The KVCR integration is expected to be published in an upcoming public vLLM
-# PR. Until that source is available, these placeholders make the public E2E
-# build fail with an explicit status message instead of fetching private code.
+# Require callers to select an immutable public adapter revision explicitly.
+# These placeholders keep an accidental unpinned build fail-closed.
 FROM build-base AS vllm-kvcr-source
 ARG KVCR_VLLM_REPO=PUBLIC_VLLM_PR_REPOSITORY_PENDING
 ARG KVCR_VLLM_REF=PUBLIC_VLLM_PR_COMMIT_PENDING
 RUN if [ "${KVCR_VLLM_REPO}" = "PUBLIC_VLLM_PR_REPOSITORY_PENDING" ] \
       || [ "${KVCR_VLLM_REF}" = "PUBLIC_VLLM_PR_COMMIT_PENDING" ]; then \
-      echo "KVCR E2E support is pending an upcoming public vLLM PR." >&2; \
-      echo "Set KVCR_VLLM_REPO and KVCR_VLLM_REF after that PR is available." >&2; \
+      echo "Set KVCR_VLLM_REPO to the public vLLM repository." >&2; \
+      echo "Set KVCR_VLLM_REF to a specific pinned KVCR adapter commit SHA." >&2; \
       exit 1; \
     fi \
  && git init /src/vllm-kvcr \
@@ -85,8 +85,8 @@ RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
       "nvidia-nccl-cu13==${NCCL_VERSION}"
 
 # Overlay the six vLLM files fetched from the public KVCR integration commit.
-# Verify and record its compatibility with the pinned vLLM image when the
-# public PR is available.
+# The quick start pins that commit and this base image as one validated
+# compatibility set.
 COPY --from=vllm-kvcr-source /overlay/vllm /tmp/kvcr-vllm-overlay/vllm
 RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
  && cp -a /tmp/kvcr-vllm-overlay/vllm/. "${VLLM_DIR}/" \

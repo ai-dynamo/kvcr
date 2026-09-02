@@ -5,10 +5,10 @@ Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack
 without editing source code in any of those projects.
 
 > [!IMPORTANT]
-> Public end-to-end availability is pending an upcoming vLLM PR containing the
-> KVCR integration. Until that PR is available, this guide is a preview and the
-> image build intentionally stops at the public-source placeholders. Once the
-> PR is public, users can supply its repository and commit to try KVCR E2E.
+> This guide uses the public, still-open vLLM
+> [KVCR secondary-tier adapter PR #53624](https://github.com/vllm-project/vllm/pull/53624)
+> at a specific pinned commit SHA. Treat this as a public preview until the PR is
+> merged and released in vLLM.
 
 For source builds, editable installs, API development, or test workflows, use
 the [developer guide](dev-guide.md).
@@ -35,13 +35,13 @@ Run the commands below from the KVCR repository root.
 
 ## 1. Build the integration image
 
-The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start),
-which is prepared to assemble the required integration environment after the
-public PR is available:
+The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start).
+Pin the public adapter source used by this guide, then build the integration
+image:
 
 ```bash
-export KVCR_VLLM_REPO=PUBLIC_VLLM_PR_REPOSITORY_PENDING
-export KVCR_VLLM_REF=PUBLIC_VLLM_PR_COMMIT_PENDING
+export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
+export KVCR_VLLM_REF=35ab7457aafa89d6849e40d01401c69ffff8e33a
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \
@@ -51,24 +51,9 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-Do not run this command with the placeholder values. After the public vLLM PR
-is available, replace both values with its public repository URL and immutable
-commit. No private-repository credentials should be required.
-
-The first build pulls the large vLLM runtime and compiles Dynamo's Rust
-bindings, so it can take several minutes even on a fast host.
-
-The build starts from the pinned vLLM nightly, fetches and applies the matching
-six-file KVCR integration from the public PR, installs the local KVCR checkout,
-and builds Dynamo at the revision that supports one KVCR control endpoint per
-data-parallel rank. Once published, the public integration revision and base
-image must be treated as one compatibility set.
-
-The last build steps import all four components, verify `nixl==1.3.2`, preserve
-the base image's validated NCCL 2.30.7, guard its NumPy and protobuf ABI
-families, and confirm that Dynamo contains the required `control_ports`
-router-hint support. A failure there means the image is not usable; do not
-continue to the launch steps.
+No private-repository credentials are required. The first build uses pinned,
+tested vLLM and Dynamo revisions and may take several minutes. Continue only if
+its final compatibility checks pass.
 
 ---
 
@@ -197,69 +182,122 @@ The important relationships are:
 | `control_ports` | Contains one unique port per local DP rank, in rank order |
 | `control_advertise_host` | Is reachable by peer workers; loopback is valid only on one host |
 | KV events endpoint | Does not overlap the control-port range |
-
-For multiple hosts, replace `127.0.0.1` with an address reachable from every
-peer and bind or advertise the KV-events endpoint appropriately. NIXL and its
-UCX transport must also be configured for the intended interconnect.
-
 ---
 
-## 5. Verify with real requests
+## 5. Verify a KVCR peer to peer transfer
 
-Do not treat a liveness response as proof that a backend is ready. Wait for a
-real inference request through the Dynamo frontend to return HTTP 200 with a
-non-empty `choices` array:
+First make a real inference request and read the registered worker ID shared by
+the two DP ranks from the response:
 
 ```bash
 export MODEL=Qwen/Qwen3-0.6B
 
-curl -sS http://127.0.0.1:8000/v1/completions \
-  -H 'content-type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"prompt\":\"Reply with the word ready.\",\"max_tokens\":8}"
-```
-
-Then send at least two prompts that share several full blocks. vLLM publishes
-stored events for full blocks, so a very short shared prefix may never become
-visible to the router:
-
-```bash
-PREFIX=$(python3 -c 'print(" ".join(f"section{i} cache routing data" for i in range(80)))')
-
-for QUESTION in \
-  'Summarize the design.' \
-  'List two failure modes.'
-do
-  curl -sS http://127.0.0.1:8000/v1/completions \
+WORKER_ID=$(
+  curl --fail --silent --show-error \
+    http://127.0.0.1:8000/v1/completions \
     -H 'content-type: application/json' \
-    -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX $QUESTION\",\"max_tokens\":32,\"temperature\":0}"
-done
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"worker identity probe\",\"max_tokens\":1,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}" \
+  | python3 -c 'import json, sys; response = json.load(sys.stdin); assert response["choices"]; print(response["nvext"]["worker_id"]["decode_worker_id"])'
+)
+export WORKER_ID
 ```
 
-Confirm all of the following before calling the stack healthy:
-
-1. Both DP ranks initialized a KVCR tier and distinct control endpoints.
-2. Dynamo consumed self-describing KV events from the workers.
-3. Repeated-prefix requests completed correctly through port 8000.
-4. A delivered block was exposed to vLLM only after a terminal KVCR completion.
-
-Normal deterministic KV routing prefers the worker that already owns the
-prefix, so a healthy run may use local reuse without performing a peer
-transfer. To exercise the peer-transfer mechanics, stop only the frontend with
-Ctrl-C, restart it in the same terminal, and repeat the shared-prefix requests:
+Use a fresh prefix spanning several complete blocks. Send it first to DP rank 0,
+then send the shared prefix to DP rank 1:
 
 ```bash
-env -u NATS_SERVER python3 -m dynamo.frontend \
-  --router-mode kv \
-  --router-temperature 1 \
-  --http-port 8000
+PREFIX=$(python3 -c 'import uuid; tag = uuid.uuid4().hex; print(" ".join(f"{tag} section{i} cache routing data" for i in range(80)))')
+
+curl --fail --silent --show-error \
+  http://127.0.0.1:8000/v1/completions \
+  -H 'content-type: application/json' \
+  -H "x-dynamo-worker-instance-id: $WORKER_ID" \
+  -H 'x-dynamo-dp-rank: 0' \
+  -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX seed source\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
+
+# CPU offload, KV-event publication, and router indexing are asynchronous.
+sleep 10
+
+curl --fail --silent --show-error \
+  http://127.0.0.1:8000/v1/completions \
+  -H 'content-type: application/json' \
+  -H "x-dynamo-worker-instance-id: $WORKER_ID" \
+  -H 'x-dynamo-dp-rank: 1' \
+  -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX retrieve on target\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
 ```
 
-This deliberately trades locality for cross-rank traffic and is for mechanism
-validation, not a performance comparison. Wait for the periodic `KV Transfer
-metrics` log. A successful transfer reports `transfer` with result `success`
-on the source and `remote_deliver` with result `success` on the destination;
-their block and byte counts must agree. Verify this telemetry rather than
-relying only on the router's overlap score.
+A successful run prints two JSON responses. The generated text, IDs, and exact
+token counts vary. These are the relevant fields from one validated run:
+
+Rank 0 seed:
+
+```json
+{
+  "usage": {"prompt_tokens_details": {"cached_tokens": 0}},
+  "nvext": {
+    "worker_id": {
+      "decode_worker_id": 2509471956910756130,
+      "decode_dp_rank": 0
+    }
+  }
+}
+```
+
+Rank 1 retrieval:
+
+```json
+{
+  "usage": {"prompt_tokens_details": {"cached_tokens": 2688}},
+  "nvext": {
+    "worker_id": {
+      "decode_worker_id": 2509471956910756130,
+      "decode_dp_rank": 1
+    }
+  }
+}
+```
+
+The unchanged `decode_worker_id` is expected because both DP ranks belong to
+the same worker endpoint. The change from `decode_dp_rank: 0` to
+`decode_dp_rank: 1` confirms that the headers selected the requested ranks.
+The seed has zero cached tokens because its prefix is fresh. In the retrieval,
+2,688 cached tokens means rank 1 accepted 42 complete 64-token blocks. The
+exact value may differ, but it must be positive and block-aligned. If the
+retrieval reports zero cached tokens, rank selection worked but this test did
+not demonstrate KVCR reuse. Generate a new `PREFIX` before retrying so rank 1
+cannot satisfy the retry from KV it computed locally.
+
+These headers constrain the KV router; they do not bypass it. For the retrieval,
+the router can still identify rank 0 as the source and provide its source hint
+to rank 1. The response is useful evidence, but terminal telemetry is the final
+proof. The relevant post-request `KV Transfer metrics` from that run contained:
+
+```text
+source rank 0:
+  vllm:kvcr_duration_seconds:('transfer', 'success')_count=1
+  vllm:kvcr_duration_seconds:('source_write', 'success')_count=1
+  vllm:kvcr_transfer_blocks:('source_write',)=42
+  vllm:kvcr_transfer_bytes:('source_write',)=308281344
+
+destination rank 1:
+  vllm:kvcr_duration_seconds:('remote_deliver', 'success')_count=1
+  vllm:kvcr_transfer_blocks:('remote_deliver',)=42
+  vllm:kv_offload_tiering_read_bytes:('1:kvcr',)=308281344
+```
+
+The exact counts may differ, but the source and destination block counts must
+match, as must the source-write and destination-read byte counts. There must be
+no positive `remote_deliver` `partial` or `failed` count. These values reset
+after each reporting interval, so inspect the interval or intervals covering
+the retrieval instead of subtracting two log lines.
+
+The explicit rank selection is only for this deterministic mechanism test. In
+a normal deployment, omit the two routing headers. KVCR transfers can occur
+when load, availability, or routing constraints cause the KV router to select a
+target other than the cache-owning worker. Confirm each such transfer in the
+post-request `KV Transfer metrics`: the source reports `transfer=success` and
+`source_write=success`, the destination reports `remote_deliver=success`, and
+their transferred block and byte counts match.
 
 ---
 
@@ -268,9 +306,9 @@ relying only on the router's overlap score.
 ### The image does not build
 
 - Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach
-  the public KVCR-vLLM source, Dynamo's GitHub repository, and PyPI.
-- Confirm that the public vLLM PR is available and that `KVCR_VLLM_REPO` and
-  `KVCR_VLLM_REF` identify its public repository and immutable commit.
+  the public vLLM source, Dynamo's GitHub repository, and PyPI.
+- Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and
+  `KVCR_VLLM_REF` is the pinned PR #53624 commit SHA shown above.
 - Read the final compatibility-check output. It identifies whether the Dynamo
   router build, the vLLM adapter, or KVCR failed.
 - Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together. Overriding
