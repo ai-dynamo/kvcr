@@ -430,7 +430,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         assert continue_promotion.wait(timeout=_TIMEOUT_SECONDS)
         if recovery == "given-up":
             # What a ring the primary outran leaves behind.
-            guard._mirror = None
+            guard._recovery.mirror = None
         promote(guard)
         assert guard._core is not None
         promoted_with.append(len(guard._core._block_record_map))

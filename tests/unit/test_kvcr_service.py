@@ -283,17 +283,17 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     first_path = Path(guard._owner.spec.path)
     second_path = Path(registry._pools[1]._owner.spec.path)
     # An unclosable mapping keeps its file: unlinking would hide committed RAM.
-    guard._attachment.close.side_effect = RuntimeError("still holding the mapping")
-    with pytest.raises(RuntimeError, match="still holding the mapping"):
+    guard._recovery.attachment.close.side_effect = RuntimeError("mapping held")
+    with pytest.raises(RuntimeError, match="mapping held"):
         registry.close()
     assert registry._pools.keys() == {0}
-    assert registry._pools[0]._attachment is not None
+    assert registry._pools[0]._recovery.attachment is not None
     assert first_path.exists()
     # The pool behind it still went, files and all.
     assert second.closed is True and not second_path.exists()
 
     # The kept pool must still name what it leaked, or nobody could retry it.
-    guard._attachment.close.side_effect = None
+    guard._recovery.attachment.close.side_effect = None
     stubborn = Mock(close=Mock(side_effect=OSError("will not close")))
     guard._pool_lease.listener = stubborn
     with pytest.raises(OSError, match="will not close"):
