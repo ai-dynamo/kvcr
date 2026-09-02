@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-ROUTER_HINT_CAPABILITIES = frozenset({"router_hint"})
+ROUTER_HINT_KEY = "router_hint"
+ROUTER_HINT_CAPABILITIES = frozenset({ROUTER_HINT_KEY})
 
 
 def _parse_kv_hint(
