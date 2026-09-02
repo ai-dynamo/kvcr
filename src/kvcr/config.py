@@ -56,12 +56,17 @@ class KVCRBackendConfigs:
     # as one address range. Keep the singular field above for API compatibility;
     # callers must choose exactly one spelling.
     framework_dram_regions: tuple[FrameworkDramInput, ...] = ()
+    # Heterogeneous framework caches need one fixed-slot KVCR arena per object
+    # size. Keep the singular field above for source compatibility.
+    local_dram_arenas: tuple[LocalDramInfo, ...] = ()
 
     def __post_init__(self) -> None:
         if self.framework_dram is not None and self.framework_dram_regions:
             raise ValueError(
                 "framework_dram and framework_dram_regions are mutually exclusive"
             )
+        if self.local_dram is not None and self.local_dram_arenas:
+            raise ValueError("local_dram and local_dram_arenas are mutually exclusive")
 
 
 class TelemetryStats(Protocol):

@@ -8,8 +8,12 @@ from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import (
+    FakeBytesControl,
     FakeNixlAgent,
+    FakePrimaryPinning,
+    FakeTelemetryStats,
     _mem_descriptor,
+    _new_kvcr,
     _new_local_kvcr,
     _op_entries,
     _poll_until,
@@ -17,6 +21,12 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr import (
+    STATE_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+)
+from kvcr.config import KVCRConfig, LocalDramInfo
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
@@ -32,6 +42,191 @@ from kvcr.types import (
     PlacementAction,
     QueryStatus,
 )
+
+
+def _new_multi_arena_kvcr(
+    agent,
+    arenas,
+    *,
+    telemetry: bool = False,
+    inventory_sink=None,
+):
+    control = FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        config=KVCRConfig(
+            nixl_agent_name="target",
+            enable_telemetry=telemetry,
+            inventory_report_interval_ms=0,
+        ),
+        local_dram_arenas=tuple(
+            LocalDramInfo(ctypes.addressof(buffer), len(buffer), slot_count)
+            for buffer, slot_count in arenas
+        ),
+        inventory_sink=inventory_sink,
+    )
+    return kvcr, control
+
+
+def _metric_totals(stats: FakeTelemetryStats):
+    totals = {}
+    for kind, name, value, labels in stats.records:
+        key = (kind, name, *labels)
+        totals[key] = totals.get(key, 0) + value
+    return totals
+
+
+def test_two_local_arenas_deposit_deliver_and_reject_size_mismatches() -> None:
+    primary = ctypes.create_string_buffer(24)
+    primary.raw = b"a" * 8 + b"b" * 16
+    local_8 = ctypes.create_string_buffer(8)
+    local_16 = ctypes.create_string_buffer(16)
+    destination = ctypes.create_string_buffer(24)
+    primary_addr = ctypes.addressof(primary)
+    destination_addr = ctypes.addressof(destination)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    # Reverse size order deliberately: arena selection must not be positional.
+    kvcr, control = _new_multi_arena_kvcr(
+        agent,
+        ((local_16, 1), (local_8, 1)),
+        telemetry=True,
+    )
+    key_8, key_16 = BlockKey(b"k8"), BlockKey(b"k16")
+
+    deposit = kvcr.deposit(
+        {
+            key_8: _mem_descriptor(primary_addr, 8),
+            key_16: _mem_descriptor(primary_addr + 8, 16),
+        }
+    )
+    assert dict(_poll_until(kvcr, bool))[deposit] == _op_entries(
+        {key_8: True, key_16: True}
+    )
+    assert local_8.raw == b"a" * 8
+    assert local_16.raw == b"b" * 16
+    assert len(agent.xfers) == 2
+
+    registrations = [
+        (descriptors, mem_type) for descriptors, mem_type in agent.registrations
+    ]
+    assert len(registrations) == 2
+    assert {
+        (descriptors[0][0], descriptors[0][1], mem_type)
+        for descriptors, mem_type in registrations
+    } == {
+        (ctypes.addressof(local_8), 8, "DRAM"),
+        (ctypes.addressof(local_16), 16, "DRAM"),
+    }
+    assert all(len(descriptors) == 1 for descriptors, _ in registrations)
+
+    wrong_duplicate = kvcr.deposit({key_8: _mem_descriptor(primary_addr + 8, 16)})
+    assert list(kvcr.poll_completed()) == [
+        (wrong_duplicate, _op_entries({key_8: False}))
+    ]
+    assert len(agent.xfers) == 2
+    assert local_8.raw == b"a" * 8
+    assert local_16.raw == b"b" * 16
+    assert kvcr._core._local_dram.acquire_sources((key_8, key_16)) == {}
+    assert all(
+        kvcr._core._block_record_map[key].local_dram.claim_count == 0
+        for key in (key_8, key_16)
+    )
+
+    wrong_destination = kvcr.deliver({key_8: _mem_descriptor(destination_addr, 16)})
+    assert list(kvcr.poll_completed()) == [
+        (wrong_destination, _op_entries({key_8: False}))
+    ]
+    assert len(agent.xfers) == 2
+
+    deliver = kvcr.deliver(
+        {
+            key_8: _mem_descriptor(destination_addr, 8),
+            key_16: _mem_descriptor(destination_addr + 8, 16),
+        }
+    )
+    assert dict(_poll_until(kvcr, bool))[deliver] == _op_entries(
+        {key_8: True, key_16: True}
+    )
+    assert destination.raw == primary.raw
+    assert len(agent.xfers) == 4
+    assert all(transfer[4] == agent.name for transfer in agent.xfers)
+    assert control.sent == []
+
+    stats = kvcr.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    metrics = _metric_totals(stats)
+    assert metrics[("counter", TRANSFER_BLOCKS_METRIC, "local_fill")] == 2
+    assert metrics[("counter", TRANSFER_BYTES_METRIC, "local_fill")] == 24
+    assert metrics[("counter", TRANSFER_BLOCKS_METRIC, "local_deliver")] == 2
+    assert metrics[("counter", TRANSFER_BYTES_METRIC, "local_deliver")] == 24
+    expected_state = {
+        "local_g2_total_slots": 2,
+        "local_g2_free_slots": 0,
+        "local_g2_allocated_slots": 2,
+        "local_g2_evictable_slots": 2,
+        "local_g2_total_bytes": 24,
+        "local_g2_free_bytes": 0,
+        "local_g2_allocated_bytes": 24,
+        "local_g2_evictable_bytes": 24,
+        "local_g2_arena_8_total_slots": 1,
+        "local_g2_arena_8_free_slots": 0,
+        "local_g2_arena_8_allocated_slots": 1,
+        "local_g2_arena_8_evictable_slots": 1,
+        "local_g2_arena_16_total_slots": 1,
+        "local_g2_arena_16_free_slots": 0,
+        "local_g2_arena_16_allocated_slots": 1,
+        "local_g2_arena_16_evictable_slots": 1,
+    }
+    assert {
+        labels[0]: value
+        for kind, name, value, labels in stats.records
+        if kind == "gauge" and name == STATE_METRIC
+    }.items() >= expected_state.items()
+
+
+def test_full_small_arena_evicts_only_its_size_class() -> None:
+    primary = ctypes.create_string_buffer(32)
+    primary.raw = b"a" * 8 + b"b" * 16 + b"c" * 8
+    primary_addr = ctypes.addressof(primary)
+    local_8 = ctypes.create_string_buffer(8)
+    local_16 = ctypes.create_string_buffer(16)
+    events: list[InventoryEvent] = []
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr, _ = _new_multi_arena_kvcr(
+        agent,
+        ((local_8, 1), (local_16, 1)),
+        inventory_sink=events.append,
+    )
+    key_8_old = BlockKey(b"k8-old")
+    key_8_new = BlockKey(b"k8-new")
+    key_16 = BlockKey(b"k16")
+
+    first = kvcr.deposit(
+        {
+            key_8_old: _mem_descriptor(primary_addr, 8),
+            key_16: _mem_descriptor(primary_addr + 8, 16),
+        }
+    )
+    assert dict(_poll_until(kvcr, bool))[first] == _op_entries(
+        {key_8_old: True, key_16: True}
+    )
+
+    replacement = kvcr.deposit({key_8_new: _mem_descriptor(primary_addr + 24, 8)})
+    assert dict(_poll_until(kvcr, bool))[replacement] == _op_entries({key_8_new: True})
+    assert kvcr.query((key_8_old, key_8_new, key_16)) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+    assert local_8.raw == b"c" * 8
+    assert local_16.raw == b"b" * 16
+    assert [key for event in events if event.removed for key in event.keys] == [
+        key_8_old
+    ]
 
 
 def test_local_deposit_deduplicates_and_evicts_fifo() -> None:

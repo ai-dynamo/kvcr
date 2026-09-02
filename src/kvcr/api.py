@@ -91,6 +91,10 @@ class KVCR:
             if guard_config is None:
                 core = _KVCRCore(config, bindings, backend_configs)
             else:
+                if backend_configs.local_dram_arenas:
+                    raise ValueError(
+                        "guard_config conflicts with backend_configs.local_dram_arenas"
+                    )
                 claimed = _recovery.claim_guarded_pool(
                     guard_config, bindings, backend_configs
                 )

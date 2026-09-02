@@ -38,12 +38,32 @@ class _LocalDramState(Enum):
     DISCARDING = auto()
 
 
+@dataclass
+class _LocalDramArena:
+    address: int
+    length: int
+    slot_size: int
+    free_slots: deque[int]
+    evictable: _EvictionQueue = field(default_factory=_EvictionQueue)
+    unscored: set[BlockKey] = field(default_factory=set)
+    capacity_waiters: deque["_CapacityWaiter"] = field(default_factory=deque)
+    capacity_eviction_key: BlockKey | None = None
+    resuming_capacity_waiters: bool = False
+
+    @property
+    def slot_count(self) -> int:
+        return self.length // self.slot_size
+
+
 @dataclass(slots=True)
 class _LocalDramResidency:
     slot: int
     state: _LocalDramState
     claim_count: int = 0
     retire_on_release: bool = False
+    # None is the legacy single-arena representation used by recovery records.
+    # Multi-arena residencies name their unique size class explicitly.
+    arena_size: int | None = None
 
 
 @dataclass
@@ -76,6 +96,7 @@ class _LocalCopyOp(_ProgressOp):
     deliver_op_id: _OpId | None
     ordered_keys: tuple[BlockKey, ...]
     local_slots: tuple[int, ...]
+    arena_size: int
     src_descriptors: tuple[MemDescriptor, ...]
     dst_descriptors: tuple[MemDescriptor, ...]
     deadline: float
@@ -133,34 +154,56 @@ class _LocalCopyOp(_ProgressOp):
 
 
 class _LocalDram:
-    """Main-thread metadata for one externally allocated DRAM region."""
+    """Main-thread metadata for fixed-slot DRAM arenas keyed by slot size."""
 
     def __init__(
         self,
         kvcr: "_KVCRCore",
-        region: LocalDramInfo,
+        regions: Collection[LocalDramInfo],
     ) -> None:
-        if region.address <= 0:
-            raise ValueError("local DRAM address must be positive")
-        if region.length <= 0:
-            raise ValueError("local DRAM length must be positive")
-        if region.slot_count <= 0:
-            raise ValueError("local DRAM slot_count must be positive")
-        if region.length % region.slot_count:
-            raise ValueError("local DRAM length must divide evenly into slots")
-
         self._kvcr = kvcr
-        self._address = region.address
-        self._length = region.length
-        self._slot_size = region.length // region.slot_count
-        self._free_slots = deque(range(region.slot_count))
-        self._evictable = _EvictionQueue()
-        self._unscored: set[BlockKey] = set()
+        arenas: list[_LocalDramArena] = []
+        arena_by_size: dict[int, _LocalDramArena] = {}
+        memory_ranges: list[tuple[int, int]] = []
+        for region in regions:
+            if region.address <= 0:
+                raise ValueError("local DRAM address must be positive")
+            if region.length <= 0:
+                raise ValueError("local DRAM length must be positive")
+            if region.slot_count <= 0:
+                raise ValueError("local DRAM slot_count must be positive")
+            if region.length % region.slot_count:
+                raise ValueError("local DRAM length must divide evenly into slots")
+            slot_size = region.length // region.slot_count
+            if slot_size in arena_by_size:
+                raise ValueError(f"duplicate local DRAM arena slot size {slot_size}")
+            start, end = region.address, region.address + region.length
+            if any(
+                start < other_end and other_start < end
+                for other_start, other_end in memory_ranges
+            ):
+                raise ValueError("local DRAM arena memory regions must not overlap")
+            arena = _LocalDramArena(
+                address=region.address,
+                length=region.length,
+                slot_size=slot_size,
+                free_slots=deque(range(region.slot_count)),
+            )
+            arenas.append(arena)
+            arena_by_size[slot_size] = arena
+            memory_ranges.append((start, end))
+        if not arenas:
+            raise ValueError("at least one local DRAM arena is required")
+
+        self._arenas = tuple(arenas)
+        self._arena_by_size = arena_by_size
+        self._single_arena = arenas[0] if len(arenas) == 1 else None
+        # Private legacy attributes remain available for the single-arena path.
+        self._address = arenas[0].address if len(arenas) == 1 else None
+        self._length = arenas[0].length if len(arenas) == 1 else None
+        self._slot_size = arenas[0].slot_size if len(arenas) == 1 else None
         self._pending_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         self._pending_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
-        self._capacity_waiters: deque[_CapacityWaiter] = deque()
-        self._capacity_eviction_key: BlockKey | None = None
-        self._resuming_capacity_waiters = False
         self._public_claims: dict[
             ReleaseHandle, tuple[BlockKey, _LocalDramResidency]
         ] = {}
@@ -174,11 +217,40 @@ class _LocalDram:
 
     @property
     def memory_region(self) -> tuple[int, int]:
-        return self._address, self._length
+        arena = self._require_single_arena()
+        return arena.address, arena.length
+
+    @property
+    def memory_regions(self) -> tuple[tuple[int, int], ...]:
+        return tuple((arena.address, arena.length) for arena in self._arenas)
+
+    @property
+    def _free_slots(self) -> deque[int]:
+        return self._require_single_arena().free_slots
+
+    @property
+    def _evictable(self) -> _EvictionQueue:
+        return self._require_single_arena().evictable
+
+    @property
+    def _unscored(self) -> set[BlockKey]:
+        return self._require_single_arena().unscored
+
+    @property
+    def _capacity_waiters(self) -> deque[_CapacityWaiter]:
+        return self._require_single_arena().capacity_waiters
+
+    @property
+    def _capacity_eviction_key(self) -> BlockKey | None:
+        return self._require_single_arena().capacity_eviction_key
+
+    @_capacity_eviction_key.setter
+    def _capacity_eviction_key(self, key: BlockKey | None) -> None:
+        self._require_single_arena().capacity_eviction_key = key
 
     @property
     def _total_slots(self) -> int:
-        return self._length // self._slot_size
+        return sum(arena.slot_count for arena in self._arenas)
 
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
@@ -192,7 +264,8 @@ class _LocalDram:
         with them. Ranking them is rank_recovered, which needs the policy to have
         seen every block first.
         """
-        slot_count = self._total_slots
+        arena = self._require_single_arena()
+        slot_count = arena.slot_count
         occupied: set[int] = set()
         for record in records.values():
             residency = record.local_dram
@@ -207,7 +280,7 @@ class _LocalDram:
             ):
                 raise ValueError("invalid local DRAM recovery slots")
             occupied.add(slot)
-        self._free_slots = deque(
+        arena.free_slots = deque(
             slot for slot in range(slot_count) if slot not in occupied
         )
 
@@ -225,12 +298,69 @@ class _LocalDram:
 
     def telemetry_state(self) -> dict[str, int]:
         total_slots = self._total_slots
-        return {
+        free_slots = sum(len(arena.free_slots) for arena in self._arenas)
+        state = {
             "local_g2_total_slots": total_slots,
-            "local_g2_free_slots": len(self._free_slots),
-            "local_g2_allocated_slots": total_slots - len(self._free_slots),
-            "local_g2_evictable_slots": len(self._evictable),
+            "local_g2_free_slots": free_slots,
+            "local_g2_allocated_slots": total_slots - free_slots,
+            "local_g2_evictable_slots": sum(
+                len(arena.evictable) for arena in self._arenas
+            ),
+            "local_g2_total_bytes": sum(arena.length for arena in self._arenas),
+            "local_g2_free_bytes": sum(
+                len(arena.free_slots) * arena.slot_size for arena in self._arenas
+            ),
+            "local_g2_allocated_bytes": sum(
+                (arena.slot_count - len(arena.free_slots)) * arena.slot_size
+                for arena in self._arenas
+            ),
+            "local_g2_evictable_bytes": sum(
+                len(arena.evictable) * arena.slot_size for arena in self._arenas
+            ),
         }
+        for arena in self._arenas:
+            prefix = f"local_g2_arena_{arena.slot_size}"
+            state.update(
+                {
+                    f"{prefix}_total_slots": arena.slot_count,
+                    f"{prefix}_free_slots": len(arena.free_slots),
+                    f"{prefix}_allocated_slots": arena.slot_count
+                    - len(arena.free_slots),
+                    f"{prefix}_evictable_slots": len(arena.evictable),
+                    f"{prefix}_total_bytes": arena.length,
+                    f"{prefix}_free_bytes": len(arena.free_slots) * arena.slot_size,
+                    f"{prefix}_allocated_bytes": (
+                        arena.slot_count - len(arena.free_slots)
+                    )
+                    * arena.slot_size,
+                    f"{prefix}_evictable_bytes": len(arena.evictable) * arena.slot_size,
+                }
+            )
+        return state
+
+    def _require_single_arena(self) -> _LocalDramArena:
+        arena = self._single_arena
+        if arena is None:
+            raise RuntimeError("operation requires a single local DRAM arena")
+        return arena
+
+    def _arena_for_residency(self, residency: _LocalDramResidency) -> _LocalDramArena:
+        arena_size = residency.arena_size
+        if arena_size is None:
+            return self._require_single_arena()
+        arena = self._arena_by_size.get(arena_size)
+        if arena is None:
+            raise RuntimeError(f"unknown local DRAM arena size {arena_size}")
+        return arena
+
+    def _new_residency(
+        self, arena: _LocalDramArena, slot: int, state: _LocalDramState
+    ) -> _LocalDramResidency:
+        return _LocalDramResidency(
+            slot,
+            state,
+            arena_size=None if self._single_arena is not None else arena.slot_size,
+        )
 
     def deposit(
         self,
@@ -255,16 +385,22 @@ class _LocalDram:
         self._pending_residency_ops[op.op_id] = op
         self._kvcr._add_block_dependencies(op, new_operation=True)
 
-        copy_keys: list[BlockKey] = []
-        slots: list[int] = []
-        src_descriptors: list[MemDescriptor] = []
-        dst_descriptors: list[MemDescriptor] = []
+        copy_groups: dict[
+            int, list[tuple[BlockKey, int, MemDescriptor, MemDescriptor]]
+        ] = {}
         evicted: list[BlockKey] = []
         for key, src in blocks.items():
             record = self._kvcr._block_record(key)
             residency = record.local_dram
+            arena = self._arena_by_size.get(src.size)
+            if arena is None:
+                op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                continue
             if residency is not None:
-                if residency.state is _LocalDramState.READY:
+                resident_arena = self._arena_for_residency(residency)
+                if resident_arena is not arena:
+                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                elif residency.state is _LocalDramState.READY:
                     op.results[key] = (
                         self._new_public_claim(key, residency)
                         if no_evict
@@ -273,11 +409,8 @@ class _LocalDram:
                 elif residency.state is _LocalDramState.DISCARDING:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 continue
-            if src.size != self._slot_size:
-                op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
-                continue
             decision = self._kvcr._policy.decide_ingest(
-                self._kvcr._block_meta(key, record, self._slot_size),
+                self._kvcr._block_meta(key, record, arena.slot_size),
                 CacheTier.FW_G2,
                 required_local=no_evict,
                 framework_hints=hints,
@@ -285,27 +418,29 @@ class _LocalDram:
             if decision[0] is PlacementAction.DROP:
                 op.results[key] = OpEntryResult(OpEntryStatus.DROPPED)
                 continue
-            slot, evicted_key, eviction_pending = self._allocate_slot(keys, deadline)
+            slot, evicted_key, eviction_pending = self._allocate_slot(
+                arena, keys, deadline
+            )
             if slot is None:
                 if eviction_pending:
-                    self._enqueue_capacity_waiter(op, key, src)
+                    self._enqueue_capacity_waiter(arena, op, key, src)
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 continue
             if evicted_key is not None:
                 evicted.append(evicted_key)
-            self._kvcr._block_record(key).local_dram = _LocalDramResidency(
-                slot, _LocalDramState.FILLING
+            self._kvcr._block_record(key).local_dram = self._new_residency(
+                arena, slot, _LocalDramState.FILLING
             )
-            copy_keys.append(key)
-            slots.append(slot)
-            src_descriptors.append(src)
-            dst_descriptors.append(self._descriptor(slot))
+            copy_groups.setdefault(arena.slot_size, []).append(
+                (key, slot, src, self._descriptor(arena, slot))
+            )
 
         self._update_capacity_pressure()
         self._kvcr._publish_inventory(evicted, CacheTier.LOCAL_G2, removed=True)
         self._finish_residency_if_ready(op)
-        if copy_keys:
+        for arena_size, copies in copy_groups.items():
+            copy_keys, slots, src_descriptors, dst_descriptors = zip(*copies)
             self._kvcr._progress.submit(
                 _LocalCopyOp(
                     op_id=("local_copy", self._next_copy_id),
@@ -313,6 +448,7 @@ class _LocalDram:
                     deliver_op_id=None,
                     ordered_keys=tuple(copy_keys),
                     local_slots=tuple(slots),
+                    arena_size=arena_size,
                     src_descriptors=tuple(src_descriptors),
                     dst_descriptors=tuple(dst_descriptors),
                     deadline=deadline,
@@ -352,7 +488,11 @@ class _LocalDram:
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if residency is None:
-                if key in sources:
+                if self._single_arena is None:
+                    # A key and source tier do not reveal which heterogeneous
+                    # arena should receive a cold fill.
+                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                elif key in sources:
                     to_reserve.append(key)
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -363,10 +503,17 @@ class _LocalDram:
                 # A discarded fill still owns its slot, so this block cannot be
                 # reserved yet. Wait for the slot instead of failing a key a
                 # lower tier can still serve.
-                if key in sources:
-                    self._enqueue_capacity_waiter(op, key, sources[key])
+                if self._single_arena is None:
+                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                elif key in sources:
+                    self._enqueue_capacity_waiter(
+                        self._require_single_arena(), op, key, sources[key]
+                    )
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+        if self._single_arena is None:
+            self._finish_residency_if_ready(op)
+            return {}
         destinations, eviction_pending = self.reserve_fill(
             to_reserve,
             sources=sources,
@@ -376,7 +523,9 @@ class _LocalDram:
         )
         op.remote_fill_keys.update(destinations)
         for key in eviction_pending:
-            self._enqueue_capacity_waiter(op, key, sources[key])
+            self._enqueue_capacity_waiter(
+                self._require_single_arena(), op, key, sources[key]
+            )
         for key in to_reserve:
             if key not in destinations and key not in eviction_pending:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -384,6 +533,10 @@ class _LocalDram:
         return destinations
 
     def complete_fill(self, keys: Collection[BlockKey], *, success: bool) -> None:
+        if self._single_arena is None:
+            raise RuntimeError(
+                "cold fetch into multiple local DRAM arenas requires expected sizes"
+            )
         ordered_keys = tuple(keys)
         slots: list[int] = []
         for key in ordered_keys:
@@ -401,7 +554,11 @@ class _LocalDram:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             slots.append(residency.slot)
         self._apply_fill_result(
-            ordered_keys, tuple(slots), success, CacheTier.REMOTE_G2
+            ordered_keys,
+            tuple(slots),
+            self._require_single_arena().slot_size,
+            success,
+            CacheTier.REMOTE_G2,
         )
 
     def deliver(
@@ -437,6 +594,11 @@ class _LocalDram:
     def acquire_sources(
         self, keys: Collection[BlockKey]
     ) -> dict[BlockKey, MemDescriptor]:
+        if self._single_arena is None:
+            # Source-side peer writes need to compare each selected arena with
+            # the target descriptor before NIXL submission. Keep that remote
+            # path disabled until the wire-side prefix check is arena-aware.
+            return {}
         sources: dict[BlockKey, MemDescriptor] = {}
         for key in keys:
             if key in sources:
@@ -446,7 +608,8 @@ class _LocalDram:
             if residency is None or residency.state is not _LocalDramState.READY:
                 continue
             self._acquire_claim(key, residency)
-            sources[key] = self._descriptor(residency.slot)
+            arena = self._arena_for_residency(residency)
+            sources[key] = self._descriptor(arena, residency.slot)
         self._update_capacity_pressure()
         return sources
 
@@ -479,8 +642,9 @@ class _LocalDram:
         move is abandoned, that reservation has to be dropped or every later admission
         is refused for the life of the process.
         """
-        if self._capacity_eviction_key == key:
-            self._capacity_eviction_key = None
+        for arena in self._arenas:
+            if arena.capacity_eviction_key == key:
+                arena.capacity_eviction_key = None
 
     def discard_fill(self, keys: Collection[BlockKey]) -> None:
         residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -540,7 +704,7 @@ class _LocalDram:
             copy.started_at,
             copy.success,
             len(copy.ordered_keys),
-            len(copy.ordered_keys) * self._slot_size,
+            sum(descriptor.size for descriptor in copy.src_descriptors),
         )
         if copy.deliver_op_id is not None:
             self._finish_delivery_copy(copy)
@@ -549,6 +713,7 @@ class _LocalDram:
         self._apply_fill_result(
             copy.ordered_keys,
             copy.local_slots,
+            copy.arena_size,
             copy.success,
             CacheTier.FW_G2,
         )
@@ -557,6 +722,7 @@ class _LocalDram:
         self,
         ordered_keys: tuple[BlockKey, ...],
         local_slots: tuple[int, ...],
+        arena_size: int,
         success: bool,
         source: CacheTier,
     ) -> None:
@@ -565,6 +731,7 @@ class _LocalDram:
         affected_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         deliver_keys: dict[_OpId, list[BlockKey]] = {}
         now = self._kvcr._clock()
+        arena = self._arena_by_size[arena_size]
         for key, slot in zip(ordered_keys, local_slots):
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
@@ -572,6 +739,7 @@ class _LocalDram:
                 record is None
                 or residency is None
                 or residency.slot != slot
+                or self._arena_for_residency(residency) is not arena
                 or residency.state
                 not in (
                     _LocalDramState.FILLING,
@@ -584,13 +752,13 @@ class _LocalDram:
                 record.last_access = now
                 residency.state = _LocalDramState.READY
                 self._residency_observer(key, record)
-                meta = self._kvcr._block_meta(key, record, self._slot_size)
+                meta = self._kvcr._block_meta(key, record, arena.slot_size)
                 self._kvcr._on_ingest(meta, source)
                 self._make_evictable(key)
                 committed.append(key)
             else:
                 record.local_dram = None
-                self._free_slots.append(slot)
+                arena.free_slots.append(slot)
 
             for op_id in record.active_op_ids:
                 residency_op = self._pending_residency_ops.get(op_id)
@@ -630,7 +798,7 @@ class _LocalDram:
         if not success:
             for key in ordered_keys:
                 self._kvcr._prune_block_record(key)
-        self._resume_capacity_waiters()
+        self._resume_capacity_waiters(arena)
 
     def reserve_fill(
         self,
@@ -641,6 +809,7 @@ class _LocalDram:
         deadline: float,
         framework_hints: object | None = None,
     ) -> tuple[dict[BlockKey, MemDescriptor], set[BlockKey]]:
+        arena = self._require_single_arena()
         keys = tuple(dict.fromkeys(keys))
         protected = set(keys)
         destinations: dict[BlockKey, MemDescriptor] = {}
@@ -653,24 +822,24 @@ class _LocalDram:
             if record.local_dram is not None:
                 continue
             decision = self._kvcr._policy.decide_ingest(
-                self._kvcr._block_meta(key, record, self._slot_size),
+                self._kvcr._block_meta(key, record, arena.slot_size),
                 sources[key],
                 required_local,
                 framework_hints=framework_hints,
             )
             if decision[0] is PlacementAction.DROP:
                 continue
-            slot, evicted_key, waiting = self._allocate_slot(protected, deadline)
+            slot, evicted_key, waiting = self._allocate_slot(arena, protected, deadline)
             if slot is None:
                 if waiting:
                     eviction_pending.add(key)
                 continue
             if evicted_key is not None:
                 evicted.append(evicted_key)
-            self._kvcr._block_record(key).local_dram = _LocalDramResidency(
-                slot, _LocalDramState.FILLING
+            self._kvcr._block_record(key).local_dram = self._new_residency(
+                arena, slot, _LocalDramState.FILLING
             )
-            destinations[key] = self._descriptor(slot)
+            destinations[key] = self._descriptor(arena, slot)
         self._update_capacity_pressure()
         self._kvcr._publish_inventory(evicted, CacheTier.LOCAL_G2, removed=True)
         return destinations, eviction_pending
@@ -678,10 +847,9 @@ class _LocalDram:
     def _start_deliveries(
         self, op: _PendingDeliverOp, keys: Collection[BlockKey]
     ) -> None:
-        copy_keys: list[BlockKey] = []
-        local_slots: list[int] = []
-        src_descriptors: list[MemDescriptor] = []
-        dst_descriptors: list[MemDescriptor] = []
+        copy_groups: dict[
+            int, list[tuple[BlockKey, int, MemDescriptor, MemDescriptor]]
+        ] = {}
         now = self._kvcr._clock()
         for key in keys:
             if key in op.results or key in op.active_keys:
@@ -692,22 +860,29 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.FILLING:
                 continue
-            elif (
-                residency.state is _LocalDramState.DISCARDING
-                or op.destinations[key].size != self._slot_size
-                or now >= op.deadline
-            ):
-                op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             else:
+                arena = self._arena_for_residency(residency)
+                if (
+                    residency.state is _LocalDramState.DISCARDING
+                    or op.destinations[key].size != arena.slot_size
+                    or now >= op.deadline
+                ):
+                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                    continue
                 self._acquire_claim(key, residency)
                 op.active_keys.add(key)
-                copy_keys.append(key)
-                local_slots.append(residency.slot)
-                src_descriptors.append(self._descriptor(residency.slot))
-                dst_descriptors.append(op.destinations[key])
+                copy_groups.setdefault(arena.slot_size, []).append(
+                    (
+                        key,
+                        residency.slot,
+                        self._descriptor(arena, residency.slot),
+                        op.destinations[key],
+                    )
+                )
 
         self._update_capacity_pressure()
-        if copy_keys:
+        for arena_size, copies in copy_groups.items():
+            copy_keys, local_slots, src_descriptors, dst_descriptors = zip(*copies)
             self._kvcr._progress.submit(
                 _LocalCopyOp(
                     op_id=("local_copy", self._next_copy_id),
@@ -715,6 +890,7 @@ class _LocalDram:
                     deliver_op_id=op.op_id,
                     ordered_keys=tuple(copy_keys),
                     local_slots=tuple(local_slots),
+                    arena_size=arena_size,
                     src_descriptors=tuple(src_descriptors),
                     dst_descriptors=tuple(dst_descriptors),
                     deadline=op.deadline,
@@ -729,12 +905,14 @@ class _LocalDram:
         if copy.deliver_op_id is None:
             raise RuntimeError("local delivery has no owning operation")
         op = self._pending_deliver_ops[copy.deliver_op_id]
+        arena = self._arena_by_size[copy.arena_size]
         for key, slot in zip(copy.ordered_keys, copy.local_slots):
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if (
                 residency is None
                 or residency.slot != slot
+                or self._arena_for_residency(residency) is not arena
                 or residency.state is not _LocalDramState.READY
             ):
                 raise RuntimeError(f"local DRAM delivery state lost for {key!r}")
@@ -797,35 +975,36 @@ class _LocalDram:
 
     def _enqueue_capacity_waiter(
         self,
+        arena: _LocalDramArena,
         op: _PendingResidencyOp,
         key: BlockKey,
         source: MemDescriptor | CacheTier,
     ) -> None:
         if key in op.capacity_waiters:
             raise RuntimeError(f"duplicate local capacity waiter for {key!r}")
-        self._capacity_waiters.append(_CapacityWaiter(op, key, source))
+        arena.capacity_waiters.append(_CapacityWaiter(op, key, source))
         op.capacity_waiters.add(key)
 
-    def _resume_capacity_waiters(self) -> None:
-        if self._resuming_capacity_waiters:
+    def _resume_capacity_waiters(self, arena: _LocalDramArena) -> None:
+        if arena.resuming_capacity_waiters:
             return
-        self._resuming_capacity_waiters = True
+        arena.resuming_capacity_waiters = True
         try:
-            while self._capacity_waiters:
-                waiter = self._capacity_waiters[0]
+            while arena.capacity_waiters:
+                waiter = arena.capacity_waiters[0]
                 op = waiter.op
                 if (
                     waiter.key not in op.capacity_waiters
                     or self._pending_residency_ops.get(op.op_id) is not op
                 ):
-                    self._capacity_waiters.popleft()
+                    arena.capacity_waiters.popleft()
                     continue
                 if waiter.key in op.results:
-                    self._capacity_waiters.popleft()
+                    arena.capacity_waiters.popleft()
                     op.capacity_waiters.remove(waiter.key)
                     continue
                 if self._kvcr._clock() >= op.deadline:
-                    self._capacity_waiters.popleft()
+                    arena.capacity_waiters.popleft()
                     op.capacity_waiters.remove(waiter.key)
                     op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
                     self._finish_residency_if_ready(op)
@@ -834,9 +1013,11 @@ class _LocalDram:
                 record = self._kvcr._block_record(waiter.key)
                 residency = record.local_dram
                 if residency is not None:
-                    self._capacity_waiters.popleft()
+                    arena.capacity_waiters.popleft()
                     op.capacity_waiters.remove(waiter.key)
-                    if residency.state is _LocalDramState.READY:
+                    if self._arena_for_residency(residency) is not arena:
+                        op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
+                    elif residency.state is _LocalDramState.READY:
                         op.results[waiter.key] = (
                             self._new_public_claim(waiter.key, residency)
                             if op.claim_on_ready
@@ -848,35 +1029,37 @@ class _LocalDram:
                     continue
 
                 evicted_key: BlockKey | None = None
-                if self._free_slots:
-                    slot = self._free_slots.popleft()
-                elif self._capacity_eviction_key is not None:
+                if arena.free_slots:
+                    slot = arena.free_slots.popleft()
+                elif arena.capacity_eviction_key is not None:
                     break
                 else:
                     slot, evicted_key, eviction_pending = self._allocate_slot(
-                        op.keys, op.deadline
+                        arena, op.keys, op.deadline
                     )
                     if slot is None:
                         if eviction_pending:
                             break
-                        self._capacity_waiters.popleft()
+                        arena.capacity_waiters.popleft()
                         op.capacity_waiters.remove(waiter.key)
                         op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
                         self._finish_residency_if_ready(op)
                         continue
 
-                self._capacity_waiters.popleft()
+                arena.capacity_waiters.popleft()
                 op.capacity_waiters.remove(waiter.key)
                 if evicted_key is not None:
                     self._kvcr._publish_inventory(
                         (evicted_key,), CacheTier.LOCAL_G2, removed=True
                     )
-                record.local_dram = _LocalDramResidency(slot, _LocalDramState.FILLING)
+                record.local_dram = self._new_residency(
+                    arena, slot, _LocalDramState.FILLING
+                )
                 if isinstance(waiter.source, CacheTier):
                     op.remote_fill_keys.add(waiter.key)
                     self._kvcr._start_local_fill(
                         waiter.source,
-                        {waiter.key: self._descriptor(slot)},
+                        {waiter.key: self._descriptor(arena, slot)},
                         op.request_id,
                         op.deadline,
                     )
@@ -888,8 +1071,9 @@ class _LocalDram:
                             deliver_op_id=None,
                             ordered_keys=(waiter.key,),
                             local_slots=(slot,),
+                            arena_size=arena.slot_size,
                             src_descriptors=(waiter.source,),
-                            dst_descriptors=(self._descriptor(slot),),
+                            dst_descriptors=(self._descriptor(arena, slot),),
                             deadline=op.deadline,
                             clock=self._kvcr._clock,
                             started_at=self._kvcr._timer(),
@@ -897,7 +1081,7 @@ class _LocalDram:
                     )
                     self._next_copy_id += 1
         finally:
-            self._resuming_capacity_waiters = False
+            arena.resuming_capacity_waiters = False
             self._update_capacity_pressure()
 
     def _new_public_claim(
@@ -907,16 +1091,17 @@ class _LocalDram:
         handle = ReleaseHandle(self._next_release_handle)
         self._next_release_handle += 1
         self._public_claims[handle] = (key, residency)
+        arena = self._arena_for_residency(residency)
         return OpEntryResult(
             OpEntryStatus.SUCCESS,
-            self._descriptor(residency.slot),
+            self._descriptor(arena, residency.slot),
             handle,
         )
 
     def _acquire_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         if residency.state is not _LocalDramState.READY:
             raise RuntimeError(f"cannot claim unready local DRAM entry {key!r}")
-        self._remove_evictable(key)
+        self._remove_evictable(key, residency)
         residency.claim_count += 1
 
     def _release_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
@@ -927,95 +1112,103 @@ class _LocalDram:
             or residency.claim_count <= 0
         ):
             raise RuntimeError(f"invalid local DRAM claim for {key!r}")
+        arena = self._arena_for_residency(residency)
         residency.claim_count -= 1
         if residency.claim_count == 0:
             if residency.retire_on_release:
                 record.local_dram = None
                 self._residency_observer(key, record)
-                self._free_slots.append(residency.slot)
+                arena.free_slots.append(residency.slot)
                 self.abandon_capacity_eviction(key)
                 self._kvcr._on_remove(
-                    self._kvcr._block_meta(key, record, self._slot_size)
+                    self._kvcr._block_meta(key, record, arena.slot_size)
                 )
                 self._kvcr._publish_inventory((key,), CacheTier.LOCAL_G2, removed=True)
                 self._kvcr._prune_block_record(key)
-                self._resume_capacity_waiters()
+                self._resume_capacity_waiters(arena)
             else:
                 self._make_evictable(key)
 
     def _allocate_slot(
-        self, protected: set[BlockKey], deadline: float
+        self,
+        arena: _LocalDramArena,
+        protected: set[BlockKey],
+        deadline: float,
     ) -> tuple[int | None, BlockKey | None, bool]:
-        if self._free_slots:
-            return self._free_slots.popleft(), None, False
-        if self._capacity_eviction_key is not None:
+        if arena.free_slots:
+            return arena.free_slots.popleft(), None, False
+        if arena.capacity_eviction_key is not None:
             return None, None, True
-        self._retry_unscored()
+        self._retry_unscored(arena)
         skipped = set(protected)
-        while (key := self._evictable.select(skipped)) is not None:
+        while (key := arena.evictable.select(skipped)) is not None:
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if (
                 record is None
                 or residency is None
+                or self._arena_for_residency(residency) is not arena
                 or residency.state is not _LocalDramState.READY
                 or residency.claim_count
             ):
                 raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
             decision, eviction_pending = self._kvcr._decide_eviction(
-                self._kvcr._block_meta(key, record, self._slot_size),
+                self._kvcr._block_meta(key, record, arena.slot_size),
                 CacheTier.LOCAL_G2,
                 deadline,
             )
-            if self._free_slots:
-                return self._free_slots.popleft(), None, False
+            if arena.free_slots:
+                return arena.free_slots.popleft(), None, False
             if eviction_pending:
-                self._capacity_eviction_key = key
+                arena.capacity_eviction_key = key
                 return None, None, True
             if decision[0] is PlacementAction.KEEP:
                 skipped.add(key)
                 continue
-            self._evictable.remove(key)
+            arena.evictable.remove(key)
             record.local_dram = None
             self._residency_observer(key, record)
-            self._kvcr._on_remove(self._kvcr._block_meta(key, record, self._slot_size))
+            self._kvcr._on_remove(self._kvcr._block_meta(key, record, arena.slot_size))
             self._kvcr._prune_block_record(key)
             return residency.slot, key, False
         return None, None, False
 
     def _make_evictable(self, key: BlockKey) -> None:
         record = self._kvcr._block_record_map.get(key)
-        if record is None:
+        residency = record.local_dram if record is not None else None
+        if record is None or residency is None:
             raise RuntimeError(f"missing block record for {key!r}")
+        arena = self._arena_for_residency(residency)
         score = self._kvcr._policy.eviction_score(
-            self._kvcr._block_meta(key, record, self._slot_size),
+            self._kvcr._block_meta(key, record, arena.slot_size),
             CacheTier.LOCAL_G2,
         )
         if score is None:
-            self._unscored.add(key)
+            arena.unscored.add(key)
             return
-        self._unscored.discard(key)
-        self._evictable.insert(key, score)
+        arena.unscored.discard(key)
+        arena.evictable.insert(key, score)
 
-    def _remove_evictable(self, key: BlockKey) -> None:
-        self._unscored.discard(key)
-        self._evictable.remove(key)
+    def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
+        arena = self._arena_for_residency(residency)
+        arena.unscored.discard(key)
+        arena.evictable.remove(key)
 
-    def _retry_unscored(self) -> None:
-        for key in tuple(self._unscored):
+    def _retry_unscored(self, arena: _LocalDramArena) -> None:
+        for key in tuple(arena.unscored):
             self._make_evictable(key)
 
-    def _descriptor(self, slot: int) -> MemDescriptor:
+    def _descriptor(self, arena: _LocalDramArena, slot: int) -> MemDescriptor:
         return MemDescriptor(
             end_point_name=self._kvcr.nixl_agent_name,
             mem_type="DRAM",
-            addr=self._address + slot * self._slot_size,
-            size=self._slot_size,
+            addr=arena.address + slot * arena.slot_size,
+            size=arena.slot_size,
             device_Id=0,
             info="",
         )
 
     def _update_capacity_pressure(self) -> None:
         self._kvcr._update_capacity_pressure(
-            len(self._free_slots) + len(self._evictable)
+            sum(len(arena.free_slots) + len(arena.evictable) for arena in self._arenas)
         )

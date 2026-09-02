@@ -406,6 +406,23 @@ def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> N
     client.assert_not_called()
 
 
+def test_service_dram_rejects_explicit_local_dram_arenas_before_claim(
+    monkeypatch,
+) -> None:
+    client = Mock()
+    monkeypatch.setattr(kvcr_recovery, "KVCRClient", client)
+
+    with pytest.raises(ValueError, match="local_dram_arenas"):
+        KVCR(
+            KVCRConfig(nixl_agent_name="target"),
+            KVCRBindings(Mock(), Mock(), Mock()),
+            KVCRBackendConfigs(local_dram_arenas=(LocalDramInfo(1234, 8192, 8),)),
+            _GUARD_CONFIG,
+        )
+
+    client.assert_not_called()
+
+
 def test_get_stats_emits_public_state_metric_name() -> None:
     kvcr = _new_kvcr(
         FakeNixlAgent(),
@@ -508,6 +525,45 @@ def test_singular_and_plural_framework_dram_are_mutually_exclusive() -> None:
             KVCRBackendConfigs(
                 framework_dram=FrameworkDramInput(128, 64),
                 framework_dram_regions=(FrameworkDramInput(256, 128),),
+            ),
+        )
+
+
+def test_singular_and_plural_local_dram_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="local_dram"):
+        KVCRBackendConfigs(
+            local_dram=LocalDramInfo(128, 16, 2),
+            local_dram_arenas=(LocalDramInfo(256, 16, 1),),
+        )
+
+
+def test_local_dram_arenas_reject_duplicate_slot_sizes() -> None:
+    with pytest.raises(ValueError, match="duplicate.*slot size.*8"):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            local_dram_arenas=(
+                LocalDramInfo(128, 16, 2),
+                LocalDramInfo(256, 24, 3),
+            ),
+        )
+
+
+def test_g3_rejects_multiple_local_dram_arenas(tmp_path) -> None:
+    with pytest.raises(ValueError, match="G3.*multiple.*local DRAM arenas"):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            local_dram_arenas=(
+                LocalDramInfo(128, 8, 1),
+                LocalDramInfo(256, 16, 1),
+            ),
+            g3=G3Options(
+                paths=(tmp_path / "g3.data",),
+                capacity_bytes_per_file=16,
+                backend="MOCK",
             ),
         )
 

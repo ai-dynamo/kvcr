@@ -130,7 +130,9 @@ class _KVCRCore:
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
-        local_dram_config = backend_configs.local_dram
+        local_dram_configs = backend_configs.local_dram_arenas
+        if backend_configs.local_dram is not None:
+            local_dram_configs = (backend_configs.local_dram,)
         framework_dram = backend_configs.framework_dram
         framework_dram_regions = backend_configs.framework_dram_regions
         if framework_dram is not None:
@@ -140,7 +142,7 @@ class _KVCRCore:
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
         configured_tiers = set()
-        if local_dram_config is not None:
+        if local_dram_configs:
             configured_tiers.add(CacheTier.LOCAL_G2)
         if g3_config is not None:
             configured_tiers.add(CacheTier.G3)
@@ -154,8 +156,15 @@ class _KVCRCore:
         )
 
         # Common KVCR state tables.
-        if g3_config is not None and local_dram_config is None:
+        if g3_config is not None and not local_dram_configs:
             raise ValueError("G3 requires configured local DRAM")
+        if g3_config is not None and len(local_dram_configs) > 1:
+            raise ValueError("G3 does not support multiple local DRAM arenas")
+        if len(local_dram_configs) > 1 and self.config.capacity_low_watermark_percent:
+            raise ValueError(
+                "capacity low watermark does not support multiple local DRAM arenas"
+            )
+        local_dram_config = local_dram_configs[0] if local_dram_configs else None
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._pending_inventory_events: list[InventoryEvent] = []
         self._inventory_flush_deadline: float | None = None
@@ -204,9 +213,7 @@ class _KVCRCore:
         from .remote_fw_dram import _RemoteFWDram
 
         self._local_dram = (
-            _LocalDram(self, local_dram_config)
-            if local_dram_config is not None
-            else None
+            _LocalDram(self, local_dram_configs) if local_dram_configs else None
         )
         self._remote_fw_dram = _RemoteFWDram(
             self,
@@ -227,7 +234,7 @@ class _KVCRCore:
             (region.address, region.length) for region in framework_dram_regions
         )
         if self._local_dram is not None:
-            memory_regions.append(self._local_dram.memory_region)
+            memory_regions.extend(self._local_dram.memory_regions)
 
         def initialize_progress(progress: _KVCRProgress) -> None:
             self._remote_fw_dram.initialize_progress(progress)
