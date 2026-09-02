@@ -52,8 +52,6 @@ _RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
 # object, so nothing stale (reused pid, retried release) can touch a newer lease.
 _Lease = PidfdLiveness
 
-_OPS = dict(claim="_claim", release="_stand_down", abort="_abort", close="_close")
-
 
 def _without_g3(
     records: dict[BlockKey, _BlockRecord],
@@ -96,16 +94,25 @@ class _Command:
         self.future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
 
-# First six: stable resting states. Last three: transient reservations taken
-# before a command is queued, so a conflicting command is refused immediately.
-_Phase = enum.Enum(
-    "_Phase",
-    "UNCONFIGURED IDLE STANDBY PRIMARY FAILED CLOSED CLAIMING RELEASING PROMOTING",
-)
+class _Phase(enum.Enum):
+    """First six: stable resting states. Last three: transient reservations taken
+    before a command is queued, so a conflicting command is refused immediately.
+    """
+
+    UNCONFIGURED = enum.auto()
+    IDLE = enum.auto()
+    STANDBY = enum.auto()
+    PRIMARY = enum.auto()
+    FAILED = enum.auto()
+    CLOSED = enum.auto()
+    CLAIMING = enum.auto()
+    RELEASING = enum.auto()
+    PROMOTING = enum.auto()
 
 
 class _Guard:
-    """One pool's standby, alive as long as the service owns the pool.
+    """One pool's lifecycle actor: owns the pool file, control endpoint, holder
+    pidfd, and recovery state, alive as long as the service owns the pool.
     Outlives every primary: a claim is reported to it, not what creates it.
     """
 
@@ -136,6 +143,12 @@ class _Guard:
         # Recovered half a Guard cannot serve; kept for the next primary, which can.
         self._g3_records: dict[BlockKey, _G3Residency] = {}
         self._commands: queue.Queue[_Command] = queue.Queue()
+        self._ops = {
+            "claim": self._claim,
+            "release": self._stand_down,
+            "abort": self._abort,
+            "close": self._close,
+        }
         self._thread = threading.Thread(
             target=self._run, name=f"kvcr-guard-{spec.pool_id}", daemon=True
         )
@@ -320,7 +333,7 @@ class _Guard:
                 continue
             failed: BaseException | None = None
             try:
-                result = getattr(self, _OPS[command.operation])(*command.args)
+                result = self._ops[command.operation](*command.args)
             except BaseException as error:  # noqa: BLE001 - returned to caller
                 failed = error
                 with self._phase_lock:
