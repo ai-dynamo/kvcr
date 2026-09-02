@@ -321,10 +321,10 @@ class _KVCRCore:
                 "KVCR submit_hint requires request_id; dropping %d keys",
                 len(block_key_list),
             )
-        # Only the request-scoped source and opaque hint are currently used by
-        # remote-G2 query, fetch, and deliver. Proactive copy or move using the
-        # block list is not implemented.
-        self._remote_fw_dram.submit_hint(src, hints, request_id)
+        # The block list and opaque framework hint are alternative membership
+        # representations. Neither starts proactive movement; both only scope
+        # which keys may use this request's remote source.
+        self._remote_fw_dram.submit_hint(block_key_list, src, hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)
@@ -370,15 +370,20 @@ class _KVCRCore:
         local_blocks: dict[BlockKey, MemDescriptor] = {}
         g3_blocks: dict[BlockKey, MemDescriptor] = {}
         remote_blocks: dict[BlockKey, MemDescriptor] = {}
+        failed_keys: set[BlockKey] = set()
         for key, destination in blocks.items():
             if self._is_local_resident(key):
                 local_blocks[key] = destination
             elif self._g3 is not None and self._g3.is_ready(key):
                 g3_blocks[key] = destination
-            else:
+            elif request_id is not None and self._remote_fw_dram.query(
+                key, request_id
+            ):
                 remote_blocks[key] = destination
+            else:
+                failed_keys.add(key)
 
-        if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
+        if sum(map(bool, (local_blocks, g3_blocks, remote_blocks, failed_keys))) > 1:
             self._joined_completions[op_handle] = (set(blocks), {})
         if local_dram is not None and local_blocks:
             local_dram.deliver(op_handle, local_blocks, deadline=deadline)
@@ -389,6 +394,11 @@ class _KVCRCore:
             self._complete(
                 op_handle,
                 {key: OpEntryResult(OpEntryStatus.FAILED) for key in g3_blocks},
+            )
+        if failed_keys:
+            self._complete(
+                op_handle,
+                {key: OpEntryResult(OpEntryStatus.FAILED) for key in failed_keys},
             )
         if remote_blocks:
             self._remote_fw_dram.deliver(

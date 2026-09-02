@@ -55,6 +55,7 @@ class _FwMemResidency:
 @dataclass(frozen=True)
 class _RequestHint:
     source: str
+    keys: frozenset[BlockKey]
     value: object
     submitted_at: float | None
     failed: bool = False
@@ -426,6 +427,7 @@ class _RemoteFWDram:
 
     def submit_hint(
         self,
+        keys: Collection[BlockKey],
         src: str | None,
         hints: object | None,
         request_id: str | None,
@@ -441,6 +443,7 @@ class _RemoteFWDram:
                     return
                 self._request_hints[request_id] = _RequestHint(
                     source=src,
+                    keys=frozenset(keys),
                     value=(
                         hints
                         if hints is not None
@@ -461,13 +464,13 @@ class _RemoteFWDram:
         """Return whether ``key`` matches the request's remote hint."""
         request_hint = self._request_hints.get(request_id)
         adapter = self._key_hint_adapter
-        if request_hint is None or request_hint.failed or adapter is None:
+        if request_hint is None or request_hint.failed:
             return False
-        if not self._options.opportunistic_query and not adapter.matches(
-            key, request_hint.value
-        ):
-            return False
-        return True
+        if self._options.opportunistic_query:
+            return True
+        if key in request_hint.keys:
+            return True
+        return adapter is not None and adapter.matches(key, request_hint.value)
 
     def _start_target_pull(
         self,
