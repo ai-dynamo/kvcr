@@ -215,8 +215,8 @@ curl --fail --silent --show-error \
   -H 'x-dynamo-dp-rank: 0' \
   -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX seed source\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
 
-# Allow the asynchronous full-block KV events to reach the local router.
-sleep 2
+# CPU offload, KV-event publication, and router indexing are asynchronous.
+sleep 10
 
 curl --fail --silent --show-error \
   http://127.0.0.1:8000/v1/completions \
@@ -226,23 +226,77 @@ curl --fail --silent --show-error \
   -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX retrieve on target\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
 ```
 
-These headers constrain the KV router to a specific DP rank; they do not bypass
-it. For the second request, the router can still identify rank 0 as the source
-and provide its source hint to rank 1. The two responses should report
-`decode_dp_rank` 0 and 1, respectively, under `nvext.worker_id`.
+A successful run prints two JSON responses. The generated text, IDs, and exact
+token counts vary. These are the relevant fields from one validated run:
 
-Compare the periodic `KV Transfer metrics` immediately before and after the
-second request. The source must report successful `transfer` and `source_write`
-operations with positive block and byte deltas. The destination must report a
-successful, not partial, `remote_deliver` with the same block delta, and its
-`kv_offload_tiering_read_bytes` delta must equal the source byte delta.
+Rank 0 seed:
+
+```json
+{
+  "usage": {"prompt_tokens_details": {"cached_tokens": 0}},
+  "nvext": {
+    "worker_id": {
+      "decode_worker_id": 2509471956910756130,
+      "decode_dp_rank": 0
+    }
+  }
+}
+```
+
+Rank 1 retrieval:
+
+```json
+{
+  "usage": {"prompt_tokens_details": {"cached_tokens": 2688}},
+  "nvext": {
+    "worker_id": {
+      "decode_worker_id": 2509471956910756130,
+      "decode_dp_rank": 1
+    }
+  }
+}
+```
+
+The unchanged `decode_worker_id` is expected because both DP ranks belong to
+the same worker endpoint. The change from `decode_dp_rank: 0` to
+`decode_dp_rank: 1` confirms that the headers selected the requested ranks.
+The seed has zero cached tokens because its prefix is fresh. In the retrieval,
+2,688 cached tokens means rank 1 accepted 42 complete 64-token blocks. The
+exact value may differ, but it must be positive and block-aligned. If the
+retrieval reports zero cached tokens, rank selection worked but this test did
+not demonstrate KVCR reuse. Generate a new `PREFIX` before retrying so rank 1
+cannot satisfy the retry from KV it computed locally.
+
+These headers constrain the KV router; they do not bypass it. For the retrieval,
+the router can still identify rank 0 as the source and provide its source hint
+to rank 1. The response is useful evidence, but terminal telemetry is the final
+proof. The relevant post-request `KV Transfer metrics` from that run contained:
+
+```text
+source rank 0:
+  vllm:kvcr_duration_seconds:('transfer', 'success')_count=1
+  vllm:kvcr_duration_seconds:('source_write', 'success')_count=1
+  vllm:kvcr_transfer_blocks:('source_write',)=42
+  vllm:kvcr_transfer_bytes:('source_write',)=308281344
+
+destination rank 1:
+  vllm:kvcr_duration_seconds:('remote_deliver', 'success')_count=1
+  vllm:kvcr_transfer_blocks:('remote_deliver',)=42
+  vllm:kv_offload_tiering_read_bytes:('1:kvcr',)=308281344
+```
+
+The exact counts may differ, but the source and destination block counts must
+match, as must the source-write and destination-read byte counts. There must be
+no positive `remote_deliver` `partial` or `failed` count. These values reset
+after each reporting interval, so inspect the interval or intervals covering
+the retrieval instead of subtracting two log lines.
 
 The explicit rank selection is only for this deterministic mechanism test. In
 a normal deployment, omit the two routing headers. KVCR transfers can occur
 when load, availability, or routing constraints cause the KV router to select a
 target other than the cache-owning worker. Confirm each such transfer in the
 post-request `KV Transfer metrics`: the source reports `transfer=success` and
-`source_write=success`, the destination reports `remote_deliver=success`, and 
+`source_write=success`, the destination reports `remote_deliver=success`, and
 their transferred block and byte counts match.
 
 ---
