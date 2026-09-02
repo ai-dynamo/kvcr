@@ -53,6 +53,85 @@ _RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
 _Lease = PidfdLiveness
 
 
+class _PoolLease:
+    """One pool's holder identity and persistent control listener."""
+
+    def __init__(self, pool_index: int) -> None:
+        self._pool_index = pool_index
+        self.current: _Lease | None = None
+        self.listener: socket.socket | None = None
+        # As the claimant asked: getsockname() is numeric and rejects aliases.
+        self.bind_address: tuple[str, int] | None = None
+
+    def clear_if_current(self, lease: _Lease) -> None:
+        if self.current is lease:
+            self.current = None
+
+    def poll_pidfd(self, lease: _Lease) -> int | None:
+        """Return raw pidfd events for interpretation after lifecycle validation."""
+        poller = select.poll()
+        poller.register(lease.fileno(), select.POLLIN)
+        events = poller.poll(0)
+        return events[0][1] if events else None
+
+    def bind(self, address: tuple[str, int]) -> tuple[socket.socket, bool]:
+        """Bind once and return the listener plus whether this call created it."""
+        if self.listener is not None:
+            if self.bind_address != address:
+                raise KVCRServiceError(
+                    f"KVCR pool {self._pool_index} answers on "
+                    f"{self.bind_address[0]}:{self.bind_address[1]} and cannot be "
+                    "moved to "
+                    f"{address[0]}:{address[1]}"
+                )
+            return self.listener, False
+        try:
+            listener = socket.create_server(address)
+        except OSError as error:
+            raise KVCRServiceError(
+                f"KVCR pool {self._pool_index} control listener "
+                f"{address[0]}:{address[1]} is unavailable: {error}"
+            ) from error
+        self.listener = listener
+        self.bind_address = address
+        return listener, True
+
+    def unbind(self) -> BaseException | None:
+        """Forget a first-claim listener and report any failure to close it."""
+        listener, self.listener = self.listener, None
+        self.bind_address = None
+        if listener is None:
+            return None
+        try:
+            listener.close()
+        except BaseException as error:  # noqa: BLE001 - the Guard decides severity
+            return error
+        return None
+
+    def close(self) -> None:
+        """Close holder then listener, retaining failures for a later retry."""
+        failure: BaseException | None = None
+        lease = self.current
+        if lease is not None:
+            try:
+                lease.close()
+            except BaseException as error:  # noqa: BLE001 - first failure wins
+                failure = error
+            else:
+                self.clear_if_current(lease)
+        # Unlike unbind(), a failure keeps the listener so close can retry it.
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except BaseException as error:  # noqa: BLE001 - holder failure still wins
+                failure = failure or error
+            else:
+                self.listener = None
+                self.bind_address = None
+        if failure is not None:
+            raise failure
+
+
 def _without_g3(
     records: dict[BlockKey, _BlockRecord],
 ) -> dict[BlockKey, _BlockRecord]:
@@ -133,9 +212,7 @@ class _Guard:
         # claim needs no lock -- the mailbox is the reservation.
         self._owner = owner
         self._refusing = refusing
-        self._lease = self._listener = None
-        # As the claimant asked: getsockname() is numeric and rejects aliases.
-        self._bind: tuple[str, int] | None = None
+        self._pool_lease = _PoolLease(pool_index)
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
@@ -204,7 +281,7 @@ class _Guard:
         shutdown too: the close path owns every resource this touches.
         """
         with self._phase_lock:
-            if self._closing or lease is not self._lease:
+            if self._closing or self._pool_lease.current is not lease:
                 return
             if self._reserved is not None:
                 if self._reserved is _Phase.PROMOTING:
@@ -261,9 +338,8 @@ class _Guard:
             if self._reserved is not None:
                 raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
             if self._phase is _Phase.PRIMARY:
-                poller = select.poll()
-                poller.register(self._lease.fileno(), select.POLLIN)
-                if not poller.poll(0):
+                lease = self._pool_lease.current
+                if self._pool_lease.poll_pidfd(lease) is None:
                     raise KVCRServiceError(
                         f"KVCR pool {self._pool_index} is held by another worker"
                     )
@@ -363,15 +439,17 @@ class _Guard:
                 or self._closing
             ):
                 return
-            lease = self._lease
-        poller = select.poll()
-        poller.register(lease.fileno(), select.POLLIN)
-        if not (events := poller.poll(0)):
+            lease = self._pool_lease.current
+        flags = self._pool_lease.poll_pidfd(lease)
+        if flags is None:
             return
-        flags = events[0][1]
         with self._phase_lock:
-            if self._lease is not lease or self._reserved is not None or self._closing:
-                # An in-flight close owns the teardown; promoting would race it.
+            if (
+                self._pool_lease.current is not lease
+                or self._reserved is not None
+                or self._closing
+            ):
+                # Interpret only while this lease is current and no transition began.
                 return
             self._reserved = _Phase.PROMOTING
         try:
@@ -393,8 +471,7 @@ class _Guard:
         All fallible work runs before the lease exists, and commit and refusal
         share one lock: a lease is never half-granted.
         """
-        bound_here = self._listener is None
-        listener = self._bind_listener(bind)
+        listener, bound_here = self._pool_lease.bind(bind)
         granted_fd = -1
         try:
             granted_fd = os.dup(listener.fileno())
@@ -408,7 +485,7 @@ class _Guard:
             self._adopt(control, tier_config)
             with self._phase_lock:
                 if not self._closing and not self._refusing():
-                    self._lease = liveness
+                    self._pool_lease.current = liveness
                     self._phase = _Phase.PRIMARY
                     return self._spec, granted_fd, liveness
             # Refused at the commit: a closing service must not grant a pool.
@@ -423,7 +500,9 @@ class _Guard:
                     os.close(granted_fd)
             if bound_here:
                 # Keeping an address this claim chose would refuse a retry as a move.
-                self._unbind_listener()
+                unbind_error = self._pool_lease.unbind()
+                if unbind_error is not None:
+                    self._escalate(unbind_error)
             if isinstance(error, (ValueError, RecoveryMirrorError)):
                 raise KVCRServiceError(str(error)) from error
             raise
@@ -441,8 +520,7 @@ class _Guard:
         finally:
             lease.close()
             with self._phase_lock:
-                if self._lease is lease:
-                    self._lease = None
+                self._pool_lease.clear_if_current(lease)
         with self._phase_lock:
             self._phase = _Phase.IDLE
 
@@ -467,44 +545,9 @@ class _Guard:
         finally:
             lease.close()
             with self._phase_lock:
-                if self._lease is lease:
-                    self._lease = None
+                self._pool_lease.clear_if_current(lease)
         with self._phase_lock:
             self._phase = _Phase.STANDBY
-
-    def _bind_listener(self, control_bind: tuple[str, int]) -> socket.socket:
-        """Bind this pool's address, once and never moved: a claim naming a
-        different endpoint is refused rather than migrated.
-        """
-        if self._listener is not None:
-            if self._bind != control_bind:
-                raise KVCRServiceError(
-                    f"KVCR pool {self._pool_index} answers on "
-                    f"{self._bind[0]}:{self._bind[1]} and cannot be moved to "
-                    f"{control_bind[0]}:{control_bind[1]}"
-                )
-            return self._listener
-        try:
-            listener = socket.create_server(control_bind)
-        except OSError as error:
-            raise KVCRServiceError(
-                f"KVCR pool {self._pool_index} control listener "
-                f"{control_bind[0]}:{control_bind[1]} is unavailable: {error}"
-            ) from error
-        self._listener = listener
-        self._bind = control_bind
-        return listener
-
-    def _unbind_listener(self) -> None:
-        listener, self._listener = self._listener, None
-        self._bind = None
-        if listener is None:
-            return
-        try:
-            listener.close()
-        except BaseException as error:  # noqa: BLE001 - escalated, not swallowed
-            # An address that will not close: nothing may claim this pool again.
-            self._escalate(error)
 
     def _escalate(self, error: BaseException) -> None:
         logger.critical("KVCR pool %d Guard failed", self._pool_index)
@@ -812,8 +855,7 @@ class _Guard:
         for give_back in (
             lambda: self._close_field("_control"),
             lambda: self._close_field("_attachment"),
-            lambda: self._close_field("_lease"),
-            self._close_listener,
+            self._pool_lease.close,
             self._close_owner,
         ):
             try:
@@ -831,13 +873,6 @@ class _Guard:
         if held is not None:
             held.close()
             setattr(self, name, None)
-
-    def _close_listener(self) -> None:
-        # Unlike _unbind_listener, a failure raises: the kept pool must name the leak.
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
-            self._bind = None
 
     def _close_owner(self) -> None:
         if self._owner is None:

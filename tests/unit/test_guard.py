@@ -25,6 +25,7 @@ from kvcr.guard import (
     _Command,
     _Guard,
     _Phase,
+    _PoolLease,
 )
 from kvcr.guard_protocol import _G3Config, _TierConfig
 from kvcr.local_disk import _G3Residency
@@ -112,11 +113,9 @@ def _configurable_guard() -> _Guard:
     guard._phase = _Phase.IDLE
     guard._reserved = None
     guard._closing = False
-    guard._lease = None
+    guard._pool_lease = _PoolLease(0)
     guard._refusing = lambda: False
     guard._pool_index = 0
-    guard._listener = None
-    guard._bind = None
     return guard
 
 
@@ -161,7 +160,7 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
     """The one window the first gate cannot see: closing set while poll ran."""
     guard = _configurable_guard()
     guard._phase = _Phase.PRIMARY
-    guard._lease = Mock(fileno=lambda: 7)
+    guard._pool_lease.current = Mock(fileno=lambda: 7)
     guard._promote_for = Mock()
     poller = Mock()
 
@@ -465,6 +464,31 @@ def test_guard_closes_control_when_its_thread_does_not_start(monkeypatch) -> Non
     attachment.close.assert_called_once_with()
 
 
+def test_pool_lease_closes_listener_after_holder_failure_and_retries_holder() -> None:
+    """One failed resource must not skip the other or lose the failed holder."""
+    holder_error = RuntimeError("holder close failed")
+    holder = Mock(close=Mock(side_effect=[holder_error, None]))
+    listener = Mock()
+    lease = _PoolLease(0)
+    lease.current = holder
+    lease.listener = listener
+    lease.bind_address = ("127.0.0.1", 1234)
+
+    with pytest.raises(RuntimeError) as raised:
+        lease.close()
+
+    assert raised.value is holder_error
+    assert lease.current is holder
+    assert lease.listener is None
+    assert lease.bind_address is None
+    listener.close.assert_called_once_with()
+
+    lease.close()
+    assert lease.current is None
+    assert holder.close.call_count == 2
+    listener.close.assert_called_once_with()
+
+
 def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
     caplog,
 ) -> None:
@@ -626,16 +650,16 @@ def test_a_grant_that_never_arrived_resumes_the_guard_it_stood_down() -> None:
     guard._release = lambda: outcomes.append("release")
 
     lease = Mock()
-    guard._lease = lease
+    guard._pool_lease.current = lease
     guard._abort(lease)
     assert outcomes == ["promote"]
     lease.close.assert_called_once_with()
-    assert guard._lease is None
+    assert guard._pool_lease.current is None
     assert guard._phase is _Phase.STANDBY
 
     guard._resumable = False
     stale = Mock()
-    guard._lease = stale
+    guard._pool_lease.current = stale
     guard._abort(stale)
     assert outcomes == ["promote", "release"]
     assert guard._phase is _Phase.IDLE

@@ -49,7 +49,11 @@ from kvcr.memory import _KVCRPoolOwner
 
 def _holders_of(registry) -> dict[int, object]:
     """The pools a worker holds, in the shape the old binding map had."""
-    return {i: p._lease for i, p in registry._pools.items() if p._lease is not None}
+    return {
+        i: p._pool_lease.current
+        for i, p in registry._pools.items()
+        if p._pool_lease.current is not None
+    }
 
 
 _SERVER_STOP_TIMEOUT_SECONDS = 5
@@ -273,7 +277,7 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
 
     # The retried release of the old lease must not end the new one.
     registry.release(0, stale)
-    assert registry._pools[0]._lease is current
+    assert registry._pools[0]._pool_lease.current is current
     assert third.closed is False
 
     first_path = Path(guard._owner.spec.path)
@@ -291,14 +295,14 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     # The kept pool must still name what it leaked, or nobody could retry it.
     guard._attachment.close.side_effect = None
     stubborn = Mock(close=Mock(side_effect=OSError("will not close")))
-    guard._listener = stubborn
+    guard._pool_lease.listener = stubborn
     with pytest.raises(OSError, match="will not close"):
         registry.close()
     assert registry._pools.keys() == {0}
-    assert registry._pools[0]._listener is stubborn
+    assert registry._pools[0]._pool_lease.listener is stubborn
 
     # With nothing left refusing, the retried close finally takes the pool.
-    guard._listener = None
+    guard._pool_lease.listener = None
     registry.close()
     assert registry._pools == {} and third.closed is True
 
@@ -394,15 +398,15 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         )
         taken_fd, taken_name = taken[0]
         # The Guard is handed a duplicate; the pool keeps the original.
-        assert taken_fd != guard._listener.fileno()
-        assert taken_name == guard._listener.getsockname()
+        assert taken_fd != guard._pool_lease.listener.fileno()
+        assert taken_name == guard._pool_lease.listener.getsockname()
 
         hold.release()
 
-        assert guard._phase is _Phase.IDLE and guard._lease is None
+        assert guard._phase is _Phase.IDLE and guard._pool_lease.current is None
         # The adopted channel went with the lease; the endpoint did not.
         control.close.assert_called_once_with()
-        assert guard._listener is not None
+        assert guard._pool_lease.listener is not None
 
 
 def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
@@ -417,13 +421,14 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
         with patch("kvcr.guard.os.dup", side_effect=OSError("dup failed")):
             with pytest.raises(OSError, match="dup failed"):
                 registry.claim(0, _TEST_TIER_CONFIG, _FakeLiveness(), _control_bind(0))
-        assert guard._listener is None and guard._lease is None
+        assert guard._pool_lease.listener is None and guard._pool_lease.current is None
         assert guard._reserved is None and guard._phase is not _Phase.PRIMARY
 
         # The pool survived its failed grant: the retry simply works.
         replacement = _FakeLiveness()
         _spec, lease = _claim(registry, 0, replacement)
-        assert guard._lease is lease and guard._bind == _control_bind(0)
+        assert guard._pool_lease.current is lease
+        assert guard._pool_lease.bind_address == _control_bind(0)
 
         # A rollback that cannot free the pool's address must stop the service.
         fatal = registry._pools[1]
@@ -432,16 +437,17 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
         uncontained: list[BaseException] = []
         registry.on_uncontained_failure = uncontained.append
         fatal._adopt = Mock(side_effect=adopt_failure)
-        real_bind = fatal._bind_listener
+        real_bind = fatal._pool_lease.bind
 
         def bind_a_listener_that_will_not_close(control_bind):
-            bound.append(real_bind(control_bind))
-            fatal._listener = Mock(
+            listener, bound_here = real_bind(control_bind)
+            bound.append(listener)
+            fatal._pool_lease.listener = Mock(
                 fileno=bound[-1].fileno, close=Mock(side_effect=unbind_failure)
             )
-            return fatal._listener
+            return fatal._pool_lease.listener, bound_here
 
-        fatal._bind_listener = bind_a_listener_that_will_not_close
+        fatal._pool_lease.bind = bind_a_listener_that_will_not_close
         with pytest.raises(RuntimeError) as raised:
             _claim(registry, 1, _FakeLiveness())
 
@@ -449,9 +455,9 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
         assert raised.value is adopt_failure
         assert uncontained == [unbind_failure]
         # The transition ended: nothing is left reserved against this pool.
-        assert fatal._reserved is None and fatal._lease is None
+        assert fatal._reserved is None and fatal._pool_lease.current is None
     finally:
-        registry._pools[1]._listener = None
+        registry._pools[1]._pool_lease.listener = None
         for listener in bound:
             listener.close()
         registry.close()
@@ -512,15 +518,16 @@ def test_a_standby_survives_failed_claims_and_hands_over_to_a_replacement(
         with pytest.raises(RuntimeError, match="adopt failed"):
             _claim(registry, 0, _FakeLiveness(), control_bind)
         assert guard._phase is _Phase.STANDBY
-        assert guard._reserved is None and guard._listener is not None
+        assert guard._reserved is None and guard._pool_lease.listener is not None
         assert _holders_of(registry) == {}
 
         guard._adopt = real_adopt
         replacement = _FakeLiveness()
         _spec, lease = _claim(registry, 0, replacement, control_bind)
-        assert guard._phase is _Phase.PRIMARY and guard._lease is lease
+        assert guard._phase is _Phase.PRIMARY
+        assert guard._pool_lease.current is lease
         # The same endpoint, never rebound: the replacement inherited it.
-        assert guard._listener.getsockname() == control_bind
+        assert guard._pool_lease.listener.getsockname() == control_bind
     finally:
         registry.close()
 
@@ -1035,7 +1042,7 @@ def test_a_lease_older_than_the_idle_timeout_still_releases_cleanly(
 
         hold.release()
 
-        assert harness.server._registry._pools[0]._lease is None
+        assert harness.server._registry._pools[0]._pool_lease.current is None
 
 
 def test_refuse_claims_is_a_barrier_no_grant_can_cross(tmp_path: Path) -> None:
@@ -1081,7 +1088,7 @@ def test_refuse_claims_is_a_barrier_no_grant_can_cross(tmp_path: Path) -> None:
         assert not claimant.is_alive()
         assert "grant" not in outcome
         assert isinstance(outcome["error"], KVCRServiceError)
-        assert guard._lease is None and guard._reserved is None
+        assert guard._pool_lease.current is None and guard._reserved is None
         # The refusal rolled the adoption back: the channel the claim adopted
         # was closed and released, not left holding the pool's endpoint.
         assert guard._control is None
@@ -1105,7 +1112,7 @@ def test_a_failed_release_reports_promptly_and_fences_the_pool_first(
     guard._release = Mock(side_effect=failure)
     claimable_when_reported: list[bool] = []
     registry.on_uncontained_failure = lambda _error: claimable_when_reported.append(
-        guard._lease is None and guard._failure is None
+        guard._pool_lease.current is None and guard._failure is None
     )
     liveness = _FakeLiveness()
     try:
