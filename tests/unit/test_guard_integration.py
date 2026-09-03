@@ -467,7 +467,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # The G2 block: a Guard serves what the pool holds and opens no G3.
         key = BlockKey(b"resident-b")
         stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
-        target.submit_hint((), src=source_endpoint, request_id="stalled")
+        target.submit_hint((key,), src=source_endpoint, request_id="stalled")
         target.deliver(
             {key: _mem_descriptor(ctypes.addressof(stalled_destination), page_size)},
             request_id="stalled",
@@ -502,7 +502,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # A real core either way, answering on the endpoint it inherited.
         assert guard._core is not None
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
-        target.submit_hint((), src=source_endpoint, request_id="retry")
+        target.submit_hint((key,), src=source_endpoint, request_id="retry")
         operation = target.deliver(
             {key: _mem_descriptor(ctypes.addressof(destination), len(destination))},
             request_id="retry",
