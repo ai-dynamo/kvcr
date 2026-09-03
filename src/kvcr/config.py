@@ -92,12 +92,12 @@ class FrameworkControl(Protocol):
     def recv(self) -> list[bytes]: ...
 
 
-class KeyHintAdapter(Protocol):
-    """Framework-specific key and router-hint interpretation."""
+class KeyAdapter(Protocol):
+    """Framework-specific key conversion."""
 
     def encode(self, framework_key: object) -> BlockKey: ...
 
-    def matches(self, key: BlockKey, hint: object) -> bool: ...
+    def decode(self, key: BlockKey) -> int | bytes: ...
 
 
 @dataclass(frozen=True)

@@ -45,6 +45,15 @@ _OPEN_KVCRS: list[KVCR] = []
 _HANDED_OUT: set[int] = set()
 
 
+def _router_hint(
+    source: str, block_hashes: Collection[int] = (123,)
+) -> dict[str, object]:
+    return {
+        "source_control_endpoint": source,
+        "block_hashes": list(block_hashes),
+    }
+
+
 def _ephemeral_floor() -> int:
     """The lowest port the kernel hands out for a bind to port 0."""
     try:
@@ -442,7 +451,7 @@ def _new_kvcr(
     control: FakeBytesControl,
     config: KVCRConfig | None = None,
     name: str = "target",
-    key_hint_adapter: object | None = None,
+    key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
     framework_dram: FrameworkDramInput | None = None,
     local_dram: LocalDramInfo | None = None,
@@ -464,7 +473,7 @@ def _new_kvcr(
                 release_pin=pinning.release_pin,
                 cancel_pin_request=getattr(pinning, "cancel_pin_request", None),
                 framework_control=control,
-                key_hint_adapter=key_hint_adapter,
+                key_adapter=key_adapter,
                 inventory_sink=inventory_sink,
                 policy=policy,
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
@@ -538,9 +547,9 @@ class _RecordingFIFOPolicy(FIFOPolicy):
         self.removed.append(meta)
 
 
-class _MatchingHintAdapter:
-    def matches(self, key, hint):
-        return hint == "hint"
+class _ConstantHashAdapter:
+    def decode(self, key):
+        return 123
 
 
 def _recovered_record(*, g2: int | None = None, g3: int | None = None) -> _BlockRecord:

@@ -12,12 +12,13 @@ from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
     FakeTelemetryStats,
+    _ConstantHashAdapter,
     _decode_control_message,
     _has_outstanding_operations,
-    _MatchingHintAdapter,
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _router_hint,
     _write_done_notification,
 )
 
@@ -157,7 +158,7 @@ def _new_g3_kvcr(
     g3_slot_count=2,
     control=None,
     telemetry=False,
-    key_hint_adapter=None,
+    key_adapter=None,
     remote_options=None,
     inventory_sink=None,
     g3_paths=None,
@@ -181,7 +182,7 @@ def _new_g3_kvcr(
         ),
         policy=policy,
         inventory_sink=inventory_sink,
-        key_hint_adapter=key_hint_adapter,
+        key_adapter=key_adapter,
         remote_options=remote_options,
     )
 
@@ -580,7 +581,7 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         agent=agent,
         slot_count=2,
         control=control,
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
 
@@ -591,7 +592,7 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
             ctypes.addressof(primary) + index * page_size,
             page_size,
         ).success
-    kvcr.submit_hint(remotes, src="tcp://source:1", request_id="req", hints="hint")
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = kvcr.fetch(remotes, request_id="req")
 
     _poll_until(

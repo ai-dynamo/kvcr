@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
-from .config import KeyHintAdapter, RemoteFWDramOptions
+from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
     DURATION_METRIC,
     TRANSFER_BLOCKS_METRIC,
@@ -54,8 +54,8 @@ class _FwMemResidency:
 
 @dataclass(frozen=True)
 class _RequestHint:
-    source: str
-    value: object
+    source: str | None
+    block_hashes: frozenset[int]
     submitted_at: float | None
     failed: bool = False
 
@@ -386,13 +386,13 @@ class _RemoteFWDram:
         self,
         kvcr: "_KVCRCore",
         options: RemoteFWDramOptions,
-        key_hint_adapter: KeyHintAdapter | None,
+        key_adapter: KeyAdapter | None,
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
         self._kvcr = kvcr
         self._options = options
-        self._key_hint_adapter = key_hint_adapter
+        self._key_adapter = key_adapter
 
         # Main-thread state: request hints, framework pins, and progress state.
         self._closed = False
@@ -427,44 +427,41 @@ class _RemoteFWDram:
     def submit_hint(
         self,
         src: str | None,
-        hints: object | None,
+        block_hashes: frozenset[int],
         request_id: str | None,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
             previous = self._request_hints.get(request_id)
-            if src is None and previous is not None:
-                src = previous.source
-            if isinstance(src, str) and src:
-                if previous is not None and previous.source != src:
-                    self._request_hints[request_id] = replace(previous, failed=True)
-                    return
-                self._request_hints[request_id] = _RequestHint(
-                    source=src,
-                    value=(
-                        hints
-                        if hints is not None
-                        else (previous.value if previous is not None else None)
-                    ),
-                    submitted_at=(
-                        previous.submitted_at
-                        if previous is not None and previous.submitted_at is not None
-                        else kvcr._timer()
-                    ),
-                )
-        if not isinstance(src, str) or not src:
-            return
-        if self._options.eager_ctrl_connect:
+            if previous is not None and previous.source != src:
+                self._request_hints[request_id] = replace(previous, failed=True)
+                return
+            self._request_hints[request_id] = _RequestHint(
+                source=src,
+                block_hashes=block_hashes,
+                submitted_at=(
+                    previous.submitted_at
+                    if previous is not None and previous.submitted_at is not None
+                    else kvcr._timer()
+                ),
+            )
+        if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
 
     def query(self, key: BlockKey, request_id: str) -> bool:
         """Return whether ``key`` matches the request's remote hint."""
         request_hint = self._request_hints.get(request_id)
-        adapter = self._key_hint_adapter
-        if request_hint is None or request_hint.failed or adapter is None:
+        adapter = self._key_adapter
+        if (
+            request_hint is None
+            or request_hint.source is None
+            or request_hint.failed
+            or adapter is None
+        ):
             return False
-        if not self._options.opportunistic_query and not adapter.matches(
-            key, request_hint.value
+        if (
+            not self._options.opportunistic_query
+            and adapter.decode(key) not in request_hint.block_hashes
         ):
             return False
         return True
@@ -489,7 +486,7 @@ class _RemoteFWDram:
             kvcr._record_duration(scope, started_at, "failed")
             return False
 
-        if current_hint is None:
+        if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
             return False
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
