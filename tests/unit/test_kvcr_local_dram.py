@@ -559,7 +559,7 @@ def test_capacity_needed_is_edge_triggered() -> None:
     ("failure", "terminal_state", "success"),
     [
         ("submission", None, False),
-        ("timeout", None, False),
+        ("timeout", "ERR", False),
         ("timeout", "DONE", True),
     ],
 )
@@ -597,7 +597,15 @@ def test_local_deposit_waits_for_safe_release(
     _wait_until(lambda: bool(agent.transfers))
     if failure == "timeout":
         now = 2.0
-    _wait_until(lambda: agent.release_attempts > 0)
+        _wait_until(
+            lambda: any(
+                bool(getattr(op, "cancellation_requested", False))
+                for op in kvcr._core._progress._in_flight_ops.values()
+            )
+        )
+        assert agent.release_attempts == 0
+    else:
+        _wait_until(lambda: agent.release_attempts > 0)
 
     assert list(kvcr.poll_completed()) == []
     assert kvcr._core._block_record_map[key].local_dram is not None

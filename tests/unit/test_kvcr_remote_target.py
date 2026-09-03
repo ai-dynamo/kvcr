@@ -68,13 +68,18 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     assert target.query((requested_key,), "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
     ]
-    target.deliver({requested_key: _mem_descriptor()}, request_id="req")
+    op_handle = target.deliver({requested_key: _mem_descriptor()}, request_id="req")
 
     assert list(target.poll_completed()) == []
     _wait_until(lambda: bool(control.sent))
     assert _decode_control_message(control.sent[0][1])["keys"] == [requested_key]
     target.discard_hint("req")
     assert target.query((requested_key,), "req") == [(QueryStatus.MISS, None)]
+    agent = target._core._progress.nixl_agent
+    agent.notifs["source"] = [_write_done_notification(op_handle, success=False)]
+    assert _poll_until(target, lambda done: bool(done)) == [
+        (op_handle, _op_entries({requested_key: False}))
+    ]
 
 
 def test_repeated_hint_replaces_the_explicit_key_snapshot() -> None:
@@ -114,9 +119,7 @@ def test_deliver_does_not_pull_a_key_outside_its_request_hint() -> None:
 
     deliver = target.deliver({key: _mem_descriptor()}, request_id="req")
 
-    assert list(target.poll_completed()) == [
-        (deliver, _op_entries({key: False}))
-    ]
+    assert list(target.poll_completed()) == [(deliver, _op_entries({key: False}))]
     assert control.sent == []
 
 
@@ -135,9 +138,7 @@ def test_deliver_rechecks_hint_membership_after_local_eviction() -> None:
         local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 1),
     )
     old, replacement = BlockKey(b"old"), BlockKey(b"replacement")
-    old_deposit = target.deposit(
-        {old: _mem_descriptor(ctypes.addressof(primary), 16)}
-    )
+    old_deposit = target.deposit({old: _mem_descriptor(ctypes.addressof(primary), 16)})
     assert dict(_poll_until(target, bool))[old_deposit] == _op_entries({old: True})
     target.submit_hint(
         (),
@@ -156,9 +157,7 @@ def test_deliver_rechecks_hint_membership_after_local_eviction() -> None:
     assert target.query((old,), "req") == [(QueryStatus.MISS, None)]
 
     deliver = target.deliver({old: _mem_descriptor()}, request_id="req")
-    assert list(target.poll_completed()) == [
-        (deliver, _op_entries({old: False}))
-    ]
+    assert list(target.poll_completed()) == [(deliver, _op_entries({old: False}))]
     assert control.sent == []
 
 
@@ -808,6 +807,11 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
         "tcp://source-B:1",
     ]
     assert {("target", op_a), ("target", op_b)} <= _block_op_ids(kvcr)
+    agent.notifs["sources"] = [
+        _write_done_notification(op_a, success=False),
+        _write_done_notification(op_b, success=False),
+    ]
+    assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
 
 
 @pytest.mark.parametrize(

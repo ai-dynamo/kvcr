@@ -908,7 +908,7 @@ def test_g3_deliver_rejects_a_destination_that_is_not_slot_sized(
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
 
-def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
+def test_closing_an_unfinished_spill_retains_registered_resources(
     tmp_path,
 ) -> None:
     class _StuckWriteAgent(_FakeG3Agent):
@@ -928,7 +928,8 @@ def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
     primary = ctypes.create_string_buffer(page_size * 2)
     local = ctypes.create_string_buffer(page_size)
     first, second = BlockKey(b"first"), BlockKey(b"second")
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=_StuckWriteAgent())
+    agent = _StuckWriteAgent()
+    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent)
 
     assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
     kvcr.deposit(
@@ -938,9 +939,16 @@ def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
     _poll_until(kvcr, lambda _: local_dram._capacity_eviction_key == first)
 
     _OPEN_KVCRS.remove(kvcr)
-    kvcr.close()
-    # Nothing will finish the spill now, so nothing may stay queued behind it.
-    assert local_dram._capacity_eviction_key is None
+    with pytest.raises(RuntimeError, match="not quiescent|did not close"):
+        kvcr.close()
+
+    # A pending native write may still reference both the G3 FILE region and
+    # the common DRAM regions.  Retain all of them for process reclaim rather
+    # than releasing bookkeeping or deregistering memory underneath the write.
+    assert local_dram._capacity_eviction_key == first
+    assert kvcr._core._g3._file_registration is not None
+    assert kvcr._core._progress._memory_registrations
+    assert agent.deregistered == []
 
 
 def test_waiting_g3_fetch_obeys_original_deadline(tmp_path) -> None:

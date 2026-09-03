@@ -178,7 +178,7 @@ def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
 def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     failure: str,
 ) -> None:
-    """Every source-transfer failure reports failure and releases its state."""
+    """Only a known terminal transfer failure releases source state."""
 
     class FailingTransferAgent(FakeNixlAgent):
         def initialize_xfer(self, *args, **kwargs):
@@ -198,6 +198,14 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     key = BlockKey(b"k0")
     control.incoming.append(_start_write_message(5, key))
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
+
+    if failure == "exception":
+        assert _poll_until(kvcr, lambda _: source_agent.transfers == [1]) == []
+        assert source_agent.sent_notifs == []
+        assert source_agent.released_xfers == []
+        assert pinning.unpins == []
+        assert _has_outstanding_operations(kvcr)
+        source_agent.state = "ERR"
 
     assert _poll_until(kvcr, lambda _: pinning.unpins == ["pin"]) == []
 
@@ -266,13 +274,9 @@ def test_kvcr_source_ignores_malformed_control_messages():
     assert pinning.unpins == []
 
 
-@pytest.mark.parametrize(
-    "terminal_state",
-    [None, "ERR", "DONE"],
-    ids=["cancelled", "failed", "completed"],
-)
+@pytest.mark.parametrize("terminal_state", ["ERR", "DONE"], ids=["failed", "completed"])
 def test_kvcr_source_timeout_holds_pins_until_safe_release(
-    terminal_state: str | None,
+    terminal_state: str,
 ) -> None:
     class DelayedReleaseAgent(FakeNixlAgent):
         def __init__(self):
@@ -309,13 +313,18 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
 
     assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
     now = 2.0
-    _wait_until(lambda: source_agent.release_attempts > 0)
+    _wait_until(
+        lambda: any(
+            getattr(getattr(op, "state", None), "name", "") == "CANCEL_PENDING"
+            for op in kvcr._core._progress._in_flight_ops.values()
+        )
+    )
+    assert source_agent.release_attempts == 0
     assert source_agent.released_xfers == []
     assert pinning.unpins == []
     assert _has_outstanding_operations(kvcr)
 
-    if terminal_state is not None:
-        source_agent.state = terminal_state
+    source_agent.state = terminal_state
     source_agent.allow_release = True
     assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
     assert not kvcr._core._remote_fw_dram._source_pin_ops
@@ -386,10 +395,14 @@ def test_framework_pin_poll_failures_are_logged_without_escaping(kvcr_caplog):
     assert any("framework pin result polling failed" in message for message in warnings)
 
 
-def test_kvcr_source_poll_failure_is_terminal_and_logged(kvcr_caplog):
+def test_kvcr_source_poll_failure_retains_state_until_terminal(kvcr_caplog):
     class RaisingAgent(FakeNixlAgent):
+        fail_poll = True
+
         def check_xfer_state(self, handle):
-            raise RuntimeError("boom")
+            if self.fail_poll:
+                raise RuntimeError("boom")
+            return super().check_xfer_state(handle)
 
     source_agent = RaisingAgent(metadata=b"source-md")
     pinning = FakePrimaryPinning()
@@ -398,6 +411,23 @@ def test_kvcr_source_poll_failure_is_terminal_and_logged(kvcr_caplog):
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
 
     control.incoming.append(_start_write_message(5, key))
+    assert (
+        _poll_until(
+            kvcr,
+            lambda _: any(
+                "transfer progress failed" in rec.getMessage()
+                for rec in kvcr_caplog.records
+            ),
+        )
+        == []
+    )
+    assert source_agent.released_xfers == []
+    assert pinning.unpins == []
+    assert source_agent.sent_notifs == []
+    assert _has_outstanding_operations(kvcr)
+
+    source_agent.fail_poll = False
+    source_agent.state = "ERR"
     assert (
         _poll_until(
             kvcr,
@@ -481,6 +511,10 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
     if shared_key_hit:
         assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
         assert [xfer[2] for xfer in agent.xfers] == [[0, 1], [0, 1]]
+        agent.state = "DONE"
+        assert (
+            _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
+        )
     else:
         assert (
             _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []

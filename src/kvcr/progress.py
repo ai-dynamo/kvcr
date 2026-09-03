@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
 _CLOSE_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
+_PROGRESS_LOG_INTERVAL_SECONDS = 1.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
@@ -34,6 +35,7 @@ class _TransferState:
     capture_telemetry: bool = False
     outcome: bool | None = None
     telemetry: Any | None = None
+    next_progress_log_at: float = 0.0
     next_release_log_at: float = 0.0
 
 
@@ -131,7 +133,12 @@ class _KVCRProgress:
         *,
         cancellation_requested: bool = False,
     ) -> tuple[bool, Any | None] | None:
-        """Advance a transfer and return its result after releasing its handle."""
+        """Return a transfer only after NIXL reports a terminal state.
+
+        ``cancellation_requested`` is advisory: the Python NIXL API does not
+        expose an abort fence, so PROC/PEND and polling faults must retain the
+        handle and every buffer it can still mutate.
+        """
         state = self._active_transfers.get(transfer_id)
         if state is None:
             raise KeyError(f"unknown transfer {transfer_id}")
@@ -141,17 +148,27 @@ class _KVCRProgress:
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
             except Exception:
-                logger.warning(
-                    "NIXL transfer progress failed",
-                    exc_info=True,
-                )
-                xfer_state = "ERR"
-            pending = xfer_state in ("PROC", "PEND")
-            if pending and not cancellation_requested:
+                now = time.monotonic()
+                if now >= state.next_progress_log_at:
+                    logger.warning(
+                        "NIXL transfer progress failed",
+                        exc_info=True,
+                    )
+                    state.next_progress_log_at = now + _PROGRESS_LOG_INTERVAL_SECONDS
                 return None
-            outcome = xfer_state == "DONE"
-            if not pending:
-                state.outcome = outcome
+            if xfer_state in ("PROC", "PEND"):
+                return None
+            if xfer_state == "DONE":
+                outcome = True
+            elif xfer_state == "ERR":
+                outcome = False
+            else:
+                logger.warning(
+                    "NIXL transfer returned unexpected progress state %r",
+                    xfer_state,
+                )
+                return None
+            state.outcome = outcome
         if outcome and state.capture_telemetry:
             get_telemetry = getattr(agent, "get_xfer_telemetry", None)
             if get_telemetry is not None:
@@ -212,12 +229,11 @@ class _KVCRProgress:
         return transfer_id, submitted
 
     def cancel_transfer(self, transfer_id: int) -> bool:
-        """Cancel if necessary and forget only after NIXL releases the handle."""
+        """Drain a cancelled transfer, retaining it until NIXL is terminal."""
         state = self._active_transfers.get(transfer_id)
         if state is None:
             return True
-        state.outcome = False
-        return self._release_transfer(transfer_id, state)
+        return self.poll_transfer(transfer_id, cancellation_requested=True) is not None
 
     def _make_transfer_descriptors(self, descriptors: Sequence[MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type
@@ -314,13 +330,16 @@ class _KVCRProgress:
             self._failure = error
         finally:
             try:
-                try:
-                    self._close_progress_ops()
-                finally:
-                    try:
-                        self._close()
-                    finally:
-                        self._close_nixl()
+                self._close_progress_ops()
+                if self._in_flight_ops or self._active_transfers:
+                    raise RuntimeError(
+                        "KVCR native operations are not quiescent at progress close"
+                    )
+                # Backend-specific registrations and common NIXL registrations
+                # may still be referenced by those operations.  Close neither
+                # tier unless the operation drain above proved quiescence.
+                self._close()
+                self._close_nixl()
             except BaseException as error:
                 if self._failure is None:
                     self._failure = error
@@ -433,6 +452,8 @@ class _KVCRProgress:
             self._nixl_agent_metadata = get_agent_metadata()
 
     def _close_nixl(self) -> None:
+        if self._in_flight_ops:
+            raise RuntimeError("cannot close NIXL with in-flight operations")
         if self._active_transfers:
             raise RuntimeError("cannot close NIXL with active transfers")
         failure: BaseException | None = None

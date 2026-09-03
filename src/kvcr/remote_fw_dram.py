@@ -110,6 +110,10 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
+            # Publish ownership before the fallible send.  If an interrupt
+            # lands after the source accepted the message, teardown must assume
+            # that the destination can still be written.
+            self.state = _TargetPullState.WAITING_WRITE_DONE
             sent = backend._send_control(
                 progress,
                 self.remote_ctrl_ep,
@@ -126,7 +130,6 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
-            self.state = _TargetPullState.WAITING_WRITE_DONE
             return False, True
 
         if self.state in (
@@ -192,6 +195,16 @@ class _TargetPullOp(_RemoteOp):
             backend._invalidate_control_peer(self.remote_ctrl_ep)
             return False, True
         return False, False
+
+    def close(self, _progress: _KVCRProgress) -> bool:
+        # Once start_write was sent, the source may still be writing directly
+        # into this operation's destination.  A timeout is not a remote fence;
+        # retain the operation (and therefore its buffers) until the matching
+        # terminal notification was observed.
+        return self.state in (
+            _TargetPullState.START_WRITE,
+            _TargetPullState.FINISHED,
+        )
 
 
 @dataclass

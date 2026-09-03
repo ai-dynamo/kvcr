@@ -3,10 +3,12 @@
 
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from kvcr.progress import _KVCRProgress, _ProgressOp
+from kvcr.remote_fw_dram import _TargetPullOp, _TargetPullState
 from kvcr.types import MemDescriptor
 
 
@@ -136,11 +138,12 @@ def test_progress_submits_and_completes_transfer(
     assert telemetry < release
 
 
-def test_progress_retries_release_while_operation_is_active() -> None:
+@pytest.mark.parametrize("active_state", ["PROC", "PEND"])
+def test_progress_cancel_does_not_release_an_active_transfer(
+    active_state: str,
+) -> None:
     agent = _TransferAgent()
-    agent.state = "PROC"
-    agent.submit_exception = True
-    agent.release_failures = 2
+    agent.state = active_state
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "READ",
@@ -149,14 +152,15 @@ def test_progress_retries_release_while_operation_is_active() -> None:
         remote_side_agent=b"remote-agent",
     )
 
-    assert not submitted
-    assert progress.poll_transfer(transfer_id, cancellation_requested=True) is None
-    assert progress.poll_transfer(transfer_id, cancellation_requested=True) is None
-    result = progress.poll_transfer(transfer_id, cancellation_requested=True)
-    assert result is not None
-    success, _ = result
-    assert not success
-    assert agent.events.count("release-transfer:1") == 3
+    assert submitted
+    assert not progress.cancel_transfer(transfer_id)
+    assert transfer_id in progress._active_transfers
+    assert "release-transfer:1" not in agent.events
+
+    agent.state = "ERR"
+    assert progress.cancel_transfer(transfer_id)
+    assert transfer_id not in progress._active_transfers
+    assert agent.events[-1] == "release-transfer:1"
 
 
 def test_progress_reports_rejected_transfer_submission() -> None:
@@ -177,7 +181,7 @@ def test_progress_reports_rejected_transfer_submission() -> None:
     assert not success
 
 
-def test_progress_treats_poll_exception_as_terminal_failure() -> None:
+def test_progress_poll_exception_retains_transfer_until_terminal_state() -> None:
     agent = _TransferAgent()
     agent.check_exception = True
     progress = _transfer_progress(agent)
@@ -188,10 +192,15 @@ def test_progress_treats_poll_exception_as_terminal_failure() -> None:
         remote_side_agent=b"remote-agent",
     )
 
+    assert progress.poll_transfer(transfer_id) is None
+    assert transfer_id in progress._active_transfers
+    assert "release-transfer:1" not in agent.events
+
+    agent.check_exception = False
+    agent.state = "ERR"
     result = progress.poll_transfer(transfer_id)
-    assert result is not None
-    success, _ = result
-    assert not success
+    assert result == (False, None)
+    assert transfer_id not in progress._active_transfers
     assert agent.events[-1] == "release-transfer:1"
 
 
@@ -297,6 +306,57 @@ def test_progress_close_retries_operations_until_they_release() -> None:
 
 
 @pytest.mark.parametrize(
+    ("state", "can_close"),
+    [
+        (_TargetPullState.START_WRITE, True),
+        (_TargetPullState.WAITING_WRITE_DONE, False),
+        (_TargetPullState.WAITING_TERMINAL, False),
+        (_TargetPullState.FINISHED, True),
+    ],
+)
+def test_target_pull_close_retains_a_destination_until_terminal(
+    state: _TargetPullState,
+    can_close: bool,
+) -> None:
+    op = _TargetPullOp(
+        op_id=("target", 1),
+        keys=set(),
+        started_at=None,
+        deadline=1.0,
+        state=state,
+        local_fill=False,
+        remote_ctrl_ep="tcp://source:1",
+        _backend=Mock(),
+    )
+
+    assert op.close(Mock()) is can_close
+
+
+def test_target_pull_send_interrupt_keeps_destination_owned() -> None:
+    backend = SimpleNamespace(
+        _kvcr=SimpleNamespace(_clock=lambda: 0.0),
+        _send_control=Mock(side_effect=KeyboardInterrupt),
+        _record_progress_duration=Mock(),
+    )
+    op = _TargetPullOp(
+        op_id=("target", 1),
+        keys=set(),
+        started_at=None,
+        deadline=1.0,
+        state=_TargetPullState.START_WRITE,
+        local_fill=False,
+        remote_ctrl_ep="tcp://source:1",
+        _backend=backend,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        op.progress(Mock(), None)
+
+    assert op.state is _TargetPullState.WAITING_WRITE_DONE
+    assert not op.close(Mock())
+
+
+@pytest.mark.parametrize(
     "attribute",
     ["_active_transfers", "_in_flight_ops", "_memory_registrations"],
 )
@@ -314,7 +374,7 @@ def test_progress_quiescence_tracks_native_state(attribute: str) -> None:
     assert progress.is_quiescent()
 
 
-def test_progress_cleanup_continues_after_operation_close_failure(
+def test_progress_retains_native_resources_after_operation_close_failure(
     monkeypatch,
 ) -> None:
     cleaned = []
@@ -334,7 +394,8 @@ def test_progress_cleanup_continues_after_operation_close_failure(
 
     progress._run()
 
-    assert cleaned == ["backend", "nixl"]
+    assert cleaned == []
+    assert isinstance(progress._failure, RuntimeError)
 
 
 def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
@@ -358,6 +419,19 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
     progress._close_nixl()
     assert agent.deregistered == [7]
     assert progress._nixl_agent is None
+
+
+def test_progress_does_not_deregister_memory_with_an_in_flight_operation() -> None:
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    progress._memory_registrations.append(7)
+    progress._in_flight_ops[("target", 1)] = object()
+
+    with pytest.raises(RuntimeError, match="in-flight operations"):
+        progress._close_nixl()
+
+    assert progress.nixl_agent is agent
+    assert agent.deregistered == []
 
 
 @pytest.mark.parametrize(
