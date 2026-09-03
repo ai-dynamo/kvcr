@@ -826,7 +826,9 @@ def test_remote_framework_dram_transfers_available_prefix(
     eager_ctrl_connect: bool,
     missing_indices: tuple[int, ...],
     completed_count: int,
+    caplog,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="kvcr.core")
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_agent = FakeNixlAgent(metadata=b"source-md")
     source_pinning = FakePrimaryPinning(missing_indices=missing_indices)
@@ -908,3 +910,17 @@ def test_remote_framework_dram_transfers_available_prefix(
         completed_count,
         ("remote_deliver",),
     ) in target_stats.records
+    messages = [record.getMessage() for record in caplog.records]
+    source_message = (
+        f"KVCR native transfer scope=source_write op={op_handle} "
+        f"result=success blocks={completed_count}/2 "
+        f"bytes={completed_count * 16}/32"
+    )
+    assert messages.count(source_message) == 1
+    target_result = "success" if completed_count == 2 else "partial"
+    target_message = (
+        f"KVCR native transfer scope=remote_deliver op={op_handle} "
+        f"result={target_result} blocks={completed_count}/2 "
+        f"bytes={completed_count * 16}/32"
+    )
+    assert messages.count(target_message) == 1

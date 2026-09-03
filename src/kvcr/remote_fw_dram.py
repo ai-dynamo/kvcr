@@ -174,6 +174,13 @@ class _TargetPullOp(_RemoteOp):
                 else "failed"
             )
             backend._record_progress_duration(scope, self.started_at, result)
+            backend._log_native_transfer(
+                scope,
+                self.op_id[1],
+                result,
+                self.dst_descriptors,
+                len(completed_keys),
+            )
             return True, True
 
         if now >= self.deadline:
@@ -356,6 +363,13 @@ class _SourceWriteOp(_RemoteOp):
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
         result = "success" if success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
+        backend._log_native_transfer(
+            "source_write",
+            self.op_handle,
+            result,
+            self.dst_descriptors,
+            self.completed_count if success else 0,
+        )
         self.success = success
         self.state = _SourceWriteState.FINISHED
         return True, True
@@ -1556,6 +1570,33 @@ class _RemoteFWDram:
     ) -> None:
         if self._telemetry_enabled:
             self._progress_metrics.append(("counter", name, value, labels))
+
+    def _log_native_transfer(
+        self,
+        scope: str,
+        op_handle: int,
+        result: str,
+        descriptors: tuple[MemDescriptor, ...],
+        completed_count: int,
+    ) -> None:
+        """Emit one joinable source/target record for an observed native transfer."""
+        if not self._kvcr.config.enable_telemetry:
+            return
+        completed_count = min(max(completed_count, 0), len(descriptors))
+        completed_bytes = sum(
+            descriptor.size for descriptor in descriptors[:completed_count]
+        )
+        total_bytes = sum(descriptor.size for descriptor in descriptors)
+        logger.info(
+            "KVCR native transfer scope=%s op=%d result=%s blocks=%d/%d bytes=%d/%d",
+            scope,
+            op_handle,
+            result,
+            completed_count,
+            len(descriptors),
+            completed_bytes,
+            total_bytes,
+        )
 
     def _apply_progress_update(self, update: _ProgressUpdate) -> None:
         self._connected_remote_count = update.connected_remote_count
