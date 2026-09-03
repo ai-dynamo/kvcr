@@ -108,7 +108,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
 
 _GUARD_CONFIG = KVCRGuardConfig(
     kvcr_service_socket_path="/tmp/kvcr.sock",
-    pool_index=3,
+    guard_index=3,
     row_stride=1024,
     compatibility_digest="Opaque-Digest",
 )
@@ -359,7 +359,7 @@ def test_service_journal_is_attached_before_primary_start(
         KVCRBackendConfigs(g3=g3_config),
         KVCRGuardConfig(
             kvcr_service_socket_path="/tmp/kvcr.sock",
-            pool_index=3,
+            guard_index=3,
             row_stride=1024,
             compatibility_digest="Opaque-Digest",
         ),

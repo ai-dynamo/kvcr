@@ -82,7 +82,7 @@ class _PoolRegistry:
         if not self._pool_dir.is_dir():
             raise ValueError(f"KVCR pool directory does not exist: {self._pool_dir}")
         self._guard_count = guard_count
-        self._pools: dict[int, _Guard] = {}
+        self._guards: dict[int, _Guard] = {}
         self._refusing = threading.Event()
         # Stand-in until the owning server takes over; only it can stop the service.
         self.on_uncontained_failure = functools.partial(
@@ -105,7 +105,7 @@ class _PoolRegistry:
                         owner.spec,
                         functools.partial(self._guard_failed, rank),
                         compatibility_digest=compatibility_digest,
-                        pool_index=rank,
+                        guard_index=rank,
                         owner=owner,
                         refusing=self._refusing.is_set,
                     )
@@ -116,7 +116,7 @@ class _PoolRegistry:
                     raise
                 # Recorded before it starts, so a failed preparation is rolled back by
                 # the sweep below.
-                self._pools[rank] = guard
+                self._guards[rank] = guard
                 guard.start()
             except BaseException:
                 self._release_pools()
@@ -124,7 +124,7 @@ class _PoolRegistry:
 
     def _release_pools(self) -> None:
         """Give back every pool built so far, for a startup that cannot finish."""
-        for pool_index, guard in list(self._pools.items()):
+        for guard_index, guard in list(self._guards.items()):
             # Even an interrupt must not stop the sweep: the startup failure is
             # already propagating, and every pool left behind is committed RAM.
             try:
@@ -139,7 +139,7 @@ class _PoolRegistry:
                     exc_info=True,
                 )
                 continue
-            del self._pools[pool_index]
+            del self._guards[guard_index]
 
     def _purge_orphaned_pools(self) -> None:
         """Remove pool files no live daemon owns.
@@ -170,19 +170,19 @@ class _PoolRegistry:
                 else:
                     logger.info("Leaving KVCR pool still in use: %s", path)
 
-    def _pool(self, pool_index: int) -> _Guard:
-        if not (0 <= pool_index < self._guard_count):
+    def _guard(self, guard_index: int) -> _Guard:
+        if not (0 <= guard_index < self._guard_count):
             raise KVCRServiceError(
-                f"pool_index {pool_index} is out of range [0, {self._guard_count})"
+                f"guard_index {guard_index} is out of range [0, {self._guard_count})"
             )
-        guard = self._pools.get(pool_index)
+        guard = self._guards.get(guard_index)
         if guard is None:
-            raise KVCRServiceError(f"no claimable KVCR pool {pool_index}")
+            raise KVCRServiceError(f"no claimable KVCR Guard {guard_index}")
         return guard
 
     def claim(
         self,
-        pool_index: int,
+        guard_index: int,
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
@@ -194,14 +194,14 @@ class _PoolRegistry:
         """
         if self._refusing.is_set():
             raise KVCRServiceError("KVCR pool registry is closed")
-        return self._pool(pool_index).claim(liveness, tier_config, control_bind)
+        return self._guard(guard_index).claim(liveness, tier_config, control_bind)
 
-    def release(self, pool_index: int, lease: "_Lease") -> None:
-        self._pool(pool_index).release(lease)
+    def release(self, guard_index: int, lease: "_Lease") -> None:
+        self._guard(guard_index).release(lease)
 
-    def abort_grant(self, pool_index: int, lease: "_Lease") -> None:
+    def abort_grant(self, guard_index: int, lease: "_Lease") -> None:
         """Take back a grant its claimant declared it never served."""
-        self._pool(pool_index).abort_grant(lease)
+        self._guard(guard_index).abort_grant(lease)
 
     def refuse_claims(self) -> None:
         """Stop granting pools without waiting for the close path to run.
@@ -211,7 +211,7 @@ class _PoolRegistry:
         """
         self._refusing.set()
         # Snapshot: close() deletes pools from the dict on other threads.
-        for guard in list(self._pools.values()):
+        for guard in list(self._guards.values()):
             with guard._phase_lock:
                 pass
 
@@ -225,7 +225,7 @@ class _PoolRegistry:
         self._refusing.set()
         failure: BaseException | None = None
         # Tell all pools before waiting on any: a wedged one must not block the rest.
-        for guard in self._pools.values():
+        for guard in self._guards.values():
             try:
                 guard.begin_close()
             except BaseException as error:  # noqa: BLE001 - raised below
@@ -233,27 +233,27 @@ class _PoolRegistry:
         deadline = time.monotonic() + _REGISTRY_TRANSITION_TIMEOUT_SECONDS
         wedged: list[int] = []
         kept: set[int] = set()
-        for pool_index in sorted(self._pools):
+        for guard_index in sorted(self._guards):
             try:
-                if self._pools[pool_index].finish_close(deadline):
-                    wedged.append(pool_index)
-                    kept.add(pool_index)
+                if self._guards[guard_index].finish_close(deadline):
+                    wedged.append(guard_index)
+                    kept.add(guard_index)
             except BaseException as error:  # noqa: BLE001 - raised below
                 failure = failure or error
-                kept.add(pool_index)
+                kept.add(guard_index)
         # Wedged pools stay visible; drained ones stay listed until the whole
         # drain finished, so a release racing shutdown is absorbed.
-        for pool_index in [index for index in self._pools if index not in kept]:
-            del self._pools[pool_index]
+        for guard_index in [index for index in self._guards if index not in kept]:
+            del self._guards[guard_index]
         if failure is not None:
             raise failure
         if wedged:
             raise TimeoutError(
-                f"timed out waiting for KVCR pool transitions: pools {wedged} leaked"
+                f"timed out waiting for KVCR Guard transitions: guards {wedged} leaked"
             )
 
     def _guard_failed(
-        self, pool_index: int, _guard: "_Guard", error: BaseException
+        self, guard_index: int, _guard: "_Guard", error: BaseException
     ) -> None:
         """A Guard has stopped being one, which the service cannot survive.
 
@@ -261,7 +261,7 @@ class _PoolRegistry:
         still hold an endpoint the service cannot reach. One pool takes the others'
         workers with it; add isolation back if that stops being acceptable.
         """
-        logger.critical("KVCR pool %d Guard failed", pool_index)
+        logger.critical("KVCR Guard %d failed", guard_index)
         self.on_uncontained_failure(error)
 
 
@@ -299,7 +299,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 self.channel.send(response)
             return
 
-        pool_index, listener_fd, lease = grant
+        guard_index, listener_fd, lease = grant
         try:
             # No timeout: a held connection must wait as long as the lease lives.
             # Inside the try: shutdown may have landed; listener_fd closes either way.
@@ -316,9 +316,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         finally:
             with contextlib.suppress(OSError):
                 os.close(listener_fd)
-        self._await_release(pool_index, lease)
+        self._await_release(guard_index, lease)
 
-    def _await_release(self, pool_index: int, lease: "_Lease") -> None:
+    def _await_release(self, guard_index: int, lease: "_Lease") -> None:
         """Wait for the one message a held connection may send: its release.
 
         The pool's actor watches the pidfd, not this thread. EOF only ends the
@@ -332,21 +332,21 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                 self._send_error(error)
                 continue
-            if self._release_or_fail(pool_index, lease, release.activated):
+            if self._release_or_fail(guard_index, lease, release.activated):
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))
             return
 
     def _release_or_fail(
-        self, pool_index: int, lease: "_Lease", activated: bool = True
+        self, guard_index: int, lease: "_Lease", activated: bool = True
     ) -> bool:
         try:
             if activated:
-                self.server.registry.release(pool_index, lease)
+                self.server.registry.release(guard_index, lease)
             else:
                 # The claimant declared it never served this lease; the Guard
                 # it stood down may resume serving.
-                self.server.registry.abort_grant(pool_index, lease)
+                self.server.registry.abort_grant(guard_index, lease)
         except KVCRServiceError as error:
             # Registry closing: claimant learns the release did not commit; not fatal.
             self._send_error(error)
@@ -407,14 +407,14 @@ class _ThreadingUnixServer(
                 "KVCR compatibility digest does not match the service"
             )
         spec, listener_fd, lease = self.registry.claim(
-            request.pool_index,
+            request.guard_index,
             request.tier_config,
             liveness,
             (request.control_host, request.control_port),
         )
         return (
-            _Granted(request.pool_index, spec, request.tier_config, _PROTOCOL_VERSION),
-            (request.pool_index, listener_fd, lease),
+            _Granted(request.guard_index, spec, request.tier_config, _PROTOCOL_VERSION),
+            (request.guard_index, listener_fd, lease),
         )
 
     def fail(self, error: BaseException) -> None:

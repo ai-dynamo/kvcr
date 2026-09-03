@@ -113,6 +113,6 @@ class KVCRConfig:
 @dataclass(frozen=True)
 class KVCRGuardConfig:
     kvcr_service_socket_path: str
-    pool_index: int
+    guard_index: int
     row_stride: int
     compatibility_digest: str

@@ -315,8 +315,8 @@ IDs, or raw endpoints.
 
 The KVCR service daemon owns pool lifecycle. It pre-allocates `--guard-count`
 contiguous pool allocations before exposing its socket, one per Guard. Each has
-the same ordered pool sizes. A worker claims an allocation by index; it outlives
-that worker but not the service:
+the same ordered pool sizes. A worker claims a Guard by index; its allocation
+outlives that worker but not the service:
 
 ```bash
 python -m kvcr.kvcr_service \
@@ -341,7 +341,7 @@ GiB plus the journal for every Guard. Until grouped grants are introduced, the
 current claim path exposes those pool regions as one combined data area.
 
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(pool_index, row_stride, compatibility_digest, control_bind)`,
+`KVCRClient.claim(guard_index, row_stride, compatibility_digest, control_bind)`,
 naming the address its Guard will answer on. The digest must match the service
 exactly, and callers must change it whenever the row stride or any other
 KV-cache layout term changes. The returned `KVCRPoolHold` describes the mapped

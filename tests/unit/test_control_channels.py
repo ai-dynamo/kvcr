@@ -112,7 +112,7 @@ def channel() -> Iterator[ZmqPeerControlChannel]:
 
 def test_messages_keep_their_boundaries(pair: Pair) -> None:
     sender, receiver = pair
-    claim = _Message("claim", {"pool_index": 3})
+    claim = _Message("claim", {"guard_index": 3})
     FramedConnection(sender).send(claim)
     FramedConnection(sender).send(_Message("ping"))
     incoming = FramedConnection(receiver)
@@ -134,7 +134,7 @@ def test_a_frame_carries_at_most_one_descriptor(
     received_fd: int | None = None
     with _pipe() as (read_fd, _write_fd):
         try:
-            message = _Message("claim", {"pool_index": 3})
+            message = _Message("claim", {"guard_index": 3})
             FramedConnection(sender).send_with_fd(message, read_fd)
 
             received, received_fd = incoming.receive_with_fd(_MESSAGE_DECODER)

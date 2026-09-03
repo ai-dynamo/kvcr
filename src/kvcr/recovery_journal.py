@@ -441,7 +441,7 @@ def claim_guarded_pool(
             "endpoint, so that a Guard can answer on it after this worker dies"
         )
     hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
-        guard_config.pool_index,
+        guard_config.guard_index,
         guard_config.row_stride,
         guard_config.compatibility_digest,
         bind_address(),

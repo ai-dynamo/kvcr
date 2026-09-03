@@ -43,23 +43,23 @@ _STOP_TIMEOUT_SECONDS = 5.0
 _START_TIMEOUT_SECONDS = 60.0
 
 
-_POOL_BINDS: dict[int, tuple[str, int]] = {}
+_GUARD_BINDS: dict[int, tuple[str, int]] = {}
 
 
-def _control_bind(pool_index: int) -> tuple[str, int]:
-    """One address per pool, stable across the claims that reuse it."""
-    bind = _POOL_BINDS.get(pool_index)
+def _control_bind(guard_index: int) -> tuple[str, int]:
+    """One address per Guard, stable across the claims that reuse it."""
+    bind = _GUARD_BINDS.get(guard_index)
     if bind is None:
-        bind = _POOL_BINDS[pool_index] = ("127.0.0.1", free_port())
+        bind = _GUARD_BINDS[guard_index] = ("127.0.0.1", free_port())
     return bind
 
 
 @pytest.fixture(autouse=True)
-def _fresh_pool_binds() -> Iterator[None]:
-    """One address per pool per test; the service holding it is gone by the next."""
-    _POOL_BINDS.clear()
+def _fresh_guard_binds() -> Iterator[None]:
+    """One address per Guard per test; the service holding it is gone by the next."""
+    _GUARD_BINDS.clear()
     yield
-    _POOL_BINDS.clear()
+    _GUARD_BINDS.clear()
 
 
 def _socket_path() -> Path:
@@ -68,14 +68,14 @@ def _socket_path() -> Path:
 
 
 def _claim_when_ready(
-    process: subprocess.Popen[bytes], socket_path: Path, pool_index: int
+    process: subprocess.Popen[bytes], socket_path: Path, guard_index: int
 ) -> KVCRPoolHold:
     client = KVCRClient(socket_path)
     deadline = time.monotonic() + _START_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
             return client.claim(
-                pool_index, _ROW_STRIDE, _DIGEST, _control_bind(pool_index)
+                guard_index, _ROW_STRIDE, _DIGEST, _control_bind(guard_index)
             )
         except KVCRSocketError:
             if process.poll() is not None:
@@ -186,7 +186,7 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
                     KVCRBackendConfigs(),
                     KVCRGuardConfig(
                         kvcr_service_socket_path=str(socket_path),
-                        pool_index=0,
+                        guard_index=0,
                         row_stride=_ROW_STRIDE,
                         compatibility_digest=_DIGEST,
                     ),
