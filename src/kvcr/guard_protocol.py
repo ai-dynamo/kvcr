@@ -15,7 +15,7 @@ from typing import Annotated, Literal
 
 import msgspec
 
-from .config import G3Options, LocalDramInfo
+from .config import G3Options, LocalDramOptions
 from .control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -50,6 +50,7 @@ class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     row_stride: Annotated[int, msgspec.Meta(gt=0)]
     g3: _G3Config | None
+    remote_fw_dram_backend: Annotated[str, msgspec.Meta(min_length=1)] = "UCX"
 
     def __post_init__(self) -> None:
         # Mirrors what the claimant's _G3 will enforce. The first claim fixes
@@ -162,7 +163,7 @@ class PidfdLiveness:
 class KVCRPoolHold:
     """A mapped pool and the connection holding its lease."""
 
-    local_dram: LocalDramInfo
+    local_dram: LocalDramOptions
     _attachment: KVCRPoolAttachment
     _connection: FramedConnection
     _control_listener_fd: int | None = None
@@ -216,6 +217,7 @@ class KVCRClient:
         compatibility_digest: str,
         control_bind: tuple[str, int],
         g3: G3Options | None = None,
+        remote_fw_dram_backend: str = "UCX",
     ) -> KVCRPoolHold:
         """Claim and map one service-owned pool."""
         g3_config = g3 and {
@@ -230,7 +232,11 @@ class KVCRClient:
             {
                 "pool_index": pool_index,
                 "compatibility_digest": compatibility_digest,
-                "tier_config": {"row_stride": row_stride, "g3": g3_config},
+                "tier_config": {
+                    "row_stride": row_stride,
+                    "g3": g3_config,
+                    "remote_fw_dram_backend": remote_fw_dram_backend,
+                },
                 "control_host": control_bind[0],
                 "control_port": control_bind[1],
                 "version": _PROTOCOL_VERSION,
@@ -265,8 +271,11 @@ class KVCRClient:
                 ) from geometry_error
             attachment = KVCRPoolAttachment.attach(spec)
             return KVCRPoolHold(
-                local_dram=LocalDramInfo(
-                    attachment.data_address, effective_bytes, rows
+                local_dram=LocalDramOptions(
+                    attachment.data_address,
+                    effective_bytes,
+                    rows,
+                    request.tier_config.remote_fw_dram_backend,
                 ),
                 _attachment=attachment,
                 _connection=connection,

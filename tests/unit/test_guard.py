@@ -17,7 +17,7 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record, _wait_until
 
-from kvcr.config import LocalDramInfo
+from kvcr.config import LocalDramOptions
 from kvcr.control_channels import KVCRServiceError, ZmqPeerControlChannel
 from kvcr.core import _BlockRecord
 from kvcr.guard import (
@@ -280,7 +280,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         backend="FILE",
         backend_options={},
     )
-    tier = _TierConfig(_PAGE_STRIDE, g3_config)
+    tier = _TierConfig(_PAGE_STRIDE, g3_config, "REMOTE")
     guard = _Guard(_PAGE_SPEC, compatibility_digest=_TEST_DIGEST)
     # Driven directly, then the thread starts already busy: the actor blocks
     # on an empty mailbox when idle, so mutating around a sleeping thread
@@ -307,7 +307,10 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         uuid.UUID(config.nixl_agent_name.removeprefix(prefix))
         assert config.nixl_listen_port == 0
         assert bindings.framework_control is channels[0]
-        assert backends.local_dram == LocalDramInfo(1234 + 8192, 2 * _PAGE_STRIDE, 2)
+        assert backends.local_dram == LocalDramOptions(
+            1234 + 8192, 2 * _PAGE_STRIDE, 2, "REMOTE"
+        )
+        assert backends.remote_fw_dram.backend == "REMOTE"
         # A Guard opens no G3: it serves the G2 half and keeps the rest for the
         # primary that takes the pool back.
         assert backends.g3 is None

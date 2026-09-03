@@ -31,7 +31,7 @@ from kvcr import (
 from kvcr.config import (
     G3Options,
     KVCRConfig,
-    LocalDramInfo,
+    LocalDramOptions,
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
@@ -97,15 +97,11 @@ class _FakeG3Agent(FakeNixlAgent):
 
     def transfer(self, handle):
         backend = self._xfer_backends[handle]
-        if not backend:
+        if backend != ("MOCK",):
             return super().transfer(handle)
         self.transfers.append(handle)
         operation = self.xfers[handle - 1][0]
-        if (
-            self._fail_file_writes
-            and operation == "WRITE"
-            and self._xfer_backends[handle] == ("MOCK",)
-        ):
+        if self._fail_file_writes and operation == "WRITE":
             return "ERR"
         _, local_descs, local_indices, remote_descs, _, _ = self.xfers[handle - 1]
         for index in local_indices:
@@ -173,7 +169,7 @@ def _new_g3_kvcr(
             if telemetry
             else None
         ),
-        local_dram=LocalDramInfo(ctypes.addressof(local), len(local), slot_count),
+        local_dram=LocalDramOptions(ctypes.addressof(local), len(local), slot_count),
         g3=G3Options(
             paths=((tmp_path / "g3.data",) if g3_paths is None else tuple(g3_paths)),
             capacity_bytes_per_file=page_size * g3_slot_count,
@@ -667,7 +663,7 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         def transfer(self, handle):
             result = super().transfer(handle)
             operation = self.xfers[handle - 1][0]
-            if operation == "READ" and self._xfer_backends[handle]:
+            if operation == "READ" and self._xfer_backends[handle] == ("MOCK",):
                 return "PROC"
             return result
 
@@ -675,7 +671,7 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
             operation = self.xfers[handle - 1][0]
             if (
                 operation == "READ"
-                and self._xfer_backends[handle]
+                and self._xfer_backends[handle] == ("MOCK",)
                 and not self.allow_reads
             ):
                 return "PROC"
@@ -816,7 +812,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
             return (
                 self.stuck
                 and self.xfers[handle - 1][0] == "READ"
-                and bool(self._xfer_backends.get(handle))
+                and self._xfer_backends.get(handle) == ("MOCK",)
             )
 
         def transfer(self, handle):
@@ -914,8 +910,8 @@ def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
 ) -> None:
     class _StuckWriteAgent(_FakeG3Agent):
         def _is_file_write(self, handle):
-            return self.xfers[handle - 1][0] == "WRITE" and bool(
-                self._xfer_backends.get(handle)
+            return self.xfers[handle - 1][0] == "WRITE" and (
+                self._xfer_backends.get(handle) == ("MOCK",)
             )
 
         def transfer(self, handle):

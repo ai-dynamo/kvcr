@@ -11,7 +11,7 @@ import msgspec
 import pytest
 
 from kvcr import guard_protocol as protocol_module
-from kvcr.config import LocalDramInfo
+from kvcr.config import LocalDramOptions
 from kvcr.control_channels import (
     KVCRGuardProtocolError,
     KVCRServiceError,
@@ -231,7 +231,11 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "type": "claim",
         "pool_index": _POOL_INDEX,
         "compatibility_digest": _DIGEST,
-        "tier_config": {"row_stride": _ROW_STRIDE, "g3": None},
+        "tier_config": {
+            "row_stride": _ROW_STRIDE,
+            "g3": None,
+            "remote_fw_dram_backend": "UCX",
+        },
         "control_host": "127.0.0.1",
         "control_port": 5555,
         "version": 1,
@@ -248,11 +252,15 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
             "mapping_bytes": _MAPPING_BYTES,
             "journal_bytes": _JOURNAL_BYTES,
         },
-        "tier_config": {"row_stride": _ROW_STRIDE, "g3": None},
+        "tier_config": {
+            "row_stride": _ROW_STRIDE,
+            "g3": None,
+            "remote_fw_dram_backend": "UCX",
+        },
         "version": 1,
     }
     attach.assert_called_once_with(_grant().spec)
-    assert hold.local_dram == LocalDramInfo(1234 + _JOURNAL_BYTES, 8192, 8)
+    assert hold.local_dram == LocalDramOptions(1234 + _JOURNAL_BYTES, 8192, 8)
     # The endpoint a Guard will answer on, handed over with the grant.
     assert hold._control_listener_fd == connection.handed_fd
 
@@ -347,7 +355,7 @@ def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> N
         [ConnectionResetError("release acknowledgement was lost")], events
     )
     hold = KVCRPoolHold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        local_dram=LocalDramOptions(1234, 8192, 8),
         _attachment=attachment,
         _connection=connection,
     )

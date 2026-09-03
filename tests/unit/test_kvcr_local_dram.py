@@ -230,17 +230,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     primary_addr = ctypes.addressof(primary)
     primary.raw = b"a" * block_size + b"b" * block_size
 
-    class _PluginAwareAgent(FakeNixlAgent):
-        """An agent that created a backend that cannot carry DRAM."""
-
-        backend_mems = {
-            "UCX": ["DRAM_SEG", "VRAM_SEG"],
-            # A file backend advertises DRAM for its memory side too; that
-            # must not qualify it for memory-to-memory copies.
-            "POSIX": ["FILE_SEG", "DRAM_SEG"],
-        }
-
-    agent = _PluginAwareAgent()
+    agent = FakeNixlAgent()
     policy = _RecordingFIFOPolicy()
     capacity_requests: list[int] = []
     kvcr = _new_local_kvcr(
@@ -250,6 +240,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         capacity_low_watermark_percent=100,
         capacity_needed_callback=capacity_requests.append,
         policy=policy,
+        local_dram_backend="LOCAL",
     )
     now = 0.0
     kvcr._core._clock = lambda: now
@@ -305,10 +296,8 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         (deliver, _op_entries({first_key: True, second_key: False}))
     ]
     assert destination.raw[:block_size] == b"a" * block_size
-    # Derived, not configured: every DRAM copy is pinned to the plugins that
-    # can carry it, so a file plugin loaded for G3 is never NIXL's choice.
     assert agent.xfer_backends and all(
-        backends == ["UCX"] for backends in agent.xfer_backends
+        backends == ["LOCAL"] for backends in agent.xfer_backends
     )
     assert [
         (meta.access_count, meta.last_access)

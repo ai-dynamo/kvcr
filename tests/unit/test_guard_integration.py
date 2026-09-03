@@ -77,8 +77,7 @@ class _FileBackedNixlAgent(FakeNixlAgent):
         return super().deregister_memory(handle)
 
     def transfer(self, handle):
-        # The base class already records per-xfer backends; none means DRAM.
-        if not self.xfer_backends[handle - 1]:
+        if self.xfer_backends[handle - 1] != ["MOCK"]:
             if self.block_remote_writes:
                 self.transfers.append(handle)
                 self.blocked_remote_writes += 1

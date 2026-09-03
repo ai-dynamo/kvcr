@@ -16,10 +16,11 @@ InventorySink = Callable[[InventoryEvent], None]
 
 
 @dataclass(frozen=True)
-class LocalDramInfo:
+class LocalDramOptions:
     address: int
     length: int
     slot_count: int
+    backend: str = "UCX"
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class RemoteFWDramOptions:
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
+    backend: str = "UCX"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -49,7 +51,7 @@ class G3Options:
 @dataclass(frozen=True)
 class KVCRBackendConfigs:
     framework_dram: FrameworkDramInput | None = None
-    local_dram: LocalDramInfo | None = None
+    local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
     remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)
 

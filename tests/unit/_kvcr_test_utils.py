@@ -23,7 +23,7 @@ from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
-    LocalDramInfo,
+    LocalDramOptions,
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
@@ -454,7 +454,7 @@ def _new_kvcr(
     key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
     framework_dram: FrameworkDramInput | None = None,
-    local_dram: LocalDramInfo | None = None,
+    local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
     inventory_sink=None,
     policy=None,
@@ -497,6 +497,7 @@ def _new_local_kvcr(
     capacity_low_watermark_percent=0,
     capacity_needed_callback=None,
     policy=None,
+    local_dram_backend="UCX",
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -516,9 +517,12 @@ def _new_local_kvcr(
                 policy=policy,
             ),
             KVCRBackendConfigs(
-                local_dram=LocalDramInfo(
-                    ctypes.addressof(local), len(local), slot_count
-                )
+                local_dram=LocalDramOptions(
+                    ctypes.addressof(local),
+                    len(local),
+                    slot_count,
+                    local_dram_backend,
+                ),
             ),
         )
     _OPEN_KVCRS.append(kvcr)

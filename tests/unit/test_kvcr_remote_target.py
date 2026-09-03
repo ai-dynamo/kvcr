@@ -30,7 +30,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.config import KVCRConfig, LocalDramInfo, RemoteFWDramOptions
+from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -126,7 +126,9 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         source_pinning,
         source_control,
         name="source",
-        local_dram=LocalDramInfo(ctypes.addressof(source_local), len(source_local), 2),
+        local_dram=LocalDramOptions(
+            ctypes.addressof(source_local), len(source_local), 2
+        ),
         policy=source_policy,
     )
     source_now = 0.0
@@ -139,7 +141,9 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False,
         ),
-        local_dram=LocalDramInfo(ctypes.addressof(target_local), len(target_local), 2),
+        local_dram=LocalDramOptions(
+            ctypes.addressof(target_local), len(target_local), 2
+        ),
         inventory_sink=events.append,
         policy=policy,
     )
@@ -243,7 +247,7 @@ def test_remote_staging_commits_available_prefix() -> None:
         control,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 2),
+        local_dram=LocalDramOptions(ctypes.addressof(local), len(local), 2),
         inventory_sink=events.append,
     )
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -287,7 +291,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
         ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramInfo(ctypes.addressof(local), len(local), 1),
+        local_dram=LocalDramOptions(ctypes.addressof(local), len(local), 1),
     )
     target._core._clock = lambda: now
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -676,6 +680,7 @@ def test_remote_framework_dram_transfers_available_prefix(
         source_control,
         KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
         name="source",
+        remote_options=RemoteFWDramOptions(backend="REMOTE"),
     )
     source._core._clock = lambda: 0.0
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
@@ -702,6 +707,7 @@ def test_remote_framework_dram_transfers_available_prefix(
     source_control.incoming.extend(message for _, message in target_control.sent)
 
     assert _poll_until(source, lambda _: bool(source_agent.xfers)) == []
+    assert source_agent.xfer_backends == [["REMOTE"]]
     assert source_agent.xfers[0][2] == list(range(completed_count))
     notification = source_agent.xfers[0][5]
     assert notification is not None

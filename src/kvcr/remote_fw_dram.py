@@ -272,6 +272,7 @@ class _SourceWriteOp(_RemoteOp):
                     self.src_descriptors,
                     self.dst_descriptors[: self.completed_count],
                     remote_side_agent=self.remote_agent,
+                    backend=backend._options.backend,
                     notif_msg=_write_done_notif(
                         self.op_handle,
                         True,
@@ -390,6 +391,8 @@ class _RemoteFWDram:
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
+        if not options.backend:
+            raise ValueError("remote framework DRAM NIXL backend must be non-empty")
         self._kvcr = kvcr
         self._options = options
         self._key_adapter = key_adapter
