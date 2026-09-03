@@ -36,8 +36,8 @@ from kvcr.kvcr_service import _DEFAULT_JOURNAL_BYTES, _KVCRService
 _ROW_STRIDE = 1024
 _DIGEST = "opaque workflow digest: Preserve-Me EXACTLY"
 _JOURNAL_BYTES = 8192
-_POOL_SIZE_BYTES = _JOURNAL_BYTES + 8192
-_CLI_POOL_SIZE_BYTES = _DEFAULT_JOURNAL_BYTES + 8192
+_POOL_SIZE_BYTES = 8192
+_CLI_POOL_SIZE_BYTES = 8192
 _CLI_POOL_SIZE_GB = str(_CLI_POOL_SIZE_BYTES / (1 << 30))
 _STOP_TIMEOUT_SECONDS = 5.0
 _START_TIMEOUT_SECONDS = 60.0
@@ -97,9 +97,9 @@ def _running_daemon(pool_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], P
             str(socket_path),
             "--pool-dir",
             str(pool_dir),
-            "--pool-count",
+            "--guard-count",
             "2",
-            "--pool-size-gb",
+            "--pool-sizes-gb",
             _CLI_POOL_SIZE_GB,
             "--compatibility-digest",
             _DIGEST,
@@ -121,7 +121,7 @@ def _running_daemon(pool_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], P
 @contextmanager
 def _running_service(
     pool_dir: Path,
-    pool_count: int = 2,
+    guard_count: int = 2,
     socket_path: Path | None = None,
 ) -> Iterator[Path]:
     if socket_path is None:
@@ -129,8 +129,8 @@ def _running_service(
     server = _KVCRService(
         socket_path,
         pool_dir,
-        pool_count=pool_count,
-        pool_size_bytes=_POOL_SIZE_BYTES,
+        guard_count=guard_count,
+        pool_sizes_bytes=(_POOL_SIZE_BYTES,),
         compatibility_digest=_DIGEST,
         journal_bytes=_JOURNAL_BYTES,
     )
@@ -218,10 +218,13 @@ def test_cli_daemon_sets_geometry_and_restart_reclaims_only_unattached(
 
             # The deployed flags produce the requested pool and data geometry.
             pools = list(pool_dir.iterdir())
-            assert len(pools) == 2, "--pool-count pools at startup"
-            requested = int(float(_CLI_POOL_SIZE_GB) * (1 << 30))
-            client_rows = (requested - _DEFAULT_JOURNAL_BYTES) // _ROW_STRIDE
-            assert all(path.stat().st_size == requested for path in pools)
+            assert len(pools) == 2, "--guard-count pools at startup"
+            pool_bytes = int(float(_CLI_POOL_SIZE_GB) * (1 << 30))
+            client_rows = pool_bytes // _ROW_STRIDE
+            assert all(
+                path.stat().st_size == _DEFAULT_JOURNAL_BYTES + pool_bytes
+                for path in pools
+            )
             assert hold.local_dram.length == client_rows * _ROW_STRIDE
             assert hold.local_dram.slot_count == client_rows
 
@@ -234,7 +237,7 @@ def test_cli_daemon_sets_geometry_and_restart_reclaims_only_unattached(
             assert unclaimed_pool.exists()
 
             # The successor reclaims the unclaimed pool but leaves the attached one.
-            with _running_service(pool_dir, pool_count=1, socket_path=socket_path):
+            with _running_service(pool_dir, guard_count=1, socket_path=socket_path):
                 assert attached_pool.exists()
                 assert not unclaimed_pool.exists()
                 assert len(list(pool_dir.iterdir())) == 2
@@ -246,7 +249,7 @@ def test_cli_daemon_sets_geometry_and_restart_reclaims_only_unattached(
             hold = None
 
             # Once the worker unmaps it, the next successor reclaims the orphan.
-            with _running_service(pool_dir, pool_count=1, socket_path=socket_path):
+            with _running_service(pool_dir, guard_count=1, socket_path=socket_path):
                 assert not attached_pool.exists()
                 assert len(list(pool_dir.iterdir())) == 1
         finally:

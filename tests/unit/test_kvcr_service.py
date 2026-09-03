@@ -59,9 +59,10 @@ def _holders_of(registry) -> dict[int, object]:
 _SERVER_STOP_TIMEOUT_SECONDS = 5
 _CONNECTION_POLL_INTERVAL_SECONDS = 0.001
 
-_TEST_POOL_COUNT = 2
+_TEST_GUARD_COUNT = 2
 _TEST_JOURNAL_BYTES = 8192
-_TEST_POOL_SIZE_BYTES = _TEST_JOURNAL_BYTES + 8192
+_TEST_POOL_SIZE_BYTES = 8192
+_TEST_POOL_SIZES_BYTES = (_TEST_POOL_SIZE_BYTES,)
 _TEST_ROW_STRIDE = 1024
 _TEST_DIGEST = "opaque digest: Preserve-Me EXACTLY"
 _TEST_TIER_CONFIG = _TierConfig(_TEST_ROW_STRIDE, None)
@@ -139,8 +140,8 @@ def _test_socket_path() -> Path:
 @contextmanager
 def _running_server(
     tmp_path: Path,
-    pool_count: int = _TEST_POOL_COUNT,
-    pool_size_bytes: int = _TEST_POOL_SIZE_BYTES,
+    guard_count: int = _TEST_GUARD_COUNT,
+    pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
     journal_bytes: int = _TEST_JOURNAL_BYTES,
 ) -> Iterator[_ServerHarness]:
     socket_path = _test_socket_path()
@@ -149,8 +150,8 @@ def _running_server(
     server = _KVCRService(
         socket_path,
         pool_dir,
-        pool_count=pool_count,
-        pool_size_bytes=pool_size_bytes,
+        guard_count=guard_count,
+        pool_sizes_bytes=pool_sizes_bytes,
         compatibility_digest=_TEST_DIGEST,
         journal_bytes=journal_bytes,
     )
@@ -220,7 +221,7 @@ def _stand_in_pool(spec) -> Mock:
     return attachment
 
 
-def _new_registry(tmp_path: Path, pool_count: int = 1) -> _PoolRegistry:
+def _new_registry(tmp_path: Path, guard_count: int = 1) -> _PoolRegistry:
     """A registry of real Guards over stand-in pool mappings."""
     journal = Mock()
     journal.read_next.return_value = None
@@ -230,8 +231,8 @@ def _new_registry(tmp_path: Path, pool_count: int = 1) -> _PoolRegistry:
     ):
         return _PoolRegistry(
             tmp_path,
-            pool_count,
-            _TEST_POOL_SIZE_BYTES,
+            guard_count,
+            _TEST_POOL_SIZES_BYTES,
             _TEST_JOURNAL_BYTES,
             _TEST_DIGEST,
         )
@@ -255,11 +256,21 @@ def test_socket_is_private(tmp_path: Path) -> None:
         assert stat.S_IMODE(harness.server.socket_path.stat().st_mode) == 0o600
 
 
+def test_each_guard_allocation_contains_all_pool_sizes(tmp_path: Path) -> None:
+    pool_sizes = (2 * _PAGE_STRIDE, 3 * _PAGE_STRIDE)
+    with _running_server(tmp_path, pool_sizes_bytes=pool_sizes) as harness:
+        expected = _TEST_JOURNAL_BYTES + sum(pool_sizes)
+        assert all(
+            guard._owner.spec.mapping_bytes == expected
+            for guard in harness.server._registry._pools.values()
+        )
+
+
 def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     tmp_path: Path,
 ) -> None:
     """Pools lease independently; close keeps, names, and can retry a wedged one."""
-    registry = _new_registry(tmp_path, pool_count=2)
+    registry = _new_registry(tmp_path, guard_count=2)
     guard = registry._pools[0]
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
     first_spec, stale = _claim(registry, 0, first)
@@ -413,7 +424,7 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
     tmp_path: Path,
 ) -> None:
     """A failed claim gives back lease and endpoint; an unfreeable address is fatal."""
-    registry = _new_registry(tmp_path, pool_count=2)
+    registry = _new_registry(tmp_path, guard_count=2)
     guard = registry._pools[0]
     bound: list[socket.socket] = []
     try:
@@ -536,7 +547,7 @@ def test_slow_promotion_does_not_block_other_pools_or_shutdown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry = _new_registry(tmp_path, pool_count=2)
+    registry = _new_registry(tmp_path, guard_count=2)
     guard = registry._pools[0]
     promotion_started = threading.Event()
     continue_promotion = threading.Event()
@@ -617,7 +628,7 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
 
 
 def test_held_connection_accepts_only_release(tmp_path: Path) -> None:
-    with _running_server(tmp_path, pool_count=1) as harness:
+    with _running_server(tmp_path, guard_count=1) as harness:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(str(harness.server.socket_path))
             channel = FramedConnection(connection)
@@ -747,7 +758,7 @@ def test_startup_rollback_gives_back_every_pool_but_a_wedged_one(
         pytest.raises(RuntimeError, match="attach failed"),
     ):
         _PoolRegistry(
-            tmp_path, 3, _TEST_POOL_SIZE_BYTES, _TEST_JOURNAL_BYTES, _TEST_DIGEST
+            tmp_path, 3, _TEST_POOL_SIZES_BYTES, _TEST_JOURNAL_BYTES, _TEST_DIGEST
         )
 
     # The pool that closed is gone with the one that never attached; the pool
@@ -781,8 +792,8 @@ def test_startup_allocation_failure_rolls_back_before_listener(
         _KVCRService(
             _test_socket_path(),
             tmp_path,
-            pool_count=3,
-            pool_size_bytes=_TEST_POOL_SIZE_BYTES,
+            guard_count=3,
+            pool_sizes_bytes=_TEST_POOL_SIZES_BYTES,
             compatibility_digest=_TEST_DIGEST,
             journal_bytes=_TEST_JOURNAL_BYTES,
         )
@@ -818,7 +829,7 @@ def test_shutdown_does_not_unlink_replaced_socket_path(tmp_path: Path) -> None:
 def test_idle_client_does_not_block_shutdown_cleanup(tmp_path: Path) -> None:
     with _running_server(tmp_path) as harness:
         pool_paths = list((tmp_path / "pools").glob("kvcr-pool_*-*"))
-        assert len(pool_paths) == _TEST_POOL_COUNT
+        assert len(pool_paths) == _TEST_GUARD_COUNT
         socket_path = harness.server.socket_path
         _wait_for_connection_state(harness.server, connected=False)
         idle_connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1214,10 +1225,36 @@ def test_shutdown_drains_a_held_connection(tmp_path: Path) -> None:
         hold._connection.close()
 
 
-def test_a_pool_no_bigger_than_its_journal_is_rejected_at_the_flag() -> None:
-    """Sized at or below the journal, a pool has nothing left to cache with."""
-    flags = "--socket-path s --pool-dir d --pool-count 1 --compatibility-digest g"
+def _service_args(pool_sizes_gb: str) -> list[str]:
+    return (
+        "--socket-path s --pool-dir d --guard-count 2 --pool-sizes-gb".split()
+        + [pool_sizes_gb]
+        + "--compatibility-digest g".split()
+    )
+
+
+def test_pool_size_list_preserves_order_and_floors_each_item_to_pages() -> None:
+    raw_sizes = (2 * _PAGE_STRIDE + 123, 3 * _PAGE_STRIDE + 456)
+    parsed = _parse_args(
+        _service_args(",".join(str(size / (1 << 30)) for size in raw_sizes))
+    )
+
+    expected = (2 * _PAGE_STRIDE, 3 * _PAGE_STRIDE)
+    assert parsed.pool_sizes_bytes == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "1,,2",
+        "nan",
+        "0",
+        str((_PAGE_STRIDE - 1) / (1 << 30)),
+        "1e1000000",
+        ",".join([str(sys.maxsize // (1 << 30))] * 2),
+    ],
+)
+def test_invalid_pool_size_items_are_rejected(value: str) -> None:
     with pytest.raises(SystemExit):
-        _parse_args([*flags.split(), "--pool-size-gb", "0.05"])
-    parsed = _parse_args([*flags.split(), "--pool-size-gb", "0.2"])
-    assert parsed.pool_size_bytes > 100 * (1 << 20)
+        _parse_args(_service_args(value))

@@ -234,8 +234,8 @@ def live_service(
     service = _KVCRService(
         tmp_path / "service.sock",
         pool_dir,
-        pool_count=1,
-        pool_size_bytes=8192 + os.sysconf("SC_PAGE_SIZE"),
+        guard_count=1,
+        pool_sizes_bytes=(os.sysconf("SC_PAGE_SIZE"),),
         journal_bytes=8192,
         compatibility_digest=_DIGEST,
     )

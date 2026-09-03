@@ -9,15 +9,17 @@ import argparse
 import contextlib
 import functools
 import logging
-import math
+import mmap
 import os
 import re
 import signal
 import socket
 import socketserver
 import stat
+import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -58,6 +60,7 @@ _STALE_SOCKET_PROBE_SECONDS = 1.0
 _DEFAULT_JOURNAL_BYTES = 100 * (1 << 20)
 # Matches names produced by memory._pool_filename: "kvcr-<pool_id>-<32 hex>".
 _ORPHANED_POOL_NAME = re.compile(rf"{re.escape(_POOL_PREFIX)}-.+-[0-9a-f]{{32}}")
+_GB = 1 << 30
 
 
 class _PoolRegistry:
@@ -70,15 +73,15 @@ class _PoolRegistry:
     def __init__(
         self,
         pool_dir: str | os.PathLike[str],
-        pool_count: int,
-        pool_size_bytes: int,
+        guard_count: int,
+        pool_sizes_bytes: tuple[int, ...],
         journal_bytes: int,
         compatibility_digest: str,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
             raise ValueError(f"KVCR pool directory does not exist: {self._pool_dir}")
-        self._pool_count = pool_count
+        self._guard_count = guard_count
         self._pools: dict[int, _Guard] = {}
         self._refusing = threading.Event()
         # Stand-in until the owning server takes over; only it can stop the service.
@@ -86,11 +89,12 @@ class _PoolRegistry:
             logger.critical, "Uncontained KVCR pool failure: %s"
         )
         self._purge_orphaned_pools()
-        for rank in range(pool_count):
+        mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
+        for rank in range(guard_count):
             try:
                 owner = _KVCRPoolOwner.allocate(
                     pool_id=f"pool_{rank}",
-                    pool_size_bytes=pool_size_bytes,
+                    pool_size_bytes=mapping_bytes,
                     journal_bytes=journal_bytes,
                     pool_dir=self._pool_dir,
                 )
@@ -167,9 +171,9 @@ class _PoolRegistry:
                     logger.info("Leaving KVCR pool still in use: %s", path)
 
     def _pool(self, pool_index: int) -> _Guard:
-        if not (0 <= pool_index < self._pool_count):
+        if not (0 <= pool_index < self._guard_count):
             raise KVCRServiceError(
-                f"pool_index {pool_index} is out of range [0, {self._pool_count})"
+                f"pool_index {pool_index} is out of range [0, {self._guard_count})"
             )
         guard = self._pools.get(pool_index)
         if guard is None:
@@ -451,8 +455,8 @@ class _KVCRService:
         self,
         socket_path: str | os.PathLike[str],
         pool_dir: str | os.PathLike[str],
-        pool_count: int,
-        pool_size_bytes: int,
+        guard_count: int,
+        pool_sizes_bytes: tuple[int, ...],
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
     ) -> None:
@@ -465,7 +469,7 @@ class _KVCRService:
         # per pod and clears the path before starting it.
         _unlink_stale_socket(self.socket_path)
         self._registry = _PoolRegistry(
-            pool_dir, pool_count, pool_size_bytes, journal_bytes, compatibility_digest
+            pool_dir, guard_count, pool_sizes_bytes, journal_bytes, compatibility_digest
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -563,38 +567,56 @@ def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
     raise _ShutdownRequested
 
 
+def _parse_pool_sizes_gb(value: str) -> tuple[int, ...]:
+    try:
+        sizes_gb = tuple(Decimal(item) for item in value.split(","))
+        if not all(size.is_finite() and size > 0 for size in sizes_gb):
+            raise InvalidOperation
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(
+            "--pool-sizes-gb must contain positive, finite numbers"
+        ) from error
+    if any(size > sys.maxsize for size in sizes_gb):
+        raise argparse.ArgumentTypeError(
+            "--pool-sizes-gb describes an allocation that is too large"
+        )
+    page = mmap.PAGESIZE
+    with localcontext() as context:
+        context.prec = max(len(size.as_tuple().digits) for size in sizes_gb) + 10
+        sizes_bytes = tuple(int(size * _GB) // page * page for size in sizes_gb)
+    if not all(size >= page for size in sizes_bytes):
+        raise argparse.ArgumentTypeError(
+            "--pool-sizes-gb values must be at least one memory page"
+        )
+    if _DEFAULT_JOURNAL_BYTES + sum(sizes_bytes) > sys.maxsize:
+        raise argparse.ArgumentTypeError(
+            "--pool-sizes-gb describes an allocation that is too large"
+        )
+    return sizes_bytes
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse and validate the service's command line."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket-path", required=True)
     parser.add_argument("--pool-dir", required=True)
-    parser.add_argument("--pool-count", type=int, required=True)
-    parser.add_argument("--pool-size-gb", type=float, required=True)
+    parser.add_argument("--guard-count", type=int, required=True)
+    parser.add_argument(
+        "--pool-sizes-gb",
+        type=_parse_pool_sizes_gb,
+        dest="pool_sizes_bytes",
+        required=True,
+    )
     parser.add_argument("--compatibility-digest", required=True)
     args = parser.parse_args(argv)
-
-    # Reject nan/inf before converting to int, which would otherwise raise a
-    # raw ValueError/OverflowError instead of an argparse usage error.
-    if not math.isfinite(args.pool_size_gb) or args.pool_size_gb <= 0:
-        parser.error("--pool-size-gb must be a positive, finite number")
-    if args.pool_count < 1:
-        parser.error("--pool-count must be at least 1")
-
-    args.pool_size_bytes = int(args.pool_size_gb * (1 << 30))
-    if args.pool_size_bytes <= _DEFAULT_JOURNAL_BYTES:
-        # The journal is carved out of this size, not added to it, so a pool this small
-        # has no room to cache anything.
-        parser.error(
-            "--pool-size-gb must exceed the "
-            f"{_DEFAULT_JOURNAL_BYTES >> 20} MiB journal each pool reserves"
-        )
+    if args.guard_count < 1:
+        parser.error("--guard-count must be at least 1")
     return args
 
 
 def main() -> None:
     """Run the standalone KVCR service daemon."""
     args = _parse_args()
-    pool_size_bytes = args.pool_size_bytes
 
     shutdown_signals = {signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
@@ -605,18 +627,18 @@ def main() -> None:
         server = _KVCRService(
             args.socket_path,
             args.pool_dir,
-            pool_count=args.pool_count,
-            pool_size_bytes=pool_size_bytes,
+            guard_count=args.guard_count,
+            pool_sizes_bytes=args.pool_sizes_bytes,
             compatibility_digest=args.compatibility_digest,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logging.basicConfig(level=logging.INFO)
         logger.info(
-            "KVCR service ready: socket=%s pools=%d pool_size_bytes=%d "
+            "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
             "journal_bytes=%d",
             args.socket_path,
-            args.pool_count,
-            pool_size_bytes,
+            args.guard_count,
+            args.pool_sizes_bytes,
             _DEFAULT_JOURNAL_BYTES,
         )
         server.serve_forever()
