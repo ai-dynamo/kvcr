@@ -146,7 +146,7 @@ def _make_kvcr(
             ),
             KVCRGuardConfig(
                 kvcr_service_socket_path=socket_path,
-                pool_index=0,
+                guard_index=0,
                 row_stride=page_size,
                 compatibility_digest=_DIGEST,
             ),
@@ -233,8 +233,8 @@ def live_service(
     service = _KVCRService(
         tmp_path / "service.sock",
         pool_dir,
-        pool_count=1,
-        pool_size_bytes=8192 + os.sysconf("SC_PAGE_SIZE"),
+        guard_count=1,
+        pool_sizes_bytes=(os.sysconf("SC_PAGE_SIZE"),),
         journal_bytes=8192,
         compatibility_digest=_DIGEST,
     )
@@ -317,7 +317,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         "_real_nixl_primary_child", service.socket_path, g3_path, control_port
     )
     _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
-    guard = service._registry._pools[0]
+    guard = service._registry._guards[0]
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -483,7 +483,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         child.kill()
         child.wait(timeout=_TIMEOUT_SECONDS)
         assert promotion_started.wait(timeout=_TIMEOUT_SECONDS)
-        guard = service._registry._pools[0]
+        guard = service._registry._guards[0]
 
         now[0] = 6.0
         _wait_until(
@@ -555,7 +555,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # operation deadline instead of failing them now.
     idle = spawn("_primary_child", service.socket_path, g3_path, control_port, "idle")
     _await_marker(idle, "ready")
-    first_guard = service._registry._pools[0]
+    first_guard = service._registry._guards[0]
     idle.kill()
     idle.wait(timeout=_TIMEOUT_SECONDS)
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)

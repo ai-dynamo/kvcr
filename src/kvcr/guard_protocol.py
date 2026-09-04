@@ -68,7 +68,7 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 class _Claim(msgspec.Struct, frozen=True, tag="claim"):
-    pool_index: Annotated[int, msgspec.Meta(ge=0)]
+    guard_index: Annotated[int, msgspec.Meta(ge=0)]
     compatibility_digest: str
     tier_config: _TierConfig
     control_host: str
@@ -96,7 +96,7 @@ class _Release(msgspec.Struct, frozen=True, tag="release"):
 
 
 class _Granted(msgspec.Struct, frozen=True, tag="granted"):
-    pool_index: int
+    guard_index: int
     spec: KVCRPoolSpec
     tier_config: _TierConfig
     version: ProtocolVersion
@@ -212,7 +212,7 @@ class KVCRClient:
 
     def claim(
         self,
-        pool_index: int,
+        guard_index: int,
         row_stride: int,
         compatibility_digest: str,
         control_bind: tuple[str, int],
@@ -230,7 +230,7 @@ class KVCRClient:
         # port or G3 path fails here, not at the service.
         request = msgspec.convert(
             {
-                "pool_index": pool_index,
+                "guard_index": guard_index,
                 "compatibility_digest": compatibility_digest,
                 "tier_config": {
                     "row_stride": row_stride,
@@ -253,7 +253,7 @@ class KVCRClient:
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
             grant_received = True
-            spec = _grant_spec(response, pool_index, request.tier_config)
+            spec = _grant_spec(response, guard_index, request.tier_config)
             if listener_fd is None:
                 # Every pool has a Guard, and a Guard answers on the endpoint
                 # this claimant named. A grant without it means the two sides
@@ -308,14 +308,14 @@ class KVCRClient:
 
 def _grant_spec(
     response: _Granted,
-    requested_pool_index: int,
+    requested_guard_index: int,
     requested_tier_config: _TierConfig,
 ) -> KVCRPoolSpec:
     """Take the grant apart, refusing one that answers a different request."""
-    if response.pool_index != requested_pool_index:
+    if response.guard_index != requested_guard_index:
         raise KVCRGuardProtocolError(
-            "claim pool mismatch: "
-            f"requested {requested_pool_index}, got {response.pool_index}"
+            "claim Guard mismatch: "
+            f"requested {requested_guard_index}, got {response.guard_index}"
         )
     if response.tier_config != requested_tier_config:
         raise KVCRGuardProtocolError("claim tier configuration mismatch")

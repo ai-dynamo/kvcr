@@ -61,8 +61,8 @@ _Lease = PidfdLiveness
 class _PoolLease:
     """One pool's holder identity and persistent control listener."""
 
-    def __init__(self, pool_index: int) -> None:
-        self._pool_index = pool_index
+    def __init__(self, guard_index: int) -> None:
+        self._guard_index = guard_index
         self.current: _Lease | None = None
         self.listener: socket.socket | None = None
         # As the claimant asked: getsockname() is numeric and rejects aliases.
@@ -84,7 +84,7 @@ class _PoolLease:
         if self.listener is not None:
             if self.bind_address != address:
                 raise KVCRServiceError(
-                    f"KVCR pool {self._pool_index} answers on "
+                    f"KVCR Guard {self._guard_index} answers on "
                     f"{self.bind_address[0]}:{self.bind_address[1]} and cannot be "
                     "moved to "
                     f"{address[0]}:{address[1]}"
@@ -94,7 +94,7 @@ class _PoolLease:
             listener = socket.create_server(address)
         except OSError as error:
             raise KVCRServiceError(
-                f"KVCR pool {self._pool_index} control listener "
+                f"KVCR Guard {self._guard_index} control listener "
                 f"{address[0]}:{address[1]} is unavailable: {error}"
             ) from error
         self.listener = listener
@@ -357,17 +357,17 @@ class _Guard:
         failure_callback: Callable[..., None] | None = None,
         *,
         compatibility_digest: str,
-        pool_index: int = 0,
+        guard_index: int = 0,
         owner: _KVCRPoolOwner | None = None,
         refusing: Callable[[], bool] = lambda: False,
     ) -> None:
         self._spec = spec
-        self._pool_index = pool_index
+        self._guard_index = guard_index
         # Owned here, not by the registry: one thread owns one pool, so a
         # claim needs no lock -- the mailbox is the reservation.
         self._owner = owner
         self._refusing = refusing
-        self._pool_lease = _PoolLease(pool_index)
+        self._pool_lease = _PoolLease(guard_index)
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
@@ -441,7 +441,7 @@ class _Guard:
                 if self._reserved is _Phase.PROMOTING:
                     # The death of this same lease got here first; it wins.
                     return
-                raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
+                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             self._reserved = _Phase.RELEASING
         self._submit(_Command(operation, (lease,)))
 
@@ -490,15 +490,15 @@ class _Guard:
             if self._failure is not None:
                 raise self._failure
             if self._reserved is not None:
-                raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
+                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             if self._phase is _Phase.PRIMARY:
                 lease = self._pool_lease.current
                 if self._pool_lease.poll_pidfd(lease) is None:
                     raise KVCRServiceError(
-                        f"KVCR pool {self._pool_index} is held by another worker"
+                        f"KVCR Guard {self._guard_index} is held by another worker"
                     )
                 # Dead but not yet promoted: the actor is the sole authority.
-                raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
+                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             if self._phase in (_Phase.FAILED, _Phase.CLOSED):
                 raise KVCRServiceError("KVCR pool registry is closed")
             self._reserved = _Phase.CLAIMING
@@ -704,7 +704,7 @@ class _Guard:
             self._phase = _Phase.STANDBY
 
     def _escalate(self, error: BaseException) -> None:
-        logger.critical("KVCR pool %d Guard failed", self._pool_index)
+        logger.critical("KVCR Guard %d failed", self._guard_index)
         try:
             self._failure_callback(self, error)
         except BaseException:  # noqa: BLE001 - retain the original failure

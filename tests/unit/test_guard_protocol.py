@@ -31,7 +31,7 @@ from kvcr.guard_protocol import (
 )
 from kvcr.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
 
-_POOL_INDEX = 3
+_GUARD_INDEX = 3
 _ROW_STRIDE = 1024
 _GENERATION = "a" * 32
 _DEVICE = 2049
@@ -162,15 +162,15 @@ class _Attachment:
 
 def _grant(
     *,
-    pool_index: int = _POOL_INDEX,
+    guard_index: int = _GUARD_INDEX,
     mapping_bytes: int = _MAPPING_BYTES,
     tier_config: _TierConfig = _TIER_CONFIG,
 ) -> _Granted:
     return _Granted(
-        pool_index,
+        guard_index,
         KVCRPoolSpec(
-            pool_id=f"pool_{_POOL_INDEX}",
-            path=f"/tmp/kvcr-pool_{_POOL_INDEX}-{_GENERATION}",
+            pool_id=f"pool_{_GUARD_INDEX}",
+            path=f"/tmp/kvcr-pool_{_GUARD_INDEX}-{_GENERATION}",
             generation=_GENERATION,
             device=_DEVICE,
             inode=_INODE,
@@ -224,12 +224,12 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
 
     hold = KVCRClient("/unused").claim(
-        _POOL_INDEX, _ROW_STRIDE, _DIGEST, ("127.0.0.1", 5555)
+        _GUARD_INDEX, _ROW_STRIDE, _DIGEST, ("127.0.0.1", 5555)
     )
 
     assert msgspec.to_builtins(connection.sent[0]) == {
         "type": "claim",
-        "pool_index": _POOL_INDEX,
+        "guard_index": _GUARD_INDEX,
         "compatibility_digest": _DIGEST,
         "tier_config": {
             "row_stride": _ROW_STRIDE,
@@ -242,10 +242,10 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     }
     assert msgspec.to_builtins(_grant()) == {
         "type": "granted",
-        "pool_index": _POOL_INDEX,
+        "guard_index": _GUARD_INDEX,
         "spec": {
-            "pool_id": f"pool_{_POOL_INDEX}",
-            "path": f"/tmp/kvcr-pool_{_POOL_INDEX}-{_GENERATION}",
+            "pool_id": f"pool_{_GUARD_INDEX}",
+            "path": f"/tmp/kvcr-pool_{_GUARD_INDEX}-{_GENERATION}",
             "generation": _GENERATION,
             "device": _DEVICE,
             "inode": _INODE,
@@ -292,7 +292,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
 @pytest.mark.parametrize(
     ("reply", "mapping_error"),
     [
-        pytest.param(_grant(pool_index=_POOL_INDEX + 1), None, id="wrong-pool"),
+        pytest.param(_grant(guard_index=_GUARD_INDEX + 1), None, id="wrong-guard"),
         pytest.param(
             _grant(tier_config=_TierConfig(_ROW_STRIDE * 2, None)),
             None,
@@ -331,7 +331,7 @@ def test_a_failed_claim_is_released_without_masking_the_original(
         type(original) if original is not None else KVCRGuardProtocolError
     ) as raised:
         KVCRClient("/unused").claim(
-            _POOL_INDEX, _ROW_STRIDE, _DIGEST, ("127.0.0.1", 5555)
+            _GUARD_INDEX, _ROW_STRIDE, _DIGEST, ("127.0.0.1", 5555)
         )
 
     if original is not None:
@@ -339,7 +339,7 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     # A mismatched or undecodable grant is refused before the pool is mapped.
     assert attach.call_count == (1 if mapping_error else 0)
     assert connection.sent == [
-        _Claim(_POOL_INDEX, _DIGEST, _TIER_CONFIG, "127.0.0.1", 5555, 1),
+        _Claim(_GUARD_INDEX, _DIGEST, _TIER_CONFIG, "127.0.0.1", 5555, 1),
         # Unactivated: this claim never served, so the Guard may resume.
         _Release(1, activated=False),
     ]

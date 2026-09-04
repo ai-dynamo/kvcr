@@ -313,16 +313,17 @@ IDs, or raw endpoints.
 
 ### KVCR service daemon
 
-The KVCR service daemon owns pool lifecycle. It pre-allocates `--pool-count`
-fixed-size pools before exposing its socket. A worker claims a pool by index;
-the pool outlives that worker but not the service:
+The KVCR service daemon owns pool lifecycle. It pre-allocates `--guard-count`
+contiguous pool allocations before exposing its socket, one per Guard. Each has
+the same ordered pool sizes. A worker claims a Guard by index; its allocation
+outlives that worker but not the service:
 
 ```bash
 python -m kvcr.kvcr_service \
   --socket-path /run/kvcr/memory.sock \
   --pool-dir /dev/shm/kvcr \
-  --pool-count 1 \
-  --pool-size-gb 64 \
+  --guard-count 1 \
+  --pool-sizes-gb 48,16 \
   --compatibility-digest example-model-layout
 ```
 
@@ -330,15 +331,17 @@ python -m kvcr.kvcr_service \
 | --- | --- | --- |
 | `--socket-path` | *(required)* | Unix socket the workers connect to |
 | `--pool-dir` | *(required)* | Writable directory holding the pool files |
-| `--pool-count` | *(required)* | Number of pools available by index |
-| `--pool-size-gb` | *(required)* | Total mapped size of each pool |
+| `--guard-count` | *(required)* | Number of Guards available by index |
+| `--pool-sizes-gb` | *(required)* | Comma-separated usable pool sizes in each Guard allocation |
 | `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
 
-Each pool reserves a fixed 100 MiB journal, taken out of `--pool-size-gb`
-rather than added to it: a 64 GiB pool caches 64 GiB minus 100 MiB.
+The service rounds each pool size down to a memory-page boundary and adds one
+fixed 100 MiB journal to each Guard allocation. For example, `48,16` maps 64
+GiB plus the journal for every Guard. Until grouped grants are introduced, the
+current claim path exposes those pool regions as one combined data area.
 
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(pool_index, row_stride, compatibility_digest, control_bind)`,
+`KVCRClient.claim(guard_index, row_stride, compatibility_digest, control_bind)`,
 naming the address its Guard will answer on. The digest must match the service
 exactly, and callers must change it whenever the row stride or any other
 KV-cache layout term changes. The returned `KVCRPoolHold` describes the mapped
@@ -401,7 +404,7 @@ its Guard can mirror fills the ring. Both sides treat that as survivable -- the
 primary stops publishing, the Guard drops what it holds -- and the pool becomes
 claimable but cold if that primary dies. Recovery is lost for that pool only.
 Watch for `KVCR pool recovery disabled` if failovers stop coming back warm. The
-journal is a fixed 100 MiB whatever `--pool-size-gb` is, so the only levers are
+journal is a fixed 100 MiB whatever `--pool-sizes-gb` is, so the only levers are
 larger blocks, which publish fewer residency changes, or accepting a cold
 failover for that pool.
 
@@ -872,14 +875,15 @@ release may need to wait for NIXL quiescence even after caller-visible timeout.
 Verify that:
 
 - the socket parent and pool directory exist and are writable;
-- the pool directory has capacity for every pool at its full
-  `--pool-size-gb`, which already includes that pool's journal. A pool
-  changing hands briefly appends its handback snapshot past that size;
+- the pool directory has capacity for every Guard's full allocation: the sum
+  of `--pool-sizes-gb` plus its 100 MiB journal. A pool changing hands briefly
+  appends its handback snapshot past that size;
   where there is no room for it, that handover comes back cold and the
   service carries on;
 - another process is not listening on the socket;
-- `--pool-count` is at least one; and
-- `--pool-size-gb` is positive, finite, and larger than the 100 MiB journal.
+- `--guard-count` is at least one; and
+- every comma-separated `--pool-sizes-gb` value is positive, finite, and at
+  least one memory page.
 
 The service removes a stale socket only after confirming no live service is
 listening. It refuses to replace a socket owned by another live service.
