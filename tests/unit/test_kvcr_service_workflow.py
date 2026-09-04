@@ -75,7 +75,10 @@ def _claim_when_ready(
     while time.monotonic() < deadline:
         try:
             return client.claim(
-                guard_index, _ROW_STRIDE, _DIGEST, _control_bind(guard_index)
+                guard_index,
+                [(_ROW_STRIDE, "")],
+                _DIGEST,
+                _control_bind(guard_index),
             )
         except KVCRSocketError:
             if process.poll() is not None:
@@ -153,14 +156,16 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
 
     with _running_service(pool_dir) as socket_path:
         client = KVCRClient(socket_path)
-        first = client.claim(0, _ROW_STRIDE, _DIGEST, _control_bind(0))
-        second = client.claim(1, _ROW_STRIDE, _DIGEST, _control_bind(1))
+        first = client.claim(0, [(_ROW_STRIDE, "")], _DIGEST, _control_bind(0))
+        second = client.claim(1, [(_ROW_STRIDE, "")], _DIGEST, _control_bind(1))
         try:
             assert first.local_dram.address != second.local_dram.address
             ctypes.memmove(first.local_dram.address, payload, len(payload))
 
             first.release()
-            replacement = client.claim(0, _ROW_STRIDE, _DIGEST, _control_bind(0))
+            replacement = client.claim(
+                0, [(_ROW_STRIDE, "")], _DIGEST, _control_bind(0)
+            )
             try:
                 assert (
                     ctypes.string_at(replacement.local_dram.address, len(payload))
@@ -176,7 +181,11 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
             control = ZmqPeerControlChannel(host, port, host)
             with _use_nixl_agent(FakeNixlAgent()):
                 controller = KVCR(
-                    KVCRConfig(nixl_agent_name="target", nixl_listen_port=1),
+                    KVCRConfig(
+                        nixl_agent_name="target",
+                        pool_layout=[(_ROW_STRIDE, "")],
+                        nixl_listen_port=1,
+                    ),
                     KVCRBindings(
                         pinning.request_pin,
                         pinning.poll_pin_results,
@@ -187,19 +196,18 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
                     KVCRGuardConfig(
                         kvcr_service_socket_path=str(socket_path),
                         guard_index=0,
-                        row_stride=_ROW_STRIDE,
                         compatibility_digest=_DIGEST,
                     ),
                 )
             try:
                 with pytest.raises(KVCRServiceError, match="held"):
-                    client.claim(0, _ROW_STRIDE, _DIGEST, (host, port))
+                    client.claim(0, [(_ROW_STRIDE, "")], _DIGEST, (host, port))
             finally:
                 controller.close()
                 control.close()
 
             # Closing the worker released the pool: the next claim is served.
-            reclaimed = client.claim(0, _ROW_STRIDE, _DIGEST, (host, port))
+            reclaimed = client.claim(0, [(_ROW_STRIDE, "")], _DIGEST, (host, port))
             reclaimed.release()
         finally:
             second.release()
@@ -220,13 +228,11 @@ def test_cli_daemon_sets_geometry_and_restart_reclaims_only_unattached(
             pools = list(pool_dir.iterdir())
             assert len(pools) == 2, "--guard-count pools at startup"
             pool_bytes = int(float(_CLI_POOL_SIZE_GB) * (1 << 30))
-            client_rows = pool_bytes // _ROW_STRIDE
             assert all(
                 path.stat().st_size == _DEFAULT_JOURNAL_BYTES + pool_bytes
                 for path in pools
             )
-            assert hold.local_dram.length == client_rows * _ROW_STRIDE
-            assert hold.local_dram.slot_count == client_rows
+            assert hold.local_dram.pool_sizes_bytes == [(pool_bytes, "")]
 
             attached_pool = next(pool_dir.glob("kvcr-pool_0-*"))
             unclaimed_pool = next(pool_dir.glob("kvcr-pool_1-*"))

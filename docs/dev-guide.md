@@ -213,7 +213,10 @@ from kvcr import KVCR, KVCRBindings
 from kvcr.config import KVCRBackendConfigs, KVCRConfig
 
 runner = KVCR(
-    config=KVCRConfig(nixl_agent_name="worker-0"),
+    config=KVCRConfig(
+        nixl_agent_name="worker-0",
+        pool_layout=[(block_size_bytes, "")],
+    ),
     bindings=KVCRBindings(
         request_pin=request_pin,
         poll_pin_results=poll_pin_results,
@@ -337,19 +340,19 @@ python -m kvcr.kvcr_service \
 
 The service rounds each pool size down to a memory-page boundary and adds one
 fixed 100 MiB journal to each Guard allocation. For example, `48,16` maps 64
-GiB plus the journal for every Guard. Until grouped grants are introduced, the
-current claim path exposes those pool regions as one combined data area.
+GiB plus the journal for every Guard. The current claim path exposes those
+regions as one combined data area.
 
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(guard_index, row_stride, compatibility_digest, control_bind)`,
+`KVCRClient.claim(guard_index, pool_layout, compatibility_digest, control_bind)`,
 naming the address its Guard will answer on. The digest must match the service
-exactly, and callers must change it whenever the row stride or any other
-KV-cache layout term changes. The returned `KVCRPoolHold` describes the mapped
-local DRAM and owns an exclusive lease on the pool. Each claim is measured
-against its own pool only; pools do not have to agree on a stride.
+exactly, and callers must change it whenever the pool layout or any other KV-cache
+term changes. The returned `KVCRPoolHold` describes the mapped local DRAM and
+owns an exclusive lease on the pool. Only one pool-layout entry is currently
+supported; an empty string is a valid pool name.
 
 **A pool's configuration is fixed by its first claim.** Every later claim on
-that pool must name the same row stride and, when G3 is configured, the same
+that pool must name the same pool layout and, when G3 is configured, the same
 G3 paths in the same order, the same per-file capacity, and the same backend
 and backend options. It must also name the same remote framework DRAM backend.
 A mismatch is refused for the life of the service. Change the configuration by

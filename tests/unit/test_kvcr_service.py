@@ -64,8 +64,9 @@ _TEST_JOURNAL_BYTES = 8192
 _TEST_POOL_SIZE_BYTES = 8192
 _TEST_POOL_SIZES_BYTES = (_TEST_POOL_SIZE_BYTES,)
 _TEST_ROW_STRIDE = 1024
+_TEST_POOL_LAYOUT = [(_TEST_ROW_STRIDE, "")]
 _TEST_DIGEST = "opaque digest: Preserve-Me EXACTLY"
-_TEST_TIER_CONFIG = _TierConfig(_TEST_ROW_STRIDE, None)
+_TEST_TIER_CONFIG = _TierConfig(_TEST_POOL_LAYOUT, None)
 # G3 terms are refused at decode unless a real claimant could open them, so
 # the one claim that carries G3 uses a page-aligned stride.
 _PAGE_STRIDE = os.sysconf("SC_PAGE_SIZE")
@@ -275,7 +276,10 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
     first_spec, stale = _claim(registry, 0, first)
     _spec, _fd, _lease = registry.claim(
-        1, _TierConfig(_TEST_ROW_STRIDE * 2, None), second, _control_bind(1)
+        1,
+        _TierConfig([(_TEST_ROW_STRIDE * 2, "")], None),
+        second,
+        _control_bind(1),
     )
     os.close(_fd)
     # One pool's geometry says nothing about another's.
@@ -339,11 +343,11 @@ def test_refused_claims_do_not_bind_the_pool(tmp_path: Path) -> None:
 
         taken = (str(squatter.getsockname()[0]), int(squatter.getsockname()[1]))
         with pytest.raises(KVCRServiceError, match="control listener"):
-            harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, control_bind=taken)
+            harness.client.claim(0, _TEST_POOL_LAYOUT, _TEST_DIGEST, control_bind=taken)
 
         # The rejected claims left the pool free to take normally.
         harness.client.claim(
-            0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind()
+            0, _TEST_POOL_LAYOUT, _TEST_DIGEST, _control_bind()
         ).release()
 
 
@@ -396,10 +400,12 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         # Built and started with the pool, before any claim named it.
         assert guard._phase is _Phase.UNCONFIGURED
 
-        hold = harness.client.claim(1, _PAGE_STRIDE, _TEST_DIGEST, _control_bind(), g3)
+        hold = harness.client.claim(
+            1, [(_PAGE_STRIDE, "")], _TEST_DIGEST, _control_bind(), g3
+        )
         assert guard._phase is _Phase.PRIMARY and guard._control is control
         assert guard._configured == _TierConfig(
-            _PAGE_STRIDE,
+            [(_PAGE_STRIDE, "")],
             _G3Config(
                 paths=(str(g3.paths[0]),),
                 capacity_bytes_per_file=g3.capacity_bytes_per_file,
@@ -509,7 +515,7 @@ def test_a_standby_survives_failed_claims_and_hands_over_to_a_replacement(
         with pytest.raises(KVCRServiceError, match="another tier configuration"):
             registry.claim(
                 0,
-                _TierConfig(_TEST_ROW_STRIDE * 2, None),
+                _TierConfig([(_TEST_ROW_STRIDE * 2, "")], None),
                 _FakeLiveness(),
                 control_bind,
             )
@@ -595,11 +601,14 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
         spec = harness.server._registry._guards[0]._owner.spec
         with pytest.raises(KVCRServiceError, match="compatibility digest"):
             harness.client.claim(
-                0, _TEST_ROW_STRIDE, _TEST_DIGEST.swapcase(), _control_bind()
+                0, _TEST_POOL_LAYOUT, _TEST_DIGEST.swapcase(), _control_bind()
             )
-        with pytest.raises(KVCRServiceError, match="one complete KV row"):
+        with pytest.raises(KVCRServiceError, match="one complete KV block"):
             harness.client.claim(
-                0, _TEST_POOL_SIZE_BYTES + 1, _TEST_DIGEST, _control_bind()
+                0,
+                [(_TEST_POOL_SIZE_BYTES + 1, "")],
+                _TEST_DIGEST,
+                _control_bind(),
             )
         assert "Unexpected failure while handling KVCR claim" not in caplog.text
 
@@ -611,7 +620,9 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
                 Mock(side_effect=internal_error),
             )
             with pytest.raises(KVCRServiceError, match="internal KVCR service error"):
-                harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+                harness.client.claim(
+                    0, _TEST_POOL_LAYOUT, _TEST_DIGEST, _control_bind()
+                )
 
         log_record = next(
             record
@@ -623,7 +634,7 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
         assert harness.server._registry._guards[0]._owner.spec is spec
         assert _holders_of(harness.server._registry) == {}
         harness.client.claim(
-            0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind()
+            0, _TEST_POOL_LAYOUT, _TEST_DIGEST, _control_bind()
         ).release()
 
 
@@ -681,7 +692,7 @@ def test_fork_and_exec_do_not_preserve_claimant_access(
                 "import time",
                 "from kvcr.guard_protocol import KVCRClient",
                 f"hold = KVCRClient({str(harness.server.socket_path)!r}).claim("
-                f"0, {_TEST_ROW_STRIDE}, {_TEST_DIGEST!r}, {_control_bind()!r})",
+                f"0, {_TEST_POOL_LAYOUT!r}, {_TEST_DIGEST!r}, {_control_bind()!r})",
                 "forked_pid = os.fork()",
                 "if forked_pid == 0:",
                 "    hold._connection.close()",
@@ -712,7 +723,9 @@ def test_fork_and_exec_do_not_preserve_claimant_access(
             assert spec is not None
             assert spec.path not in Path(f"/proc/{forked_pid}/maps").read_text()
             with pytest.raises(KVCRServiceError, match="held"):
-                harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+                harness.client.claim(
+                    0, _TEST_POOL_LAYOUT, _TEST_DIGEST, _control_bind()
+                )
 
             child.terminate()
             child.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
@@ -1048,7 +1061,7 @@ def test_a_lease_older_than_the_idle_timeout_still_releases_cleanly(
     """The accept-time idle timeout must not sever a held connection."""
     monkeypatch.setattr("kvcr.kvcr_service._CLIENT_IDLE_TIMEOUT_SECONDS", 0.2)
     with _running_server(tmp_path) as harness:
-        hold = harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+        hold = harness.client.claim(0, _TEST_POOL_LAYOUT, _TEST_DIGEST, _control_bind())
         time.sleep(0.5)
 
         hold.release()
@@ -1218,7 +1231,7 @@ def test_a_close_in_progress_absorbs_races_and_answers_stragglers(
 
 def test_shutdown_drains_a_held_connection(tmp_path: Path) -> None:
     with _running_server(tmp_path) as harness:
-        hold = harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+        hold = harness.client.claim(0, _TEST_POOL_LAYOUT, _TEST_DIGEST, _control_bind())
         harness.stop()
         _wait_for_connection_state(harness.server, connected=False)
         hold._attachment.close()

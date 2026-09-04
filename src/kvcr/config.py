@@ -18,8 +18,7 @@ InventorySink = Callable[[InventoryEvent], None]
 @dataclass(frozen=True)
 class LocalDramOptions:
     address: int
-    length: int
-    slot_count: int
+    pool_sizes_bytes: list[tuple[int, str]]
     backend: str = "UCX"
 
 
@@ -105,6 +104,7 @@ class KeyAdapter(Protocol):
 @dataclass(frozen=True)
 class KVCRConfig:
     nixl_agent_name: str
+    pool_layout: list[tuple[int, str]]
     enable_telemetry: bool = False
     operation_timeout_ms: int = 1000
     inventory_report_interval_ms: int = 10
@@ -116,5 +116,4 @@ class KVCRConfig:
 class KVCRGuardConfig:
     kvcr_service_socket_path: str
     guard_index: int
-    row_stride: int
     compatibility_digest: str

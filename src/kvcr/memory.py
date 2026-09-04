@@ -275,17 +275,17 @@ class _KVCRPoolOwner:
 
 def _compute_pool_geometry(
     requested_bytes: int,
-    row_stride: int,
+    block_size_bytes: int,
 ) -> tuple[int, int]:
     _validate_positive_int("requested_bytes", requested_bytes)
-    _validate_positive_int("row_stride", row_stride)
-    rows = requested_bytes // row_stride
-    if rows == 0:
+    _validate_positive_int("block_size_bytes", block_size_bytes)
+    block_count = requested_bytes // block_size_bytes
+    if block_count == 0:
         raise ValueError(
-            "requested_bytes must hold at least one complete KV row "
-            f"of {row_stride} bytes"
+            "requested_bytes must hold at least one complete KV block "
+            f"of {block_size_bytes} bytes"
         )
-    return rows * row_stride, rows
+    return block_count * block_size_bytes, block_count
 
 
 def _validate_pool_layout(mapping_bytes: int, journal_bytes: int) -> None:

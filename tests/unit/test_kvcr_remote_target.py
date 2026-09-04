@@ -97,7 +97,7 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     assert target.query((requested_key,), "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
     ]
-    target.deliver({requested_key: _mem_descriptor()}, request_id="req")
+    target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
 
     assert list(target.poll_completed()) == []
     _wait_until(lambda: bool(control.sent))
@@ -127,7 +127,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         source_control,
         name="source",
         local_dram=LocalDramOptions(
-            ctypes.addressof(source_local), len(source_local), 2
+            ctypes.addressof(source_local), [(len(source_local), "")]
         ),
         policy=source_policy,
     )
@@ -142,14 +142,14 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
             eager_ctrl_connect=False,
         ),
         local_dram=LocalDramOptions(
-            ctypes.addressof(target_local), len(target_local), 2
+            ctypes.addressof(target_local), [(len(target_local), "")]
         ),
         inventory_sink=events.append,
         policy=policy,
     )
 
     source_deposit = source.deposit(
-        {keys[0]: _mem_descriptor(ctypes.addressof(source_primary), block_size)}
+        {keys[0]: [_mem_descriptor(ctypes.addressof(source_primary), block_size)]}
     )
     _wait_until(lambda: bool(source_agent.transfers))
     source_agent.state = "DONE"
@@ -205,7 +205,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     assert set(completed) == {fetch}
     assert all(result.success for result in completed[fetch].values())
     assert all(
-        result.descriptor is not None and result.release_handle is not None
+        result.descriptors is not None and result.release_handle is not None
         for result in completed[fetch].values()
     )
     assert target.query(keys, "req") == [
@@ -247,7 +247,7 @@ def test_remote_staging_commits_available_prefix() -> None:
         control,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramOptions(ctypes.addressof(local), len(local), 2),
+        local_dram=LocalDramOptions(ctypes.addressof(local), [(len(local), "")]),
         inventory_sink=events.append,
     )
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -262,7 +262,7 @@ def test_remote_staging_commits_available_prefix() -> None:
     assert len(completed) == 1 and completed[0][0] == fetch
     results = completed[0][1]
     assert results[keys[0]].success
-    assert results[keys[0]].descriptor is not None
+    assert results[keys[0]].descriptors is not None
     release_handle = results[keys[0]].release_handle
     assert release_handle is not None
     assert results[keys[1]] == OpEntryResult(OpEntryStatus.FAILED)
@@ -287,11 +287,12 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
         control,
         KVCRConfig(
             nixl_agent_name="target",
+            pool_layout=[(16, "")],
             operation_timeout_ms=10,
         ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramOptions(ctypes.addressof(local), len(local), 1),
+        local_dram=LocalDramOptions(ctypes.addressof(local), [(len(local), "")]),
     )
     target._core._clock = lambda: now
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -305,7 +306,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
     ]
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
     assert _has_outstanding_operations(target)
-    blocked = target.deposit({replacement: _mem_descriptor(size=block_size)})
+    blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
     assert list(target.poll_completed()) == [
         (blocked, _op_entries({replacement: False}))
     ]
@@ -325,14 +326,14 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         target_agent,
         FakePrimaryPinning(),
         target_control,
-        KVCRConfig(nixl_agent_name="target"),
+        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     source = _new_kvcr(
         source_agent,
         source_pinning,
         source_control,
-        KVCRConfig(nixl_agent_name="source"),
+        KVCRConfig(nixl_agent_name="source", pool_layout=[(16, "")]),
         name="source",
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -340,7 +341,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     op_handle = target.deliver(
-        {key: _mem_descriptor()},
+        {key: [_mem_descriptor()]},
         request_id="req",
     )
     _wait_until(lambda: bool(target_control.sent))
@@ -369,7 +370,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
 
     target_control.sent = []
     retry_handle = target.deliver(
-        {key: _mem_descriptor()},
+        {key: [_mem_descriptor()]},
         request_id="req",
     )
     assert list(target.poll_completed()) == [(retry_handle, _op_entries({key: False}))]
@@ -389,7 +390,7 @@ def _acked_deliver(control, kvcr, source, key):
     control.sent = []
 
     kvcr.submit_hint(_router_hint(source), request_id="load")
-    op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
+    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
     _wait_until(lambda: len(control.sent) == 1)
     sent = _decode_control_message(control.sent[-1][1])
     assert sent["type"] == "start_write"
@@ -404,7 +405,7 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
         FakeNixlAgent(metadata=b"target-md"),
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target"),
+        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
     )
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
@@ -445,7 +446,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
         agent,
         pinning,
         control,
-        KVCRConfig(nixl_agent_name="target"),
+        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
     )
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
@@ -477,7 +478,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     key = BlockKey(b"k0")
     kvcr.submit_hint(_router_hint(source), request_id="load")
     control.send_result = False
-    op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="load")
+    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
     assert _poll_until(kvcr, lambda completed: bool(completed)) == [
         (op_handle, _op_entries({key: False}))
     ]
@@ -505,13 +506,17 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", operation_timeout_ms=1000),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layout=[(16, "")],
+            operation_timeout_ms=1000,
+        ),
     )
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
 
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="req")
+    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
     _wait_until(
         lambda: any(
             _decode_control_message(message)["type"] == "start_write"
@@ -591,7 +596,7 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target"),
+        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     key_a = _make_block_key(b"block-A", 0)
@@ -600,7 +605,7 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
     kvcr.submit_hint(_router_hint("tcp://source-B:1"), request_id="req")
 
     op_handle = kvcr.deliver(
-        {key_a: _mem_descriptor(), key_b: _mem_descriptor()}, request_id="req"
+        {key_a: [_mem_descriptor()], key_b: [_mem_descriptor()]}, request_id="req"
     )
 
     assert list(kvcr.poll_completed()) == [
@@ -615,7 +620,7 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
     kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
     key = _make_block_key(b"orphan", 0)
 
-    op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="req")
+    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
 
     assert list(kvcr.poll_completed()) == [(op_handle, _op_entries({key: False}))]
     assert control.sent == []
@@ -628,15 +633,15 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target"),
+        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     key = _make_block_key(b"shared-block", 0)
 
     kvcr.submit_hint(_router_hint("tcp://source-A:1"), request_id="req-a")
     kvcr.submit_hint(_router_hint("tcp://source-B:1"), request_id="req-b")
-    op_a = kvcr.deliver({key: _mem_descriptor()}, request_id="req-a")
-    op_b = kvcr.deliver({key: _mem_descriptor()}, request_id="req-b")
+    op_a = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req-a")
+    op_b = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req-b")
 
     _wait_until(lambda: len(control.sent) == 2)
     assert [endpoint for endpoint, _ in control.sent] == [
@@ -668,7 +673,11 @@ def test_remote_framework_dram_transfers_available_prefix(
         target_agent,
         FakePrimaryPinning(),
         target_control,
-        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layout=[(16, "")],
+            enable_telemetry=True,
+        ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=eager_ctrl_connect,
@@ -678,7 +687,11 @@ def test_remote_framework_dram_transfers_available_prefix(
         source_agent,
         source_pinning,
         source_control,
-        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
+        KVCRConfig(
+            nixl_agent_name="source",
+            pool_layout=[(16, "")],
+            enable_telemetry=True,
+        ),
         name="source",
         remote_options=RemoteFWDramOptions(backend="REMOTE"),
     )
@@ -698,7 +711,7 @@ def test_remote_framework_dram_transfers_available_prefix(
 
     op_handle = target.deliver(
         {
-            key: _mem_descriptor(addr=8192 + index * 16)
+            key: [_mem_descriptor(addr=8192 + index * 16)]
             for index, key in enumerate(keys)
         },
         request_id="req",
