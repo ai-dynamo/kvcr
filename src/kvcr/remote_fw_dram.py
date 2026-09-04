@@ -162,6 +162,20 @@ class _TargetPullOp(_RemoteOp):
                     len(completed_keys),
                     (scope,),
                 )
+                # Descriptors are positionally aligned with ordered_keys, so
+                # the delivered span sizes give the byte count for the same
+                # keys the block counter above reports.
+                backend._record_progress_counter(
+                    TRANSFER_BYTES_METRIC,
+                    sum(
+                        descriptor.size
+                        for key, descriptor in zip(
+                            self.ordered_keys, self.dst_descriptors
+                        )
+                        if key in completed_keys
+                    ),
+                    (scope,),
+                )
             result = (
                 "success"
                 if all_completed
