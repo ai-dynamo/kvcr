@@ -46,11 +46,32 @@ _HANDED_OUT: set[int] = set()
 
 
 def _router_hint(
-    source: str, block_hashes: Collection[int] = (123,)
+    source: str | None,
+    block_hashes: Collection[int] = (123,),
+    *,
+    mode: str = "copy",
+    no_retain: bool | None = None,
 ) -> dict[str, object]:
-    return {
-        "source_control_endpoint": source,
+    payload: dict[str, object] = {
         "block_hashes": list(block_hashes),
+    }
+    if source is not None:
+        payload["source_control_endpoint"] = source
+    if mode != "copy":
+        payload["mode"] = mode
+    if no_retain is not None:
+        payload["no_retain"] = no_retain
+    return {
+        "protocol_version": "0.1",
+        "message_id": "test-message",
+        "actions": [
+            {
+                "action_id": "a1",
+                "action_type": "kv.fetch",
+                "action_version": "1.0",
+                "payload": payload,
+            }
+        ],
     }
 
 

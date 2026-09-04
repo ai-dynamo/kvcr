@@ -10,6 +10,13 @@ without editing source code in any of those projects.
 > at a specific pinned commit SHA. Treat this as a public preview until the PR is
 > merged and released in vLLM.
 
+> [!WARNING]
+> [KVCR PR #18](https://github.com/ai-dynamo/kvcr/pull/18) adopts the versioned
+> Dynamo-to-KVCR KV hint contract. Once that KVCR change is merged, use Dynamo with
+> [PR #13134](https://github.com/ai-dynamo/dynamo/pull/13134), or a later Dynamo
+> release that includes it. Older Dynamo versions produce an incompatible KV hint
+> contract, so KVCR cannot perform remote reuse.
+
 For source builds, editable installs, API development, or test workflows, use
 the [developer guide](dev-guide.md).
 
