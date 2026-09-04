@@ -103,6 +103,7 @@ def test_parse_kv_hint_rejects_invalid_protocol(kv_hint: object) -> None:
 @pytest.mark.parametrize(
     "fetch_payload",
     [
+        {"block_hashes": [1]},
         {"source_control_endpoint": "", "block_hashes": [1]},
         {"source_control_endpoint": "tcp://source:1", "block_hashes": []},
         {"source_control_endpoint": "tcp://source:1", "block_hashes": [True]},

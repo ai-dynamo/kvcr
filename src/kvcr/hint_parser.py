@@ -76,8 +76,8 @@ def _parse_kv_hint(
         hint: Versioned KV hint envelope.
 
     Returns:
-        A tuple (source, block_hashes, mode), where source is the optional
-        source control endpoint, block_hashes holds deduplicated block hashes,
+        A tuple (source, block_hashes, mode), where source is the source
+        control endpoint, block_hashes holds deduplicated block hashes,
         and mode is the fetch mode.
 
     Raises:
@@ -170,8 +170,8 @@ def _parse_fetch_payload(
         payload: ``kv.fetch`` action payload.
 
     Returns:
-        A tuple (source, block_hashes, mode), where source is the optional
-        source control endpoint, block_hashes holds deduplicated block hashes,
+        A tuple (source, block_hashes, mode), where source is the source
+        control endpoint, block_hashes holds deduplicated block hashes,
         and mode is the fetch mode.
 
     Raises:
@@ -182,7 +182,8 @@ def _parse_fetch_payload(
     block_hashes = payload.get("block_hashes")
     mode = payload.get("mode", "copy")
     if (
-        (source is not None and (not isinstance(source, str) or not source))
+        not isinstance(source, str)
+        or not source
         or not isinstance(block_hashes, list)
         or not isinstance(mode, str)
         or mode not in ("copy", "move")
