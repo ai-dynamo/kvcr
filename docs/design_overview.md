@@ -102,7 +102,7 @@ Figure 1 summarizes the component boundaries.
 
 A KVCR-owned DRAM pool may be allocated by the framework and passed to KVCR, or owned by KVCR-Guard. This choice changes the pool lifetime and recovery guarantee, but not the cache API or policy semantics. The pool should remain near the GPUs it serves when the NUMA topology permits. When KVCR-Guard owns the pool, the active in-process KVCR attaches through a socket endpoint and then accesses the pool directly through shared memory, so normal cache operations require no IPC round trip.
 
-`KVLayoutManifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible. Matching TP layouts are sufficient for most prefill-to-prefill, decode-to-decode, and aggregated deployments. A TP-independent host representation further removes that constraint as well.
+`compatibility_manifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible.
 
 If the engine or GPU fails, KVCR-Guard fences the failed owner before activating its backup KVCR. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
 
@@ -136,17 +136,17 @@ The framework and KVCR interact through the following API.
 # Python-style pseudocode
 # Framework → KVCR
 kvcr = KVCR(
-    pools=[PoolSpec(...)],
-    layout_manifest=layout_manifest,
+    pool_layout=[(block_size_bytes, pool_name), ...],
+    compatibility_manifest=compatibility_manifest,
     kvcr_guard_endpoint=None,
     peer_control_endpoint=peer_control_endpoint,
     config=config,
 )
 
-kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, MemDescriptor]; completion value is None or (ptr, release_handle)
+kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemDescriptor]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
-kvcr.fetch(block_key_list, request_id=None, hints=None, callback=None) -> OperationHandle # completion value is (ptr, release_handle)
-kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, MemDescriptor]
+kvcr.fetch(block_key_list, request_id=None, hints=None, expected_layouts=None, callback=None) -> OperationHandle # completion value is (list[MemDescriptor], release_handle)
+kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemDescriptor]]
 kvcr.release(release_handle_list) -> list[Result[None, Error]]      # release fetch/no-evict claims
 
 kvcr.poll_completed() -> list[Completion]                          # drain individual completions
@@ -162,6 +162,12 @@ framework.cancel_pin_request(pin_request_id)                                    
 framework.release_pin(pin_handle)                                                 # release an acquired framework-owned source pin
 ```
 
+The list-shaped API allows a key to span multiple pools. A descriptor's `info`
+can identify its pool and may be extended for other descriptor metadata.
+`fetch` may receive the expected layout for each key as a list of
+`(block_size_bytes, pool_name)` entries so KVCR can allocate the destinations
+immediately.
+
 ### Operating flow
 
 **Using KVCR-owned DRAM**
@@ -170,7 +176,7 @@ framework.release_pin(pin_handle)                                               
 
 `fetch`/`release` — framework asks the KVCR to make a block resident in its KVCR-owned DRAM pool and pin it there. On success, `fetch` returns the resident pointer and a release handle; the framework calls `deliver` to place the block into a framework-provided destination and calls `release` when the pool claim is no longer needed.
 
-`deposit` also accepts a `no_evict` flag (batch-level, applies to all entries): when set, the KVCR keeps every completed slot non-evictable and returns the pointer plus release handle per entry. A framework that wants guaranteed local DRAM residency behavior for selected KV blocks can get that behavior through `no_evict`, while the KVCR still handles sharing, routing visibility, transfer setup, and tiering policy. The framework calls `release` with the corresponding handle to clear the no-evict claim.
+`deposit` also accepts a `no_evict` flag (batch-level, applies to all entries): when set, the KVCR keeps every completed slot non-evictable and returns a release handle per entry. A framework that wants guaranteed local DRAM residency behavior for selected KV blocks can get that behavior through `no_evict`, while the KVCR still handles sharing, routing visibility, transfer setup, and tiering policy. The framework calls `release` with the corresponding handle to clear the no-evict claim.
 
 The tradeoff is backpressure: when policy cannot free enough capacity—for example, because `no_evict` claims occupy the pool or an attempted eviction does not free its source—KVCR may invoke `capacity_needed` as a last-resort pressure signal. The framework should release enough claims to free the requested slots. If sufficient capacity remains unavailable, affected committed entries complete with errors. Pool size and the free-slot threshold that triggers `capacity_needed` are deployment knobs.
 
@@ -237,7 +243,7 @@ KVCR-to-KVCR movement is destination-initiated. A router hint gives the destinat
 
 `submit_hint` may establish the peer connection, but does not start data movement or remote pinning; proactive fetching, staging, or pinning may be added later if useful. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole `BlockKeyList` from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
 
-The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR.
+The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
 ### Peer control and liveness
 

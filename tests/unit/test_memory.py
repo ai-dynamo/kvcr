@@ -43,11 +43,11 @@ def pool_owner(tmp_path: Path) -> Iterator[_KVCRPoolOwner]:
 
 
 @pytest.mark.parametrize(
-    ("requested_bytes", "row_stride", "expected"),
+    ("requested_bytes", "block_size_bytes", "expected"),
     [
         (4096, 1024, nullcontext((4096, 4))),
         (4097, 1024, nullcontext((4096, 4))),
-        (1023, 1024, pytest.raises(ValueError, match="one complete KV row")),
+        (1023, 1024, pytest.raises(ValueError, match="one complete KV block")),
         (True, 1, pytest.raises(TypeError)),
         (0, 1, pytest.raises(ValueError)),
         (1, True, pytest.raises(TypeError)),
@@ -56,12 +56,12 @@ def pool_owner(tmp_path: Path) -> Iterator[_KVCRPoolOwner]:
 )
 def test_pool_geometry_is_row_aligned_and_validated(
     requested_bytes: int,
-    row_stride: int,
+    block_size_bytes: int,
     expected: AbstractContextManager[tuple[int, int] | None],
 ) -> None:
-    """Geometry snaps down to whole KV rows and refuses non-positive or bool input."""
+    """Geometry snaps down to whole KV blocks and refuses invalid input."""
     with expected as geometry:
-        assert _compute_pool_geometry(requested_bytes, row_stride) == geometry
+        assert _compute_pool_geometry(requested_bytes, block_size_bytes) == geometry
 
 
 def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(

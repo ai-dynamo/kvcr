@@ -203,7 +203,7 @@ class FakePrimaryPinning:
                     "pin",
                     {
                         key: (
-                            _mem_descriptor(addr=0)
+                            [_mem_descriptor(addr=0)]
                             if (
                                 (prefix_length is None or index < prefix_length)
                                 and index not in self.missing_indices
@@ -256,7 +256,7 @@ class PendingPrimaryPinning(FakePrimaryPinning):
                 (
                     pin_handle,
                     {
-                        key: None if index in missing_indices else _mem_descriptor()
+                        key: None if index in missing_indices else [_mem_descriptor()]
                         for index, key in enumerate(keys)
                     },
                 ),
@@ -380,14 +380,14 @@ class FakeBytesControl:
         return incoming
 
 
-def _mem_descriptor(addr: int = 128, size: int = 16) -> MemDescriptor:
+def _mem_descriptor(addr: int = 128, size: int = 16, info: str = "") -> MemDescriptor:
     return MemDescriptor(
         end_point_name="primary",
         mem_type="DRAM",
         addr=addr,
         size=size,
         device_Id=0,
-        info="",
+        info=info,
     )
 
 
@@ -460,7 +460,12 @@ def _new_kvcr(
     policy=None,
 ) -> KVCR:
     config = replace(
-        config or KVCRConfig(nixl_agent_name=name, inventory_report_interval_ms=0),
+        config
+        or KVCRConfig(
+            nixl_agent_name=name,
+            pool_layout=[(16, "")],
+            inventory_report_interval_ms=0,
+        ),
         nixl_agent_name=name,
         nixl_listen_port=1,
     )
@@ -504,6 +509,7 @@ def _new_local_kvcr(
         kvcr = KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
+                pool_layout=[(len(local) // slot_count, "")],
                 nixl_listen_port=1,
                 inventory_report_interval_ms=0,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
@@ -519,8 +525,7 @@ def _new_local_kvcr(
             KVCRBackendConfigs(
                 local_dram=LocalDramOptions(
                     ctypes.addressof(local),
-                    len(local),
-                    slot_count,
+                    [(len(local), "")],
                     local_dram_backend,
                 ),
             ),

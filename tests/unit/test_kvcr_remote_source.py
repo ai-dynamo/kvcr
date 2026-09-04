@@ -52,7 +52,11 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         source_agent,
         pinning,
         control,
-        KVCRConfig(nixl_agent_name="source", operation_timeout_ms=10_000),
+        KVCRConfig(
+            nixl_agent_name="source",
+            pool_layout=[(16, "")],
+            operation_timeout_ms=10_000,
+        ),
         name="source",
     )
     source._core._clock = clock
@@ -294,6 +298,7 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
         control,
         KVCRConfig(
             nixl_agent_name="source",
+            pool_layout=[(16, "")],
             operation_timeout_ms=1000,
             enable_telemetry=True,
         ),
@@ -517,7 +522,11 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
         agent,
         pinning,
         control,
-        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
+        KVCRConfig(
+            nixl_agent_name="source",
+            pool_layout=[(16, "")],
+            enable_telemetry=True,
+        ),
         name="source",
     )
 

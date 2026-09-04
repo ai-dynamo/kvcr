@@ -144,21 +144,25 @@ class _LocalDram:
     ) -> None:
         if region.address <= 0:
             raise ValueError("local DRAM address must be positive")
-        if region.length <= 0:
-            raise ValueError("local DRAM length must be positive")
-        if region.slot_count <= 0:
-            raise ValueError("local DRAM slot_count must be positive")
-        if region.length % region.slot_count:
-            raise ValueError("local DRAM length must divide evenly into slots")
+        if len(region.pool_sizes_bytes) != 1:
+            raise ValueError("local DRAM supports only a single pool")
+        length, pool_name = region.pool_sizes_bytes[0]
+        if type(length) is not int or length <= 0:
+            raise ValueError("local DRAM pool size must be a positive integer")
+        if pool_name != kvcr.pool_layout[0][1]:
+            raise ValueError("local DRAM pool name must match pool_layout")
         if not region.backend:
             raise ValueError("local DRAM NIXL backend must be non-empty")
 
         self._kvcr = kvcr
         self._backend = region.backend
         self._address = region.address
-        self._length = region.length
-        self._slot_size = region.length // region.slot_count
-        self._free_slots = deque(range(region.slot_count))
+        self._length = length
+        self._slot_size = kvcr.block_size_bytes
+        slot_count = length // self._slot_size
+        if not slot_count:
+            raise ValueError("local DRAM pool must hold at least one block")
+        self._free_slots = deque(range(slot_count))
         self._evictable = _EvictionQueue()
         self._unscored: set[BlockKey] = set()
         self._pending_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -271,7 +275,9 @@ class _LocalDram:
             if residency is not None:
                 if residency.state is _LocalDramState.READY:
                     op.results[key] = (
-                        self._new_public_claim(key, residency)
+                        self._new_public_claim(
+                            key, residency, include_descriptors=False
+                        )
                         if no_evict
                         else OpEntryResult(OpEntryStatus.SUCCESS)
                     )
@@ -364,7 +370,9 @@ class _LocalDram:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.READY:
                 self._kvcr._record_access((key,))
-                op.results[key] = self._new_public_claim(key, residency)
+                op.results[key] = self._new_public_claim(
+                    key, residency, include_descriptors=True
+                )
             elif residency.state is _LocalDramState.DISCARDING:
                 # A discarded fill still owns its slot, so this block cannot be
                 # reserved yet. Wait for the slot instead of failing a key a
@@ -608,7 +616,11 @@ class _LocalDram:
                         if residency_op.op_id[0] == "fetch":
                             self._kvcr._record_access((key,))
                         residency_op.results[key] = (
-                            self._new_public_claim(key, residency)
+                            self._new_public_claim(
+                                key,
+                                residency,
+                                include_descriptors=residency_op.op_id[0] == "fetch",
+                            )
                             if residency_op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
@@ -845,7 +857,11 @@ class _LocalDram:
                     op.capacity_waiters.remove(waiter.key)
                     if residency.state is _LocalDramState.READY:
                         op.results[waiter.key] = (
-                            self._new_public_claim(waiter.key, residency)
+                            self._new_public_claim(
+                                waiter.key,
+                                residency,
+                                include_descriptors=op.op_id[0] == "fetch",
+                            )
                             if op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
@@ -909,7 +925,11 @@ class _LocalDram:
             self._update_capacity_pressure()
 
     def _new_public_claim(
-        self, key: BlockKey, residency: _LocalDramResidency
+        self,
+        key: BlockKey,
+        residency: _LocalDramResidency,
+        *,
+        include_descriptors: bool,
     ) -> OpEntryResult:
         self._acquire_claim(key, residency)
         handle = ReleaseHandle(self._next_release_handle)
@@ -917,7 +937,7 @@ class _LocalDram:
         self._public_claims[handle] = (key, residency)
         return OpEntryResult(
             OpEntryStatus.SUCCESS,
-            self._descriptor(residency.slot),
+            [self._descriptor(residency.slot)] if include_descriptors else None,
             handle,
         )
 
@@ -1020,7 +1040,7 @@ class _LocalDram:
             addr=self._address + slot * self._slot_size,
             size=self._slot_size,
             device_Id=0,
-            info="",
+            info=self._kvcr.pool_layout[0][1],
         )
 
     def _update_capacity_pressure(self) -> None:

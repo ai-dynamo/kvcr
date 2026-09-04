@@ -54,13 +54,13 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
 
     first = kvcr.deposit(
         {
-            key: _mem_descriptor(primary_addr + index * block_size)
+            key: [_mem_descriptor(primary_addr + index * block_size)]
             for index, key in enumerate(keys[:2])
         },
         hints={"priority": "test"},
     )
     _wait_until(lambda: len(agent.transfers) == 1)
-    filling_duplicate = kvcr.deposit({keys[0]: _mem_descriptor(primary_addr)})
+    filling_duplicate = kvcr.deposit({keys[0]: [_mem_descriptor(primary_addr)]})
     assert list(kvcr.poll_completed()) == []
     assert len(agent.transfers) == 1
     assert policy.ingested == []
@@ -81,7 +81,7 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
         for meta, *_ in policy.ingested
     )
 
-    ready_duplicate = kvcr.deposit({keys[0]: _mem_descriptor(primary_addr)})
+    ready_duplicate = kvcr.deposit({keys[0]: [_mem_descriptor(primary_addr)]})
     assert list(kvcr.poll_completed()) == [
         (ready_duplicate, _op_entries({keys[0]: True}))
     ]
@@ -90,7 +90,7 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
     assert len(policy.ingested) == 2
 
     replacement = kvcr.deposit(
-        {keys[2]: _mem_descriptor(primary_addr + 2 * block_size)}
+        {keys[2]: [_mem_descriptor(primary_addr + 2 * block_size)]}
     )
     completed = _poll_until(kvcr, lambda results: bool(results))
     assert completed == [(replacement, _op_entries({keys[2]: True}))]
@@ -105,6 +105,13 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
         InventoryEvent((keys[0],), CacheTier.LOCAL_G2, True),
         InventoryEvent((keys[2],), CacheTier.LOCAL_G2, False),
     ]
+
+
+def test_local_transfer_rejects_multiple_descriptors() -> None:
+    kvcr = _new_local_kvcr(FakeNixlAgent(), ctypes.create_string_buffer(16), 1)
+
+    with pytest.raises(ValueError, match="exactly one descriptor"):
+        kvcr.deposit({BlockKey(b"key"): [_mem_descriptor(), _mem_descriptor()]})
 
 
 @pytest.mark.parametrize(
@@ -128,7 +135,7 @@ def test_builtin_policy_eviction_order(
 
     kvcr.deposit(
         {
-            key: _mem_descriptor(primary_addr + index * block_size)
+            key: [_mem_descriptor(primary_addr + index * block_size)]
             for index, key in enumerate(keys[:2])
         }
     )
@@ -143,7 +150,7 @@ def test_builtin_policy_eviction_order(
     assert first_claim is not None and second_claim is not None
     kvcr.release((second_claim, first_claim))
 
-    kvcr.deposit({keys[2]: _mem_descriptor(primary_addr + 2 * block_size)})
+    kvcr.deposit({keys[2]: [_mem_descriptor(primary_addr + 2 * block_size)]})
     _poll_until(kvcr, lambda results: bool(results))
     statuses = kvcr.query(keys)
     assert statuses.pop(evicted_index) == (QueryStatus.MISS, None)
@@ -170,7 +177,7 @@ def test_local_deposit_applies_optional_admission() -> None:
 
     op_handle = kvcr.deposit(
         {
-            key: _mem_descriptor(ctypes.addressof(primary) + index * block_size)
+            key: [_mem_descriptor(ctypes.addressof(primary) + index * block_size)]
             for index, key in enumerate(keys)
         },
         hints={"source": "framework"},
@@ -209,7 +216,7 @@ def test_policy_lifecycle_hook_failures_are_logged(caplog) -> None:
     with caplog.at_level(logging.WARNING, logger="kvcr.policy_runtime"):
         for index, key in enumerate(keys):
             op_handle = kvcr.deposit(
-                {key: _mem_descriptor(ctypes.addressof(primary) + index * block_size)}
+                {key: [_mem_descriptor(ctypes.addressof(primary) + index * block_size)]}
             )
             assert _poll_until(kvcr, lambda results: bool(results)) == [
                 (op_handle, _op_entries({key: True}))
@@ -246,10 +253,13 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     kvcr._core._clock = lambda: now
     first_key, second_key = BlockKey(b"k0"), BlockKey(b"k1")
 
-    deposit = kvcr.deposit({first_key: _mem_descriptor(primary_addr)}, no_evict=True)
+    deposit = kvcr.deposit({first_key: [_mem_descriptor(primary_addr)]}, no_evict=True)
     _wait_until(lambda: bool(agent.transfers))
     assert capacity_requests == [1]
-    fetch = kvcr.fetch((first_key,))
+    layouts = {first_key: [(16, "")], second_key: [(8, "")]}
+    with pytest.raises(ValueError, match="expected layouts"):
+        kvcr.fetch((first_key, second_key), expected_layouts=layouts)
+    fetch = kvcr.fetch((first_key,), expected_layouts={first_key: [(block_size, "")]})
     assert kvcr.query((first_key,)) == [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
     assert list(kvcr.poll_completed()) == []
 
@@ -257,14 +267,14 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
     deposit_result = completed[deposit][first_key]
     assert deposit_result.success
-    assert deposit_result.descriptor is not None
+    assert deposit_result.descriptors is None
     deposit_claim = deposit_result.release_handle
     assert deposit_claim is not None
 
     assert kvcr.query((first_key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     fetch_result = completed[fetch][first_key]
     fetch_claim = fetch_result.release_handle
-    assert fetch_result.descriptor == deposit_result.descriptor
+    assert fetch_result.descriptors is not None
     assert fetch_claim is not None
 
     ready_fetch = kvcr.fetch((first_key,))
@@ -275,8 +285,8 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     agent.state = "PROC"
     deliver = kvcr.deliver(
         {
-            first_key: _mem_descriptor(ctypes.addressof(destination)),
-            second_key: _mem_descriptor(ctypes.addressof(destination) + block_size),
+            first_key: [_mem_descriptor(ctypes.addressof(destination))],
+            second_key: [_mem_descriptor(ctypes.addressof(destination) + block_size)],
         }
     )
     _wait_until(lambda: len(agent.transfers) == 2)
@@ -287,7 +297,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     ]
     assert kvcr.release((fetch_claim,)) == [(fetch_claim, False)]
 
-    blocked = kvcr.deposit({second_key: _mem_descriptor(primary_addr + block_size)})
+    blocked = kvcr.deposit({second_key: [_mem_descriptor(primary_addr + block_size)]})
     assert list(kvcr.poll_completed()) == [(blocked, _op_entries({second_key: False}))]
 
     agent.state = "DONE"
@@ -307,7 +317,9 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     assert [meta.block_key for meta, *_ in policy.ingested] == [first_key]
     assert policy.removed == []
 
-    replacement = kvcr.deposit({second_key: _mem_descriptor(primary_addr + block_size)})
+    replacement = kvcr.deposit(
+        {second_key: [_mem_descriptor(primary_addr + block_size)]}
+    )
     assert capacity_requests == [1, 1]
     assert _poll_until(kvcr, lambda results: bool(results)) == [
         (replacement, _op_entries({second_key: True}))
@@ -373,7 +385,7 @@ def test_local_deposit_waits_for_safe_release(
     key = BlockKey(b"k0")
 
     op_handle = kvcr.deposit(
-        {key: _mem_descriptor(ctypes.addressof(primary), block_size)}
+        {key: [_mem_descriptor(ctypes.addressof(primary), block_size)]}
     )
     _wait_until(lambda: bool(agent.transfers))
     if failure == "timeout":
@@ -406,7 +418,7 @@ def test_local_initialize_failure_completes_without_failing_progress() -> None:
     key = BlockKey(b"k0")
 
     op_handle = kvcr.deposit(
-        {key: _mem_descriptor(ctypes.addressof(primary), len(primary))}
+        {key: [_mem_descriptor(ctypes.addressof(primary), len(primary))]}
     )
 
     assert _poll_until(kvcr, lambda results: bool(results)) == [
@@ -446,7 +458,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(
         {
-            key: _mem_descriptor(ctypes.addressof(primary) + index * block_size)
+            key: [_mem_descriptor(ctypes.addressof(primary) + index * block_size)]
             for index, key in enumerate(fresh)
         }
     )
@@ -465,7 +477,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     assert not local_dram._free_slots
     extra = BlockKey(b"extra")
     operation = kvcr.deposit(
-        {extra: _mem_descriptor(ctypes.addressof(primary) + 2 * block_size)}
+        {extra: [_mem_descriptor(ctypes.addressof(primary) + 2 * block_size)]}
     )
     completed = dict(_poll_until(kvcr, lambda results: bool(results)))
 

@@ -418,6 +418,7 @@ class ClaimedPool:
 
 
 def claim_guarded_pool(
+    config: KVCRConfig,
     guard_config: KVCRGuardConfig,
     bindings: "KVCRBindings",
     backend_configs: KVCRBackendConfigs,
@@ -442,7 +443,7 @@ def claim_guarded_pool(
         )
     hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
         guard_config.guard_index,
-        guard_config.row_stride,
+        config.pool_layout,
         guard_config.compatibility_digest,
         bind_address(),
         backend_configs.g3,
@@ -455,7 +456,7 @@ def claim_guarded_pool(
         recovered = read_handback(
             hold._attachment,
             guard_config.compatibility_digest,
-            guard_config.row_stride,
+            config.pool_layout,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -538,15 +539,17 @@ def _recovery_frames(
 
 
 # Bound to the pool and to the geometry: a slot index only means the same
-# bytes under the same file and layout. The generation stops a replay into a
+# bytes under the same file and pool layout. The generation stops a replay into a
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
 _SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
-_SNAPSHOT_TERMS = struct.Struct("<QQQQQ")
+_SNAPSHOT_TERMS = struct.Struct("<QQQQ")
 
 
 def canonical_pool_terms(
-    compatibility_digest: str, row_stride: int, spec: "KVCRPoolSpec"
+    compatibility_digest: str,
+    pool_layout: list[tuple[int, str]],
+    spec: "KVCRPoolSpec",
 ) -> bytes:
     """Encode what a handback region must not be replayed across."""
     return (
@@ -554,8 +557,12 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
+        + msgspec.msgpack.encode(pool_layout)
         + _SNAPSHOT_TERMS.pack(
-            row_stride, spec.journal_bytes, spec.mapping_bytes, spec.device, spec.inode
+            spec.journal_bytes,
+            spec.mapping_bytes,
+            spec.device,
+            spec.inode,
         )
     )
 
@@ -653,7 +660,9 @@ def read_recovery_snapshot(
 
 
 def read_handback(
-    pool: KVCRPoolAttachment, compatibility_digest: str, row_stride: int
+    pool: KVCRPoolAttachment,
+    compatibility_digest: str,
+    pool_layout: list[tuple[int, str]],
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -664,7 +673,7 @@ def read_handback(
     else ever would, and it would refuse every later claim on this pool too.
     """
     mirror = _RecoveryMirror()
-    terms = canonical_pool_terms(compatibility_digest, row_stride, pool._spec)
+    terms = canonical_pool_terms(compatibility_digest, pool_layout, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)
