@@ -29,13 +29,7 @@ _LOGGED_HINT_ISSUES: set[str] = set()
 
 
 def _warn_once(issue: str, message: str, *args: object) -> None:
-    """Log a parser warning at most once per issue kind.
-
-    Args:
-        issue: Stable identifier used to deduplicate warnings.
-        message: Warning message format string.
-        *args: Values interpolated into ``message``.
-    """
+    """Log a parser warning at most once per issue kind."""
     if issue in _LOGGED_HINT_ISSUES:
         return
     _LOGGED_HINT_ISSUES.add(issue)
@@ -49,15 +43,7 @@ def _warn_version_mismatch(
     issue: str,
     message: str,
 ) -> None:
-    """Warn once when a supported schema version does not match received value.
-
-    Args:
-        supported: Version string currently supported by the parser.
-        received: Version value from the hint envelope or action.
-        issue: Stable identifier used to deduplicate warnings.
-        message: Warning message format string for ``supported`` and
-            ``received``.
-    """
+    """Warn once when a supported schema version does not match received value."""
     if received == supported:
         return
     _warn_once(issue, message, supported, received)
@@ -71,18 +57,6 @@ def _parse_kv_hint(
     Hints are advisory and parsed on the request path. Version mismatches warn
     once per issue kind and are interpreted with the schema KVCR currently
     supports. KVCR consumes the first valid ``kv.fetch`` action in the envelope.
-
-    Args:
-        hint: Versioned KV hint envelope.
-
-    Returns:
-        A tuple (source, block_hashes, mode), where source is the source
-        control endpoint, block_hashes holds deduplicated block hashes,
-        and mode is the fetch mode.
-
-    Raises:
-        ValueError: If no usable ``kv.fetch`` action exists or the fetch
-            payload is malformed.
     """
     if not isinstance(hint, Mapping):
         raise ValueError("invalid router hint")
@@ -99,18 +73,7 @@ def _parse_kv_hint(
 
 
 def _parse_fetch_action(action: object) -> Mapping[str, object] | None:
-    """Parse one envelope action as a ``kv.fetch`` payload.
-
-    Args:
-        action: Candidate action from a KV hint envelope.
-
-    Returns:
-        The action payload for a usable ``kv.fetch`` action, or None if the
-        action should be skipped.
-
-    Raises:
-        ValueError: If the action is ``kv.fetch`` but its payload is malformed.
-    """
+    """Parse one envelope action as a ``kv.fetch`` payload."""
     if not isinstance(action, Mapping):
         return None
     if action.get("action_type") != _KV_FETCH_ACTION_TYPE:
@@ -136,19 +99,7 @@ def _parse_fetch_action(action: object) -> Mapping[str, object] | None:
 def _extract_kv_fetch_payload(
     hint: Mapping[str, object],
 ) -> Mapping[str, object]:
-    """Extract the first ``kv.fetch`` action payload from a hint envelope.
-
-    Args:
-        hint: Versioned KV hint envelope.
-
-    Returns:
-        The payload mapping from the first usable ``kv.fetch`` action.
-
-    Raises:
-        ValueError: If ``actions`` is missing or malformed, no ``kv.fetch``
-            action exists, or the first matching action has a malformed
-            payload.
-    """
+    """Extract the first ``kv.fetch`` action payload from a hint envelope."""
     actions = hint.get("actions")
     if not isinstance(actions, list):
         raise ValueError("invalid router hint")
@@ -164,20 +115,8 @@ def _extract_kv_fetch_payload(
 def _parse_fetch_payload(
     payload: Mapping[str, object],
 ) -> tuple[str | None, frozenset[int], str]:
-    """Parse and validate fields from a ``kv.fetch`` action payload.
+    """Parse and validate fields from a ``kv.fetch`` action payload."""
 
-    Args:
-        payload: ``kv.fetch`` action payload.
-
-    Returns:
-        A tuple (source, block_hashes, mode), where source is the source
-        control endpoint, block_hashes holds deduplicated block hashes,
-        and mode is the fetch mode.
-
-    Raises:
-        ValueError: If the payload does not match the supported router hint
-            shape.
-    """
     source = payload.get("source_control_endpoint")
     block_hashes = payload.get("block_hashes")
     mode = payload.get("mode", "copy")
