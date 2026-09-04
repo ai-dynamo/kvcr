@@ -225,6 +225,13 @@ class _KVCRCore:
             memory_regions.append((framework_dram.address, framework_dram.length))
         if self._local_dram is not None:
             memory_regions.append(self._local_dram.memory_region)
+        dram_backends: set[str] = set()
+        if self._local_dram is not None:
+            dram_backends.add(local_dram_config.backend)
+        if self.framework_control is not None:
+            dram_backends.add(backend_configs.remote_fw_dram.backend)
+        if not dram_backends:
+            raise ValueError("at least one DRAM backend must be configured")
 
         def initialize_progress(progress: _KVCRProgress) -> None:
             self._remote_fw_dram.initialize_progress(progress)
@@ -245,6 +252,7 @@ class _KVCRCore:
             close_progress,
             nixl_agent_name=self.nixl_agent_name,
             nixl_listen_port=self.config.nixl_listen_port,
+            dram_backends=list(dram_backends),
             memory_regions=tuple(memory_regions),
         )
 

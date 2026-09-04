@@ -18,7 +18,12 @@ from contextlib import suppress
 from typing import Any
 
 from .api import KVCRBindings
-from .config import KVCRBackendConfigs, KVCRConfig, LocalDramInfo
+from .config import (
+    KVCRBackendConfigs,
+    KVCRConfig,
+    LocalDramOptions,
+    RemoteFWDramOptions,
+)
 from .control_channels import KVCRServiceError, ZmqPeerControlChannel
 from .core import _BlockRecord, _KVCRCore
 from .guard_protocol import PidfdLiveness, _TierConfig
@@ -242,8 +247,12 @@ class _RecoveryState:
         }
         return _without_g3(records)
 
-    def local_dram_info(self, effective_bytes: int, rows: int) -> LocalDramInfo:
-        return LocalDramInfo(self.attachment.data_address, effective_bytes, rows)
+    def local_dram_info(
+        self, effective_bytes: int, rows: int, backend: str
+    ) -> LocalDramOptions:
+        return LocalDramOptions(
+            self.attachment.data_address, effective_bytes, rows, backend
+        )
 
     def release_snapshot_region(self) -> None:
         self.attachment.release_snapshot_region()
@@ -842,7 +851,9 @@ class _Guard:
         effective_bytes, rows = _compute_pool_geometry(
             self._spec.data_bytes, self._configured.row_stride
         )
-        dram = self._recovery.local_dram_info(effective_bytes, rows)
+        dram = self._recovery.local_dram_info(
+            effective_bytes, rows, self._configured.remote_fw_dram_backend
+        )
         core = _KVCRCore(
             KVCRConfig(
                 nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
@@ -855,7 +866,13 @@ class _Guard:
                 lambda _handle: False,
                 framework_control=self._control,
             ),
-            KVCRBackendConfigs(local_dram=dram, g3=None),
+            KVCRBackendConfigs(
+                local_dram=dram,
+                g3=None,
+                remote_fw_dram=RemoteFWDramOptions(
+                    backend=self._configured.remote_fw_dram_backend
+                ),
+            ),
         )
         self._core = core
         core.adopt_recovery_records(records)

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, cast
 
-from .config import LocalDramInfo
+from .config import LocalDramOptions
 from .policy_runtime import _EvictionQueue
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
 from .types import (
@@ -79,6 +79,7 @@ class _LocalCopyOp(_ProgressOp):
     src_descriptors: tuple[MemDescriptor, ...]
     dst_descriptors: tuple[MemDescriptor, ...]
     deadline: float
+    backend: str
     clock: _Clock = field(repr=False, compare=False)
     started_at: float | None = field(repr=False, compare=False)
     transfer_id: int | None = None
@@ -100,6 +101,7 @@ class _LocalCopyOp(_ProgressOp):
                     self.src_descriptors,
                     self.dst_descriptors,
                     remote_side_agent=progress.nixl_agent_name,
+                    backend=self.backend,
                 )
                 self.transfer_id = transfer_id
                 self.cancellation_requested = not submitted
@@ -138,7 +140,7 @@ class _LocalDram:
     def __init__(
         self,
         kvcr: "_KVCRCore",
-        region: LocalDramInfo,
+        region: LocalDramOptions,
     ) -> None:
         if region.address <= 0:
             raise ValueError("local DRAM address must be positive")
@@ -148,8 +150,11 @@ class _LocalDram:
             raise ValueError("local DRAM slot_count must be positive")
         if region.length % region.slot_count:
             raise ValueError("local DRAM length must divide evenly into slots")
+        if not region.backend:
+            raise ValueError("local DRAM NIXL backend must be non-empty")
 
         self._kvcr = kvcr
+        self._backend = region.backend
         self._address = region.address
         self._length = region.length
         self._slot_size = region.length // region.slot_count
@@ -316,6 +321,7 @@ class _LocalDram:
                     src_descriptors=tuple(src_descriptors),
                     dst_descriptors=tuple(dst_descriptors),
                     deadline=deadline,
+                    backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
                 )
@@ -718,6 +724,7 @@ class _LocalDram:
                     src_descriptors=tuple(src_descriptors),
                     dst_descriptors=tuple(dst_descriptors),
                     deadline=op.deadline,
+                    backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
                 )
@@ -891,6 +898,7 @@ class _LocalDram:
                             src_descriptors=(waiter.source,),
                             dst_descriptors=(self._descriptor(slot),),
                             deadline=op.deadline,
+                            backend=self._backend,
                             clock=self._kvcr._clock,
                             started_at=self._kvcr._timer(),
                         )

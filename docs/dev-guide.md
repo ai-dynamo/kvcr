@@ -348,9 +348,8 @@ against its own pool only; pools do not have to agree on a stride.
 **A pool's configuration is fixed by its first claim.** Every later claim on
 that pool must name the same row stride and, when G3 is configured, the same
 G3 paths in the same order, the same per-file capacity, and the same backend
-and backend options; one that does not is refused for the life of the
-service, because a different layout renames the rows and slots the recovered
-records describe. Change the layout by
+and backend options. It must also name the same remote framework DRAM backend.
+A mismatch is refused for the life of the service. Change the configuration by
 restarting the service, which recreates the pools.
 
 The service grants a pool to one live claimant at a time, and pool mappings are
@@ -412,9 +411,10 @@ records naming it are carried across, so the replacement reopens the tier with
 its disk cache rather than a cold one -- the files themselves are not held in
 the meantime, which is the limitation described below.
 
-**Deployment prerequisite.** Run the service with the same NIXL backend and
-plugin environment as the engines that claim its pools. Nothing checks this for
-you; a mismatch surfaces when a replacement primary opens G3.
+**Deployment prerequisite.** Make the configured NIXL backends available in
+each process that uses them. Nothing checks plugin availability across processes
+for you; a mismatch surfaces when a Guard promotes or a replacement primary
+opens G3.
 
 **G3 files are not verified across a failover.** A Guard hands a replacement
 primary the G3 records it inherited without checking that the files still hold
@@ -673,6 +673,8 @@ The important fields are:
 | `control_ports` | One local control port for each DP rank managed by this worker |
 | `control_advertise_host` | Host or address placed in worker registration and sent to peers |
 | `eager_ctrl_connect` | Establishes peer control earlier; disabling it moves setup onto the request path |
+| `local_dram_backend` | NIXL backend used for local DRAM transfers |
+| `remote_fw_dram_backend` | NIXL backend used for peer DRAM transfers |
 | `operation_timeout_ms` | Deadline for KVCR operations; timeout begins safe cancellation and cleanup |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 

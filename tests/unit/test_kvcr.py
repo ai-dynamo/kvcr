@@ -34,7 +34,8 @@ from kvcr.config import (
     KVCRBackendConfigs,
     KVCRConfig,
     KVCRGuardConfig,
-    LocalDramInfo,
+    LocalDramOptions,
+    RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
 from kvcr.guard_protocol import KVCRPoolHold
@@ -159,7 +160,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
     hold = _fake_hold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        local_dram=LocalDramOptions(1234, 8192, 8),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -238,7 +239,7 @@ def test_startup_timeout_retains_nonquiescent_resources(
     entered = threading.Event()
     unblock = threading.Event()
     hold = _fake_hold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        local_dram=LocalDramOptions(1234, 8192, 8),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=Mock(),
@@ -281,7 +282,9 @@ def test_startup_timeout_retains_nonquiescent_resources(
                     Mock(),
                     framework_control=None if guard_config is None else guarded_control,
                 ),
-                KVCRBackendConfigs(),
+                KVCRBackendConfigs(
+                    local_dram=hold.local_dram if guard_config is None else None
+                ),
                 guard_config,
             )
 
@@ -307,7 +310,7 @@ def test_service_journal_is_attached_before_primary_start(
     events: list[str] = []
     attachment = _UNSERVED_POOL
     hold = _fake_hold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        local_dram=LocalDramOptions(1234, 8192, 8),
         _attachment=attachment,
         _control_listener_fd=7,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -353,10 +356,14 @@ def test_service_journal_is_attached_before_primary_start(
         paths=(tmp_path / "g3",),
         capacity_bytes_per_file=8192,
     )
+    backend_configs = KVCRBackendConfigs(
+        g3=g3_config,
+        remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
+    )
     controller = KVCR(
         KVCRConfig(nixl_agent_name="target"),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
-        KVCRBackendConfigs(g3=g3_config),
+        backend_configs,
         KVCRGuardConfig(
             kvcr_service_socket_path="/tmp/kvcr.sock",
             pool_index=3,
@@ -371,6 +378,7 @@ def test_service_journal_is_attached_before_primary_start(
         "Opaque-Digest",
         ("127.0.0.1", 5555),
         g3_config,
+        "REMOTE",
     )
     assert constructor.call_args.args[1].framework_control is primary_control
     assert constructor.call_args.args[2].g3 is g3_config
@@ -399,11 +407,20 @@ def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> N
         KVCR(
             KVCRConfig(nixl_agent_name="target"),
             KVCRBindings(Mock(), Mock(), Mock()),
-            KVCRBackendConfigs(local_dram=LocalDramInfo(1234, 8192, 8)),
+            KVCRBackendConfigs(local_dram=LocalDramOptions(1234, 8192, 8)),
             _GUARD_CONFIG,
         )
 
     client.assert_not_called()
+
+
+def test_kvcr_rejects_no_dram_backends() -> None:
+    with pytest.raises(ValueError, match="at least one DRAM backend"):
+        KVCR(
+            KVCRConfig(nixl_agent_name="target"),
+            KVCRBindings(Mock(), Mock(), Mock()),
+            KVCRBackendConfigs(),
+        )
 
 
 def test_get_stats_emits_public_state_metric_name() -> None:
@@ -420,7 +437,13 @@ def test_get_stats_emits_public_state_metric_name() -> None:
     assert {record[1] for record in stats.records} == {"kvcr_state"}
 
 
-def test_nixl_lifecycle_stays_on_progress_thread(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("remote_enabled", "expected_backends"),
+    [(False, {"LOCAL"}), (True, {"LOCAL", "REMOTE"})],
+)
+def test_nixl_lifecycle_stays_on_progress_thread(
+    monkeypatch, remote_enabled, expected_backends
+) -> None:
     main_thread = threading.get_ident()
     lifecycle_threads: list[int] = []
     agents: list[Any] = []
@@ -454,10 +477,14 @@ def test_nixl_lifecycle_stays_on_progress_thread(monkeypatch) -> None:
             pinning.request_pin,
             pinning.poll_pin_results,
             pinning.release_pin,
+            framework_control=(
+                SimpleNamespace(recv=lambda: ()) if remote_enabled else None
+            ),
         ),
         KVCRBackendConfigs(
             framework_dram=FrameworkDramInput(128, 256),
-            local_dram=LocalDramInfo(384, 128, 2),
+            local_dram=LocalDramOptions(384, 128, 2, "LOCAL"),
+            remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
         ),
     )
     kvcr.close()
@@ -467,6 +494,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(monkeypatch) -> None:
     assert agent.name == "target"
     assert agent.config["listen_port"] == 1234
     assert agent.config["enable_listen_thread"] is True
+    assert set(agent.config["backends"]) == expected_backends
     assert len(set(lifecycle_threads)) == 1
     assert lifecycle_threads[0] != main_thread
     assert agent.registrations == [

@@ -74,6 +74,7 @@ class _KVCRProgress:
         flush: _Flush,
         close: _Close,
         *,
+        dram_backends: list[str] = [],
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
@@ -91,6 +92,7 @@ class _KVCRProgress:
         self._active_transfers: dict[int, _TransferState] = {}
         self._next_transfer_id = 0
         self._nixl_listen_port = nixl_listen_port
+        self._dram_backends = dram_backends
         self._memory_regions = memory_regions
         self._memory_registrations: list[Any] = []
         self._nixl_agent_metadata: bytes | None = None
@@ -187,7 +189,7 @@ class _KVCRProgress:
             self._make_transfer_descriptors(remote_descriptors),
             remote_side_agent,
             notif_msg=notif_msg,
-            backends=[backend] if backend else self._dram_capable_backends(),
+            backends=[backend] if backend else [],
         )
         if handle is None:
             raise RuntimeError("initialize_xfer returned None")
@@ -390,31 +392,9 @@ class _KVCRProgress:
                     capture_telemetry=True,
                     enable_listen_thread=True,
                     listen_port=self._nixl_listen_port,
+                    backends=self._dram_backends,
                 ),
             )
-
-    def _dram_capable_backends(self) -> list[str]:
-        """The instantiated backends that can carry a DRAM transfer.
-
-        With a file backend created for G3, an unpinned DRAM copy is NIXL's
-        choice across every created backend -- and file backends advertise
-        DRAM_SEG for their memory side while requiring FILE_SEG on the other,
-        so a memory-to-memory copy must not ride them. Read per transfer,
-        because G3 creates its backend after the agent exists. An empty list
-        keeps NIXL's own selection.
-        """
-        backend_mems = getattr(self._nixl_agent, "backend_mems", None)
-        if not isinstance(backend_mems, dict) or not backend_mems:
-            return []
-        capable = [
-            name
-            for name, kinds in backend_mems.items()
-            if any("DRAM" in str(kind).upper() for kind in kinds)
-            and not any("FILE" in str(kind).upper() for kind in kinds)
-        ]
-        # Only a strict subset is worth pinning; otherwise leave the choice
-        # exactly as NIXL would have made it.
-        return capable if capable and len(capable) < len(backend_mems) else []
 
     def _register_memory_regions(self) -> None:
         if self._nixl_agent is None:
