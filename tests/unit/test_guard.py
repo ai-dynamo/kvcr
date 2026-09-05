@@ -176,7 +176,7 @@ def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> N
     failure_callback = Mock()
     guard = _Guard(_TEST_SPEC, failure_callback, compatibility_digest=_TEST_DIGEST)
     guard._control = control
-    guard._configure(_TierConfig(16, None))
+    guard._configure(_TierConfig([(16, "")], None))
     guard._recovery._journal = journal
     guard._serving = True
     guard._core = core
@@ -210,7 +210,7 @@ def test_standby_guard_failure_releases_adopted_listener() -> None:
     journal.read_next.side_effect = error
     guard = _Guard(_TEST_SPEC, failure_callback, compatibility_digest=_TEST_DIGEST)
     guard._control = control
-    guard._configure(_TierConfig(16, None))
+    guard._configure(_TierConfig([(16, "")], None))
     guard._recovery._journal = journal
     guard._recovery.mirror = Mock()
 
@@ -280,7 +280,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         backend="FILE",
         backend_options={},
     )
-    tier = _TierConfig(_PAGE_STRIDE, g3_config, "REMOTE")
+    tier = _TierConfig([(_PAGE_STRIDE, "")], g3_config, "REMOTE")
     guard = _Guard(_PAGE_SPEC, compatibility_digest=_TEST_DIGEST)
     # Driven directly, then the thread starts already busy: the actor blocks
     # on an empty mailbox when idle, so mutating around a sleeping thread
@@ -288,7 +288,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     guard._started = True
     guard._recovery.prepare()
     # Unclaimed, so any tier shape is still available; the first claim fixes it.
-    guard._refuse_incompatible(_TierConfig(16, None))
+    guard._refuse_incompatible(_TierConfig([(16, "")], None))
     guard._adopt(new_channel(), tier)
     try:
         attach.assert_called_once_with(_PAGE_SPEC)
@@ -296,7 +296,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # Adoption only grants; a core exists once a promotion needs one.
         assert constructed == []
         with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
-            guard._refuse_incompatible(_TierConfig(16, None))
+            guard._refuse_incompatible(_TierConfig([(16, "")], None))
 
         promoted_records = guard._recovery.mirror._records
         guard._promote()
@@ -308,7 +308,9 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert config.nixl_listen_port == 0
         assert bindings.framework_control is channels[0]
         assert backends.local_dram == LocalDramOptions(
-            1234 + 8192, 2 * _PAGE_STRIDE, 2, "REMOTE"
+            1234 + 8192,
+            [(2 * _PAGE_STRIDE, "")],
+            "REMOTE",
         )
         assert backends.remote_fw_dram.backend == "REMOTE"
         # A Guard opens no G3: it serves the G2 half and keeps the rest for the
@@ -381,7 +383,7 @@ def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     """Which reader finds the invalid journal is a race; none may take the service."""
     guard = _configurable_guard()
     # Every one of these readers runs on a pool a primary has already claimed.
-    guard._configured = _TierConfig(16, None)
+    guard._configured = _TierConfig([(16, "")], None)
     guard._recovery.mirror = _RecoveryMirror()
     guard._recovery.attachment = Mock()
     guard._control = None
@@ -433,11 +435,15 @@ def test_the_same_g3_paths_in_another_order_are_another_configuration() -> None:
     """A slot names its file by position, so reordering renames every slot."""
     guard = _configurable_guard()
     guard._configured = _TierConfig(
-        _PAGE_STRIDE, _G3Config(("/a", "/b"), _PAGE_STRIDE, "MOCK", {})
+        [(_PAGE_STRIDE, "")],
+        _G3Config(("/a", "/b"), _PAGE_STRIDE, "MOCK", {}),
     )
     with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
         guard._refuse_incompatible(
-            _TierConfig(_PAGE_STRIDE, _G3Config(("/b", "/a"), _PAGE_STRIDE, "MOCK", {}))
+            _TierConfig(
+                [(_PAGE_STRIDE, "")],
+                _G3Config(("/b", "/a"), _PAGE_STRIDE, "MOCK", {}),
+            )
         )
 
 
@@ -451,7 +457,7 @@ def test_guard_closes_control_when_its_thread_does_not_start(monkeypatch) -> Non
     monkeypatch.setattr("kvcr.guard.RecoveryJournal", Mock())
     guard = _Guard(_TEST_SPEC, compatibility_digest=_TEST_DIGEST)
     guard._control = control
-    guard._configure(_TierConfig(16, None))
+    guard._configure(_TierConfig([(16, "")], None))
     guard._thread.start = Mock(side_effect=RuntimeError("thread start failed"))
 
     with pytest.raises(RuntimeError, match="thread start failed"):
@@ -529,7 +535,7 @@ def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
     core.is_quiescent.return_value = False
     guard = _Guard(_TEST_SPEC, compatibility_digest=_TEST_DIGEST)
     guard._control = control
-    guard._configure(_TierConfig(16, None))
+    guard._configure(_TierConfig([(16, "")], None))
     guard._core = core
     guard._recovery.attachment = attachment
     caplog.set_level(logging.WARNING, logger="kvcr.guard")
@@ -566,7 +572,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
 
     if refused_by == "hand-over":
         # A hand-back that fails cannot be reported as a refused claim.
-        guard._configured = _TierConfig(16, None)
+        guard._configured = _TierConfig([(16, "")], None)
         guard._serving = True
         guard._recovery.mirror = _RecoveryMirror()
         guard._core = Mock(_block_record_map={})
@@ -574,7 +580,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
         guard._hand_back = Mock(side_effect=failure)
 
         with pytest.raises(OSError, match="no space left"):
-            guard._adopt(control, _TierConfig(16, None))
+            guard._adopt(control, _TierConfig([(16, "")], None))
 
         assert reported == [failure]
         assert guard._failure is failure
@@ -584,11 +590,11 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
         )
         if refused_by == "geometry":
             expected: type[Exception] = ValueError
-            tier_config = _TierConfig(_TEST_SPEC.mapping_bytes, None)
+            tier_config = _TierConfig([(_TEST_SPEC.mapping_bytes, "")], None)
             handback = Mock(return_value=_RecoveryMirror())
         else:
             expected = RecoveryJournalError
-            tier_config = _TierConfig(16, None)
+            tier_config = _TierConfig([(16, "")], None)
             handback = Mock(side_effect=RecoveryJournalError("written for other terms"))
         monkeypatch.setattr("kvcr.guard.read_handback", handback)
 
@@ -602,7 +608,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
         guard._hand_back.assert_not_called()
         # Nothing was chosen, so a corrected claim can still have this pool.
         assert guard._configured is None
-        guard._refuse_incompatible(_TierConfig(32, None))
+        guard._refuse_incompatible(_TierConfig([(32, "")], None))
     control.close.assert_called_once_with()
 
 
@@ -653,13 +659,13 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(code: int) -> No
     guard = _configurable_guard()
     guard._control = None
     guard._failure_callback = lambda *_args: None
-    guard._configured = _TierConfig(16, None)
+    guard._configured = _TierConfig([(16, "")], None)
     guard._recovery.mirror = _RecoveryMirror()
     _give_serving_core(guard)
     guard._recovery._journal = _Journal()
     guard._recovery._write_handback = Mock(side_effect=OSError(code, "No space left"))
 
-    guard._adopt(Mock(), _TierConfig(16, None))
+    guard._adopt(Mock(), _TierConfig([(16, "")], None))
 
     # The pool went cold, not fatal: the Guard stood down and dropped the core.
     assert guard._serving is False
@@ -709,7 +715,7 @@ def test_a_release_drops_its_mirror_after_handing_back_what_it_can(
     guard = _configurable_guard()
     control = Mock()
     guard._control = control
-    guard._configured = _TierConfig(16, None)
+    guard._configured = _TierConfig([(16, "")], None)
     guard._recovery.mirror = _RecoveryMirror()
     if mode == "serving":
         _give_serving_core(guard)
@@ -730,9 +736,9 @@ def test_a_release_drops_its_mirror_after_handing_back_what_it_can(
     assert guard._recovery.mirror is None
     control.close.assert_called_once_with()
     if mode == "accepts":
-        records, row_stride = guard._recovery._write_handback.call_args.args
+        records, pool_layout = guard._recovery._write_handback.call_args.args
         assert set(records) == {BlockKey(b"published"), BlockKey(b"tail")}
-        assert row_stride == 16
+        assert pool_layout == [(16, "")]
     elif mode == "serving":
         assert guard._serving is False
         assert guard._core is None

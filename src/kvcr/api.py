@@ -92,7 +92,7 @@ class KVCR:
                 core = _KVCRCore(config, bindings, backend_configs)
             else:
                 claimed = _recovery.claim_guarded_pool(
-                    guard_config, bindings, backend_configs
+                    config, guard_config, bindings, backend_configs
                 )
                 pool_hold = claimed.hold
                 core = _recovery.claimed_core(
@@ -147,7 +147,7 @@ class KVCR:
 
     def deliver(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None = None,
     ) -> OpHandle:
         """Asynchronously deliver blocks to caller-provided destinations."""
@@ -155,7 +155,7 @@ class KVCR:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
@@ -166,10 +166,11 @@ class KVCR:
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
+        expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
         """Asynchronously fetch blocks into KVCR-managed storage."""
-        return self._core.fetch(keys, request_id, hints)
+        return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(
         self,

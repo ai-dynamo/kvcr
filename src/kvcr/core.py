@@ -14,6 +14,7 @@ from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
     TelemetryStats,
+    _validate_pool_layout,
 )
 from .hint_parser import _parse_kv_hint
 from .local_disk import _G3, _G3Residency
@@ -115,6 +116,12 @@ class _KVCRCore:
         backend_configs: KVCRBackendConfigs,
     ) -> None:
         self.config = config
+        self.pool_layout = list(config.pool_layout)
+        _validate_pool_layout(self.pool_layout)
+        # TODO: Support multiple pools after remote fetch and G3 discover layouts.
+        if len(self.pool_layout) != 1:
+            raise ValueError("only a single pool is currently supported")
+        self.block_size_bytes = self.pool_layout[0][0]
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.inventory_report_interval_ms < 0:
@@ -156,11 +163,6 @@ class _KVCRCore:
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._pending_inventory_events: list[InventoryEvent] = []
         self._inventory_flush_deadline: float | None = None
-        self._capacity_low_watermark_slots = ceil(
-            (local_dram_config.slot_count if local_dram_config else 0)
-            * self.config.capacity_low_watermark_percent
-            / 100
-        )
         self._capacity_pressure_active = False
         self._closed = False
         self._outstanding_operations = 0
@@ -205,6 +207,11 @@ class _KVCRCore:
             if local_dram_config is not None
             else None
         )
+        self._capacity_low_watermark_slots = ceil(
+            (self._local_dram._total_slots if self._local_dram is not None else 0)
+            * self.config.capacity_low_watermark_percent
+            / 100
+        )
         self._remote_fw_dram = _RemoteFWDram(
             self,
             backend_configs.remote_fw_dram,
@@ -214,7 +221,7 @@ class _KVCRCore:
             _G3(
                 self,
                 g3_config,
-                local_dram_config.length // local_dram_config.slot_count,
+                self.block_size_bytes,
             )
             if g3_config is not None and local_dram_config is not None
             else None
@@ -348,17 +355,21 @@ class _KVCRCore:
     # TODO: Add optional completion callbacks to movement APIs.
     def deliver(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None = None,
     ) -> OpHandle:
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         deadline = self._operation_deadline()
         local_dram = self._local_dram
+        normalized = {
+            key: self._normalize_descriptors(descriptors)
+            for key, descriptors in blocks.items()
+        }
         local_blocks: dict[BlockKey, MemDescriptor] = {}
         g3_blocks: dict[BlockKey, MemDescriptor] = {}
         remote_blocks: dict[BlockKey, MemDescriptor] = {}
-        for key, destination in blocks.items():
+        for key, destination in normalized.items():
             if self._is_local_resident(key):
                 local_blocks[key] = destination
             elif self._g3 is not None and self._g3.is_ready(key):
@@ -388,7 +399,7 @@ class _KVCRCore:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
@@ -400,15 +411,27 @@ class _KVCRCore:
                 {key: OpEntryResult(OpEntryStatus.FAILED) for key in blocks},
             )
         else:
-            self._local_dram.deposit(op_handle, blocks, no_evict=no_evict, hints=hints)
+            self._local_dram.deposit(
+                op_handle,
+                {
+                    key: self._normalize_descriptors(descriptors)
+                    for key, descriptors in blocks.items()
+                },
+                no_evict=no_evict,
+                hints=hints,
+            )
         return op_handle
 
     def fetch(
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
+        expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
+        expected_layout = [""] if expected_layout is None else expected_layout
+        if expected_layout != [self.pool_layout[0][1]]:
+            raise ValueError("expected layout must match the configured pool_layout")
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -671,6 +694,18 @@ class _KVCRCore:
                 sources.update(claimed)
                 self._local_dram_sources_by_op[op_id] = sources
         return sources
+
+    def _normalize_descriptors(self, descriptors: list[MemDescriptor]) -> MemDescriptor:
+        if not isinstance(descriptors, list):
+            raise TypeError("block descriptors must be a list")
+        if len(descriptors) != 1 or not isinstance(descriptors[0], MemDescriptor):
+            raise ValueError("each block requires exactly one descriptor")
+        descriptor = descriptors[0]
+        if descriptor.info != self.pool_layout[0][1]:
+            raise ValueError(f"unknown descriptor pool {descriptor.info!r}")
+        if descriptor.size != self.block_size_bytes:
+            raise ValueError("block descriptor has the wrong byte count")
+        return descriptor
 
     def _release_local_dram_sources(
         self,

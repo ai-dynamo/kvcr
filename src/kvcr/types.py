@@ -28,6 +28,10 @@ class MemDescriptor:
     In a scenario where one key spans multiple workers and NIXL agents, grouping
     its spans by endpoint and memory type would add two hierarchy levels merely
     to factor out values typically shared by reference.
+
+    ``info`` currently identifies the descriptor's pool in ``pool_layout``; an empty
+    string names the single unnamed pool. This generic field may support additional
+    metadata conventions later.
     """
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
@@ -38,7 +42,7 @@ class MemDescriptor:
     info: str = ""
 
 
-PinResult = tuple[PinHandle, Mapping[BlockKey, MemDescriptor | None]] | None
+PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]] | None
 
 
 class OpEntryStatus(Enum):
@@ -51,7 +55,7 @@ class OpEntryStatus(Enum):
 @dataclass(frozen=True)
 class OpEntryResult:
     status: OpEntryStatus
-    descriptor: MemDescriptor | None = None
+    descriptors: list[MemDescriptor] | None = None
     release_handle: ReleaseHandle | None = None
 
     @property

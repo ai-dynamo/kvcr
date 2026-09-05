@@ -279,7 +279,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
     """Replayed whole under its own terms, discardable when torn, gone once released."""
     with _attached(tmp_path) as pool:
         path = Path(pool._spec.path)
-        terms = canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec)
+        terms = canonical_pool_terms(_TEST_DIGEST, [(4096, "")], pool._spec)
         assert list(read_recovery_snapshot(pool, terms)) == []
 
         records = {
@@ -301,8 +301,8 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
 
         # A slot number only means the same bytes under the same geometry.
         for other in (
-            canonical_pool_terms("another-digest", 4096, pool._spec),
-            canonical_pool_terms(_TEST_DIGEST, 8192, pool._spec),
+            canonical_pool_terms("another-digest", [(4096, "")], pool._spec),
+            canonical_pool_terms(_TEST_DIGEST, [(8192, "")], pool._spec),
         ):
             with pytest.raises(RecoveryJournalError, match="other terms"):
                 list(read_recovery_snapshot(pool, other))
@@ -328,7 +328,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
             region[: _SNAPSHOT_HEADER.size] = bytes(_SNAPSHOT_HEADER.size)
         with pytest.raises(RecoveryJournalTornError, match="unfinished"):
             list(read_recovery_snapshot(pool, terms))
-        assert read_handback(pool, _TEST_DIGEST, 4096)._records == {}
+        assert read_handback(pool, _TEST_DIGEST, [(4096, "")])._records == {}
         assert list(read_recovery_snapshot(pool, terms)) == []
 
         # A released region is truncated away, so it replays nothing.

@@ -15,11 +15,26 @@ from .types import (
 InventorySink = Callable[[InventoryEvent], None]
 
 
+def _validate_pool_layout(pool_layout: list[tuple[int, str]]) -> None:
+    if not pool_layout:
+        raise ValueError("pool_layout must contain at least one pool")
+    names = []
+    for block_size_bytes, pool_name in pool_layout:
+        if type(block_size_bytes) is not int or block_size_bytes <= 0:
+            raise ValueError("pool_layout block size must be a positive integer")
+        if not isinstance(pool_name, str):
+            raise ValueError("pool_layout pool name must be a string")
+        names.append(pool_name)
+    if len(names) != len(set(names)):
+        raise ValueError("pool_layout pool names must be unique")
+    if len(names) > 1 and "" in names:
+        raise ValueError("pool_layout cannot use an empty name with multiple pools")
+
+
 @dataclass(frozen=True)
 class LocalDramOptions:
     address: int
-    length: int
-    slot_count: int
+    pool_sizes_bytes: list[tuple[int, str]]
     backend: str = "UCX"
 
 
@@ -105,6 +120,7 @@ class KeyAdapter(Protocol):
 @dataclass(frozen=True)
 class KVCRConfig:
     nixl_agent_name: str
+    pool_layout: list[tuple[int, str]]
     enable_telemetry: bool = False
     operation_timeout_ms: int = 1000
     inventory_report_interval_ms: int = 10
@@ -116,5 +132,4 @@ class KVCRConfig:
 class KVCRGuardConfig:
     kvcr_service_socket_path: str
     guard_index: int
-    row_stride: int
     compatibility_digest: str

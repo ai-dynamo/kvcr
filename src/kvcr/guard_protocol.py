@@ -15,7 +15,7 @@ from typing import Annotated, Literal
 
 import msgspec
 
-from .config import G3Options, LocalDramOptions
+from .config import G3Options, LocalDramOptions, _validate_pool_layout
 from .control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -48,19 +48,24 @@ class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    row_stride: Annotated[int, msgspec.Meta(gt=0)]
+    pool_layout: list[tuple[int, str]]
     g3: _G3Config | None
     remote_fw_dram_backend: Annotated[str, msgspec.Meta(min_length=1)] = "UCX"
 
     def __post_init__(self) -> None:
+        _validate_pool_layout(self.pool_layout)
+        # TODO: Support multiple pools after fetch and storage can discover layouts.
+        if len(self.pool_layout) != 1:
+            raise ValueError("only a single pool is currently supported")
+        block_size_bytes = self.pool_layout[0][0]
         # Mirrors what the claimant's _G3 will enforce. The first claim fixes
         # the pool's tiers forever, so a config no claimant could ever open
         # must be refused here, before it binds.
         if self.g3 is None:
             return
-        if self.row_stride % mmap.PAGESIZE:
+        if block_size_bytes % mmap.PAGESIZE:
             raise ValueError("G3 slot size must be page aligned")
-        if self.g3.capacity_bytes_per_file % self.row_stride:
+        if self.g3.capacity_bytes_per_file % block_size_bytes:
             raise ValueError("G3 file capacity must contain complete slots")
         resolved = {os.path.realpath(path) for path in self.g3.paths}
         if len(resolved) != len(self.g3.paths):
@@ -213,7 +218,7 @@ class KVCRClient:
     def claim(
         self,
         guard_index: int,
-        row_stride: int,
+        pool_layout: list[tuple[int, str]],
         compatibility_digest: str,
         control_bind: tuple[str, int],
         g3: G3Options | None = None,
@@ -226,14 +231,14 @@ class KVCRClient:
             "backend": g3.backend,
             "backend_options": dict(g3.backend_options),
         }
-        # msgspec.convert validates where __init__ would not: bad stride,
+        # msgspec.convert validates where __init__ would not: bad pool layout,
         # port or G3 path fails here, not at the service.
         request = msgspec.convert(
             {
                 "guard_index": guard_index,
                 "compatibility_digest": compatibility_digest,
                 "tier_config": {
-                    "row_stride": row_stride,
+                    "pool_layout": pool_layout,
                     "g3": g3_config,
                     "remote_fw_dram_backend": remote_fw_dram_backend,
                 },
@@ -262,19 +267,17 @@ class KVCRClient:
                     "claim was granted without the endpoint it answers on"
                 )
             try:
-                effective_bytes, rows = _compute_pool_geometry(
-                    spec.data_bytes, request.tier_config.row_stride
-                )
+                block_size, pool_name = request.tier_config.pool_layout[0]
+                effective_bytes, _ = _compute_pool_geometry(spec.data_bytes, block_size)
             except ValueError as geometry_error:
                 raise KVCRGuardProtocolError(
-                    "invalid pool grant: no room for the journal and one KV row"
+                    "invalid pool grant: no room for one KV block"
                 ) from geometry_error
             attachment = KVCRPoolAttachment.attach(spec)
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
                     attachment.data_address,
-                    effective_bytes,
-                    rows,
+                    [(effective_bytes, pool_name)],
                     request.tier_config.remote_fw_dram_backend,
                 ),
                 _attachment=attachment,
