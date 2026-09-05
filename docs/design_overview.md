@@ -145,7 +145,7 @@ kvcr = KVCR(
 
 kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemDescriptor]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
-kvcr.fetch(block_key_list, request_id=None, hints=None, expected_layouts=None, callback=None) -> OperationHandle # completion value is (list[MemDescriptor], release_handle)
+kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion value is (list[MemDescriptor], release_handle)
 kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemDescriptor]]
 kvcr.release(release_handle_list) -> list[Result[None, Error]]      # release fetch/no-evict claims
 
@@ -164,9 +164,10 @@ framework.release_pin(pin_handle)                                               
 
 The list-shaped API allows a key to span multiple pools. A descriptor's `info`
 can identify its pool and may be extended for other descriptor metadata.
-`fetch` may receive the expected layout for each key as a list of
-`(block_size_bytes, pool_name)` entries so KVCR can allocate the destinations
-immediately.
+`fetch` may receive the expected layout shared by its keys as an ordered list
+of pool names so KVCR can allocate the destinations. Repeated
+names represent multiple descriptors from the same pool. A single-pool caller
+using the empty pool name may omit it.
 
 ### Operating flow
 

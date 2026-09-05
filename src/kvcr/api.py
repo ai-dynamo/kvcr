@@ -166,11 +166,11 @@ class KVCR:
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
+        expected_layout: list[str] | None = None,
         hints: object | None = None,
-        expected_layouts: Mapping[BlockKey, list[tuple[int, str]]] | None = None,
     ) -> OpHandle:
         """Asynchronously fetch blocks into KVCR-managed storage."""
-        return self._core.fetch(keys, request_id, hints, expected_layouts)
+        return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(
         self,

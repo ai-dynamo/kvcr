@@ -443,6 +443,32 @@ def test_kvcr_rejects_multi_pool_layout() -> None:
         )
 
 
+def test_kvcr_rejects_ambiguous_pool_names() -> None:
+    bindings = KVCRBindings(Mock(), Mock(), Mock())
+    for pool_layout, message in (
+        ([(8, ""), (8, "swa")], "empty"),
+        ([(8, "swa"), (8, "swa")], "unique"),
+    ):
+        config = KVCRConfig(nixl_agent_name="target", pool_layout=pool_layout)
+        with pytest.raises(ValueError, match=message):
+            KVCR(config, bindings, KVCRBackendConfigs())
+
+
+def test_fetch_requires_layout_for_a_named_single_pool() -> None:
+    local = ctypes.create_string_buffer(16)
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "named")]),
+        local_dram=LocalDramOptions(ctypes.addressof(local), [(16, "named")]),
+    )
+
+    with pytest.raises(ValueError, match="expected layout"):
+        kvcr.fetch((BlockKey(b"key"),))
+    kvcr.fetch((BlockKey(b"key"),), expected_layout=["named"])
+
+
 def test_get_stats_emits_public_state_metric_name() -> None:
     kvcr = _new_kvcr(
         FakeNixlAgent(),
