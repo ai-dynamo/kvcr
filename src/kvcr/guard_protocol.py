@@ -15,7 +15,7 @@ from typing import Annotated, Literal
 
 import msgspec
 
-from .config import G3Options, LocalDramOptions
+from .config import G3Options, LocalDramOptions, _validate_pool_layout
 from .control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -53,14 +53,11 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     remote_fw_dram_backend: Annotated[str, msgspec.Meta(min_length=1)] = "UCX"
 
     def __post_init__(self) -> None:
+        _validate_pool_layout(self.pool_layout)
         # TODO: Support multiple pools after fetch and storage can discover layouts.
         if len(self.pool_layout) != 1:
             raise ValueError("only a single pool is currently supported")
-        block_size_bytes, pool_name = self.pool_layout[0]
-        if isinstance(block_size_bytes, bool) or block_size_bytes <= 0:
-            raise ValueError("pool layout block size must be a positive integer")
-        if not isinstance(pool_name, str):
-            raise ValueError("pool layout pool name must be a string")
+        block_size_bytes = self.pool_layout[0][0]
         # Mirrors what the claimant's _G3 will enforce. The first claim fixes
         # the pool's tiers forever, so a config no claimant could ever open
         # must be refused here, before it binds.

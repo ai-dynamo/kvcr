@@ -256,10 +256,9 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     deposit = kvcr.deposit({first_key: [_mem_descriptor(primary_addr)]}, no_evict=True)
     _wait_until(lambda: bool(agent.transfers))
     assert capacity_requests == [1]
-    layouts = {first_key: [(16, "")], second_key: [(8, "")]}
-    with pytest.raises(ValueError, match="expected layouts"):
-        kvcr.fetch((first_key, second_key), expected_layouts=layouts)
-    fetch = kvcr.fetch((first_key,), expected_layouts={first_key: [(block_size, "")]})
+    with pytest.raises(ValueError, match="expected layout"):
+        kvcr.fetch((first_key, second_key), expected_layout=["unknown"])
+    fetch = kvcr.fetch((first_key,), expected_layout=[""])
     assert kvcr.query((first_key,)) == [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
     assert list(kvcr.poll_completed()) == []
 

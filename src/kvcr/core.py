@@ -14,6 +14,7 @@ from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
     TelemetryStats,
+    _validate_pool_layout,
 )
 from .hint_parser import _parse_kv_hint
 from .local_disk import _G3, _G3Residency
@@ -116,14 +117,11 @@ class _KVCRCore:
     ) -> None:
         self.config = config
         self.pool_layout = list(config.pool_layout)
+        _validate_pool_layout(self.pool_layout)
         # TODO: Support multiple pools after remote fetch and G3 discover layouts.
         if len(self.pool_layout) != 1:
             raise ValueError("only a single pool is currently supported")
-        self.block_size_bytes, pool_name = self.pool_layout[0]
-        if type(self.block_size_bytes) is not int or self.block_size_bytes <= 0:
-            raise ValueError("pool_layout block size must be a positive integer")
-        if not isinstance(pool_name, str):
-            raise ValueError("pool_layout pool name must be a string")
+        self.block_size_bytes = self.pool_layout[0][0]
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.inventory_report_interval_ms < 0:
@@ -428,17 +426,16 @@ class _KVCRCore:
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
+        expected_layout: list[str] | None = None,
         hints: object | None = None,
-        expected_layouts: Mapping[BlockKey, list[tuple[int, str]]] | None = None,
     ) -> OpHandle:
+        expected_layout = [""] if expected_layout is None else expected_layout
+        if expected_layout != [self.pool_layout[0][1]]:
+            raise ValueError("expected layout must match the configured pool_layout")
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
         ordered_keys = tuple(dict.fromkeys(keys))
-        if expected_layouts is not None and any(
-            expected_layouts.get(key) != self.pool_layout for key in ordered_keys
-        ):
-            raise ValueError("expected layouts must match the configured pool_layout")
         if local_dram is None:
             self._complete(
                 op_handle,
