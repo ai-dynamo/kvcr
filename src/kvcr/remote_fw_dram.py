@@ -892,8 +892,11 @@ class _RemoteFWDram:
             ):
                 raise TypeError("invalid remaining_timeout_ms")
             keys = _message_keys(payload)
-            dst_descriptors = msgspec.convert(
-                payload["dst_descriptors"], type=_MEM_DESCRIPTORS_TYPE
+            dst_descriptors = tuple(
+                self._kvcr._normalize_descriptors([descriptor])
+                for descriptor in msgspec.convert(
+                    payload["dst_descriptors"], type=_MEM_DESCRIPTORS_TYPE
+                )
             )
         except (KeyError, TypeError, ValueError, msgspec.ValidationError):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
@@ -1289,7 +1292,7 @@ class _RemoteFWDram:
     def _install_framework_pin(
         self,
         keys: Collection[BlockKey],
-        pin_result: tuple[PinHandle, Mapping[BlockKey, MemDescriptor | None]],
+        pin_result: tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]],
     ) -> PinHandle | None:
         pin_handle: PinHandle | None = None
         try:
@@ -1299,16 +1302,19 @@ class _RemoteFWDram:
             requested_keys = set(keys)
             if set(descriptors) != requested_keys:
                 raise KeyError("request_pin returned incomplete descriptors")
-            if any(
-                descriptor is not None and not isinstance(descriptor, MemDescriptor)
-                for descriptor in descriptors.values()
-            ):
-                raise TypeError("request_pin returned invalid descriptors")
-            if not any(descriptor is not None for descriptor in descriptors.values()):
+            normalized = {
+                key: (
+                    None
+                    if descriptor_list is None
+                    else self._kvcr._normalize_descriptors(descriptor_list)
+                )
+                for key, descriptor_list in descriptors.items()
+            }
+            if not any(descriptor is not None for descriptor in normalized.values()):
                 raise ValueError("request_pin returned no descriptors")
             pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
             for key in keys:
-                descriptor = descriptors[key]
+                descriptor = normalized[key]
                 if descriptor is None:
                     continue
                 record = self._kvcr._block_record(key)
