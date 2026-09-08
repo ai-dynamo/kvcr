@@ -463,7 +463,7 @@ def _new_kvcr(
         config
         or KVCRConfig(
             nixl_agent_name=name,
-            pool_layout=[(16, "")],
+            pool_layouts=[("", 16)],
             inventory_report_interval_ms=0,
         ),
         nixl_agent_name=name,
@@ -509,7 +509,7 @@ def _new_local_kvcr(
         kvcr = KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layout=[(len(local) // slot_count, "")],
+                pool_layouts=[("", len(local) // slot_count)],
                 nixl_listen_port=1,
                 inventory_report_interval_ms=0,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
@@ -524,8 +524,7 @@ def _new_local_kvcr(
             ),
             KVCRBackendConfigs(
                 local_dram=LocalDramOptions(
-                    ctypes.addressof(local),
-                    [(len(local), "")],
+                    [("", ctypes.addressof(local), len(local))],
                     local_dram_backend,
                 ),
             ),

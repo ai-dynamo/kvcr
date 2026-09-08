@@ -166,11 +166,11 @@ def _new_g3_kvcr(
         control or FakeBytesControl(),
         config=KVCRConfig(
             nixl_agent_name="target",
-            pool_layout=[(len(local) // slot_count, "")],
+            pool_layouts=[("", len(local) // slot_count)],
             enable_telemetry=telemetry,
             inventory_report_interval_ms=10 if telemetry else 0,
         ),
-        local_dram=LocalDramOptions(ctypes.addressof(local), [(len(local), "")]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
             paths=((tmp_path / "g3.data",) if g3_paths is None else tuple(g3_paths)),
             capacity_bytes_per_file=page_size * g3_slot_count,

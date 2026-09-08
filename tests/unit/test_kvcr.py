@@ -161,7 +161,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
     hold = _fake_hold(
-        local_dram=LocalDramOptions(1234, [(8192, "")]),
+        local_dram=LocalDramOptions([("", 1234, 8192)]),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -219,7 +219,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layout=[(1024, "")],
+                pool_layouts=[("", 1024)],
                 nixl_listen_port=1,
             ),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
@@ -244,7 +244,7 @@ def test_startup_timeout_retains_nonquiescent_resources(
     entered = threading.Event()
     unblock = threading.Event()
     hold = _fake_hold(
-        local_dram=LocalDramOptions(1234, [(8192, "")]),
+        local_dram=LocalDramOptions([("", 1234, 8192)]),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=Mock(),
@@ -282,7 +282,7 @@ def test_startup_timeout_retains_nonquiescent_resources(
             KVCR(
                 KVCRConfig(
                     nixl_agent_name="target",
-                    pool_layout=[(1024, "")],
+                    pool_layouts=[("", 1024)],
                     nixl_listen_port=1,
                 ),
                 KVCRBindings(
@@ -319,7 +319,7 @@ def test_service_journal_is_attached_before_primary_start(
     events: list[str] = []
     attachment = _UNSERVED_POOL
     hold = _fake_hold(
-        local_dram=LocalDramOptions(1234, [(8192, "")]),
+        local_dram=LocalDramOptions([("", 1234, 8192)]),
         _attachment=attachment,
         _control_listener_fd=7,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -370,7 +370,7 @@ def test_service_journal_is_attached_before_primary_start(
         remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
     )
     controller = KVCR(
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(1024, "")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 1024)]),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         backend_configs,
         KVCRGuardConfig(
@@ -382,7 +382,7 @@ def test_service_journal_is_attached_before_primary_start(
 
     claim.assert_called_once_with(
         3,
-        [(1024, "")],
+        [("", 1024)],
         "Opaque-Digest",
         ("127.0.0.1", 5555),
         g3_config,
@@ -413,9 +413,9 @@ def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> N
 
     with pytest.raises(ValueError, match="local_dram"):
         KVCR(
-            KVCRConfig(nixl_agent_name="target", pool_layout=[(1024, "")]),
+            KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 1024)]),
             KVCRBindings(Mock(), Mock(), Mock()),
-            KVCRBackendConfigs(local_dram=LocalDramOptions(1234, [(8192, "")])),
+            KVCRBackendConfigs(local_dram=LocalDramOptions([("", 1234, 8192)])),
             _GUARD_CONFIG,
         )
 
@@ -425,18 +425,18 @@ def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> N
 def test_kvcr_rejects_no_dram_backends() -> None:
     with pytest.raises(ValueError, match="at least one DRAM backend"):
         KVCR(
-            KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
+            KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
             KVCRBindings(Mock(), Mock(), Mock()),
             KVCRBackendConfigs(),
         )
 
 
-def test_kvcr_rejects_multi_pool_layout() -> None:
+def test_kvcr_rejects_multi_pool_layouts() -> None:
     with pytest.raises(ValueError, match="only a single pool"):
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layout=[(8, "full"), (8, "swa")],
+                pool_layouts=[("full", 8), ("swa", 8)],
             ),
             KVCRBindings(Mock(), Mock(), Mock()),
             KVCRBackendConfigs(),
@@ -445,11 +445,11 @@ def test_kvcr_rejects_multi_pool_layout() -> None:
 
 def test_kvcr_rejects_ambiguous_pool_names() -> None:
     bindings = KVCRBindings(Mock(), Mock(), Mock())
-    for pool_layout, message in (
-        ([(8, ""), (8, "swa")], "empty"),
-        ([(8, "swa"), (8, "swa")], "unique"),
+    for pool_layouts, message in (
+        ([("", 8), ("swa", 8)], "empty"),
+        ([("swa", 8), ("swa", 8)], "unique"),
     ):
-        config = KVCRConfig(nixl_agent_name="target", pool_layout=pool_layout)
+        config = KVCRConfig(nixl_agent_name="target", pool_layouts=pool_layouts)
         with pytest.raises(ValueError, match=message):
             KVCR(config, bindings, KVCRBackendConfigs())
 
@@ -460,8 +460,8 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
         FakeNixlAgent(),
         FakePrimaryPinning(),
         FakeBytesControl(),
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "named")]),
-        local_dram=LocalDramOptions(ctypes.addressof(local), [(16, "named")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("named", 16)]),
+        local_dram=LocalDramOptions([("named", ctypes.addressof(local), 16)]),
     )
 
     with pytest.raises(ValueError, match="expected layout"):
@@ -476,7 +476,7 @@ def test_get_stats_emits_public_state_metric_name() -> None:
         FakeBytesControl(),
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layout=[(16, "")],
+            pool_layouts=[("", 16)],
             enable_telemetry=True,
         ),
     )
@@ -521,7 +521,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     kvcr = KVCR(
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layout=[(64, "")],
+            pool_layouts=[("", 64)],
             nixl_listen_port=1234,
         ),
         KVCRBindings(
@@ -534,7 +534,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ),
         KVCRBackendConfigs(
             framework_dram=FrameworkDramInput(128, 256),
-            local_dram=LocalDramOptions(384, [(128, "")], "LOCAL"),
+            local_dram=LocalDramOptions([("", 384, 128)], "LOCAL"),
             remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
         ),
     )

@@ -215,7 +215,7 @@ from kvcr.config import KVCRBackendConfigs, KVCRConfig
 runner = KVCR(
     config=KVCRConfig(
         nixl_agent_name="worker-0",
-        pool_layout=[(block_size_bytes, "")],
+        pool_layouts=[("", block_size_bytes)],
     ),
     bindings=KVCRBindings(
         request_pin=request_pin,
@@ -344,12 +344,13 @@ GiB plus the journal for every Guard. The current claim path exposes those
 regions as one combined data area.
 
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(guard_index, pool_layout, compatibility_digest, control_bind)`,
+`KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)`,
 naming the address its Guard will answer on. The digest must match the service
-exactly, and callers must change it whenever the pool layout or any other KV-cache
-term changes. The returned `KVCRPoolHold` describes the mapped local DRAM and
-owns an exclusive lease on the pool. Only one pool-layout entry is currently
-supported; an empty string is a valid pool name.
+exactly, and each pool-layout entry is `(pool_name, block_size_bytes)`. Callers must
+change the digest whenever the pool layout or any other KV-cache term changes.
+The returned `KVCRPoolHold` describes the mapped local DRAM and owns an exclusive
+lease on the pool. Only one pool-layout entry is currently supported; an empty
+string is a valid pool name.
 
 **A pool's configuration is fixed by its first claim.** Every later claim on
 that pool must name the same pool layout and, when G3 is configured, the same
