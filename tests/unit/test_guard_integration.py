@@ -18,6 +18,7 @@ import pytest
 from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
+    _ConstantHashAdapter,
     _has_outstanding_operations,
     _mem_descriptor,
     _new_kvcr,
@@ -341,6 +342,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
             target_pinning.request_pin,
             target_pinning.poll_pin_results,
             target_pinning.release_pin,
+            key_adapter=_ConstantHashAdapter(),
             framework_control=ZmqPeerControlChannel(
                 "127.0.0.1", free_port(), "127.0.0.1"
             ),
@@ -462,6 +464,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
                 pool_layouts=[("", page_size)],
                 operation_timeout_ms=5000,
             ),
+            key_adapter=_ConstantHashAdapter(),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
             framework_dram=FrameworkDramInput(
                 ctypes.addressof(target_memory), len(target_memory)

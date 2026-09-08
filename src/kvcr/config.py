@@ -70,6 +70,16 @@ class KVCRBackendConfigs:
     local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
     remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)
+    # Frameworks with several disjoint host-cache tensors cannot describe them
+    # as one address range. Keep the singular field above for API compatibility;
+    # callers must choose exactly one spelling.
+    framework_dram_regions: tuple[FrameworkDramInput, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.framework_dram is not None and self.framework_dram_regions:
+            raise ValueError(
+                "framework_dram and framework_dram_regions are mutually exclusive"
+            )
 
 
 class TelemetryStats(Protocol):

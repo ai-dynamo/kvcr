@@ -8,8 +8,12 @@ from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import (
+    FakeBytesControl,
     FakeNixlAgent,
+    FakePrimaryPinning,
+    FakeTelemetryStats,
     _mem_descriptor,
+    _new_kvcr,
     _new_local_kvcr,
     _op_entries,
     _poll_until,
@@ -17,6 +21,12 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr import (
+    STATE_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+)
+from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
@@ -32,6 +42,223 @@ from kvcr.types import (
     PlacementAction,
     QueryStatus,
 )
+
+
+def _new_multi_pool_kvcr(
+    agent,
+    pool_layouts,
+    pools,
+    *,
+    telemetry: bool = False,
+    inventory_sink=None,
+):
+    control = FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        config=KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=pool_layouts,
+            enable_telemetry=telemetry,
+            inventory_report_interval_ms=0,
+        ),
+        local_dram=LocalDramOptions(
+            [(name, ctypes.addressof(buffer), len(buffer)) for name, buffer in pools]
+        ),
+        inventory_sink=inventory_sink,
+    )
+    return kvcr, control
+
+
+def _metric_totals(stats: FakeTelemetryStats):
+    totals = {}
+    for kind, name, value, labels in stats.records:
+        key = (kind, name, *labels)
+        totals[key] = totals.get(key, 0) + value
+    return totals
+
+
+def test_composite_local_pool_deposit_deliver_and_layout_validation() -> None:
+    primary = ctypes.create_string_buffer(40)
+    primary.raw = b"a" * 8 + b"b" * 16 + b"c" * 16
+    local_full = ctypes.create_string_buffer(8)
+    local_swa = ctypes.create_string_buffer(32)
+    destination = ctypes.create_string_buffer(40)
+    primary_addr = ctypes.addressof(primary)
+    destination_addr = ctypes.addressof(destination)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr, control = _new_multi_pool_kvcr(
+        agent,
+        [("full", 8), ("swa", 16)],
+        (("full", local_full), ("swa", local_swa)),
+        telemetry=True,
+    )
+    key = BlockKey(b"composite")
+
+    deposit = kvcr.deposit(
+        {
+            key: [
+                _mem_descriptor(primary_addr, 8, "full"),
+                _mem_descriptor(primary_addr + 8, 16, "swa"),
+                _mem_descriptor(primary_addr + 24, 16, "swa"),
+            ]
+        }
+    )
+    assert dict(_poll_until(kvcr, bool))[deposit] == _op_entries({key: True})
+    assert local_full.raw == b"a" * 8
+    assert local_swa.raw == b"b" * 16 + b"c" * 16
+    assert len(agent.xfers) == 1
+
+    registrations = [
+        (descriptors, mem_type) for descriptors, mem_type in agent.registrations
+    ]
+    assert len(registrations) == 2
+    assert {
+        (descriptors[0][0], descriptors[0][1], mem_type)
+        for descriptors, mem_type in registrations
+    } == {
+        (ctypes.addressof(local_full), 8, "DRAM"),
+        (ctypes.addressof(local_swa), 32, "DRAM"),
+    }
+    assert all(len(descriptors) == 1 for descriptors, _ in registrations)
+
+    wrong_duplicate = kvcr.deposit(
+        {
+            key: [
+                _mem_descriptor(primary_addr, 8, "full"),
+                _mem_descriptor(primary_addr + 8, 16, "swa"),
+            ]
+        }
+    )
+    assert list(kvcr.poll_completed()) == [(wrong_duplicate, _op_entries({key: False}))]
+    assert len(agent.xfers) == 1
+    sources = kvcr._core._local_dram.acquire_sources((key,))
+    assert [descriptor.info for descriptor in sources[key]] == [
+        "full",
+        "swa",
+        "swa",
+    ]
+    assert [descriptor.size for descriptor in sources[key]] == [8, 16, 16]
+    assert [descriptor.addr for descriptor in sources[key]] == [
+        ctypes.addressof(local_full),
+        ctypes.addressof(local_swa),
+        ctypes.addressof(local_swa) + 16,
+    ]
+    assert kvcr._core._block_record_map[key].local_dram.claim_count == 1
+    kvcr._core._local_dram.release_sources((key,))
+    assert kvcr._core._block_record_map[key].local_dram.claim_count == 0
+
+    wrong_destination = kvcr.deliver(
+        {
+            key: [
+                _mem_descriptor(destination_addr, 16, "swa"),
+                _mem_descriptor(destination_addr + 16, 8, "full"),
+                _mem_descriptor(destination_addr + 24, 16, "swa"),
+            ]
+        }
+    )
+    assert list(kvcr.poll_completed()) == [
+        (wrong_destination, _op_entries({key: False}))
+    ]
+    assert len(agent.xfers) == 1
+
+    with pytest.raises(ValueError, match="wrong byte count"):
+        kvcr.deposit({key: [_mem_descriptor(primary_addr, 16, "full")]})
+
+    deliver = kvcr.deliver(
+        {
+            key: [
+                _mem_descriptor(destination_addr, 8, "full"),
+                _mem_descriptor(destination_addr + 8, 16, "swa"),
+                _mem_descriptor(destination_addr + 24, 16, "swa"),
+            ]
+        }
+    )
+    assert dict(_poll_until(kvcr, bool))[deliver] == _op_entries({key: True})
+    assert destination.raw == primary.raw
+    assert len(agent.xfers) == 2
+    assert all(transfer[4] == agent.name for transfer in agent.xfers)
+    assert control.sent == []
+
+    stats = kvcr.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    metrics = _metric_totals(stats)
+    assert metrics[("counter", TRANSFER_BLOCKS_METRIC, "local_fill")] == 1
+    assert metrics[("counter", TRANSFER_BYTES_METRIC, "local_fill")] == 40
+    assert metrics[("counter", TRANSFER_BLOCKS_METRIC, "local_deliver")] == 1
+    assert metrics[("counter", TRANSFER_BYTES_METRIC, "local_deliver")] == 40
+    expected_state = {
+        "local_g2_total_slots": 3,
+        "local_g2_free_slots": 0,
+        "local_g2_allocated_slots": 3,
+        "local_g2_evictable_slots": 3,
+        "local_g2_total_bytes": 40,
+        "local_g2_free_bytes": 0,
+        "local_g2_allocated_bytes": 40,
+        "local_g2_evictable_bytes": 40,
+        "local_g2_pool_full_total_slots": 1,
+        "local_g2_pool_full_free_slots": 0,
+        "local_g2_pool_full_allocated_slots": 1,
+        "local_g2_pool_full_evictable_slots": 1,
+        "local_g2_pool_swa_total_slots": 2,
+        "local_g2_pool_swa_free_slots": 0,
+        "local_g2_pool_swa_allocated_slots": 2,
+        "local_g2_pool_swa_evictable_slots": 2,
+    }
+    assert {
+        labels[0]: value
+        for kind, name, value, labels in stats.records
+        if kind == "gauge" and name == STATE_METRIC
+    }.items() >= expected_state.items()
+
+
+def test_equal_sized_named_pools_keep_capacity_and_eviction_isolated() -> None:
+    primary = ctypes.create_string_buffer(24)
+    primary.raw = b"a" * 8 + b"b" * 8 + b"c" * 8
+    primary_addr = ctypes.addressof(primary)
+    local_full = ctypes.create_string_buffer(8)
+    local_swa = ctypes.create_string_buffer(8)
+    events: list[InventoryEvent] = []
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr, _ = _new_multi_pool_kvcr(
+        agent,
+        [("full", 8), ("swa", 8)],
+        (("full", local_full), ("swa", local_swa)),
+        inventory_sink=events.append,
+    )
+    key_full_old = BlockKey(b"full-old")
+    key_full_new = BlockKey(b"full-new")
+    key_swa = BlockKey(b"swa")
+
+    first = kvcr.deposit(
+        {
+            key_full_old: [_mem_descriptor(primary_addr, 8, "full")],
+            key_swa: [_mem_descriptor(primary_addr + 8, 8, "swa")],
+        }
+    )
+    assert dict(_poll_until(kvcr, bool))[first] == _op_entries(
+        {key_full_old: True, key_swa: True}
+    )
+
+    replacement = kvcr.deposit(
+        {key_full_new: [_mem_descriptor(primary_addr + 16, 8, "full")]}
+    )
+    assert dict(_poll_until(kvcr, bool))[replacement] == _op_entries(
+        {key_full_new: True}
+    )
+    assert kvcr.query((key_full_old, key_full_new, key_swa)) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+    assert local_full.raw == b"c" * 8
+    assert local_swa.raw == b"b" * 8
+    assert [key for event in events if event.removed for key in event.keys] == [
+        key_full_old
+    ]
 
 
 def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
@@ -105,13 +332,6 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
         InventoryEvent((keys[0],), CacheTier.LOCAL_G2, True),
         InventoryEvent((keys[2],), CacheTier.LOCAL_G2, False),
     ]
-
-
-def test_local_transfer_rejects_multiple_descriptors() -> None:
-    kvcr = _new_local_kvcr(FakeNixlAgent(), ctypes.create_string_buffer(16), 1)
-
-    with pytest.raises(ValueError, match="exactly one descriptor"):
-        kvcr.deposit({BlockKey(b"key"): [_mem_descriptor(), _mem_descriptor()]})
 
 
 @pytest.mark.parametrize(
@@ -256,7 +476,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     deposit = kvcr.deposit({first_key: [_mem_descriptor(primary_addr)]}, no_evict=True)
     _wait_until(lambda: bool(agent.transfers))
     assert capacity_requests == [1]
-    with pytest.raises(ValueError, match="expected layout"):
+    with pytest.raises(ValueError, match="unknown pool"):
         kvcr.fetch((first_key, second_key), expected_layout=["unknown"])
     fetch = kvcr.fetch((first_key,), expected_layout=[""])
     assert kvcr.query((first_key,)) == [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
@@ -351,7 +571,7 @@ def test_capacity_needed_is_edge_triggered() -> None:
     ("failure", "terminal_state", "success"),
     [
         ("submission", None, False),
-        ("timeout", None, False),
+        ("timeout", "ERR", False),
         ("timeout", "DONE", True),
     ],
 )
@@ -389,7 +609,15 @@ def test_local_deposit_waits_for_safe_release(
     _wait_until(lambda: bool(agent.transfers))
     if failure == "timeout":
         now = 2.0
-    _wait_until(lambda: agent.release_attempts > 0)
+        _wait_until(
+            lambda: any(
+                bool(getattr(op, "cancellation_requested", False))
+                for op in kvcr._core._progress._in_flight_ops.values()
+            )
+        )
+        assert agent.release_attempts == 0
+    else:
+        _wait_until(lambda: agent.release_attempts > 0)
 
     assert list(kvcr.poll_completed()) == []
     assert kvcr._core._block_record_map[key].local_dram is not None

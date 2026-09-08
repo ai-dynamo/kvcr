@@ -883,6 +883,7 @@ class _Guard:
                     backend=self._configured.remote_fw_dram_backend
                 ),
             ),
+            recovery_enabled=True,
         )
         self._core = core
         core.adopt_recovery_records(records)

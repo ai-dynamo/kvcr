@@ -431,15 +431,112 @@ def test_kvcr_rejects_no_dram_backends() -> None:
         )
 
 
-def test_kvcr_rejects_multi_pool_layouts() -> None:
-    with pytest.raises(ValueError, match="only a single pool"):
-        KVCR(
+def test_kvcr_accepts_equal_sized_named_local_pools() -> None:
+    full = ctypes.create_string_buffer(16)
+    swa = ctypes.create_string_buffer(24)
+    agent = FakeNixlAgent()
+
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 8), ("swa", 8)],
+        ),
+        local_dram=LocalDramOptions(
+            [
+                ("full", ctypes.addressof(full), len(full)),
+                ("swa", ctypes.addressof(swa), len(swa)),
+            ]
+        ),
+    )
+
+    assert kvcr.config.pool_layouts == [("full", 8), ("swa", 8)]
+
+
+def test_g3_rejects_multiple_pool_layouts(tmp_path) -> None:
+    local = ctypes.create_string_buffer(32)
+    with pytest.raises(ValueError, match="G3.*multiple pool layouts"):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layouts=[("full", 8), ("swa", 8)],
+                pool_layouts=[("full", 8), ("swa", 16)],
             ),
-            KVCRBindings(Mock(), Mock(), Mock()),
-            KVCRBackendConfigs(),
+            local_dram=LocalDramOptions(
+                [
+                    ("full", ctypes.addressof(local), 16),
+                    ("swa", ctypes.addressof(local) + 16, 16),
+                ]
+            ),
+            g3=G3Options(
+                paths=(tmp_path / "g3.data",),
+                capacity_bytes_per_file=16,
+                backend="MOCK",
+            ),
+        )
+
+
+def test_g3_rejects_repeated_single_pool_descriptors(tmp_path, monkeypatch) -> None:
+    primary = ctypes.create_string_buffer(32)
+    local = ctypes.create_string_buffer(32)
+    monkeypatch.setattr("kvcr.core._G3", Mock(return_value=Mock()))
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        g3=G3Options(
+            paths=(tmp_path / "g3.data",),
+            capacity_bytes_per_file=16,
+            backend="MOCK",
+        ),
+    )
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(primary), 16),
+        _mem_descriptor(ctypes.addressof(primary) + 16, 16),
+    ]
+
+    with pytest.raises(ValueError, match="exactly one descriptor"):
+        kvcr.deposit({BlockKey(b"composite"): descriptors})
+    with pytest.raises(ValueError, match="exactly one descriptor"):
+        kvcr.fetch((BlockKey(b"composite"),), expected_layout=["", ""])
+
+
+def test_plural_framework_regions_are_registered_independently() -> None:
+    first = ctypes.create_string_buffer(16)
+    second = ctypes.create_string_buffer(24)
+    agent = FakeNixlAgent()
+
+    _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_dram_regions=(
+            FrameworkDramInput(ctypes.addressof(first), len(first)),
+            FrameworkDramInput(ctypes.addressof(second), len(second)),
+        ),
+    )
+
+    assert {
+        (descriptors[0][0], descriptors[0][1])
+        for descriptors, mem_type in agent.registrations
+        if mem_type == "DRAM"
+    } == {
+        (ctypes.addressof(first), len(first)),
+        (ctypes.addressof(second), len(second)),
+    }
+
+
+def test_singular_and_plural_framework_regions_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="framework_dram"):
+        KVCRBackendConfigs(
+            framework_dram=FrameworkDramInput(128, 16),
+            framework_dram_regions=(FrameworkDramInput(256, 16),),
         )
 
 

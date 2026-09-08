@@ -210,7 +210,7 @@ configuration, backend memory descriptions, and callbacks:
 
 ```python
 from kvcr import KVCR, KVCRBindings
-from kvcr.config import KVCRBackendConfigs, KVCRConfig
+from kvcr.config import KVCRBackendConfigs, KVCRConfig, LocalDramOptions
 
 runner = KVCR(
     config=KVCRConfig(
@@ -228,6 +228,31 @@ runner = KVCR(
 
 The callback names above represent services implemented by the framework
 adapter; they are not provided by KVCR itself.
+
+For a heterogeneous cache, configure each allocator pool once and provide its
+own memory region:
+
+```python
+config = KVCRConfig(
+    nixl_agent_name="worker-0",
+    pool_layouts=[("full", full_block_bytes), ("swa", swa_block_bytes)],
+)
+backends = KVCRBackendConfigs(
+    local_dram=LocalDramOptions(
+        pools=[
+            ("full", full_address, full_capacity_bytes),
+            ("swa", swa_address, swa_capacity_bytes),
+        ]
+    )
+)
+```
+
+The pool names, not their block sizes, identify capacity. Thus equal-sized
+`full` and `swa` pools are still independent. A key's descriptor list states
+its ordered layout; for example, `full, swa, swa` reserves one `full` slot and
+two `swa` slots atomically. G3, Guard recovery, and the capacity-low-watermark
+callback currently support only one configured pool; G3 and Guard additionally
+require one descriptor per key.
 
 The main calls are:
 

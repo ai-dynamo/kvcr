@@ -250,8 +250,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 
     # The seeding mechanics live on the core (adopt_recovery_records); this
     # test orders the Guard's calls around it, not what happens inside it.
-    def new_core(config, bindings, backends) -> Mock:
-        constructed.append((config, bindings, backends))
+    def new_core(config, bindings, backends, *, recovery_enabled=False) -> Mock:
+        constructed.append((config, bindings, backends, recovery_enabled))
         core = Mock(_local_dram=Mock(), _g3=None, _block_record_map={})
         core.adopt_recovery_records.side_effect = lambda records: order.append(
             ("adopt", tuple(records))
@@ -301,7 +301,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         promoted_records = guard._recovery.mirror._records
         guard._promote()
 
-        config, bindings, backends = constructed[0]
+        config, bindings, backends, recovery_enabled = constructed[0]
+        assert recovery_enabled
         prefix = "KVCR-Guard-"
         assert config.nixl_agent_name.startswith(prefix)
         uuid.UUID(config.nixl_agent_name.removeprefix(prefix))

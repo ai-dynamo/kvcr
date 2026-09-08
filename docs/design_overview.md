@@ -169,6 +169,15 @@ of pool names so KVCR can allocate the destinations. Repeated names represent
 multiple descriptors from the same pool. A single-pool caller using the empty
 pool name may omit it.
 
+`pool_layouts` defines the unique named pools and their descriptor sizes;
+`LocalDramOptions.pools` supplies one independently sized memory region for
+each name. Names remain distinct even when their descriptor sizes are equal.
+For each key, KVCR treats the ordered descriptor list as one atomic residency:
+allocation either reserves every required extent, including repeated names, or
+reserves none, and eviction releases the whole residency. G3, Guard recovery,
+and the capacity-low-watermark callback currently require one configured pool;
+G3 and Guard additionally require one descriptor per key.
+
 ### Operating flow
 
 **Using KVCR-owned DRAM**

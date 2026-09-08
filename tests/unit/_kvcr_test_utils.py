@@ -454,6 +454,7 @@ def _new_kvcr(
     key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
     framework_dram: FrameworkDramInput | None = None,
+    framework_dram_regions: tuple[FrameworkDramInput, ...] = (),
     local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
     inventory_sink=None,
@@ -485,6 +486,7 @@ def _new_kvcr(
             ),
             KVCRBackendConfigs(
                 framework_dram=framework_dram,
+                framework_dram_regions=framework_dram_regions,
                 local_dram=local_dram,
                 g3=g3,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),

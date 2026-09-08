@@ -482,6 +482,7 @@ def claimed_core(
         config,
         bindings,
         replace(backend_configs, local_dram=claimed.hold.local_dram),
+        recovery_enabled=True,
     )
 
 
