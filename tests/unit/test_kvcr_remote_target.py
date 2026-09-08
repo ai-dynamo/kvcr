@@ -59,7 +59,7 @@ def test_submit_hint_filters_unlisted_hash():
     assert target.query((BlockKey(b"k"),), "req") == [(QueryStatus.MISS, None)]
 
 
-def test_submit_hint_handles_source_less_protocol_hint():
+def test_submit_hint_rejects_source_less_protocol_hint():
     target = _new_kvcr(
         FakeNixlAgent(),
         FakePrimaryPinning(),
@@ -67,16 +67,9 @@ def test_submit_hint_handles_source_less_protocol_hint():
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
-    hint = {"block_hashes": [1], "no_retain": True}
 
-    target.submit_hint(hint, request_id="req")
-
-    stored = target._core._remote_fw_dram._request_hints["req"]
-    assert stored.source is None
-    assert target.query((BlockKey(b"k"),), "req") == [(QueryStatus.MISS, None)]
-
-    with pytest.raises(ValueError, match="only copy mode is currently supported"):
-        target.submit_hint({"block_hashes": [1], "mode": "move"})
+    with pytest.raises(ValueError, match="invalid router hint"):
+        target.submit_hint(_router_hint(None, (1,), no_retain=True), request_id="req")
 
 
 def test_kvcr_opportunistic_query_accepts_key_outside_hint():
