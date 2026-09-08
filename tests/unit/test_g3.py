@@ -12,12 +12,13 @@ from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
     FakeTelemetryStats,
+    _ConstantHashAdapter,
     _decode_control_message,
     _has_outstanding_operations,
-    _MatchingHintAdapter,
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _router_hint,
     _write_done_notification,
 )
 
@@ -30,7 +31,7 @@ from kvcr import (
 from kvcr.config import (
     G3Options,
     KVCRConfig,
-    LocalDramInfo,
+    LocalDramOptions,
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
@@ -96,15 +97,11 @@ class _FakeG3Agent(FakeNixlAgent):
 
     def transfer(self, handle):
         backend = self._xfer_backends[handle]
-        if not backend:
+        if backend != ("MOCK",):
             return super().transfer(handle)
         self.transfers.append(handle)
         operation = self.xfers[handle - 1][0]
-        if (
-            self._fail_file_writes
-            and operation == "WRITE"
-            and self._xfer_backends[handle] == ("MOCK",)
-        ):
+        if self._fail_file_writes and operation == "WRITE":
             return "ERR"
         _, local_descs, local_indices, remote_descs, _, _ = self.xfers[handle - 1]
         for index in local_indices:
@@ -157,7 +154,7 @@ def _new_g3_kvcr(
     g3_slot_count=2,
     control=None,
     telemetry=False,
-    key_hint_adapter=None,
+    key_adapter=None,
     remote_options=None,
     inventory_sink=None,
     g3_paths=None,
@@ -167,12 +164,13 @@ def _new_g3_kvcr(
         agent or _FakeG3Agent(),
         FakePrimaryPinning(),
         control or FakeBytesControl(),
-        config=(
-            KVCRConfig(nixl_agent_name="target", enable_telemetry=True)
-            if telemetry
-            else None
+        config=KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", len(local) // slot_count)],
+            enable_telemetry=telemetry,
+            inventory_report_interval_ms=10 if telemetry else 0,
         ),
-        local_dram=LocalDramInfo(ctypes.addressof(local), len(local), slot_count),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
             paths=((tmp_path / "g3.data",) if g3_paths is None else tuple(g3_paths)),
             capacity_bytes_per_file=page_size * g3_slot_count,
@@ -181,13 +179,13 @@ def _new_g3_kvcr(
         ),
         policy=policy,
         inventory_sink=inventory_sink,
-        key_hint_adapter=key_hint_adapter,
+        key_adapter=key_adapter,
         remote_options=remote_options,
     )
 
 
 def _deposit(kvcr, key, address, size):
-    handle = kvcr.deposit({key: _mem_descriptor(address, size)})
+    handle = kvcr.deposit({key: [_mem_descriptor(address, size)]})
     return dict(_poll_until(kvcr, bool))[handle][key]
 
 
@@ -359,7 +357,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     destination_addr = ctypes.addressof(destination)
     deliver = kvcr.deliver(
         {
-            key: _mem_descriptor(destination_addr + index * page_size, page_size)
+            key: [_mem_descriptor(destination_addr + index * page_size, page_size)]
             for index, key in enumerate(keys[:4])
         }
     )
@@ -385,7 +383,11 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     assert replacement is not None and replacement.slot == evicted_slot
     replacement_destination = ctypes.create_string_buffer(page_size)
     replacement_deliver = kvcr.deliver(
-        {keys[4]: _mem_descriptor(ctypes.addressof(replacement_destination), page_size)}
+        {
+            keys[4]: [
+                _mem_descriptor(ctypes.addressof(replacement_destination), page_size)
+            ]
+        }
     )
     replacement_result = dict(
         _poll_until(kvcr, lambda done: replacement_deliver in dict(done))
@@ -453,7 +455,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     ]
 
     deliver = kvcr.deliver(
-        {second: _mem_descriptor(ctypes.addressof(destination), page_size)}
+        {second: [_mem_descriptor(ctypes.addressof(destination), page_size)]}
     )
     assert dict(_poll_until(kvcr, bool))[deliver][second].success
     assert destination.raw == b"s" * page_size
@@ -508,12 +510,12 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
     assert kvcr._core._block_record_map[first].local_dram is None
     local_deliver = kvcr.deliver(
-        {second: _mem_descriptor(ctypes.addressof(destination), page_size)}
+        {second: [_mem_descriptor(ctypes.addressof(destination), page_size)]}
     )
     assert dict(_poll_until(kvcr, bool))[local_deliver][second].success
     now = 1.0
     deliver = kvcr.deliver(
-        {first: _mem_descriptor(ctypes.addressof(destination), page_size)}
+        {first: [_mem_descriptor(ctypes.addressof(destination), page_size)]}
     )
     assert dict(_poll_until(kvcr, bool))[deliver][first].success
     assert destination.raw == b"a" * page_size
@@ -522,8 +524,11 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     now = 2.0
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, bool))[fetch][first]
-    assert fetch_result.success and fetch_result.descriptor is not None
-    assert ctypes.string_at(fetch_result.descriptor.addr, page_size) == b"a" * page_size
+    assert fetch_result.success and fetch_result.descriptors is not None
+    assert (
+        ctypes.string_at(fetch_result.descriptors[0].addr, page_size)
+        == b"a" * page_size
+    )
     record = kvcr._core._block_record_map[first]
     assert record.local_dram is not None and record.g3 is not None
     assert [
@@ -580,7 +585,7 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         agent=agent,
         slot_count=2,
         control=control,
-        key_hint_adapter=_MatchingHintAdapter(),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
 
@@ -591,7 +596,7 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
             ctypes.addressof(primary) + index * page_size,
             page_size,
         ).success
-    kvcr.submit_hint(remotes, src="tcp://source:1", request_id="req", hints="hint")
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = kvcr.fetch(remotes, request_id="req")
 
     _poll_until(
@@ -666,7 +671,7 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         def transfer(self, handle):
             result = super().transfer(handle)
             operation = self.xfers[handle - 1][0]
-            if operation == "READ" and self._xfer_backends[handle]:
+            if operation == "READ" and self._xfer_backends[handle] == ("MOCK",):
                 return "PROC"
             return result
 
@@ -674,7 +679,7 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
             operation = self.xfers[handle - 1][0]
             if (
                 operation == "READ"
-                and self._xfer_backends[handle]
+                and self._xfer_backends[handle] == ("MOCK",)
                 and not self.allow_reads
             ):
                 return "PROC"
@@ -778,7 +783,7 @@ def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:
 
     assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
     deposit = kvcr.deposit(
-        {second: _mem_descriptor(ctypes.addressof(primary) + page_size, page_size)}
+        {second: [_mem_descriptor(ctypes.addressof(primary) + page_size, page_size)]}
     )
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, lambda done: bool(done)))[fetch][first]
@@ -815,7 +820,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
             return (
                 self.stuck
                 and self.xfers[handle - 1][0] == "READ"
-                and bool(self._xfer_backends.get(handle))
+                and self._xfer_backends.get(handle) == ("MOCK",)
             )
 
         def transfer(self, handle):
@@ -872,8 +877,11 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     retry_result = dict(_poll_until(kvcr, lambda done: retry in dict(done)))[retry][
         first
     ]
-    assert retry_result.success and retry_result.descriptor is not None
-    assert ctypes.string_at(retry_result.descriptor.addr, page_size) == b"a" * page_size
+    assert retry_result.success and retry_result.descriptors is not None
+    assert (
+        ctypes.string_at(retry_result.descriptors[0].addr, page_size)
+        == b"a" * page_size
+    )
 
 
 def test_g3_deliver_rejects_a_destination_that_is_not_slot_sized(
@@ -898,11 +906,10 @@ def test_g3_deliver_rejects_a_destination_that_is_not_slot_sized(
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     reads = [operation for operation, *_ in agent.xfers if operation == "READ"]
-    deliver = kvcr.deliver(
-        {first: _mem_descriptor(ctypes.addressof(destination), page_size // 2)}
-    )
-    result = dict(_poll_until(kvcr, lambda done: deliver in dict(done)))
-    assert not result[deliver][first].success
+    with pytest.raises(ValueError, match="wrong byte count"):
+        kvcr.deliver(
+            {first: [_mem_descriptor(ctypes.addressof(destination), page_size // 2)]}
+        )
     # The undersized destination must never reach NIXL as a whole-slot read.
     assert [operation for operation, *_ in agent.xfers if operation == "READ"] == reads
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
@@ -913,8 +920,8 @@ def test_closing_an_unfinished_spill_retains_registered_resources(
 ) -> None:
     class _StuckWriteAgent(_FakeG3Agent):
         def _is_file_write(self, handle):
-            return self.xfers[handle - 1][0] == "WRITE" and bool(
-                self._xfer_backends.get(handle)
+            return self.xfers[handle - 1][0] == "WRITE" and (
+                self._xfer_backends.get(handle) == ("MOCK",)
             )
 
         def transfer(self, handle):
@@ -933,7 +940,7 @@ def test_closing_an_unfinished_spill_retains_registered_resources(
 
     assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
     kvcr.deposit(
-        {second: _mem_descriptor(ctypes.addressof(primary) + page_size, page_size)}
+        {second: [_mem_descriptor(ctypes.addressof(primary) + page_size, page_size)]}
     )
     local_dram = kvcr._core._local_dram
     _poll_until(kvcr, lambda _: local_dram._capacity_eviction_key == first)

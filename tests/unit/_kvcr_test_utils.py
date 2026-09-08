@@ -23,7 +23,7 @@ from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
-    LocalDramInfo,
+    LocalDramOptions,
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
@@ -43,6 +43,15 @@ _OPEN_KVCRS: list[KVCR] = []
 
 
 _HANDED_OUT: set[int] = set()
+
+
+def _router_hint(
+    source: str, block_hashes: Collection[int] = (123,)
+) -> dict[str, object]:
+    return {
+        "source_control_endpoint": source,
+        "block_hashes": list(block_hashes),
+    }
 
 
 def _ephemeral_floor() -> int:
@@ -194,7 +203,7 @@ class FakePrimaryPinning:
                     "pin",
                     {
                         key: (
-                            _mem_descriptor(addr=0)
+                            [_mem_descriptor(addr=0)]
                             if (
                                 (prefix_length is None or index < prefix_length)
                                 and index not in self.missing_indices
@@ -247,7 +256,7 @@ class PendingPrimaryPinning(FakePrimaryPinning):
                 (
                     pin_handle,
                     {
-                        key: None if index in missing_indices else _mem_descriptor()
+                        key: None if index in missing_indices else [_mem_descriptor()]
                         for index, key in enumerate(keys)
                     },
                 ),
@@ -371,14 +380,14 @@ class FakeBytesControl:
         return incoming
 
 
-def _mem_descriptor(addr: int = 128, size: int = 16) -> MemDescriptor:
+def _mem_descriptor(addr: int = 128, size: int = 16, info: str = "") -> MemDescriptor:
     return MemDescriptor(
         end_point_name="primary",
         mem_type="DRAM",
         addr=addr,
         size=size,
         device_Id=0,
-        info="",
+        info=info,
     )
 
 
@@ -442,17 +451,22 @@ def _new_kvcr(
     control: FakeBytesControl,
     config: KVCRConfig | None = None,
     name: str = "target",
-    key_hint_adapter: object | None = None,
+    key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
     framework_dram: FrameworkDramInput | None = None,
-    local_dram: LocalDramInfo | None = None,
-    local_dram_arenas: tuple[LocalDramInfo, ...] = (),
+    framework_dram_regions: tuple[FrameworkDramInput, ...] = (),
+    local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
     inventory_sink=None,
     policy=None,
 ) -> KVCR:
     config = replace(
-        config or KVCRConfig(nixl_agent_name=name, inventory_report_interval_ms=0),
+        config
+        or KVCRConfig(
+            nixl_agent_name=name,
+            pool_layouts=[("", 16)],
+            inventory_report_interval_ms=0,
+        ),
         nixl_agent_name=name,
         nixl_listen_port=1,
     )
@@ -465,15 +479,15 @@ def _new_kvcr(
                 release_pin=pinning.release_pin,
                 cancel_pin_request=getattr(pinning, "cancel_pin_request", None),
                 framework_control=control,
-                key_hint_adapter=key_hint_adapter,
+                key_adapter=key_adapter,
                 inventory_sink=inventory_sink,
                 policy=policy,
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),
             KVCRBackendConfigs(
                 framework_dram=framework_dram,
+                framework_dram_regions=framework_dram_regions,
                 local_dram=local_dram,
-                local_dram_arenas=local_dram_arenas,
                 g3=g3,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
             ),
@@ -490,12 +504,14 @@ def _new_local_kvcr(
     capacity_low_watermark_percent=0,
     capacity_needed_callback=None,
     policy=None,
+    local_dram_backend="UCX",
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
         kvcr = KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
+                pool_layouts=[("", len(local) // slot_count)],
                 nixl_listen_port=1,
                 inventory_report_interval_ms=0,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
@@ -509,9 +525,10 @@ def _new_local_kvcr(
                 policy=policy,
             ),
             KVCRBackendConfigs(
-                local_dram=LocalDramInfo(
-                    ctypes.addressof(local), len(local), slot_count
-                )
+                local_dram=LocalDramOptions(
+                    [("", ctypes.addressof(local), len(local))],
+                    local_dram_backend,
+                ),
             ),
         )
     _OPEN_KVCRS.append(kvcr)
@@ -540,9 +557,9 @@ class _RecordingFIFOPolicy(FIFOPolicy):
         self.removed.append(meta)
 
 
-class _MatchingHintAdapter:
-    def matches(self, key, hint):
-        return hint == "hint"
+class _ConstantHashAdapter:
+    def decode(self, key):
+        return 123
 
 
 def _recovered_record(*, g2: int | None = None, g3: int | None = None) -> _BlockRecord:

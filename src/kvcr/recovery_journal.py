@@ -23,7 +23,7 @@ from .guard_protocol import KVCRClient, KVCRPoolHold
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, RecoveryMirrorError
+from .types import BlockKey, PoolBlockLayouts, RecoveryMirrorError
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
@@ -418,6 +418,7 @@ class ClaimedPool:
 
 
 def claim_guarded_pool(
+    config: KVCRConfig,
     guard_config: KVCRGuardConfig,
     bindings: "KVCRBindings",
     backend_configs: KVCRBackendConfigs,
@@ -441,11 +442,12 @@ def claim_guarded_pool(
             "endpoint, so that a Guard can answer on it after this worker dies"
         )
     hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
-        guard_config.pool_index,
-        guard_config.row_stride,
+        guard_config.guard_index,
+        config.pool_layouts,
         guard_config.compatibility_digest,
         bind_address(),
         backend_configs.g3,
+        backend_configs.remote_fw_dram.backend,
     )
     # The lease is live from here, and the caller cannot release what it has not
     # been handed yet: anything that fails before this returns has to give the pool
@@ -454,7 +456,7 @@ def claim_guarded_pool(
         recovered = read_handback(
             hold._attachment,
             guard_config.compatibility_digest,
-            guard_config.row_stride,
+            config.pool_layouts,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -480,6 +482,7 @@ def claimed_core(
         config,
         bindings,
         replace(backend_configs, local_dram=claimed.hold.local_dram),
+        recovery_enabled=True,
     )
 
 
@@ -537,15 +540,17 @@ def _recovery_frames(
 
 
 # Bound to the pool and to the geometry: a slot index only means the same
-# bytes under the same file and layout. The generation stops a replay into a
+# bytes under the same file and pool layout. The generation stops a replay into a
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
 _SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
-_SNAPSHOT_TERMS = struct.Struct("<QQQQQ")
+_SNAPSHOT_TERMS = struct.Struct("<QQQQ")
 
 
 def canonical_pool_terms(
-    compatibility_digest: str, row_stride: int, spec: "KVCRPoolSpec"
+    compatibility_digest: str,
+    pool_layouts: PoolBlockLayouts,
+    spec: "KVCRPoolSpec",
 ) -> bytes:
     """Encode what a handback region must not be replayed across."""
     return (
@@ -553,8 +558,12 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
+        + msgspec.msgpack.encode(pool_layouts)
         + _SNAPSHOT_TERMS.pack(
-            row_stride, spec.journal_bytes, spec.mapping_bytes, spec.device, spec.inode
+            spec.journal_bytes,
+            spec.mapping_bytes,
+            spec.device,
+            spec.inode,
         )
     )
 
@@ -652,7 +661,9 @@ def read_recovery_snapshot(
 
 
 def read_handback(
-    pool: KVCRPoolAttachment, compatibility_digest: str, row_stride: int
+    pool: KVCRPoolAttachment,
+    compatibility_digest: str,
+    pool_layouts: PoolBlockLayouts,
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -663,7 +674,7 @@ def read_handback(
     else ever would, and it would refuse every later claim on this pool too.
     """
     mirror = _RecoveryMirror()
-    terms = canonical_pool_terms(compatibility_digest, row_stride, pool._spec)
+    terms = canonical_pool_terms(compatibility_digest, pool_layouts, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)

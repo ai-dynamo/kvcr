@@ -14,7 +14,9 @@ from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
     TelemetryStats,
+    _validate_pool_layouts,
 )
+from .hint_parser import _parse_kv_hint
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
@@ -112,8 +114,14 @@ class _KVCRCore:
         config: KVCRConfig,
         bindings: "KVCRBindings",
         backend_configs: KVCRBackendConfigs,
+        *,
+        recovery_enabled: bool = False,
     ) -> None:
         self.config = config
+        self.pool_layouts = list(config.pool_layouts)
+        _validate_pool_layouts(self.pool_layouts)
+        self._pool_block_sizes = dict(self.pool_layouts)
+        self.block_size_bytes = self.pool_layouts[0][1]
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.inventory_report_interval_ms < 0:
@@ -130,19 +138,13 @@ class _KVCRCore:
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
-        local_dram_configs = backend_configs.local_dram_arenas
-        if backend_configs.local_dram is not None:
-            local_dram_configs = (backend_configs.local_dram,)
-        framework_dram = backend_configs.framework_dram
-        framework_dram_regions = backend_configs.framework_dram_regions
-        if framework_dram is not None:
-            framework_dram_regions = (framework_dram,)
+        local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
         policy = bindings.policy
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
         configured_tiers = set()
-        if local_dram_configs:
+        if local_dram_config is not None:
             configured_tiers.add(CacheTier.LOCAL_G2)
         if g3_config is not None:
             configured_tiers.add(CacheTier.G3)
@@ -156,28 +158,27 @@ class _KVCRCore:
         )
 
         # Common KVCR state tables.
-        if g3_config is not None and not local_dram_configs:
+        if g3_config is not None and local_dram_config is None:
             raise ValueError("G3 requires configured local DRAM")
-        if g3_config is not None and len(local_dram_configs) > 1:
-            raise ValueError("G3 does not support multiple local DRAM arenas")
-        if len(local_dram_configs) > 1 and self.config.capacity_low_watermark_percent:
+        if len(self.pool_layouts) > 1 and g3_config is not None:
+            raise ValueError("G3 does not support multiple pool layouts")
+        if len(self.pool_layouts) > 1 and recovery_enabled:
+            raise ValueError("Guard recovery does not support multiple pool layouts")
+        if len(self.pool_layouts) > 1 and self.config.capacity_low_watermark_percent:
             raise ValueError(
-                "capacity low watermark does not support multiple local DRAM arenas"
+                "capacity low watermark does not support multiple pool layouts"
             )
-        local_dram_config = local_dram_configs[0] if local_dram_configs else None
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._pending_inventory_events: list[InventoryEvent] = []
         self._inventory_flush_deadline: float | None = None
-        self._capacity_low_watermark_slots = ceil(
-            (local_dram_config.slot_count if local_dram_config else 0)
-            * self.config.capacity_low_watermark_percent
-            / 100
-        )
         self._capacity_pressure_active = False
+        self._single_descriptor_only = g3_config is not None or recovery_enabled
         self._closed = False
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
-        self._local_dram_sources_by_op: dict[_OpId, dict[BlockKey, MemDescriptor]] = {}
+        self._local_dram_sources_by_op: dict[
+            _OpId, dict[BlockKey, tuple[MemDescriptor, ...]]
+        ] = {}
 
         self._completion_queue: list[OpResult] = []
         self._joined_completions: dict[
@@ -213,28 +214,46 @@ class _KVCRCore:
         from .remote_fw_dram import _RemoteFWDram
 
         self._local_dram = (
-            _LocalDram(self, local_dram_configs) if local_dram_configs else None
+            _LocalDram(self, local_dram_config)
+            if local_dram_config is not None
+            else None
+        )
+        self._capacity_low_watermark_slots = ceil(
+            (self._local_dram._total_slots if self._local_dram is not None else 0)
+            * self.config.capacity_low_watermark_percent
+            / 100
         )
         self._remote_fw_dram = _RemoteFWDram(
             self,
             backend_configs.remote_fw_dram,
-            bindings.key_hint_adapter,
+            bindings.key_adapter,
         )
         self._g3 = (
             _G3(
                 self,
                 g3_config,
-                local_dram_config.length // local_dram_config.slot_count,
+                self.block_size_bytes,
             )
             if g3_config is not None and local_dram_config is not None
             else None
         )
+        framework_dram = backend_configs.framework_dram
+        framework_dram_regions = backend_configs.framework_dram_regions
+        if framework_dram is not None:
+            framework_dram_regions = (framework_dram,)
         memory_regions: list[tuple[int, int]] = []
         memory_regions.extend(
             (region.address, region.length) for region in framework_dram_regions
         )
         if self._local_dram is not None:
             memory_regions.extend(self._local_dram.memory_regions)
+        dram_backends: set[str] = set()
+        if self._local_dram is not None:
+            dram_backends.add(local_dram_config.backend)
+        if self.framework_control is not None:
+            dram_backends.add(backend_configs.remote_fw_dram.backend)
+        if not dram_backends:
+            raise ValueError("at least one DRAM backend must be configured")
 
         def initialize_progress(progress: _KVCRProgress) -> None:
             self._remote_fw_dram.initialize_progress(progress)
@@ -255,6 +274,7 @@ class _KVCRCore:
             close_progress,
             nixl_agent_name=self.nixl_agent_name,
             nixl_listen_port=self.config.nixl_listen_port,
+            dram_backends=list(dram_backends),
             memory_regions=tuple(memory_regions),
         )
 
@@ -307,24 +327,14 @@ class _KVCRCore:
 
     def submit_hint(
         self,
-        block_key_list: Collection[BlockKey],
-        src: str | None = None,
-        mode: str = "copy",
-        hints: object | None = None,
+        hints: Mapping[str, object],
         request_id: str | None = None,
     ) -> None:
+        src, block_hashes, mode = _parse_kv_hint(hints)
         # TODO: Let policy consume mode="move" and no_retain hints.
         if mode != "copy":
             raise ValueError("only copy mode is currently supported")
-        if block_key_list and request_id is None:
-            logger.warning(
-                "KVCR submit_hint requires request_id; dropping %d keys",
-                len(block_key_list),
-            )
-        # The block list and opaque framework hint are alternative membership
-        # representations. Neither starts proactive movement; both only scope
-        # which keys may use this request's remote source.
-        self._remote_fw_dram.submit_hint(block_key_list, src, hints, request_id)
+        self._remote_fw_dram.submit_hint(src, block_hashes, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)
@@ -360,25 +370,27 @@ class _KVCRCore:
     # TODO: Add optional completion callbacks to movement APIs.
     def deliver(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None = None,
     ) -> OpHandle:
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         deadline = self._operation_deadline()
         local_dram = self._local_dram
-        local_blocks: dict[BlockKey, MemDescriptor] = {}
-        g3_blocks: dict[BlockKey, MemDescriptor] = {}
-        remote_blocks: dict[BlockKey, MemDescriptor] = {}
+        normalized = {
+            key: self._normalize_descriptors(descriptors)
+            for key, descriptors in blocks.items()
+        }
+        local_blocks: dict[BlockKey, tuple[MemDescriptor, ...]] = {}
+        g3_blocks: dict[BlockKey, tuple[MemDescriptor, ...]] = {}
+        remote_blocks: dict[BlockKey, tuple[MemDescriptor, ...]] = {}
         failed_keys: set[BlockKey] = set()
-        for key, destination in blocks.items():
+        for key, destination in normalized.items():
             if self._is_local_resident(key):
                 local_blocks[key] = destination
             elif self._g3 is not None and self._g3.is_ready(key):
                 g3_blocks[key] = destination
-            elif request_id is not None and self._remote_fw_dram.query(
-                key, request_id
-            ):
+            elif request_id is not None and self._remote_fw_dram.query(key, request_id):
                 remote_blocks[key] = destination
             else:
                 failed_keys.add(key)
@@ -389,7 +401,11 @@ class _KVCRCore:
             local_dram.deliver(op_handle, local_blocks, deadline=deadline)
         if g3_blocks and (
             self._g3 is None
-            or not self._g3.start_deliver(op_handle, g3_blocks, deadline)
+            or not self._g3.start_deliver(
+                op_handle,
+                {key: descriptors[0] for key, descriptors in g3_blocks.items()},
+                deadline,
+            )
         ):
             self._complete(
                 op_handle,
@@ -410,7 +426,7 @@ class _KVCRCore:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
@@ -422,15 +438,40 @@ class _KVCRCore:
                 {key: OpEntryResult(OpEntryStatus.FAILED) for key in blocks},
             )
         else:
-            self._local_dram.deposit(op_handle, blocks, no_evict=no_evict, hints=hints)
+            self._local_dram.deposit(
+                op_handle,
+                {
+                    key: self._normalize_descriptors(descriptors)
+                    for key, descriptors in blocks.items()
+                },
+                no_evict=no_evict,
+                hints=hints,
+            )
         return op_handle
 
     def fetch(
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
+        expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
+        if expected_layout is None:
+            if len(self.pool_layouts) != 1 or self.pool_layouts[0][0] != "":
+                raise ValueError(
+                    "expected layout is required for named or multiple pools"
+                )
+            normalized_layout = ("",)
+        else:
+            if not isinstance(expected_layout, list) or not expected_layout:
+                raise ValueError("expected_layout must be a non-empty list")
+            normalized_layout = tuple(expected_layout)
+            if any(name not in self._pool_block_sizes for name in normalized_layout):
+                raise ValueError("expected_layout contains an unknown pool")
+        if self._single_descriptor_only and len(normalized_layout) != 1:
+            raise ValueError(
+                "G3 and Guard recovery support exactly one descriptor per block"
+            )
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -457,6 +498,7 @@ class _KVCRCore:
             sources,
             request_id,
             deadline,
+            expected_layout=normalized_layout,
             hints=hints,
         )
         for source in (CacheTier.G3, CacheTier.REMOTE_G2):
@@ -660,7 +702,7 @@ class _KVCRCore:
     def _start_local_fill(
         self,
         source: CacheTier,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, tuple[MemDescriptor, ...]],
         request_id: str | None,
         deadline: float,
     ) -> None:
@@ -670,7 +712,9 @@ class _KVCRCore:
         self._next_fill_handle -= 1
         if source is CacheTier.G3:
             started = self._g3 is not None and self._g3.start_fill(
-                fill_handle, dict(blocks), deadline
+                fill_handle,
+                {key: descriptors[0] for key, descriptors in blocks.items()},
+                deadline,
             )
         elif source is CacheTier.REMOTE_G2:
             started = self._remote_fw_dram.fetch(
@@ -683,7 +727,7 @@ class _KVCRCore:
 
     def _claim_local_dram_sources(
         self, op_id: _OpId, keys: Collection[BlockKey]
-    ) -> Mapping[BlockKey, MemDescriptor]:
+    ) -> Mapping[BlockKey, tuple[MemDescriptor, ...]]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
@@ -693,6 +737,29 @@ class _KVCRCore:
                 sources.update(claimed)
                 self._local_dram_sources_by_op[op_id] = sources
         return sources
+
+    def _normalize_descriptors(
+        self, descriptors: list[MemDescriptor]
+    ) -> tuple[MemDescriptor, ...]:
+        if not isinstance(descriptors, list):
+            raise TypeError("block descriptors must be a list")
+        if not descriptors or any(
+            not isinstance(descriptor, MemDescriptor) for descriptor in descriptors
+        ):
+            raise ValueError("each block requires at least one memory descriptor")
+        if self._single_descriptor_only and len(descriptors) != 1:
+            raise ValueError(
+                "G3 and Guard recovery support exactly one descriptor per block"
+            )
+        for descriptor in descriptors:
+            expected_size = self._pool_block_sizes.get(descriptor.info)
+            if expected_size is None:
+                raise ValueError(f"unknown descriptor pool {descriptor.info!r}")
+            if descriptor.size != expected_size:
+                raise ValueError(
+                    f"descriptor for pool {descriptor.info!r} has the wrong byte count"
+                )
+        return tuple(descriptors)
 
     def _release_local_dram_sources(
         self,

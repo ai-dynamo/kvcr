@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
-from .config import KeyHintAdapter, RemoteFWDramOptions
+from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
     DURATION_METRIC,
     TRANSFER_BLOCKS_METRIC,
@@ -44,19 +44,19 @@ if TYPE_CHECKING:
 
 
 _MEM_DESCRIPTORS_TYPE = tuple[MemDescriptor, ...]
+_DESCRIPTOR_BUNDLE_TYPE = tuple[MemDescriptor, ...]
 
 
 @dataclass(slots=True)
 class _FwMemResidency:
-    descriptor: MemDescriptor
+    descriptors: _DESCRIPTOR_BUNDLE_TYPE
     pin_handle: PinHandle
 
 
 @dataclass(frozen=True)
 class _RequestHint:
-    source: str
-    keys: frozenset[BlockKey]
-    value: object
+    source: str | None
+    block_hashes: frozenset[int]
     submitted_at: float | None
     failed: bool = False
 
@@ -94,6 +94,7 @@ class _TargetPullOp(_RemoteOp):
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     ordered_keys: tuple[BlockKey, ...] = ()
     dst_descriptors: tuple[MemDescriptor, ...] = ()
+    descriptor_counts: tuple[int, ...] = ()
     request_id: str | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
@@ -110,9 +111,9 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
-            # Publish ownership before the fallible send.  If an interrupt
-            # lands after the source accepted the message, teardown must assume
-            # that the destination can still be written.
+            # Publish ownership before the fallible send. If an interrupt lands
+            # after the source accepted the message, teardown must assume that
+            # the destination can still be written.
             self.state = _TargetPullState.WAITING_WRITE_DONE
             sent = backend._send_control(
                 progress,
@@ -123,6 +124,7 @@ class _TargetPullOp(_RemoteOp):
                     "remaining_timeout_ms": (self.deadline - now) * 1000,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
+                    "descriptor_counts": self.descriptor_counts,
                 },
             )
             if not sent:
@@ -179,6 +181,7 @@ class _TargetPullOp(_RemoteOp):
                 self.op_id[1],
                 result,
                 self.dst_descriptors,
+                self.descriptor_counts,
                 len(completed_keys),
             )
             return True, True
@@ -205,7 +208,7 @@ class _TargetPullOp(_RemoteOp):
 
     def close(self, _progress: _KVCRProgress) -> bool:
         # Once start_write was sent, the source may still be writing directly
-        # into this operation's destination.  A timeout is not a remote fence;
+        # into this operation's destination. A timeout is not a remote fence;
         # retain the operation (and therefore its buffers) until the matching
         # terminal notification was observed.
         return self.state in (
@@ -224,6 +227,7 @@ class _SourcePinOp(_Op):
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[MemDescriptor, ...]
+    descriptor_counts: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
@@ -253,6 +257,8 @@ class _SourceWriteOp(_RemoteOp):
     transfer_id: int | None = None
     success: bool = False
     completed_count: int = 0
+    completed_descriptor_count: int = 0
+    descriptor_counts: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
 
     def progress(
@@ -273,6 +279,14 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
+                backend._log_native_transfer(
+                    "source_write",
+                    self.op_handle,
+                    "failed",
+                    self.dst_descriptors,
+                    self.descriptor_counts,
+                    0,
+                )
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
@@ -291,8 +305,9 @@ class _SourceWriteOp(_RemoteOp):
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
                     self.src_descriptors,
-                    self.dst_descriptors[: self.completed_count],
+                    self.dst_descriptors[: self.completed_descriptor_count],
                     remote_side_agent=self.remote_agent,
+                    backend=backend._options.backend,
                     notif_msg=_write_done_notif(
                         self.op_handle,
                         True,
@@ -332,6 +347,14 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
+                backend._log_native_transfer(
+                    "source_write",
+                    self.op_handle,
+                    "failed",
+                    self.dst_descriptors,
+                    self.descriptor_counts,
+                    0,
+                )
                 self.state = _SourceWriteState.FINISHED
                 return True, True
 
@@ -356,7 +379,7 @@ class _SourceWriteOp(_RemoteOp):
             backend._record_transfer_telemetry(telemetry)
             backend._record_progress_counter(
                 TRANSFER_BLOCKS_METRIC,
-                len(self.keys),
+                self.completed_count,
                 ("source_write",),
             )
         else:
@@ -368,6 +391,7 @@ class _SourceWriteOp(_RemoteOp):
             self.op_handle,
             result,
             self.dst_descriptors,
+            self.descriptor_counts,
             self.completed_count if success else 0,
         )
         self.success = success
@@ -414,13 +438,15 @@ class _RemoteFWDram:
         self,
         kvcr: "_KVCRCore",
         options: RemoteFWDramOptions,
-        key_hint_adapter: KeyHintAdapter | None,
+        key_adapter: KeyAdapter | None,
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
+        if not options.backend:
+            raise ValueError("remote framework DRAM NIXL backend must be non-empty")
         self._kvcr = kvcr
         self._options = options
-        self._key_hint_adapter = key_hint_adapter
+        self._key_adapter = key_adapter
 
         # Main-thread state: request hints, framework pins, and progress state.
         self._closed = False
@@ -454,54 +480,41 @@ class _RemoteFWDram:
 
     def submit_hint(
         self,
-        keys: Collection[BlockKey],
         src: str | None,
-        hints: object | None,
+        block_hashes: frozenset[int],
         request_id: str | None,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
             previous = self._request_hints.get(request_id)
-            if src is None and previous is not None:
-                src = previous.source
-            if isinstance(src, str) and src:
-                if previous is not None and previous.source != src:
-                    self._request_hints[request_id] = replace(previous, failed=True)
-                    return
-                self._request_hints[request_id] = _RequestHint(
-                    source=src,
-                    keys=frozenset(keys),
-                    value=(
-                        hints
-                        if hints is not None
-                        else (previous.value if previous is not None else None)
-                    ),
-                    submitted_at=(
-                        previous.submitted_at
-                        if previous is not None and previous.submitted_at is not None
-                        else kvcr._timer()
-                    ),
-                )
-        if not isinstance(src, str) or not src:
-            return
-        if self._options.eager_ctrl_connect:
+            if previous is not None and previous.source != src:
+                self._request_hints[request_id] = replace(previous, failed=True)
+                return
+            self._request_hints[request_id] = _RequestHint(
+                source=src,
+                block_hashes=block_hashes,
+                submitted_at=(
+                    previous.submitted_at
+                    if previous is not None and previous.submitted_at is not None
+                    else kvcr._timer()
+                ),
+            )
+        if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
 
     def query(self, key: BlockKey, request_id: str) -> bool:
         """Return whether ``key`` matches the request's remote hint."""
         request_hint = self._request_hints.get(request_id)
-        adapter = self._key_hint_adapter
-        if request_hint is None or request_hint.failed:
+        if request_hint is None or request_hint.source is None or request_hint.failed:
             return False
         if self._options.opportunistic_query:
             return True
-        if key in request_hint.keys:
-            return True
-        return adapter is not None and adapter.matches(key, request_hint.value)
+        adapter = self._key_adapter
+        return adapter is not None and adapter.decode(key) in request_hint.block_hashes
 
     def _start_target_pull(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, _DESCRIPTOR_BUNDLE_TYPE],
         request_id: str | None,
         deadline: float,
         op_handle: OpHandle,
@@ -511,6 +524,11 @@ class _RemoteFWDram:
         kvcr = self._kvcr
         started_at = kvcr._timer()
         keys = tuple(blocks)
+        descriptor_groups = tuple(_as_descriptor_bundle(blocks[key]) for key in keys)
+        descriptor_counts = tuple(len(group) for group in descriptor_groups)
+        dst_descriptors = tuple(
+            descriptor for group in descriptor_groups for descriptor in group
+        )
         scope = "remote_fetch" if local_fill else "remote_deliver"
         current_hint = (
             self._request_hints.get(request_id) if request_id is not None else None
@@ -519,7 +537,7 @@ class _RemoteFWDram:
             kvcr._record_duration(scope, started_at, "failed")
             return False
 
-        if current_hint is None:
+        if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
             return False
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
@@ -536,7 +554,8 @@ class _RemoteFWDram:
             remote_ctrl_ep=current_hint.source,
             _backend=self,
             ordered_keys=keys,
-            dst_descriptors=tuple(blocks[key] for key in keys),
+            dst_descriptors=dst_descriptors,
+            descriptor_counts=descriptor_counts,
             request_id=request_id,
         )
         kvcr._add_block_dependencies(op, new_operation=True)
@@ -546,7 +565,7 @@ class _RemoteFWDram:
     def deliver(
         self,
         op_handle: OpHandle,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, _DESCRIPTOR_BUNDLE_TYPE],
         request_id: str | None,
         *,
         deadline: float,
@@ -570,7 +589,7 @@ class _RemoteFWDram:
 
     def fetch(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, _DESCRIPTOR_BUNDLE_TYPE],
         request_id: str | None,
         deadline: float,
         *,
@@ -925,11 +944,16 @@ class _RemoteFWDram:
             dst_descriptors = msgspec.convert(
                 payload["dst_descriptors"], type=_MEM_DESCRIPTORS_TYPE
             )
+            descriptor_counts = _message_descriptor_counts(
+                payload,
+                key_count=len(keys),
+                descriptor_count=len(dst_descriptors),
+            )
         except (KeyError, TypeError, ValueError, msgspec.ValidationError):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
-        if not keys or len(keys) != len(dst_descriptors):
+        if not keys:
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
@@ -964,6 +988,7 @@ class _RemoteFWDram:
                 op_handle=op_handle,
                 ordered_keys=keys,
                 dst_descriptors=dst_descriptors,
+                descriptor_counts=descriptor_counts,
                 route=(target_agent, self._route_generation.get(target_agent, 0)),
             )
         )
@@ -988,27 +1013,71 @@ class _RemoteFWDram:
             source_pin.op_id, source_pin.ordered_keys
         )
         framework_sources = {
-            key: record.fw_mem.descriptor
+            key: record.fw_mem.descriptors
             for key in source_pin.ordered_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
         sources = {} if force_failure else {**framework_sources, **local_sources}
+        descriptor_counts = _effective_descriptor_counts(
+            source_pin.descriptor_counts,
+            key_count=len(source_pin.ordered_keys),
+            descriptor_count=len(source_pin.dst_descriptors),
+        )
+        destination_groups = _split_descriptor_groups(
+            source_pin.dst_descriptors, descriptor_counts
+        )
         completed_keys: tuple[BlockKey, ...] = ()
-        for index, key in enumerate(source_pin.ordered_keys):
-            source = sources.get(key)
-            if source is None:
+        source_groups: list[_DESCRIPTOR_BUNDLE_TYPE] = []
+        for index, (key, destination_group) in enumerate(
+            zip(source_pin.ordered_keys, destination_groups)
+        ):
+            raw_source = sources.get(key)
+            if raw_source is None:
                 break
-            destination = source_pin.dst_descriptors[index]
-            if source.size != destination.size:
+            source_group = _as_descriptor_bundle(raw_source)
+            if len(source_group) != len(destination_group):
                 logger.warning(
-                    "KVCR source/destination size mismatch for %r: %d != %d",
+                    "KVCR source/destination descriptor count mismatch for %r: "
+                    "%d != %d",
                     key,
+                    len(source_group),
+                    len(destination_group),
+                )
+                break
+            source_layout = tuple(descriptor.info for descriptor in source_group)
+            destination_layout = tuple(
+                descriptor.info for descriptor in destination_group
+            )
+            if source_layout != destination_layout:
+                logger.warning(
+                    "KVCR source/destination descriptor layout mismatch for %r: "
+                    "%r != %r",
+                    key,
+                    source_layout,
+                    destination_layout,
+                )
+                break
+            mismatched_pair = next(
+                (
+                    (source, destination)
+                    for source, destination in zip(source_group, destination_group)
+                    if source.size != destination.size
+                ),
+                None,
+            )
+            if mismatched_pair is not None:
+                source, destination = mismatched_pair
+                logger.warning(
+                    "KVCR source/destination size mismatch for %r pool=%r: %d != %d",
+                    key,
+                    source.info,
                     source.size,
                     destination.size,
                 )
                 break
+            source_groups.append(source_group)
             completed_keys = source_pin.ordered_keys[: index + 1]
 
         kvcr._release_local_dram_sources(
@@ -1047,8 +1116,12 @@ class _RemoteFWDram:
             route=source_pin.route,
             _backend=self,
             framework_pins=framework_pins,
-            src_descriptors=tuple(sources[key] for key in completed_keys),
+            src_descriptors=tuple(
+                descriptor for group in source_groups for descriptor in group
+            ),
             completed_count=len(completed_keys),
+            completed_descriptor_count=sum(descriptor_counts[: len(completed_keys)]),
+            descriptor_counts=descriptor_counts,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1329,7 +1402,7 @@ class _RemoteFWDram:
     def _install_framework_pin(
         self,
         keys: Collection[BlockKey],
-        pin_result: tuple[PinHandle, Mapping[BlockKey, MemDescriptor | None]],
+        pin_result: tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]],
     ) -> PinHandle | None:
         pin_handle: PinHandle | None = None
         try:
@@ -1339,22 +1412,25 @@ class _RemoteFWDram:
             requested_keys = set(keys)
             if set(descriptors) != requested_keys:
                 raise KeyError("request_pin returned incomplete descriptors")
-            if any(
-                descriptor is not None and not isinstance(descriptor, MemDescriptor)
-                for descriptor in descriptors.values()
-            ):
-                raise TypeError("request_pin returned invalid descriptors")
-            if not any(descriptor is not None for descriptor in descriptors.values()):
+            normalized = {
+                key: (
+                    None
+                    if descriptor_list is None
+                    else self._kvcr._normalize_descriptors(descriptor_list)
+                )
+                for key, descriptor_list in descriptors.items()
+            }
+            if not any(descriptor is not None for descriptor in normalized.values()):
                 raise ValueError("request_pin returned no descriptors")
             pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
             for key in keys:
-                descriptor = descriptors[key]
-                if descriptor is None:
+                descriptor_bundle = normalized[key]
+                if descriptor_bundle is None:
                     continue
                 record = self._kvcr._block_record(key)
                 if record.fw_mem is not None:
                     continue
-                record.fw_mem = _FwMemResidency(descriptor, pin_handle)
+                record.fw_mem = _FwMemResidency(descriptor_bundle, pin_handle)
                 pin_keys.add(key)
             return pin_handle
         except Exception:
@@ -1366,7 +1442,7 @@ class _RemoteFWDram:
         self,
         keys: tuple[BlockKey, ...],
     ) -> (
-        tuple[dict[BlockKey, MemDescriptor], set[PinHandle]]
+        tuple[dict[BlockKey, _DESCRIPTOR_BUNDLE_TYPE], set[PinHandle]]
         | _PendingFrameworkSources
         | None
     ):
@@ -1399,14 +1475,14 @@ class _RemoteFWDram:
                     framework_pins=held_framework_pins,
                 )
 
-        descriptors: dict[BlockKey, MemDescriptor] = {}
+        descriptors: dict[BlockKey, _DESCRIPTOR_BUNDLE_TYPE] = {}
         framework_pins: set[PinHandle] = set()
         for key in keys:
             record = kvcr._block_record_map.get(key)
             residency = record.fw_mem if record is not None else None
             if residency is None:
                 continue
-            descriptors[key] = residency.descriptor
+            descriptors[key] = residency.descriptors
             framework_pins.add(residency.pin_handle)
         if not descriptors:
             return None
@@ -1577,14 +1653,25 @@ class _RemoteFWDram:
         op_handle: int,
         result: str,
         descriptors: tuple[MemDescriptor, ...],
+        descriptor_counts: tuple[int, ...],
         completed_count: int,
     ) -> None:
-        """Emit one joinable source/target record for an observed native transfer."""
+        """Emit one source/target record in logical blocks and physical bytes."""
         if not self._kvcr.config.enable_telemetry:
             return
-        completed_count = min(max(completed_count, 0), len(descriptors))
+        try:
+            counts = _effective_descriptor_counts(
+                descriptor_counts,
+                key_count=(len(descriptor_counts) or len(descriptors)),
+                descriptor_count=len(descriptors),
+            )
+        except TypeError:
+            logger.debug("KVCR could not summarize native transfer op=%d", op_handle)
+            return
+        completed_count = min(max(completed_count, 0), len(counts))
+        completed_descriptor_count = sum(counts[:completed_count])
         completed_bytes = sum(
-            descriptor.size for descriptor in descriptors[:completed_count]
+            descriptor.size for descriptor in descriptors[:completed_descriptor_count]
         )
         total_bytes = sum(descriptor.size for descriptor in descriptors)
         logger.info(
@@ -1593,7 +1680,7 @@ class _RemoteFWDram:
             op_handle,
             result,
             completed_count,
-            len(descriptors),
+            len(counts),
             completed_bytes,
             total_bytes,
         )
@@ -1640,6 +1727,74 @@ class _RemoteFWDram:
 # Control wire-format helpers.
 
 _NOTIF_PREFIX = b"KVCR:"
+
+
+def _as_descriptor_bundle(descriptors: object) -> _DESCRIPTOR_BUNDLE_TYPE:
+    """Normalize internal scalar state while rolling into descriptor bundles."""
+    if isinstance(descriptors, MemDescriptor):
+        return (descriptors,)
+    if (
+        not isinstance(descriptors, tuple)
+        or not descriptors
+        or not all(isinstance(descriptor, MemDescriptor) for descriptor in descriptors)
+    ):
+        raise TypeError("invalid descriptor bundle")
+    return descriptors
+
+
+def _effective_descriptor_counts(
+    descriptor_counts: tuple[int, ...],
+    *,
+    key_count: int,
+    descriptor_count: int,
+) -> tuple[int, ...]:
+    """Validate bundle boundaries, accepting legacy one-descriptor messages."""
+    if not descriptor_counts:
+        if descriptor_count != key_count:
+            raise TypeError("missing descriptor counts")
+        return (1,) * key_count
+    if (
+        len(descriptor_counts) != key_count
+        or any(type(count) is not int or count <= 0 for count in descriptor_counts)
+        or sum(descriptor_counts) != descriptor_count
+    ):
+        raise TypeError("invalid descriptor counts")
+    return descriptor_counts
+
+
+def _message_descriptor_counts(
+    payload: Mapping[str, Any],
+    *,
+    key_count: int,
+    descriptor_count: int,
+) -> tuple[int, ...]:
+    raw_counts = payload.get("descriptor_counts")
+    if raw_counts is None:
+        counts: tuple[int, ...] = ()
+    elif isinstance(raw_counts, (list, tuple)):
+        counts = tuple(raw_counts)
+    else:
+        raise TypeError("invalid descriptor counts")
+    return _effective_descriptor_counts(
+        counts,
+        key_count=key_count,
+        descriptor_count=descriptor_count,
+    )
+
+
+def _split_descriptor_groups(
+    descriptors: tuple[MemDescriptor, ...],
+    descriptor_counts: tuple[int, ...],
+) -> tuple[_DESCRIPTOR_BUNDLE_TYPE, ...]:
+    groups: list[_DESCRIPTOR_BUNDLE_TYPE] = []
+    offset = 0
+    for count in descriptor_counts:
+        next_offset = offset + count
+        groups.append(descriptors[offset:next_offset])
+        offset = next_offset
+    if offset != len(descriptors):
+        raise TypeError("descriptor counts do not cover descriptors")
+    return tuple(groups)
 
 
 def _message_keys(payload: Mapping[str, Any]) -> tuple[BlockKey, ...]:

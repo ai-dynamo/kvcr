@@ -210,10 +210,13 @@ configuration, backend memory descriptions, and callbacks:
 
 ```python
 from kvcr import KVCR, KVCRBindings
-from kvcr.config import KVCRBackendConfigs, KVCRConfig
+from kvcr.config import KVCRBackendConfigs, KVCRConfig, LocalDramOptions
 
 runner = KVCR(
-    config=KVCRConfig(nixl_agent_name="worker-0"),
+    config=KVCRConfig(
+        nixl_agent_name="worker-0",
+        pool_layouts=[("", block_size_bytes)],
+    ),
     bindings=KVCRBindings(
         request_pin=request_pin,
         poll_pin_results=poll_pin_results,
@@ -225,6 +228,31 @@ runner = KVCR(
 
 The callback names above represent services implemented by the framework
 adapter; they are not provided by KVCR itself.
+
+For a heterogeneous cache, configure each allocator pool once and provide its
+own memory region:
+
+```python
+config = KVCRConfig(
+    nixl_agent_name="worker-0",
+    pool_layouts=[("full", full_block_bytes), ("swa", swa_block_bytes)],
+)
+backends = KVCRBackendConfigs(
+    local_dram=LocalDramOptions(
+        pools=[
+            ("full", full_address, full_capacity_bytes),
+            ("swa", swa_address, swa_capacity_bytes),
+        ]
+    )
+)
+```
+
+The pool names, not their block sizes, identify capacity. Thus equal-sized
+`full` and `swa` pools are still independent. A key's descriptor list states
+its ordered layout; for example, `full, swa, swa` reserves one `full` slot and
+two `swa` slots atomically. G3, Guard recovery, and the capacity-low-watermark
+callback currently support only one configured pool; G3 and Guard additionally
+require one descriptor per key.
 
 The main calls are:
 
@@ -313,16 +341,17 @@ IDs, or raw endpoints.
 
 ### KVCR service daemon
 
-The KVCR service daemon owns pool lifecycle. It pre-allocates `--pool-count`
-fixed-size pools before exposing its socket. A worker claims a pool by index;
-the pool outlives that worker but not the service:
+The KVCR service daemon owns pool lifecycle. It pre-allocates `--guard-count`
+contiguous pool allocations before exposing its socket, one per Guard. Each has
+the same ordered pool sizes. A worker claims a Guard by index; its allocation
+outlives that worker but not the service:
 
 ```bash
 python -m kvcr.kvcr_service \
   --socket-path /run/kvcr/memory.sock \
   --pool-dir /dev/shm/kvcr \
-  --pool-count 1 \
-  --pool-size-gb 64 \
+  --guard-count 1 \
+  --pool-sizes-gb 48,16 \
   --compatibility-digest example-model-layout
 ```
 
@@ -330,27 +359,29 @@ python -m kvcr.kvcr_service \
 | --- | --- | --- |
 | `--socket-path` | *(required)* | Unix socket the workers connect to |
 | `--pool-dir` | *(required)* | Writable directory holding the pool files |
-| `--pool-count` | *(required)* | Number of pools available by index |
-| `--pool-size-gb` | *(required)* | Total mapped size of each pool |
+| `--guard-count` | *(required)* | Number of Guards available by index |
+| `--pool-sizes-gb` | *(required)* | Comma-separated usable pool sizes in each Guard allocation |
 | `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
 
-Each pool reserves a fixed 100 MiB journal, taken out of `--pool-size-gb`
-rather than added to it: a 64 GiB pool caches 64 GiB minus 100 MiB.
+The service rounds each pool size down to a memory-page boundary and adds one
+fixed 100 MiB journal to each Guard allocation. For example, `48,16` maps 64
+GiB plus the journal for every Guard. The current claim path exposes those
+regions as one combined data area.
 
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(pool_index, row_stride, compatibility_digest, control_bind)`,
+`KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)`,
 naming the address its Guard will answer on. The digest must match the service
-exactly, and callers must change it whenever the row stride or any other
-KV-cache layout term changes. The returned `KVCRPoolHold` describes the mapped
-local DRAM and owns an exclusive lease on the pool. Each claim is measured
-against its own pool only; pools do not have to agree on a stride.
+exactly, and each pool-layout entry is `(pool_name, block_size_bytes)`. Callers must
+change the digest whenever the pool layout or any other KV-cache term changes.
+The returned `KVCRPoolHold` describes the mapped local DRAM and owns an exclusive
+lease on the pool. Only one pool-layout entry is currently supported; an empty
+string is a valid pool name.
 
 **A pool's configuration is fixed by its first claim.** Every later claim on
-that pool must name the same row stride and, when G3 is configured, the same
+that pool must name the same pool layout and, when G3 is configured, the same
 G3 paths in the same order, the same per-file capacity, and the same backend
-and backend options; one that does not is refused for the life of the
-service, because a different layout renames the rows and slots the recovered
-records describe. Change the layout by
+and backend options. It must also name the same remote framework DRAM backend.
+A mismatch is refused for the life of the service. Change the configuration by
 restarting the service, which recreates the pools.
 
 The service grants a pool to one live claimant at a time, and pool mappings are
@@ -402,7 +433,7 @@ its Guard can mirror fills the ring. Both sides treat that as survivable -- the
 primary stops publishing, the Guard drops what it holds -- and the pool becomes
 claimable but cold if that primary dies. Recovery is lost for that pool only.
 Watch for `KVCR pool recovery disabled` if failovers stop coming back warm. The
-journal is a fixed 100 MiB whatever `--pool-size-gb` is, so the only levers are
+journal is a fixed 100 MiB whatever `--pool-sizes-gb` is, so the only levers are
 larger blocks, which publish fewer residency changes, or accepting a cold
 failover for that pool.
 
@@ -412,9 +443,10 @@ records naming it are carried across, so the replacement reopens the tier with
 its disk cache rather than a cold one -- the files themselves are not held in
 the meantime, which is the limitation described below.
 
-**Deployment prerequisite.** Run the service with the same NIXL backend and
-plugin environment as the engines that claim its pools. Nothing checks this for
-you; a mismatch surfaces when a replacement primary opens G3.
+**Deployment prerequisite.** Make the configured NIXL backends available in
+each process that uses them. Nothing checks plugin availability across processes
+for you; a mismatch surfaces when a Guard promotes or a replacement primary
+opens G3.
 
 **G3 files are not verified across a failover.** A Guard hands a replacement
 primary the G3 records it inherited without checking that the files still hold
@@ -673,6 +705,8 @@ The important fields are:
 | `control_ports` | One local control port for each DP rank managed by this worker |
 | `control_advertise_host` | Host or address placed in worker registration and sent to peers |
 | `eager_ctrl_connect` | Establishes peer control earlier; disabling it moves setup onto the request path |
+| `local_dram_backend` | NIXL backend used for local DRAM transfers |
+| `remote_fw_dram_backend` | NIXL backend used for peer DRAM transfers |
 | `operation_timeout_ms` | Deadline for KVCR operations; timeout begins safe cancellation and cleanup |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 
@@ -795,7 +829,7 @@ Check the contract in this order:
 
 Do not infer hint delivery solely from a high router overlap score. Record the
 hint payload at the framework boundary and verify that `submit_hint()` receives
-the expected source endpoint, request ID, mode, and keys.
+a protocol-conforming hint and the expected request ID.
 
 ### Peer control connection fails
 
@@ -870,14 +904,15 @@ release may need to wait for NIXL quiescence even after caller-visible timeout.
 Verify that:
 
 - the socket parent and pool directory exist and are writable;
-- the pool directory has capacity for every pool at its full
-  `--pool-size-gb`, which already includes that pool's journal. A pool
-  changing hands briefly appends its handback snapshot past that size;
+- the pool directory has capacity for every Guard's full allocation: the sum
+  of `--pool-sizes-gb` plus its 100 MiB journal. A pool changing hands briefly
+  appends its handback snapshot past that size;
   where there is no room for it, that handover comes back cold and the
   service carries on;
 - another process is not listening on the socket;
-- `--pool-count` is at least one; and
-- `--pool-size-gb` is positive, finite, and larger than the 100 MiB journal.
+- `--guard-count` is at least one; and
+- every comma-separated `--pool-sizes-gb` value is positive, finite, and at
+  least one memory page.
 
 The service removes a stale socket only after confirming no live service is
 listening. It refuses to replace a socket owned by another live service.

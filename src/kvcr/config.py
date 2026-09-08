@@ -10,16 +10,33 @@ from typing import Protocol
 from .types import (
     BlockKey,
     InventoryEvent,
+    LocalDramRegions,
+    PoolBlockLayouts,
 )
 
 InventorySink = Callable[[InventoryEvent], None]
 
 
+def _validate_pool_layouts(pool_layouts: PoolBlockLayouts) -> None:
+    if not pool_layouts:
+        raise ValueError("pool_layouts must contain at least one pool")
+    names = []
+    for pool_name, block_size_bytes in pool_layouts:
+        if not isinstance(pool_name, str):
+            raise ValueError("pool_layouts pool name must be a string")
+        if type(block_size_bytes) is not int or block_size_bytes <= 0:
+            raise ValueError("pool_layouts block size must be a positive integer")
+        names.append(pool_name)
+    if len(names) != len(set(names)):
+        raise ValueError("pool_layouts pool names must be unique")
+    if len(names) > 1 and "" in names:
+        raise ValueError("pool_layouts cannot use an empty name with multiple pools")
+
+
 @dataclass(frozen=True)
-class LocalDramInfo:
-    address: int
-    length: int
-    slot_count: int
+class LocalDramOptions:
+    pools: LocalDramRegions
+    backend: str = "UCX"
 
 
 @dataclass(frozen=True)
@@ -34,6 +51,7 @@ class RemoteFWDramOptions:
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
+    backend: str = "UCX"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -49,24 +67,19 @@ class G3Options:
 @dataclass(frozen=True)
 class KVCRBackendConfigs:
     framework_dram: FrameworkDramInput | None = None
-    local_dram: LocalDramInfo | None = None
+    local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
     remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)
     # Frameworks with several disjoint host-cache tensors cannot describe them
     # as one address range. Keep the singular field above for API compatibility;
     # callers must choose exactly one spelling.
     framework_dram_regions: tuple[FrameworkDramInput, ...] = ()
-    # Heterogeneous framework caches need one fixed-slot KVCR arena per object
-    # size. Keep the singular field above for source compatibility.
-    local_dram_arenas: tuple[LocalDramInfo, ...] = ()
 
     def __post_init__(self) -> None:
         if self.framework_dram is not None and self.framework_dram_regions:
             raise ValueError(
                 "framework_dram and framework_dram_regions are mutually exclusive"
             )
-        if self.local_dram is not None and self.local_dram_arenas:
-            raise ValueError("local_dram and local_dram_arenas are mutually exclusive")
 
 
 class TelemetryStats(Protocol):
@@ -107,17 +120,18 @@ class FrameworkControl(Protocol):
     def recv(self) -> list[bytes]: ...
 
 
-class KeyHintAdapter(Protocol):
-    """Framework-specific key and router-hint interpretation."""
+class KeyAdapter(Protocol):
+    """Framework-specific key conversion."""
 
     def encode(self, framework_key: object) -> BlockKey: ...
 
-    def matches(self, key: BlockKey, hint: object) -> bool: ...
+    def decode(self, key: BlockKey) -> int | bytes: ...
 
 
 @dataclass(frozen=True)
 class KVCRConfig:
     nixl_agent_name: str
+    pool_layouts: PoolBlockLayouts
     enable_telemetry: bool = False
     operation_timeout_ms: int = 1000
     inventory_report_interval_ms: int = 10
@@ -128,6 +142,5 @@ class KVCRConfig:
 @dataclass(frozen=True)
 class KVCRGuardConfig:
     kvcr_service_socket_path: str
-    pool_index: int
-    row_stride: int
+    guard_index: int
     compatibility_digest: str

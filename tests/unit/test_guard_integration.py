@@ -18,10 +18,12 @@ import pytest
 from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
+    _ConstantHashAdapter,
     _has_outstanding_operations,
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _router_hint,
     _use_nixl_agent,
     _wait_until,
     free_port,
@@ -76,8 +78,7 @@ class _FileBackedNixlAgent(FakeNixlAgent):
         return super().deregister_memory(handle)
 
     def transfer(self, handle):
-        # The base class already records per-xfer backends; none means DRAM.
-        if not self.xfer_backends[handle - 1]:
+        if self.xfer_backends[handle - 1] != ["MOCK"]:
             if self.block_remote_writes:
                 self.transfers.append(handle)
                 self.blocked_remote_writes += 1
@@ -118,6 +119,7 @@ def _make_kvcr(
         return KVCR(
             KVCRConfig(
                 nixl_agent_name=agent_name,
+                pool_layouts=[("", page_size)],
                 nixl_listen_port=0,
                 inventory_report_interval_ms=0,
             ),
@@ -146,8 +148,7 @@ def _make_kvcr(
             ),
             KVCRGuardConfig(
                 kvcr_service_socket_path=socket_path,
-                pool_index=0,
-                row_stride=page_size,
+                guard_index=0,
                 compatibility_digest=_DIGEST,
             ),
         )
@@ -160,7 +161,7 @@ def _deposit_two_blocks(kvcr: KVCR, source: int, block_bytes: int) -> None:
         (BlockKey(b"resident-b"), b"B" * block_bytes),
     ):
         ctypes.memmove(source, payload, block_bytes)
-        operation = kvcr.deposit({key: _mem_descriptor(source, block_bytes)})
+        operation = kvcr.deposit({key: [_mem_descriptor(source, block_bytes)]})
         assert dict(_poll_until(kvcr, bool))[operation][key].success, key
     assert kvcr.query((BlockKey(b"resident-a"),)) == [
         (QueryStatus.FETCHABLE, CacheTier.G3)
@@ -233,8 +234,8 @@ def live_service(
     service = _KVCRService(
         tmp_path / "service.sock",
         pool_dir,
-        pool_count=1,
-        pool_size_bytes=8192 + os.sysconf("SC_PAGE_SIZE"),
+        guard_count=1,
+        pool_sizes_bytes=(os.sysconf("SC_PAGE_SIZE"),),
         journal_bytes=8192,
         compatibility_digest=_DIGEST,
     )
@@ -317,7 +318,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         "_real_nixl_primary_child", service.socket_path, g3_path, control_port
     )
     _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
-    guard = service._registry._pools[0]
+    guard = service._registry._guards[0]
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -332,6 +333,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
     target = KVCR(
         KVCRConfig(
             nixl_agent_name="real-target",
+            pool_layouts=[("", page_size)],
             nixl_listen_port=0,
             inventory_report_interval_ms=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
@@ -340,6 +342,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
             target_pinning.request_pin,
             target_pinning.poll_pin_results,
             target_pinning.release_pin,
+            key_adapter=_ConstantHashAdapter(),
             framework_control=ZmqPeerControlChannel(
                 "127.0.0.1", free_port(), "127.0.0.1"
             ),
@@ -353,9 +356,9 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
     )
     try:
         served_key = BlockKey(b"resident-b")
-        target.submit_hint((served_key,), src=source_endpoint, request_id="from-guard")
+        target.submit_hint(_router_hint(source_endpoint), request_id="from-guard")
         operation = target.deliver(
-            {served_key: _mem_descriptor(ctypes.addressof(target_memory), page_size)},
+            {served_key: [_mem_descriptor(ctypes.addressof(target_memory), page_size)]},
             request_id="from-guard",
         )
         deadline = time.monotonic() + _REAL_NIXL_TIMEOUT_SECONDS
@@ -393,7 +396,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         ):
             ctypes.memset(destination, 0, len(payload))
             operation = replacement.deliver(
-                {key: _mem_descriptor(destination, len(payload))}
+                {key: [_mem_descriptor(destination, len(payload))]}
             )
             result = dict(
                 _poll_until(replacement, bool, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
@@ -430,7 +433,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         assert continue_promotion.wait(timeout=_TIMEOUT_SECONDS)
         if recovery == "given-up":
             # What a ring the primary outran leaves behind.
-            guard._mirror = None
+            guard._recovery.mirror = None
         promote(guard)
         assert guard._core is not None
         promoted_with.append(len(guard._core._block_record_map))
@@ -456,7 +459,12 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
             target_agent,
             FakePrimaryPinning(),
             target_control,
-            KVCRConfig(nixl_agent_name="target", operation_timeout_ms=5000),
+            KVCRConfig(
+                nixl_agent_name="target",
+                pool_layouts=[("", page_size)],
+                operation_timeout_ms=5000,
+            ),
+            key_adapter=_ConstantHashAdapter(),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
             framework_dram=FrameworkDramInput(
                 ctypes.addressof(target_memory), len(target_memory)
@@ -467,9 +475,9 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # The G2 block: a Guard serves what the pool holds and opens no G3.
         key = BlockKey(b"resident-b")
         stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
-        target.submit_hint((key,), src=source_endpoint, request_id="stalled")
+        target.submit_hint(_router_hint(source_endpoint), request_id="stalled")
         target.deliver(
-            {key: _mem_descriptor(ctypes.addressof(stalled_destination), page_size)},
+            {key: [_mem_descriptor(ctypes.addressof(stalled_destination), page_size)]},
             request_id="stalled",
         )
         _await_marker(child, "in-flight")
@@ -483,7 +491,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         child.kill()
         child.wait(timeout=_TIMEOUT_SECONDS)
         assert promotion_started.wait(timeout=_TIMEOUT_SECONDS)
-        guard = service._registry._pools[0]
+        guard = service._registry._guards[0]
 
         now[0] = 6.0
         _wait_until(
@@ -502,9 +510,9 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         # A real core either way, answering on the endpoint it inherited.
         assert guard._core is not None
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
-        target.submit_hint((key,), src=source_endpoint, request_id="retry")
+        target.submit_hint(_router_hint(source_endpoint), request_id="retry")
         operation = target.deliver(
-            {key: _mem_descriptor(ctypes.addressof(destination), len(destination))},
+            {key: [_mem_descriptor(ctypes.addressof(destination), len(destination))]},
             request_id="retry",
         )
 
@@ -555,7 +563,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # operation deadline instead of failing them now.
     idle = spawn("_primary_child", service.socket_path, g3_path, control_port, "idle")
     _await_marker(idle, "ready")
-    first_guard = service._registry._pools[0]
+    first_guard = service._registry._guards[0]
     idle.kill()
     idle.wait(timeout=_TIMEOUT_SECONDS)
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
@@ -597,7 +605,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
         ):
             destination = ctypes.create_string_buffer(len(payload))
             operation = replacement.deliver(
-                {key: _mem_descriptor(ctypes.addressof(destination), len(payload))}
+                {key: [_mem_descriptor(ctypes.addressof(destination), len(payload))]}
             )
             result = dict(_poll_until(replacement, bool))[operation][key]
             assert result.success, key

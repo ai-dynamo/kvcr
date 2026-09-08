@@ -12,7 +12,7 @@ from . import recovery_journal as _recovery
 from .config import (
     FrameworkControl,
     InventorySink,
-    KeyHintAdapter,
+    KeyAdapter,
     KVCRBackendConfigs,
     KVCRConfig,
     KVCRGuardConfig,
@@ -64,7 +64,7 @@ class KVCRBindings:
 
     # Control, key translation, and inventory reporting.
     framework_control: FrameworkControl | None = None
-    key_hint_adapter: KeyHintAdapter | None = None
+    key_adapter: KeyAdapter | None = None
     inventory_sink: InventorySink | None = None
 
     # Capacity pressure, telemetry, and placement policy.
@@ -91,12 +91,8 @@ class KVCR:
             if guard_config is None:
                 core = _KVCRCore(config, bindings, backend_configs)
             else:
-                if backend_configs.local_dram_arenas:
-                    raise ValueError(
-                        "guard_config conflicts with backend_configs.local_dram_arenas"
-                    )
                 claimed = _recovery.claim_guarded_pool(
-                    guard_config, bindings, backend_configs
+                    config, guard_config, bindings, backend_configs
                 )
                 pool_hold = claimed.hold
                 core = _recovery.claimed_core(
@@ -131,20 +127,11 @@ class KVCR:
 
     def submit_hint(
         self,
-        block_key_list: Collection[BlockKey],
-        src: str | None = None,
-        mode: str = "copy",
-        hints: object | None = None,
+        hints: Mapping[str, object],
         request_id: str | None = None,
     ) -> None:
-        """Submit request-scoped router hints."""
-        self._core.submit_hint(
-            block_key_list,
-            src=src,
-            mode=mode,
-            hints=hints,
-            request_id=request_id,
-        )
+        """Submit a hint conforming to the hint protocol."""
+        self._core.submit_hint(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         """Discard request-scoped router hints."""
@@ -160,7 +147,7 @@ class KVCR:
 
     def deliver(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None = None,
     ) -> OpHandle:
         """Asynchronously deliver blocks to caller-provided destinations."""
@@ -168,7 +155,7 @@ class KVCR:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
@@ -179,10 +166,11 @@ class KVCR:
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
+        expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
         """Asynchronously fetch blocks into KVCR-managed storage."""
-        return self._core.fetch(keys, request_id, hints)
+        return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(
         self,
