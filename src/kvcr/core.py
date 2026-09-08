@@ -14,7 +14,7 @@ from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
     TelemetryStats,
-    _validate_pool_layout,
+    _validate_pool_layouts,
 )
 from .hint_parser import _parse_kv_hint
 from .local_disk import _G3, _G3Residency
@@ -116,12 +116,12 @@ class _KVCRCore:
         backend_configs: KVCRBackendConfigs,
     ) -> None:
         self.config = config
-        self.pool_layout = list(config.pool_layout)
-        _validate_pool_layout(self.pool_layout)
+        self.pool_layouts = list(config.pool_layouts)
+        _validate_pool_layouts(self.pool_layouts)
         # TODO: Support multiple pools after remote fetch and G3 discover layouts.
-        if len(self.pool_layout) != 1:
+        if len(self.pool_layouts) != 1:
             raise ValueError("only a single pool is currently supported")
-        self.block_size_bytes = self.pool_layout[0][0]
+        self.block_size_bytes = self.pool_layouts[0][1]
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.inventory_report_interval_ms < 0:
@@ -430,8 +430,8 @@ class _KVCRCore:
         hints: object | None = None,
     ) -> OpHandle:
         expected_layout = [""] if expected_layout is None else expected_layout
-        if expected_layout != [self.pool_layout[0][1]]:
-            raise ValueError("expected layout must match the configured pool_layout")
+        if expected_layout != [self.pool_layouts[0][0]]:
+            raise ValueError("expected layout must match the configured pool_layouts")
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -701,7 +701,7 @@ class _KVCRCore:
         if len(descriptors) != 1 or not isinstance(descriptors[0], MemDescriptor):
             raise ValueError("each block requires exactly one descriptor")
         descriptor = descriptors[0]
-        if descriptor.info != self.pool_layout[0][1]:
+        if descriptor.info != self.pool_layouts[0][0]:
             raise ValueError(f"unknown descriptor pool {descriptor.info!r}")
         if descriptor.size != self.block_size_bytes:
             raise ValueError("block descriptor has the wrong byte count")

@@ -15,6 +15,8 @@ PinRequestId = NewType("PinRequestId", int)
 OpHandle = int
 ReleaseHandle = NewType("ReleaseHandle", int)
 ReleaseResult = tuple[ReleaseHandle, bool]
+LocalDramRegions = list[tuple[str, int, int]]  # name, address, size in bytes
+PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
 @dataclass(frozen=True)
@@ -29,7 +31,7 @@ class MemDescriptor:
     its spans by endpoint and memory type would add two hierarchy levels merely
     to factor out values typically shared by reference.
 
-    ``info`` currently identifies the descriptor's pool in ``pool_layout``; an empty
+    ``info`` currently identifies the descriptor's pool in ``pool_layouts``; an empty
     string names the single unnamed pool. This generic field may support additional
     metadata conventions later.
     """

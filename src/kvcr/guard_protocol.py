@@ -15,7 +15,7 @@ from typing import Annotated, Literal
 
 import msgspec
 
-from .config import G3Options, LocalDramOptions, _validate_pool_layout
+from .config import G3Options, LocalDramOptions, _validate_pool_layouts
 from .control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -23,6 +23,7 @@ from .control_channels import (
     KVCRSocketError,
 )
 from .memory import KVCRPoolAttachment, KVCRPoolSpec, _compute_pool_geometry
+from .types import PoolBlockLayouts
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +49,16 @@ class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    pool_layout: list[tuple[int, str]]
+    pool_layouts: PoolBlockLayouts
     g3: _G3Config | None
     remote_fw_dram_backend: Annotated[str, msgspec.Meta(min_length=1)] = "UCX"
 
     def __post_init__(self) -> None:
-        _validate_pool_layout(self.pool_layout)
+        _validate_pool_layouts(self.pool_layouts)
         # TODO: Support multiple pools after fetch and storage can discover layouts.
-        if len(self.pool_layout) != 1:
+        if len(self.pool_layouts) != 1:
             raise ValueError("only a single pool is currently supported")
-        block_size_bytes = self.pool_layout[0][0]
+        block_size_bytes = self.pool_layouts[0][1]
         # Mirrors what the claimant's _G3 will enforce. The first claim fixes
         # the pool's tiers forever, so a config no claimant could ever open
         # must be refused here, before it binds.
@@ -218,7 +219,7 @@ class KVCRClient:
     def claim(
         self,
         guard_index: int,
-        pool_layout: list[tuple[int, str]],
+        pool_layouts: PoolBlockLayouts,
         compatibility_digest: str,
         control_bind: tuple[str, int],
         g3: G3Options | None = None,
@@ -238,7 +239,7 @@ class KVCRClient:
                 "guard_index": guard_index,
                 "compatibility_digest": compatibility_digest,
                 "tier_config": {
-                    "pool_layout": pool_layout,
+                    "pool_layouts": pool_layouts,
                     "g3": g3_config,
                     "remote_fw_dram_backend": remote_fw_dram_backend,
                 },
@@ -267,7 +268,7 @@ class KVCRClient:
                     "claim was granted without the endpoint it answers on"
                 )
             try:
-                block_size, pool_name = request.tier_config.pool_layout[0]
+                pool_name, block_size = request.tier_config.pool_layouts[0]
                 effective_bytes, _ = _compute_pool_geometry(spec.data_bytes, block_size)
             except ValueError as geometry_error:
                 raise KVCRGuardProtocolError(
@@ -276,8 +277,7 @@ class KVCRClient:
             attachment = KVCRPoolAttachment.attach(spec)
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
-                    attachment.data_address,
-                    [(effective_bytes, pool_name)],
+                    [(pool_name, attachment.data_address, effective_bytes)],
                     request.tier_config.remote_fw_dram_backend,
                 ),
                 _attachment=attachment,
