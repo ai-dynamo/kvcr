@@ -44,7 +44,7 @@ from .recovery_journal import (
     read_handback,
     write_recovery_snapshot,
 )
-from .types import BlockKey
+from .types import BlockKey, PoolBlockLayouts
 
 logger = logging.getLogger(__name__)
 
@@ -187,11 +187,11 @@ class _RecoveryState:
         self.attachment = KVCRPoolAttachment.attach(self._spec)
         self._journal = RecoveryJournal(self.attachment)
 
-    def recover(self, pool_layout: list[tuple[int, str]]) -> _RecoveryMirror:
+    def recover(self, pool_layouts: PoolBlockLayouts) -> _RecoveryMirror:
         """Return held recovery or read the prior handback under this pool layout."""
         if self.mirror is not None:
             return self.mirror
-        return read_handback(self.attachment, self._compatibility_digest, pool_layout)
+        return read_handback(self.attachment, self._compatibility_digest, pool_layouts)
 
     def start_primary(self) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
@@ -254,8 +254,7 @@ class _RecoveryState:
         backend: str,
     ) -> LocalDramOptions:
         return LocalDramOptions(
-            self.attachment.data_address,
-            [(effective_bytes, pool_name)],
+            [(pool_name, self.attachment.data_address, effective_bytes)],
             backend,
         )
 
@@ -271,13 +270,13 @@ class _RecoveryState:
     def hand_back(
         self,
         records: dict[BlockKey, _BlockRecord],
-        pool_layout: list[tuple[int, str]],
+        pool_layouts: PoolBlockLayouts,
     ) -> None:
         """Write and mirror a closed core's map under its pool layout."""
         mirror = self.mirror
         records = _with_g3(records, self._g3_records)
         try:
-            self._write_handback(records, pool_layout)
+            self._write_handback(records, pool_layouts)
         except OSError as error:
             if error.errno not in _RECOVERY_CAPACITY_ERRORS:
                 raise
@@ -287,13 +286,13 @@ class _RecoveryState:
             mirror.adopt(records)
         self._g3_records = {}
 
-    def release(self, pool_layout: list[tuple[int, str]]) -> None:
+    def release(self, pool_layouts: PoolBlockLayouts) -> None:
         """Write the current primary's journal tail, then drop its mirror."""
         mirror = self.mirror
         try:
             while (frame := self._journal.read_next()) is not None:
                 mirror.apply(*frame)
-            self._write_handback(mirror.take_records(), pool_layout)
+            self._write_handback(mirror.take_records(), pool_layouts)
         except RecoveryJournalError as error:
             self._drop_recovery(error)
         except OSError as error:
@@ -312,11 +311,11 @@ class _RecoveryState:
     def _write_handback(
         self,
         records: Mapping[BlockKey, _BlockRecord],
-        pool_layout: list[tuple[int, str]],
+        pool_layouts: PoolBlockLayouts,
     ) -> None:
         write_recovery_snapshot(
             self.attachment,
-            canonical_pool_terms(self._compatibility_digest, pool_layout, self._spec),
+            canonical_pool_terms(self._compatibility_digest, pool_layouts, self._spec),
             _recovery_frames(records),
         )
 
@@ -736,11 +735,11 @@ class _Guard:
             if self._failure is not None:
                 raise self._failure
             self._refuse_incompatible(tier_config)
-            served_under = self._configured.pool_layout if self._configured else ()
+            served_under = self._configured.pool_layouts if self._configured else ()
             # The prior handback is this lease's baseline. Read now, under
             # the claim's pool layout: refusing at promotion stops the service,
             # and a claimant dying in between takes everything with it.
-            recovered = self._recovery.recover(tier_config.pool_layout)
+            recovered = self._recovery.recover(tier_config.pool_layouts)
             # Last, once nothing left can refuse this claim: a pool whose handback
             # would not replay has not chosen anything, and a corrected claim can
             # still have it.
@@ -775,11 +774,11 @@ class _Guard:
         if self._failure is not None:
             raise self._failure
         if self._serving:
-            self._hand_back(self._configured.pool_layout)
+            self._hand_back(self._configured.pool_layouts)
             # Re-adopt lets start_primary() retain or replace the mirror.
             self._recovery.mirror = None
         elif self._recovery.mirror is not None:
-            self._recovery.release(self._configured.pool_layout)
+            self._recovery.release(self._configured.pool_layouts)
         if self._control is not None:
             self._control.close()
             self._control = None
@@ -798,7 +797,7 @@ class _Guard:
         """Take up this primary's tiers: the geometry check runs before the
         assignment, so a bad configuration leaves the old one intact.
         """
-        _compute_pool_geometry(self._spec.data_bytes, tier_config.pool_layout[0][0])
+        _compute_pool_geometry(self._spec.data_bytes, tier_config.pool_layouts[0][1])
         self._configured = tier_config
 
     def _poll(self) -> bool:
@@ -857,7 +856,7 @@ class _Guard:
         def reject_pin(keys: object) -> int:
             raise RuntimeError("Guard has no framework-owned memory")
 
-        block_size, pool_name = self._configured.pool_layout[0]
+        pool_name, block_size = self._configured.pool_layouts[0]
         effective_bytes, _ = _compute_pool_geometry(self._spec.data_bytes, block_size)
         dram = self._recovery.local_dram_info(
             effective_bytes,
@@ -867,7 +866,7 @@ class _Guard:
         core = _KVCRCore(
             KVCRConfig(
                 nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
-                pool_layout=list(self._configured.pool_layout),
+                pool_layouts=list(self._configured.pool_layouts),
                 inventory_report_interval_ms=0,
                 nixl_listen_port=0,
             ),
@@ -893,7 +892,7 @@ class _Guard:
         core.start()
         self._serving = True
 
-    def _hand_back(self, pool_layout: list[tuple[int, str]]) -> None:
+    def _hand_back(self, pool_layouts: PoolBlockLayouts) -> None:
         """Stop serving, leaving this pool's state where the next primary looks.
         The core closes first: the Guard stops answering, and region and
         records both come from the map close leaves behind.
@@ -902,7 +901,7 @@ class _Guard:
         if core is None or self._recovery.mirror is None:
             raise RecoveryMirrorError("a serving Guard has no state to hand back")
         core.close()
-        self._recovery.hand_back(core._block_record_map, pool_layout)
+        self._recovery.hand_back(core._block_record_map, pool_layouts)
         self._core = None
         self._serving = False
 

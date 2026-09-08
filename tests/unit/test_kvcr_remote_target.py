@@ -127,7 +127,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         source_control,
         name="source",
         local_dram=LocalDramOptions(
-            ctypes.addressof(source_local), [(len(source_local), "")]
+            [("", ctypes.addressof(source_local), len(source_local))]
         ),
         policy=source_policy,
     )
@@ -142,7 +142,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
             eager_ctrl_connect=False,
         ),
         local_dram=LocalDramOptions(
-            ctypes.addressof(target_local), [(len(target_local), "")]
+            [("", ctypes.addressof(target_local), len(target_local))]
         ),
         inventory_sink=events.append,
         policy=policy,
@@ -247,7 +247,7 @@ def test_remote_staging_commits_available_prefix() -> None:
         control,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramOptions(ctypes.addressof(local), [(len(local), "")]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         inventory_sink=events.append,
     )
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -287,12 +287,12 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
         control,
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layout=[(16, "")],
+            pool_layouts=[("", 16)],
             operation_timeout_ms=10,
         ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramOptions(ctypes.addressof(local), [(len(local), "")]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
     )
     target._core._clock = lambda: now
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -326,14 +326,14 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         target_agent,
         FakePrimaryPinning(),
         target_control,
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     source = _new_kvcr(
         source_agent,
         source_pinning,
         source_control,
-        KVCRConfig(nixl_agent_name="source", pool_layout=[(16, "")]),
+        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
         name="source",
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -405,7 +405,7 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
         FakeNixlAgent(metadata=b"target-md"),
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
     )
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
@@ -446,7 +446,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
         agent,
         pinning,
         control,
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
     )
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
@@ -508,7 +508,7 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
         control,
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layout=[(16, "")],
+            pool_layouts=[("", 16)],
             operation_timeout_ms=1000,
         ),
     )
@@ -596,7 +596,7 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     key_a = _make_block_key(b"block-A", 0)
@@ -633,7 +633,7 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", pool_layout=[(16, "")]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     key = _make_block_key(b"shared-block", 0)
@@ -675,7 +675,7 @@ def test_remote_framework_dram_transfers_available_prefix(
         target_control,
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layout=[(16, "")],
+            pool_layouts=[("", 16)],
             enable_telemetry=True,
         ),
         key_adapter=_ConstantHashAdapter(),
@@ -689,7 +689,7 @@ def test_remote_framework_dram_transfers_available_prefix(
         source_control,
         KVCRConfig(
             nixl_agent_name="source",
-            pool_layout=[(16, "")],
+            pool_layouts=[("", 16)],
             enable_telemetry=True,
         ),
         name="source",

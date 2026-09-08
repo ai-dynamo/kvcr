@@ -32,15 +32,15 @@ from kvcr.guard_protocol import (
 from kvcr.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
 
 _GUARD_INDEX = 3
-_ROW_STRIDE = 1024
+_BLOCK_SIZE_BYTES = 1024
 _GENERATION = "a" * 32
 _DEVICE = 2049
 _INODE = 42
 _DIGEST = "opaque digest: leave unchanged"
 _JOURNAL_BYTES = 2 * _JOURNAL_HEADER_BYTES
 _MAPPING_BYTES = _JOURNAL_BYTES + 8195
-_POOL_LAYOUT = [(_ROW_STRIDE, "")]
-_TIER_CONFIG = _TierConfig(_POOL_LAYOUT, None)
+_POOL_LAYOUTS = [("", _BLOCK_SIZE_BYTES)]
+_TIER_CONFIG = _TierConfig(_POOL_LAYOUTS, None)
 
 
 def test_close_swaps_the_pidfd_under_its_lock() -> None:
@@ -204,20 +204,20 @@ def test_unsupported_tier_configuration_is_refused_at_decode() -> None:
         "backend_options": {},
     }
     with pytest.raises(ValueError, match="only a single pool"):
-        _TierConfig([(page, "full"), (page, "swa")], None)
+        _TierConfig([("full", page), ("swa", page)], None)
     with pytest.raises(ValueError, match="page aligned"):
-        _TierConfig([(page // 2, "")], _G3Config(**good))
+        _TierConfig([("", page // 2)], _G3Config(**good))
     with pytest.raises(ValueError, match="complete slots"):
         _TierConfig(
-            [(page, "")],
+            [("", page)],
             _G3Config(**{**good, "capacity_bytes_per_file": page + 1}),
         )
     with pytest.raises(ValueError, match="unique"):
         _TierConfig(
-            [(page, "")],
+            [("", page)],
             _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")}),
         )
-    _TierConfig([(page, "")], _G3Config(**good))
+    _TierConfig([("", page)], _G3Config(**good))
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
@@ -232,7 +232,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
 
     hold = KVCRClient("/unused").claim(
-        _GUARD_INDEX, _POOL_LAYOUT, _DIGEST, ("127.0.0.1", 5555)
+        _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
     )
 
     assert msgspec.to_builtins(connection.sent[0]) == {
@@ -240,7 +240,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "guard_index": _GUARD_INDEX,
         "compatibility_digest": _DIGEST,
         "tier_config": {
-            "pool_layout": [(_ROW_STRIDE, "")],
+            "pool_layouts": [("", _BLOCK_SIZE_BYTES)],
             "g3": None,
             "remote_fw_dram_backend": "UCX",
         },
@@ -261,17 +261,14 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
             "journal_bytes": _JOURNAL_BYTES,
         },
         "tier_config": {
-            "pool_layout": [(_ROW_STRIDE, "")],
+            "pool_layouts": [("", _BLOCK_SIZE_BYTES)],
             "g3": None,
             "remote_fw_dram_backend": "UCX",
         },
         "version": 1,
     }
     attach.assert_called_once_with(_grant().spec)
-    assert hold.local_dram == LocalDramOptions(
-        1234 + _JOURNAL_BYTES,
-        [(8192, "")],
-    )
+    assert hold.local_dram == LocalDramOptions([("", 1234 + _JOURNAL_BYTES, 8192)])
     # The endpoint a Guard will answer on, handed over with the grant.
     assert hold._control_listener_fd == connection.handed_fd
 
@@ -305,12 +302,12 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     [
         pytest.param(_grant(guard_index=_GUARD_INDEX + 1), None, id="wrong-guard"),
         pytest.param(
-            _grant(tier_config=_TierConfig([(_ROW_STRIDE * 2, "")], None)),
+            _grant(tier_config=_TierConfig([("", _BLOCK_SIZE_BYTES * 2)], None)),
             None,
             id="wrong-pool-layout",
         ),
         pytest.param(
-            _grant(mapping_bytes=_JOURNAL_BYTES + _ROW_STRIDE - 1),
+            _grant(mapping_bytes=_JOURNAL_BYTES + _BLOCK_SIZE_BYTES - 1),
             None,
             id="short-mapping",
         ),
@@ -342,7 +339,7 @@ def test_a_failed_claim_is_released_without_masking_the_original(
         type(original) if original is not None else KVCRGuardProtocolError
     ) as raised:
         KVCRClient("/unused").claim(
-            _GUARD_INDEX, _POOL_LAYOUT, _DIGEST, ("127.0.0.1", 5555)
+            _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
         )
 
     if original is not None:
@@ -366,7 +363,7 @@ def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> N
         [ConnectionResetError("release acknowledgement was lost")], events
     )
     hold = KVCRPoolHold(
-        local_dram=LocalDramOptions(1234, [(8192, "")]),
+        local_dram=LocalDramOptions([("", 1234, 8192)]),
         _attachment=attachment,
         _connection=connection,
     )

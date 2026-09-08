@@ -118,7 +118,7 @@ def _make_kvcr(
         return KVCR(
             KVCRConfig(
                 nixl_agent_name=agent_name,
-                pool_layout=[(page_size, "")],
+                pool_layouts=[("", page_size)],
                 nixl_listen_port=0,
                 inventory_report_interval_ms=0,
             ),
@@ -332,7 +332,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
     target = KVCR(
         KVCRConfig(
             nixl_agent_name="real-target",
-            pool_layout=[(page_size, "")],
+            pool_layouts=[("", page_size)],
             nixl_listen_port=0,
             inventory_report_interval_ms=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
@@ -459,7 +459,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
             target_control,
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layout=[(page_size, "")],
+                pool_layouts=[("", page_size)],
                 operation_timeout_ms=5000,
             ),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),

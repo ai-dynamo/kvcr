@@ -23,7 +23,7 @@ from .guard_protocol import KVCRClient, KVCRPoolHold
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, RecoveryMirrorError
+from .types import BlockKey, PoolBlockLayouts, RecoveryMirrorError
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
@@ -443,7 +443,7 @@ def claim_guarded_pool(
         )
     hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
         guard_config.guard_index,
-        config.pool_layout,
+        config.pool_layouts,
         guard_config.compatibility_digest,
         bind_address(),
         backend_configs.g3,
@@ -456,7 +456,7 @@ def claim_guarded_pool(
         recovered = read_handback(
             hold._attachment,
             guard_config.compatibility_digest,
-            config.pool_layout,
+            config.pool_layouts,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -548,7 +548,7 @@ _SNAPSHOT_TERMS = struct.Struct("<QQQQ")
 
 def canonical_pool_terms(
     compatibility_digest: str,
-    pool_layout: list[tuple[int, str]],
+    pool_layouts: PoolBlockLayouts,
     spec: "KVCRPoolSpec",
 ) -> bytes:
     """Encode what a handback region must not be replayed across."""
@@ -557,7 +557,7 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
-        + msgspec.msgpack.encode(pool_layout)
+        + msgspec.msgpack.encode(pool_layouts)
         + _SNAPSHOT_TERMS.pack(
             spec.journal_bytes,
             spec.mapping_bytes,
@@ -662,7 +662,7 @@ def read_recovery_snapshot(
 def read_handback(
     pool: KVCRPoolAttachment,
     compatibility_digest: str,
-    pool_layout: list[tuple[int, str]],
+    pool_layouts: PoolBlockLayouts,
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -673,7 +673,7 @@ def read_handback(
     else ever would, and it would refuse every later claim on this pool too.
     """
     mirror = _RecoveryMirror()
-    terms = canonical_pool_terms(compatibility_digest, pool_layout, pool._spec)
+    terms = canonical_pool_terms(compatibility_digest, pool_layouts, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)

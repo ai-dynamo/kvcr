@@ -142,21 +142,21 @@ class _LocalDram:
         kvcr: "_KVCRCore",
         region: LocalDramOptions,
     ) -> None:
-        if region.address <= 0:
-            raise ValueError("local DRAM address must be positive")
-        if len(region.pool_sizes_bytes) != 1:
+        if len(region.pools) != 1:
             raise ValueError("local DRAM supports only a single pool")
-        length, pool_name = region.pool_sizes_bytes[0]
+        pool_name, address, length = region.pools[0]
+        if address <= 0:
+            raise ValueError("local DRAM address must be positive")
         if type(length) is not int or length <= 0:
             raise ValueError("local DRAM pool size must be a positive integer")
-        if pool_name != kvcr.pool_layout[0][1]:
-            raise ValueError("local DRAM pool name must match pool_layout")
+        if pool_name != kvcr.pool_layouts[0][0]:
+            raise ValueError("local DRAM pool name must match pool_layouts")
         if not region.backend:
             raise ValueError("local DRAM NIXL backend must be non-empty")
 
         self._kvcr = kvcr
         self._backend = region.backend
-        self._address = region.address
+        self._address = address
         self._length = length
         self._slot_size = kvcr.block_size_bytes
         slot_count = length // self._slot_size
@@ -1040,7 +1040,7 @@ class _LocalDram:
             addr=self._address + slot * self._slot_size,
             size=self._slot_size,
             device_Id=0,
-            info=self._kvcr.pool_layout[0][1],
+            info=self._kvcr.pool_layouts[0][0],
         )
 
     def _update_capacity_pressure(self) -> None:

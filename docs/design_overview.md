@@ -136,7 +136,7 @@ The framework and KVCR interact through the following API.
 # Python-style pseudocode
 # Framework → KVCR
 kvcr = KVCR(
-    pool_layout=[(block_size_bytes, pool_name), ...],
+    pool_layouts=[(pool_name, block_size_bytes), ...],
     compatibility_manifest=compatibility_manifest,
     kvcr_guard_endpoint=None,
     peer_control_endpoint=peer_control_endpoint,
@@ -165,9 +165,9 @@ framework.release_pin(pin_handle)                                               
 The list-shaped API allows a key to span multiple pools. A descriptor's `info`
 can identify its pool and may be extended for other descriptor metadata.
 `fetch` may receive the expected layout shared by its keys as an ordered list
-of pool names so KVCR can allocate the destinations. Repeated
-names represent multiple descriptors from the same pool. A single-pool caller
-using the empty pool name may omit it.
+of pool names so KVCR can allocate the destinations. Repeated names represent
+multiple descriptors from the same pool. A single-pool caller using the empty
+pool name may omit it.
 
 ### Operating flow
 
