@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""KVCR-Service: the process that owns what outlives a worker.
-
-Today that is shared-memory pools and their recovery Guards; a worker claims one.
-"""
+"""KVCR-Service owns Guarded shared-memory pool groups beyond a worker's life."""
 
 import argparse
 import contextlib
@@ -39,6 +36,7 @@ from .guard_protocol import (
     _Claim,
     _Error,
     _Granted,
+    _PoolDescriptor,
     _Released,
     _TierConfig,
 )
@@ -64,10 +62,10 @@ _GB = 1 << 30
 
 
 class _PoolRegistry:
-    """A directory of pools, each owned end to end by its own Guard thread.
+    """A directory of pool groups, each owned by one Guard thread.
 
-    No locks: each pool's mailbox orders its claims, releases and deaths;
-    pools share nothing but the refusal flag.
+    No locks: each Guard's mailbox orders its claims, releases and deaths;
+    Guards share nothing but the refusal flag.
     """
 
     def __init__(
@@ -98,20 +96,21 @@ class _PoolRegistry:
                     journal_bytes=journal_bytes,
                     pool_dir=self._pool_dir,
                 )
-                # Built with the pool, not a claim: a Guard that cannot attach its
-                # pool is better discovered at startup than when a worker dies.
+                # Built with the group, not a claim: a Guard that cannot attach its
+                # allocation is better discovered at startup than when a worker dies.
                 try:
                     guard = _Guard(
                         owner.spec,
                         functools.partial(self._guard_failed, rank),
                         compatibility_digest=compatibility_digest,
                         guard_index=rank,
+                        pool_sizes_bytes=pool_sizes_bytes,
                         owner=owner,
                         refusing=self._refusing.is_set,
                     )
                 except BaseException:
-                    # Nothing has recorded this pool yet, so the sweep below cannot
-                    # reach it and its file would outlive the process.
+                    # Nothing has recorded this pool group yet, so the sweep
+                    # below cannot reach it and its file would outlive the process.
                     owner.close()
                     raise
                 # Recorded before it starts, so a failed preparation is rolled back by
@@ -123,14 +122,14 @@ class _PoolRegistry:
                 raise
 
     def _release_pools(self) -> None:
-        """Give back every pool built so far, for a startup that cannot finish."""
+        """Give back every pool group built so far after a failed startup."""
         for guard_index, guard in list(self._guards.items()):
             # Even an interrupt must not stop the sweep: the startup failure is
-            # already propagating, and every pool left behind is committed RAM.
+            # already propagating, and every group left behind is committed RAM.
             try:
                 guard.close()
             except BaseException:
-                # The Guard's thread may still hold this pool's mapping, and
+                # The Guard's thread may still hold this group's mapping, and
                 # unlinking under it would fault the process. Leave the file
                 # for the next start's purge, and keep the pool visible.
                 logger.warning(
@@ -186,8 +185,8 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-    ) -> "tuple[KVCRPoolSpec, int, _Lease]":
-        """Give a pool to a primary, and hand back the endpoint it answers on.
+    ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
+        """Give a pool group to a primary and return its Guard endpoint.
 
         The refusal check is a fast path only; the grant commits on the pool's
         actor under the same lock refuse_claims reads, so no grant follows it.
@@ -204,27 +203,27 @@ class _PoolRegistry:
         self._guard(guard_index).abort_grant(lease)
 
     def refuse_claims(self) -> None:
-        """Stop granting pools without waiting for the close path to run.
+        """Stop granting pool groups without waiting for the close path to run.
 
-        Each pool's phase lock is the barrier: after this returns, no grant can
+        Each Guard's phase lock is the barrier: after this returns, no grant can
         commit. Pre-barrier grants may still deliver; those leases are fenced.
         """
         self._refusing.set()
-        # Snapshot: close() deletes pools from the dict on other threads.
+        # Snapshot: close() deletes groups from the dict on other threads.
         for guard in list(self._guards.values()):
             with guard._phase_lock:
                 pass
 
     def close(self) -> None:
-        """Give every pool back, keeping the first reason one would not go.
+        """Give every pool group back, keeping the first reason one would not go.
 
-        A pool that will not close keeps only its own file and endpoint and
+        A group that will not close keeps only its own file and endpoint and
         stays listed, so a later close can try it again; failing that, the
         flock dies with the process and the next start reclaims.
         """
         self._refusing.set()
         failure: BaseException | None = None
-        # Tell all pools before waiting on any: a wedged one must not block the rest.
+        # Tell all Guards before waiting on any: a wedged one must not block the rest.
         for guard in self._guards.values():
             try:
                 guard.begin_close()
@@ -241,7 +240,7 @@ class _PoolRegistry:
             except BaseException as error:  # noqa: BLE001 - raised below
                 failure = failure or error
                 kept.add(guard_index)
-        # Wedged pools stay visible; drained ones stay listed until the whole
+        # Wedged groups stay visible; drained ones stay listed until the whole
         # drain finished, so a release racing shutdown is absorbed.
         for guard_index in [index for index in self._guards if index not in kept]:
             del self._guards[guard_index]
@@ -257,8 +256,8 @@ class _PoolRegistry:
     ) -> None:
         """A Guard has stopped being one, which the service cannot survive.
 
-        TODO: no per-pool containment. Its pool can no longer be recovered and may
-        still hold an endpoint the service cannot reach. One pool takes the others'
+        TODO: no per-Guard containment. Its group can no longer be recovered and may
+        still hold an endpoint the service cannot reach. One Guard takes the others'
         workers with it; add isolation back if that stops being acceptable.
         """
         logger.critical("KVCR Guard %d failed", guard_index)
@@ -321,7 +320,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
     def _await_release(self, guard_index: int, lease: "_Lease") -> None:
         """Wait for the one message a held connection may send: its release.
 
-        The pool's actor watches the pidfd, not this thread. EOF only ends the
+        The Guard actor watches the pidfd, not this thread. EOF only ends the
         connection; the lease outlives it, and a death still promotes.
         """
         while True:
@@ -406,14 +405,20 @@ class _ThreadingUnixServer(
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
             )
-        spec, listener_fd, lease = self.registry.claim(
+        spec, pools, listener_fd, lease = self.registry.claim(
             request.guard_index,
             request.tier_config,
             liveness,
             (request.control_host, request.control_port),
         )
         return (
-            _Granted(request.guard_index, spec, request.tier_config, _PROTOCOL_VERSION),
+            _Granted(
+                request.guard_index,
+                spec,
+                request.tier_config,
+                pools,
+                _PROTOCOL_VERSION,
+            ),
             (request.guard_index, listener_fd, lease),
         )
 

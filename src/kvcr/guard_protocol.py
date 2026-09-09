@@ -46,6 +46,23 @@ class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     def __post_init__(self) -> None:
         if not all(os.path.isabs(path) for path in self.paths):
             raise ValueError("G3 paths must be absolute")
+        resolved = {os.path.realpath(path) for path in self.paths}
+        if len(resolved) != len(self.paths):
+            raise ValueError("G3 file paths must be unique")
+
+
+class _PoolDescriptor(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """One ordered pool region within a Guard-owned allocation."""
+
+    name: str
+    size_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    block_size_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    offset_bytes: Annotated[int, msgspec.Meta(ge=0)] = 0
+
+    def __post_init__(self) -> None:
+        _compute_pool_geometry(self.size_bytes, self.block_size_bytes)
+        if type(self.offset_bytes) is not int or self.offset_bytes < 0:
+            raise ValueError("pool offset must be a non-negative integer")
 
 
 class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -55,22 +72,15 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
     def __post_init__(self) -> None:
         _validate_pool_layouts(self.pool_layouts)
-        # TODO: Support multiple pools after fetch and storage can discover layouts.
-        if len(self.pool_layouts) != 1:
-            raise ValueError("only a single pool is currently supported")
-        block_size_bytes = self.pool_layouts[0][1]
-        # Mirrors what the claimant's _G3 will enforce. The first claim fixes
-        # the pool's tiers forever, so a config no claimant could ever open
-        # must be refused here, before it binds.
-        if self.g3 is None:
-            return
-        if block_size_bytes % mmap.PAGESIZE:
-            raise ValueError("G3 slot size must be page aligned")
-        if self.g3.capacity_bytes_per_file % block_size_bytes:
-            raise ValueError("G3 file capacity must contain complete slots")
-        resolved = {os.path.realpath(path) for path in self.g3.paths}
-        if len(resolved) != len(self.g3.paths):
-            raise ValueError("G3 file paths must be unique")
+        if self.g3 is not None:
+            if len(self.pool_layouts) != 1:
+                raise ValueError("G3 does not support multiple pools")
+            block_size_bytes = self.pool_layouts[0][1]
+            if (
+                block_size_bytes % mmap.PAGESIZE
+                or self.g3.capacity_bytes_per_file % block_size_bytes
+            ):
+                raise ValueError("G3 requires page-aligned complete slots")
 
 
 class _Claim(msgspec.Struct, frozen=True, tag="claim"):
@@ -105,6 +115,7 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     guard_index: int
     spec: KVCRPoolSpec
     tier_config: _TierConfig
+    pools: tuple[_PoolDescriptor, ...]
     version: ProtocolVersion
 
 
@@ -167,9 +178,10 @@ class PidfdLiveness:
 
 @dataclass
 class KVCRPoolHold:
-    """A mapped pool and the connection holding its lease."""
+    """One mapped pool group and the connection holding its lease."""
 
     local_dram: LocalDramOptions
+    _pools: tuple[_PoolDescriptor, ...]
     _attachment: KVCRPoolAttachment
     _connection: FramedConnection
     _control_listener_fd: int | None = None
@@ -187,7 +199,7 @@ class KVCRPoolHold:
         """Stop local access before releasing the connection-scoped lease.
 
         ``activated=False`` tells the service this lease never served: the
-        Guard it stood down may resume instead of leaving the pool idle.
+        Guard it stood down may resume instead of leaving the pool group idle.
         """
         if self._release_attempted:
             return
@@ -225,7 +237,7 @@ class KVCRClient:
         g3: G3Options | None = None,
         remote_fw_dram_backend: str = "UCX",
     ) -> KVCRPoolHold:
-        """Claim and map one service-owned pool."""
+        """Claim and map one Guard-owned pool group."""
         g3_config = g3 and {
             "paths": [str(path.expanduser().resolve()) for path in g3.paths],
             "capacity_bytes_per_file": g3.capacity_bytes_per_file,
@@ -259,27 +271,30 @@ class KVCRClient:
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
             grant_received = True
-            spec = _grant_spec(response, guard_index, request.tier_config)
+            spec, granted_pools = _grant_layout(
+                response, guard_index, request.tier_config
+            )
             if listener_fd is None:
                 # Every pool has a Guard, and a Guard answers on the endpoint
                 # this claimant named. A grant without it means the two sides
-                # disagree about who serves this pool.
+                # disagree about who serves this pool group.
                 raise KVCRGuardProtocolError(
                     "claim was granted without the endpoint it answers on"
                 )
-            try:
-                pool_name, block_size = request.tier_config.pool_layouts[0]
-                effective_bytes, _ = _compute_pool_geometry(spec.data_bytes, block_size)
-            except ValueError as geometry_error:
-                raise KVCRGuardProtocolError(
-                    "invalid pool grant: no room for one KV block"
-                ) from geometry_error
             attachment = KVCRPoolAttachment.attach(spec)
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
-                    [(pool_name, attachment.data_address, effective_bytes)],
+                    [
+                        (
+                            pool.name,
+                            attachment.address + pool.offset_bytes,
+                            pool.size_bytes,
+                        )
+                        for pool in granted_pools
+                    ],
                     request.tier_config.remote_fw_dram_backend,
                 ),
+                _pools=granted_pools,
                 _attachment=attachment,
                 _connection=connection,
                 _control_listener_fd=listener_fd,
@@ -309,11 +324,11 @@ class KVCRClient:
             raise
 
 
-def _grant_spec(
+def _grant_layout(
     response: _Granted,
     requested_guard_index: int,
     requested_tier_config: _TierConfig,
-) -> KVCRPoolSpec:
+) -> tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...]]:
     """Take the grant apart, refusing one that answers a different request."""
     if response.guard_index != requested_guard_index:
         raise KVCRGuardProtocolError(
@@ -322,7 +337,23 @@ def _grant_spec(
         )
     if response.tier_config != requested_tier_config:
         raise KVCRGuardProtocolError("claim tier configuration mismatch")
-    return response.spec
+    pools = response.pools
+    if len(pools) != len(requested_tier_config.pool_layouts):
+        raise KVCRGuardProtocolError("claim pool count mismatch")
+    expected_offset = response.spec.journal_bytes
+    for index, (pool, layout) in enumerate(
+        zip(pools, requested_tier_config.pool_layouts)
+    ):
+        if (
+            (pool.name, pool.block_size_bytes) != layout
+            or pool.offset_bytes != expected_offset
+            or pool.size_bytes % mmap.PAGESIZE
+        ):
+            raise KVCRGuardProtocolError(f"claim pool {index} layout mismatch")
+        expected_offset += pool.size_bytes
+    if expected_offset != response.spec.mapping_bytes:
+        raise KVCRGuardProtocolError("claim pool sizes do not fill the allocation")
+    return response.spec, pools
 
 
 def _send_release(connection: FramedConnection, *, activated: bool = True) -> None:

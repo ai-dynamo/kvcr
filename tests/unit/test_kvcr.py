@@ -4,6 +4,7 @@
 
 import ctypes
 import logging
+import mmap
 import threading
 from contextlib import nullcontext, suppress
 from functools import partial
@@ -48,6 +49,7 @@ from kvcr.types import BlockKey
 
 def _fake_hold(**fields: Any) -> SimpleNamespace:
     """A hold double that hands its listener over exactly like the real one."""
+    fields.setdefault("_pools", ())
     hold = SimpleNamespace(**fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
@@ -65,7 +67,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     backend = kvcr._core._local_dram
     assert backend is not None
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
-    observed: list[tuple[BlockKey, list[tuple[str, int]] | None]] = []
+    observed: list[tuple[BlockKey, int | None]] = []
 
     def observe(key: BlockKey, record: _BlockRecord) -> None:
         residency = record.local_dram
@@ -135,6 +137,8 @@ _UNSERVED_POOL = SimpleNamespace(
     [
         ("control-absent", ValueError, "share its control endpoint", []),
         ("control-cannot-share", ValueError, "share its control endpoint", []),
+        ("g3-invalid", ValueError, "page aligned", []),
+        ("g3-multi-pool", ValueError, "does not support multiple pools", []),
         (
             "handback-unreadable",
             RuntimeError,
@@ -151,12 +155,14 @@ _UNSERVED_POOL = SimpleNamespace(
     ids=[
         "control-absent",
         "control-cannot-share",
+        "g3-invalid",
+        "g3-multi-pool",
         "handback-unreadable",
         "install-fails",
     ],
 )
 def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
-    monkeypatch, stage, error, match, expected_events
+    tmp_path, monkeypatch, stage, error, match, expected_events
 ) -> None:
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
@@ -179,10 +185,18 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     # taken.
     control: Any = Mock()
     control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    backend_configs = KVCRBackendConfigs()
     if stage == "control-absent":
         control = None
     elif stage == "control-cannot-share":
         control = SimpleNamespace(control_bind_address=None, adopt_listener=None)
+    elif stage in ("g3-invalid", "g3-multi-pool"):
+        backend_configs = KVCRBackendConfigs(
+            g3=G3Options(
+                paths=(tmp_path / "g3",),
+                capacity_bytes_per_file=mmap.PAGESIZE,
+            )
+        )
     elif stage == "handback-unreadable":
         # The lease is live well before the caller is handed anything.
         monkeypatch.setattr(
@@ -219,11 +233,15 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layouts=[("", 1024)],
+                pool_layouts=(
+                    [("full", 1024), ("swa", 1024)]
+                    if stage == "g3-multi-pool"
+                    else [("", mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024)]
+                ),
                 nixl_listen_port=1,
             ),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
-            KVCRBackendConfigs(),
+            backend_configs,
             _GUARD_CONFIG,
         )
 
@@ -338,8 +356,8 @@ def test_service_journal_is_attached_before_primary_start(
         events.append("journal")
         return journal
 
-    def attach_journal(local, configured_journal, pool_names, disk) -> None:
-        assert (local, configured_journal, pool_names, disk) == (
+    def attach_journal(local, configured_journal, pool_name, disk) -> None:
+        assert (local, configured_journal, pool_name, disk) == (
             local_dram,
             journal,
             ("",),
@@ -368,14 +386,14 @@ def test_service_journal_is_attached_before_primary_start(
     primary_control.adopt_listener.side_effect = lambda fd: events.append(f"adopt:{fd}")
     g3_config = G3Options(
         paths=(tmp_path / "g3",),
-        capacity_bytes_per_file=8192,
+        capacity_bytes_per_file=2 * mmap.PAGESIZE,
     )
     backend_configs = KVCRBackendConfigs(
         g3=g3_config,
         remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
     )
     controller = KVCR(
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 1024)]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", mmap.PAGESIZE)]),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         backend_configs,
         KVCRGuardConfig(
@@ -387,7 +405,7 @@ def test_service_journal_is_attached_before_primary_start(
 
     claim.assert_called_once_with(
         3,
-        [("", 1024)],
+        [("", mmap.PAGESIZE)],
         "Opaque-Digest",
         ("127.0.0.1", 5555),
         g3_config,
@@ -434,6 +452,19 @@ def test_kvcr_rejects_no_dram_backends() -> None:
             KVCRBindings(Mock(), Mock(), Mock()),
             KVCRBackendConfigs(),
         )
+
+
+def test_kvcr_accepts_multi_pool_layouts() -> None:
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 8), ("swa", 4)],
+        ),
+    )
+    assert kvcr._core.pool_layouts == [("full", 8), ("swa", 4)]
 
 
 def test_kvcr_rejects_ambiguous_pool_names() -> None:
@@ -659,7 +690,7 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
         _BlockRecord(),
         _LocalDramResidency([("", 0)], _LocalDramState.READY),
         _G3Residency(0),
-        _FwMemResidency(_mem_descriptor(), object()),
+        _FwMemResidency([_mem_descriptor()], object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__
 

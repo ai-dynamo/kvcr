@@ -17,13 +17,18 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
-from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
+from .config import (
+    KVCRBackendConfigs,
+    KVCRConfig,
+    KVCRGuardConfig,
+    _validate_pool_layouts,
+)
 from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import KVCRClient, KVCRPoolHold
-from .local_disk import _G3, _G3Residency
+from .guard_protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
+from .local_disk import _G3, _G3Residency, _validate_g3_slot_geometry
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, PoolBlockLayouts, RecoveryMirrorError
+from .types import BlockKey, RecoveryMirrorError
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
@@ -73,10 +78,9 @@ _RECORD_BLOCK = 1
 _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 
 
-# Arrays, not maps: repeating field names costs ring space, and the ring
-# filling ends recovery. 3 bytes a record instead of 21.
-#
-# Field order is the format. Append only -- never reorder or remove.
+# Arrays avoid repeating field names in the bounded ring. Field order is the
+# format: append only, never reorder or remove. G2 cost grows with its location
+# count and pool-name lengths.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     # Ordered pool locations, or nothing. Pool names may repeat.
     g2: list[tuple[str, int]] | None = None
@@ -453,6 +457,14 @@ def claim_guarded_pool(
     """
     if backend_configs.local_dram is not None:
         raise ValueError("guard_config conflicts with backend_configs.local_dram")
+    if backend_configs.g3 is not None:
+        _validate_pool_layouts(config.pool_layouts)
+        if len(config.pool_layouts) != 1:
+            raise ValueError("G3 does not support multiple pools")
+        _validate_g3_slot_geometry(
+            backend_configs.g3,
+            config.pool_layouts[0][1],
+        )
     # Duck-typed: what matters is whether the framework's control can hand its
     # endpoint over, not what class it is.
     framework_control = bindings.framework_control
@@ -478,7 +490,7 @@ def claim_guarded_pool(
         recovered = read_handback(
             hold._attachment,
             guard_config.compatibility_digest,
-            config.pool_layouts,
+            hold._pools,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -566,16 +578,16 @@ def _recovery_frames(
 
 
 # Bound to the pool and to the geometry: a slot index only means the same
-# bytes under the same file and pool layout. The generation stops a replay into a
+# bytes under the same file and layout. The generation stops a replay into a
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
 _SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
-_SNAPSHOT_TERMS = struct.Struct("<QQQQ")
+_SNAPSHOT_ALLOCATION_TERMS = struct.Struct("<QQQQ")
 
 
 def canonical_pool_terms(
     compatibility_digest: str,
-    pool_layouts: PoolBlockLayouts,
+    pools: tuple[_PoolDescriptor, ...],
     spec: "KVCRPoolSpec",
 ) -> bytes:
     """Encode what a handback region must not be replayed across."""
@@ -584,12 +596,22 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
-        + msgspec.msgpack.encode(pool_layouts)
-        + _SNAPSHOT_TERMS.pack(
+        + _SNAPSHOT_ALLOCATION_TERMS.pack(
             spec.journal_bytes,
             spec.mapping_bytes,
             spec.device,
             spec.inode,
+        )
+        + msgspec.msgpack.encode(
+            [
+                (
+                    pool.name,
+                    pool.size_bytes,
+                    pool.block_size_bytes,
+                    pool.offset_bytes,
+                )
+                for pool in pools
+            ]
         )
     )
 
@@ -689,7 +711,7 @@ def read_recovery_snapshot(
 def read_handback(
     pool: KVCRPoolAttachment,
     compatibility_digest: str,
-    pool_layouts: PoolBlockLayouts,
+    pools: tuple[_PoolDescriptor, ...],
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -699,9 +721,9 @@ def read_handback(
     write never finished is this service's own, and is thrown away -- nothing
     else ever would, and it would refuse every later claim on this pool too.
     """
-    pool_names = tuple(name for name, _ in pool_layouts)
+    pool_names = tuple(pool.name for pool in pools)
     mirror = _RecoveryMirror(pool_names)
-    terms = canonical_pool_terms(compatibility_digest, pool_layouts, pool._spec)
+    terms = canonical_pool_terms(compatibility_digest, pools, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)

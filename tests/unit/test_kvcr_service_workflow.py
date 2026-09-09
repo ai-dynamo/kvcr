@@ -3,6 +3,7 @@
 """Whole-workflow tests for the standalone KVCR service daemon."""
 
 import ctypes
+import mmap
 import signal
 import subprocess
 import sys
@@ -34,10 +35,11 @@ from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.kvcr_service import _DEFAULT_JOURNAL_BYTES, _KVCRService
 
 _BLOCK_SIZE_BYTES = 1024
+_POOL_LAYOUTS = [("pool0", _BLOCK_SIZE_BYTES)]
 _DIGEST = "opaque workflow digest: Preserve-Me EXACTLY"
-_JOURNAL_BYTES = 8192
-_POOL_SIZE_BYTES = 8192
-_CLI_POOL_SIZE_BYTES = 8192
+_JOURNAL_BYTES = 2 * mmap.PAGESIZE
+_POOL_SIZES_BYTES = (2 * mmap.PAGESIZE,)
+_CLI_POOL_SIZE_BYTES = 2 * mmap.PAGESIZE
 _CLI_POOL_SIZE_GB = str(_CLI_POOL_SIZE_BYTES / (1 << 30))
 _STOP_TIMEOUT_SECONDS = 5.0
 _START_TIMEOUT_SECONDS = 60.0
@@ -75,10 +77,7 @@ def _claim_when_ready(
     while time.monotonic() < deadline:
         try:
             return client.claim(
-                guard_index,
-                [("", _BLOCK_SIZE_BYTES)],
-                _DIGEST,
-                _control_bind(guard_index),
+                guard_index, _POOL_LAYOUTS, _DIGEST, _control_bind(guard_index)
             )
         except KVCRSocketError:
             if process.poll() is not None:
@@ -133,7 +132,7 @@ def _running_service(
         socket_path,
         pool_dir,
         guard_count=guard_count,
-        pool_sizes_bytes=(_POOL_SIZE_BYTES,),
+        pool_sizes_bytes=_POOL_SIZES_BYTES,
         compatibility_digest=_DIGEST,
         journal_bytes=_JOURNAL_BYTES,
     )
@@ -156,17 +155,14 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
 
     with _running_service(pool_dir) as socket_path:
         client = KVCRClient(socket_path)
-        first = client.claim(0, [("", _BLOCK_SIZE_BYTES)], _DIGEST, _control_bind(0))
-        second = client.claim(1, [("", _BLOCK_SIZE_BYTES)], _DIGEST, _control_bind(1))
+        first = client.claim(0, _POOL_LAYOUTS, _DIGEST, _control_bind(0))
+        second = client.claim(1, _POOL_LAYOUTS, _DIGEST, _control_bind(1))
         try:
-            first_address = first.local_dram.pools[0][1]
-            assert first_address != second.local_dram.pools[0][1]
-            ctypes.memmove(first_address, payload, len(payload))
+            assert first.local_dram.pools[0][1] != second.local_dram.pools[0][1]
+            ctypes.memmove(first.local_dram.pools[0][1], payload, len(payload))
 
             first.release()
-            replacement = client.claim(
-                0, [("", _BLOCK_SIZE_BYTES)], _DIGEST, _control_bind(0)
-            )
+            replacement = client.claim(0, _POOL_LAYOUTS, _DIGEST, _control_bind(0))
             try:
                 assert (
                     ctypes.string_at(replacement.local_dram.pools[0][1], len(payload))
@@ -184,7 +180,7 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
                 controller = KVCR(
                     KVCRConfig(
                         nixl_agent_name="target",
-                        pool_layouts=[("", _BLOCK_SIZE_BYTES)],
+                        pool_layouts=_POOL_LAYOUTS,
                         nixl_listen_port=1,
                     ),
                     KVCRBindings(
@@ -202,15 +198,13 @@ def test_pools_persist_bytes_and_a_held_pool_refuses_claims(tmp_path: Path) -> N
                 )
             try:
                 with pytest.raises(KVCRServiceError, match="held"):
-                    client.claim(0, [("", _BLOCK_SIZE_BYTES)], _DIGEST, (host, port))
+                    client.claim(0, _POOL_LAYOUTS, _DIGEST, (host, port))
             finally:
                 controller.close()
                 control.close()
 
             # Closing the worker released the pool: the next claim is served.
-            reclaimed = client.claim(
-                0, [("", _BLOCK_SIZE_BYTES)], _DIGEST, (host, port)
-            )
+            reclaimed = client.claim(0, _POOL_LAYOUTS, _DIGEST, (host, port))
             reclaimed.release()
         finally:
             second.release()
@@ -229,15 +223,12 @@ def test_cli_daemon_sets_geometry_and_restart_reclaims_only_unattached(
 
             # The deployed flags produce the requested pool and data geometry.
             pools = list(pool_dir.iterdir())
-            assert len(pools) == 2, "--guard-count pools at startup"
-            pool_bytes = int(float(_CLI_POOL_SIZE_GB) * (1 << 30))
+            assert len(pools) == 2, "--guard-count allocations at startup"
+            usable = _CLI_POOL_SIZE_BYTES
             assert all(
-                path.stat().st_size == _DEFAULT_JOURNAL_BYTES + pool_bytes
-                for path in pools
+                path.stat().st_size == _DEFAULT_JOURNAL_BYTES + usable for path in pools
             )
-            pool_name, address, size_bytes = hold.local_dram.pools[0]
-            assert (pool_name, size_bytes) == ("", pool_bytes)
-            assert address > 0
+            assert hold.local_dram.pools[0][2] == usable
 
             attached_pool = next(pool_dir.glob("kvcr-pool_0-*"))
             unclaimed_pool = next(pool_dir.glob("kvcr-pool_1-*"))
