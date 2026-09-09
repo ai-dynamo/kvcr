@@ -148,7 +148,6 @@ class _PolicyInvoker:
 class _Entry:
     score: float
     sequence: int
-    weight: int
 
 
 class _EvictionQueue:
@@ -156,26 +155,21 @@ class _EvictionQueue:
         self._heap: list[tuple[float, int, BlockKey]] = []
         self._live: dict[BlockKey, _Entry] = {}
         self._next_sequence = 0
-        self.total_weight = 0
 
     def __len__(self) -> int:
         return len(self._live)
 
-    def insert(self, key: BlockKey, score: float, weight: int = 1) -> bool:
+    def insert(self, key: BlockKey, score: float) -> bool:
         previous = self._live.get(key)
-        if previous is not None:
-            self.total_weight -= previous.weight
-        entry = _Entry(score, self._next_sequence, weight)
+        entry = _Entry(score, self._next_sequence)
         self._next_sequence += 1
         self._live[key] = entry
-        self.total_weight += weight
         heapq.heappush(self._heap, (entry.score, entry.sequence, key))
         return previous is None
 
     def remove(self, key: BlockKey) -> bool:
         entry = self._live.pop(key, None)
         if entry is not None:
-            self.total_weight -= entry.weight
             return True
         return False
 

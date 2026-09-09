@@ -252,7 +252,7 @@ class _LocalDram:
             "local_g2_total_slots": total_slots,
             "local_g2_free_slots": free_slots,
             "local_g2_allocated_slots": total_slots - free_slots,
-            "local_g2_evictable_slots": self._evictable.total_weight,
+            "local_g2_evictable_slots": sum(self._evictable_slots.values()),
         }
 
     def deposit(
@@ -1091,7 +1091,7 @@ class _LocalDram:
             self._unscored.add(key)
             return
         self._unscored.discard(key)
-        if self._evictable.insert(key, score, len(record.local_dram.slots)):
+        if self._evictable.insert(key, score):
             self._evictable_slots.update(name for name, _ in record.local_dram.slots)
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
