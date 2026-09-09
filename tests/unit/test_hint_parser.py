@@ -2,16 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from collections.abc import Callable
+from typing import cast
 
 import pytest
 from _kvcr_test_utils import _router_hint
 
-from kvcr.hint_parser import _LOGGED_HINT_ISSUES, _parse_kv_hint
+from kvcr.hint_parser import _LOGGED_HINT_ISSUES, _KVFetchHint
 
 
-def test_parse_kv_hint_extracts_first_fetch_action() -> None:
+def test_kv_fetch_hint_parses_first_fetch_action() -> None:
     fetch_hint = _router_hint("tcp://source:1234", (123, 456, 123))
+    later_fetch_hint = _router_hint("tcp://other:1234", (789,))
     payload = {
         "protocol_version": "0.1",
         "message_id": "test-message",
@@ -23,46 +24,34 @@ def test_parse_kv_hint_extracts_first_fetch_action() -> None:
                 "payload": {"opaque": True},
             },
             fetch_hint["actions"][0],
+            later_fetch_hint["actions"][0],
         ],
     }
 
-    assert _parse_kv_hint(payload) == (
-        "tcp://source:1234",
-        frozenset({123, 456}),
-        "copy",
+    assert _KVFetchHint.from_hint(payload) == _KVFetchHint(
+        source_endpoint="tcp://source:1234",
+        block_hashes=frozenset({123, 456}),
     )
 
 
-@pytest.mark.parametrize(
-    ("mutate_hint", "warning_text"),
-    [
-        (
-            lambda kv_hint: kv_hint.__setitem__("protocol_version", "9.0"),
-            "KV hint protocol_version mismatch",
-        ),
-        (
-            lambda kv_hint: kv_hint["actions"][0].__setitem__(
-                "action_version", "2.0"
-            ),
-            "kv.fetch action_version mismatch",
-        ),
-    ],
-)
-def test_parse_kv_hint_warns_but_reads_mismatched_versions(
+def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
     caplog: pytest.LogCaptureFixture,
-    mutate_hint: Callable[[dict[str, object]], None],
-    warning_text: str,
 ) -> None:
-    """Treat envelope/action version mismatches as advisory, not fatal."""
     _LOGGED_HINT_ISSUES.clear()
     kv_hint = _router_hint("tcp://source:1234", (123,))
-    mutate_hint(kv_hint)
+    action = cast(list[dict[str, object]], kv_hint["actions"])[0]
+    kv_hint["protocol_version"] = "9.0"
+    action["action_version"] = "2.0"
 
     with caplog.at_level(logging.WARNING):
-        parsed = _parse_kv_hint(kv_hint)
+        parsed = _KVFetchHint.from_hint(kv_hint)
+        kv_hint["protocol_version"] = "10.0"
+        action["action_version"] = "3.0"
+        _KVFetchHint.from_hint(kv_hint)
 
-    assert parsed == ("tcp://source:1234", frozenset({123}), "copy")
-    assert warning_text in caplog.text
+    assert parsed == _KVFetchHint("tcp://source:1234", frozenset({123}))
+    assert caplog.text.count("KV hint protocol_version mismatch") == 1
+    assert caplog.text.count("kv.fetch action_version mismatch") == 1
 
 
 @pytest.mark.parametrize(
@@ -95,9 +84,9 @@ def test_parse_kv_hint_warns_but_reads_mismatched_versions(
         },
     ],
 )
-def test_parse_kv_hint_rejects_invalid_protocol(kv_hint: object) -> None:
+def test_kv_fetch_hint_rejects_invalid_envelope(kv_hint: object) -> None:
     with pytest.raises(ValueError, match="invalid router hint"):
-        _parse_kv_hint(kv_hint)  # type: ignore[arg-type]
+        _KVFetchHint.from_hint(kv_hint)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -112,12 +101,16 @@ def test_parse_kv_hint_rejects_invalid_protocol(kv_hint: object) -> None:
         {
             "source_control_endpoint": "tcp://source:1",
             "block_hashes": [1],
-            "mode": "invalid",
+            "mode": "move",
         },
-        {"block_hashes": [1], "no_retain": "yes"},
+        {
+            "source_control_endpoint": "tcp://source:1",
+            "block_hashes": [1],
+            "no_retain": True,
+        },
     ],
 )
-def test_parse_kv_hint_rejects_invalid_fetch_payload(fetch_payload: object) -> None:
+def test_kv_fetch_hint_rejects_invalid_payload(fetch_payload: object) -> None:
     """Reject malformed payloads on a matching ``kv.fetch`` action."""
     kv_hint = _router_hint("tcp://source:1")
     kv_hint["actions"] = [
@@ -129,5 +122,5 @@ def test_parse_kv_hint_rejects_invalid_fetch_payload(fetch_payload: object) -> N
         }
     ]
 
-    with pytest.raises(ValueError, match="invalid router hint"):
-        _parse_kv_hint(kv_hint)
+    with pytest.raises(ValueError):
+        _KVFetchHint.from_hint(kv_hint)

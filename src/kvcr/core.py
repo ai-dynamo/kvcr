@@ -16,7 +16,7 @@ from .config import (
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hint_parser import _parse_kv_hint
+from .hint_parser import _KVFetchHint
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
@@ -315,11 +315,10 @@ class _KVCRCore:
         hints: Mapping[str, object],
         request_id: str | None = None,
     ) -> None:
-        src, block_hashes, mode = _parse_kv_hint(hints)
-        # TODO: Let policy consume mode="move" and no_retain hints.
-        if mode != "copy":
-            raise ValueError("only copy mode is currently supported")
-        self._remote_fw_dram.submit_hint(src, block_hashes, request_id)
+        hint = _KVFetchHint.from_hint(hints)
+        self._remote_fw_dram.submit_hint(
+            hint.source_endpoint, hint.block_hashes, request_id
+        )
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)
