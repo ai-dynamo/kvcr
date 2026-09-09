@@ -13,7 +13,8 @@ permissions:
 
 jobs:
   verify-two-gpus:
-    runs-on: prod-tester-amd-gpu-2-v2
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container: nvidia/cuda:12.8.1-base-ubuntu24.04
     timeout-minutes: 10
     steps:
       - name: Show NVIDIA devices
