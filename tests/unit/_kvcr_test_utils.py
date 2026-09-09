@@ -438,7 +438,7 @@ def _start_write_message(
         "remaining_timeout_ms": remaining_timeout_ms,
         "target_agent_metadata": b"target-md",
         "keys": [key],
-        "dst_descriptors": [_mem_descriptor().__dict__],
+        "dst_descriptors": [[_mem_descriptor().__dict__]],
     }
     if target_agent is not None:
         payload["target_agent"] = target_agent
@@ -560,7 +560,9 @@ class _ConstantHashAdapter:
         return 123
 
 
-def _recovered_record(*, g2: int | None = None, g3: int | None = None) -> _BlockRecord:
+def _recovered_record(
+    *, g2: int | list[tuple[str, int]] | None = None, g3: int | None = None
+) -> _BlockRecord:
     """A block record as recovery rebuilds one: settled residencies, nothing live."""
     return _BlockRecord(
         local_dram=(

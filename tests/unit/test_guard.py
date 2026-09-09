@@ -86,13 +86,15 @@ class _Journal:
 
 def _frame(key: BlockKey, record: _BlockRecord) -> tuple[int, bytes, bytes]:
     """One journal frame, exactly as a primary would publish it."""
-    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record, ("",)))
     return (_RECORD_BLOCK, bytes(key), payload)
 
 
 def _give_serving_core(guard: _Guard) -> Mock:
     """A serving core still holding one READY G2 block."""
-    record = _BlockRecord(local_dram=_LocalDramResidency(0, _LocalDramState.READY))
+    record = _BlockRecord(
+        local_dram=_LocalDramResidency([("", 0)], _LocalDramState.READY)
+    )
     core = Mock(_block_record_map={BlockKey(b"warm"): record})
     guard._core = core
     guard._serving = True
@@ -235,8 +237,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     )
     journal = _Journal(
         [
-            _frame(first, _recovered_record(g2=0, g3=7)),
-            _frame(second, _recovered_record(g2=1)),
+            _frame(first, _recovered_record(g2=[("", 0)], g3=7)),
+            _frame(second, _recovered_record(g2=[("", 1)])),
             _frame(g3_only, _recovered_record(g3=9)),
         ]
     )
@@ -332,10 +334,10 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         retained_g3 = guard._recovery._g3_records[first]
         records = {
             first: _BlockRecord(
-                local_dram=_LocalDramResidency(0, _LocalDramState.FILLING),
+                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING),
                 g3=_G3Residency(7),
             ),
-            second: _recovered_record(g2=1),
+            second: _recovered_record(g2=[("", 1)]),
         }
         cores[0]._block_record_map = records
         write_handback = Mock()
@@ -346,7 +348,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert guard._recovery.mirror._records[first].g3 is retained_g3
         assert guard._recovery.mirror._records == {
             first: _recovered_record(g3=7),
-            second: _recovered_record(g2=1),
+            second: _recovered_record(g2=[("", 1)]),
             g3_only: _recovered_record(g3=9),
         }
         assert guard._recovery._g3_records == {}
@@ -357,7 +359,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
             [
                 _frame(first, _BlockRecord()),
                 _frame(g3_only, _BlockRecord()),
-                _frame(fresh, _recovered_record(g2=0, g3=7)),
+                _frame(fresh, _recovered_record(g2=[("", 0)], g3=7)),
             ]
         )
         guard._promote()
@@ -383,7 +385,7 @@ def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     guard = _configurable_guard()
     # Every one of these readers runs on a pool a primary has already claimed.
     guard._configured = _TierConfig([("", 16)], None)
-    guard._recovery.mirror = _RecoveryMirror()
+    guard._recovery.mirror = _RecoveryMirror(("",))
     guard._recovery.attachment = Mock()
     guard._control = None
     journal = Mock()
@@ -501,7 +503,7 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     owner = Mock()
     guard = _Guard(_TEST_SPEC, compatibility_digest=_TEST_DIGEST, owner=owner)
     guard._recovery.attachment = attachment
-    mirror = guard._recovery.mirror = _RecoveryMirror()
+    mirror = guard._recovery.mirror = _RecoveryMirror(("",))
     g3_records = guard._recovery._g3_records = {BlockKey(b"g3"): _G3Residency(0)}
     guard._pool_lease.current = holder
 
@@ -573,7 +575,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
         # A hand-back that fails cannot be reported as a refused claim.
         guard._configured = _TierConfig([("", 16)], None)
         guard._serving = True
-        guard._recovery.mirror = _RecoveryMirror()
+        guard._recovery.mirror = _RecoveryMirror(("",))
         guard._core = Mock(_block_record_map={})
         failure = OSError("no space left on device")
         guard._hand_back = Mock(side_effect=failure)
@@ -590,7 +592,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
         if refused_by == "geometry":
             expected: type[Exception] = ValueError
             tier_config = _TierConfig([("", _TEST_SPEC.mapping_bytes)], None)
-            handback = Mock(return_value=_RecoveryMirror())
+            handback = Mock(return_value=_RecoveryMirror(("",)))
         else:
             expected = RecoveryJournalError
             tier_config = _TierConfig([("", 16)], None)
@@ -614,7 +616,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
 def test_a_handback_with_an_unexpected_storage_error_fails() -> None:
     """Only capacity errors (ENOSPC/EDQUOT) are survivable at the handback writer."""
     guard = _configurable_guard()
-    guard._recovery.mirror = _RecoveryMirror()
+    guard._recovery.mirror = _RecoveryMirror(("",))
     _give_serving_core(guard)
     error = OSError(errno.EIO, "I/O error")
     guard._recovery._write_handback = Mock(side_effect=error)
@@ -639,7 +641,7 @@ def test_a_handback_without_a_mirror_does_not_close_the_core() -> None:
 def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
     """ENOSPC at the pool tail drops the mirror with the handback it refused."""
     guard = _configurable_guard()
-    guard._recovery.mirror = _RecoveryMirror()
+    guard._recovery.mirror = _RecoveryMirror(("",))
     _give_serving_core(guard)
     guard._recovery._write_handback = Mock(
         side_effect=OSError(errno.ENOSPC, "No space left on device")
@@ -659,7 +661,7 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(code: int) -> No
     guard._control = None
     guard._failure_callback = lambda *_args: None
     guard._configured = _TierConfig([("", 16)], None)
-    guard._recovery.mirror = _RecoveryMirror()
+    guard._recovery.mirror = _RecoveryMirror(("",))
     _give_serving_core(guard)
     guard._recovery._journal = _Journal()
     guard._recovery._write_handback = Mock(side_effect=OSError(code, "No space left"))
@@ -675,7 +677,11 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(code: int) -> No
     # And the grant is retractable: the Guard it stood down can resume.
     assert guard._resumable is True
     guard._recovery._journal.pending = [
-        (_RECORD_BLOCK, b"fresh", _RECOVERY_ENCODER.encode(_RecoveryBlock(g2=1)))
+        (
+            _RECORD_BLOCK,
+            b"fresh",
+            _RECOVERY_ENCODER.encode(_RecoveryBlock(g2=[("", 1)])),
+        )
     ]
     guard._poll()
     assert BlockKey(b"fresh") in guard._recovery.mirror._records
@@ -685,7 +691,7 @@ def test_a_grant_that_never_arrived_resumes_the_guard_it_stood_down() -> None:
     """An aborted grant re-promotes after a hand-back; otherwise it releases."""
     guard = _configurable_guard()
     guard._resumable = True
-    guard._recovery.mirror = _RecoveryMirror()
+    guard._recovery.mirror = _RecoveryMirror(("",))
     outcomes: list[str] = []
     guard._promote = lambda: outcomes.append("promote")
     guard._release = lambda: outcomes.append("release")
@@ -715,14 +721,14 @@ def test_a_release_drops_its_mirror_after_handing_back_what_it_can(
     control = Mock()
     guard._control = control
     guard._configured = _TierConfig([("", 16)], None)
-    guard._recovery.mirror = _RecoveryMirror()
+    guard._recovery.mirror = _RecoveryMirror(("",))
     if mode == "serving":
         _give_serving_core(guard)
     else:
         guard._recovery.mirror.apply(
-            *_frame(BlockKey(b"published"), _recovered_record(g2=0))
+            *_frame(BlockKey(b"published"), _recovered_record(g2=[("", 0)]))
         )
-        tail = _frame(BlockKey(b"tail"), _recovered_record(g2=1))
+        tail = _frame(BlockKey(b"tail"), _recovered_record(g2=[("", 1)]))
         guard._recovery._journal = _Journal(pending=[tail])
     guard._recovery._write_handback = Mock(
         side_effect=OSError(errno.ENOSPC, "No space left")

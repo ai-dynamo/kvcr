@@ -193,10 +193,10 @@ class _RecoveryState:
             return self.mirror
         return read_handback(self.attachment, self._compatibility_digest, pool_layouts)
 
-    def start_primary(self) -> None:
+    def start_primary(self, pool_layouts: PoolBlockLayouts) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
         if self.mirror is None:
-            self.mirror = _RecoveryMirror()
+            self.mirror = _RecoveryMirror(tuple(name for name, _ in pool_layouts))
         self._journal.reset()
 
     def poll(self) -> bool:
@@ -220,7 +220,9 @@ class _RecoveryState:
             with suppress(Exception):
                 self._journal.invalidate()
 
-    def take_for_promotion(self) -> dict[BlockKey, _BlockRecord]:
+    def take_for_promotion(
+        self, pool_layouts: PoolBlockLayouts
+    ) -> dict[BlockKey, _BlockRecord]:
         """Drain and transfer recovered records, leaving a fresh mirror."""
         records: dict[BlockKey, _BlockRecord] = {}
         mirror = self.mirror
@@ -235,7 +237,7 @@ class _RecoveryState:
             except RecoveryJournalError as error:
                 self._drop_recovery(error)
         # A handover still needs somewhere to put the core's eventual records.
-        self.mirror = _RecoveryMirror()
+        self.mirror = _RecoveryMirror(tuple(name for name, _ in pool_layouts))
         return records
 
     def prepare_to_serve(
@@ -316,7 +318,7 @@ class _RecoveryState:
         write_recovery_snapshot(
             self.attachment,
             canonical_pool_terms(self._compatibility_digest, pool_layouts, self._spec),
-            _recovery_frames(records),
+            _recovery_frames(records, tuple(name for name, _ in pool_layouts)),
         )
 
     def close(self) -> None:
@@ -754,7 +756,7 @@ class _Guard:
                 self._hand_back(served_under)
                 self._resumable = True
             # A refused handback is cold for the new lease, not unmirrored.
-            self._recovery.start_primary()
+            self._recovery.start_primary(tier_config.pool_layouts)
             # The old channel is the last reference to the prior primary's listener.
             if self._control is not None:
                 self._control.close()
@@ -842,7 +844,7 @@ class _Guard:
         self._resumable = False
         if self._failure is not None:
             raise self._failure
-        self._serve(self._recovery.take_for_promotion())
+        self._serve(self._recovery.take_for_promotion(self._configured.pool_layouts))
 
     def _serve(self, records: dict[BlockKey, _BlockRecord]) -> None:
         """Answer on this pool's endpoint, with whatever came back from it.

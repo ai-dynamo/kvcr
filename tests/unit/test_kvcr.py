@@ -65,7 +65,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     backend = kvcr._core._local_dram
     assert backend is not None
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
-    observed: list[tuple[BlockKey, int | None]] = []
+    observed: list[tuple[BlockKey, list[tuple[str, int]] | None]] = []
 
     def observe(key: BlockKey, record: _BlockRecord) -> None:
         residency = record.local_dram
@@ -74,14 +74,14 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
         else:
             assert residency.state is _LocalDramState.READY
             assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
-        observed.append((key, None if residency is None else residency.slot))
+        observed.append((key, None if residency is None else residency.slots))
 
     backend.observe_residency(observe)
     address = ctypes.addressof(primary)
 
     first = kvcr.deposit({keys[0]: [_mem_descriptor(address, block_size)]})
     _poll_until(kvcr, lambda done: first in dict(done))
-    assert observed == [(keys[0], 0)]
+    assert observed == [(keys[0], [("", 0)])]
 
     agent.state = "ERR"
     failed = kvcr.deposit(
@@ -90,7 +90,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[failed]
     assert not failed_result[keys[1]].success
     assert observed == [
-        (keys[0], 0),
+        (keys[0], [("", 0)]),
         (keys[0], None),
     ]
 
@@ -104,7 +104,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     assert len(observed) == 3
     backend.release_sources((keys[2],))
     assert observed[2:] == [
-        (keys[2], 0),
+        (keys[2], [("", 0)]),
         (keys[2], None),
     ]
 
@@ -338,8 +338,13 @@ def test_service_journal_is_attached_before_primary_start(
         events.append("journal")
         return journal
 
-    def attach_journal(local, configured_journal, disk) -> None:
-        assert (local, configured_journal, disk) == (local_dram, journal, g3)
+    def attach_journal(local, configured_journal, pool_names, disk) -> None:
+        assert (local, configured_journal, pool_names, disk) == (
+            local_dram,
+            journal,
+            ("",),
+            g3,
+        )
         events.append("attach")
 
     monkeypatch.setattr(
@@ -426,18 +431,6 @@ def test_kvcr_rejects_no_dram_backends() -> None:
     with pytest.raises(ValueError, match="at least one DRAM backend"):
         KVCR(
             KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
-            KVCRBindings(Mock(), Mock(), Mock()),
-            KVCRBackendConfigs(),
-        )
-
-
-def test_kvcr_rejects_multi_pool_layouts() -> None:
-    with pytest.raises(ValueError, match="only a single pool"):
-        KVCR(
-            KVCRConfig(
-                nixl_agent_name="target",
-                pool_layouts=[("full", 8), ("swa", 8)],
-            ),
             KVCRBindings(Mock(), Mock(), Mock()),
             KVCRBackendConfigs(),
         )
@@ -664,7 +657,7 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
     """Every record a resident block can hold, so none of them grows one back."""
     for residency in (
         _BlockRecord(),
-        _LocalDramResidency(0, _LocalDramState.READY),
+        _LocalDramResidency([("", 0)], _LocalDramState.READY),
         _G3Residency(0),
         _FwMemResidency(_mem_descriptor(), object()),
     ):

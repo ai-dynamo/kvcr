@@ -119,9 +119,12 @@ class _FakeG3Agent(FakeNixlAgent):
 class _MoveLocalToG3Policy(FIFOPolicy):
     def __init__(self):
         self.move = True
+        self.keep_g3 = False
         self.failures = []
 
     def decide_eviction(self, meta, source):
+        if self.keep_g3 and source is CacheTier.G3:
+            return (PlacementAction.KEEP, None)
         if self.move and source is CacheTier.LOCAL_G2:
             return (PlacementAction.MOVE_TO, CacheTier.G3)
         return super().decide_eviction(meta, source)
@@ -772,6 +775,37 @@ def test_failed_g3_spill_recovers_by_dropping_source(tmp_path, caplog) -> None:
     metrics = _metric_totals(stats)
     assert ("histogram", DURATION_METRIC, "g3_store", "failed") in metrics
     assert metrics[("counter", TRANSFER_BLOCKS_METRIC, "g3_store")] == 1
+
+
+def test_full_g3_does_not_hide_a_synchronously_freed_local_slot(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    primary = ctypes.create_string_buffer(3 * page_size)
+    local = ctypes.create_string_buffer(page_size)
+    policy = _MoveLocalToG3Policy()
+    kvcr = _new_g3_kvcr(tmp_path, local, policy=policy, g3_slot_count=1)
+    first, second, third = (BlockKey(bytes((index,))) for index in range(3))
+
+    for index, key in enumerate((first, second)):
+        assert _deposit(
+            kvcr,
+            key,
+            ctypes.addressof(primary) + index * page_size,
+            page_size,
+        ).success
+
+    policy.keep_g3 = True
+    assert _deposit(
+        kvcr,
+        third,
+        ctypes.addressof(primary) + 2 * page_size,
+        page_size,
+    ).success
+
+    assert kvcr.query((first, second, third)) == [
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
 
 
 def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:

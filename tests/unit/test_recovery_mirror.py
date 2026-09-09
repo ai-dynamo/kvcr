@@ -19,16 +19,19 @@ from kvcr.recovery_journal import (
 )
 from kvcr.types import BlockKey
 
+_ONE_POOL = ("",)
+_TWO_POOLS = ("full", "swa")
 
-def _payload(record: _BlockRecord) -> bytes:
-    return _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+
+def _payload(record: _BlockRecord, pool_names: tuple[str, ...] = _ONE_POOL) -> bytes:
+    return _RECOVERY_ENCODER.encode(_project_recovery_record(record, pool_names))
 
 
 # Every live-only field set, to prove projection strips all of it.
 _FULLY_LOADED_RECORD = _BlockRecord(
     fw_mem=object(),
     local_dram=_LocalDramResidency(
-        3,
+        [("", 3)],
         _LocalDramState.READY,
         claim_count=2,
         retire_on_release=True,
@@ -41,21 +44,42 @@ _FULLY_LOADED_RECORD = _BlockRecord(
 
 
 @pytest.mark.parametrize(
-    ("record", "wire", "recovered"),
+    ("record", "pool_names", "wire", "recovered"),
     [
-        (_FULLY_LOADED_RECORD, [3, 5], _recovered_record(g2=3, g3=5)),
-        # An absent tier still occupies its slot, because position is the name.
-        (_BlockRecord(), [None, None], _BlockRecord()),
-        (_recovered_record(g2=3), [3, None], _recovered_record(g2=3)),
-        (_recovered_record(g3=5), [None, 5], _recovered_record(g3=5)),
+        (
+            _FULLY_LOADED_RECORD,
+            _ONE_POOL,
+            [[["", 3]], 5],
+            _recovered_record(g2=[("", 3)], g3=5),
+        ),
+        (
+            _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
+            _TWO_POOLS,
+            [[["full", 7], ["full", 2], ["swa", 9]], 5],
+            _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
+        ),
+        (_BlockRecord(), _ONE_POOL, [None, None], _BlockRecord()),
+        (
+            _recovered_record(g2=[("", 3)]),
+            _ONE_POOL,
+            [[["", 3]], None],
+            _recovered_record(g2=[("", 3)]),
+        ),
+        (_recovered_record(g3=5), _ONE_POOL, [None, 5], _recovered_record(g3=5)),
         # A G2 slot still FILLING or DISCARDING never settled, so it must not wire.
         (
-            _BlockRecord(local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)),
+            _BlockRecord(
+                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
+            ),
+            _ONE_POOL,
             [None, None],
             _BlockRecord(),
         ),
         (
-            _BlockRecord(local_dram=_LocalDramResidency(0, _LocalDramState.DISCARDING)),
+            _BlockRecord(
+                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.DISCARDING)
+            ),
+            _ONE_POOL,
             [None, None],
             _BlockRecord(),
         ),
@@ -63,32 +87,30 @@ _FULLY_LOADED_RECORD = _BlockRecord(
 )
 def test_recovery_wire_round_trip_keeps_only_settled_slots(
     record: _BlockRecord,
+    pool_names: tuple[str, ...],
     wire: list[object],
     recovered: _BlockRecord,
 ) -> None:
     """Only settled G2/G3 slots reach the wire; decode rebuilds fresh live state."""
-    encoded = _payload(record)
+    encoded = _payload(record, pool_names)
 
-    # Positional, so no field names ride along in every record.
+    # The outer record stays positional; G2 locations carry their pool names.
     assert msgspec.msgpack.decode(encoded) == wire
-    assert len(encoded) == 3
-    assert _decode_recovery_record(encoded) == recovered
+    assert _decode_recovery_record(encoded, pool_names) == recovered
 
 
 def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     """Appending is the one change this format allows, and it has to work."""
 
     class _RecoveryBlockV2(msgspec.Struct, frozen=True, array_like=True):
-        g2: int | None = None
+        g2: list[tuple[str, int]] | None = None
         g3: int | None = None
         appended: int = 0
 
-    today = _RECOVERY_ENCODER.encode(
-        _project_recovery_record(_recovered_record(g2=3, g3=5))
-    )
+    today = _payload(_recovered_record(g2=[("", 3)], g3=5))
 
     upgraded = msgspec.msgpack.Decoder(_RecoveryBlockV2).decode(today)
-    assert upgraded.g2 == 3
+    assert upgraded.g2 == [("", 3)]
     assert upgraded.g3 == 5
     assert upgraded.appended == 0
 
@@ -101,25 +123,32 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode({"g2": {"slot": 0, "state": "ready"}}),
         msgspec.msgpack.encode({"g3": {"slot": -1}}),
         msgspec.msgpack.encode({"g2": {"slot": "0"}}),
+        msgspec.msgpack.encode([[["other", 0]], None]),
+        msgspec.msgpack.encode([[["", -1]], None]),
+        msgspec.msgpack.encode([0, None]),
+        msgspec.msgpack.encode([[[""]], None]),
+        msgspec.msgpack.encode([[], None]),
     ],
 )
 def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:
     """A frame that does not decode to valid wire state is refused, not applied."""
-    mirror = _RecoveryMirror()
+    mirror = _RecoveryMirror(_ONE_POOL)
 
     with pytest.raises(RecoveryMirrorError, match="malformed"):
         mirror.apply(_RECORD_BLOCK, b"block", payload)
 
+    assert mirror._records == {}
+
 
 def test_mirror_replaces_blocks_whole_and_hands_them_over_uncopied() -> None:
     """Frames replace blocks whole in _records (mirrored table); take transfers it."""
-    mirror = _RecoveryMirror()
+    mirror = _RecoveryMirror(_ONE_POOL)
     key = BlockKey(b"spilled")
 
-    mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g2=1)))
-    mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g2=1, g3=7)))
+    mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g2=[("", 1)])))
+    mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g2=[("", 1)], g3=7)))
 
-    assert mirror._records == {key: _recovered_record(g2=1, g3=7)}
+    assert mirror._records == {key: _recovered_record(g2=[("", 1)], g3=7)}
 
     mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g3=7)))
 
@@ -130,14 +159,14 @@ def test_mirror_replaces_blocks_whole_and_hands_them_over_uncopied() -> None:
 
     assert mirror._records == {}
 
-    mirror.apply(_RECORD_BLOCK, b"resident", _payload(_recovered_record(g2=1)))
+    mirror.apply(_RECORD_BLOCK, b"resident", _payload(_recovered_record(g2=[("", 1)])))
     held = mirror._records
 
     taken = mirror.take_records()
 
     # Sole ownership: copying would leave two live populations of the set.
     assert taken is held
-    assert taken == {BlockKey(b"resident"): _recovered_record(g2=1)}
+    assert taken == {BlockKey(b"resident"): _recovered_record(g2=[("", 1)])}
     assert mirror._records == {}
 
 
@@ -150,7 +179,10 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     served = {
         ready: _BlockRecord(
             local_dram=_LocalDramResidency(
-                0, _LocalDramState.READY, claim_count=1, retire_on_release=True
+                [("full", 0), ("swa", 10)],
+                _LocalDramState.READY,
+                claim_count=1,
+                retire_on_release=True,
             ),
             in_flight_ops={("target", 7)},
             access_count=12,
@@ -158,33 +190,37 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
         ),
         spilled: _BlockRecord(g3=_G3Residency(3, claim_count=2)),
         filling: _BlockRecord(
-            local_dram=_LocalDramResidency(1, _LocalDramState.FILLING)
+            local_dram=_LocalDramResidency(
+                [("full", 1), ("swa", 11)], _LocalDramState.FILLING
+            )
         ),
         forgotten: _BlockRecord(),
         # A good G3 residency must not carry a half-written G2 slot with it.
         filling_spill: _BlockRecord(
-            local_dram=_LocalDramResidency(7, _LocalDramState.FILLING),
+            local_dram=_LocalDramResidency(
+                [("full", 7), ("swa", 17)], _LocalDramState.FILLING
+            ),
             g3=_G3Residency(4),
         ),
         discarding_spill: _BlockRecord(
-            local_dram=_LocalDramResidency(8, _LocalDramState.DISCARDING),
+            local_dram=_LocalDramResidency(
+                [("full", 8), ("swa", 18)], _LocalDramState.DISCARDING
+            ),
             g3=_G3Residency(5),
         ),
     }
     # A kept mirror must match exactly what the handback frames carry.
     framed = {
-        BlockKey(key): _decode_recovery_record(payload)
-        for _, key, payload in _recovery_frames(served)
+        BlockKey(key): _decode_recovery_record(payload, _TWO_POOLS)
+        for _, key, payload in _recovery_frames(served, _TWO_POOLS)
     }
-    assert set(framed) == {ready, spilled, filling_spill, discarding_spill}
-
-    mirror = _RecoveryMirror()
+    mirror = _RecoveryMirror(_TWO_POOLS)
     mirror.adopt(served)
 
     assert mirror._records is served
     assert mirror._records == framed
     assert mirror._records == {
-        ready: _recovered_record(g2=0),
+        ready: _recovered_record(g2=[("full", 0), ("swa", 10)]),
         spilled: _recovered_record(g3=3),
         filling_spill: _recovered_record(g3=4),
         discarding_spill: _recovered_record(g3=5),
