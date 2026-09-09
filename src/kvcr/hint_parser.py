@@ -4,7 +4,7 @@
 """Parse KV hint envelopes for KVCR fetch metadata.
 
 Hints are advisory request metadata. This module validates versioned KV hint
-envelopes, extracts the first usable ``kv.fetch`` action, and parses the
+envelopes, extracts the first ``kv.fetch`` action, and parses the
 fields KVCR consumes. Integration constants are exported by ``kvcr.__init__``.
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 # Public integration constants exported by kvcr.__init__.
 ROUTER_HINT_KEY = "kv_hint"
@@ -28,14 +29,6 @@ logger = logging.getLogger(__name__)
 _LOGGED_HINT_ISSUES: set[str] = set()
 
 
-def _warn_once(issue: str, message: str, *args: object) -> None:
-    """Log a parser warning at most once per issue kind."""
-    if issue in _LOGGED_HINT_ISSUES:
-        return
-    _LOGGED_HINT_ISSUES.add(issue)
-    logger.warning(message, *args)
-
-
 def _warn_version_mismatch(
     *,
     supported: object,
@@ -44,103 +37,88 @@ def _warn_version_mismatch(
     message: str,
 ) -> None:
     """Warn once when a supported schema version does not match received value."""
-    if received == supported:
+    if received == supported or issue in _LOGGED_HINT_ISSUES:
         return
-    _warn_once(issue, message, supported, received)
+    _LOGGED_HINT_ISSUES.add(issue)
+    logger.warning(message, supported, received)
 
 
-def _parse_kv_hint(
-    hint: Mapping[str, object],
-) -> tuple[str | None, frozenset[int], str]:
-    """Parse a KV hint envelope into KVCR fetch metadata.
+@dataclass(frozen=True, slots=True)
+class _KVFetchHint:
+    """Fields KVCR currently supports from the first ``kv.fetch`` action."""
 
-    Hints are advisory and parsed on the request path. Version mismatches warn
-    once per issue kind and are interpreted with the schema KVCR currently
-    supports. KVCR consumes the first valid ``kv.fetch`` action in the envelope.
-    """
-    if not isinstance(hint, Mapping):
-        raise ValueError("invalid router hint")
+    source_endpoint: str
+    block_hashes: frozenset[int]
 
-    _warn_version_mismatch(
-        supported=_KV_HINT_PROTOCOL_VERSION,
-        received=hint.get("protocol_version"),
-        issue="protocol-version-mismatch",
-        message="KV hint protocol_version mismatch; supported=%r received=%r",
-    )
+    @classmethod
+    def from_hint(cls, hint: Mapping[str, object]) -> _KVFetchHint:
+        """Parse and validate a KV hint envelope."""
+        if not isinstance(hint, Mapping):
+            raise ValueError("invalid router hint")
 
-    fetch_payload = _extract_kv_fetch_payload(hint)
-    return _parse_fetch_payload(fetch_payload)
+        _warn_version_mismatch(
+            supported=_KV_HINT_PROTOCOL_VERSION,
+            received=hint.get("protocol_version"),
+            issue="protocol-version-mismatch",
+            message="KV hint protocol_version mismatch; supported=%r received=%r",
+        )
 
+        actions = hint.get("actions")
+        if not isinstance(actions, list):
+            raise ValueError("invalid router hint")
 
-def _parse_fetch_action(action: object) -> Mapping[str, object] | None:
-    """Parse one envelope action as a ``kv.fetch`` payload."""
-    if not isinstance(action, Mapping):
-        return None
-    if action.get("action_type") != _KV_FETCH_ACTION_TYPE:
-        return None
+        fetch_payload = None
+        for action in actions:
+            if not isinstance(action, Mapping):
+                continue
+            if action.get("action_type") != _KV_FETCH_ACTION_TYPE:
+                continue
+            _warn_version_mismatch(
+                supported=_KV_FETCH_ACTION_VERSION,
+                received=action.get("action_version"),
+                issue="fetch-version-mismatch",
+                message=(
+                    "kv.fetch action_version mismatch; supported=%r received=%r; "
+                    "processing with supported schema"
+                ),
+            )
+            fetch_payload = action.get("payload")
+            break
 
-    action_version = action.get("action_version")
-    _warn_version_mismatch(
-        supported=_KV_FETCH_ACTION_VERSION,
-        received=action_version,
-        issue=f"fetch-version-mismatch:{action_version}",
-        message=(
-            "kv.fetch action_version mismatch; supported=%r received=%r; "
-            "processing with supported schema"
-        ),
-    )
+        if not isinstance(fetch_payload, Mapping):
+            raise ValueError("invalid router hint")
 
-    fetch_payload = action.get("payload")
-    if not isinstance(fetch_payload, Mapping):
-        raise ValueError("invalid router hint")
-    return fetch_payload
+        # TODO: Add mode and no_retain when KVCR starts consuming them.
+        if "no_retain" in fetch_payload:
+            raise ValueError("no_retain is not currently supported")
 
+        mode = fetch_payload.get("mode", "copy")
+        if mode != "copy":
+            raise ValueError("only copy mode is currently supported")
 
-def _extract_kv_fetch_payload(
-    hint: Mapping[str, object],
-) -> Mapping[str, object]:
-    """Extract the first ``kv.fetch`` action payload from a hint envelope."""
-    actions = hint.get("actions")
-    if not isinstance(actions, list):
-        raise ValueError("invalid router hint")
+        source = fetch_payload.get("source_control_endpoint")
+        if source is None:
+            raise ValueError("source-less hints are not currently supported")
 
-    for action in actions:
-        payload = _parse_fetch_action(action)
-        if payload is not None:
-            return payload
-
-    raise ValueError("invalid router hint")
-
-
-def _parse_fetch_payload(
-    payload: Mapping[str, object],
-) -> tuple[str | None, frozenset[int], str]:
-    """Parse and validate fields from a ``kv.fetch`` action payload."""
-
-    source = payload.get("source_control_endpoint")
-    block_hashes = payload.get("block_hashes")
-    mode = payload.get("mode", "copy")
-    if (
-        not isinstance(source, str)
-        or not source
-        or not isinstance(block_hashes, list)
-        or not isinstance(mode, str)
-        or mode not in ("copy", "move")
-        or not isinstance(payload.get("no_retain", False), bool)
-    ):
-        raise ValueError("invalid router hint")
-
-    hashes: set[int] = set()
-    for block_hash in block_hashes:
+        block_hashes = fetch_payload.get("block_hashes")
         if (
-            isinstance(block_hash, bool)
-            or not isinstance(block_hash, int)
-            or not 0 <= block_hash < 1 << 64
+            not isinstance(source, str)
+            or not source
+            or not isinstance(block_hashes, list)
         ):
             raise ValueError("invalid router hint")
-        hashes.add(block_hash)
-    if not hashes:
-        raise ValueError("invalid router hint")
 
-    # Add other fields to the parsed result when KVCR starts consuming them.
-    return source, frozenset(hashes), mode
+        hashes: set[int] = set()
+        for block_hash in block_hashes:
+            if (
+                isinstance(block_hash, bool)
+                or not isinstance(block_hash, int)
+                or not 0 <= block_hash < 1 << 64
+            ):
+                raise ValueError("invalid router hint")
+            hashes.add(block_hash)
+        if not hashes:
+            raise ValueError("invalid router hint")
+
+        # Add other fields to the parsed result when KVCR starts consuming them.
+        return cls(source, frozenset(hashes))
