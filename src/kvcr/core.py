@@ -441,8 +441,6 @@ class _KVCRCore:
             name not in self._block_sizes for name in expected_layout
         ):
             raise ValueError("expected layout must use configured pools")
-        if self._g3 is not None and len(expected_layout) != 1:
-            raise ValueError("G3 does not support multi-block layouts")
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
