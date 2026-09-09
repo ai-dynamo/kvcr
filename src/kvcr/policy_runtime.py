@@ -161,7 +161,7 @@ class _EvictionQueue:
     def __len__(self) -> int:
         return len(self._live)
 
-    def insert(self, key: BlockKey, score: float, weight: int = 1) -> None:
+    def insert(self, key: BlockKey, score: float, weight: int = 1) -> bool:
         previous = self._live.get(key)
         if previous is not None:
             self.total_weight -= previous.weight
@@ -170,11 +170,14 @@ class _EvictionQueue:
         self._live[key] = entry
         self.total_weight += weight
         heapq.heappush(self._heap, (entry.score, entry.sequence, key))
+        return previous is None
 
-    def remove(self, key: BlockKey) -> None:
+    def remove(self, key: BlockKey) -> bool:
         entry = self._live.pop(key, None)
         if entry is not None:
             self.total_weight -= entry.weight
+            return True
+        return False
 
     def select(self, excluded: set[BlockKey]) -> BlockKey | None:
         skipped: list[tuple[float, int, BlockKey]] = []

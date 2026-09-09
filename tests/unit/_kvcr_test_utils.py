@@ -457,6 +457,7 @@ def _new_kvcr(
     local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
     inventory_sink=None,
+    capacity_needed_callback=None,
     policy=None,
 ) -> KVCR:
     config = replace(
@@ -480,6 +481,7 @@ def _new_kvcr(
                 framework_control=control,
                 key_adapter=key_adapter,
                 inventory_sink=inventory_sink,
+                capacity_needed_callback=capacity_needed_callback,
                 policy=policy,
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),

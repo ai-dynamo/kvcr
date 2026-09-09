@@ -162,7 +162,7 @@ class _KVCRCore:
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._pending_inventory_events: list[InventoryEvent] = []
         self._inventory_flush_deadline: float | None = None
-        self._capacity_pressure_active = False
+        self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
@@ -208,10 +208,17 @@ class _KVCRCore:
             if local_dram_config is not None
             else None
         )
-        self._capacity_low_watermark_slots = ceil(
-            (self._local_dram._total_slots if self._local_dram is not None else 0)
-            * self.config.capacity_low_watermark_percent
-            / 100
+        self._capacity_low_watermarks = {
+            name: ceil(count * self.config.capacity_low_watermark_percent / 100)
+            for name, count in (
+                self._local_dram._slot_counts.items()
+                if self._local_dram is not None
+                else ()
+            )
+        }
+        self._capacity_pressure_enabled = (
+            self._capacity_needed_callback is not None
+            and any(self._capacity_low_watermarks.values())
         )
         self._remote_fw_dram = _RemoteFWDram(
             self,
@@ -632,18 +639,26 @@ class _KVCRCore:
         for event in events:
             self._send_inventory(event)
 
-    def _update_capacity_pressure(self, reclaimable_slots: int) -> None:
+    def _update_capacity_pressure(self, reclaimable_slots: Mapping[str, int]) -> None:
         callback = self._capacity_needed_callback
-        if callback is None or self._capacity_low_watermark_slots == 0:
+        if callback is None or not self._capacity_pressure_enabled:
             return
-        if reclaimable_slots >= self._capacity_low_watermark_slots:
-            self._capacity_pressure_active = False
+        pressured = {
+            name
+            for name, watermark in self._capacity_low_watermarks.items()
+            if watermark and reclaimable_slots[name] < watermark
+        }
+        newly_pressured = pressured - self._capacity_pressure_pools
+        self._capacity_pressure_pools = pressured
+        if not newly_pressured:
             return
-        if self._capacity_pressure_active:
-            return
-        self._capacity_pressure_active = True
+        request = [
+            (name, self._capacity_low_watermarks[name])
+            for name, _ in self.pool_layouts
+            if name in newly_pressured
+        ]
         try:
-            callback(self._capacity_low_watermark_slots)
+            callback(request)
         except Exception:
             logger.warning("KVCR capacity callback failed", exc_info=True)
 

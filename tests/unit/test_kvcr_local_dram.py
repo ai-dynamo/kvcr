@@ -387,7 +387,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
 
     agent = FakeNixlAgent()
     policy = _RecordingFIFOPolicy()
-    capacity_requests: list[int] = []
+    capacity_requests: list[list[tuple[str, int]]] = []
     kvcr = _new_local_kvcr(
         agent,
         local,
@@ -403,7 +403,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
 
     deposit = kvcr.deposit({first_key: [_mem_descriptor(primary_addr)]}, no_evict=True)
     _wait_until(lambda: bool(agent.transfers))
-    assert capacity_requests == [1]
+    assert capacity_requests == [[("", 1)]]
     with pytest.raises(ValueError, match="expected layout"):
         kvcr.fetch((first_key, second_key), expected_layout=["unknown"])
     fetch = kvcr.fetch((first_key,), expected_layout=[""])
@@ -467,7 +467,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     replacement = kvcr.deposit(
         {second_key: [_mem_descriptor(primary_addr + block_size)]}
     )
-    assert capacity_requests == [1, 1]
+    assert capacity_requests == [[("", 1)], [("", 1)]]
     assert _poll_until(kvcr, lambda results: bool(results)) == [
         (replacement, _op_entries({second_key: True}))
     ]
@@ -476,7 +476,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
 
 def test_capacity_needed_is_edge_triggered() -> None:
     local = ctypes.create_string_buffer(10)
-    capacity_requests: list[int] = []
+    capacity_requests: list[list[tuple[str, int]]] = []
     kvcr = _new_local_kvcr(
         FakeNixlAgent(),
         local,
@@ -485,14 +485,58 @@ def test_capacity_needed_is_edge_triggered() -> None:
         capacity_needed_callback=capacity_requests.append,
     )
 
-    kvcr._core._update_capacity_pressure(2)
-    kvcr._core._update_capacity_pressure(1)
-    kvcr._core._update_capacity_pressure(0)
-    assert capacity_requests == [2]
+    kvcr._core._update_capacity_pressure({"": 2})
+    kvcr._core._update_capacity_pressure({"": 1})
+    kvcr._core._update_capacity_pressure({"": 0})
+    assert capacity_requests == [[("", 2)]]
 
-    kvcr._core._update_capacity_pressure(2)
-    kvcr._core._update_capacity_pressure(1)
-    assert capacity_requests == [2, 2]
+    kvcr._core._update_capacity_pressure({"": 2})
+    kvcr._core._update_capacity_pressure({"": 1})
+    assert capacity_requests == [[("", 2)], [("", 2)]]
+
+
+def test_capacity_pressure_is_pool_local() -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(24)
+    capacity_requests: list[list[tuple[str, int]]] = []
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 8), ("swa", 8)],
+            capacity_low_watermark_percent=100,
+        ),
+        local_dram=LocalDramOptions(
+            [
+                ("full", ctypes.addressof(pools[0]), 8),
+                ("swa", ctypes.addressof(pools[1]), 16),
+            ]
+        ),
+        capacity_needed_callback=capacity_requests.append,
+    )
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+        _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+        _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
+    ]
+
+    full = kvcr.deposit({BlockKey(b"full"): descriptors[:1]}, no_evict=True)
+    _poll_until(kvcr, lambda done: full in dict(done))
+    assert capacity_requests == [[("full", 1)]]
+
+    swa_key = BlockKey(b"swa")
+    swa = kvcr.deposit({swa_key: descriptors[1:]})
+    _poll_until(kvcr, lambda done: swa in dict(done))
+    assert capacity_requests == [[("full", 1)], [("swa", 2)]]
+    capacity_requests.clear()
+
+    claim = kvcr.fetch((swa_key,), expected_layout=["swa", "swa"])
+    _poll_until(kvcr, lambda done: claim in dict(done))
+    assert capacity_requests == [[("swa", 2)]]
 
 
 @pytest.mark.parametrize(
