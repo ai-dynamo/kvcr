@@ -209,17 +209,15 @@ class _KVCRCore:
             else None
         )
         self._capacity_low_watermarks = {
-            name: ceil(count * self.config.capacity_low_watermark_percent / 100)
-            for name, count in (
-                self._local_dram._slot_counts.items()
-                if self._local_dram is not None
-                else ()
+            name: ceil(
+                length // block_size * self.config.capacity_low_watermark_percent / 100
+            )
+            for name, (_, length, block_size) in (
+                self._local_dram._pools.items() if self._local_dram is not None else ()
             )
         }
-        self._capacity_pressure_enabled = (
-            self._capacity_needed_callback is not None
-            and any(self._capacity_low_watermarks.values())
-        )
+        if not any(self._capacity_low_watermarks.values()):
+            self._capacity_needed_callback = None
         self._remote_fw_dram = _RemoteFWDram(
             self,
             backend_configs.remote_fw_dram,
@@ -641,7 +639,7 @@ class _KVCRCore:
 
     def _update_capacity_pressure(self, reclaimable_slots: Mapping[str, int]) -> None:
         callback = self._capacity_needed_callback
-        if callback is None or not self._capacity_pressure_enabled:
+        if callback is None:
             return
         pressured = {
             name

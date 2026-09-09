@@ -159,19 +159,14 @@ class _EvictionQueue:
     def __len__(self) -> int:
         return len(self._live)
 
-    def insert(self, key: BlockKey, score: float) -> bool:
-        previous = self._live.get(key)
+    def insert(self, key: BlockKey, score: float) -> None:
         entry = _Entry(score, self._next_sequence)
         self._next_sequence += 1
         self._live[key] = entry
         heapq.heappush(self._heap, (entry.score, entry.sequence, key))
-        return previous is None
 
-    def remove(self, key: BlockKey) -> bool:
-        entry = self._live.pop(key, None)
-        if entry is not None:
-            return True
-        return False
+    def remove(self, key: BlockKey) -> None:
+        self._live.pop(key, None)
 
     def select(self, excluded: set[BlockKey]) -> BlockKey | None:
         skipped: list[tuple[float, int, BlockKey]] = []
@@ -179,7 +174,7 @@ class _EvictionQueue:
         while self._heap:
             score, sequence, key = self._heap[0]
             entry = self._live.get(key)
-            if entry is None or (entry.score, entry.sequence) != (score, sequence):
+            if entry != _Entry(score, sequence):
                 heapq.heappop(self._heap)
                 continue
             if key not in excluded:

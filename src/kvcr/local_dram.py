@@ -153,7 +153,6 @@ class _LocalDram:
         self._kvcr = kvcr
         self._backend = region.backend
         self._pools: dict[str, tuple[int, int, int]] = {}
-        self._slot_counts: dict[str, int] = {}
         self._free_slots: dict[str, deque[int]] = {}
         for (pool_name, address, length), (_, slot_size) in zip(
             region.pools, kvcr.pool_layouts
@@ -166,7 +165,6 @@ class _LocalDram:
             if not slot_count:
                 raise ValueError("local DRAM pool must hold at least one block")
             self._pools[pool_name] = (address, length, slot_size)
-            self._slot_counts[pool_name] = slot_count
             self._free_slots[pool_name] = deque(range(slot_count))
         self._evictable = _EvictionQueue()
         self._evictable_slots: Counter[str] = Counter()
@@ -976,7 +974,11 @@ class _LocalDram:
     def _acquire_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         if residency.state is not _LocalDramState.READY:
             raise RuntimeError(f"cannot claim unready local DRAM entry {key!r}")
-        self._remove_evictable(key, residency)
+        if residency.claim_count == 0:
+            if key in self._unscored:
+                self._unscored.remove(key)
+            else:
+                self._remove_evictable(key, residency)
         residency.claim_count += 1
 
     def _release_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
@@ -1091,13 +1093,12 @@ class _LocalDram:
             self._unscored.add(key)
             return
         self._unscored.discard(key)
-        if self._evictable.insert(key, score):
-            self._evictable_slots.update(name for name, _ in record.local_dram.slots)
+        self._evictable.insert(key, score)
+        self._evictable_slots.update(name for name, _ in record.local_dram.slots)
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
-        self._unscored.discard(key)
-        if self._evictable.remove(key):
-            self._evictable_slots.subtract(name for name, _ in residency.slots)
+        self._evictable.remove(key)
+        self._evictable_slots.subtract(name for name, _ in residency.slots)
 
     def _retry_unscored(self) -> None:
         for key in tuple(self._unscored):
@@ -1135,7 +1136,7 @@ class _LocalDram:
         ]
 
     def _update_capacity_pressure(self) -> None:
-        if not self._kvcr._capacity_pressure_enabled:
+        if self._kvcr._capacity_needed_callback is None:
             return
         self._kvcr._update_capacity_pressure(
             {
