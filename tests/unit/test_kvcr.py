@@ -137,8 +137,18 @@ _UNSERVED_POOL = SimpleNamespace(
     [
         ("control-absent", ValueError, "share its control endpoint", []),
         ("control-cannot-share", ValueError, "share its control endpoint", []),
-        ("g3-invalid", ValueError, "page aligned", []),
-        ("g3-multi-pool", ValueError, "does not support multiple pools", []),
+        (
+            "g3-invalid",
+            ValueError,
+            "page aligned",
+            ["claim", "hold.release"],
+        ),
+        (
+            "g3-multi-pool",
+            ValueError,
+            "does not support multiple pools",
+            ["claim", "hold.release"],
+        ),
         (
             "handback-unreadable",
             RuntimeError,

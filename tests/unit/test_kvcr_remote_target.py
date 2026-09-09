@@ -234,6 +234,70 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     )
 
 
+def test_remote_fetch_preserves_a_multi_pool_layout() -> None:
+    names = ("full", "swa")
+    layout = [(name, 8) for name in names]
+    source_primary = ctypes.create_string_buffer(16)
+    source_local = [ctypes.create_string_buffer(8) for _ in names]
+    target_local = [ctypes.create_string_buffer(8) for _ in names]
+    source_agent = FakeNixlAgent(metadata=b"source-md")
+    target_agent = FakeNixlAgent(metadata=b"target-md")
+    source_control = FakeBytesControl("tcp://source:1")
+    target_control = FakeBytesControl("tcp://target:1")
+    config = KVCRConfig(nixl_agent_name="unused", pool_layouts=layout)
+
+    def dram(memories: list[ctypes.Array]) -> LocalDramOptions:
+        return LocalDramOptions(
+            [
+                (name, ctypes.addressof(memory), len(memory))
+                for name, memory in zip(names, memories, strict=True)
+            ]
+        )
+
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(),
+        source_control,
+        config,
+        name="source",
+        local_dram=dram(source_local),
+    )
+    target = _new_kvcr(
+        target_agent,
+        FakePrimaryPinning(),
+        target_control,
+        config,
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        local_dram=dram(target_local),
+    )
+    key = BlockKey(b"multi-pool")
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source_primary) + index * 8, 8, info=name)
+        for index, name in enumerate(names)
+    ]
+    source_agent.state = "DONE"
+    deposit = source.deposit({key: descriptors})
+    assert dict(_poll_until(source, bool))[deposit][key].success
+    source_agent.state = "PROC"
+
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    fetch = target.fetch((key,), "req", expected_layout=list(names))
+    _wait_until(lambda: bool(target_control.sent))
+    source_control.incoming.extend(message for _, message in target_control.sent)
+    _poll_until(source, lambda _: len(source_agent.xfers) == 2)
+    source_xfer = source_agent.xfers[1]
+    assert len(source_xfer[1]) == len(source_xfer[3]) == 2
+
+    notification = source_xfer[5]
+    source_agent.state = "DONE"
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    target_agent.notifs["source"] = [notification]
+    result = dict(_poll_until(target, bool))[fetch][key]
+    assert result.success
+    assert [descriptor.info for descriptor in result.descriptors or ()] == list(names)
+
+
 def test_remote_staging_commits_available_prefix() -> None:
     block_size = 16
     local = ctypes.create_string_buffer(block_size * 2)

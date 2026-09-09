@@ -131,6 +131,25 @@ def test_local_transfer_accepts_multiple_blocks_in_one_pool() -> None:
     ].success
 
 
+def test_local_dram_rejects_overlapping_pools() -> None:
+    memory = ctypes.create_string_buffer(16)
+    address = ctypes.addressof(memory)
+
+    with pytest.raises(ValueError, match="overlap"):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            KVCRConfig(
+                nixl_agent_name="target",
+                pool_layouts=[("full", 8), ("swa", 8)],
+            ),
+            local_dram=LocalDramOptions(
+                [("full", address, 16), ("swa", address + 8, 8)]
+            ),
+        )
+
+
 def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     full = ctypes.create_string_buffer(16)
     swa = ctypes.create_string_buffer(16)

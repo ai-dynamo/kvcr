@@ -17,15 +17,10 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
-from .config import (
-    KVCRBackendConfigs,
-    KVCRConfig,
-    KVCRGuardConfig,
-    _validate_pool_layouts,
-)
+from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from .core import _BlockRecord, _KVCRCore
 from .guard_protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
-from .local_disk import _G3, _G3Residency, _validate_g3_slot_geometry
+from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
 from .types import BlockKey, RecoveryMirrorError
@@ -457,14 +452,6 @@ def claim_guarded_pool(
     """
     if backend_configs.local_dram is not None:
         raise ValueError("guard_config conflicts with backend_configs.local_dram")
-    if backend_configs.g3 is not None:
-        _validate_pool_layouts(config.pool_layouts)
-        if len(config.pool_layouts) != 1:
-            raise ValueError("G3 does not support multiple pools")
-        _validate_g3_slot_geometry(
-            backend_configs.g3,
-            config.pool_layouts[0][1],
-        )
     # Duck-typed: what matters is whether the framework's control can hand its
     # endpoint over, not what class it is.
     framework_control = bindings.framework_control

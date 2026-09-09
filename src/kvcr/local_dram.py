@@ -166,6 +166,14 @@ class _LocalDram:
                 raise ValueError("local DRAM pool must hold at least one block")
             self._pools[pool_name] = (address, length, slot_size)
             self._free_slots[pool_name] = deque(range(slot_count))
+        ranges = sorted(
+            (address, address + length) for address, length, _ in self._pools.values()
+        )
+        if any(
+            left_end > right_start
+            for (_, left_end), (right_start, _) in zip(ranges, ranges[1:])
+        ):
+            raise ValueError("local DRAM pools must not overlap")
         self._evictable = _EvictionQueue()
         self._evictable_slots: Counter[str] = Counter()
         self._unscored: set[BlockKey] = set()
