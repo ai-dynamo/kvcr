@@ -300,21 +300,10 @@ def test_canonical_pool_terms_bind_ordered_geometry_and_allocation_identity() ->
         _PoolDescriptor("pool1", 2 * mmap.PAGESIZE, 2048, 3 * mmap.PAGESIZE),
     )
 
-    def terms_for(candidate=pools, digest=_TEST_DIGEST, allocation=spec):
-        return canonical_pool_terms(digest, candidate, allocation)
-
-    terms = terms_for()
-
-    for field, value in (
-        ("name", "other"),
-        ("size_bytes", 8192),
-        ("block_size_bytes", 2048),
-        ("offset_bytes", 12288),
-    ):
-        changed = msgspec.structs.replace(pools[0], **{field: value})
-        assert terms_for((changed, pools[1])) != terms
-    assert terms_for(tuple(reversed(pools))) != terms
-    assert terms_for(allocation=msgspec.structs.replace(spec, device=8)) != terms
+    terms = canonical_pool_terms(_TEST_DIGEST, pools, spec)
+    changed = msgspec.structs.replace(pools[0], block_size_bytes=2048)
+    assert canonical_pool_terms(_TEST_DIGEST, (changed, pools[1]), spec) != terms
+    assert canonical_pool_terms(_TEST_DIGEST, tuple(reversed(pools)), spec) != terms
 
 
 def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -> None:

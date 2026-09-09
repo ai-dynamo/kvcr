@@ -602,17 +602,7 @@ def canonical_pool_terms(
             spec.device,
             spec.inode,
         )
-        + msgspec.msgpack.encode(
-            [
-                (
-                    pool.name,
-                    pool.size_bytes,
-                    pool.block_size_bytes,
-                    pool.offset_bytes,
-                )
-                for pool in pools
-            ]
-        )
+        + msgspec.msgpack.encode(pools)
     )
 
 

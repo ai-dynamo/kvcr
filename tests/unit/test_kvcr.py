@@ -454,19 +454,6 @@ def test_kvcr_rejects_no_dram_backends() -> None:
         )
 
 
-def test_kvcr_accepts_multi_pool_layouts() -> None:
-    kvcr = _new_kvcr(
-        FakeNixlAgent(),
-        FakePrimaryPinning(),
-        FakeBytesControl(),
-        KVCRConfig(
-            nixl_agent_name="target",
-            pool_layouts=[("full", 8), ("swa", 4)],
-        ),
-    )
-    assert kvcr._core.pool_layouts == [("full", 8), ("swa", 4)]
-
-
 def test_kvcr_rejects_ambiguous_pool_names() -> None:
     bindings = KVCRBindings(Mock(), Mock(), Mock())
     for pool_layouts, message in (

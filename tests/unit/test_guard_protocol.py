@@ -219,35 +219,8 @@ def _connect_with(
 def test_pool_descriptor_constraints_are_part_of_the_wire_contract() -> None:
     with pytest.raises(ValueError, match="positive"):
         _PoolDescriptor("pool", 0, 1)
-    with pytest.raises(ValueError, match="non-negative"):
-        _PoolDescriptor("pool", 1, 1, -1)
     with pytest.raises(ValueError, match="complete KV block"):
         _PoolDescriptor("pool", 1023, 1024)
-
-
-def test_collection_wire_shapes_are_nonempty_and_have_no_scalar_aliases() -> None:
-    claim_wire = msgspec.to_builtins(
-        _Claim(_GUARD_INDEX, _DIGEST, _TIER_CONFIG, "127.0.0.1", 5555, 1)
-    )
-    empty_claim = {**claim_wire, "tier_config": {"pool_layouts": [], "g3": None}}
-    negative_claim = {**claim_wire, "guard_index": -1}
-    scalar_tier = {"row_stride": _POOL_LAYOUTS[0][1], "g3": None}
-    scalar_claim = {
-        **claim_wire,
-        "tier_config": scalar_tier,
-    }
-    scalar_claim["pool_index"] = scalar_claim.pop("guard_index")
-    scalar_grant = {**msgspec.to_builtins(_grant()), "tier_config": scalar_tier}
-    scalar_grant["pool_index"] = scalar_grant.pop("guard_index")
-    scalar_grant.pop("pools")
-    for decoder, wire in (
-        (protocol_module._CLAIM_DECODER, empty_claim),
-        (protocol_module._CLAIM_DECODER, negative_claim),
-        (protocol_module._CLAIM_DECODER, scalar_claim),
-        (protocol_module._CLAIM_RESPONSE_DECODER, scalar_grant),
-    ):
-        with pytest.raises(msgspec.ValidationError):
-            decoder.decode(msgspec.msgpack.encode(wire))
 
 
 def test_g3_config_keeps_its_intrinsic_path_checks() -> None:

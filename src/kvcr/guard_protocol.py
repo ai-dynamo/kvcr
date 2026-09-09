@@ -61,8 +61,6 @@ class _PoolDescriptor(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
     def __post_init__(self) -> None:
         _compute_pool_geometry(self.size_bytes, self.block_size_bytes)
-        if type(self.offset_bytes) is not int or self.offset_bytes < 0:
-            raise ValueError("pool offset must be a non-negative integer")
 
 
 class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):

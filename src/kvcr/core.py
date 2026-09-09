@@ -649,8 +649,8 @@ class _KVCRCore:
         if not newly_pressured:
             return
         request = [
-            (name, self._capacity_low_watermarks[name])
-            for name, _ in self.pool_layouts
+            (name, watermark)
+            for name, watermark in self._capacity_low_watermarks.items()
             if name in newly_pressured
         ]
         try:

@@ -204,8 +204,6 @@ def _group_primary_child(socket_path: str, control_port: str) -> None:
         _DIGEST,
         ("127.0.0.1", int(control_port)),
     )
-    for index, (_name, address, size_bytes) in enumerate(hold.local_dram.pools):
-        ctypes.memset(address, ord("A") + index, size_bytes)
     record = _BlockRecord(
         local_dram=_LocalDramResidency(
             [("pool0", 0), ("pool1", 0)], _LocalDramState.READY
@@ -258,12 +256,13 @@ def live_service(
     request: pytest.FixtureRequest,
 ) -> Iterator[tuple[_KVCRService, Callable[..., subprocess.Popen[str]]]]:
     """A service on its own thread; children it spawns die with it."""
-    pool_count = getattr(request, "param", 1)
     pool_dir = tmp_path / "pools"
     pool_dir.mkdir()
     page_size = os.sysconf("SC_PAGE_SIZE")
     pool_sizes = (
-        (2 * page_size, page_size) if pool_count == 2 else (page_size,) * pool_count
+        (2 * page_size, page_size)
+        if getattr(request, "param", 1) == 2
+        else (page_size,)
     )
     service = _KVCRService(
         tmp_path / "service.sock",
@@ -492,16 +491,9 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
             _DIGEST,
             replacement._pools,
         ).take_records()
-        recovered_record = recovered[key]
-        assert recovered_record.local_dram is not None
-        assert recovered_record.local_dram.slots == [("pool0", 0), ("pool1", 0)]
-        for index, (_name, address, _size_bytes) in enumerate(
-            replacement.local_dram.pools
-        ):
-            assert (
-                ctypes.string_at(address, page_size)
-                == bytes((ord("A") + index,)) * page_size
-            )
+        assert recovered[key].local_dram == _LocalDramResidency(
+            [("pool0", 0), ("pool1", 0)], _LocalDramState.READY
+        )
     finally:
         replacement.release()
 

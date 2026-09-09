@@ -16,6 +16,7 @@ import time
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from itertools import chain
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
@@ -269,15 +270,11 @@ class _SourceWriteOp(_RemoteOp):
             try:
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
+                    tuple(chain.from_iterable(self.src_descriptors)),
                     tuple(
-                        descriptor
-                        for descriptors in self.src_descriptors
-                        for descriptor in descriptors
-                    ),
-                    tuple(
-                        descriptor
-                        for descriptors in self.dst_descriptors[: self.completed_count]
-                        for descriptor in descriptors
+                        chain.from_iterable(
+                            self.dst_descriptors[: self.completed_count]
+                        )
                     ),
                     remote_side_agent=self.remote_agent,
                     backend=backend._options.backend,

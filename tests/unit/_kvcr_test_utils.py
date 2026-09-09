@@ -563,7 +563,7 @@ class _ConstantHashAdapter:
 
 
 def _recovered_record(
-    *, g2: int | list[tuple[str, int]] | None = None, g3: int | None = None
+    *, g2: list[tuple[str, int]] | None = None, g3: int | None = None
 ) -> _BlockRecord:
     """A block record as recovery rebuilds one: settled residencies, nothing live."""
     return _BlockRecord(

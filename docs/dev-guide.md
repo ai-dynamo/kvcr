@@ -357,8 +357,9 @@ pools do not have to agree on a block size.
 
 `KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and
 `KVCRGuardConfig`-driven construction. Remote-transfer peers must use the same
-pool names, block sizes, and order; a mismatch fails that operation. G3 supports
-one pool and exactly one block per key; repeated slots in that pool are unsupported.
+pool names, block sizes, and order; a mismatch fails that operation. The current
+G3 data plane stores one slot per key, so it supports one pool and one block per
+key; multiple blocks in that pool remain out of scope.
 
 **A pool group's configuration is fixed by its first claim.** Every later
 claim on that Guard must name the same ordered pool layout and, when G3 is

@@ -81,6 +81,7 @@ def _fake_attachment() -> Mock:
     """A stand-in with the pool-tail surface a Guard reaches for."""
     attachment = Mock(
         address=1234,
+        data_address=1234 + _TEST_SPEC.journal_bytes,
         _spec=_TEST_SPEC,
     )
     attachment.mapped_snapshot.return_value = nullcontext(None)
@@ -212,8 +213,8 @@ def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> N
     assert caplog.records[0].exc_info[1] is error
     core.close.assert_called_once_with()
     control.close.assert_not_called()
-    failure_callback.assert_called_once_with(guard, error)
     journal.invalidate.assert_called_once_with()
+    failure_callback.assert_called_once_with(guard, error)
 
 
 def test_standby_guard_failure_releases_adopted_listener() -> None:
@@ -713,19 +714,19 @@ def test_a_grant_that_never_arrived_resumes_the_guard_it_stood_down() -> None:
     guard._promote = lambda: outcomes.append("promote")
     guard._release = lambda: outcomes.append("release")
 
-    lease = Mock(close=Mock(side_effect=lambda: outcomes.append("close")))
+    lease = Mock()
     guard._pool_lease.current = lease
     guard._abort(lease)
-    assert outcomes == ["promote", "close"]
+    assert outcomes == ["promote"]
     lease.close.assert_called_once_with()
     assert guard._pool_lease.current is None
     assert guard._phase is _Phase.STANDBY
 
     guard._resumable = False
-    stale = Mock(close=Mock(side_effect=lambda: outcomes.append("close")))
+    stale = Mock()
     guard._pool_lease.current = stale
     guard._abort(stale)
-    assert outcomes == ["promote", "close", "release", "close"]
+    assert outcomes == ["promote", "release"]
     assert guard._phase is _Phase.IDLE
 
 

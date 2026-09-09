@@ -1029,6 +1029,7 @@ def test_promotion_failure_fails_the_pool_and_stops_the_whole_service(
         _claim(registry, 0, liveness)
 
         _kill_and_wait(registry, 0, liveness)
+
         assert server._fatal_error is failure
         server.shutdown.assert_called_once_with()
         assert registry._refusing.is_set() is True

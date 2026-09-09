@@ -189,10 +189,6 @@ class _LocalDram:
     def memory_regions(self) -> tuple[tuple[int, int], ...]:
         return tuple((address, length) for address, length, _ in self._pools.values())
 
-    @property
-    def _total_slots(self) -> int:
-        return sum(length // slot_size for _, length, slot_size in self._pools.values())
-
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
     ) -> None:
@@ -244,7 +240,9 @@ class _LocalDram:
                 self._make_evictable(key)
 
     def telemetry_state(self) -> dict[str, int]:
-        total_slots = self._total_slots
+        total_slots = sum(
+            length // slot_size for _, length, slot_size in self._pools.values()
+        )
         free_slots = sum(map(len, self._free_slots.values()))
         return {
             "local_g2_total_slots": total_slots,
