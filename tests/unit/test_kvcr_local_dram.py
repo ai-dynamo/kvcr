@@ -177,6 +177,8 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     ]
     first, second = BlockKey(b"first"), BlockKey(b"second")
 
+    with pytest.raises(ValueError, match="configured pools"):
+        kvcr.deposit({first: [_mem_descriptor(info="unknown")]})
     operation = kvcr.deposit({first: descriptors})
     _wait_until(lambda: bool(agent.transfers))
     wrong_layout = kvcr.fetch((first,), expected_layout=["swa"])
@@ -194,6 +196,13 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     ]
     kvcr.release([result.release_handle])
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
+
+    wrong = kvcr.deliver({first: descriptors[1:]})
+    assert dict(kvcr.poll_completed())[wrong][first].status is OpEntryStatus.FAILED
+    matching = kvcr.deliver({first: descriptors})
+    assert dict(_poll_until(kvcr, lambda done: matching in dict(done)))[matching][
+        first
+    ].success
 
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
@@ -240,7 +249,7 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
 
 
 def test_group_allocation_evicts_enough_whole_keys() -> None:
-    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    pools = [ctypes.create_string_buffer(16), ctypes.create_string_buffer(16)]
     source = ctypes.create_string_buffer(24)
     agent = FakeNixlAgent()
     agent.state = "DONE"
@@ -251,7 +260,7 @@ def test_group_allocation_evicts_enough_whole_keys() -> None:
         KVCRConfig(nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]),
         local_dram=LocalDramOptions(
             [
-                ("full", ctypes.addressof(pools[0]), 8),
+                ("full", ctypes.addressof(pools[0]), 16),
                 ("swa", ctypes.addressof(pools[1]), 16),
             ]
         ),
@@ -273,12 +282,12 @@ def test_group_allocation_evicts_enough_whole_keys() -> None:
 
     assert result[grouped].success
     assert kvcr.query((full, swa0, swa1, grouped)) == [
-        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
-    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 4
 
 
 @pytest.mark.parametrize(
@@ -542,6 +551,11 @@ def test_capacity_pressure_is_pool_local() -> None:
         _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
         _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
     ]
+
+    kvcr._core._update_capacity_pressure({"full": 0, "swa": 0})
+    assert capacity_requests == [[("full", 1), ("swa", 2)]]
+    kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
+    capacity_requests.clear()
 
     full = kvcr.deposit({BlockKey(b"full"): descriptors[:1]}, no_evict=True)
     _poll_until(kvcr, lambda done: full in dict(done))

@@ -245,6 +245,11 @@ def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
             [("pool", mmap.PAGESIZE)],
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE + 1}),
         )
+    with pytest.raises(ValueError, match="page-aligned"):
+        _TierConfig(
+            [("pool", mmap.PAGESIZE // 2)],
+            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
+        )
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(

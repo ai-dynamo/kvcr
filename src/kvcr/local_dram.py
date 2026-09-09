@@ -390,16 +390,13 @@ class _LocalDram:
                     to_reserve.append(key)
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
-            elif residency.state is _LocalDramState.READY:
-                if [name for name, _ in residency.slots] == layout:
-                    self._kvcr._record_access((key,))
-                    op.results[key] = self._new_public_claim(
-                        key, residency, include_descriptors=True
-                    )
-                else:
-                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif [name for name, _ in residency.slots] != layout:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+            elif residency.state is _LocalDramState.READY:
+                self._kvcr._record_access((key,))
+                op.results[key] = self._new_public_claim(
+                    key, residency, include_descriptors=True
+                )
             elif residency.state is _LocalDramState.DISCARDING:
                 # A discarded fill still owns its slot, so this block cannot be
                 # reserved yet. Wait for the slot instead of failing a key a

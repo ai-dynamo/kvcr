@@ -222,7 +222,6 @@ def _stand_in_pool(spec) -> Mock:
 def _new_registry(
     tmp_path: Path,
     guard_count: int = 1,
-    pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
 ) -> _PoolRegistry:
     """A registry of real Guards over stand-in pool mappings."""
     journal = Mock()
@@ -234,7 +233,7 @@ def _new_registry(
         return _PoolRegistry(
             tmp_path,
             guard_count,
-            pool_sizes_bytes,
+            _TEST_POOL_SIZES_BYTES,
             _TEST_JOURNAL_BYTES,
             _TEST_DIGEST,
         )

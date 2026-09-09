@@ -210,11 +210,7 @@ def _group_primary_child(socket_path: str, control_port: str) -> None:
         )
     )
     journal = RecoveryJournal(hold._attachment)
-    journal.publish(
-        *next(
-            iter(_recovery_frames({BlockKey(b"grouped"): record}, ("pool0", "pool1")))
-        )
-    )
+    journal.publish(*next(iter(_recovery_frames({BlockKey(b"grouped"): record}))))
     print("ready", flush=True)
     time.sleep(60)
 

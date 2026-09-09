@@ -81,7 +81,6 @@ def _fake_attachment() -> Mock:
     """A stand-in with the pool-tail surface a Guard reaches for."""
     attachment = Mock(
         address=1234,
-        data_address=1234 + _TEST_SPEC.journal_bytes,
         _spec=_TEST_SPEC,
     )
     attachment.mapped_snapshot.return_value = nullcontext(None)
@@ -106,7 +105,7 @@ class _Journal:
 
 def _frame(key: BlockKey, record: _BlockRecord) -> tuple[int, bytes, bytes]:
     """One journal frame, exactly as a primary would publish it."""
-    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record, ("",)))
+    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
     return (_RECORD_BLOCK, bytes(key), payload)
 
 

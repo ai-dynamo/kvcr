@@ -318,7 +318,7 @@ class _RecoveryState:
         write_recovery_snapshot(
             self.attachment,
             canonical_pool_terms(self._compatibility_digest, self.pools, self._spec),
-            _recovery_frames(records, tuple(pool.name for pool in self.pools)),
+            _recovery_frames(records),
         )
 
     def close(self) -> None:

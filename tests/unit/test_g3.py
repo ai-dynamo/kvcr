@@ -525,6 +525,8 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     now = 2.0
+    with pytest.raises(ValueError, match="multi-block"):
+        kvcr.fetch((first,), expected_layout=["", ""])
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, bool))[fetch][first]
     assert fetch_result.success and fetch_result.descriptors is not None

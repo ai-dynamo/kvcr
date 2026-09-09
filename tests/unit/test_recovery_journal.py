@@ -140,7 +140,7 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     journal, _ = journal_and_mapping
     local_dram, g3 = _Source(), _Source()
     key = BlockKey(b"block")
-    _attach_journal(local_dram, journal, ("pool0",), g3)
+    _attach_journal(local_dram, journal, g3)
     caplog.set_level("WARNING", logger="kvcr.recovery_journal")
 
     local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]))
@@ -174,7 +174,7 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
         fresh = RecoveryJournal(_attachment(fresh_mapping, _TEST_JOURNAL_BYTES))
         fresh.reset()
         source = _Source()
-        _attach_journal(source, fresh, ("pool0",))
+        _attach_journal(source, fresh)
         assert not fresh.is_invalid()
         with patch.object(fresh, "publish", side_effect=RuntimeError("publish failed")):
             source.emit(
@@ -280,7 +280,6 @@ def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -
     """One-slot handback region: the smallest finished snapshot."""
     frames = _recovery_frames(
         {BlockKey(key * 32): _recovered_record(g2=[("pool0", slot)])},
-        ("pool0",),
     )
     write_recovery_snapshot(pool, terms, frames)
 
@@ -324,7 +323,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
             BlockKey(b"b" * 32): _recovered_record(g2=[("pool0", 4)], g3=9),
             BlockKey(b"c" * 32): _recovered_record(g3=2),
         }
-        write_recovery_snapshot(pool, terms, _recovery_frames(records, ("pool0",)))
+        write_recovery_snapshot(pool, terms, _recovery_frames(records))
         # Inside the pool file, so it has no name of its own to be found under.
         assert set(tmp_path.iterdir()) == {path}
         assert path.stat().st_size > pool._spec.mapping_bytes

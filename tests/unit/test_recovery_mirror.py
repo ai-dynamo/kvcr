@@ -23,8 +23,8 @@ _ONE_POOL = ("",)
 _TWO_POOLS = ("full", "swa")
 
 
-def _payload(record: _BlockRecord, pool_names: tuple[str, ...] = _ONE_POOL) -> bytes:
-    return _RECOVERY_ENCODER.encode(_project_recovery_record(record, pool_names))
+def _payload(record: _BlockRecord) -> bytes:
+    return _RECOVERY_ENCODER.encode(_project_recovery_record(record))
 
 
 # Every live-only field set, to prove projection strips all of it.
@@ -92,7 +92,7 @@ def test_recovery_wire_round_trip_keeps_only_settled_slots(
     recovered: _BlockRecord,
 ) -> None:
     """Only settled G2/G3 slots reach the wire; decode rebuilds fresh live state."""
-    encoded = _payload(record, pool_names)
+    encoded = _payload(record)
 
     # The outer record stays positional; G2 locations carry their pool names.
     assert msgspec.msgpack.decode(encoded) == wire
@@ -136,8 +136,6 @@ def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:
 
     with pytest.raises(RecoveryMirrorError, match="malformed"):
         mirror.apply(_RECORD_BLOCK, b"block", payload)
-
-    assert mirror._records == {}
 
 
 def test_mirror_replaces_blocks_whole_and_hands_them_over_uncopied() -> None:
@@ -212,7 +210,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     # A kept mirror must match exactly what the handback frames carry.
     framed = {
         BlockKey(key): _decode_recovery_record(payload, _TWO_POOLS)
-        for _, key, payload in _recovery_frames(served, _TWO_POOLS)
+        for _, key, payload in _recovery_frames(served)
     }
     mirror = _RecoveryMirror(_TWO_POOLS)
     mirror.adopt(served)

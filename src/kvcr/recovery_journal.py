@@ -78,7 +78,13 @@ _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 # count and pool-name lengths.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     # Ordered pool locations, or nothing. Pool names may repeat.
-    g2: list[tuple[str, int]] | None = None
+    g2: (
+        Annotated[
+            list[tuple[str, Annotated[int, msgspec.Meta(ge=0)]]],
+            msgspec.Meta(min_length=1),
+        ]
+        | None
+    ) = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
 
 
@@ -103,40 +109,25 @@ def _is_recoverable(record: _BlockRecord) -> bool:
     )
 
 
-def _g2_locations(
-    slots: list[tuple[str, int]], pool_names: tuple[str, ...]
-) -> list[tuple[str, int]]:
-    if type(slots) is not list or not slots:
-        raise ValueError("G2 recovery locations must be a non-empty list")
-    allowed = set(pool_names)
-    for location in slots:
-        if type(location) is not tuple or len(location) != 2:
-            raise ValueError("G2 recovery location must be a pool and slot pair")
-        pool_name, pool_slot = location
-        if pool_name not in allowed or type(pool_slot) is not int or pool_slot < 0:
-            raise ValueError("G2 recovery location does not match the pool group")
-    return slots
-
-
-def _project_recovery_record(
-    record: _BlockRecord, pool_names: tuple[str, ...]
-) -> _RecoveryBlock:
+def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
     g3 = record.g3.slot if record.g3 is not None else None
     local_dram = record.local_dram
     if local_dram is None or local_dram.state is not _LocalDramState.READY:
         return _RecoveryBlock(g3=g3)
-    return _RecoveryBlock(g2=_g2_locations(local_dram.slots, pool_names), g3=g3)
+    return _RecoveryBlock(g2=local_dram.slots, g3=g3)
 
 
 def _decode_recovery_record(
     payload: bytes, pool_names: tuple[str, ...]
 ) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
+    if recovered.g2 is not None and any(
+        name not in pool_names for name, _ in recovered.g2
+    ):
+        raise ValueError("G2 recovery location does not match the pool group")
     return _BlockRecord(
         local_dram=(
-            _LocalDramResidency(
-                _g2_locations(recovered.g2, pool_names), _LocalDramState.READY
-            )
+            _LocalDramResidency(recovered.g2, _LocalDramState.READY)
             if recovered.g2 is not None
             else None
         ),
@@ -357,7 +348,6 @@ class _RecoveryMirror:
                 if local_dram.state is not _LocalDramState.READY:
                     record.local_dram = None
                 else:
-                    _g2_locations(local_dram.slots, self._pool_names)
                     local_dram.claim_count = 0
                     local_dram.retire_on_release = False
             if record.g3 is not None:
@@ -386,7 +376,6 @@ class _RecoveryMirror:
 def _attach_journal(
     local_dram: _LocalDram,
     journal: RecoveryJournal,
-    pool_names: tuple[str, ...],
     g3: _G3 | None = None,
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
@@ -410,7 +399,7 @@ def _attach_journal(
 
     def publish(key: BlockKey, record: _BlockRecord) -> None:
         # TODO: Publish per-tier deltas if full-record journal traffic is material.
-        recovered = _project_recovery_record(record, pool_names)
+        recovered = _project_recovery_record(record)
         publish_frame(_RECORD_BLOCK, bytes(key), _RECOVERY_ENCODER.encode(recovered))
 
     if g3 is not None:
@@ -519,7 +508,6 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
     _attach_journal(
         core._local_dram,
         RecoveryJournal(hold._attachment),
-        tuple(pool[0] for pool in hold.local_dram.pools),
         core._g3,
     )
     install_recovery_records(core, claimed.recovered.take_records())
@@ -554,13 +542,13 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
 
 
 def _recovery_frames(
-    records: Mapping[BlockKey, _BlockRecord], pool_names: tuple[str, ...]
+    records: Mapping[BlockKey, _BlockRecord],
 ) -> Iterator[tuple[int, bytes, bytes]]:
     """Every frame a returning primary needs to rebuild this state."""
     for key, record in records.items():
         if not _is_recoverable(record):
             continue
-        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record, pool_names))
+        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
         yield _RECORD_BLOCK, bytes(key), payload
 
 

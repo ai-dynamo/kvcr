@@ -234,7 +234,13 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     )
 
 
-def test_remote_fetch_preserves_a_multi_pool_layout() -> None:
+@pytest.mark.parametrize(
+    ("expected_layout", "success"),
+    [(["swa", "full"], False), (["full", "swa"], True)],
+)
+def test_remote_fetch_validates_a_multi_pool_layout(
+    expected_layout: list[str], success: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     names = ("full", "swa")
     layout = [(name, 8) for name in names]
     source_primary = ctypes.create_string_buffer(16)
@@ -282,20 +288,27 @@ def test_remote_fetch_preserves_a_multi_pool_layout() -> None:
     source_agent.state = "PROC"
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = target.fetch((key,), "req", expected_layout=list(names))
+    fetch = target.fetch((key,), "req", expected_layout=expected_layout)
     _wait_until(lambda: bool(target_control.sent))
     source_control.incoming.extend(message for _, message in target_control.sent)
-    _poll_until(source, lambda _: len(source_agent.xfers) == 2)
-    source_xfer = source_agent.xfers[1]
-    assert len(source_xfer[1]) == len(source_xfer[3]) == 2
-
-    notification = source_xfer[5]
-    source_agent.state = "DONE"
-    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    if success:
+        _poll_until(source, lambda _: len(source_agent.xfers) == 2)
+        source_xfer = source_agent.xfers[1]
+        assert len(source_xfer[1]) == len(source_xfer[3]) == 2
+        notification = source_xfer[5]
+        source_agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    else:
+        _poll_until(source, lambda _: bool(source_agent.sent_notifs))
+        notification = source_agent.sent_notifs[0][1]
+        assert "start_write layout mismatch" in caplog.text
     target_agent.notifs["source"] = [notification]
     result = dict(_poll_until(target, bool))[fetch][key]
-    assert result.success
-    assert [descriptor.info for descriptor in result.descriptors or ()] == list(names)
+    assert result.success is success
+    if success:
+        assert [descriptor.info for descriptor in result.descriptors or ()] == list(
+            names
+        )
 
 
 def test_remote_staging_commits_available_prefix() -> None:

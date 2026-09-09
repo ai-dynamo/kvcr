@@ -380,7 +380,7 @@ class _KVCRCore:
             if self._is_local_resident(key):
                 local_blocks[key] = destination
             elif self._g3 is not None and self._g3.is_ready(key):
-                g3_blocks[key] = destination[0]
+                g3_blocks[key] = self._g3._single_descriptor(destination)
             else:
                 remote_blocks[key] = destination
 
@@ -437,10 +437,9 @@ class _KVCRCore:
         hints: object | None = None,
     ) -> OpHandle:
         expected_layout = [""] if expected_layout is None else list(expected_layout)
-        if not expected_layout or any(
-            name not in self._block_sizes for name in expected_layout
-        ):
-            raise ValueError("expected layout must use configured pools")
+        self._validate_block_layout(
+            expected_layout, "expected layout must use configured pools"
+        )
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -690,7 +689,10 @@ class _KVCRCore:
         if source is CacheTier.G3:
             started = self._g3 is not None and self._g3.start_fill(
                 fill_handle,
-                {key: descriptors[0] for key, descriptors in blocks.items()},
+                {
+                    key: self._g3._single_descriptor(descriptors)
+                    for key, descriptors in blocks.items()
+                },
                 deadline,
             )
         elif source is CacheTier.REMOTE_G2:
@@ -724,15 +726,21 @@ class _KVCRCore:
             isinstance(descriptor, MemDescriptor) for descriptor in descriptors
         ):
             raise ValueError("each block requires at least one descriptor")
+        self._validate_block_layout(
+            [descriptor.info for descriptor in descriptors],
+            "block descriptors must use configured pools",
+        )
         for descriptor in descriptors:
-            block_size = self._block_sizes.get(descriptor.info)
-            if block_size is None:
-                raise ValueError(f"unknown descriptor pool {descriptor.info!r}")
+            block_size = self._block_sizes[descriptor.info]
             if descriptor.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
-        if self._g3 is not None and len(descriptors) != 1:
-            raise ValueError("G3 does not support multi-block layouts")
         return list(descriptors)
+
+    def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
+        if not layout or any(name not in self._block_sizes for name in layout):
+            raise ValueError(invalid_message)
+        if self._g3 is not None and len(layout) != 1:
+            raise ValueError("G3 does not support multi-block layouts")
 
     def _release_local_dram_sources(
         self,

@@ -144,12 +144,6 @@ _UNSERVED_POOL = SimpleNamespace(
             ["claim", "hold.release"],
         ),
         (
-            "g3-multi-pool",
-            ValueError,
-            "does not support multiple pools",
-            ["claim", "hold.release"],
-        ),
-        (
             "handback-unreadable",
             RuntimeError,
             "region unreadable",
@@ -166,7 +160,6 @@ _UNSERVED_POOL = SimpleNamespace(
         "control-absent",
         "control-cannot-share",
         "g3-invalid",
-        "g3-multi-pool",
         "handback-unreadable",
         "install-fails",
     ],
@@ -200,7 +193,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         control = None
     elif stage == "control-cannot-share":
         control = SimpleNamespace(control_bind_address=None, adopt_listener=None)
-    elif stage in ("g3-invalid", "g3-multi-pool"):
+    elif stage == "g3-invalid":
         backend_configs = KVCRBackendConfigs(
             g3=G3Options(
                 paths=(tmp_path / "g3",),
@@ -243,11 +236,9 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layouts=(
-                    [("full", 1024), ("swa", 1024)]
-                    if stage == "g3-multi-pool"
-                    else [("", mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024)]
-                ),
+                pool_layouts=[
+                    ("", mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024)
+                ],
                 nixl_listen_port=1,
             ),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
@@ -366,11 +357,10 @@ def test_service_journal_is_attached_before_primary_start(
         events.append("journal")
         return journal
 
-    def attach_journal(local, configured_journal, pool_name, disk) -> None:
-        assert (local, configured_journal, pool_name, disk) == (
+    def attach_journal(local, configured_journal, disk) -> None:
+        assert (local, configured_journal, disk) == (
             local_dram,
             journal,
-            ("",),
             g3,
         )
         events.append("attach")
