@@ -119,7 +119,6 @@ class _KVCRCore:
         self.pool_layouts = list(config.pool_layouts)
         _validate_pool_layouts(self.pool_layouts)
         self._block_sizes = dict(self.pool_layouts)
-        self.block_size_bytes = self.pool_layouts[0][1]
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.inventory_report_interval_ms < 0:
@@ -223,7 +222,7 @@ class _KVCRCore:
             _G3(
                 self,
                 g3_config,
-                self.block_size_bytes,
+                self.pool_layouts[0][1],
             )
             if g3_config is not None and local_dram_config is not None
             else None
