@@ -5,10 +5,10 @@ Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack
 without editing source code in any of those projects.
 
 > [!IMPORTANT]
-> This guide uses the public, still-open vLLM
-> [KVCR secondary-tier adapter PR #53624](https://github.com/vllm-project/vllm/pull/53624)
-> at a specific pinned commit SHA. Treat this as a public preview until the PR is
-> merged and released in vLLM.
+> vLLM must include the KVCR secondary tier (`"type": "kvcr"`), implemented in
+> [PR #53624](https://github.com/vllm-project/vllm/pull/53624). This can come from
+> the PR source, a `main` checkout, or a release containing the integration.
+> The container recipe below pins an adapter revision and compatible base image.
 
 > [!WARNING]
 > KVCR uses the versioned Dynamo-to-KVCR KV hint contract introduced by
@@ -42,8 +42,8 @@ Run the commands below from the KVCR repository root.
 ## 1. Build the integration image
 
 The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start).
-Pin the public adapter source used by this guide, then build the integration
-image:
+The build fetches pinned adapter source and applies it to the base image.
+Pass the public repository and exact revision explicitly:
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
@@ -315,7 +315,7 @@ their transferred block and byte counts match.
 - Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach
   the public vLLM source, Dynamo's GitHub repository, and PyPI.
 - Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and
-  `KVCR_VLLM_REF` is the pinned PR #53624 commit SHA shown above.
+  `KVCR_VLLM_REF` is the pinned adapter commit SHA in the build step above.
 - Read the final compatibility-check output. It identifies whether the Dynamo
   router build, the vLLM adapter, or KVCR failed.
 - Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together. Overriding
@@ -326,7 +326,8 @@ their transferred block and byte counts match.
 ### The KVCR tier does not initialize
 
 - Verify that the package imports as `kvcr`.
-- Verify that the vLLM tier adapter expects `"type": "kvcr"`.
+- Verify that vLLM registers the `"kvcr"` secondary tier; installing
+  `nvidia-kvcr` alone does not add the adapter to vLLM.
 - Make `control_ports` a list with exactly one entry per local DP rank.
 - Check that every control and KV-events port is unique and available.
 - Confirm that the installed NIXL version matches the `nvidia-kvcr` pin.
