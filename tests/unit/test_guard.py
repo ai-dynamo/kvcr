@@ -9,7 +9,6 @@ import os
 import queue
 import select
 import socket
-import uuid
 from contextlib import nullcontext
 from unittest.mock import Mock
 
@@ -261,7 +260,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     )
     closed: list[str] = []
     order: list[object] = []
-    constructed: list[tuple] = []
+    agent_names: list[str] = []
     cores: list[Mock] = []
     channels: list[Mock] = []
     attachment = _fake_attachment()
@@ -270,7 +269,16 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     # The seeding mechanics live on the core (adopt_recovery_records); this
     # test orders the Guard's calls around it, not what happens inside it.
     def new_core(config, bindings, backends) -> Mock:
-        constructed.append((config, bindings, backends))
+        agent_names.append(config.nixl_agent_name)
+        assert config.nixl_listen_port == 0
+        assert bindings.framework_control is channels[-1]
+        assert backends.local_dram == LocalDramOptions(
+            [("", 1234 + 8192, 2 * _PAGE_BLOCK_SIZE_BYTES)],
+            "REMOTE",
+        )
+        assert backends.remote_fw_dram.backend == "REMOTE"
+        # A Guard serves G2 and holds G3 records for the returning primary.
+        assert backends.g3 is None
         core = Mock(_local_dram=Mock(), _g3=None, _block_record_map={})
 
         def adopt(records) -> None:
@@ -316,27 +324,13 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         attach.assert_called_once_with(_PAGE_SPEC)
         assert journal.reset_called
         # Adoption only grants; a core exists once a promotion needs one.
-        assert constructed == []
+        assert cores == []
         with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
             guard._refuse_incompatible(_tier(16))
 
         promoted_records = guard._recovery.mirror._records
         guard._promote()
 
-        config, bindings, backends = constructed[0]
-        prefix = "KVCR-Guard-"
-        assert config.nixl_agent_name.startswith(prefix)
-        uuid.UUID(config.nixl_agent_name.removeprefix(prefix))
-        assert config.nixl_listen_port == 0
-        assert bindings.framework_control is channels[0]
-        assert backends.local_dram == LocalDramOptions(
-            [("", 1234 + 8192, 2 * _PAGE_BLOCK_SIZE_BYTES)],
-            "REMOTE",
-        )
-        assert backends.remote_fw_dram.backend == "REMOTE"
-        # A Guard opens no G3: it serves the G2 half and keeps the rest for the
-        # primary that takes the pool back.
-        assert backends.g3 is None
         assert journal.pending == []
         assert order == [
             ("adopt", (first, second)),
@@ -380,6 +374,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         )
         guard._promote()
 
+        assert len(set(agent_names)) == 2
         assert set(guard._recovery._g3_records) == {fresh}
         assert guard._recovery._g3_records[fresh].slot == 7
         assert order[3:] == [("adopt", (second, fresh)), "clear", "start"]

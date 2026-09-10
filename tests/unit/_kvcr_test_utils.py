@@ -329,6 +329,10 @@ class FakeNixlAgent:
     ):
         local_descs = list(local_descs)
         remote_descs = list(remote_descs)
+        if len(local_descs) != len(remote_descs) or any(
+            local[1] != remote[1] for local, remote in zip(local_descs, remote_descs)
+        ):
+            raise RuntimeError("NIXL rejected unaligned descriptors")
         self.xfers.append(
             (
                 op,
@@ -348,10 +352,10 @@ class FakeNixlAgent:
             handle - 1
         ]
         if op == "WRITE" and remote_agent == self.name:
-            for local_index, remote_index in zip(local_indices, local_indices):
+            for local_index in local_indices:
                 src_addr, src_size, _ = local_descs[local_index]
-                dst_addr, dst_size, _ = remote_descs[remote_index]
-                ctypes.memmove(dst_addr, src_addr, min(src_size, dst_size))
+                dst_addr, _, _ = remote_descs[local_index]
+                ctypes.memmove(dst_addr, src_addr, src_size)
         return "PROC"
 
     def check_xfer_state(self, handle):

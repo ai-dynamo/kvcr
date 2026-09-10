@@ -411,6 +411,7 @@ class _RemoteFWDram:
         self._pending_pin_keys: dict[BlockKey, set[PinRequestId]] = {}
         # Pins retained while their source operations execute.
         self._fw_pins_by_op: dict[_OpId, set[PinHandle]] = {}
+        self._releasing_framework_pins: set[PinHandle] = set()
 
         # Progress-thread state: G2 control and outbound events.
         self._progress_outbound: list[object] = []
@@ -560,6 +561,7 @@ class _RemoteFWDram:
         )
 
     def poll_main(self, items: Collection[object]) -> None:
+        self._release_framework_pins(tuple(self._releasing_framework_pins))
         for item in items:
             if isinstance(item, _SourcePinOp):
                 self._start_source_pin(item)
@@ -603,6 +605,8 @@ class _RemoteFWDram:
                 if now >= op.deadline:
                     logger.warning("KVCR operation %r expired", op_id)
                     self._expire_source_pin(op_id, op)
+                elif not op.pending_pin_ids:
+                    self._resume_source_pin(op_id, op)
 
     def discard_hint(self, request_id: str) -> None:
         self._request_hints.pop(request_id, None)
@@ -700,6 +704,8 @@ class _RemoteFWDram:
             else:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
+        # Warning suppression can be added if persistent backend faults
+        # cause excessive polling logs.
         observed_work |= self._process_control_messages(progress)
         # A real notification outranks a refusal for the same operation.
         events = {**self._refused_writes, **self._poll_notifications(progress)}
@@ -973,7 +979,7 @@ class _RemoteFWDram:
             and record.fw_mem is not None
         }
         sources = {} if force_failure else {**framework_sources, **local_sources}
-        completed_keys: tuple[BlockKey, ...] = ()
+        completed_count = 0
         for index, key in enumerate(source_pin.ordered_keys):
             source = sources.get(key)
             destination = source_pin.dst_descriptors[index]
@@ -988,7 +994,8 @@ class _RemoteFWDram:
                     key,
                 )
                 break
-            completed_keys = source_pin.ordered_keys[: index + 1]
+            completed_count += 1
+        completed_keys = source_pin.ordered_keys[:completed_count]
 
         kvcr._release_local_dram_sources(
             source_pin.op_id, local_sources.keys() - set(completed_keys)
@@ -1083,7 +1090,7 @@ class _RemoteFWDram:
                 and request in op.pending_pin_ids
             ]
             if not ops:
-                self._discard_pin_result(result)
+                self._discard_pin_result(result, wait.keys if wait is not None else ())
                 continue
 
             now = kvcr._clock()
@@ -1091,7 +1098,7 @@ class _RemoteFWDram:
             active_ops = [(op_id, op) for op_id, op in ops if now < op.deadline]
             if not active_ops:
                 self._record_pending_pin_wait(wait, "timeout")
-                self._discard_pin_result(result)
+                self._discard_pin_result(result, wait.keys)
                 for op_id, op in expired_ops:
                     op.pending_pin_ids.discard(request)
                     self._expire_source_pin(op_id, op)
@@ -1165,6 +1172,11 @@ class _RemoteFWDram:
             key for key in op.ordered_keys if key not in local_sources
         )
         if unresolved_keys and not op.framework_acquire_attempted:
+            if any(
+                not kvcr._framework_pin_keys[pin].isdisjoint(unresolved_keys)
+                for pin in self._releasing_framework_pins
+            ):
+                return
             op.framework_acquire_attempted = True
             framework_sources = self._acquire_framework_sources(unresolved_keys)
             if isinstance(framework_sources, _PendingFrameworkSources):
@@ -1270,7 +1282,9 @@ class _RemoteFWDram:
         if wait is not None:
             self._kvcr._record_duration("framework_pin_wait", wait.started_at, result)
 
-    def _discard_pin_result(self, result: PinResult) -> None:
+    def _discard_pin_result(
+        self, result: PinResult, keys: Collection[BlockKey] = ()
+    ) -> None:
         if result is None:
             return
         try:
@@ -1278,7 +1292,11 @@ class _RemoteFWDram:
         except (IndexError, TypeError):
             return
         if isinstance(pin_handle, str):
-            self._try_release_pin(pin_handle)
+            pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
+            pin_keys.update(keys)
+            if len(result) > 1 and isinstance(result[1], Mapping):
+                pin_keys.update(result[1])
+            self._release_framework_pins((pin_handle,))
 
     # Framework pin ownership.
 
@@ -1310,7 +1328,6 @@ class _RemoteFWDram:
         keys: Collection[BlockKey],
         pin_result: tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]],
     ) -> PinHandle | None:
-        pin_handle: PinHandle | None = None
         try:
             pin_handle, descriptors = pin_result
             if not isinstance(pin_handle, str) or not isinstance(descriptors, Mapping):
@@ -1340,8 +1357,7 @@ class _RemoteFWDram:
                 pin_keys.add(key)
             return pin_handle
         except Exception:
-            if pin_handle is not None:
-                self._try_release_pin(pin_handle)
+            self._discard_pin_result(pin_result, keys)
             return None
 
     def _acquire_framework_sources(
@@ -1404,9 +1420,10 @@ class _RemoteFWDram:
             pin_keys = kvcr._framework_pin_keys.get(pin_handle)
             if pin_keys is None:
                 continue
-            if not self._try_release_pin(pin_handle):
-                continue
-            kvcr._framework_pin_keys.pop(pin_handle, None)
+            # Once release starts, its descriptors are no longer safe to reuse.
+            # Keep the keys until release is accepted, so overlapping pins wait.
+            first_attempt = pin_handle not in self._releasing_framework_pins
+            self._releasing_framework_pins.add(pin_handle)
             for key in pin_keys:
                 record = kvcr._block_record_map.get(key)
                 if (
@@ -1416,17 +1433,24 @@ class _RemoteFWDram:
                 ):
                     record.fw_mem = None
                     kvcr._prune_block_record(key)
+            if self._try_release_pin(pin_handle, warn=first_attempt):
+                kvcr._framework_pin_keys.pop(pin_handle, None)
+                self._releasing_framework_pins.discard(pin_handle)
 
-    def _try_release_pin(self, pin_handle: PinHandle) -> bool:
+    def _try_release_pin(self, pin_handle: PinHandle, *, warn: bool) -> bool:
+        # True means the framework accepts responsibility for completing release.
+        # False or exceptions cause retries, which must be safe after partial release.
         try:
             released = self._kvcr._release_pin_callback(pin_handle)
         except Exception:
-            logger.warning(
-                "KVCR release_pin failed for pin=%r", pin_handle, exc_info=True
-            )
+            if warn:
+                logger.warning(
+                    "KVCR release_pin failed for pin=%r", pin_handle, exc_info=True
+                )
             return False
-        if released is False:
-            logger.warning("KVCR release_pin failed for pin=%r", pin_handle)
+        if released is not True:
+            if warn:
+                logger.warning("KVCR release_pin failed for pin=%r", pin_handle)
             return False
         return True
 

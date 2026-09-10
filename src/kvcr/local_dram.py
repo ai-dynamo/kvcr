@@ -432,14 +432,9 @@ class _LocalDram:
         for key in ordered_keys:
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
-            if (
-                residency is None
-                or residency.state
-                not in (
-                    _LocalDramState.FILLING,
-                    _LocalDramState.DISCARDING,
-                )
-                or (success and residency.state is not _LocalDramState.FILLING)
+            if residency is None or residency.state not in (
+                _LocalDramState.FILLING,
+                _LocalDramState.DISCARDING,
             ):
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             slots.append(tuple(residency.slots))
@@ -605,6 +600,7 @@ class _LocalDram:
         source: CacheTier,
     ) -> None:
         committed: list[BlockKey] = []
+        failed: list[BlockKey] = []
         affected_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         affected_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         deliver_keys: dict[_OpId, list[BlockKey]] = {}
@@ -621,10 +617,12 @@ class _LocalDram:
                     _LocalDramState.FILLING,
                     _LocalDramState.DISCARDING,
                 )
-                or (success and residency.state is not _LocalDramState.FILLING)
             ):
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
-            if success:
+            # Main may discard a fill after progress queues its success.
+            # A terminal completion then frees the slot instead of committing it.
+            key_success = success and residency.state is _LocalDramState.FILLING
+            if key_success:
                 record.last_access = now
                 residency.state = _LocalDramState.READY
                 self._residency_observer(key, record)
@@ -637,11 +635,12 @@ class _LocalDram:
             else:
                 record.local_dram = None
                 self._free(residency.slots)
+                failed.append(key)
 
             for op_id in record.active_op_ids:
                 residency_op = self._pending_residency_ops.get(op_id)
                 if residency_op is not None and key in residency_op.keys:
-                    if success and (
+                    if key_success and (
                         residency_op.op_id[0] == "deposit"
                         or now < residency_op.deadline
                     ):
@@ -665,7 +664,7 @@ class _LocalDram:
 
                 deliver_op = self._pending_deliver_ops.get(op_id)
                 if deliver_op is not None and key in deliver_op.keys:
-                    if success:
+                    if key_success:
                         deliver_keys.setdefault(op_id, []).append(key)
                     else:
                         deliver_op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -677,9 +676,8 @@ class _LocalDram:
             self._finish_residency_if_ready(residency_op)
         for op_id, deliver_op in affected_deliver_ops.items():
             self._start_deliveries(deliver_op, deliver_keys.get(op_id, ()))
-        if not success:
-            for key in ordered_keys:
-                self._kvcr._prune_block_record(key)
+        for key in failed:
+            self._kvcr._prune_block_record(key)
         self._resume_capacity_waiters()
 
     def reserve_fill(
