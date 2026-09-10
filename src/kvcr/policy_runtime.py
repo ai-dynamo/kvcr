@@ -5,7 +5,7 @@
 import heapq
 import logging
 import math
-from collections.abc import Collection
+from collections.abc import Collection, Generator
 from dataclasses import dataclass
 
 from .policy import KVCachePolicy
@@ -152,7 +152,7 @@ class _Entry:
 
 class _EvictionQueue:
     # TODO: Bound stale heap growth from DRAM/G3 claim/release cycles.
-    # Removal only invalidates _live; select() removes stale heap entries as
+    # Removal only invalidates _live; candidates() removes stale heap entries as
     # it encounters them, so repeated cache use can grow _heap without eviction.
     def __init__(self) -> None:
         self._heap: list[tuple[float, int, BlockKey]] = []
@@ -171,19 +171,21 @@ class _EvictionQueue:
     def remove(self, key: BlockKey) -> bool:
         return self._live.pop(key, None) is not None
 
-    def select(self, excluded: set[BlockKey]) -> BlockKey | None:
+    def candidates(self, excluded: set[BlockKey]) -> Generator[BlockKey, None, None]:
+        """Visit each key once in score order; close to restore live entries."""
+        excluded = set(excluded)
         skipped: list[tuple[float, int, BlockKey]] = []
-        selected: BlockKey | None = None
-        while self._heap:
-            score, sequence, key = self._heap[0]
-            entry = self._live.get(key)
-            if entry != _Entry(score, sequence):
-                heapq.heappop(self._heap)
-                continue
-            if key not in excluded:
-                selected = key
-                break
-            skipped.append(heapq.heappop(self._heap))
-        for item in skipped:
-            heapq.heappush(self._heap, item)
-        return selected
+        try:
+            while self._heap:
+                item = heapq.heappop(self._heap)
+                score, sequence, key = item
+                if self._live.get(key) != _Entry(score, sequence):
+                    continue
+                skipped.append(item)
+                if key not in excluded:
+                    excluded.add(key)
+                    yield key
+        finally:
+            for score, sequence, key in skipped:
+                if self._live.get(key) == _Entry(score, sequence):
+                    heapq.heappush(self._heap, (score, sequence, key))

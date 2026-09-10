@@ -5,6 +5,7 @@
 import logging
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
+from contextlib import closing
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, cast
@@ -1021,7 +1022,6 @@ class _LocalDram:
         if self._capacity_eviction_key is not None:
             return None, [], True
         self._retry_unscored()
-        skipped = set(protected)
         victims: list[tuple[BlockKey, "_BlockRecord", _LocalDramResidency, int]] = []
         freed: Counter[str] = Counter()
 
@@ -1032,39 +1032,37 @@ class _LocalDram:
                 if len(self._free_slots[name]) + freed[name] < count
             }
 
-        while deficient := short():
-            key = self._evictable.select(skipped)
-            if key is None:
-                return None, [], False
-            record = self._kvcr._block_record_map.get(key)
-            residency = record.local_dram if record is not None else None
-            if (
-                record is None
-                or residency is None
-                or residency.state is not _LocalDramState.READY
-                or residency.claim_count
-            ):
-                raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-            if not any(name in deficient for name, _ in residency.slots):
-                skipped.add(key)
-                continue
-            size_bytes = self._size_bytes(residency.slots)
-            decision, eviction_pending = self._kvcr._decide_eviction(
-                self._kvcr._block_meta(key, record, size_bytes),
-                CacheTier.LOCAL_G2,
-                deadline,
-            )
-            if not short():
-                break
-            if eviction_pending:
-                self._capacity_eviction_key = key
-                return None, [], True
-            if decision[0] is PlacementAction.KEEP:
-                skipped.add(key)
-                continue
-            victims.append((key, record, residency, size_bytes))
-            skipped.add(key)
-            freed.update(name for name, _ in residency.slots)
+        with closing(self._evictable.candidates(protected)) as candidates:
+            while deficient := short():
+                key = next(candidates, None)
+                if key is None:
+                    return None, [], False
+                record = self._kvcr._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if (
+                    record is None
+                    or residency is None
+                    or residency.state is not _LocalDramState.READY
+                    or residency.claim_count
+                ):
+                    raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
+                if not any(name in deficient for name, _ in residency.slots):
+                    continue
+                size_bytes = self._size_bytes(residency.slots)
+                decision, eviction_pending = self._kvcr._decide_eviction(
+                    self._kvcr._block_meta(key, record, size_bytes),
+                    CacheTier.LOCAL_G2,
+                    deadline,
+                )
+                if not short():
+                    break
+                if eviction_pending:
+                    self._capacity_eviction_key = key
+                    return None, [], True
+                if decision[0] is PlacementAction.KEEP:
+                    continue
+                victims.append((key, record, residency, size_bytes))
+                freed.update(name for name, _ in residency.slots)
 
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)

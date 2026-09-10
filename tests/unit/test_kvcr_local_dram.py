@@ -3,6 +3,7 @@
 """KVCR local-DRAM, capacity, and policy tests."""
 
 import ctypes
+import heapq
 import logging
 from unittest.mock import Mock
 
@@ -227,37 +228,62 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
+    retry = kvcr.deposit({grouped: [descriptors[0]]})
+    assert dict(_poll_until(kvcr, lambda done: retry in dict(done)))[retry][
+        grouped
+    ].success
 
 
-def test_group_allocation_evicts_enough_whole_keys() -> None:
-    pools = [ctypes.create_string_buffer(16), ctypes.create_string_buffer(16)]
+def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
+    full = tuple(BlockKey(f"full{index}".encode()) for index in range(32))
+    pools = [
+        ctypes.create_string_buffer((len(full) + 1) * 8),
+        ctypes.create_string_buffer(16),
+    ]
     source = ctypes.create_string_buffer(24)
     agent = FakeNixlAgent()
     agent.state = "DONE"
     kvcr = _two_pool_kvcr(agent, pools)
-    full, swa0, swa1, grouped = (
-        BlockKey(name) for name in (b"full", b"swa0", b"swa1", b"grouped")
-    )
+    swa0, swa1, grouped = (BlockKey(name) for name in (b"swa0", b"swa1", b"grouped"))
     descriptors = [
         _mem_descriptor(ctypes.addressof(source), 8, info="full"),
         _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
         _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
     ]
 
-    for key, descriptor in zip((full, swa0, swa1), descriptors, strict=True):
-        operation = kvcr.deposit({key: [descriptor]})
-        _poll_until(kvcr, lambda done: operation in dict(done))
+    operation = kvcr.deposit(
+        {
+            **{key: [descriptors[0]] for key in full},
+            swa0: [descriptors[1]],
+            swa1: [descriptors[2]],
+        }
+    )
+    _poll_until(kvcr, lambda done: operation in dict(done))
+    pops = Mock(wraps=heapq.heappop)
+    monkeypatch.setattr(heapq, "heappop", pops)
     operation = kvcr.deposit({grouped: descriptors})
     result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
 
     assert result[grouped].success
-    assert kvcr.query((full, swa0, swa1, grouped)) == [
-        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    # The older full-only rows must be scanned once while making room in swa.
+    assert pops.call_count <= len(full) + 2
+    assert kvcr.query(full) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * len(full)
+    assert kvcr.query((swa0, swa1, grouped)) == [
         (QueryStatus.MISS, None),
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
-    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 4
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == (
+        len(full) + 3
+    )
+    retry = kvcr.deposit({swa0: [descriptors[0]]})
+    assert dict(_poll_until(kvcr, lambda done: retry in dict(done)))[retry][
+        swa0
+    ].success
+    assert kvcr.query(full[:2]) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
 
 
 @pytest.mark.parametrize(
