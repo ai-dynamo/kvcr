@@ -60,9 +60,10 @@ def test_submit_hint_filters_unlisted_hash():
 
 
 def test_kvcr_opportunistic_query_accepts_key_outside_hint():
+    agent = FakeNixlAgent()
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
-        FakeNixlAgent(),
+        agent,
         FakePrimaryPinning(),
         control,
         key_adapter=_ConstantHashAdapter(),
@@ -77,13 +78,15 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     assert target.query((requested_key,), "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
     ]
-    target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
+    op_handle = target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
 
     assert list(target.poll_completed()) == []
     _wait_until(lambda: bool(control.sent))
     assert _decode_control_message(control.sent[0][1])["keys"] == [requested_key]
     target.discard_hint("req")
     assert target.query((requested_key,), "req") == [(QueryStatus.MISS, None)]
+    agent.notifs["source"] = [_write_done_notification(op_handle)]
+    _poll_until(target, bool)
 
 
 def test_remote_fetch_uses_local_then_framework_sources() -> None:
@@ -429,6 +432,10 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
 
+    progress = target._core._progress
+    _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
+    operation = progress._in_flight_ops[("target", message["op_handle"])]
+    assert not operation.close(progress)
     if completion_before_timeout:
         # Progress accepts success before expiry; main consumes it after expiry.
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
@@ -443,6 +450,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
             (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
         ]
         assert _has_outstanding_operations(target)
+        assert not operation.close(progress)
         blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
         assert list(target.poll_completed()) == [
             (blocked, _op_entries({replacement: False}))
@@ -454,6 +462,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         )
     assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
+    assert operation.close(progress)
 
     # The terminal completion makes the single slot reusable.
     primary = ctypes.create_string_buffer(b"a" * block_size, block_size)
@@ -677,6 +686,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
         (None, "replacement"),
         (None, "already-replaced"),
         (None, "late-terminal"),
+        (None, "unknown-generation"),
         (False, None),
         (True, None),
     ],
@@ -702,9 +712,12 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
     key = BlockKey(b"k0")
     source = "tcp://source:1"
 
-    op_handle, _ = _acked_deliver(control, kvcr, source, key, source_agent="source")
+    unknown_agent = recovery == "unknown-generation"
+    op_handle, _ = _acked_deliver(
+        control, kvcr, source, key, source_agent=None if unknown_agent else "source"
+    )
     other_handle = None
-    if recovery == "late-terminal":
+    if recovery in ("late-terminal", "unknown-generation"):
         other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
         _wait_until(lambda: len(control.sent) == 2)
 
@@ -746,7 +759,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
             assert source not in backend._source_tombstones
             assert agent.removed_remote_agents == ["source"]
             return
-        assert agent.removed_remote_agents == ["source"]
+        assert agent.removed_remote_agents == ([] if unknown_agent else ["source"])
         metadata_ack = {
             "type": "target_metadata_ack",
             "sender_control_endpoint": source,
@@ -771,7 +784,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
             _decode_control_message(message)["type"] for _, message in control.sent
         ] == ["target_metadata"]
 
-        if recovery == "late-terminal":
+        if recovery in ("late-terminal", "unknown-generation"):
             control.incoming.append(
                 msgspec.msgpack.encode(
                     {
@@ -940,6 +953,11 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
         "tcp://source-B:1",
     ]
     assert {("target", op_a), ("target", op_b)} <= _block_op_ids(kvcr)
+    agent.notifs["source"] = [
+        _write_done_notification(op_a),
+        _write_done_notification(op_b),
+    ]
+    _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
 
 
 @pytest.mark.parametrize(

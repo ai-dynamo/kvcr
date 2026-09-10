@@ -425,6 +425,8 @@ class _KVCRProgress:
     def _close_nixl(self) -> None:
         if self._active_transfers:
             raise RuntimeError("cannot close NIXL with active transfers")
+        if self._in_flight_ops:
+            raise RuntimeError("cannot close NIXL with unresolved operations")
         failure: BaseException | None = None
         pending_registrations: list[Any] = []
         if self._nixl_agent is not None:

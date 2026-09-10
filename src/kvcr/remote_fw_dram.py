@@ -233,6 +233,10 @@ class _TargetPullOp(_RemoteOp):
             return False, self.probe_sent
         return False, False
 
+    def close(self, progress: _KVCRProgress) -> bool:
+        # Shutdown must not release destinations still awaiting a remote write.
+        return self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
+
 
 @dataclass
 class _SourcePinOp(_Op):
@@ -412,6 +416,9 @@ class _SourceWriteOp(_RemoteOp):
             if not progress.cancel_transfer(self.transfer_id):
                 return False
             self.transfer_id = None
+        self._backend._send_write_done(
+            progress, self.remote_agent, self.op_handle, False
+        )
         self._backend._finish_source_write((self.route[0], self.op_handle))
         return True
 
@@ -1013,7 +1020,8 @@ class _RemoteFWDram:
                     op.source_agent = source_agent
             self._source_agents_by_endpoint[source_endpoint] = source_agent
             if source_endpoint in self._source_tombstones:
-                if self._source_tombstones[source_endpoint][0] == source_agent:
+                if self._source_tombstones[source_endpoint][0] in (None, source_agent):
+                    # An unknown generation does not establish a replacement.
                     # Recheck unresolved writes; a restarted source reports
                     # unknown handles as terminal.
                     for handle in self._source_tombstones[source_endpoint][1]:

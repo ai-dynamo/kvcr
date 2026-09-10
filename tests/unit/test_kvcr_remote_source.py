@@ -29,6 +29,7 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig
 from kvcr.core import _BlockRecord, _KVCRCore
+from kvcr.progress import _STOP
 from kvcr.remote_fw_dram import _FwMemResidency, _RemoteFWDram, _SourcePinOp
 from kvcr.types import BlockKey, PinHandle, PinRequestId
 
@@ -345,8 +346,8 @@ def test_kvcr_source_ignores_malformed_control_messages():
 
 @pytest.mark.parametrize(
     "terminal_state",
-    [None, "ERR", "DONE"],
-    ids=["cancelled", "failed", "completed"],
+    [None, "ERR", "DONE", "shutdown"],
+    ids=["cancelled", "failed", "completed", "shutdown"],
 )
 def test_kvcr_source_timeout_holds_pins_until_safe_release(
     terminal_state: str | None,
@@ -389,16 +390,23 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
     control.incoming.append(_write_probe_message(12))
     _wait_until(lambda: bool(control.sent))
     assert _decode_control_message(control.sent[-1][1])["terminal"] is False
-    now = 2.0
+    if terminal_state == "shutdown":
+        kvcr._core._progress._submissions.put(_STOP)
+    else:
+        now = 2.0
     _wait_until(lambda: source_agent.release_attempts > 0)
     assert source_agent.released_xfers == []
+    assert source_agent.sent_notifs == []
     assert pinning.unpins == []
     assert _has_outstanding_operations(kvcr)
 
-    if terminal_state is not None:
+    if terminal_state not in (None, "shutdown"):
         source_agent.state = terminal_state
     source_agent.allow_release = True
-    assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
+    if terminal_state == "shutdown":
+        kvcr.close()
+    else:
+        assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
     assert not kvcr._core._remote_fw_dram._source_pin_ops
     assert pinning.unpins == ["pin"]
     assert source_agent.released_xfers == [1]
