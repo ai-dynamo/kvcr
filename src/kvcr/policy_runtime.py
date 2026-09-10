@@ -165,8 +165,8 @@ class _EvictionQueue:
         self._live[key] = entry
         heapq.heappush(self._heap, (entry.score, entry.sequence, key))
 
-    def remove(self, key: BlockKey) -> None:
-        self._live.pop(key, None)
+    def remove(self, key: BlockKey) -> bool:
+        return self._live.pop(key, None) is not None
 
     def select(self, excluded: set[BlockKey]) -> BlockKey | None:
         skipped: list[tuple[float, int, BlockKey]] = []

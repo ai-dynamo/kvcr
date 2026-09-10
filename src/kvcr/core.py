@@ -118,10 +118,7 @@ class _KVCRCore:
         self.config = config
         self.pool_layouts = list(config.pool_layouts)
         _validate_pool_layouts(self.pool_layouts)
-        # TODO: Support multiple pools after remote fetch and G3 discover layouts.
-        if len(self.pool_layouts) != 1:
-            raise ValueError("only a single pool is currently supported")
-        self.block_size_bytes = self.pool_layouts[0][1]
+        self._block_sizes = dict(self.pool_layouts)
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.inventory_report_interval_ms < 0:
@@ -140,6 +137,8 @@ class _KVCRCore:
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
+        if g3_config is not None and len(self.pool_layouts) != 1:
+            raise ValueError("G3 does not support multiple pools")
         policy = bindings.policy
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
@@ -163,11 +162,13 @@ class _KVCRCore:
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._pending_inventory_events: list[InventoryEvent] = []
         self._inventory_flush_deadline: float | None = None
-        self._capacity_pressure_active = False
+        self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
-        self._local_dram_sources_by_op: dict[_OpId, dict[BlockKey, MemDescriptor]] = {}
+        self._local_dram_sources_by_op: dict[
+            _OpId, dict[BlockKey, list[MemDescriptor]]
+        ] = {}
 
         self._completion_queue: list[OpResult] = []
         self._joined_completions: dict[
@@ -207,11 +208,16 @@ class _KVCRCore:
             if local_dram_config is not None
             else None
         )
-        self._capacity_low_watermark_slots = ceil(
-            (self._local_dram._total_slots if self._local_dram is not None else 0)
-            * self.config.capacity_low_watermark_percent
-            / 100
-        )
+        self._capacity_low_watermarks = {
+            name: ceil(
+                length // block_size * self.config.capacity_low_watermark_percent / 100
+            )
+            for name, (_, length, block_size) in (
+                self._local_dram._pools.items() if self._local_dram is not None else ()
+            )
+        }
+        if not any(self._capacity_low_watermarks.values()):
+            self._capacity_needed_callback = None
         self._remote_fw_dram = _RemoteFWDram(
             self,
             backend_configs.remote_fw_dram,
@@ -221,7 +227,7 @@ class _KVCRCore:
             _G3(
                 self,
                 g3_config,
-                self.block_size_bytes,
+                self.pool_layouts[0][1],
             )
             if g3_config is not None and local_dram_config is not None
             else None
@@ -231,7 +237,7 @@ class _KVCRCore:
         if framework_dram is not None:
             memory_regions.append((framework_dram.address, framework_dram.length))
         if self._local_dram is not None:
-            memory_regions.append(self._local_dram.memory_region)
+            memory_regions.extend(self._local_dram.memory_regions)
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
@@ -283,6 +289,11 @@ class _KVCRCore:
         g3 = self._g3
         if g3 is None and any(record.g3 is not None for record in records.values()):
             raise RecoveryMirrorError("recovered G3 residency has no configured G3")
+        if g3 is not None and any(
+            record.local_dram is not None and len(record.local_dram.slots) != 1
+            for record in records.values()
+        ):
+            raise RecoveryMirrorError("G3 recovery requires one local DRAM slot")
         if self._block_record_map:
             raise RecoveryMirrorError("recovered records need a core that holds none")
 
@@ -297,7 +308,8 @@ class _KVCRCore:
         # so routing through it would skip everything recovered into both.
         for key, record in records.items():
             if record.local_dram is not None or g3 is None:
-                source, slot_size = CacheTier.LOCAL_G2, local_dram._slot_size
+                source = CacheTier.LOCAL_G2
+                slot_size = local_dram._size_bytes(record.local_dram.slots)
             else:
                 source, slot_size = CacheTier.G3, g3._slot_size
             self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
@@ -365,14 +377,14 @@ class _KVCRCore:
             key: self._normalize_descriptors(descriptors)
             for key, descriptors in blocks.items()
         }
-        local_blocks: dict[BlockKey, MemDescriptor] = {}
+        local_blocks: dict[BlockKey, list[MemDescriptor]] = {}
         g3_blocks: dict[BlockKey, MemDescriptor] = {}
-        remote_blocks: dict[BlockKey, MemDescriptor] = {}
+        remote_blocks: dict[BlockKey, list[MemDescriptor]] = {}
         for key, destination in normalized.items():
             if self._is_local_resident(key):
                 local_blocks[key] = destination
             elif self._g3 is not None and self._g3.is_ready(key):
-                g3_blocks[key] = destination
+                g3_blocks[key] = destination[0]
             else:
                 remote_blocks[key] = destination
 
@@ -428,9 +440,10 @@ class _KVCRCore:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        expected_layout = [""] if expected_layout is None else expected_layout
-        if expected_layout != [self.pool_layouts[0][0]]:
-            raise ValueError("expected layout must match the configured pool_layouts")
+        expected_layout = [""] if expected_layout is None else list(expected_layout)
+        self._validate_block_layout(
+            expected_layout, "expected layout must use configured pools"
+        )
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -458,6 +471,7 @@ class _KVCRCore:
             request_id,
             deadline,
             hints=hints,
+            layout=expected_layout,
         )
         for source in (CacheTier.G3, CacheTier.REMOTE_G2):
             self._start_local_fill(
@@ -624,18 +638,26 @@ class _KVCRCore:
         for event in events:
             self._send_inventory(event)
 
-    def _update_capacity_pressure(self, reclaimable_slots: int) -> None:
+    def _update_capacity_pressure(self, reclaimable_slots: Mapping[str, int]) -> None:
         callback = self._capacity_needed_callback
-        if callback is None or self._capacity_low_watermark_slots == 0:
+        if callback is None:
             return
-        if reclaimable_slots >= self._capacity_low_watermark_slots:
-            self._capacity_pressure_active = False
+        pressured = {
+            name
+            for name, watermark in self._capacity_low_watermarks.items()
+            if watermark and reclaimable_slots[name] < watermark
+        }
+        newly_pressured = pressured - self._capacity_pressure_pools
+        self._capacity_pressure_pools = pressured
+        if not newly_pressured:
             return
-        if self._capacity_pressure_active:
-            return
-        self._capacity_pressure_active = True
+        request = [
+            (name, watermark)
+            for name, watermark in self._capacity_low_watermarks.items()
+            if name in newly_pressured
+        ]
         try:
-            callback(self._capacity_low_watermark_slots)
+            callback(request)
         except Exception:
             logger.warning("KVCR capacity callback failed", exc_info=True)
 
@@ -660,7 +682,7 @@ class _KVCRCore:
     def _start_local_fill(
         self,
         source: CacheTier,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None,
         deadline: float,
     ) -> None:
@@ -670,7 +692,9 @@ class _KVCRCore:
         self._next_fill_handle -= 1
         if source is CacheTier.G3:
             started = self._g3 is not None and self._g3.start_fill(
-                fill_handle, dict(blocks), deadline
+                fill_handle,
+                {key: descriptors[0] for key, descriptors in blocks.items()},
+                deadline,
             )
         elif source is CacheTier.REMOTE_G2:
             started = self._remote_fw_dram.fetch(
@@ -683,7 +707,7 @@ class _KVCRCore:
 
     def _claim_local_dram_sources(
         self, op_id: _OpId, keys: Collection[BlockKey]
-    ) -> Mapping[BlockKey, MemDescriptor]:
+    ) -> Mapping[BlockKey, list[MemDescriptor]]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
@@ -694,17 +718,30 @@ class _KVCRCore:
                 self._local_dram_sources_by_op[op_id] = sources
         return sources
 
-    def _normalize_descriptors(self, descriptors: list[MemDescriptor]) -> MemDescriptor:
+    def _normalize_descriptors(
+        self, descriptors: list[MemDescriptor]
+    ) -> list[MemDescriptor]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
-        if len(descriptors) != 1 or not isinstance(descriptors[0], MemDescriptor):
-            raise ValueError("each block requires exactly one descriptor")
-        descriptor = descriptors[0]
-        if descriptor.info != self.pool_layouts[0][0]:
-            raise ValueError(f"unknown descriptor pool {descriptor.info!r}")
-        if descriptor.size != self.block_size_bytes:
-            raise ValueError("block descriptor has the wrong byte count")
-        return descriptor
+        if not descriptors or not all(
+            isinstance(descriptor, MemDescriptor) for descriptor in descriptors
+        ):
+            raise ValueError("each block requires at least one descriptor")
+        self._validate_block_layout(
+            [descriptor.info for descriptor in descriptors],
+            "block descriptors must use configured pools",
+        )
+        for descriptor in descriptors:
+            block_size = self._block_sizes[descriptor.info]
+            if descriptor.size != block_size:
+                raise ValueError("block descriptor has the wrong byte count")
+        return list(descriptors)
+
+    def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
+        if not layout or any(name not in self._block_sizes for name in layout):
+            raise ValueError(invalid_message)
+        if self._g3 is not None and len(layout) != 1:
+            raise ValueError("G3 does not support multi-block layouts")
 
     def _release_local_dram_sources(
         self,

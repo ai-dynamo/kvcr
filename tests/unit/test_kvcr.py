@@ -4,6 +4,7 @@
 
 import ctypes
 import logging
+import mmap
 import threading
 from contextlib import nullcontext, suppress
 from functools import partial
@@ -48,6 +49,7 @@ from kvcr.types import BlockKey
 
 def _fake_hold(**fields: Any) -> SimpleNamespace:
     """A hold double that hands its listener over exactly like the real one."""
+    fields.setdefault("_pools", ())
     hold = SimpleNamespace(**fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
@@ -74,14 +76,14 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
         else:
             assert residency.state is _LocalDramState.READY
             assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
-        observed.append((key, None if residency is None else residency.slot))
+        observed.append((key, None if residency is None else residency.slots))
 
     backend.observe_residency(observe)
     address = ctypes.addressof(primary)
 
     first = kvcr.deposit({keys[0]: [_mem_descriptor(address, block_size)]})
     _poll_until(kvcr, lambda done: first in dict(done))
-    assert observed == [(keys[0], 0)]
+    assert observed == [(keys[0], [("", 0)])]
 
     agent.state = "ERR"
     failed = kvcr.deposit(
@@ -90,7 +92,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[failed]
     assert not failed_result[keys[1]].success
     assert observed == [
-        (keys[0], 0),
+        (keys[0], [("", 0)]),
         (keys[0], None),
     ]
 
@@ -104,7 +106,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     assert len(observed) == 3
     backend.release_sources((keys[2],))
     assert observed[2:] == [
-        (keys[2], 0),
+        (keys[2], [("", 0)]),
         (keys[2], None),
     ]
 
@@ -136,6 +138,12 @@ _UNSERVED_POOL = SimpleNamespace(
         ("control-absent", ValueError, "share its control endpoint", []),
         ("control-cannot-share", ValueError, "share its control endpoint", []),
         (
+            "g3-invalid",
+            ValueError,
+            "page aligned",
+            ["claim", "hold.release"],
+        ),
+        (
             "handback-unreadable",
             RuntimeError,
             "region unreadable",
@@ -151,12 +159,13 @@ _UNSERVED_POOL = SimpleNamespace(
     ids=[
         "control-absent",
         "control-cannot-share",
+        "g3-invalid",
         "handback-unreadable",
         "install-fails",
     ],
 )
 def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
-    monkeypatch, stage, error, match, expected_events
+    tmp_path, monkeypatch, stage, error, match, expected_events
 ) -> None:
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
@@ -179,10 +188,18 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     # taken.
     control: Any = Mock()
     control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    backend_configs = KVCRBackendConfigs()
     if stage == "control-absent":
         control = None
     elif stage == "control-cannot-share":
         control = SimpleNamespace(control_bind_address=None, adopt_listener=None)
+    elif stage == "g3-invalid":
+        backend_configs = KVCRBackendConfigs(
+            g3=G3Options(
+                paths=(tmp_path / "g3",),
+                capacity_bytes_per_file=mmap.PAGESIZE,
+            )
+        )
     elif stage == "handback-unreadable":
         # The lease is live well before the caller is handed anything.
         monkeypatch.setattr(
@@ -219,11 +236,13 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layouts=[("", 1024)],
+                pool_layouts=[
+                    ("", mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024)
+                ],
                 nixl_listen_port=1,
             ),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
-            KVCRBackendConfigs(),
+            backend_configs,
             _GUARD_CONFIG,
         )
 
@@ -363,14 +382,14 @@ def test_service_journal_is_attached_before_primary_start(
     primary_control.adopt_listener.side_effect = lambda fd: events.append(f"adopt:{fd}")
     g3_config = G3Options(
         paths=(tmp_path / "g3",),
-        capacity_bytes_per_file=8192,
+        capacity_bytes_per_file=2 * mmap.PAGESIZE,
     )
     backend_configs = KVCRBackendConfigs(
         g3=g3_config,
         remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
     )
     controller = KVCR(
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 1024)]),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", mmap.PAGESIZE)]),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         backend_configs,
         KVCRGuardConfig(
@@ -382,7 +401,7 @@ def test_service_journal_is_attached_before_primary_start(
 
     claim.assert_called_once_with(
         3,
-        [("", 1024)],
+        [("", mmap.PAGESIZE)],
         "Opaque-Digest",
         ("127.0.0.1", 5555),
         g3_config,
@@ -426,18 +445,6 @@ def test_kvcr_rejects_no_dram_backends() -> None:
     with pytest.raises(ValueError, match="at least one DRAM backend"):
         KVCR(
             KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
-            KVCRBindings(Mock(), Mock(), Mock()),
-            KVCRBackendConfigs(),
-        )
-
-
-def test_kvcr_rejects_multi_pool_layouts() -> None:
-    with pytest.raises(ValueError, match="only a single pool"):
-        KVCR(
-            KVCRConfig(
-                nixl_agent_name="target",
-                pool_layouts=[("full", 8), ("swa", 8)],
-            ),
             KVCRBindings(Mock(), Mock(), Mock()),
             KVCRBackendConfigs(),
         )
@@ -664,9 +671,9 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
     """Every record a resident block can hold, so none of them grows one back."""
     for residency in (
         _BlockRecord(),
-        _LocalDramResidency(0, _LocalDramState.READY),
+        _LocalDramResidency([("", 0)], _LocalDramState.READY),
         _G3Residency(0),
-        _FwMemResidency(_mem_descriptor(), object()),
+        _FwMemResidency([_mem_descriptor()], object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__
 

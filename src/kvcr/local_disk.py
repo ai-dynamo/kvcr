@@ -293,7 +293,7 @@ class _G3:
         if key not in sources:
             return (PlacementAction.KEEP, None), False
         try:
-            if not self._start_store(op_id, sources, deadline):
+            if not self._start_store(op_id, {key: sources[key][0]}, deadline):
                 self._recover_store_failure(key, "G3 destination unavailable")
                 return (PlacementAction.KEEP, None), False
         except Exception:

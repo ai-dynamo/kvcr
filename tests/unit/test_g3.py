@@ -18,6 +18,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _recovered_record,
     _router_hint,
     _write_done_notification,
 )
@@ -45,6 +46,7 @@ from kvcr.types import (
     InventoryEvent,
     PlacementAction,
     QueryStatus,
+    RecoveryMirrorError,
 )
 
 
@@ -119,9 +121,12 @@ class _FakeG3Agent(FakeNixlAgent):
 class _MoveLocalToG3Policy(FIFOPolicy):
     def __init__(self):
         self.move = True
+        self.keep_g3 = False
         self.failures = []
 
     def decide_eviction(self, meta, source):
+        if self.keep_g3 and source is CacheTier.G3:
+            return (PlacementAction.KEEP, None)
         if self.move and source is CacheTier.LOCAL_G2:
             return (PlacementAction.MOVE_TO, CacheTier.G3)
         return super().decide_eviction(meta, source)
@@ -481,6 +486,18 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
     assert kvcr._core._block_record_map == {}
 
 
+def test_g3_recovery_rejects_multi_block_local_residency(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(2 * page_size)
+    kvcr = _new_g3_kvcr(tmp_path, local, slot_count=2)
+
+    with pytest.raises(RecoveryMirrorError, match="one local DRAM slot"):
+        install_recovery_records(
+            kvcr._core,
+            {BlockKey(b"multi"): _recovered_record(g2=[("", 0), ("", 1)])},
+        )
+
+
 def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 2)
@@ -522,6 +539,8 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     now = 2.0
+    with pytest.raises(ValueError, match="multi-block"):
+        kvcr.fetch((first,), expected_layout=["", ""])
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, bool))[fetch][first]
     assert fetch_result.success and fetch_result.descriptors is not None
@@ -772,6 +791,30 @@ def test_failed_g3_spill_recovers_by_dropping_source(tmp_path, caplog) -> None:
     metrics = _metric_totals(stats)
     assert ("histogram", DURATION_METRIC, "g3_store", "failed") in metrics
     assert metrics[("counter", TRANSFER_BLOCKS_METRIC, "g3_store")] == 1
+
+
+def test_full_g3_does_not_hide_a_synchronously_freed_local_slot(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    primary = ctypes.create_string_buffer(3 * page_size)
+    local = ctypes.create_string_buffer(page_size)
+    policy = _MoveLocalToG3Policy()
+    kvcr = _new_g3_kvcr(tmp_path, local, policy=policy, g3_slot_count=1)
+    first, second, third = (BlockKey(bytes((index,))) for index in range(3))
+
+    for index, key in enumerate((first, second, third)):
+        policy.keep_g3 = index == 2
+        assert _deposit(
+            kvcr,
+            key,
+            ctypes.addressof(primary) + index * page_size,
+            page_size,
+        ).success
+
+    assert kvcr.query((first, second, third)) == [
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
 
 
 def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:

@@ -19,11 +19,11 @@ import msgspec
 
 from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import KVCRClient, KVCRPoolHold
+from .guard_protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
 from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, PoolBlockLayouts, RecoveryMirrorError
+from .types import BlockKey, RecoveryMirrorError
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
@@ -73,13 +73,18 @@ _RECORD_BLOCK = 1
 _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 
 
-# Arrays, not maps: repeating field names costs ring space, and the ring
-# filling ends recovery. 3 bytes a record instead of 21.
-#
-# Field order is the format. Append only -- never reorder or remove.
+# Arrays avoid repeating field names in the bounded ring. Field order is the
+# format: append only, never reorder or remove. G2 cost grows with its location
+# count and pool-name lengths.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
-    # A slot per tier, or nothing. Bare ints: wrapping one costs a byte each.
-    g2: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    # Ordered pool locations, or nothing. Pool names may repeat.
+    g2: (
+        Annotated[
+            list[tuple[str, Annotated[int, msgspec.Meta(ge=0)]]],
+            msgspec.Meta(min_length=1),
+        ]
+        | None
+    ) = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
 
 
@@ -105,19 +110,21 @@ def _is_recoverable(record: _BlockRecord) -> bool:
 
 
 def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
+    g3 = record.g3.slot if record.g3 is not None else None
     local_dram = record.local_dram
-    return _RecoveryBlock(
-        g2=(
-            local_dram.slot
-            if local_dram is not None and local_dram.state is _LocalDramState.READY
-            else None
-        ),
-        g3=record.g3.slot if record.g3 is not None else None,
-    )
+    if local_dram is None or local_dram.state is not _LocalDramState.READY:
+        return _RecoveryBlock(g3=g3)
+    return _RecoveryBlock(g2=local_dram.slots, g3=g3)
 
 
-def _decode_recovery_record(payload: bytes) -> _BlockRecord:
+def _decode_recovery_record(
+    payload: bytes, pool_names: tuple[str, ...]
+) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
+    if recovered.g2 is not None and any(
+        name not in pool_names for name, _ in recovered.g2
+    ):
+        raise ValueError("G2 recovery location does not match the pool group")
     return _BlockRecord(
         local_dram=(
             _LocalDramResidency(recovered.g2, _LocalDramState.READY)
@@ -309,7 +316,8 @@ class RecoveryJournal:
 
 
 class _RecoveryMirror:
-    def __init__(self) -> None:
+    def __init__(self, pool_names: tuple[str, ...]) -> None:
+        self._pool_names = pool_names
         self._records: dict[BlockKey, _BlockRecord] = {}
 
     def apply(self, record_type: int, key: bytes, payload: bytes) -> None:
@@ -317,7 +325,7 @@ class _RecoveryMirror:
         # where frames are published and read, not again here.
         del record_type
         try:
-            record = _decode_recovery_record(payload)
+            record = _decode_recovery_record(payload, self._pool_names)
         except (TypeError, ValueError, msgspec.DecodeError) as error:
             raise RecoveryMirrorError("recovery record is malformed") from error
         block_key = BlockKey(key)
@@ -456,7 +464,7 @@ def claim_guarded_pool(
         recovered = read_handback(
             hold._attachment,
             guard_config.compatibility_digest,
-            config.pool_layouts,
+            hold._pools,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -539,7 +547,7 @@ def _recovery_frames(
 
 
 # Bound to the pool and to the geometry: a slot index only means the same
-# bytes under the same file and pool layout. The generation stops a replay into a
+# bytes under the same file and layout. The generation stops a replay into a
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
 _SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
@@ -548,7 +556,7 @@ _SNAPSHOT_TERMS = struct.Struct("<QQQQ")
 
 def canonical_pool_terms(
     compatibility_digest: str,
-    pool_layouts: PoolBlockLayouts,
+    pools: tuple[_PoolDescriptor, ...],
     spec: "KVCRPoolSpec",
 ) -> bytes:
     """Encode what a handback region must not be replayed across."""
@@ -557,7 +565,7 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
-        + msgspec.msgpack.encode(pool_layouts)
+        + msgspec.msgpack.encode(pools)
         + _SNAPSHOT_TERMS.pack(
             spec.journal_bytes,
             spec.mapping_bytes,
@@ -662,7 +670,7 @@ def read_recovery_snapshot(
 def read_handback(
     pool: KVCRPoolAttachment,
     compatibility_digest: str,
-    pool_layouts: PoolBlockLayouts,
+    pools: tuple[_PoolDescriptor, ...],
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -672,8 +680,9 @@ def read_handback(
     write never finished is this service's own, and is thrown away -- nothing
     else ever would, and it would refuse every later claim on this pool too.
     """
-    mirror = _RecoveryMirror()
-    terms = canonical_pool_terms(compatibility_digest, pool_layouts, pool._spec)
+    pool_names = tuple(pool.name for pool in pools)
+    mirror = _RecoveryMirror(pool_names)
+    terms = canonical_pool_terms(compatibility_digest, pools, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)
@@ -682,7 +691,7 @@ def read_handback(
             "KVCR discarding a handback region that was never finished", exc_info=True
         )
         pool.release_snapshot_region()
-        return _RecoveryMirror()
+        return _RecoveryMirror(pool_names)
     return mirror
 
 

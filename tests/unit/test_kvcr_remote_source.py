@@ -134,6 +134,7 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
     }
     assert any(
         "malformed start_write" in record.getMessage()
+        and "remaining_timeout_ms" in record.getMessage()
         for record in kvcr_caplog.records
         if record.levelno == logging.WARNING
     )
@@ -442,7 +443,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     "target_agent_metadata": b"target-md",
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        _mem_descriptor(addr=128 + index * 16).__dict__
+                        [_mem_descriptor(addr=128 + index * 16).__dict__]
                         for index in range(len(op_keys))
                     ],
                 }
@@ -582,8 +583,10 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
 
     key = BlockKey(b"shared")
     borrowed = PinHandle("pinned-by-the-other-operation")
+    sources = [_mem_descriptor(info="full"), _mem_descriptor(info="swa")]
+    destinations = tuple(_mem_descriptor(info=item.info) for item in sources)
     kvcr._block_record_map[key] = _BlockRecord(
-        fw_mem=_FwMemResidency(_mem_descriptor(), borrowed)
+        fw_mem=_FwMemResidency(sources, borrowed)
     )
 
     # This operation acquired a pin of its own for a key it no longer needs.
@@ -594,7 +597,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
         remote_agent=b"peer",
         op_handle=1,
         ordered_keys=(key,),
-        dst_descriptors=(_mem_descriptor(),),
+        dst_descriptors=(destinations,),
         op_id=("source", 1),
         keys={key},
         framework_pins={stale},
@@ -604,6 +607,8 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     backend._submit_prepared_source_write(("source", 1), waiting)
 
     submitted = kvcr._progress.submit.call_args.args[0]
+    assert submitted.src_descriptors == (tuple(sources),)
+    assert submitted.dst_descriptors == (destinations,)
     assert borrowed in submitted.framework_pins, (
         "the resumed write reads through this pin but does not hold it"
     )

@@ -8,8 +8,11 @@ from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import (
+    FakeBytesControl,
     FakeNixlAgent,
+    FakePrimaryPinning,
     _mem_descriptor,
+    _new_kvcr,
     _new_local_kvcr,
     _op_entries,
     _poll_until,
@@ -17,6 +20,7 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
@@ -32,6 +36,25 @@ from kvcr.types import (
     PlacementAction,
     QueryStatus,
 )
+
+
+def _two_pool_kvcr(agent, pools, config=None, capacity_needed_callback=None):
+    config = config or KVCRConfig(
+        nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]
+    )
+    return _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config,
+        local_dram=LocalDramOptions(
+            [
+                (name, ctypes.addressof(pool), len(pool))
+                for (name, _), pool in zip(config.pool_layouts, pools, strict=True)
+            ]
+        ),
+        capacity_needed_callback=capacity_needed_callback,
+    )
 
 
 def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
@@ -107,11 +130,134 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
     ]
 
 
-def test_local_transfer_rejects_multiple_descriptors() -> None:
-    kvcr = _new_local_kvcr(FakeNixlAgent(), ctypes.create_string_buffer(16), 1)
+def test_local_dram_rejects_overlapping_pools() -> None:
+    memory = ctypes.create_string_buffer(16)
+    address = ctypes.addressof(memory)
 
-    with pytest.raises(ValueError, match="exactly one descriptor"):
-        kvcr.deposit({BlockKey(b"key"): [_mem_descriptor(), _mem_descriptor()]})
+    with pytest.raises(ValueError, match="overlap"):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            KVCRConfig(
+                nixl_agent_name="target",
+                pool_layouts=[("full", 8), ("swa", 8)],
+            ),
+            local_dram=LocalDramOptions(
+                [("full", address, 16), ("swa", address + 8, 8)]
+            ),
+        )
+
+
+def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
+    full = ctypes.create_string_buffer(16)
+    swa = ctypes.create_string_buffer(16)
+    source = ctypes.create_string_buffer(32)
+    agent = FakeNixlAgent()
+    kvcr = _two_pool_kvcr(
+        agent,
+        (full, swa),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 16), ("swa", 8)],
+        ),
+    )
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source), 16, info="full"),
+        _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
+        _mem_descriptor(ctypes.addressof(source) + 24, 8, info="swa"),
+    ]
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+
+    with pytest.raises(ValueError, match="configured pools"):
+        kvcr.deposit({first: [_mem_descriptor(info="unknown")]})
+    operation = kvcr.deposit({first: descriptors})
+    _wait_until(lambda: bool(agent.transfers))
+    wrong_layout = kvcr.fetch((first,), expected_layout=["swa"])
+    assert (
+        dict(kvcr.poll_completed())[wrong_layout][first].status is OpEntryStatus.FAILED
+    )
+    agent.state = "DONE"
+    _poll_until(kvcr, lambda done: operation in dict(done))
+    claim = kvcr.fetch((first,), expected_layout=["full", "swa", "swa"])
+    result = dict(_poll_until(kvcr, lambda done: claim in dict(done)))[claim][first]
+    assert [(item.info, item.addr) for item in result.descriptors or ()] == [
+        ("full", ctypes.addressof(full)),
+        ("swa", ctypes.addressof(swa)),
+        ("swa", ctypes.addressof(swa) + 8),
+    ]
+    kvcr.release([result.release_handle])
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
+
+    wrong = kvcr.deliver({first: descriptors[1:]})
+    assert dict(kvcr.poll_completed())[wrong][first].status is OpEntryStatus.FAILED
+    matching = kvcr.deliver({first: descriptors})
+    assert dict(_poll_until(kvcr, lambda done: matching in dict(done)))[matching][
+        first
+    ].success
+
+    operation = kvcr.deposit({second: descriptors})
+    _poll_until(kvcr, lambda done: operation in dict(done))
+    assert kvcr.query((first, second)) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+
+
+def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
+    source = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools)
+    full, swa, grouped = (BlockKey(name) for name in (b"full", b"swa", b"grouped"))
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+        _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+    ]
+
+    for key, descriptor in ((full, descriptors[0]), (swa, descriptors[1])):
+        operation = kvcr.deposit({key: [descriptor]}, no_evict=key == swa)
+        _poll_until(kvcr, lambda done: operation in dict(done))
+
+    operation = kvcr.deposit({grouped: descriptors})
+    result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
+    assert result[grouped].status is OpEntryStatus.FAILED
+    assert kvcr.query((full, swa)) == [
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+
+
+def test_group_allocation_evicts_enough_whole_keys() -> None:
+    pools = [ctypes.create_string_buffer(16), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(24)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools)
+    full, swa0, swa1, grouped = (
+        BlockKey(name) for name in (b"full", b"swa0", b"swa1", b"grouped")
+    )
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+        _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+        _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
+    ]
+
+    for key, descriptor in zip((full, swa0, swa1), descriptors, strict=True):
+        operation = kvcr.deposit({key: [descriptor]})
+        _poll_until(kvcr, lambda done: operation in dict(done))
+    operation = kvcr.deposit({grouped: descriptors})
+    result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
+
+    assert result[grouped].success
+    assert kvcr.query((full, swa0, swa1, grouped)) == [
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.MISS, None),
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 4
 
 
 @pytest.mark.parametrize(
@@ -239,7 +385,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
 
     agent = FakeNixlAgent()
     policy = _RecordingFIFOPolicy()
-    capacity_requests: list[int] = []
+    capacity_requests: list[list[tuple[str, int]]] = []
     kvcr = _new_local_kvcr(
         agent,
         local,
@@ -255,7 +401,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
 
     deposit = kvcr.deposit({first_key: [_mem_descriptor(primary_addr)]}, no_evict=True)
     _wait_until(lambda: bool(agent.transfers))
-    assert capacity_requests == [1]
+    assert capacity_requests == [[("", 1)]]
     with pytest.raises(ValueError, match="expected layout"):
         kvcr.fetch((first_key, second_key), expected_layout=["unknown"])
     fetch = kvcr.fetch((first_key,), expected_layout=[""])
@@ -319,32 +465,58 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     replacement = kvcr.deposit(
         {second_key: [_mem_descriptor(primary_addr + block_size)]}
     )
-    assert capacity_requests == [1, 1]
+    assert capacity_requests == [[("", 1)], [("", 1)]]
     assert _poll_until(kvcr, lambda results: bool(results)) == [
         (replacement, _op_entries({second_key: True}))
     ]
     assert local.raw == b"b" * block_size
 
 
-def test_capacity_needed_is_edge_triggered() -> None:
-    local = ctypes.create_string_buffer(10)
-    capacity_requests: list[int] = []
-    kvcr = _new_local_kvcr(
-        FakeNixlAgent(),
-        local,
-        10,
-        capacity_low_watermark_percent=20,
+def test_capacity_pressure_is_pool_local() -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(24)
+    capacity_requests: list[list[tuple[str, int]]] = []
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(
+        agent,
+        pools,
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 8), ("swa", 8)],
+            capacity_low_watermark_percent=100,
+        ),
         capacity_needed_callback=capacity_requests.append,
     )
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+        _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+        _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
+    ]
 
-    kvcr._core._update_capacity_pressure(2)
-    kvcr._core._update_capacity_pressure(1)
-    kvcr._core._update_capacity_pressure(0)
-    assert capacity_requests == [2]
+    kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
+    kvcr._core._update_capacity_pressure({"full": 0, "swa": 1})
+    kvcr._core._update_capacity_pressure({"full": 0, "swa": 0})
+    assert capacity_requests == [[("full", 1), ("swa", 2)]]
+    kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
+    kvcr._core._update_capacity_pressure({"full": 0, "swa": 1})
+    assert capacity_requests == [[("full", 1), ("swa", 2)]] * 2
+    kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
+    capacity_requests.clear()
 
-    kvcr._core._update_capacity_pressure(2)
-    kvcr._core._update_capacity_pressure(1)
-    assert capacity_requests == [2, 2]
+    full = kvcr.deposit({BlockKey(b"full"): descriptors[:1]}, no_evict=True)
+    _poll_until(kvcr, lambda done: full in dict(done))
+    assert capacity_requests == [[("full", 1)]]
+
+    swa_key = BlockKey(b"swa")
+    swa = kvcr.deposit({swa_key: descriptors[1:]})
+    _poll_until(kvcr, lambda done: swa in dict(done))
+    assert capacity_requests == [[("full", 1)], [("swa", 2)]]
+    capacity_requests.clear()
+
+    claim = kvcr.fetch((swa_key,), expected_layout=["swa", "swa"])
+    _poll_until(kvcr, lambda done: claim in dict(done))
+    assert capacity_requests == [[("swa", 2)]]
 
 
 @pytest.mark.parametrize(
@@ -432,7 +604,7 @@ def test_local_initialize_failure_completes_without_failing_progress() -> None:
 def _g2_recovered(**slots: int) -> dict[BlockKey, _BlockRecord]:
     return {
         BlockKey(name.encode()): _BlockRecord(
-            local_dram=_LocalDramResidency(slot, _LocalDramState.READY)
+            local_dram=_LocalDramResidency([("", slot)], _LocalDramState.READY)
         )
         for name, slot in slots.items()
     }
@@ -473,7 +645,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
 
     # Every row is now occupied, so the deposit below can only land by evicting
     # a recovered row -- a pool recovered full has to stay writable.
-    assert not local_dram._free_slots
+    assert not local_dram._free_slots[""]
     extra = BlockKey(b"extra")
     operation = kvcr.deposit(
         {extra: [_mem_descriptor(ctypes.addressof(primary) + 2 * block_size)]}
@@ -498,7 +670,7 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
     local = ctypes.create_string_buffer(64)
     kvcr = _new_local_kvcr(FakeNixlAgent(), local, 4)
     kvcr._core._block_record_map[BlockKey(b"held")] = _BlockRecord(
-        local_dram=_LocalDramResidency(1, _LocalDramState.READY)
+        local_dram=_LocalDramResidency([("", 1)], _LocalDramState.READY)
     )
 
     with pytest.raises(RecoveryMirrorError, match="holds none"):
@@ -512,7 +684,7 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         _g2_recovered(first=0, second=4),
         {
             BlockKey(b"first"): _BlockRecord(
-                local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)
+                local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             )
         },
     ],

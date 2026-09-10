@@ -316,10 +316,11 @@ IDs, or raw endpoints.
 
 ### KVCR service daemon
 
-The KVCR service daemon owns pool lifecycle. It pre-allocates `--guard-count`
-contiguous pool allocations before exposing its socket, one per Guard. Each has
-the same ordered pool sizes. A worker claims a Guard by index; its allocation
-outlives that worker but not the service:
+The KVCR service daemon owns pool lifecycle. It pre-allocates
+`--guard-count` Guard-owned pool groups before exposing its socket. Every
+group has the same ordered set of usable pool sizes from `--pool-sizes-gb`.
+A worker claims a whole group by Guard index; its pools outlive that worker
+but not the service:
 
 ```bash
 python -m kvcr.kvcr_service \
@@ -334,61 +335,73 @@ python -m kvcr.kvcr_service \
 | --- | --- | --- |
 | `--socket-path` | *(required)* | Unix socket the workers connect to |
 | `--pool-dir` | *(required)* | Writable directory holding the pool files |
-| `--guard-count` | *(required)* | Number of Guards available by index |
-| `--pool-sizes-gb` | *(required)* | Comma-separated usable pool sizes in each Guard allocation |
+| `--guard-count` | *(required)* | Number of Guard-owned pool groups available by index |
+| `--pool-sizes-gb` | *(required)* | Comma-separated usable sizes of the ordered pools in every group |
 | `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
 
-The service rounds each pool size down to a memory-page boundary and adds one
-fixed 100 MiB journal to each Guard allocation. For example, `48,16` maps 64
-GiB plus the journal for every Guard. The current claim path exposes those
-regions as one combined data area.
+Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the
+listed usable sizes. The example therefore creates one mapping of 64 GiB plus
+100 MiB. Its layout is `[journal header + journal payload][pool 0][pool 1]`;
+additional pools follow in list order. Each listed size is rounded down to the
+native memory-page boundary; a value smaller than one page is rejected.
 
 The pre-release wire protocol remains version 1. A worker calls
 `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)`,
-naming the address its Guard will answer on. The digest must match the service
-exactly, and each pool-layout entry is `(pool_name, block_size_bytes)`. Callers must
-change the digest whenever the pool layout or any other KV-cache term changes.
-The returned `KVCRPoolHold` describes the mapped local DRAM and owns an exclusive
-lease on the pool. Only one pool-layout entry is currently supported; an empty
-string is a valid pool name.
+naming the address its Guard will answer on and each ordered pool's name and
+block size. The digest must match the service exactly, and callers must change
+it whenever a pool layout or any other KV-cache layout term changes. The
+returned `KVCRPoolHold` owns the group's exclusive lease and exposes every pool
+through `local_dram.pools` as `(name, address, size_bytes)`. The client maps the
+allocation once; each pool's geometry is still validated independently, so
+pools do not have to agree on a block size.
 
-**A pool's configuration is fixed by its first claim.** Every later claim on
-that pool must name the same pool layout and, when G3 is configured, the same
-G3 paths in the same order, the same per-file capacity, and the same backend
-and backend options. It must also name the same remote framework DRAM backend.
-A mismatch is refused for the life of the service. Change the configuration by
-restarting the service, which recreates the pools.
+`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and
+`KVCRGuardConfig`-driven construction. Remote-transfer peers must use the same
+pool names, block sizes, and order; a mismatch fails that operation. The current
+G3 data plane stores one slot per key, so it supports one pool and one block per
+key; multiple blocks in that pool remain out of scope.
 
-The service grants a pool to one live claimant at a time, and pool mappings are
-not inherited by forked children. The `KVCRPoolHold` remains owned by the
+**A pool group's configuration is fixed by its first claim.** Every later
+claim on that Guard must name the same ordered pool layout and, when G3 is
+configured, the same G3 paths in the same order, the same per-file capacity,
+the same backend and backend options, and the same remote framework DRAM
+backend; one that does not is refused for the life of the service, because a
+different layout renames the blocks and slots the recovered records describe.
+Change the layout by restarting the service, which recreates the groups.
+
+The service grants a whole pool group to one live claimant at a time; its pools
+are allocated, claimed, promoted, and freed together. Pool mappings are not
+inherited by forked children. The `KVCRPoolHold` remains owned by the
 claiming process and must not be used by a forked child. Applications must also
 create the shareable framework-control listener after their final fork. A second
 claim is rejected while the claimant's pidfd reports it alive. The lease socket
-is close-on-exec, and the service continues fencing the pool by that pidfd until
+is close-on-exec, and the service continues fencing the group by that pidfd until
 the process exits. Closing the claim connection, including an EOF, does not
 release a live claimant's lease. `KVCRPoolHold.release()` first unmaps the pool
-locally, then explicitly releases the lease and waits for the service's
+group locally, then explicitly releases the lease and waits for the service's
 acknowledgement.
 
 #### Recovery across a claimant's death
 
-A `KVCRGuardConfig` opts into the service pool and its Guard together. A
+A `KVCRGuardConfig` opts into a service pool group and its Guard together. A
 claimant whose framework control cannot share a listener is refused rather than
 granted an unguarded pool -- recovery asked for and silently not provided is
 worse than a failed startup. Without a `KVCRGuardConfig`, KVCR neither contacts
 the service nor builds a Guard.
 
-The service binds the pool's control endpoint and hands the claimant a
-duplicate of it. When that claimant dies, the pool's Guard takes over the same
-address with the cache still in place; no second port is configured, and the
-pool stays busy to any claimant that cannot inherit the endpoint. A clean
-release instead returns the Guard to standby and the pool to claimable, and a
-replacement primary takes a served pool back keeping the recovered records
-rather than rebuilding them. Either handover costs time linear in the number of
-recovered blocks, so size it against how much cache a pool actually holds.
+The service binds the pool group's control endpoint and hands the claimant a
+duplicate of it. When that claimant dies, the whole group transfers to its
+Guard, which takes over the same address with every pool retained; no second
+port is configured, and the group stays busy to any claimant that cannot
+inherit the endpoint. The promoted Guard serves recovered G2 data from every
+configured pool. A clean release returns the Guard to standby and the group to
+claimable, and a replacement primary takes the entire served group back with
+its recovered records rather than rebuilding them. Either handover costs time
+linear in the number of recovered blocks, so size it against how much cache
+the group holds.
 
-Recovered blocks are ranked for eviction as they are installed, so a pool
-recovered full still accepts new deposits. They carry no access history, so a
+Recovered blocks are ranked for eviction as they are installed, so a fully
+recovered group still accepts new deposits. They carry no access history, so a
 recovered block ranks below anything this process has served and is evicted
 first.
 
@@ -398,25 +411,24 @@ recovery has to retry it. A promoted Guard always answers a stale request --
 serving it, or failing it, even when it was promoted with nothing to serve --
 so the peer retries instead of waiting on a completion nobody will send.
 
-Every pool has a Guard for its whole life, and there is no per-pool
-containment. Any Guard failure stops the service, on the grounds that a pool
+Every pool group has a Guard for its whole life, and there is no per-Guard
+containment. Any Guard failure stops the service, on the grounds that a group
 which can no longer be recovered, and may still hold an endpoint the service
 cannot reach, is not something to limp on with.
 
 One case is deliberately not a Guard failure: a primary publishing faster than
 its Guard can mirror fills the ring. Both sides treat that as survivable -- the
-primary stops publishing, the Guard drops what it holds -- and the pool becomes
-claimable but cold if that primary dies. Recovery is lost for that pool only.
+primary stops publishing, the Guard drops what it holds -- and the group becomes
+claimable but cold if that primary dies. Recovery is lost for that group only.
 Watch for `KVCR pool recovery disabled` if failovers stop coming back warm. The
-journal is a fixed 100 MiB whatever `--pool-sizes-gb` is, so the only levers are
-larger blocks, which publish fewer residency changes, or accepting a cold
-failover for that pool.
+journal is a fixed 100 MiB whatever `--pool-sizes-gb` is, so the only levers
+are larger blocks, shorter pool names, fewer pool locations per key, or
+accepting a cold failover for that group.
 
-A Guard serves only the recovered G2 half; it opens no G3. A block that lived
-only on disk is unavailable until a replacement primary claims the pool. The
-records naming it are carried across, so the replacement reopens the tier with
-its disk cache rather than a cold one -- the files themselves are not held in
-the meantime, which is the limitation described below.
+A Guard opens no G3. A block that lived only on disk is unavailable until a
+replacement primary claims the group. The records naming it are carried across,
+so the replacement reopens the tier with its disk cache rather than a cold one --
+the files themselves are not held in the meantime, which is the limitation below.
 
 **Deployment prerequisite.** Make the configured NIXL backends available in
 each process that uses them. Nothing checks plugin availability across processes
@@ -429,7 +441,7 @@ what those records name. Nothing holds those files while the Guard serves
 either -- a tier's exclusive lock lives with the tier, and a Guard opens no
 G3. Pointing a second KVCR at the same G3 paths is therefore not a supported
 configuration: it is not detected, and the replacement will serve whatever is
-in the slots. The intended first step -- having the service refuse two pools
+in the slots. The intended first step -- having the service refuse two Guards
 that name the same paths -- is not implemented.
 
 The same applies to a file that is simply gone. A tier recreates a missing G3
@@ -880,14 +892,14 @@ Verify that:
 
 - the socket parent and pool directory exist and are writable;
 - the pool directory has capacity for every Guard's full allocation: the sum
-  of `--pool-sizes-gb` plus its 100 MiB journal. A pool changing hands briefly
+  of `--pool-sizes-gb` plus one 100 MiB journal. A group changing hands briefly
   appends its handback snapshot past that size;
   where there is no room for it, that handover comes back cold and the
   service carries on;
 - another process is not listening on the socket;
 - `--guard-count` is at least one; and
-- every comma-separated `--pool-sizes-gb` value is positive, finite, and at
-  least one memory page.
+- every `--pool-sizes-gb` item is positive, finite, and at least one memory
+  page.
 
 The service removes a stale socket only after confirming no live service is
 listening. It refuses to replace a socket owned by another live service.

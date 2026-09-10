@@ -8,10 +8,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record
 
 from kvcr.core import _BlockRecord
+from kvcr.guard_protocol import _PoolDescriptor
 from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.recovery_journal import (
     _JOURNAL_HEADER_BYTES,
@@ -141,15 +143,17 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     _attach_journal(local_dram, journal, g3)
     caplog.set_level("WARNING", logger="kvcr.recovery_journal")
 
-    local_dram.emit(key, _recovered_record(g2=2))
-    g3.emit(key, _recovered_record(g2=2, g3=7))
+    local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]))
+    g3.emit(key, _recovered_record(g2=[("pool0", 2)], g3=7))
     local_dram.emit(key, _recovered_record(g3=7))
     g3.emit(key, _BlockRecord())
     frames = [journal.read_next() for _ in range(4)]
     assert journal.read_next() is None
-    assert [_decode_recovery_record(payload) for _, _, payload in frames] == [
-        _recovered_record(g2=2),
-        _recovered_record(g2=2, g3=7),
+    assert [
+        _decode_recovery_record(payload, ("pool0",)) for _, _, payload in frames
+    ] == [
+        _recovered_record(g2=[("pool0", 2)]),
+        _recovered_record(g2=[("pool0", 2)], g3=7),
         _recovered_record(g3=7),
         _BlockRecord(),
     ]
@@ -160,8 +164,8 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     journal.invalidate()
     caplog.clear()
     with patch.object(journal, "publish", wraps=journal.publish) as publish:
-        local_dram.emit(key, _recovered_record(g2=0))
-        local_dram.emit(key, _recovered_record(g2=1))
+        local_dram.emit(key, _recovered_record(g2=[("pool0", 0)]))
+        local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
     assert publish.call_count == 1
     assert len(caplog.messages) == 1
 
@@ -173,7 +177,10 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
         _attach_journal(source, fresh)
         assert not fresh.is_invalid()
         with patch.object(fresh, "publish", side_effect=RuntimeError("publish failed")):
-            source.emit(BlockKey(b"still-serving"), _recovered_record(g2=0))
+            source.emit(
+                BlockKey(b"still-serving"),
+                _recovered_record(g2=[("pool0", 0)]),
+            )
         assert fresh.is_invalid()
 
 
@@ -271,7 +278,9 @@ def _attached(tmp_path: Path) -> Iterator[KVCRPoolAttachment]:
 
 def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -> None:
     """One-slot handback region: the smallest finished snapshot."""
-    frames = _recovery_frames({BlockKey(key * 32): _recovered_record(g2=slot)})
+    frames = _recovery_frames(
+        {BlockKey(key * 32): _recovered_record(g2=[("pool0", slot)])},
+    )
     write_recovery_snapshot(pool, terms, frames)
 
 
@@ -279,13 +288,17 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
     """Replayed whole under its own terms, discardable when torn, gone once released."""
     with _attached(tmp_path) as pool:
         path = Path(pool._spec.path)
-        terms = canonical_pool_terms(_TEST_DIGEST, [("", 4096)], pool._spec)
+        pools = (
+            _PoolDescriptor("pool0", 2048, 1024, pool._spec.journal_bytes),
+            _PoolDescriptor("pool1", 2048, 1024, pool._spec.journal_bytes + 2048),
+        )
+        terms = canonical_pool_terms(_TEST_DIGEST, pools, pool._spec)
         assert list(read_recovery_snapshot(pool, terms)) == []
 
         records = {
-            BlockKey(b"a" * 32): _recovered_record(g2=3),
+            BlockKey(b"a" * 32): _recovered_record(g2=[("pool0", 3)]),
             # One with both halves, one only on disk.
-            BlockKey(b"b" * 32): _recovered_record(g2=4, g3=9),
+            BlockKey(b"b" * 32): _recovered_record(g2=[("pool0", 4)], g3=9),
             BlockKey(b"c" * 32): _recovered_record(g3=2),
         }
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
@@ -294,16 +307,19 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
         assert path.stat().st_size > pool._spec.mapping_bytes
 
         # The mirror the ring feeds is also what replays the region.
-        mirror = _RecoveryMirror()
+        mirror = _RecoveryMirror(("pool0",))
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)
         assert mirror.take_records() == records
 
         # A slot number only means the same bytes under the same geometry.
-        for other in (
-            canonical_pool_terms("another-digest", [("", 4096)], pool._spec),
-            canonical_pool_terms(_TEST_DIGEST, [("", 8192)], pool._spec),
+        changed = msgspec.structs.replace(pools[0], block_size_bytes=2048)
+        for digest, layout in (
+            ("another-digest", pools),
+            (_TEST_DIGEST, (changed, pools[1])),
+            (_TEST_DIGEST, tuple(reversed(pools))),
         ):
+            other = canonical_pool_terms(digest, layout, pool._spec)
             with pytest.raises(RecoveryJournalError, match="other terms"):
                 list(read_recovery_snapshot(pool, other))
 
@@ -328,7 +344,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
             region[: _SNAPSHOT_HEADER.size] = bytes(_SNAPSHOT_HEADER.size)
         with pytest.raises(RecoveryJournalTornError, match="unfinished"):
             list(read_recovery_snapshot(pool, terms))
-        assert read_handback(pool, _TEST_DIGEST, [("", 4096)])._records == {}
+        assert read_handback(pool, _TEST_DIGEST, pools)._records == {}
         assert list(read_recovery_snapshot(pool, terms)) == []
 
         # A released region is truncated away, so it replays nothing.

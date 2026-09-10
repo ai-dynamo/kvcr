@@ -214,6 +214,110 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("layout", "expected_layout", "success"),
+    [
+        ([("full", 16), ("swa", 8)], ["swa", "full"], False),
+        ([("full", 16), ("swa", 8)], ["full", "swa"], True),
+        ([("", 16), ("", 16)], ["", ""], True),
+    ],
+)
+def test_remote_fetch_preserves_block_layout_and_bytes(
+    layout: list[tuple[str, int]],
+    expected_layout: list[str],
+    success: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class CopyingWriteAgent(FakeNixlAgent):
+        def transfer(self, handle):
+            self.transfers.append(handle)
+            _, sources, _, destinations, _, _ = self.xfers[handle - 1]
+            for (src, src_size, _), (dst, dst_size, _) in zip(
+                sources, destinations, strict=True
+            ):
+                ctypes.memmove(dst, src, min(src_size, dst_size))
+            return "PROC"
+
+    payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
+    source_primary = [ctypes.create_string_buffer(data, len(data)) for data in payloads]
+    pool_data = dict.fromkeys(dict(layout), b"")
+    for (name, _), data in zip(layout, payloads, strict=True):
+        pool_data[name] += data
+    source_local = {
+        name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
+    }
+    target_local = {
+        name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
+    }
+    source_agent = CopyingWriteAgent(metadata=b"source-md")
+    target_agent = FakeNixlAgent(metadata=b"target-md")
+    source_control = FakeBytesControl("tcp://source:1")
+    target_control = FakeBytesControl("tcp://target:1")
+    config = KVCRConfig(
+        nixl_agent_name="unused", pool_layouts=list(dict(layout).items())
+    )
+
+    def dram(memories: dict[str, ctypes.Array]) -> LocalDramOptions:
+        return LocalDramOptions(
+            [
+                (name, ctypes.addressof(memory), len(memory))
+                for name, memory in memories.items()
+            ]
+        )
+
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(),
+        source_control,
+        config,
+        name="source",
+        local_dram=dram(source_local),
+    )
+    target = _new_kvcr(
+        target_agent,
+        FakePrimaryPinning(),
+        target_control,
+        config,
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        local_dram=dram(target_local),
+    )
+    key = BlockKey(b"multi-pool")
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(memory), size, info=name)
+        for (name, size), memory in zip(layout, source_primary, strict=True)
+    ]
+    source_agent.state = "DONE"
+    deposit = source.deposit({key: descriptors})
+    assert dict(_poll_until(source, bool))[deposit][key].success
+    source_agent.state = "PROC"
+
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    fetch = target.fetch((key,), "req", expected_layout=expected_layout)
+    _wait_until(lambda: bool(target_control.sent))
+    source_control.incoming.extend(message for _, message in target_control.sent)
+    if success:
+        _poll_until(source, lambda _: len(source_agent.xfers) == 2)
+        source_xfer = source_agent.xfers[1]
+        assert len(source_xfer[1]) == len(source_xfer[3]) == 2
+        notification = source_xfer[5]
+        source_agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    else:
+        _poll_until(source, lambda _: bool(source_agent.sent_notifs))
+        notification = source_agent.sent_notifs[0][1]
+        assert "start_write layout mismatch" in caplog.text
+    target_agent.notifs["source"] = [notification]
+    result = dict(_poll_until(target, bool))[fetch][key]
+    assert result.success is success
+    if success:
+        assert [
+            (descriptor.info, descriptor.size)
+            for descriptor in result.descriptors or ()
+        ] == layout
+        assert {name: memory.raw for name, memory in target_local.items()} == pool_data
+
+
 def test_remote_staging_commits_available_prefix() -> None:
     block_size = 16
     local = ctypes.create_string_buffer(block_size * 2)

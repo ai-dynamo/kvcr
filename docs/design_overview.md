@@ -154,7 +154,7 @@ kvcr.abort(operation_handle, block_key_list=None)                  # cancel this
 kvcr.close()                                                       # synchronous teardown after framework-submitted jobs are drained
 
 # KVCR → Framework
-framework.capacity_needed(num_slots)                               # last-resort capacity pressure signal
+framework.capacity_needed([(pool_name, num_slots), ...])           # last-resort capacity pressure signal
 
 framework.request_pin(block_key_list) -> PinRequestId                             # enqueue a framework-owned source pin request
 framework.poll_pin_results() -> list[tuple[PinRequestId, PinResult]]               # drain completed requests; one pin may cover the full list
@@ -179,7 +179,7 @@ pool name may omit it.
 
 `deposit` also accepts a `no_evict` flag (batch-level, applies to all entries): when set, the KVCR keeps every completed slot non-evictable and returns a release handle per entry. A framework that wants guaranteed local DRAM residency behavior for selected KV blocks can get that behavior through `no_evict`, while the KVCR still handles sharing, routing visibility, transfer setup, and tiering policy. The framework calls `release` with the corresponding handle to clear the no-evict claim.
 
-The tradeoff is backpressure: when policy cannot free enough capacity—for example, because `no_evict` claims occupy the pool or an attempted eviction does not free its source—KVCR may invoke `capacity_needed` as a last-resort pressure signal. The framework should release enough claims to free the requested slots. If sufficient capacity remains unavailable, affected committed entries complete with errors. Pool size and the free-slot threshold that triggers `capacity_needed` are deployment knobs.
+The tradeoff is backpressure: when policy cannot free enough capacity—for example, because `no_evict` claims occupy a pool or an attempted eviction does not free its source—KVCR may invoke `capacity_needed` as a last-resort pressure signal. Each `(pool_name, num_slots)` request identifies the pool-local release batch the framework should satisfy. Pressure and its configured low watermark are tracked independently per pool. If sufficient capacity remains unavailable, affected committed entries complete with errors. Pool size and the free-slot threshold that triggers `capacity_needed` are deployment knobs.
 
 **Block availability query**
 

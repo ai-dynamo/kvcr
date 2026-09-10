@@ -16,6 +16,7 @@ import time
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from itertools import chain
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
@@ -43,12 +44,12 @@ if TYPE_CHECKING:
     from .core import _KVCRCore
 
 
-_MEM_DESCRIPTORS_TYPE = tuple[MemDescriptor, ...]
+_MEM_DESCRIPTOR_LISTS_TYPE = tuple[tuple[MemDescriptor, ...], ...]
 
 
 @dataclass(slots=True)
 class _FwMemResidency:
-    descriptor: MemDescriptor
+    descriptors: list[MemDescriptor]
     pin_handle: PinHandle
 
 
@@ -92,7 +93,7 @@ class _TargetPullOp(_RemoteOp):
     remote_ctrl_ep: str
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     ordered_keys: tuple[BlockKey, ...] = ()
-    dst_descriptors: tuple[MemDescriptor, ...] = ()
+    dst_descriptors: tuple[tuple[MemDescriptor, ...], ...] = ()
     request_id: str | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
@@ -202,7 +203,7 @@ class _SourcePinOp(_Op):
     remote_agent: bytes
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
-    dst_descriptors: tuple[MemDescriptor, ...]
+    dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
     route: tuple[str, int] = ("", 0)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
@@ -225,10 +226,10 @@ class _SourceWriteOp(_RemoteOp):
     remote_agent: bytes
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
-    dst_descriptors: tuple[MemDescriptor, ...]
+    dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     framework_pins: set[PinHandle] = field(default_factory=set)
-    src_descriptors: tuple[MemDescriptor, ...] = ()
+    src_descriptors: tuple[tuple[MemDescriptor, ...], ...] = ()
     transfer_id: int | None = None
     success: bool = False
     completed_count: int = 0
@@ -269,8 +270,12 @@ class _SourceWriteOp(_RemoteOp):
             try:
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
-                    self.src_descriptors,
-                    self.dst_descriptors[: self.completed_count],
+                    tuple(chain.from_iterable(self.src_descriptors)),
+                    tuple(
+                        chain.from_iterable(
+                            self.dst_descriptors[: self.completed_count]
+                        )
+                    ),
                     remote_side_agent=self.remote_agent,
                     backend=backend._options.backend,
                     notif_msg=_write_done_notif(
@@ -471,7 +476,7 @@ class _RemoteFWDram:
 
     def _start_target_pull(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None,
         deadline: float,
         op_handle: OpHandle,
@@ -506,7 +511,7 @@ class _RemoteFWDram:
             remote_ctrl_ep=current_hint.source,
             _backend=self,
             ordered_keys=keys,
-            dst_descriptors=tuple(blocks[key] for key in keys),
+            dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             request_id=request_id,
         )
         kvcr._add_block_dependencies(op, new_operation=True)
@@ -516,7 +521,7 @@ class _RemoteFWDram:
     def deliver(
         self,
         op_handle: OpHandle,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None,
         *,
         deadline: float,
@@ -540,7 +545,7 @@ class _RemoteFWDram:
 
     def fetch(
         self,
-        blocks: Mapping[BlockKey, MemDescriptor],
+        blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None,
         deadline: float,
         *,
@@ -893,13 +898,13 @@ class _RemoteFWDram:
                 raise TypeError("invalid remaining_timeout_ms")
             keys = _message_keys(payload)
             dst_descriptors = tuple(
-                self._kvcr._normalize_descriptors([descriptor])
-                for descriptor in msgspec.convert(
-                    payload["dst_descriptors"], type=_MEM_DESCRIPTORS_TYPE
+                tuple(self._kvcr._normalize_descriptors(list(descriptors)))
+                for descriptors in msgspec.convert(
+                    payload["dst_descriptors"], type=_MEM_DESCRIPTOR_LISTS_TYPE
                 )
             )
-        except (KeyError, TypeError, ValueError, msgspec.ValidationError):
-            logger.warning("KVCR malformed start_write op=%d", op_handle)
+        except (KeyError, TypeError, ValueError, msgspec.ValidationError) as error:
+            logger.warning("KVCR malformed start_write op=%d: %s", op_handle, error)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
         if not keys or len(keys) != len(dst_descriptors):
@@ -913,7 +918,7 @@ class _RemoteFWDram:
         )
         deadline = received_at + remaining_timeout_ms / 1000
         try:
-            fallback_target = dst_descriptors[0].end_point_name
+            fallback_target = dst_descriptors[0][0].end_point_name
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
@@ -961,7 +966,7 @@ class _RemoteFWDram:
             source_pin.op_id, source_pin.ordered_keys
         )
         framework_sources = {
-            key: record.fw_mem.descriptor
+            key: record.fw_mem.descriptors
             for key in source_pin.ordered_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
@@ -970,7 +975,18 @@ class _RemoteFWDram:
         sources = {} if force_failure else {**framework_sources, **local_sources}
         completed_keys: tuple[BlockKey, ...] = ()
         for index, key in enumerate(source_pin.ordered_keys):
-            if key not in sources:
+            source = sources.get(key)
+            destination = source_pin.dst_descriptors[index]
+            if source is None:
+                break
+            if [descriptor.info for descriptor in source] != [
+                descriptor.info for descriptor in destination
+            ]:
+                logger.warning(
+                    "KVCR start_write layout mismatch op=%d key=%r",
+                    source_pin.op_handle,
+                    key,
+                )
                 break
             completed_keys = source_pin.ordered_keys[: index + 1]
 
@@ -1010,7 +1026,7 @@ class _RemoteFWDram:
             route=source_pin.route,
             _backend=self,
             framework_pins=framework_pins,
-            src_descriptors=tuple(sources[key] for key in completed_keys),
+            src_descriptors=tuple(tuple(sources[key]) for key in completed_keys),
             completed_count=len(completed_keys),
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
@@ -1332,7 +1348,7 @@ class _RemoteFWDram:
         self,
         keys: tuple[BlockKey, ...],
     ) -> (
-        tuple[dict[BlockKey, MemDescriptor], set[PinHandle]]
+        tuple[dict[BlockKey, list[MemDescriptor]], set[PinHandle]]
         | _PendingFrameworkSources
         | None
     ):
@@ -1365,14 +1381,14 @@ class _RemoteFWDram:
                     framework_pins=held_framework_pins,
                 )
 
-        descriptors: dict[BlockKey, MemDescriptor] = {}
+        descriptors: dict[BlockKey, list[MemDescriptor]] = {}
         framework_pins: set[PinHandle] = set()
         for key in keys:
             record = kvcr._block_record_map.get(key)
             residency = record.fw_mem if record is not None else None
             if residency is None:
                 continue
-            descriptors[key] = residency.descriptor
+            descriptors[key] = residency.descriptors
             framework_pins.add(residency.pin_handle)
         if not descriptors:
             return None

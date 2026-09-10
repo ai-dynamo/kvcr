@@ -68,7 +68,7 @@ class KVCRBindings:
     inventory_sink: InventorySink | None = None
 
     # Capacity pressure, telemetry, and placement policy.
-    capacity_needed_callback: Callable[[int], None] | None = None
+    capacity_needed_callback: Callable[[list[tuple[str, int]]], None] | None = None
     stats_factory: Callable[[], TelemetryStats] | None = None
     policy: "KVCachePolicy | None" = None
 

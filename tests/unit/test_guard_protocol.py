@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import errno
+import mmap
 import os
 import select
 import socket
@@ -25,6 +26,7 @@ from kvcr.guard_protocol import (
     _Error,
     _G3Config,
     _Granted,
+    _PoolDescriptor,
     _Release,
     _Released,
     _TierConfig,
@@ -32,15 +34,22 @@ from kvcr.guard_protocol import (
 from kvcr.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
 
 _GUARD_INDEX = 3
-_BLOCK_SIZE_BYTES = 1024
+_POOL_LAYOUTS = [("pool0", 1024), ("pool1", 3072)]
+_POOL_SIZES = (mmap.PAGESIZE, 2 * mmap.PAGESIZE)
 _GENERATION = "a" * 32
 _DEVICE = 2049
 _INODE = 42
 _DIGEST = "opaque digest: leave unchanged"
 _JOURNAL_BYTES = 2 * _JOURNAL_HEADER_BYTES
-_MAPPING_BYTES = _JOURNAL_BYTES + 8195
-_POOL_LAYOUTS = [("", _BLOCK_SIZE_BYTES)]
+_POOL_OFFSETS = (_JOURNAL_BYTES, _JOURNAL_BYTES + _POOL_SIZES[0])
+_MAPPING_BYTES = _JOURNAL_BYTES + sum(_POOL_SIZES)
 _TIER_CONFIG = _TierConfig(_POOL_LAYOUTS, None)
+_WIRE_POOLS = tuple(
+    _PoolDescriptor(name, size_bytes, block_size_bytes, offset_bytes)
+    for (name, block_size_bytes), size_bytes, offset_bytes in zip(
+        _POOL_LAYOUTS, _POOL_SIZES, _POOL_OFFSETS, strict=True
+    )
+)
 
 
 def test_close_swaps_the_pidfd_under_its_lock() -> None:
@@ -150,10 +159,6 @@ class _Attachment:
     def address(self) -> int:
         return 1234
 
-    @property
-    def data_address(self) -> int:
-        return self.address + _JOURNAL_BYTES
-
     def close(self) -> None:
         if self._events is not None:
             self._events.append("attachment.close")
@@ -166,6 +171,7 @@ def _grant(
     guard_index: int = _GUARD_INDEX,
     mapping_bytes: int = _MAPPING_BYTES,
     tier_config: _TierConfig = _TIER_CONFIG,
+    pools: tuple[_PoolDescriptor, ...] = _WIRE_POOLS,
 ) -> _Granted:
     return _Granted(
         guard_index,
@@ -179,7 +185,23 @@ def _grant(
             journal_bytes=_JOURNAL_BYTES,
         ),
         tier_config,
+        pools,
         1,
+    )
+
+
+def _grant_with_pool(index: int = 0, **changes) -> _Granted:
+    pools = list(_WIRE_POOLS)
+    pools[index] = msgspec.structs.replace(pools[index], **changes)
+    return _grant(pools=tuple(pools))
+
+
+def _local_dram(address: int = 1234) -> LocalDramOptions:
+    return LocalDramOptions(
+        [
+            (pool.name, address + pool.offset_bytes, pool.size_bytes)
+            for pool in _WIRE_POOLS
+        ]
     )
 
 
@@ -194,30 +216,40 @@ def _connect_with(
     )
 
 
-def test_unsupported_tier_configuration_is_refused_at_decode() -> None:
-    """Refuse unsupported pool and G3 layouts before they bind the pool."""
-    page = os.sysconf("SC_PAGE_SIZE")
+def test_pool_descriptor_constraints_are_part_of_the_wire_contract() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        _PoolDescriptor("pool", 0, 1)
+    with pytest.raises(ValueError, match="complete KV block"):
+        _PoolDescriptor("pool", 1023, 1024)
+
+
+def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
     good = {
         "paths": ("/g3/a",),
-        "capacity_bytes_per_file": page,
+        "capacity_bytes_per_file": 1,
         "backend": "FILE",
         "backend_options": {},
     }
-    with pytest.raises(ValueError, match="only a single pool"):
-        _TierConfig([("full", page), ("swa", page)], None)
-    with pytest.raises(ValueError, match="page aligned"):
-        _TierConfig([("", page // 2)], _G3Config(**good))
+    with pytest.raises(ValueError, match="absolute"):
+        _G3Config(**{**good, "paths": ("g3/a",)})
+    with pytest.raises(ValueError, match="unique"):
+        _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")})
+
+    with pytest.raises(ValueError, match="does not support multiple pools"):
+        _TierConfig(
+            _POOL_LAYOUTS,
+            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
+        )
     with pytest.raises(ValueError, match="complete slots"):
         _TierConfig(
-            [("", page)],
-            _G3Config(**{**good, "capacity_bytes_per_file": page + 1}),
+            [("pool", mmap.PAGESIZE)],
+            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE + 1}),
         )
-    with pytest.raises(ValueError, match="unique"):
+    with pytest.raises(ValueError, match="page-aligned"):
         _TierConfig(
-            [("", page)],
-            _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")}),
+            [("pool", mmap.PAGESIZE // 2)],
+            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
         )
-    _TierConfig([("", page)], _G3Config(**good))
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
@@ -240,7 +272,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "guard_index": _GUARD_INDEX,
         "compatibility_digest": _DIGEST,
         "tier_config": {
-            "pool_layouts": [("", _BLOCK_SIZE_BYTES)],
+            "pool_layouts": _POOL_LAYOUTS,
             "g3": None,
             "remote_fw_dram_backend": "UCX",
         },
@@ -248,27 +280,18 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "control_port": 5555,
         "version": 1,
     }
-    assert msgspec.to_builtins(_grant()) == {
-        "type": "granted",
-        "guard_index": _GUARD_INDEX,
-        "spec": {
-            "pool_id": f"pool_{_GUARD_INDEX}",
-            "path": f"/tmp/kvcr-pool_{_GUARD_INDEX}-{_GENERATION}",
-            "generation": _GENERATION,
-            "device": _DEVICE,
-            "inode": _INODE,
-            "mapping_bytes": _MAPPING_BYTES,
-            "journal_bytes": _JOURNAL_BYTES,
-        },
-        "tier_config": {
-            "pool_layouts": [("", _BLOCK_SIZE_BYTES)],
-            "g3": None,
-            "remote_fw_dram_backend": "UCX",
-        },
-        "version": 1,
+    grant_wire = msgspec.to_builtins(_grant())
+    assert grant_wire["type"] == "granted"
+    assert grant_wire["version"] == 1
+    assert grant_wire["guard_index"] == _GUARD_INDEX
+    assert grant_wire["tier_config"] == {
+        "pool_layouts": _POOL_LAYOUTS,
+        "g3": None,
+        "remote_fw_dram_backend": "UCX",
     }
+    assert grant_wire["pools"] == msgspec.to_builtins(_WIRE_POOLS)
     attach.assert_called_once_with(_grant().spec)
-    assert hold.local_dram == LocalDramOptions([("", 1234 + _JOURNAL_BYTES, 8192)])
+    assert hold.local_dram == _local_dram()
     # The endpoint a Guard will answer on, handed over with the grant.
     assert hold._control_listener_fd == connection.handed_fd
 
@@ -302,14 +325,28 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     [
         pytest.param(_grant(guard_index=_GUARD_INDEX + 1), None, id="wrong-guard"),
         pytest.param(
-            _grant(tier_config=_TierConfig([("", _BLOCK_SIZE_BYTES * 2)], None)),
+            _grant(
+                tier_config=_TierConfig(
+                    [("pool0", _POOL_LAYOUTS[0][1] * 2), _POOL_LAYOUTS[1]], None
+                )
+            ),
             None,
-            id="wrong-pool-layout",
+            id="wrong-tier-layout",
+        ),
+        pytest.param(_grant(pools=_WIRE_POOLS[:1]), None, id="wrong-pool-count"),
+        pytest.param(
+            _grant_with_pool(block_size_bytes=_POOL_LAYOUTS[0][1] * 2),
+            None,
+            id="wrong-pool-block-size",
         ),
         pytest.param(
-            _grant(mapping_bytes=_JOURNAL_BYTES + _BLOCK_SIZE_BYTES - 1),
+            _grant_with_pool(1, offset_bytes=_POOL_OFFSETS[1] + mmap.PAGESIZE),
             None,
-            id="short-mapping",
+            id="noncontiguous-offset",
+        ),
+        pytest.param(_grant_with_pool(size_bytes=_POOL_SIZES[0] + 1), None, id="size"),
+        pytest.param(
+            _grant(mapping_bytes=_MAPPING_BYTES + mmap.PAGESIZE), None, id="mapping"
         ),
         pytest.param(
             KVCRGuardProtocolError("invalid granted message"),
@@ -363,7 +400,8 @@ def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> N
         [ConnectionResetError("release acknowledgement was lost")], events
     )
     hold = KVCRPoolHold(
-        local_dram=LocalDramOptions([("", 1234, 8192)]),
+        local_dram=_local_dram(attachment.address),
+        _pools=_WIRE_POOLS,
         _attachment=attachment,
         _connection=connection,
     )

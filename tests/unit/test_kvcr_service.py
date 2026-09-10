@@ -33,6 +33,7 @@ from kvcr.guard_protocol import (
     _Error,
     _G3Config,
     _Granted,
+    _PoolDescriptor,
     _Release,
     _Released,
     _TierConfig,
@@ -48,7 +49,7 @@ from kvcr.memory import _KVCRPoolOwner
 
 
 def _holders_of(registry) -> dict[int, object]:
-    """The pools a worker holds, in the shape the old binding map had."""
+    """The Guards a worker holds, in the shape the old binding map had."""
     return {
         i: p._pool_lease.current
         for i, p in registry._guards.items()
@@ -58,18 +59,15 @@ def _holders_of(registry) -> dict[int, object]:
 
 _SERVER_STOP_TIMEOUT_SECONDS = 5
 _CONNECTION_POLL_INTERVAL_SECONDS = 0.001
+_PAGE_BLOCK_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
 
 _TEST_GUARD_COUNT = 2
-_TEST_JOURNAL_BYTES = 8192
-_TEST_POOL_SIZE_BYTES = 8192
-_TEST_POOL_SIZES_BYTES = (_TEST_POOL_SIZE_BYTES,)
+_TEST_JOURNAL_BYTES = 2 * _PAGE_BLOCK_SIZE_BYTES
+_TEST_POOL_SIZES_BYTES = (2 * _PAGE_BLOCK_SIZE_BYTES,)
 _TEST_BLOCK_SIZE_BYTES = 1024
-_TEST_POOL_LAYOUTS = [("", _TEST_BLOCK_SIZE_BYTES)]
+_TEST_POOL_LAYOUTS = [("pool0", _TEST_BLOCK_SIZE_BYTES)]
 _TEST_DIGEST = "opaque digest: Preserve-Me EXACTLY"
 _TEST_TIER_CONFIG = _TierConfig(_TEST_POOL_LAYOUTS, None)
-# G3 terms are refused at decode unless a real claimant could open them, so
-# the one claim that carries G3 uses a page-aligned stride.
-_PAGE_STRIDE = os.sysconf("SC_PAGE_SIZE")
 
 
 class _FakeLiveness:
@@ -96,7 +94,7 @@ class _FakeLiveness:
 
 def _claim(registry, guard_index, liveness, control_bind=None):
     """Claim through the registry, closing the granted fd the tests never send."""
-    spec, listener_fd, lease = registry.claim(
+    spec, _pools, listener_fd, lease = registry.claim(
         guard_index,
         _TEST_TIER_CONFIG,
         liveness,
@@ -107,7 +105,7 @@ def _claim(registry, guard_index, liveness, control_bind=None):
 
 
 def _kill_and_wait(registry, guard_index, liveness) -> None:
-    """Die the way a real claimant does: the pool's own actor notices."""
+    """Die the way a real claimant does: the Guard's own actor notices."""
     liveness.kill()
     guard = registry._guards[guard_index]
     _wait_until(
@@ -217,7 +215,7 @@ def _channels_are_taken():
 
 def _stand_in_pool(spec) -> Mock:
     """The pool-tail surface a Guard reaches for, without a real mapping."""
-    attachment = Mock(address=1234, data_address=1234 + spec.journal_bytes, _spec=spec)
+    attachment = Mock(address=1234, _spec=spec)
     attachment.mapped_snapshot.return_value = nullcontext(None)
     return attachment
 
@@ -257,13 +255,35 @@ def test_socket_is_private(tmp_path: Path) -> None:
         assert stat.S_IMODE(harness.server.socket_path.stat().st_mode) == 0o600
 
 
-def test_each_guard_allocation_contains_all_pool_sizes(tmp_path: Path) -> None:
-    pool_sizes = (2 * _PAGE_STRIDE, 3 * _PAGE_STRIDE)
-    with _running_server(tmp_path, pool_sizes_bytes=pool_sizes) as harness:
-        expected = _TEST_JOURNAL_BYTES + sum(pool_sizes)
-        assert all(
-            guard._owner.spec.mapping_bytes == expected
-            for guard in harness.server._registry._guards.values()
+def test_client_claims_one_grouped_allocation_with_independent_strides(
+    tmp_path: Path,
+) -> None:
+    pool_sizes = (2 * _PAGE_BLOCK_SIZE_BYTES, 3 * _PAGE_BLOCK_SIZE_BYTES)
+    pool_layouts = [
+        ("pool0", _TEST_BLOCK_SIZE_BYTES),
+        ("pool1", 3 * _TEST_BLOCK_SIZE_BYTES),
+    ]
+    with _running_server(
+        tmp_path,
+        guard_count=2,
+        pool_sizes_bytes=pool_sizes,
+    ) as harness:
+        with pytest.raises(KVCRServiceError, match="out of range"):
+            harness.client.claim(2, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(2))
+        with pytest.raises(KVCRServiceError, match="pool layout"):
+            harness.client.claim(1, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(1))
+
+        hold = harness.client.claim(1, pool_layouts, _TEST_DIGEST, _control_bind(1))
+        hold.release()
+        guard = harness.server._registry._guards[1]
+        spec = guard._owner.spec
+        assert spec.mapping_bytes == _TEST_JOURNAL_BYTES + sum(pool_sizes)
+        offsets = (_TEST_JOURNAL_BYTES, _TEST_JOURNAL_BYTES + pool_sizes[0])
+        assert guard._recovery.pools == tuple(
+            _PoolDescriptor(name, size, block_size, offset)
+            for (name, block_size), size, offset in zip(
+                pool_layouts, pool_sizes, offsets, strict=True
+            )
         )
 
 
@@ -275,9 +295,9 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     guard = registry._guards[0]
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
     first_spec, stale = _claim(registry, 0, first)
-    _spec, _fd, _lease = registry.claim(
+    _spec, _pools, _fd, _lease = registry.claim(
         1,
-        _TierConfig([("", _TEST_BLOCK_SIZE_BYTES * 2)], None),
+        _TierConfig([("pool0", _TEST_BLOCK_SIZE_BYTES * 2)], None),
         second,
         _control_bind(1),
     )
@@ -387,7 +407,7 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
 
     g3 = G3Options(
         paths=((tmp_path / "g3").resolve(),),
-        capacity_bytes_per_file=2 * _PAGE_STRIDE,
+        capacity_bytes_per_file=2 * _PAGE_BLOCK_SIZE_BYTES,
         backend="FILE",
         backend_options={"mode": "direct"},
     )
@@ -403,11 +423,11 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         assert guard._phase is _Phase.UNCONFIGURED
 
         hold = harness.client.claim(
-            1, [("", _PAGE_STRIDE)], _TEST_DIGEST, _control_bind(), g3
+            1, [("pool0", _PAGE_BLOCK_SIZE_BYTES)], _TEST_DIGEST, _control_bind(), g3
         )
         assert guard._phase is _Phase.PRIMARY and guard._control is control
         assert guard._configured == _TierConfig(
-            [("", _PAGE_STRIDE)],
+            [("pool0", _PAGE_BLOCK_SIZE_BYTES)],
             _G3Config(
                 paths=(str(g3.paths[0]),),
                 capacity_bytes_per_file=g3.capacity_bytes_per_file,
@@ -517,7 +537,7 @@ def test_a_standby_survives_failed_claims_and_hands_over_to_a_replacement(
         with pytest.raises(KVCRServiceError, match="another tier configuration"):
             registry.claim(
                 0,
-                _TierConfig([("", _TEST_BLOCK_SIZE_BYTES * 2)], None),
+                _TierConfig([("pool0", _TEST_BLOCK_SIZE_BYTES * 2)], None),
                 _FakeLiveness(),
                 control_bind,
             )
@@ -608,7 +628,7 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
         with pytest.raises(KVCRServiceError, match="one complete KV block"):
             harness.client.claim(
                 0,
-                [("", _TEST_POOL_SIZE_BYTES + 1)],
+                [("pool0", _TEST_POOL_SIZES_BYTES[0] + 1)],
                 _TEST_DIGEST,
                 _control_bind(),
             )
@@ -694,7 +714,8 @@ def test_fork_and_exec_do_not_preserve_claimant_access(
                 "import time",
                 "from kvcr.guard_protocol import KVCRClient",
                 f"hold = KVCRClient({str(harness.server.socket_path)!r}).claim("
-                f"0, {_TEST_POOL_LAYOUTS!r}, {_TEST_DIGEST!r}, {_control_bind()!r})",
+                f"0, {_TEST_POOL_LAYOUTS!r}, {_TEST_DIGEST!r}, "
+                f"{_control_bind()!r})",
                 "forked_pid = os.fork()",
                 "if forked_pid == 0:",
                 "    hold._connection.close()",
@@ -1253,12 +1274,12 @@ def _service_args(pool_sizes_gb: str) -> list[str]:
 
 
 def test_pool_size_list_preserves_order_and_floors_each_item_to_pages() -> None:
-    raw_sizes = (2 * _PAGE_STRIDE + 123, 3 * _PAGE_STRIDE + 456)
+    raw_sizes = (2 * _PAGE_BLOCK_SIZE_BYTES + 123, 3 * _PAGE_BLOCK_SIZE_BYTES + 456)
     parsed = _parse_args(
         _service_args(",".join(str(size / (1 << 30)) for size in raw_sizes))
     )
 
-    expected = (2 * _PAGE_STRIDE, 3 * _PAGE_STRIDE)
+    expected = (2 * _PAGE_BLOCK_SIZE_BYTES, 3 * _PAGE_BLOCK_SIZE_BYTES)
     assert parsed.pool_sizes_bytes == expected
 
 
@@ -1269,7 +1290,7 @@ def test_pool_size_list_preserves_order_and_floors_each_item_to_pages() -> None:
         "1,,2",
         "nan",
         "0",
-        str((_PAGE_STRIDE - 1) / (1 << 30)),
+        str((_PAGE_BLOCK_SIZE_BYTES - 1) / (1 << 30)),
         "1e1000000",
         ",".join([str(sys.maxsize // (1 << 30))] * 2),
     ],
