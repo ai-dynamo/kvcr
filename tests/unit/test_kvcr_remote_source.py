@@ -333,7 +333,7 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
         assert source_agent.telemetry_handles == [1]
 
 
-@pytest.mark.parametrize("failure", [False, RuntimeError("release failed")])
+@pytest.mark.parametrize("failure", [False, None, 1, RuntimeError("release failed")])
 def test_kvcr_pin_release_failure_is_logged_and_retried(kvcr_caplog, failure):
     class FailingPinRelease(FakePrimaryPinning):
         def release_pin(self, pin_handle):

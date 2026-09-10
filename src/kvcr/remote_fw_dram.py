@@ -1448,7 +1448,7 @@ class _RemoteFWDram:
                     "KVCR release_pin failed for pin=%r", pin_handle, exc_info=True
                 )
             return False
-        if released is False:
+        if released is not True:
             if warn:
                 logger.warning("KVCR release_pin failed for pin=%r", pin_handle)
             return False
