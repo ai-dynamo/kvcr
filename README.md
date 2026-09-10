@@ -111,11 +111,6 @@ container workflow and the public source information it will require.
 For local development, API lifecycle guidance, validation, integration, and
 KVCR service usage, see the [developer guide](docs/dev-guide.md).
 
-## Provenance
-
-See [PROVENANCE.md](PROVENANCE.md) for the immutable source commit, which
-modules were extracted from it, and which were written in this repository.
-
 ## License
 
 KVCR is released under the Apache License 2.0. The full license text is in
@@ -130,8 +125,7 @@ build retain their Apache-2.0 contributor headers.
 The public E2E quick start is pending an upcoming vLLM PR containing six
 integration files. They are not stored in this repository or included in the
 `nvidia-kvcr` wheel. Until the PR exists, the Dockerfile uses explicit pending
-placeholders and stops before fetching source. Its exact public revision will
-be recorded in [PROVENANCE.md](PROVENANCE.md) when available.
+placeholders and stops before fetching source.
 
 KVCR declares runtime dependencies on `msgspec`, `pyzmq`, and `nixl`. Each is
 installed from its own distribution under its own license. None of them are
