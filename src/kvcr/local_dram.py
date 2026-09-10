@@ -1032,8 +1032,9 @@ class _LocalDram:
                 if len(self._free_slots[name]) + freed[name] < count
             }
 
+        deficient = short()
         with closing(self._evictable.candidates(protected)) as candidates:
-            while deficient := short():
+            while deficient:
                 key = next(candidates, None)
                 if key is None:
                     return None, [], False
@@ -1054,7 +1055,8 @@ class _LocalDram:
                     CacheTier.LOCAL_G2,
                     deadline,
                 )
-                if not short():
+                deficient = short()
+                if not deficient:
                     break
                 if eviction_pending:
                     self._capacity_eviction_key = key
@@ -1063,6 +1065,7 @@ class _LocalDram:
                     continue
                 victims.append((key, record, residency, size_bytes))
                 freed.update(name for name, _ in residency.slots)
+                deficient = short()
 
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)

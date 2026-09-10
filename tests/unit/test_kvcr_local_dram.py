@@ -5,6 +5,7 @@
 import ctypes
 import heapq
 import logging
+from contextlib import closing
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +26,7 @@ from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
+from kvcr.policy_runtime import _EvictionQueue
 from kvcr.recovery_journal import (
     RecoveryMirrorError,
     install_recovery_records,
@@ -284,6 +286,27 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
+
+
+def test_eviction_heap_compaction_preserves_active_candidates() -> None:
+    queue = _EvictionQueue()
+    first, churned, excluded = (
+        BlockKey(name) for name in (b"first", b"churned", b"excluded")
+    )
+    queue.insert(first, 0)
+    queue.insert(churned, 1)
+    queue.insert(excluded, 1)
+
+    with closing(queue.candidates({excluded})) as candidates:
+        assert next(candidates) == first
+        for _ in range(100):
+            queue.remove(churned)
+            queue.insert(churned, 1)
+        assert len(queue._heap) <= 2 * len(queue)
+        assert list(candidates) == [churned]
+
+    assert len(queue._heap) == 3
+    assert list(queue.candidates(set())) == [first, excluded, churned]
 
 
 @pytest.mark.parametrize(

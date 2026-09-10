@@ -151,9 +151,6 @@ class _Entry:
 
 
 class _EvictionQueue:
-    # TODO: Bound stale heap growth from DRAM/G3 claim/release cycles.
-    # Removal only invalidates _live; candidates() removes stale heap entries as
-    # it encounters them, so repeated cache use can grow _heap without eviction.
     def __init__(self) -> None:
         self._heap: list[tuple[float, int, BlockKey]] = []
         self._live: dict[BlockKey, _Entry] = {}
@@ -167,6 +164,18 @@ class _EvictionQueue:
         self._next_sequence += 1
         self._live[key] = entry
         heapq.heappush(self._heap, (entry.score, entry.sequence, key))
+        if len(self._heap) > 2 * len(self._live):
+            # Accumulated stale entries amortize this O(n) pass. Reusing tuples
+            # limits overhead, but this insert still pays the synchronous cost.
+            # If profiling shows significant pauses, use incremental compaction.
+            # Compact queued entries only; candidates() restores those it holds.
+            self._heap = [
+                item
+                for item in self._heap
+                if (current := self._live.get(item[2])) is not None
+                and current.sequence == item[1]
+            ]
+            heapq.heapify(self._heap)
 
     def remove(self, key: BlockKey) -> bool:
         return self._live.pop(key, None) is not None
