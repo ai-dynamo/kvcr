@@ -672,12 +672,18 @@ def test_kvcr_metadata_ack_retry_lifecycle():
 
 
 @pytest.mark.parametrize(
-    "terminal_success",
-    [None, False, True],
-    ids=["source-dead", "failed", "completed"],
+    "terminal_success,recovery",
+    [
+        (None, "replacement"),
+        (None, "already-replaced"),
+        (None, "late-terminal"),
+        (False, None),
+        (True, None),
+    ],
 )
 def test_kvcr_deliver_timeout_probes_source_before_finishing(
     terminal_success: bool | None,
+    recovery: str | None,
 ) -> None:
     now = 0.0
     agent = FakeNixlAgent(metadata=b"target-md")
@@ -697,6 +703,10 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
     source = "tcp://source:1"
 
     op_handle, _ = _acked_deliver(control, kvcr, source, key, source_agent="source")
+    other_handle = None
+    if recovery == "late-terminal":
+        other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+        _wait_until(lambda: len(control.sent) == 2)
 
     now = 2.0
     _wait_until(
@@ -709,12 +719,27 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
     assert _has_outstanding_operations(kvcr)
 
     if terminal_success is None:
+        if recovery == "already-replaced":
+            control.incoming.append(
+                msgspec.msgpack.encode(
+                    {
+                        "type": "target_metadata_ack",
+                        "sender_control_endpoint": source,
+                        "target_agent": "source-generation-2",
+                    }
+                )
+            )
+            _wait_until(lambda: not control.incoming)
         now = 4.0
-        assert _poll_until(kvcr, lambda completed: bool(completed)) == [
-            (op_handle, _op_entries({key: False}))
-        ]
+        expected = [(op_handle, _op_entries({key: False}))]
+        if other_handle is not None:
+            expected.append((other_handle, _op_entries({key: False})))
+        assert _poll_until(kvcr, lambda done: len(done) == len(expected)) == expected
         backend = kvcr._core._remote_fw_dram
-        assert backend._source_tombstones[source] == "source"
+        if recovery == "already-replaced":
+            assert source not in backend._source_tombstones
+            assert agent.removed_remote_agents == ["source"]
+            return
         assert agent.removed_remote_agents == ["source"]
         metadata_ack = {
             "type": "target_metadata_ack",
@@ -732,6 +757,25 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
         assert [
             _decode_control_message(message)["type"] for _, message in control.sent
         ] == ["target_metadata"]
+
+        if recovery == "late-terminal":
+            control.incoming.append(
+                msgspec.msgpack.encode(
+                    {
+                        "type": "write_probe_ack",
+                        "sender_control_endpoint": source,
+                        "target_agent": "source",
+                        "op_handle": op_handle,
+                        "terminal": True,
+                    }
+                )
+            )
+            _wait_until(lambda: not control.incoming)
+            assert source in backend._source_tombstones
+            agent.notifs["source"] = [_write_done_notification(other_handle)]
+            _wait_until(lambda: source not in backend._source_tombstones)
+            assert list(kvcr.poll_completed()) == []
+            return
 
         metadata_ack["target_agent"] = "source-generation-2"
         control.incoming.append(msgspec.msgpack.encode(metadata_ack))

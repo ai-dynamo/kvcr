@@ -130,6 +130,32 @@ def test_write_probe_fences_write_waiting_on_framework_pin() -> None:
     assert agent.xfers == []
 
 
+def test_stalled_source_refuses_queued_and_future_writes() -> None:
+    agent = FakeNixlAgent(metadata=b"source-md")
+    pinning = PendingPrimaryPinning()
+    control = FakeBytesControl()
+    source = _new_kvcr(agent, pinning, control, name="source")
+
+    stalled_for = 0.0
+    with patch(
+        "kvcr.remote_fw_dram.time",
+        SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
+    ):
+        for handle in (1, 2):
+            control.incoming.append(
+                _start_write_message(handle, BlockKey(b"k0"), target_agent="target")
+            )
+            if handle == 1:
+                _poll_until(source, lambda _: bool(pinning.searches))
+                stalled_for = 2.0
+                pinning.complete(0)
+            assert _poll_until(source, lambda _: len(agent.sent_notifs) == handle) == []
+            assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+    assert agent.xfers == []
+    assert pinning.searches == [(BlockKey(b"k0"),)]
+    assert pinning.unpins == ["pin"]
+
+
 def test_kvcr_close_cleans_pending_pin_operations():
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()

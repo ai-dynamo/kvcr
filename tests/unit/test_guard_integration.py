@@ -611,12 +611,23 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
 
         continue_promotion.set()
         _wait_until(lambda: guard._serving, timeout=2)
+        assert guard._core is not None
+        _wait_until(
+            lambda: (
+                target._core._remote_fw_dram._source_agents_by_endpoint.get(
+                    source_endpoint
+                )
+                == guard._core.nixl_agent_name
+            ),
+            timeout=2,
+        )
+        assert list(target.poll_completed()) == []
+        now[0] = 12.0
         completed = _poll_until(target, bool, timeout=2)
         assert completed[0][0] == stalled_operation
         assert not completed[0][1][key].success
 
         # A real core either way, answering on the endpoint it inherited.
-        assert guard._core is not None
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
         target.submit_hint(_router_hint(source_endpoint), request_id="retry")
         operation = target.deliver(
