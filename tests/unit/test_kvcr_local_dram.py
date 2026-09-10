@@ -130,26 +130,6 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
     ]
 
 
-def test_local_transfer_accepts_multiple_blocks_in_one_pool() -> None:
-    agent = FakeNixlAgent()
-    agent.state = "DONE"
-    source = ctypes.create_string_buffer(32)
-    kvcr = _new_local_kvcr(agent, ctypes.create_string_buffer(32), 2)
-
-    operation = kvcr.deposit(
-        {
-            BlockKey(b"key"): [
-                _mem_descriptor(ctypes.addressof(source)),
-                _mem_descriptor(ctypes.addressof(source) + 16),
-            ]
-        }
-    )
-
-    assert dict(_poll_until(kvcr, lambda results: bool(results)))[operation][
-        BlockKey(b"key")
-    ].success
-
-
 def test_local_dram_rejects_overlapping_pools() -> None:
     memory = ctypes.create_string_buffer(16)
     address = ctypes.addressof(memory)
@@ -492,27 +472,6 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     assert local.raw == b"b" * block_size
 
 
-def test_capacity_needed_is_edge_triggered() -> None:
-    local = ctypes.create_string_buffer(10)
-    capacity_requests: list[list[tuple[str, int]]] = []
-    kvcr = _new_local_kvcr(
-        FakeNixlAgent(),
-        local,
-        10,
-        capacity_low_watermark_percent=20,
-        capacity_needed_callback=capacity_requests.append,
-    )
-
-    kvcr._core._update_capacity_pressure({"": 2})
-    kvcr._core._update_capacity_pressure({"": 1})
-    kvcr._core._update_capacity_pressure({"": 0})
-    assert capacity_requests == [[("", 2)]]
-
-    kvcr._core._update_capacity_pressure({"": 2})
-    kvcr._core._update_capacity_pressure({"": 1})
-    assert capacity_requests == [[("", 2)], [("", 2)]]
-
-
 def test_capacity_pressure_is_pool_local() -> None:
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
     source = ctypes.create_string_buffer(24)
@@ -535,8 +494,13 @@ def test_capacity_pressure_is_pool_local() -> None:
         _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
     ]
 
+    kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
+    kvcr._core._update_capacity_pressure({"full": 0, "swa": 1})
     kvcr._core._update_capacity_pressure({"full": 0, "swa": 0})
     assert capacity_requests == [[("full", 1), ("swa", 2)]]
+    kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
+    kvcr._core._update_capacity_pressure({"full": 0, "swa": 1})
+    assert capacity_requests == [[("full", 1), ("swa", 2)]] * 2
     kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})
     capacity_requests.clear()
 

@@ -235,28 +235,53 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
 
 
 @pytest.mark.parametrize(
-    ("expected_layout", "success"),
-    [(["swa", "full"], False), (["full", "swa"], True)],
+    ("layout", "expected_layout", "success"),
+    [
+        ([("full", 16), ("swa", 8)], ["swa", "full"], False),
+        ([("full", 16), ("swa", 8)], ["full", "swa"], True),
+        ([("", 16), ("", 16)], ["", ""], True),
+    ],
 )
-def test_remote_fetch_validates_a_multi_pool_layout(
-    expected_layout: list[str], success: bool, caplog: pytest.LogCaptureFixture
+def test_remote_fetch_preserves_block_layout_and_bytes(
+    layout: list[tuple[str, int]],
+    expected_layout: list[str],
+    success: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    names = ("full", "swa")
-    layout = [(name, 8) for name in names]
-    source_primary = ctypes.create_string_buffer(16)
-    source_local = [ctypes.create_string_buffer(8) for _ in names]
-    target_local = [ctypes.create_string_buffer(8) for _ in names]
-    source_agent = FakeNixlAgent(metadata=b"source-md")
+    class CopyingWriteAgent(FakeNixlAgent):
+        def transfer(self, handle):
+            self.transfers.append(handle)
+            _, sources, _, destinations, _, _ = self.xfers[handle - 1]
+            for (src, src_size, _), (dst, dst_size, _) in zip(
+                sources, destinations, strict=True
+            ):
+                ctypes.memmove(dst, src, min(src_size, dst_size))
+            return "PROC"
+
+    payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
+    source_primary = [ctypes.create_string_buffer(data, len(data)) for data in payloads]
+    pool_data = dict.fromkeys(dict(layout), b"")
+    for (name, _), data in zip(layout, payloads, strict=True):
+        pool_data[name] += data
+    source_local = {
+        name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
+    }
+    target_local = {
+        name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
+    }
+    source_agent = CopyingWriteAgent(metadata=b"source-md")
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_control = FakeBytesControl("tcp://source:1")
     target_control = FakeBytesControl("tcp://target:1")
-    config = KVCRConfig(nixl_agent_name="unused", pool_layouts=layout)
+    config = KVCRConfig(
+        nixl_agent_name="unused", pool_layouts=list(dict(layout).items())
+    )
 
-    def dram(memories: list[ctypes.Array]) -> LocalDramOptions:
+    def dram(memories: dict[str, ctypes.Array]) -> LocalDramOptions:
         return LocalDramOptions(
             [
                 (name, ctypes.addressof(memory), len(memory))
-                for name, memory in zip(names, memories, strict=True)
+                for name, memory in memories.items()
             ]
         )
 
@@ -279,8 +304,8 @@ def test_remote_fetch_validates_a_multi_pool_layout(
     )
     key = BlockKey(b"multi-pool")
     descriptors = [
-        _mem_descriptor(ctypes.addressof(source_primary) + index * 8, 8, info=name)
-        for index, name in enumerate(names)
+        _mem_descriptor(ctypes.addressof(memory), size, info=name)
+        for (name, size), memory in zip(layout, source_primary, strict=True)
     ]
     source_agent.state = "DONE"
     deposit = source.deposit({key: descriptors})
@@ -306,9 +331,11 @@ def test_remote_fetch_validates_a_multi_pool_layout(
     result = dict(_poll_until(target, bool))[fetch][key]
     assert result.success is success
     if success:
-        assert [descriptor.info for descriptor in result.descriptors or ()] == list(
-            names
-        )
+        assert [
+            (descriptor.info, descriptor.size)
+            for descriptor in result.descriptors or ()
+        ] == layout
+        assert {name: memory.raw for name, memory in target_local.items()} == pool_data
 
 
 def test_remote_staging_commits_available_prefix() -> None:
