@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
 _CLOSE_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
+# Cold start is not the same kind of wait as a join: it covers NIXL agent
+# creation, backend setup, and memory registration, none of which are bounded
+# by anything KVCR controls. UCX enumerates every network device during
+# `ucp_init`, and ranks sharing a node pay that cost concurrently, so this is
+# a liveness backstop rather than a performance target.
+_STARTUP_TIMEOUT_SECONDS = 30.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
@@ -108,6 +114,9 @@ class _KVCRProgress:
         )
         self._failure: BaseException | None = None
         self._stop_requested = False
+        # Written by the progress thread, read by start() on timeout, so the
+        # error names the stage that is actually slow.
+        self._startup_phase = "thread startup"
 
     @property
     def nixl_agent(self) -> Any:
@@ -256,8 +265,12 @@ class _KVCRProgress:
 
     def start(self) -> None:
         self._thread.start()
-        if not self._ready.wait(timeout=_JOIN_TIMEOUT_SECONDS):
-            raise RuntimeError("KVCR progress thread did not start")
+        if not self._ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+            raise RuntimeError(
+                "KVCR progress thread did not finish startup within "
+                f"{_STARTUP_TIMEOUT_SECONDS:g}s; it is still in "
+                f"{self._startup_phase!r}"
+            )
         self.raise_if_failed()
 
     def submit(self, item: object) -> None:
@@ -302,12 +315,17 @@ class _KVCRProgress:
 
     def _run(self) -> None:
         try:
+            self._startup_phase = "NIXL agent initialization"
             self._initialize_nixl()
             # Let KVCR backends initialize NIXL resources before common
             # memory registration.
+            self._startup_phase = "backend initialization"
             self._initialize(self)
+            self._startup_phase = "memory registration"
             self._register_memory_regions()
+            self._startup_phase = "agent metadata capture"
             self._capture_agent_metadata()
+            self._startup_phase = "ready"
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration():
