@@ -208,6 +208,8 @@ def _group_primary_child(socket_path: str, control_port: str) -> None:
         _DIGEST,
         ("127.0.0.1", int(control_port)),
     )
+    for index, (_, address, size) in enumerate(hold.local_dram.pools):
+        ctypes.memset(address, ord("A") + index, size)
     record = _recovered_record(g2=[("pool0", 0), ("pool1", 0)])
     journal = RecoveryJournal(hold._attachment)
     journal.publish(*next(iter(_recovery_frames({BlockKey(b"grouped"): record}))))
@@ -330,7 +332,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
     """With nothing faked, a promoted Guard serves a real UCX read then stands down."""
     # Native startup on CI can exceed the production thread timeout.
     monkeypatch.setattr(
-        kvcr_progress, "_JOIN_TIMEOUT_SECONDS", _REAL_NIXL_TIMEOUT_SECONDS
+        kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", _REAL_NIXL_TIMEOUT_SECONDS
     )
     # Not a decorator: children import this module, and NIXL logs to their stdout.
     if not _real_nixl_available():
@@ -450,6 +452,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
 ) -> None:
     """One crash moves both pools to the Guard and one claim takes both back."""
     page_size = os.sysconf("SC_PAGE_SIZE")
+    payloads = [b"A" * (page_size + page_size // 2), b"B" * page_size]
     control_port = free_port()
     guard_agent = _FileBackedNixlAgent()
     guard_agent.state = "DONE"
@@ -481,6 +484,10 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
             page_size,
         ),
     )
+    assert [
+        ctypes.string_at(descriptor.addr, descriptor.size)
+        for descriptor in guard._core._local_dram._descriptors(record.local_dram.slots)
+    ] == payloads
 
     replacement = KVCRClient(service.socket_path).claim(
         0,
@@ -497,6 +504,12 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
         assert recovered[key].local_dram == _LocalDramResidency(
             [("pool0", 0), ("pool1", 0)], _LocalDramState.READY
         )
+        assert [
+            ctypes.string_at(address, len(payload))
+            for (_, address, _), payload in zip(
+                replacement.local_dram.pools, payloads, strict=True
+            )
+        ] == payloads
     finally:
         replacement.release()
 
@@ -790,7 +803,7 @@ def _real_nixl_primary_child(
     socket_path: str, g3_path: str, control_port: str, multi_pool: str
 ) -> None:
     """Fill the pool through a real agent, then hold the claim until killed."""
-    kvcr_progress._JOIN_TIMEOUT_SECONDS = _REAL_NIXL_TIMEOUT_SECONDS
+    kvcr_progress._STARTUP_TIMEOUT_SECONDS = _REAL_NIXL_TIMEOUT_SECONDS
     page_size = os.sysconf("SC_PAGE_SIZE")
     layout = _real_nixl_layout(multi_pool == "True")
     framework = ctypes.create_string_buffer(sum(size for _, size in layout) * 2)

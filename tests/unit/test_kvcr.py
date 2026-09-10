@@ -275,6 +275,13 @@ def test_startup_timeout_retains_nonquiescent_resources(
     def create_core(*args, **kwargs):
         core = core_type(*args, **kwargs)
         cores.append(core)
+        ready_wait = core._progress._ready.wait
+
+        def wait_for_ready(timeout):
+            assert entered.wait(timeout=1)
+            return ready_wait(timeout)
+
+        monkeypatch.setattr(core._progress._ready, "wait", wait_for_ready)
         return core
 
     def create_agent(*_args, **_kwargs):
@@ -292,12 +299,15 @@ def test_startup_timeout_retains_nonquiescent_resources(
     monkeypatch.setattr(kvcr_recovery, "_KVCRCore", create_core)
     monkeypatch.setattr(kvcr_recovery, "RecoveryJournal", Mock())
     monkeypatch.setattr(kvcr_api, "_NONQUIESCENT_STARTUP_RESOURCES", retained)
+    monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(kvcr_progress, "_JOIN_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(kvcr_progress, "nixl_agent", create_agent)
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
 
     try:
-        with pytest.raises(RuntimeError, match="progress thread did not start"):
+        with pytest.raises(
+            RuntimeError, match="timed out after 0s .*NIXL agent initialization"
+        ):
             KVCR(
                 KVCRConfig(
                     nixl_agent_name="target",
@@ -316,7 +326,6 @@ def test_startup_timeout_retains_nonquiescent_resources(
                 guard_config,
             )
 
-        assert entered.wait(timeout=1)
         assert len(cores) == 1
         core = cores[0]
         assert not core.is_quiescent()
@@ -528,7 +537,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     kvcr = KVCR(
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layouts=[("", 64)],
+            pool_layouts=[("full", 64), ("swa", 32)],
             nixl_listen_port=1234,
         ),
         KVCRBindings(
@@ -541,7 +550,9 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ),
         KVCRBackendConfigs(
             framework_dram=FrameworkDramInput(128, 256),
-            local_dram=LocalDramOptions([("", 384, 128)], "LOCAL"),
+            local_dram=LocalDramOptions(
+                [("full", 384, 128), ("swa", 512, 64)], "LOCAL"
+            ),
             remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
         ),
     )
@@ -556,10 +567,9 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     assert len(set(lifecycle_threads)) == 1
     assert lifecycle_threads[0] != main_thread
     assert agent.registrations == [
-        ([(128, 256, 0, "")], "DRAM"),
-        ([(384, 128, 0, "")], "DRAM"),
+        ([(128, 256, 0, ""), (384, 128, 0, ""), (512, 64, 0, "")], "DRAM"),
     ]
-    assert agent.deregistered == [2, 1]
+    assert agent.deregistered == [1]
 
 
 @pytest.fixture

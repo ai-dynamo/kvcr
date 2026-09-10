@@ -19,8 +19,9 @@ from .types import BlockKey, MemDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
-_CLOSE_TIMEOUT_SECONDS = 5.0
+_OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
+_STARTUP_TIMEOUT_SECONDS = 30.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
@@ -108,6 +109,7 @@ class _KVCRProgress:
         )
         self._failure: BaseException | None = None
         self._stop_requested = False
+        self._startup_stage = "thread startup"
 
     @property
     def nixl_agent(self) -> Any:
@@ -256,8 +258,11 @@ class _KVCRProgress:
 
     def start(self) -> None:
         self._thread.start()
-        if not self._ready.wait(timeout=_JOIN_TIMEOUT_SECONDS):
-            raise RuntimeError("KVCR progress thread did not start")
+        if not self._ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+            raise RuntimeError(
+                "KVCR progress initialization timed out after "
+                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+            )
         self.raise_if_failed()
 
     def submit(self, item: object) -> None:
@@ -302,12 +307,17 @@ class _KVCRProgress:
 
     def _run(self) -> None:
         try:
+            self._startup_stage = "NIXL agent initialization"
             self._initialize_nixl()
             # Let KVCR backends initialize NIXL resources before common
             # memory registration.
+            self._startup_stage = "backend initialization"
             self._initialize(self)
+            self._startup_stage = "memory registration"
             self._register_memory_regions()
+            self._startup_stage = "agent metadata capture"
             self._capture_agent_metadata()
+            self._startup_stage = "ready"
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration():
@@ -315,6 +325,7 @@ class _KVCRProgress:
         except BaseException as error:
             self._failure = error
         finally:
+            self._startup_stage = "cleanup"
             try:
                 try:
                     self._close_progress_ops()
@@ -329,7 +340,7 @@ class _KVCRProgress:
             self._ready.set()
 
     def _close_progress_ops(self) -> None:
-        deadline = time.monotonic() + _CLOSE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + _OP_CLEANUP_TIMEOUT_SECONDS
         while self._in_flight_ops:
             for op_id, op in list(self._in_flight_ops.items()):
                 if op.close(self):
@@ -397,15 +408,14 @@ class _KVCRProgress:
             )
 
     def _register_memory_regions(self) -> None:
-        if self._nixl_agent is None:
+        if self._nixl_agent is None or not self._memory_regions:
             return
-        for address, size in self._memory_regions:
-            self._memory_registrations.append(
-                self._nixl_agent.register_memory(
-                    [(address, size, 0, "")],
-                    mem_type="DRAM",
-                )
+        self._memory_registrations.append(
+            self._nixl_agent.register_memory(
+                [(address, size, 0, "") for address, size in self._memory_regions],
+                mem_type="DRAM",
             )
+        )
 
     def _capture_agent_metadata(self) -> None:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)
