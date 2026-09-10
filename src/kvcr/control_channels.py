@@ -295,6 +295,8 @@ class ZmqPeerControlChannel:
         except zmq.Again:
             return messages
         except zmq.ZMQError:
+            # Warning suppression can be added if persistent ZMQ failures
+            # cause excessive receive logs.
             logger.warning("KVCR control recv failed", exc_info=True)
         return messages
 

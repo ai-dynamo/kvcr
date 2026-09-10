@@ -198,6 +198,7 @@ These statuses describe current KVCR knowledge, not a reservation or guarantee. 
 `deposit` copies from framework-owned memory into the KVCR's pool, while `deliver` places data into a framework-provided destination. `deliver` does not name a source; source selection remains with the KVCR and router. The KVCR does not allocate or free framework memory.
 
 To serve from framework-owned memory, the KVCR acquires a pin asynchronously through `request_pin` and `poll_pin_results`, reusing covered keys and requesting only the remainder; the framework keeps it valid until the KVCR calls `release_pin`.
+`release_pin` must be safely retryable: `False` or an exception leaves release pending; `True` means the framework accepts responsibility for completing release.
 
 A deployment may choose to use only framework-owned memory. In that case, it uses the pinning mechanism together with `deliver` and does not use `deposit`, `fetch`, or `release`.
 

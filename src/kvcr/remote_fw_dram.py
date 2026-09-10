@@ -704,6 +704,8 @@ class _RemoteFWDram:
             else:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
+        # Warning suppression can be added if persistent backend faults
+        # cause excessive polling logs.
         observed_work |= self._process_control_messages(progress)
         # A real notification outranks a refusal for the same operation.
         events = {**self._refused_writes, **self._poll_notifications(progress)}
@@ -1419,7 +1421,8 @@ class _RemoteFWDram:
             if pin_keys is None:
                 continue
             # Once release starts, its descriptors are no longer safe to reuse.
-            # Keep the keys until release succeeds, so overlapping pins wait.
+            # Keep the keys until release is accepted, so overlapping pins wait.
+            first_attempt = pin_handle not in self._releasing_framework_pins
             self._releasing_framework_pins.add(pin_handle)
             for key in pin_keys:
                 record = kvcr._block_record_map.get(key)
@@ -1430,20 +1433,24 @@ class _RemoteFWDram:
                 ):
                     record.fw_mem = None
                     kvcr._prune_block_record(key)
-            if self._try_release_pin(pin_handle):
+            if self._try_release_pin(pin_handle, warn=first_attempt):
                 kvcr._framework_pin_keys.pop(pin_handle, None)
                 self._releasing_framework_pins.discard(pin_handle)
 
-    def _try_release_pin(self, pin_handle: PinHandle) -> bool:
+    def _try_release_pin(self, pin_handle: PinHandle, *, warn: bool) -> bool:
+        # True means the framework accepts responsibility for completing release.
+        # False or exceptions cause retries, which must be safe after partial release.
         try:
             released = self._kvcr._release_pin_callback(pin_handle)
         except Exception:
-            logger.warning(
-                "KVCR release_pin failed for pin=%r", pin_handle, exc_info=True
-            )
+            if warn:
+                logger.warning(
+                    "KVCR release_pin failed for pin=%r", pin_handle, exc_info=True
+                )
             return False
         if released is False:
-            logger.warning("KVCR release_pin failed for pin=%r", pin_handle)
+            if warn:
+                logger.warning("KVCR release_pin failed for pin=%r", pin_handle)
             return False
         return True
 
