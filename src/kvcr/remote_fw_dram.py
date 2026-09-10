@@ -973,7 +973,7 @@ class _RemoteFWDram:
             and record.fw_mem is not None
         }
         sources = {} if force_failure else {**framework_sources, **local_sources}
-        completed_keys: tuple[BlockKey, ...] = ()
+        completed_count = 0
         for index, key in enumerate(source_pin.ordered_keys):
             source = sources.get(key)
             destination = source_pin.dst_descriptors[index]
@@ -988,7 +988,8 @@ class _RemoteFWDram:
                     key,
                 )
                 break
-            completed_keys = source_pin.ordered_keys[: index + 1]
+            completed_count += 1
+        completed_keys = source_pin.ordered_keys[:completed_count]
 
         kvcr._release_local_dram_sources(
             source_pin.op_id, local_sources.keys() - set(completed_keys)
@@ -1395,6 +1396,9 @@ class _RemoteFWDram:
         return descriptors, framework_pins
 
     def _release_framework_pins(self, framework_pins: Collection[PinHandle]) -> None:
+        # TODO: Track releasing pins separately from usable sources, retry failures
+        # during polling (including discarded pin results), and defer acquisitions
+        # for overlapping keys until release succeeds, within operation deadlines.
         kvcr = self._kvcr
         for pin_handle in framework_pins:
             if any(

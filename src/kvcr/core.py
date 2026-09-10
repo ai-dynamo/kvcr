@@ -773,7 +773,10 @@ class _KVCRCore:
         self._local_dram.discard_fill(keys)
 
     def _block_record(self, key: BlockKey) -> _BlockRecord:
-        return self._block_record_map.setdefault(key, _BlockRecord())
+        record = self._block_record_map.get(key)
+        if record is None:
+            record = self._block_record_map[key] = _BlockRecord()
+        return record
 
     def _is_local_resident(self, key: BlockKey) -> bool:
         """Report local DRAM residency a new operation can still be served from.

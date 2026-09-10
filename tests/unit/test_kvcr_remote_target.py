@@ -358,7 +358,12 @@ def test_remote_staging_commits_available_prefix() -> None:
     assert target.release((release_handle,)) == [(release_handle, True)]
 
 
-def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
+@pytest.mark.parametrize(
+    "completion_before_timeout", [False, True], ids=["late", "queued"]
+)
+def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
+    completion_before_timeout: bool,
+) -> None:
     now = 0.0
     block_size = 16
     local = ctypes.create_string_buffer(block_size)
@@ -384,20 +389,40 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal() -> None:
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
 
+    if completion_before_timeout:
+        # Progress accepts success before expiry; main consumes it after expiry.
+        agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
+        _wait_until(lambda: not target._core._progress._completed.empty())
+
     now = 0.02
     assert _poll_until(target, lambda completed: bool(completed)) == [
         (fetch, _op_entries({key: False}))
     ]
-    assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
-    assert _has_outstanding_operations(target)
-    blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
-    assert list(target.poll_completed()) == [
-        (blocked, _op_entries({replacement: False}))
-    ]
+    if not completion_before_timeout:
+        assert target.query((key,), "req") == [
+            (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+        ]
+        assert _has_outstanding_operations(target)
+        blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
+        assert list(target.poll_completed()) == [
+            (blocked, _op_entries({replacement: False}))
+        ]
 
-    agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
-    assert _poll_until(target, lambda _: not _has_outstanding_operations(target)) == []
+        agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
+        assert (
+            _poll_until(target, lambda _: not _has_outstanding_operations(target)) == []
+        )
+    assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
+
+    # The terminal completion makes the single slot reusable.
+    primary = ctypes.create_string_buffer(b"a" * block_size, block_size)
+    agent.state = "DONE"
+    deposit = target.deposit(
+        {replacement: [_mem_descriptor(ctypes.addressof(primary), block_size)]}
+    )
+    assert _poll_until(target, bool) == [(deposit, _op_entries({replacement: True}))]
+    assert local.raw == primary.raw
 
 
 def test_kvcr_deliver_propagates_source_pin_miss():

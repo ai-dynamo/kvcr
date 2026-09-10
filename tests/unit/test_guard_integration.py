@@ -15,6 +15,7 @@ from pathlib import Path
 
 import msgspec
 import pytest
+import zmq
 from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
@@ -217,8 +218,6 @@ def _group_primary_child(socket_path: str, control_port: str) -> None:
 def _stale_peer_child(control_port: str, probe_port: str) -> None:
     """A dead primary's peer: it sends into the pool's endpoint and must get
     a terminal refusal back, not silence until its operation deadline."""
-    import zmq
-
     context = zmq.Context()
     pull = context.socket(zmq.PULL)
     pull.setsockopt(zmq.RCVTIMEO, int(_TIMEOUT_SECONDS * 1000))
@@ -246,9 +245,20 @@ def _stale_peer_child(control_port: str, probe_port: str) -> None:
 
 
 @pytest.fixture
+def _zmq_context(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # Terminate this test's context after its service and clients close, so
+    # ZMQ background threads do not survive into the next native-NIXL test.
+    context = zmq.Context()
+    monkeypatch.setattr(zmq.Context, "instance", classmethod(lambda cls: context))
+    yield
+    context.term()
+
+
+@pytest.fixture
 def live_service(
     tmp_path: Path,
     request: pytest.FixtureRequest,
+    _zmq_context: None,
 ) -> Iterator[tuple[_KVCRService, Callable[..., subprocess.Popen[str]]]]:
     """A service on its own thread; children it spawns die with it."""
     pool_dir = tmp_path / "pools"
@@ -308,31 +318,10 @@ def live_service(
     assert not server_thread.is_alive()
 
 
-_RAN_BEFORE_REAL_NIXL: list[str] = []
-
-
-@pytest.fixture(autouse=True)
-def _real_nixl_runs_first(request: pytest.FixtureRequest) -> None:
-    # Enforced, not just asked for: this module's real-NIXL scenario builds
-    # real NIXL agents in this process, and real createXferReq starts failing
-    # with NIXL_ERR_INVALID_PARAM when fake-agent/ZMQ scenarios have run here
-    # first. Pre-existing sensitivity, reproduced without any of the
-    # surrounding tests' recent changes; worth its own investigation. A
-    # reordering (xdist, -p, a new test added above) fails loudly here instead
-    # of as an inscrutable NIXL error.
-    if "real_nixl" in request.node.name and _RAN_BEFORE_REAL_NIXL:
-        pytest.fail(
-            f"{request.node.name} must run first in this module; "
-            f"{_RAN_BEFORE_REAL_NIXL[0]} already ran in this process"
-        )
-    if "real_nixl" not in request.node.name:
-        _RAN_BEFORE_REAL_NIXL.append(request.node.name)
-
-
 @pytest.mark.parametrize(
     ("live_service", "multi_pool"), [(1, False), (2, True)], indirect=["live_service"]
 )
-def test_a_promoted_guard_serves_real_nixl_transfers(
+def test_promoted_guard_serves_real_nixl_transfers(
     tmp_path: Path,
     live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
     multi_pool: bool,
@@ -672,9 +661,8 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
     assert first_guard._core._block_record_map == {}
 
-    # A stale peer's request gets a terminal refusal, not silence. In its own
-    # process, as a real peer is -- and because a ZMQ probe in this process
-    # destabilizes the real-NIXL test that follows.
+    # A stale peer's request gets a terminal refusal, not silence. It runs
+    # in its own process, as a real peer does.
     peer = spawn("_stale_peer_child", control_port, free_port())
     _await_marker(peer, "refused")
     peer.wait(timeout=_TIMEOUT_SECONDS)

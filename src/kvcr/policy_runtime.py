@@ -151,6 +151,9 @@ class _Entry:
 
 
 class _EvictionQueue:
+    # TODO: Bound stale heap growth from DRAM/G3 claim/release cycles.
+    # Removal only invalidates _live; select() removes stale heap entries as
+    # it encounters them, so repeated cache use can grow _heap without eviction.
     def __init__(self) -> None:
         self._heap: list[tuple[float, int, BlockKey]] = []
         self._live: dict[BlockKey, _Entry] = {}
