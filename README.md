@@ -86,7 +86,7 @@ the future.
 - vLLM
   - [[KV Offload] Add KVCR secondary-tier adapter #53624](https://github.com/vllm-project/vllm/pull/53624)
   - [[KV Offload] Preserve KV event metadata until final residency removal #52068](https://github.com/vllm-project/vllm/pull/52068)
-  - [[KV Offload] Forward ownership in KV cache events ##52067](https://github.com/vllm-project/vllm/pull/52067)
+  - [[KV Offload] Forward ownership in KV cache events #52067](https://github.com/vllm-project/vllm/pull/52067)
 
 - SGLang
   - [[RFC] KVCR as a HiCacheStorage backend for peer-to-peer KV reuse #32903](https://github.com/sgl-project/sglang/issues/32903)
@@ -102,9 +102,14 @@ the future.
 
 ### Quick start
 
-Public E2E availability is pending an upcoming vLLM PR containing the KVCR
-integration. The [quick start](docs/quick-start.md) describes the planned
-container workflow and the public source information it will require.
+The [quick start](docs/quick-start.md) builds and runs KVCR with vLLM, Dynamo,
+and NIXL using pinned source revisions and a compatible base image.
+
+vLLM must include the KVCR secondary-tier adapter (`"type": "kvcr"`) from
+[PR #53624](https://github.com/vllm-project/vllm/pull/53624). A compatible vLLM
+`main` checkout or release containing that integration can also be used; see
+the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
+for source installation and verification.
 
 ### Development
 
@@ -117,15 +122,14 @@ KVCR is released under the Apache License 2.0. The full license text is in
 [LICENSE](LICENSE).
 
 KVCR package source files carry an SPDX Apache-2.0 identifier and the NVIDIA
-copyright notice. The vLLM integration files planned for the public quick-start
+copyright notice. The vLLM source files used in the public quick-start
 build retain their Apache-2.0 contributor headers.
 
 ## Third-party software
 
-The public E2E quick start is pending an upcoming vLLM PR containing six
-integration files. They are not stored in this repository or included in the
-`nvidia-kvcr` wheel. Until the PR exists, the Dockerfile uses explicit pending
-placeholders and stops before fetching source.
+vLLM and Dynamo are installed separately in the quick-start image and are not
+bundled into the `nvidia-kvcr` wheel. The build uses the public sources and
+pinned revisions described in the [quick start](docs/quick-start.md).
 
 KVCR declares runtime dependencies on `msgspec`, `pyzmq`, and `nixl`. Each is
 installed from its own distribution under its own license. None of them are

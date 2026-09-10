@@ -488,6 +488,13 @@ telemetry leaves the runtime behavior unchanged.
 Complete the standalone setup and validation first so framework, router, and native-runtime
 failures are not confused with KVCR core failures.
 
+Select a vLLM revision that includes the KVCR secondary-tier adapter
+(`"type": "kvcr"`, [PR #53624](https://github.com/vllm-project/vllm/pull/53624)),
+whether from the PR source, `main`, or a release containing the integration.
+Pair it with a compatible Dynamo revision that supports KV router hints and
+one KVCR control port per local data-parallel rank. The
+[quick start](quick-start.md) records a pinned combination for its container.
+
 ### Build and install Dynamo
 
 KVCR standalone tests do not require Dynamo. Install Dynamo when changing the
@@ -510,7 +517,7 @@ uv pip install -e .
 
 This builds the Rust/Python bindings and installs the Dynamo Python packages.
 Install backend extras only when needed. In particular, a Dynamo vLLM extra
-may install its own released vLLM dependency and replace a customized editable
+may install its own released vLLM dependency and replace the selected editable
 vLLM checkout.
 
 ### Build a shared Dynamo, vLLM, and KVCR integration environment
@@ -533,7 +540,7 @@ Build in this order:
 
 1. **Dynamo first.** Build its Rust bindings and install its Python package and
    required backend extras.
-2. **vLLM second.** Install the compatible customized vLLM checkout in editable
+2. **vLLM second.** Install the compatible vLLM checkout in editable
    mode. This restores the intended source tree if a Dynamo extra installed a
    released vLLM package.
 3. **KVCR last.** Install the current checkout in editable mode into the same
@@ -568,10 +575,10 @@ commit/variant or a native build. Do not silently use the newest unrelated
 wheel. Select the closest compatible artifact for the source revision, or use
 the branch's documented native build.
 
-The reference workspace scripts use the same ordering and then verify import
-provenance and the complete native-runtime matrix. Their exact CUDA, PyTorch,
-FlashInfer, and vLLM pins are examples for that workspace, not universal KVCR
-requirements.
+The [quick start](quick-start.md) provides a pinned integration build. Its
+CUDA, PyTorch, FlashInfer, and vLLM versions describe that environment rather
+than universal KVCR requirements. Verify import provenance and native-runtime
+compatibility for the environment you build.
 
 ### Verify Dynamo
 
@@ -608,6 +615,9 @@ for name in modules:
 
 for distribution in ["nvidia-kvcr", "vllm", "nixl"]:
     print(f"{distribution}=={metadata.version(distribution)}")
+
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+print("KVCR secondary tier:", SecondaryTierFactory.get_tier_class({"type": "kvcr"}))
 
 import torch
 print("torch:", torch.__version__)
@@ -705,7 +715,8 @@ peers, and every port must be unique on that host.
 
 The secondary tier can optionally own local G2 capacity through
 `secondary_g2_slots`, attach to a service-owned pool through
-`kvcr_memory_server_socket`, or configure file-backed storage through `g3`.
+`kvcr_service_socket_path` together with `compatibility_digest`, or configure
+file-backed storage through `g3`.
 Do not enable all capacity mechanisms blindly: a memory-service pool takes
 precedence over an in-process `secondary_g2_slots` allocation. Policy names and
 diagnostic options must match the KVCR and vLLM revisions being tested.
@@ -775,7 +786,7 @@ for module in [dynamo.vllm, vllm, kvcr]:
 PY
 ```
 
-If vLLM resolves to an unintended released package, reinstall the customized
+If vLLM resolves to an unintended released package, reinstall the selected
 vLLM checkout after Dynamo and its extras, then reinstall KVCR. This is why the
 integration build order is Dynamo → vLLM → KVCR.
 
