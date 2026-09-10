@@ -1107,7 +1107,9 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
 def test_remote_framework_dram_transfers_available_keys(
     eager_ctrl_connect: bool,
     missing_indices: tuple[int, ...],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_agent = FakeNixlAgent(metadata=b"source-md")
     source_pinning = FakePrimaryPinning(missing_indices=missing_indices)
@@ -1211,3 +1213,23 @@ def test_remote_framework_dram_transfers_available_keys(
         len(completed_indices),
         ("remote_deliver",),
     ) in target_stats.records
+    events = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("KVCR_EVENT")
+    ]
+    assert any(
+        "target_transfer_started" in event and "blocks=3 bytes=48" in event
+        for event in events
+    )
+    assert any(
+        "source_transfer_requested" in event and "blocks=3 bytes=48" in event
+        for event in events
+    )
+    completed = f"blocks={len(completed_indices)} bytes={16 * len(completed_indices)}"
+    assert any(
+        "source_transfer_completed" in event and completed in event for event in events
+    )
+    assert any(
+        "target_transfer_completed" in event and completed in event for event in events
+    )

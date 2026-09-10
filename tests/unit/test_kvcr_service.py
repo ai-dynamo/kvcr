@@ -1284,6 +1284,14 @@ def test_pool_size_list_preserves_order_and_floors_each_item_to_pages() -> None:
     assert parsed.pool_sizes_bytes == expected
 
 
+def test_service_log_level_accepts_cli_and_environment(monkeypatch) -> None:
+    monkeypatch.setenv("KVCR_LOG_LEVEL", "warning")
+    assert _parse_args(_service_args("1")).log_level == "WARNING"
+    assert _parse_args(_service_args("1") + ["--log-level", "debug"]).log_level == (
+        "DEBUG"
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     [
