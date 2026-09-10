@@ -120,15 +120,18 @@ class _G3:
     """Own bounded files and the metadata needed to use them as G3 cache."""
 
     def __init__(self, kvcr: "_KVCRCore", config: G3Options, slot_size: int) -> None:
+        page_size = os.sysconf("SC_PAGE_SIZE")
         paths = tuple(Path(path).expanduser().resolve() for path in config.paths)
         if not paths:
             raise ValueError("G3 requires at least one file path")
         if len(paths) != len(set(paths)):
             raise ValueError("G3 file paths must be unique")
-        if slot_size <= 0 or slot_size % os.sysconf("SC_PAGE_SIZE"):
+        if slot_size <= 0 or slot_size % page_size:
             raise ValueError("G3 slot size must be positive and page aligned")
-        capacity = config.capacity_bytes_per_file
-        if capacity <= 0 or capacity % slot_size:
+        if (
+            config.capacity_bytes_per_file <= 0
+            or config.capacity_bytes_per_file % slot_size
+        ):
             raise ValueError("G3 file capacity must contain complete slots")
         if not config.backend:
             raise ValueError("G3 NIXL backend must be non-empty")
