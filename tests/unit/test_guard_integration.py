@@ -336,8 +336,13 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
     tmp_path: Path,
     live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
     multi_pool: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With nothing faked, a promoted Guard serves a real UCX read then stands down."""
+    # Native startup on CI can exceed the production thread timeout.
+    monkeypatch.setattr(
+        kvcr_progress, "_JOIN_TIMEOUT_SECONDS", _REAL_NIXL_TIMEOUT_SECONDS
+    )
     # Not a decorator: children import this module, and NIXL logs to their stdout.
     if not _real_nixl_available():
         pytest.skip("no runnable NIXL agent on this machine")
@@ -797,6 +802,7 @@ def _real_nixl_primary_child(
     socket_path: str, g3_path: str, control_port: str, multi_pool: str
 ) -> None:
     """Fill the pool through a real agent, then hold the claim until killed."""
+    kvcr_progress._JOIN_TIMEOUT_SECONDS = _REAL_NIXL_TIMEOUT_SECONDS
     page_size = os.sysconf("SC_PAGE_SIZE")
     layout = _real_nixl_layout(multi_pool == "True")
     framework = ctypes.create_string_buffer(sum(size for _, size in layout) * 2)
