@@ -99,6 +99,7 @@ class _TargetPullOp(_RemoteOp):
     request_id: str | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
+    probe_acked: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -107,6 +108,16 @@ class _TargetPullOp(_RemoteOp):
         now = backend._kvcr._clock()
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
         if self.state is _TargetPullState.START_WRITE:
+            if self.remote_ctrl_ep in backend._source_tombstones:
+                if now >= backend._metadata_retry_after.get(self.remote_ctrl_ep, 0):
+                    backend._send_control(
+                        progress,
+                        self.remote_ctrl_ep,
+                        {"type": "target_metadata"},
+                    )
+                self.state = _TargetPullState.FINISHED
+                backend._record_progress_duration(scope, self.started_at, "failed")
+                return True, True
             if now >= self.deadline:
                 self.success = False
                 self.state = _TargetPullState.FINISHED
@@ -177,12 +188,23 @@ class _TargetPullOp(_RemoteOp):
 
         if now >= self.deadline:
             if self.state is _TargetPullState.WAITING_TERMINAL:
-                return False, False
-            # TODO: Safely retry operations that span primary-to-Guard promotion. A
-            # deadline says the write has not been reported, not that the source cannot
-            # still make it, so the destination is held rather than handed back. Until
-            # then, callers must submit a new request.
+                if not self.probe_acked:
+                    # No reply for a full probe interval: treat this source
+                    # generation as dead before releasing the destination.
+                    backend._tombstone_source(progress, self.remote_ctrl_ep)
+                    self.state = _TargetPullState.FINISHED
+                    backend._record_progress_duration(scope, self.started_at, "failed")
+                    return True, True
+                self.probe_acked = False
+                self.deadline = now + backend._kvcr.config.operation_timeout_ms / 1000
+                backend._probe_source(progress, self.remote_ctrl_ep, self.op_id[1])
+                return False, True
+            # A timed-out write may still reach the destination. Probe the source
+            # before releasing it.
             self.state = _TargetPullState.WAITING_TERMINAL
+            self.deadline = now + backend._kvcr.config.operation_timeout_ms / 1000
+            backend._invalidate_control_peer(self.remote_ctrl_ep)
+            backend._probe_source(progress, self.remote_ctrl_ep, self.op_id[1])
             if self.local_fill:
                 backend._progress_outbound.append(
                     replace(
@@ -191,7 +213,6 @@ class _TargetPullOp(_RemoteOp):
                         completed_keys=set(self.completed_keys),
                     )
                 )
-            backend._invalidate_control_peer(self.remote_ctrl_ep)
             return False, True
         return False, False
 
@@ -241,7 +262,10 @@ class _SourceWriteOp(_RemoteOp):
     ) -> tuple[bool, bool]:
         backend = self._backend
         observed_work = False
+        write_id = (self.route[0], self.op_handle)
         if self.transfer_id is None:
+            if write_id in backend._fenced_source_writes:
+                self.state = _SourceWriteState.NOTIFY_FAILURE
             if (
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
@@ -254,6 +278,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
+                backend._finish_source_write(write_id)
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
@@ -278,6 +303,7 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 return True, True
             submit_started_at = backend._kvcr._timer()
+            backend._source_write_submitted[write_id] = True
             try:
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
@@ -325,6 +351,7 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "failed"
                 )
                 self.state = _SourceWriteState.FINISHED
+                backend._finish_source_write(write_id)
                 return True, True
 
         transfer_id = self.transfer_id
@@ -357,6 +384,7 @@ class _SourceWriteOp(_RemoteOp):
         backend._record_progress_duration("source_write", self.started_at, result)
         self.success = success
         self.state = _SourceWriteState.FINISHED
+        backend._finish_source_write(write_id)
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
@@ -364,6 +392,7 @@ class _SourceWriteOp(_RemoteOp):
             if not progress.cancel_transfer(self.transfer_id):
                 return False
             self.transfer_id = None
+        self._backend._finish_source_write((self.route[0], self.op_handle))
         return True
 
 
@@ -433,6 +462,10 @@ class _RemoteFWDram:
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
         self._refused_writes: dict[_OpId, dict[str, bool]] = {}
+        self._source_agents_by_endpoint: dict[str, str] = {}
+        self._source_tombstones: dict[str, str | None] = {}
+        self._source_write_submitted: dict[tuple[str, OpHandle], bool] = {}
+        self._fenced_source_writes: set[tuple[str, OpHandle]] = set()
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
 
@@ -779,6 +812,10 @@ class _RemoteFWDram:
                 self._handle_target_metadata_ack(payload)
             elif message_type == "write_refused":
                 self._handle_write_refused(progress, payload)
+            elif message_type == "write_probe":
+                self._handle_write_probe(progress, payload)
+            elif message_type == "write_probe_ack":
+                self._handle_write_probe_ack(progress, payload)
             elif message_type == "start_write":
                 self._handle_start_write(progress, payload)
             else:
@@ -838,6 +875,32 @@ class _RemoteFWDram:
         self._metadata_acked_sources.discard(endpoint)
         self._metadata_retry_after.pop(endpoint, None)
 
+    def _probe_source(
+        self, progress: _KVCRProgress, endpoint: str, op_handle: OpHandle
+    ) -> None:
+        self._send_control(
+            progress,
+            endpoint,
+            {"type": "write_probe", "op_handle": op_handle},
+        )
+
+    def _tombstone_source(self, progress: _KVCRProgress, endpoint: str) -> None:
+        source_agent = self._source_agents_by_endpoint.get(endpoint)
+        self._source_tombstones[endpoint] = source_agent
+        self._invalidate_control_peer(endpoint)
+        if source_agent is None:
+            return
+        cached = self._remote_agents_by_target.pop(source_agent, None)
+        remote_agent = cached[1] if cached is not None else source_agent
+        try:
+            progress.nixl_agent.remove_remote_agent(remote_agent)
+        except Exception:
+            logger.warning(
+                "KVCR failed to remove tombstoned source %s",
+                source_agent,
+                exc_info=True,
+            )
+
     def _handle_target_metadata(
         self, progress: _KVCRProgress, payload: dict[str, Any]
     ) -> None:
@@ -870,8 +933,75 @@ class _RemoteFWDram:
         source_endpoint = payload.get("sender_control_endpoint")
         if not isinstance(source_endpoint, str) or not source_endpoint:
             return
+        source_agent = payload.get("target_agent")
+        if isinstance(source_agent, str) and source_agent:
+            self._source_agents_by_endpoint[source_endpoint] = source_agent
+            if source_endpoint in self._source_tombstones:
+                if self._source_tombstones[source_endpoint] == source_agent:
+                    return
+                self._source_tombstones.pop(source_endpoint)
         self._metadata_acked_sources.add(source_endpoint)
         self._metadata_retry_after.pop(source_endpoint, None)
+
+    def _handle_write_probe(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        target_agent = payload.get("target_agent")
+        op_handle = payload.get("op_handle")
+        reply_to = payload.get("sender_control_endpoint")
+        source_endpoint = payload.get("source_control_endpoint")
+        if (
+            not isinstance(target_agent, str)
+            or not target_agent
+            or type(op_handle) is not int
+            or not isinstance(reply_to, str)
+            or not reply_to
+            or not isinstance(source_endpoint, str)
+            or not source_endpoint
+        ):
+            return
+        write_id = (target_agent, OpHandle(op_handle))
+        submitted = self._source_write_submitted.get(write_id)
+        terminal = submitted is not True
+        if submitted is False:
+            self._fenced_source_writes.add(write_id)
+        self._send_control(
+            progress,
+            reply_to,
+            {
+                "type": "write_probe_ack",
+                "sender_control_endpoint": source_endpoint,
+                "op_handle": op_handle,
+                "terminal": terminal,
+            },
+        )
+
+    def _handle_write_probe_ack(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        source_endpoint = payload.get("sender_control_endpoint")
+        op_handle = payload.get("op_handle")
+        terminal = payload.get("terminal")
+        if (
+            not isinstance(source_endpoint, str)
+            or type(op_handle) is not int
+            or type(terminal) is not bool
+        ):
+            return
+        op = progress._in_flight_ops.get(("target", op_handle))
+        if (
+            not isinstance(op, _TargetPullOp)
+            or op.remote_ctrl_ep != source_endpoint
+            or op.state is not _TargetPullState.WAITING_TERMINAL
+        ):
+            return
+        source_agent = payload.get("target_agent")
+        if isinstance(source_agent, str) and source_agent:
+            self._source_agents_by_endpoint[source_endpoint] = source_agent
+        if terminal:
+            self._refused_writes[("target", op_handle)] = {"success": False}
+        else:
+            op.probe_acked = True
 
     def _ack_target_metadata(
         self,
@@ -954,6 +1084,14 @@ class _RemoteFWDram:
             )
             self._notify_start_write_failure(progress, payload, op_handle)
             return
+
+        write_id = (target_agent, OpHandle(op_handle))
+        if write_id in self._source_write_submitted:
+            return
+        if write_id in self._fenced_source_writes:
+            self._notify_start_write_failure(progress, payload, op_handle)
+            return
+        self._source_write_submitted[write_id] = False
 
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
@@ -1062,6 +1200,10 @@ class _RemoteFWDram:
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
         kvcr._progress.submit(source_write)
         self._release_framework_pins(unused_pins)
+
+    def _finish_source_write(self, write_id: tuple[str, OpHandle]) -> None:
+        self._source_write_submitted.pop(write_id, None)
+        self._fenced_source_writes.discard(write_id)
 
     def _notify_start_write_failure(
         self,

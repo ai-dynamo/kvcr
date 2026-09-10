@@ -581,7 +581,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         key = BlockKey(b"resident-b")
         stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
         target.submit_hint(_router_hint(source_endpoint), request_id="stalled")
-        target.deliver(
+        stalled_operation = target.deliver(
             {key: [_mem_descriptor(ctypes.addressof(stalled_destination), page_size)]},
             request_id="stalled",
         )
@@ -611,6 +611,9 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
 
         continue_promotion.set()
         _wait_until(lambda: guard._serving, timeout=2)
+        completed = _poll_until(target, bool, timeout=2)
+        assert completed[0][0] == stalled_operation
+        assert not completed[0][1][key].success
 
         # A real core either way, answering on the endpoint it inherited.
         assert guard._core is not None

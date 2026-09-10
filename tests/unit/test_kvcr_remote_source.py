@@ -16,6 +16,7 @@ from _kvcr_test_utils import (
     FakePrimaryPinning,
     FakeTelemetryStats,
     PendingPrimaryPinning,
+    _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
     _mem_descriptor,
@@ -30,6 +31,18 @@ from kvcr.config import KVCRConfig
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.remote_fw_dram import _FwMemResidency, _RemoteFWDram, _SourcePinOp
 from kvcr.types import BlockKey, PinHandle, PinRequestId
+
+
+def _write_probe_message(op_handle: int) -> bytes:
+    return msgspec.msgpack.encode(
+        {
+            "type": "write_probe",
+            "op_handle": op_handle,
+            "target_agent": "target",
+            "sender_control_endpoint": "tcp://target:1",
+            "source_control_endpoint": "tcp://source:1",
+        }
+    )
 
 
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
@@ -83,6 +96,38 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         "op_handle": 9,
         "success": False,
     }
+
+
+def test_write_probe_fences_write_waiting_on_framework_pin() -> None:
+    agent = FakeNixlAgent(metadata=b"source-md")
+    pinning = PendingPrimaryPinning()
+    control = FakeBytesControl("tcp://source:1")
+    source = _new_kvcr(agent, pinning, control, name="source")
+    start_write = _decode_control_message(_start_write_message(9, BlockKey(b"k0")))
+    start_write["target_agent"] = "target"
+    start_write["sender_control_endpoint"] = "tcp://target:1"
+    start_write["source_control_endpoint"] = "tcp://source:1"
+    control.incoming.append(msgspec.msgpack.encode(start_write))
+    assert (
+        _poll_until(
+            source,
+            lambda _: bool(source._core._remote_fw_dram._source_pin_ops),
+        )
+        == []
+    )
+
+    control.incoming.append(_write_probe_message(9))
+    _wait_until(
+        lambda: (
+            _decode_control_message(control.sent[-1][1]).get("type")
+            == "write_probe_ack"
+        )
+    )
+    assert _decode_control_message(control.sent[-1][1])["terminal"] is True
+
+    pinning.complete(0)
+    assert _poll_until(source, lambda _: bool(agent.sent_notifs)) == []
+    assert agent.xfers == []
 
 
 def test_kvcr_close_cleans_pending_pin_operations():
@@ -306,9 +351,12 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
         name="source",
     )
     kvcr._core._clock = lambda: now
-    control.incoming.append(_start_write_message(12, key))
+    control.incoming.append(_start_write_message(12, key, target_agent="target"))
 
     assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
+    control.incoming.append(_write_probe_message(12))
+    _wait_until(lambda: bool(control.sent))
+    assert _decode_control_message(control.sent[-1][1])["terminal"] is False
     now = 2.0
     _wait_until(lambda: source_agent.release_attempts > 0)
     assert source_agent.released_xfers == []

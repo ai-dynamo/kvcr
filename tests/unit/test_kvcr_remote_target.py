@@ -554,15 +554,14 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
 
 
-def _acked_deliver(control, kvcr, source, key):
+def _acked_deliver(control, kvcr, source, key, source_agent=None):
     """Drive a deliver whose start_write carries no metadata, and return it."""
     kvcr.submit_hint(_router_hint(source), request_id="metadata")
     _wait_until(lambda: len(control.sent) == 1)
-    control.incoming.append(
-        msgspec.msgpack.encode(
-            {"type": "target_metadata_ack", "sender_control_endpoint": source}
-        )
-    )
+    ack = {"type": "target_metadata_ack", "sender_control_endpoint": source}
+    if source_agent is not None:
+        ack["target_agent"] = source_agent
+    control.incoming.append(msgspec.msgpack.encode(ack))
     _wait_until(lambda: not control.incoming)
     control.sent = []
 
@@ -672,9 +671,13 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     ] == ["target_metadata"]
 
 
-@pytest.mark.parametrize("terminal_success", [False, True])
-def test_kvcr_deliver_timeout_waits_for_terminal_notification(
-    terminal_success: bool,
+@pytest.mark.parametrize(
+    "terminal_success",
+    [None, False, True],
+    ids=["source-dead", "failed", "completed"],
+)
+def test_kvcr_deliver_timeout_probes_source_before_finishing(
+    terminal_success: bool | None,
 ) -> None:
     now = 0.0
     agent = FakeNixlAgent(metadata=b"target-md")
@@ -691,26 +694,72 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     )
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
+    source = "tcp://source:1"
 
-    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
-    _wait_until(
-        lambda: any(
-            _decode_control_message(message)["type"] == "start_write"
-            for _, message in control.sent
-        )
-    )
-    _wait_until(
-        lambda: "tcp://source:1" in kvcr._core._remote_fw_dram._metadata_retry_after
-    )
+    op_handle, _ = _acked_deliver(control, kvcr, source, key, source_agent="source")
 
     now = 2.0
     _wait_until(
-        lambda: "tcp://source:1" not in kvcr._core._remote_fw_dram._metadata_retry_after
+        lambda: any(
+            _decode_control_message(message)["type"] == "write_probe"
+            for _, message in control.sent
+        )
     )
     assert list(kvcr.poll_completed()) == []
     assert _has_outstanding_operations(kvcr)
 
+    if terminal_success is None:
+        now = 4.0
+        assert _poll_until(kvcr, lambda completed: bool(completed)) == [
+            (op_handle, _op_entries({key: False}))
+        ]
+        backend = kvcr._core._remote_fw_dram
+        assert backend._source_tombstones[source] == "source"
+        assert agent.removed_remote_agents == ["source"]
+        metadata_ack = {
+            "type": "target_metadata_ack",
+            "sender_control_endpoint": source,
+            "target_agent": "source",
+        }
+        control.incoming.append(msgspec.msgpack.encode(metadata_ack))
+        _wait_until(lambda: not control.incoming)
+        assert source in backend._source_tombstones
+
+        control.sent.clear()
+        kvcr.submit_hint(_router_hint(source), request_id="blocked")
+        blocked = kvcr.deliver({key: [_mem_descriptor()]}, request_id="blocked")
+        assert _poll_until(kvcr, bool) == [(blocked, _op_entries({key: False}))]
+        assert [
+            _decode_control_message(message)["type"] for _, message in control.sent
+        ] == ["target_metadata"]
+
+        metadata_ack["target_agent"] = "source-generation-2"
+        control.incoming.append(msgspec.msgpack.encode(metadata_ack))
+        _wait_until(lambda: source not in backend._source_tombstones)
+        return
+
+    control.incoming.append(
+        msgspec.msgpack.encode(
+            {
+                "type": "write_probe_ack",
+                "sender_control_endpoint": source,
+                "target_agent": "source",
+                "op_handle": op_handle,
+                "terminal": False,
+            }
+        )
+    )
+    _wait_until(lambda: not control.incoming)
+    now = 4.0
+    _wait_until(
+        lambda: (
+            sum(
+                _decode_control_message(message)["type"] == "write_probe"
+                for _, message in control.sent
+            )
+            == 2
+        )
+    )
     agent.notifs["source"] = [
         _write_done_notification(op_handle, success=terminal_success)
     ]
