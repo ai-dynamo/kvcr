@@ -38,6 +38,25 @@ from kvcr.types import (
 )
 
 
+def _two_pool_kvcr(agent, pools, config=None, capacity_needed_callback=None):
+    config = config or KVCRConfig(
+        nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]
+    )
+    return _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config,
+        local_dram=LocalDramOptions(
+            [
+                (name, ctypes.addressof(pool), len(pool))
+                for (name, _), pool in zip(config.pool_layouts, pools, strict=True)
+            ]
+        ),
+        capacity_needed_callback=capacity_needed_callback,
+    )
+
+
 def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
     block_size = 16
     primary = ctypes.create_string_buffer(block_size * 3)
@@ -155,19 +174,12 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     swa = ctypes.create_string_buffer(16)
     source = ctypes.create_string_buffer(32)
     agent = FakeNixlAgent()
-    kvcr = _new_kvcr(
+    kvcr = _two_pool_kvcr(
         agent,
-        FakePrimaryPinning(),
-        FakeBytesControl(),
+        (full, swa),
         KVCRConfig(
             nixl_agent_name="target",
             pool_layouts=[("full", 16), ("swa", 8)],
-        ),
-        local_dram=LocalDramOptions(
-            [
-                ("full", ctypes.addressof(full), 16),
-                ("swa", ctypes.addressof(swa), 16),
-            ]
         ),
     )
     descriptors = [
@@ -217,18 +229,7 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     source = ctypes.create_string_buffer(16)
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _new_kvcr(
-        agent,
-        FakePrimaryPinning(),
-        FakeBytesControl(),
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]),
-        local_dram=LocalDramOptions(
-            [
-                ("full", ctypes.addressof(pools[0]), 8),
-                ("swa", ctypes.addressof(pools[1]), 8),
-            ]
-        ),
-    )
+    kvcr = _two_pool_kvcr(agent, pools)
     full, swa, grouped = (BlockKey(name) for name in (b"full", b"swa", b"grouped"))
     descriptors = [
         _mem_descriptor(ctypes.addressof(source), 8, info="full"),
@@ -253,18 +254,7 @@ def test_group_allocation_evicts_enough_whole_keys() -> None:
     source = ctypes.create_string_buffer(24)
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _new_kvcr(
-        agent,
-        FakePrimaryPinning(),
-        FakeBytesControl(),
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]),
-        local_dram=LocalDramOptions(
-            [
-                ("full", ctypes.addressof(pools[0]), 16),
-                ("swa", ctypes.addressof(pools[1]), 16),
-            ]
-        ),
-    )
+    kvcr = _two_pool_kvcr(agent, pools)
     full, swa0, swa1, grouped = (
         BlockKey(name) for name in (b"full", b"swa0", b"swa1", b"grouped")
     )
@@ -529,20 +519,13 @@ def test_capacity_pressure_is_pool_local() -> None:
     capacity_requests: list[list[tuple[str, int]]] = []
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _new_kvcr(
+    kvcr = _two_pool_kvcr(
         agent,
-        FakePrimaryPinning(),
-        FakeBytesControl(),
+        pools,
         KVCRConfig(
             nixl_agent_name="target",
             pool_layouts=[("full", 8), ("swa", 8)],
             capacity_low_watermark_percent=100,
-        ),
-        local_dram=LocalDramOptions(
-            [
-                ("full", ctypes.addressof(pools[0]), 8),
-                ("swa", ctypes.addressof(pools[1]), 16),
-            ]
         ),
         capacity_needed_callback=capacity_requests.append,
     )

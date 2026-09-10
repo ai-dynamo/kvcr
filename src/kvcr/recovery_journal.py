@@ -374,9 +374,7 @@ class _RecoveryMirror:
 
 
 def _attach_journal(
-    local_dram: _LocalDram,
-    journal: RecoveryJournal,
-    g3: _G3 | None = None,
+    local_dram: _LocalDram, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
     enabled = True
@@ -505,11 +503,7 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
     hold = claimed.hold
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
-    _attach_journal(
-        core._local_dram,
-        RecoveryJournal(hold._attachment),
-        core._g3,
-    )
+    _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
     install_recovery_records(core, claimed.recovered.take_records())
     hold.hand_listener_to(claimed.adopt_listener)
 
@@ -557,7 +551,7 @@ def _recovery_frames(
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
 _SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
-_SNAPSHOT_ALLOCATION_TERMS = struct.Struct("<QQQQ")
+_SNAPSHOT_TERMS = struct.Struct("<QQQQ")
 
 
 def canonical_pool_terms(
@@ -571,13 +565,13 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
-        + _SNAPSHOT_ALLOCATION_TERMS.pack(
+        + msgspec.msgpack.encode(pools)
+        + _SNAPSHOT_TERMS.pack(
             spec.journal_bytes,
             spec.mapping_bytes,
             spec.device,
             spec.inode,
         )
-        + msgspec.msgpack.encode(pools)
     )
 
 

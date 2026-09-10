@@ -45,6 +45,10 @@ class _LocalDramResidency:
     claim_count: int = 0
     retire_on_release: bool = False
 
+    @property
+    def layout(self) -> list[str]:
+        return [name for name, _ in self.slots]
+
 
 @dataclass
 class _PendingResidencyOp(_Op):
@@ -291,7 +295,7 @@ class _LocalDram:
             record = self._kvcr._block_record(key)
             residency = record.local_dram
             if residency is not None:
-                if not self._same_layout(residency.slots, sources):
+                if residency.layout != [descriptor.info for descriptor in sources]:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 elif residency.state is _LocalDramState.READY:
                     op.results[key] = (
@@ -390,7 +394,7 @@ class _LocalDram:
                     to_reserve.append(key)
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
-            elif [name for name, _ in residency.slots] != layout:
+            elif residency.layout != layout:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.READY:
                 self._kvcr._record_access((key,))
@@ -743,7 +747,8 @@ class _LocalDram:
                 continue
             elif (
                 residency.state is _LocalDramState.DISCARDING
-                or not self._same_layout(residency.slots, op.destinations[key])
+                or residency.layout
+                != [descriptor.info for descriptor in op.destinations[key]]
                 or now >= op.deadline
             ):
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -887,7 +892,7 @@ class _LocalDram:
                 if residency is not None:
                     self._capacity_waiters.popleft()
                     op.capacity_waiters.remove(waiter.key)
-                    if [name for name, _ in residency.slots] != waiter.layout:
+                    if residency.layout != waiter.layout:
                         op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
                     elif residency.state is _LocalDramState.READY:
                         op.results[waiter.key] = (
@@ -1124,14 +1129,6 @@ class _LocalDram:
 
     def _size_bytes(self, locations: Collection[tuple[str, int]]) -> int:
         return sum(self._pools[pool_name][2] for pool_name, _ in locations)
-
-    @staticmethod
-    def _same_layout(
-        locations: Collection[tuple[str, int]], descriptors: Collection[MemDescriptor]
-    ) -> bool:
-        return [name for name, _ in locations] == [
-            descriptor.info for descriptor in descriptors
-        ]
 
     def _update_capacity_pressure(self) -> None:
         if self._kvcr._capacity_needed_callback is None:

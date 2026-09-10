@@ -123,6 +123,8 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode({"g2": {"slot": 0, "state": "ready"}}),
         msgspec.msgpack.encode({"g3": {"slot": -1}}),
         msgspec.msgpack.encode({"g2": {"slot": "0"}}),
+        msgspec.msgpack.encode([0, None]),
+        msgspec.msgpack.encode([[[""]], None]),
         msgspec.msgpack.encode([[["other", 0]], None]),
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),
