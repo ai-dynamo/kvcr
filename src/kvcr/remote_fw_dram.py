@@ -100,6 +100,7 @@ class _TargetPullOp(_RemoteOp):
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_acked: bool = False
+    probe_sent: bool = False
     source_agent: str | None = None
 
     def progress(
@@ -194,22 +195,27 @@ class _TargetPullOp(_RemoteOp):
         if now >= self.deadline:
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 if not self.probe_acked:
-                    # No reply for a full probe interval: treat this source
-                    # generation as dead before releasing the destination.
+                    # Best-effort death detection, not a fence: posted writes
+                    # may still arrive late. Waiting for proof would retain
+                    # memory forever after a crash, so we accept that risk.
                     backend._tombstone_source(progress, self)
                     self.state = _TargetPullState.FINISHED
                     backend._record_progress_duration(scope, self.started_at, "failed")
                     return True, True
                 self.probe_acked = False
                 self.deadline = now + backend._kvcr.config.operation_timeout_ms / 1000
-                backend._probe_source(progress, self.remote_ctrl_ep, self.op_id[1])
+                self.probe_sent = backend._probe_source(
+                    progress, self.remote_ctrl_ep, self.op_id[1]
+                )
                 return False, True
             # A timed-out write may still reach the destination. Probe the source
             # before releasing it.
             self.state = _TargetPullState.WAITING_TERMINAL
             self.deadline = now + backend._kvcr.config.operation_timeout_ms / 1000
             backend._invalidate_control_peer(self.remote_ctrl_ep)
-            backend._probe_source(progress, self.remote_ctrl_ep, self.op_id[1])
+            self.probe_sent = backend._probe_source(
+                progress, self.remote_ctrl_ep, self.op_id[1]
+            )
             if self.local_fill:
                 backend._progress_outbound.append(
                     replace(
@@ -219,6 +225,12 @@ class _TargetPullOp(_RemoteOp):
                     )
                 )
             return False, True
+        if self.state is _TargetPullState.WAITING_TERMINAL and not self.probe_sent:
+            # Retry failed enqueues without extending the grace period.
+            self.probe_sent = backend._probe_source(
+                progress, self.remote_ctrl_ep, self.op_id[1]
+            )
+            return False, self.probe_sent
         return False, False
 
 
@@ -779,17 +791,20 @@ class _RemoteFWDram:
         return events, observed_work
 
     def _check_source_progress(self) -> bool:
-        if (
-            not self._source_stalled
-            and self._last_progress_at is not None
-            and time.monotonic() - self._last_progress_at
-            >= self._kvcr.config.operation_timeout_ms / 1000
-        ):
-            # A peer may have timed out while we were stalled. Keep polling
-            # submitted writes, but never start another write in this incarnation.
+        if self._source_stalled or self._last_progress_at is None:
+            return not self._source_stalled
+        gap_ms = (time.monotonic() - self._last_progress_at) * 1000
+        timeout_ms = self._kvcr.config.operation_timeout_ms
+        if gap_ms >= timeout_ms:
+            # Include slow iterations: peers see the same silence. Stay disabled
+            # so queued pre-stall requests cannot start with fresh deadlines.
+            # A longer threshold would need a matching peer grace period.
             self._source_stalled = True
             logger.error(
-                "KVCR source progress stalled; new source writes disabled until restart"
+                "KVCR source progress stalled for %.1f ms (timeout: %d ms); "
+                "new source writes disabled until restart",
+                gap_ms,
+                timeout_ms,
             )
         return not self._source_stalled
 
@@ -905,8 +920,8 @@ class _RemoteFWDram:
 
     def _probe_source(
         self, progress: _KVCRProgress, endpoint: str, op_handle: OpHandle
-    ) -> None:
-        self._send_control(
+    ) -> bool:
+        return self._send_control(
             progress,
             endpoint,
             {"type": "write_probe", "op_handle": op_handle},
@@ -999,6 +1014,10 @@ class _RemoteFWDram:
             self._source_agents_by_endpoint[source_endpoint] = source_agent
             if source_endpoint in self._source_tombstones:
                 if self._source_tombstones[source_endpoint][0] == source_agent:
+                    # Recheck unresolved writes; a restarted source reports
+                    # unknown handles as terminal.
+                    for handle in self._source_tombstones[source_endpoint][1]:
+                        self._probe_source(progress, source_endpoint, handle)
                     return
                 self._source_tombstones.pop(source_endpoint)
         self._metadata_acked_sources.add(source_endpoint)

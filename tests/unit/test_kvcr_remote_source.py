@@ -130,7 +130,7 @@ def test_write_probe_fences_write_waiting_on_framework_pin() -> None:
     assert agent.xfers == []
 
 
-def test_stalled_source_refuses_queued_and_future_writes() -> None:
+def test_stalled_source_refuses_queued_and_future_writes(kvcr_caplog) -> None:
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl()
@@ -154,6 +154,12 @@ def test_stalled_source_refuses_queued_and_future_writes() -> None:
     assert agent.xfers == []
     assert pinning.searches == [(BlockKey(b"k0"),)]
     assert pinning.unpins == ["pin"]
+    error = next(
+        record for record in kvcr_caplog.records if record.levelno == logging.ERROR
+    )
+    gap_ms, timeout_ms = error.args
+    assert gap_ms >= 2000
+    assert timeout_ms == 1000
 
 
 def test_kvcr_close_cleans_pending_pin_operations():

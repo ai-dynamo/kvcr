@@ -5,7 +5,7 @@
 import ctypes
 import logging
 import time
-from unittest.mock import Mock
+from unittest.mock import DEFAULT, Mock
 
 import msgspec
 import pytest
@@ -708,6 +708,12 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
         other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
         _wait_until(lambda: len(control.sent) == 2)
 
+    if terminal_success is not None:
+        control.send = Mock(
+            wraps=control.send, side_effect=[False, DEFAULT, False, DEFAULT]
+        )
+    elif recovery == "replacement":
+        control.send_result = False
     now = 2.0
     _wait_until(
         lambda: any(
@@ -746,10 +752,17 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
             "sender_control_endpoint": source,
             "target_agent": "source",
         }
+        control.send_result = True
+        control.sent.clear()
         control.incoming.append(msgspec.msgpack.encode(metadata_ack))
-        _wait_until(lambda: not control.incoming)
+        _wait_until(lambda: len(control.sent) == len(expected))
+        probes = [_decode_control_message(message) for _, message in control.sent]
+        assert {(probe["type"], probe["op_handle"]) for probe in probes} == {
+            ("write_probe", handle) for handle, _ in expected
+        }
         assert source in backend._source_tombstones
 
+        now = 4.2
         control.sent.clear()
         kvcr.submit_hint(_router_hint(source), request_id="blocked")
         blocked = kvcr.deliver({key: [_mem_descriptor()]}, request_id="blocked")
@@ -775,6 +788,13 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
             agent.notifs["source"] = [_write_done_notification(other_handle)]
             _wait_until(lambda: source not in backend._source_tombstones)
             assert list(kvcr.poll_completed()) == []
+            control.sent.clear()
+            kvcr.submit_hint(_router_hint(source), request_id="retry")
+            retry = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+            _wait_until(lambda: bool(control.sent))
+            assert _decode_control_message(control.sent[0][1])["type"] == "start_write"
+            agent.notifs["source"] = [_write_done_notification(retry)]
+            assert _poll_until(kvcr, bool) == [(retry, _op_entries({key: True}))]
             return
 
         metadata_ack["target_agent"] = "source-generation-2"
@@ -804,6 +824,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(
             == 2
         )
     )
+    assert control.send.call_count == 4
     agent.notifs["source"] = [
         _write_done_notification(op_handle, success=terminal_success)
     ]
