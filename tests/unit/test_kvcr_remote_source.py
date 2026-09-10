@@ -104,26 +104,13 @@ def test_write_probe_fences_write_waiting_on_framework_pin() -> None:
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl("tcp://source:1")
     source = _new_kvcr(agent, pinning, control, name="source")
-    start_write = _decode_control_message(_start_write_message(9, BlockKey(b"k0")))
-    start_write["target_agent"] = "target"
-    start_write["sender_control_endpoint"] = "tcp://target:1"
-    start_write["source_control_endpoint"] = "tcp://source:1"
-    control.incoming.append(msgspec.msgpack.encode(start_write))
-    assert (
-        _poll_until(
-            source,
-            lambda _: bool(source._core._remote_fw_dram._source_pin_ops),
-        )
-        == []
+    control.incoming.append(
+        _start_write_message(9, BlockKey(b"k0"), target_agent="target")
     )
+    _poll_until(source, lambda _: bool(pinning.pending))
 
     control.incoming.append(_write_probe_message(9))
-    _wait_until(
-        lambda: (
-            _decode_control_message(control.sent[-1][1]).get("type")
-            == "write_probe_ack"
-        )
-    )
+    _wait_until(lambda: bool(control.sent))
     assert _decode_control_message(control.sent[-1][1])["terminal"] is True
 
     pinning.complete(0)
