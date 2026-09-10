@@ -7,6 +7,7 @@ import logging
 import os
 from collections import deque
 from collections.abc import Callable, Collection, Mapping
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -516,29 +517,29 @@ class _G3:
         if self._free_slots:
             return self._free_slots.popleft()
         self._retry_unscored()
-        skipped = set(protected)
-        while (key := self._evictable.select(skipped)) is not None:
-            record = self._kvcr._block_record_map.get(key)
-            residency = record.g3 if record is not None else None
-            if record is None or residency is None or residency.claim_count:
-                raise RuntimeError(f"invalid G3 eviction candidate {key!r}")
-            if any(op_id[0] == "fetch" for op_id in record.in_flight_ops or ()):
-                skipped.add(key)
-                continue
-            decision = self._kvcr._policy.decide_eviction(
-                self._kvcr._block_meta(key, record, self._slot_size),
-                CacheTier.G3,
-            )
-            if decision[0] is PlacementAction.KEEP:
-                skipped.add(key)
-                continue
-            self._remove_evictable(key)
-            record.g3 = None
-            self._residency_observer(key, record)
-            self._kvcr._on_remove(self._kvcr._block_meta(key, record, self._slot_size))
-            self._kvcr._publish_inventory((key,), CacheTier.G3, removed=True)
-            self._kvcr._prune_block_record(key)
-            return residency.slot
+        with closing(self._evictable.candidates(protected)) as candidates:
+            for key in candidates:
+                record = self._kvcr._block_record_map.get(key)
+                residency = record.g3 if record is not None else None
+                if record is None or residency is None or residency.claim_count:
+                    raise RuntimeError(f"invalid G3 eviction candidate {key!r}")
+                if any(op_id[0] == "fetch" for op_id in record.in_flight_ops or ()):
+                    continue
+                decision = self._kvcr._policy.decide_eviction(
+                    self._kvcr._block_meta(key, record, self._slot_size),
+                    CacheTier.G3,
+                )
+                if decision[0] is PlacementAction.KEEP:
+                    continue
+                self._remove_evictable(key)
+                record.g3 = None
+                self._residency_observer(key, record)
+                self._kvcr._on_remove(
+                    self._kvcr._block_meta(key, record, self._slot_size)
+                )
+                self._kvcr._publish_inventory((key,), CacheTier.G3, removed=True)
+                self._kvcr._prune_block_record(key)
+                return residency.slot
         return None
 
     def _commit(self, reservation: _Reservation) -> None:
