@@ -333,11 +333,14 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
         assert source_agent.telemetry_handles == [1]
 
 
-def test_kvcr_pin_release_failure_is_logged_without_escaping(kvcr_caplog):
+@pytest.mark.parametrize("failure", [False, RuntimeError("release failed")])
+def test_kvcr_pin_release_failure_is_logged_and_retried(kvcr_caplog, failure):
     class FailingPinRelease(FakePrimaryPinning):
         def release_pin(self, pin_handle):
             self.unpins.append(pin_handle)
-            raise RuntimeError("release failed")
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
 
     source_agent = FakeNixlAgent(metadata=b"source-md")
     pinning = FailingPinRelease()
@@ -356,10 +359,77 @@ def test_kvcr_pin_release_failure_is_logged_without_escaping(kvcr_caplog):
 
     assert pinning.unpins == ["pin"]
     assert "pin" in kvcr._core._framework_pin_keys
+    assert not kvcr._core._block_record_map
     warnings = [record.getMessage() for record in kvcr_caplog.records]
     assert any("release_pin failed" in message for message in warnings)
-    # Shutdown reports the pin instead; drop it so the fixture can close.
-    kvcr._core._framework_pin_keys.clear()
+
+    failure = True
+    kvcr.poll_completed()
+    assert pinning.unpins == ["pin", "pin"]
+    assert not kvcr._core._framework_pin_keys
+
+
+@pytest.mark.parametrize("expires", [False, True])
+def test_framework_reacquisition_waits_for_pin_release(expires: bool) -> None:
+    now = 0.0
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    pinning = FakePrimaryPinning()
+    pinning.release_pin = Mock(return_value=False)
+    control = FakeBytesControl()
+    source = _new_kvcr(agent, pinning, control, name="source")
+    source._core._clock = lambda: now
+    backend = source._core._remote_fw_dram
+    key = BlockKey(b"k0")
+
+    control.incoming.append(_start_write_message(1, key))
+    _poll_until(source, lambda _: pinning.release_pin.called)
+    control.incoming.append(_start_write_message(2, key))
+    _poll_until(source, lambda _: backend._source_pin_ops or len(agent.xfers) > 1)
+    assert pinning.searches == [(key,)]
+    assert len(agent.xfers) == 1
+
+    if expires:
+        now = 2.0
+        _poll_until(source, lambda _: bool(agent.sent_notifs))
+        assert _decode_notif(agent.sent_notifs[-1][1]) == {
+            "type": "write_done",
+            "op_handle": 2,
+            "success": False,
+        }
+        assert pinning.searches == [(key,)]
+
+    pinning.release_pin.return_value = True
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert pinning.searches == ([(key,)] if expires else [(key,), (key,)])
+    assert len(agent.xfers) == (1 if expires else 2)
+    assert not source._core._framework_pin_keys
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["invalid-result", "late-result"])
+def test_discarded_framework_pin_release_is_retried(late: bool) -> None:
+    now = 0.0
+    agent = FakeNixlAgent()
+    pinning = PendingPrimaryPinning()
+    pinning.release_pin = Mock(return_value=False)
+    control = FakeBytesControl()
+    source = _new_kvcr(agent, pinning, control, name="source")
+    source._core._clock = lambda: now
+    key = BlockKey(b"k0")
+    control.incoming.append(_start_write_message(1, key))
+    _poll_until(source, lambda _: pinning.searches)
+    if late:
+        now = 2.0
+        _poll_until(source, lambda _: pinning.cancelled)
+    pinning.complete(0, missing_indices=() if late else (0,))
+    _poll_until(source, lambda _: pinning.release_pin.called)
+    assert "pin" in source._core._framework_pin_keys
+    assert agent.xfers == []
+
+    pinning.release_pin.return_value = True
+    source.poll_completed()
+    assert pinning.release_pin.call_count >= 2
+    assert not source._core._framework_pin_keys
 
 
 def test_framework_pin_poll_failures_are_logged_without_escaping(kvcr_caplog):
