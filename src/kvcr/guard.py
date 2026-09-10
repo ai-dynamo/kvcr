@@ -31,7 +31,6 @@ from .local_disk import _G3Residency
 from .memory import (
     KVCRPoolAttachment,
     KVCRPoolSpec,
-    _compute_pool_geometry,
     _KVCRPoolOwner,
 )
 from .recovery_journal import (
@@ -856,7 +855,7 @@ class _Guard:
                 (
                     pool.name,
                     self._recovery.attachment.address + pool.offset_bytes,
-                    _compute_pool_geometry(pool.size_bytes, pool.block_size_bytes)[0],
+                    pool.size_bytes,
                 )
                 for pool in self._recovery.pools
             ],

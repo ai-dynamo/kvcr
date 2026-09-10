@@ -358,11 +358,7 @@ def test_service_journal_is_attached_before_primary_start(
         return journal
 
     def attach_journal(local, configured_journal, disk) -> None:
-        assert (local, configured_journal, disk) == (
-            local_dram,
-            journal,
-            g3,
-        )
+        assert (local, configured_journal, disk) == (local_dram, journal, g3)
         events.append("attach")
 
     monkeypatch.setattr(

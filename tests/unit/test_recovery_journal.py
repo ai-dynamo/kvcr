@@ -284,35 +284,13 @@ def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -
     write_recovery_snapshot(pool, terms, frames)
 
 
-def test_canonical_pool_terms_bind_ordered_geometry_and_allocation_identity() -> None:
-    spec = KVCRPoolSpec(
-        pool_id="pool_0",
-        path=f"/tmp/kvcr-pool_0-{_GENERATION}",
-        generation=_GENERATION,
-        device=7,
-        inode=11,
-        mapping_bytes=5 * mmap.PAGESIZE,
-        journal_bytes=2 * mmap.PAGESIZE,
-    )
-    pools = (
-        _PoolDescriptor("pool0", mmap.PAGESIZE, 1024, 2 * mmap.PAGESIZE),
-        _PoolDescriptor("pool1", 2 * mmap.PAGESIZE, 2048, 3 * mmap.PAGESIZE),
-    )
-
-    terms = canonical_pool_terms(_TEST_DIGEST, pools, spec)
-    changed = msgspec.structs.replace(pools[0], block_size_bytes=2048)
-    assert canonical_pool_terms(_TEST_DIGEST, (changed, pools[1]), spec) != terms
-    assert canonical_pool_terms(_TEST_DIGEST, tuple(reversed(pools)), spec) != terms
-
-
 def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -> None:
     """Replayed whole under its own terms, discardable when torn, gone once released."""
     with _attached(tmp_path) as pool:
         path = Path(pool._spec.path)
         pools = (
-            _PoolDescriptor(
-                "pool0", pool._spec.data_bytes, 4096, pool._spec.journal_bytes
-            ),
+            _PoolDescriptor("pool0", 2048, 1024, pool._spec.journal_bytes),
+            _PoolDescriptor("pool1", 2048, 1024, pool._spec.journal_bytes + 2048),
         )
         terms = canonical_pool_terms(_TEST_DIGEST, pools, pool._spec)
         assert list(read_recovery_snapshot(pool, terms)) == []
@@ -335,9 +313,15 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
         assert mirror.take_records() == records
 
         # A slot number only means the same bytes under the same geometry.
-        other = canonical_pool_terms("another-digest", pools, pool._spec)
-        with pytest.raises(RecoveryJournalError, match="other terms"):
-            list(read_recovery_snapshot(pool, other))
+        changed = msgspec.structs.replace(pools[0], block_size_bytes=2048)
+        for digest, layout in (
+            ("another-digest", pools),
+            (_TEST_DIGEST, (changed, pools[1])),
+            (_TEST_DIGEST, tuple(reversed(pools))),
+        ):
+            other = canonical_pool_terms(digest, layout, pool._spec)
+            with pytest.raises(RecoveryJournalError, match="other terms"):
+                list(read_recovery_snapshot(pool, other))
 
         # Stopped once the replacing body has landed but before its header has.
         interrupted = Mock(

@@ -33,6 +33,7 @@ from kvcr.guard_protocol import (
     _Error,
     _G3Config,
     _Granted,
+    _PoolDescriptor,
     _Release,
     _Released,
     _TierConfig,
@@ -219,10 +220,7 @@ def _stand_in_pool(spec) -> Mock:
     return attachment
 
 
-def _new_registry(
-    tmp_path: Path,
-    guard_count: int = 1,
-) -> _PoolRegistry:
+def _new_registry(tmp_path: Path, guard_count: int = 1) -> _PoolRegistry:
     """A registry of real Guards over stand-in pool mappings."""
     journal = Mock()
     journal.read_next.return_value = None
@@ -281,11 +279,8 @@ def test_client_claims_one_grouped_allocation_with_independent_strides(
         spec = guard._owner.spec
         assert spec.mapping_bytes == _TEST_JOURNAL_BYTES + sum(pool_sizes)
         offsets = (_TEST_JOURNAL_BYTES, _TEST_JOURNAL_BYTES + pool_sizes[0])
-        assert tuple(
-            (pool.name, pool.size_bytes, pool.block_size_bytes, pool.offset_bytes)
-            for pool in guard._recovery.pools
-        ) == tuple(
-            (name, size, block_size, offset)
+        assert guard._recovery.pools == tuple(
+            _PoolDescriptor(name, size, block_size, offset)
             for (name, block_size), size, offset in zip(
                 pool_layouts, pool_sizes, offsets, strict=True
             )

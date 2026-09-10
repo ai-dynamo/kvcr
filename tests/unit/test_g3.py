@@ -18,6 +18,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _recovered_record,
     _router_hint,
     _write_done_notification,
 )
@@ -36,7 +37,7 @@ from kvcr.config import (
 )
 from kvcr.core import _BlockRecord
 from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
 from kvcr.recovery_journal import install_recovery_records
 from kvcr.types import (
@@ -493,13 +494,7 @@ def test_g3_recovery_rejects_multi_block_local_residency(tmp_path) -> None:
     with pytest.raises(RecoveryMirrorError, match="one local DRAM slot"):
         install_recovery_records(
             kvcr._core,
-            {
-                BlockKey(b"multi"): _BlockRecord(
-                    local_dram=_LocalDramResidency(
-                        [("", 0), ("", 1)], _LocalDramState.READY
-                    )
-                )
-            },
+            {BlockKey(b"multi"): _recovered_record(g2=[("", 0), ("", 1)])},
         )
 
 
@@ -806,21 +801,14 @@ def test_full_g3_does_not_hide_a_synchronously_freed_local_slot(tmp_path) -> Non
     kvcr = _new_g3_kvcr(tmp_path, local, policy=policy, g3_slot_count=1)
     first, second, third = (BlockKey(bytes((index,))) for index in range(3))
 
-    for index, key in enumerate((first, second)):
+    for index, key in enumerate((first, second, third)):
+        policy.keep_g3 = index == 2
         assert _deposit(
             kvcr,
             key,
             ctypes.addressof(primary) + index * page_size,
             page_size,
         ).success
-
-    policy.keep_g3 = True
-    assert _deposit(
-        kvcr,
-        third,
-        ctypes.addressof(primary) + 2 * page_size,
-        page_size,
-    ).success
 
     assert kvcr.query((first, second, third)) == [
         (QueryStatus.FETCHABLE, CacheTier.G3),

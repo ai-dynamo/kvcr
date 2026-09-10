@@ -979,8 +979,8 @@ class _RemoteFWDram:
             destination = source_pin.dst_descriptors[index]
             if source is None:
                 break
-            if [(descriptor.info, descriptor.size) for descriptor in source] != [
-                (descriptor.info, descriptor.size) for descriptor in destination
+            if [descriptor.info for descriptor in source] != [
+                descriptor.info for descriptor in destination
             ]:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",

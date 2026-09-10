@@ -22,6 +22,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _recovered_record,
     _router_hint,
     _use_nixl_agent,
     _wait_until,
@@ -39,7 +40,6 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.control_channels import ZmqPeerControlChannel
-from kvcr.core import _BlockRecord
 from kvcr.guard import _Guard
 from kvcr.kvcr_service import _KVCRService
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
@@ -204,11 +204,7 @@ def _group_primary_child(socket_path: str, control_port: str) -> None:
         _DIGEST,
         ("127.0.0.1", int(control_port)),
     )
-    record = _BlockRecord(
-        local_dram=_LocalDramResidency(
-            [("pool0", 0), ("pool1", 0)], _LocalDramState.READY
-        )
-    )
+    record = _recovered_record(g2=[("pool0", 0), ("pool1", 0)])
     journal = RecoveryJournal(hold._attachment)
     journal.publish(*next(iter(_recovery_frames({BlockKey(b"grouped"): record}))))
     print("ready", flush=True)
@@ -467,7 +463,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     assert guard._core._local_dram.memory_regions == (
         (
             guard._recovery.attachment.address + pools[0].offset_bytes,
-            page_size + page_size // 2,
+            2 * page_size,
         ),
         (
             guard._recovery.attachment.address + pools[1].offset_bytes,

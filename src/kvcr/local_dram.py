@@ -411,7 +411,7 @@ class _LocalDram:
             required_local=True,
             deadline=deadline,
             framework_hints=hints,
-            layouts={key: layout for key in to_reserve},
+            layout=layout,
         )
         op.remote_fill_keys.update(destinations)
         for key in eviction_pending:
@@ -686,13 +686,14 @@ class _LocalDram:
         required_local: bool,
         deadline: float,
         framework_hints: object | None = None,
-        layouts: Mapping[BlockKey, list[str]],
+        layout: list[str],
     ) -> tuple[dict[BlockKey, list[MemDescriptor]], set[BlockKey]]:
         keys = tuple(dict.fromkeys(keys))
         protected = set(keys)
         destinations: dict[BlockKey, list[MemDescriptor]] = {}
         eviction_pending: set[BlockKey] = set()
         evicted: list[BlockKey] = []
+        size_bytes = sum(self._pools[name][2] for name in layout)
         for key in keys:
             record = self._kvcr._block_record_map.get(key)
             if record is None:
@@ -700,11 +701,7 @@ class _LocalDram:
             if record.local_dram is not None:
                 continue
             decision = self._kvcr._policy.decide_ingest(
-                self._kvcr._block_meta(
-                    key,
-                    record,
-                    sum(self._pools[name][2] for name in layouts[key]),
-                ),
+                self._kvcr._block_meta(key, record, size_bytes),
                 sources[key],
                 required_local,
                 framework_hints=framework_hints,
@@ -712,7 +709,7 @@ class _LocalDram:
             if decision[0] is PlacementAction.DROP:
                 continue
             locations, evicted_keys, waiting = self._allocate_slots(
-                layouts[key], protected, deadline
+                layout, protected, deadline
             )
             evicted.extend(evicted_keys)
             if locations is None:
@@ -977,11 +974,7 @@ class _LocalDram:
     def _acquire_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         if residency.state is not _LocalDramState.READY:
             raise RuntimeError(f"cannot claim unready local DRAM entry {key!r}")
-        if residency.claim_count == 0:
-            if key in self._unscored:
-                self._unscored.remove(key)
-            else:
-                self._remove_evictable(key, residency)
+        self._remove_evictable(key, residency)
         residency.claim_count += 1
 
     def _release_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
@@ -1014,8 +1007,9 @@ class _LocalDram:
         self, pool_names: list[str], protected: set[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
         required = Counter(pool_names)
-        available = {name: len(self._free_slots[name]) for name in required}
-        if all(available[name] >= count for name, count in required.items()):
+        if all(
+            len(self._free_slots[name]) >= count for name, count in required.items()
+        ):
             return (
                 [(name, self._free_slots[name].popleft()) for name in pool_names],
                 [],
@@ -1026,7 +1020,19 @@ class _LocalDram:
         self._retry_unscored()
         skipped = set(protected)
         victims: list[tuple[BlockKey, "_BlockRecord", _LocalDramResidency, int]] = []
-        while (key := self._evictable.select(skipped)) is not None:
+        freed: Counter[str] = Counter()
+
+        def short() -> set[str]:
+            return {
+                name
+                for name, count in required.items()
+                if len(self._free_slots[name]) + freed[name] < count
+            }
+
+        while deficient := short():
+            key = self._evictable.select(skipped)
+            if key is None:
+                return None, [], False
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if (
@@ -1036,22 +1042,16 @@ class _LocalDram:
                 or residency.claim_count
             ):
                 raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-            if not any(
-                name in required and available[name] < required[name]
-                for name, _ in residency.slots
-            ):
+            if not any(name in deficient for name, _ in residency.slots):
                 skipped.add(key)
                 continue
             size_bytes = self._size_bytes(residency.slots)
-            free_before = {name: len(self._free_slots[name]) for name in required}
             decision, eviction_pending = self._kvcr._decide_eviction(
                 self._kvcr._block_meta(key, record, size_bytes),
                 CacheTier.LOCAL_G2,
                 deadline,
             )
-            for name in required:
-                available[name] += len(self._free_slots[name]) - free_before[name]
-            if all(available[name] >= count for name, count in required.items()):
+            if not short():
                 break
             if eviction_pending:
                 self._capacity_eviction_key = key
@@ -1061,13 +1061,7 @@ class _LocalDram:
                 continue
             victims.append((key, record, residency, size_bytes))
             skipped.add(key)
-            for name, _ in residency.slots:
-                if name in available:
-                    available[name] += 1
-            if all(available[name] >= count for name, count in required.items()):
-                break
-        else:
-            return None, [], False
+            freed.update(name for name, _ in residency.slots)
 
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
@@ -1100,8 +1094,9 @@ class _LocalDram:
         self._evictable_slots.update(name for name, _ in record.local_dram.slots)
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
-        self._evictable.remove(key)
-        self._evictable_slots.subtract(name for name, _ in residency.slots)
+        self._unscored.discard(key)
+        if self._evictable.remove(key):
+            self._evictable_slots.subtract(name for name, _ in residency.slots)
 
     def _retry_unscored(self) -> None:
         for key in tuple(self._unscored):
