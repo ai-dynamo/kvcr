@@ -295,9 +295,7 @@ class _G3:
         if key not in sources:
             return (PlacementAction.KEEP, None), False
         try:
-            if not self._start_store(
-                op_id, {key: self._single_descriptor(sources[key])}, deadline
-            ):
+            if not self._start_store(op_id, {key: sources[key][0]}, deadline):
                 self._recover_store_failure(key, "G3 destination unavailable")
                 return (PlacementAction.KEEP, None), False
         except Exception:
@@ -320,12 +318,6 @@ class _G3:
         deadline: float,
     ) -> bool:
         return self._start_read("deliver", op_handle, blocks, deadline)
-
-    @staticmethod
-    def _single_descriptor(descriptors: list[MemDescriptor]) -> MemDescriptor:
-        if len(descriptors) != 1:
-            raise ValueError("G3 requires one descriptor per block")
-        return descriptors[0]
 
     def poll_main(self, items: Collection[object]) -> list[object]:
         unhandled: list[object] = []

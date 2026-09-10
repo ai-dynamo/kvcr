@@ -289,6 +289,11 @@ class _KVCRCore:
         g3 = self._g3
         if g3 is None and any(record.g3 is not None for record in records.values()):
             raise RecoveryMirrorError("recovered G3 residency has no configured G3")
+        if g3 is not None and any(
+            record.local_dram is not None and len(record.local_dram.slots) != 1
+            for record in records.values()
+        ):
+            raise RecoveryMirrorError("G3 recovery requires one local DRAM slot")
         if self._block_record_map:
             raise RecoveryMirrorError("recovered records need a core that holds none")
 
@@ -380,7 +385,7 @@ class _KVCRCore:
             if self._is_local_resident(key):
                 local_blocks[key] = destination
             elif self._g3 is not None and self._g3.is_ready(key):
-                g3_blocks[key] = self._g3._single_descriptor(destination)
+                g3_blocks[key] = destination[0]
             else:
                 remote_blocks[key] = destination
 
@@ -689,10 +694,7 @@ class _KVCRCore:
         if source is CacheTier.G3:
             started = self._g3 is not None and self._g3.start_fill(
                 fill_handle,
-                {
-                    key: self._g3._single_descriptor(descriptors)
-                    for key, descriptors in blocks.items()
-                },
+                {key: descriptors[0] for key, descriptors in blocks.items()},
                 deadline,
             )
         elif source is CacheTier.REMOTE_G2:

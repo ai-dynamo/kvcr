@@ -36,7 +36,7 @@ from kvcr.config import (
 )
 from kvcr.core import _BlockRecord
 from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramState
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
 from kvcr.recovery_journal import install_recovery_records
 from kvcr.types import (
@@ -45,6 +45,7 @@ from kvcr.types import (
     InventoryEvent,
     PlacementAction,
     QueryStatus,
+    RecoveryMirrorError,
 )
 
 
@@ -482,6 +483,24 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
         )
 
     assert kvcr._core._block_record_map == {}
+
+
+def test_g3_recovery_rejects_multi_block_local_residency(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(2 * page_size)
+    kvcr = _new_g3_kvcr(tmp_path, local, slot_count=2)
+
+    with pytest.raises(RecoveryMirrorError, match="one local DRAM slot"):
+        install_recovery_records(
+            kvcr._core,
+            {
+                BlockKey(b"multi"): _BlockRecord(
+                    local_dram=_LocalDramResidency(
+                        [("", 0), ("", 1)], _LocalDramState.READY
+                    )
+                )
+            },
+        )
 
 
 def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
