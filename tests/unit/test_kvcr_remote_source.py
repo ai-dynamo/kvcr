@@ -556,7 +556,9 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
         assert (
             _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
         )
-        assert [xfer[2] for xfer in agent.xfers] == [[0]]
+        assert [xfer[2] for xfer in agent.xfers] == [[0]] * (
+            2 if second_has_uncovered_key else 1
+        )
         expected_unpins = (
             {"pin-ab", "pin-c"} if second_has_uncovered_key else {"pin-ab"}
         )
