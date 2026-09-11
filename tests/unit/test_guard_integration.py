@@ -373,6 +373,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
             nixl_listen_port=0,
             inventory_report_interval_ms=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
+            abandon_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 2000,
         ),
         KVCRBindings(
             target_pinning.request_pin,
@@ -573,6 +574,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
                 nixl_agent_name="target",
                 pool_layouts=[("", page_size)],
                 operation_timeout_ms=5000,
+                abandon_timeout_ms=10_000,
             ),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
             framework_dram=FrameworkDramInput(

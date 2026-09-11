@@ -696,7 +696,10 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         FakePrimaryPinning(),
         control,
         KVCRConfig(
-            nixl_agent_name="target", pool_layouts=[("", 16)], operation_timeout_ms=1000
+            nixl_agent_name="target",
+            pool_layouts=[("", 16)],
+            operation_timeout_ms=1000,
+            abandon_timeout_ms=7000,
         ),
     )
     kvcr._core._clock = lambda: now
@@ -734,9 +737,12 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         )
         _wait_until(lambda: not control.incoming and not agent.notifs)
         assert list(kvcr.poll_completed()) == []
-    now = 2.0
+    now = 6.0
+    time.sleep(0.01)
+    assert list(kvcr.poll_completed()) == []
+    now = 7.0
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
-    assert control.send.call_count == 3  # Retry at T, then cleanup probe at 2T.
+    assert control.send.call_count == 3  # Retry at T, then cleanup at abandonment.
 
     # An abandoned operation must not blacklist the endpoint for fresh work.
     kvcr.submit_hint(_router_hint(source), request_id="retry")
@@ -768,12 +774,12 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     reply["dead_incarnation"] = "source"
     control.incoming.append(msgspec.msgpack.encode(reply))
     _wait_until(lambda: dangling_ops.tombstones[handle].expires_at is not None)
-    assert dangling_ops.tombstones[handle].expires_at == 3.0
-    now = 2.5
+    assert dangling_ops.tombstones[handle].expires_at == 8.0
+    now = 7.5
     control.incoming.append(msgspec.msgpack.encode(reply))
     _wait_until(lambda: not control.incoming)
-    assert dangling_ops.tombstones[handle].expires_at == 3.0  # Not a renewable lease.
-    now = 3.0
+    assert dangling_ops.tombstones[handle].expires_at == 8.0  # Not a renewable lease.
+    now = 8.0
     _wait_until(lambda: handle not in dangling_ops.tombstones)
 
 
@@ -854,7 +860,7 @@ def test_remote_write_reports_success_only_before_destination_release(
         control.recv = guard_reply
         assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
         return
-    now = 2.0
+    now = 5.0
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")

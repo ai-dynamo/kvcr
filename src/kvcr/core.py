@@ -123,6 +123,8 @@ class _KVCRCore:
         self._block_sizes = dict(self.pool_layouts)
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
+        if self.config.abandon_timeout_ms <= self.config.operation_timeout_ms:
+            raise ValueError("abandon_timeout_ms must exceed operation_timeout_ms")
         if self.config.inventory_report_interval_ms < 0:
             raise ValueError("inventory_report_interval_ms must be non-negative")
         if not 0 <= self.config.capacity_low_watermark_percent <= 100:

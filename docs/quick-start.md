@@ -145,7 +145,7 @@ export KV_TRANSFER_CONFIG='{
         "control_host": "0.0.0.0",
         "control_ports": [17771, 17772],
         "control_advertise_host": "127.0.0.1",
-        "operation_timeout_ms": 5000,
+        "operation_timeout_ms": 1000,
         "enable_telemetry": true
       }
     ]

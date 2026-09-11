@@ -131,11 +131,13 @@ Each operation is bounded by a deadline. When an operation times out or is cance
 An internal per-instance identifier distinguishes processes even when NIXL agent
 names are reused; it is not proof of process death.
 Remote `fetch` and `deliver` use NIXL writes from the source to the destination.
-At timeout `T`, the destination probes the source, which blocks unsubmitted work
-and attempts cancellation. At its fixed `2T` deadline, the source releases content
-pins without waiting for the destination, but continues native-transfer cleanup.
-At `2T`, the destination abandons any unresolved write, releases its memory,
-and sends a final cleanup probe. Nonterminal replies do not extend this deadline.
+At `operation_timeout_ms` (`T`), the destination probes the source, which blocks
+unsubmitted work and attempts cancellation. The separate `abandon_timeout_ms`
+deadline is measured from operation start and must exceed `T` (defaults: 1s and 5s).
+At abandonment, the source releases content pins without waiting for the destination,
+but continues native-transfer cleanup. The destination abandons any unresolved write,
+releases its memory, and sends a final cleanup probe. Nonterminal replies do not
+extend this deadline.
 
 A per-operation tombstone retains destination descriptors, not memory pins, so
 new work can continue even if both the source and its Guard die. A terminal reply
@@ -151,6 +153,8 @@ during `poll_completed()`, defaulting to an error log. Source reports identify
 keys and local buffers; destination reports identify regions, not their current
 keys. A custom handler may raise to the caller without stopping progress. Writes
 without a notification, or after tombstone expiry, cannot be diagnosed this way.
+Rare late writes may corrupt reused memory; stronger NIXL cancellation support
+would reduce this risk.
 
 ---
 

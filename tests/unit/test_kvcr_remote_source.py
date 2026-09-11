@@ -70,6 +70,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
             nixl_agent_name="source",
             pool_layouts=[("", 16)],
             operation_timeout_ms=10_000,
+            abandon_timeout_ms=20_000,
         ),
         name="source",
     )
@@ -336,7 +337,7 @@ def test_kvcr_source_ignores_malformed_control_messages():
     [None, "ERR", "DONE", "shutdown", "unresolved"],
     ids=["cancelled", "failed", "completed", "shutdown", "unresolved"],
 )
-def test_kvcr_source_timeout_releases_pins_on_completion_or_at_2t(
+def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
     terminal_state: str | None,
     caplog,
 ) -> None:
@@ -375,7 +376,8 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_at_2t(
     control.incoming.append(_start_write_message(12, key, target_agent="target"))
 
     assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
-    now = 1.0
+    # Late polling must not restart the abandonment deadline.
+    now = 1.5 if terminal_state == "unresolved" else 1.0
     if terminal_state != "unresolved":
         control.incoming.append(_write_probe_message(12))
         _wait_until(lambda: bool(control.sent))
@@ -395,7 +397,12 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_at_2t(
     assert _has_outstanding_operations(kvcr)
 
     if terminal_state == "unresolved":
-        now = 2.0
+        attempts = source_agent.release_attempts
+        now = 4.0
+        _wait_until(lambda: source_agent.release_attempts > attempts)
+        assert list(kvcr.poll_completed()) == []
+        assert pinning.unpins == []
+        now = 5.0
         assert _poll_until(kvcr, lambda _: pinning.unpins) == []
         assert source_agent.released_xfers == []
         error = next(
@@ -415,7 +422,7 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_at_2t(
         assert _poll_until(kvcr, lambda _: len(source_agent.xfers) == 2) == []
         assert pinning.searches == [(key,), (key,)]
         assert pinning.unpins == ["pin"]
-        now = 3.0
+        now = 6.0
         source_agent.state = "DONE"
 
     if terminal_state not in (None, "shutdown", "unresolved"):

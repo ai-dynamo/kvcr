@@ -190,7 +190,10 @@ class _TargetPullOp(_RemoteOp):
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
             self.state = _TargetPullState.WAITING_TERMINAL
-            self.deadline += backend._kvcr.config.operation_timeout_ms / 1000
+            config = backend._kvcr.config
+            self.deadline += (
+                config.abandon_timeout_ms - config.operation_timeout_ms
+            ) / 1000
             backend._invalidate_control_peer(self.remote_ctrl_ep)
             self.probe_sent = backend._dangling_ops.probe(progress, self)
             if self.local_fill:
@@ -613,7 +616,7 @@ class _RemoteFWDram:
                     _SourceWriteState.FINISHED,
                     _SourceWriteState.CANCEL_PENDING,
                 ):
-                    # An abandoned write already returned its pins at 2T.
+                    # An abandoned write already returned its pins.
                     if item.op_id not in self._fw_pins_by_op:
                         continue
                     self._fw_pins_by_op.pop(item.op_id, None)

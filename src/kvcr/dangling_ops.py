@@ -76,8 +76,10 @@ class _DanglingOps:
         status = self.source_writes[(op.route[0], op.op_handle)]
         first_attempt = cancelling and status.cancel_deadline is None
         if first_attempt:
+            config = self._backend._kvcr.config
             status.cancel_deadline = (
-                op.deadline + self._backend._kvcr.config.operation_timeout_ms / 1000
+                op.deadline
+                + (config.abandon_timeout_ms - config.operation_timeout_ms) / 1000
             )
         result = progress.poll_transfer(
             cast(int, op.transfer_id), cancellation_requested=cancelling
@@ -91,7 +93,7 @@ class _DanglingOps:
                 float, status.cancel_deadline
             ):
                 status.abandoned = True
-                # At 2T release content pins, not the registration or native work.
+                # Release content pins, not the registration or native work.
                 # The CANCEL_PENDING snapshot is a release request, not terminal proof.
                 error = TransferError(
                     "KVCR source cancellation timed out",

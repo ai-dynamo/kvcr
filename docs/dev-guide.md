@@ -694,7 +694,7 @@ The important fields are:
 | `eager_ctrl_connect` | Establishes peer control earlier; disabling it moves setup onto the request path |
 | `local_dram_backend` | NIXL backend used for local DRAM transfers |
 | `remote_fw_dram_backend` | NIXL backend used for peer DRAM transfers |
-| `operation_timeout_ms` | Deadline for KVCR operations; timeout begins safe cancellation and cleanup |
+| `operation_timeout_ms` | Deadline for KVCR operations; timeout begins cancellation and cleanup |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 
 For several local DP ranks, provide one `control_ports` entry per local rank in
