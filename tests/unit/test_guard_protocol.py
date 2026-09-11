@@ -267,6 +267,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
     )
 
+    assert hold._incarnation
     assert msgspec.to_builtins(connection.sent[0]) == {
         "type": "claim",
         "guard_index": _GUARD_INDEX,
@@ -279,6 +280,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "control_host": "127.0.0.1",
         "control_port": 5555,
         "version": 1,
+        "incarnation": hold._incarnation,
     }
     grant_wire = msgspec.to_builtins(_grant())
     assert grant_wire["type"] == "granted"
@@ -383,11 +385,10 @@ def test_a_failed_claim_is_released_without_masking_the_original(
         assert raised.value is original
     # A mismatched or undecodable grant is refused before the pool is mapped.
     assert attach.call_count == (1 if mapping_error else 0)
-    assert connection.sent == [
-        _Claim(_GUARD_INDEX, _DIGEST, _TIER_CONFIG, "127.0.0.1", 5555, 1),
-        # Unactivated: this claim never served, so the Guard may resume.
-        _Release(1, activated=False),
-    ]
+    claim, release = connection.sent
+    assert isinstance(claim, _Claim)
+    # Unactivated: this claim never served, so the Guard may resume.
+    assert release == _Release(1, activated=False)
     assert connection.closed is True
 
 

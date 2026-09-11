@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import msgspec
 import pytest
 from _kvcr_test_utils import (
+    _OPEN_KVCRS,
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
@@ -126,7 +127,7 @@ def test_stalled_source_refuses_queued_and_future_writes(kvcr_caplog) -> None:
 
     stalled_for = 0.0
     with patch(
-        "kvcr.remote_fw_dram.time",
+        "kvcr.dangling_ops.time",
         SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
     ):
         for handle in (1, 2):
@@ -333,8 +334,8 @@ def test_kvcr_source_ignores_malformed_control_messages():
 
 @pytest.mark.parametrize(
     "terminal_state",
-    [None, "ERR", "DONE", "shutdown"],
-    ids=["cancelled", "failed", "completed", "shutdown"],
+    [None, "ERR", "DONE", "shutdown", "unresolved"],
+    ids=["cancelled", "failed", "completed", "shutdown", "unresolved"],
 )
 def test_kvcr_source_timeout_holds_pins_until_safe_release(
     terminal_state: str | None,
@@ -374,18 +375,37 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
     control.incoming.append(_start_write_message(12, key, target_agent="target"))
 
     assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
+    now = 1.0
     control.incoming.append(_write_probe_message(12))
     _wait_until(lambda: bool(control.sent))
     assert _decode_control_message(control.sent[-1][1])["terminal"] is False
     if terminal_state == "shutdown":
         kvcr._core._progress._submissions.put(_STOP)
-    else:
-        now = 2.0
     _wait_until(lambda: source_agent.release_attempts > 0)
     assert source_agent.released_xfers == []
-    assert source_agent.sent_notifs == []
+    _wait_until(lambda: bool(source_agent.sent_notifs))
+    assert _decode_notif(source_agent.sent_notifs[0][1]) == {
+        "type": "write_done",
+        "op_handle": 12,
+        "success": False,
+        "terminal": False,
+    }
     assert pinning.unpins == []
     assert _has_outstanding_operations(kvcr)
+
+    if terminal_state == "unresolved":
+        now = 2.0
+        try:
+            with pytest.raises(RuntimeError, match="source cancellation timed out"):
+                _poll_until(kvcr, bool)
+            assert source_agent.released_xfers == []
+            assert pinning.unpins == []
+        finally:
+            source_agent.allow_release = True
+            _OPEN_KVCRS.remove(kvcr)
+            with pytest.raises(RuntimeError, match="source cancellation timed out"):
+                kvcr.close()
+        return
 
     if terminal_state not in (None, "shutdown"):
         source_agent.state = terminal_state
@@ -398,13 +418,13 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
     assert pinning.unpins == ["pin"]
     assert source_agent.released_xfers == [1]
     if terminal_state != "DONE":
-        assert _decode_notif(source_agent.sent_notifs[0][1]) == {
+        assert _decode_notif(source_agent.sent_notifs[-1][1]) == {
             "type": "write_done",
             "op_handle": 12,
             "success": False,
         }
     else:
-        assert source_agent.sent_notifs == []
+        assert len(source_agent.sent_notifs) == 1  # Only the cancellation advisory.
         assert source_agent.telemetry_handles == [1]
 
 

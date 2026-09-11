@@ -514,11 +514,15 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
         replacement.release()
 
 
-@pytest.mark.parametrize("recovery", ["kept", "given-up"])
+@pytest.mark.parametrize(
+    ("recovery", "late_promotion"),
+    [("kept", False), ("kept", True), ("given-up", True)],
+)
 def test_request_timeout_during_promotion_then_retry_uses_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     recovery: str,
+    late_promotion: bool,
     live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
 ) -> None:
     """A retry after promotion is served warm or refused cold, never left hanging."""
@@ -609,23 +613,25 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         assert list(target.poll_completed()) == []
         assert _has_outstanding_operations(target)
 
+        if late_promotion:
+            now[0] = 10.0
+            completed = _poll_until(target, bool, timeout=2)
+            assert completed[0][0] == stalled_operation
+            assert not completed[0][1][key].success
         continue_promotion.set()
         _wait_until(lambda: guard._serving, timeout=2)
         assert guard._core is not None
         _wait_until(
             lambda: (
-                target._core._remote_fw_dram._source_agents_by_endpoint.get(
-                    source_endpoint
-                )
-                == guard._core.nixl_agent_name
+                target._core._remote_fw_dram._dangling_ops.sources.get(source_endpoint)
+                == guard._core._remote_fw_dram._dangling_ops.incarnation
             ),
             timeout=2,
         )
-        assert list(target.poll_completed()) == []
-        now[0] = 12.0
-        completed = _poll_until(target, bool, timeout=2)
-        assert completed[0][0] == stalled_operation
-        assert not completed[0][1][key].success
+        if not late_promotion:
+            completed = _poll_until(target, bool, timeout=2)
+            assert completed[0][0] == stalled_operation
+            assert not completed[0][1][key].success
 
         # A real core either way, answering on the endpoint it inherited.
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)

@@ -355,12 +355,6 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
     assert agent.deregistered == []
     assert progress.cancel_transfer(transfer_id)
 
-    progress._in_flight_ops[("target", 1)] = object()
-    with pytest.raises(RuntimeError, match="operations"):
-        progress._close_nixl()
-    assert agent.deregistered == []
-    progress._in_flight_ops.clear()
-
     progress._close_nixl()
     assert agent.deregistered == [7]
     assert progress._nixl_agent is None

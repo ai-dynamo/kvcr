@@ -405,6 +405,7 @@ class _ThreadingUnixServer(
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
             )
+        liveness.incarnation = request.incarnation
         spec, pools, listener_fd, lease = self.registry.claim(
             request.guard_index,
             request.tier_config,

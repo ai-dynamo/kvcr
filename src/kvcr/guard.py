@@ -379,6 +379,7 @@ class _Guard:
         self._owner = owner
         self._refusing = refusing
         self._pool_lease = _PoolLease(guard_index)
+        self._dead_incarnations: set[str] = set()
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
@@ -622,6 +623,8 @@ class _Guard:
                 # The process may still be alive: promoting could seat a
                 # second server over a live mapping.
                 raise OSError(f"pidfd poll returned without POLLIN: {flags:#x}")
+            if lease.incarnation is not None:
+                self._dead_incarnations.add(lease.incarnation)
             self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)
@@ -883,6 +886,9 @@ class _Guard:
             ),
         )
         self._core = core
+        core._remote_fw_dram._dangling_ops.dead_incarnations = (
+            self._dead_incarnations.copy()
+        )
         core.adopt_recovery_records(records)
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.

@@ -76,6 +76,7 @@ class _FakeLiveness:
     def __init__(self) -> None:
         self._read, self._write = os.pipe()
         self.closed = False
+        self.incarnation = None
 
     def fileno(self) -> int:
         if self.closed:

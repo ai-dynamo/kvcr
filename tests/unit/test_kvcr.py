@@ -50,7 +50,7 @@ from kvcr.types import BlockKey
 def _fake_hold(**fields: Any) -> SimpleNamespace:
     """A hold double that hands its listener over exactly like the real one."""
     fields.setdefault("_pools", ())
-    hold = SimpleNamespace(**fields)
+    hold = SimpleNamespace(_incarnation=None, **fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
 

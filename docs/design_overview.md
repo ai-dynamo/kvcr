@@ -104,7 +104,7 @@ A KVCR-owned DRAM pool may be allocated by the framework and passed to KVCR, or 
 
 `compatibility_manifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible.
 
-If the engine or GPU fails, KVCR-Guard fences the failed owner before activating its backup KVCR. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
+If the engine or GPU fails, KVCR-Guard verifies that the owning process has died before activating its backup KVCR; a timeout alone is not sufficient. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
 
 ### State Model
 
@@ -124,7 +124,29 @@ The event loop owns KVCR metadata mutations and never performs blocking external
 
 The active in-process KVCR owns the NIXL agent used for KVCR-owned memory and framework memory exposed through the KVCR bindings. A future integration may instead coordinate with a framework-owned agent. When resilience is enabled, the backup KVCR has its own agent but uses it only after a fenced takeover.
 
-Each operation is bounded by a deadline. When an operation times out or is cancelled, KVCR reports caller-visible completion and begins safe release immediately. Framework pins are released as soon as their dependent work finishes, minimizing interference with framework scheduling. If NIXL may still access an underlying descriptor, physical release waits until the transfer has quiesced. Expired pins are not reused; any still-needed keys are acquired again. If physical cleanup extends beyond the deadline, it does so only for safe release, not further KVCR scheduling.
+Each operation is bounded by a deadline. When an operation times out or is cancelled, KVCR begins failure handling and cleanup. Framework pins are released as soon as their dependent work finishes, minimizing interference with framework scheduling. For transfers owned by the local NIXL agent, physical release waits until the transfer has quiesced. Expired pins are not reused; any still-needed keys are acquired again. If physical cleanup extends beyond the deadline, it does so only for safe release, not further KVCR scheduling.
+
+### Failed Peers and Dangling Operations
+
+An internal per-instance identifier distinguishes processes even when NIXL agent
+names are reused; it is not proof of process death.
+Remote `fetch` and `deliver` use NIXL writes from the source to the destination.
+At timeout `T`, the destination probes the source, which blocks unsubmitted work
+and attempts cancellation; unresolved cancellation raises an error after another
+`T`. At `2T`, the destination abandons any unresolved write, releases its memory,
+and sends a final cleanup probe. Nonterminal replies do not extend this deadline.
+
+A per-operation tombstone retains destination descriptors, not memory pins, so
+new work can continue even if both the source and its Guard die. A terminal reply
+from the original source clears it; Guard confirmation of that source
+incarnation's death starts one additional `T` of retention. Without either, it
+remains for the destination's lifetime. Guard takeover fails old operations
+rather than replaying them; a reused agent name alone is not death proof.
+
+This is bounded, best-effort handling, not a transport fence: neither silence nor
+metadata removal stops an already-posted write. An observed late successful
+completion raises an exception identifying the affected destination. Writes
+without a notification, or after tombstone expiry, cannot be diagnosed this way.
 
 ---
 
@@ -253,7 +275,7 @@ The router is never on the data path: KVCR instances execute transfers peer-to-p
 
 Peer transfers use a separate control channel for connection metadata, acknowledgements, and transfer control; payload bytes move directly through NIXL and never traverse the router or control channel. Peer-protocol versioning and compatibility checks may be added as needed.
 
-The engine and router already maintain engine liveness, so loss of an in-process KVCR is covered by the engine's existing heartbeat path and does not require another KVCR heartbeat. KVCR-Guard sends its own heartbeat to the main process. If a future recovery design requires KVCR-Guard to advertise liveness or takeover directly to the router, that channel can be added then.
+The engine and router already maintain engine liveness, so loss of an in-process KVCR is covered by the engine's existing heartbeat path and does not require another periodic KVCR heartbeat. If a future recovery design requires KVCR-Guard to advertise liveness or takeover directly to the router, that channel can be added then.
 
 ---
 

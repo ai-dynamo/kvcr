@@ -292,7 +292,6 @@ class FakeNixlAgent:
         self.registrations: list[tuple[Any, str]] = []
         self.deregistered: list[Any] = []
         self.remote_agents: list[bytes] = []
-        self.removed_remote_agents: list[str | bytes] = []
         self.xfers: list[tuple[Any, ...]] = []
         self.xfer_backends: list[list[str] | None] = []
         self.transfers: list[int] = []
@@ -315,9 +314,6 @@ class FakeNixlAgent:
     def add_remote_agent(self, metadata: bytes) -> bytes:
         self.remote_agents.append(metadata)
         return f"remote-{len(self.remote_agents)}".encode()
-
-    def remove_remote_agent(self, agent: str | bytes) -> None:
-        self.removed_remote_agents.append(agent)
 
     def get_xfer_descs(self, descs, mem_type="DRAM"):
         return list(descs)
