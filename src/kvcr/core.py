@@ -5,6 +5,7 @@
 import functools
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from math import ceil
@@ -38,6 +39,7 @@ from .types import (
     RecoveryMirrorError,
     ReleaseHandle,
     ReleaseResult,
+    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -171,6 +173,7 @@ class _KVCRCore:
         ] = {}
 
         self._completion_queue: list[OpResult] = []
+        self._transfer_errors: deque[TransferError] = deque()
         self._joined_completions: dict[
             OpHandle, tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
         ] = {}
@@ -201,8 +204,12 @@ class _KVCRCore:
         )
 
         # Import lazily to keep the concrete backend private to KVCR setup.
+        from .dangling_ops import _log_transfer_error
         from .remote_fw_dram import _RemoteFWDram
 
+        self._on_error_callback = (
+            _log_transfer_error if bindings.on_error is None else bindings.on_error
+        )
         self._local_dram = (
             _LocalDram(self, local_dram_config)
             if local_dram_config is not None
@@ -500,6 +507,11 @@ class _KVCRCore:
             progress_items = self._local_dram.poll_main(progress_items)
         self._remote_fw_dram.poll_main(progress_items)
         self._flush_inventory()
+        # Apply the whole batch before invoking user code; a raising handler must
+        # not lose completions or stop the progress thread.
+        while self._transfer_errors:
+            error = self._transfer_errors.popleft()
+            self._on_error_callback(error)
         completed = self._completion_queue
         self._completion_queue = []
         return completed

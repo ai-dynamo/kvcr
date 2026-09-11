@@ -124,7 +124,7 @@ The event loop owns KVCR metadata mutations and never performs blocking external
 
 The active in-process KVCR owns the NIXL agent used for KVCR-owned memory and framework memory exposed through the KVCR bindings. A future integration may instead coordinate with a framework-owned agent. When resilience is enabled, the backup KVCR has its own agent but uses it only after a fenced takeover.
 
-Each operation is bounded by a deadline. When an operation times out or is cancelled, KVCR begins failure handling and cleanup. Framework pins are released as soon as their dependent work finishes, minimizing interference with framework scheduling. For transfers owned by the local NIXL agent, physical release waits until the transfer has quiesced. Expired pins are not reused; any still-needed keys are acquired again. If physical cleanup extends beyond the deadline, it does so only for safe release, not further KVCR scheduling.
+Each operation is bounded by a deadline. When an operation times out or is cancelled, KVCR begins failure handling and cleanup. Framework pins are released as soon as their dependent work finishes or is abandoned under the policy below, minimizing interference with framework scheduling. Backing allocations and NIXL registrations remain valid until native transfers quiesce. Expired pins are not reused; any still-needed keys are acquired again. If physical cleanup extends beyond the deadline, it does so only for safe release, not further KVCR scheduling.
 
 ### Failed Peers and Dangling Operations
 
@@ -132,8 +132,9 @@ An internal per-instance identifier distinguishes processes even when NIXL agent
 names are reused; it is not proof of process death.
 Remote `fetch` and `deliver` use NIXL writes from the source to the destination.
 At timeout `T`, the destination probes the source, which blocks unsubmitted work
-and attempts cancellation; unresolved cancellation raises an error after another
-`T`. At `2T`, the destination abandons any unresolved write, releases its memory,
+and attempts cancellation. At its fixed `2T` deadline, the source releases content
+pins without waiting for the destination, but continues native-transfer cleanup.
+At `2T`, the destination abandons any unresolved write, releases its memory,
 and sends a final cleanup probe. Nonterminal replies do not extend this deadline.
 
 A per-operation tombstone retains destination descriptors, not memory pins, so
@@ -144,8 +145,11 @@ remains for the destination's lifetime. Guard takeover fails old operations
 rather than replaying them; a reused agent name alone is not death proof.
 
 This is bounded, best-effort handling, not a transport fence: neither silence nor
-metadata removal stops an already-posted write. An observed late successful
-completion raises an exception identifying the affected destination. Writes
+metadata removal stops an already-posted write. Unresolved source cancellation
+and observed late writes report a `TransferError` through `KVCRBindings.on_error`
+during `poll_completed()`, defaulting to an error log. Source reports identify
+keys and local buffers; destination reports identify regions, not their current
+keys. A custom handler may raise to the caller without stopping progress. Writes
 without a notification, or after tombstone expiry, cannot be diagnosed this way.
 
 ---

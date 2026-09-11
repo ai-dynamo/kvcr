@@ -477,6 +477,7 @@ def _new_kvcr(
     inventory_sink=None,
     capacity_needed_callback=None,
     policy=None,
+    on_error=None,
 ) -> KVCR:
     config = replace(
         config
@@ -501,6 +502,7 @@ def _new_kvcr(
                 inventory_sink=inventory_sink,
                 capacity_needed_callback=capacity_needed_callback,
                 policy=policy,
+                on_error=on_error,
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),
             KVCRBackendConfigs(

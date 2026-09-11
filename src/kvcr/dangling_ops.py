@@ -5,28 +5,19 @@
 import heapq
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from .core import logger
-from .types import OpHandle
+from .types import OpHandle, TransferError
 
 if TYPE_CHECKING:
     from .progress import _KVCRProgress
     from .remote_fw_dram import _RemoteFWDram, _SourceWriteOp, _TargetPullOp
 
 
-class _DanglingOpError(RuntimeError):
-    def __init__(self, message: str, op: "_SourceWriteOp | _TargetPullOp") -> None:
-        self.op_handle = (
-            op.op_id[1]
-            if op.op_id[0] == "target"
-            else cast("_SourceWriteOp", op).op_handle
-        )
-        self.dst_descriptors = op.dst_descriptors
-        super().__init__(
-            f"{message}: op={self.op_handle}, destinations={self.dst_descriptors!r}"
-        )
+def _log_transfer_error(error: TransferError) -> None:
+    logger.error("%s", error)
 
 
 @dataclass
@@ -34,6 +25,7 @@ class _SourceWriteStatus:
     submitted: bool = False
     cancel_requested: bool = False
     cancel_deadline: float | None = None
+    abandoned: bool = False
 
 
 @dataclass
@@ -85,8 +77,7 @@ class _DanglingOps:
         first_attempt = cancelling and status.cancel_deadline is None
         if first_attempt:
             status.cancel_deadline = (
-                min(op.deadline, self._backend._kvcr._clock())
-                + self._backend._kvcr.config.operation_timeout_ms / 1000
+                op.deadline + self._backend._kvcr.config.operation_timeout_ms / 1000
             )
         result = progress.poll_transfer(
             cast(int, op.transfer_id), cancellation_requested=cancelling
@@ -96,9 +87,21 @@ class _DanglingOps:
                 self._backend._send_write_done(
                     progress, op.remote_agent, op.op_handle, False, terminal=False
                 )
-            if self._backend._kvcr._clock() >= cast(float, status.cancel_deadline):
-                # Propagate through normal polling; cleanup must retain native work.
-                raise _DanglingOpError("KVCR source cancellation timed out", op)
+            if not status.abandoned and self._backend._kvcr._clock() >= cast(
+                float, status.cancel_deadline
+            ):
+                status.abandoned = True
+                # At 2T release content pins, not the registration or native work.
+                # The CANCEL_PENDING snapshot is a release request, not terminal proof.
+                error = TransferError(
+                    "KVCR source cancellation timed out",
+                    op.op_handle,
+                    source_blocks={
+                        key: list(descriptors)
+                        for key, descriptors in zip(op.ordered_keys, op.src_descriptors)
+                    },
+                )
+                self._backend._progress_outbound.extend([replace(op), error])
         return result
 
     def probe(self, progress: "_KVCRProgress", op: "_TargetPullOp") -> bool:
@@ -128,9 +131,16 @@ class _DanglingOps:
             payload.get("success") is True
             and ("target", op_handle) not in progress._in_flight_ops
         ):
-            raise _DanglingOpError(
-                f"KVCR late remote write from {payload.get('source_agent')!r}",
-                tombstone.operation,
+            self._backend._progress_outbound.append(
+                TransferError(
+                    f"KVCR late remote write from {payload.get('source_agent')!r}",
+                    op_handle,
+                    destination_regions=[
+                        descriptor
+                        for descriptors in tombstone.operation.dst_descriptors
+                        for descriptor in descriptors
+                    ],
+                )
             )
         self.tombstones.pop(op_handle)
 

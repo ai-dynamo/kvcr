@@ -10,7 +10,6 @@ from unittest.mock import DEFAULT, Mock
 import msgspec
 import pytest
 from _kvcr_test_utils import (
-    _OPEN_KVCRS,
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
@@ -778,10 +777,17 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     _wait_until(lambda: handle not in dangling_ops.tombstones)
 
 
-@pytest.mark.parametrize("completion_before_release", [False, True])
+@pytest.mark.parametrize("outcome", ["on_time", "log", "raise"])
 def test_remote_write_reports_success_only_before_destination_release(
-    completion_before_release,
+    outcome,
+    caplog,
 ):
+    errors = []
+
+    def on_error(error):
+        errors.append(error)
+        raise error
+
     now = 0.0
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(ctypes.addressof(memory))
@@ -793,6 +799,7 @@ def test_remote_write_reports_success_only_before_destination_release(
         KVCRConfig(
             nixl_agent_name="target", pool_layouts=[("", 16)], operation_timeout_ms=1000
         ),
+        on_error=on_error if outcome == "raise" else None,
     )
     kvcr._core._clock = lambda: now
     key, source = BlockKey(b"k0"), "tcp://source:1"
@@ -811,7 +818,7 @@ def test_remote_write_reports_success_only_before_destination_release(
             for _, raw in control.sent
         )
     )
-    if completion_before_release:
+    if outcome == "on_time":
         # The Guard's reply and a completed write may be observed in one poll.
         # The destination is still held, so this is not a late write.
         def guard_reply():
@@ -849,20 +856,39 @@ def test_remote_write_reports_success_only_before_destination_release(
         return
     now = 2.0
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    kvcr.submit_hint(_router_hint(source), request_id="retry")
+    other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+    _wait_until(
+        lambda: any(
+            _decode_control_message(raw).get("op_handle") == other_handle
+            for _, raw in control.sent
+        )
+    )
     memory.raw = b"B" * 16
     # Model an already-posted write arriving after the framework reuses the buffer.
     ctypes.memmove(descriptor.addr, b"A" * 16, 16)
-    agent.notifs["source"] = [_write_done_notification(handle)]
-    try:
-        with pytest.raises(RuntimeError, match="late remote write") as error:
-            _poll_until(kvcr, bool)
-        assert memory.raw == b"A" * 16
-        assert error.value.op_handle == handle
-        assert error.value.dst_descriptors == ((descriptor,),)
-    finally:
-        _OPEN_KVCRS.remove(kvcr)
+    agent.notifs["source"] = [
+        _write_done_notification(handle),
+        _write_done_notification(other_handle),
+    ]
+    if outcome == "raise":
         with pytest.raises(RuntimeError, match="late remote write"):
-            kvcr.close()
+            _poll_until(kvcr, bool)
+    # Even a raising handler must not kill progress or lose another completion.
+    assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
+    if outcome == "log":
+        errors = [
+            record.args[0]
+            for record in caplog.records
+            if "late remote write" in record.getMessage()
+        ]
+    assert len(errors) == 1
+    error = errors[0]
+    assert memory.raw == b"A" * 16
+    assert error.op_handle == handle
+    assert error.destination_regions == [descriptor]
+    assert error.source_blocks is None
+    kvcr.close()
 
 
 def test_kvcr_target_ignores_unknown_op_handle_notification():

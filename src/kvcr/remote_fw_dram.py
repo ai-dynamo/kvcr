@@ -39,6 +39,7 @@ from .types import (
     PinHandle,
     PinRequestId,
     PinResult,
+    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -379,9 +380,9 @@ class _SourceWriteOp(_RemoteOp):
             )
         else:
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
-        result = "success" if success else "failed"
+        self.success = success and not status.abandoned
+        result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
-        self.success = success
         self.state = _SourceWriteState.FINISHED
         backend._finish_source_write(write_id)
         return True, True
@@ -608,7 +609,13 @@ class _RemoteFWDram:
             if isinstance(item, _SourcePinOp):
                 self._start_source_pin(item)
             elif isinstance(item, _SourceWriteOp):
-                if item.state is _SourceWriteState.FINISHED:
+                if item.state in (
+                    _SourceWriteState.FINISHED,
+                    _SourceWriteState.CANCEL_PENDING,
+                ):
+                    # An abandoned write already returned its pins at 2T.
+                    if item.op_id not in self._fw_pins_by_op:
+                        continue
                     self._fw_pins_by_op.pop(item.op_id, None)
                     self._kvcr._remove_block_dependencies(item)
                     if item.success:
@@ -638,6 +645,8 @@ class _RemoteFWDram:
                     )
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
+            elif isinstance(item, TransferError):
+                self._kvcr._transfer_errors.append(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:

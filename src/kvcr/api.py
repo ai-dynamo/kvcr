@@ -38,6 +38,7 @@ from .types import (
     QueryStatus,
     ReleaseHandle,
     ReleaseResult,
+    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -71,6 +72,9 @@ class KVCRBindings:
     capacity_needed_callback: Callable[[list[tuple[str, int]]], None] | None = None
     stats_factory: Callable[[], TelemetryStats] | None = None
     policy: "KVCachePolicy | None" = None
+
+    # Called by poll_completed; None logs at ERROR. A handler may raise to its caller.
+    on_error: Callable[[TransferError], None] | None = None
 
 
 class KVCR:

@@ -47,6 +47,30 @@ class MemDescriptor:
 PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]] | None
 
 
+class TransferError(RuntimeError):
+    """Diagnostic for an abandoned source write or an observed late destination write.
+
+    Source reports identify the original keys and local buffers. Destination
+    reports contain only local regions: their current keys are unknown to KVCR.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        op_handle: OpHandle,
+        *,
+        source_blocks: dict[BlockKey, list[MemDescriptor]] | None = None,
+        destination_regions: list[MemDescriptor] | None = None,
+    ) -> None:
+        self.op_handle = op_handle
+        self.source_blocks = source_blocks
+        self.destination_regions = destination_regions
+        super().__init__(
+            f"{message}: op={op_handle}, sources={source_blocks!r}, "
+            f"destinations={destination_regions!r}"
+        )
+
+
 class OpEntryStatus(Enum):
     # TODO: Add specific statuses for timeout, abort, capacity, and unavailable sources.
     SUCCESS = "SUCCESS"
