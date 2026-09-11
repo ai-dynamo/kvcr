@@ -366,8 +366,13 @@ def test_remote_staging_commits_available_keys() -> None:
     ]
 
 
-@pytest.mark.parametrize("completed_indices", [(-1,), (2,), (True,), (0, 0)])
-def test_remote_completion_rejects_invalid_indices(completed_indices) -> None:
+@pytest.mark.parametrize(
+    ("completed_indices", "success"),
+    [((-1,), True), ((2,), True), ((True,), True), ((0, 0), True), ((0, 1), "false")],
+)
+def test_remote_completion_rejects_invalid_notification(
+    completed_indices, success
+) -> None:
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     target = _new_kvcr(
@@ -383,7 +388,9 @@ def test_remote_completion_rejects_invalid_indices(completed_indices) -> None:
     )
     _wait_until(lambda: bool(control.sent))
     agent.notifs["source"] = [
-        _write_done_notification(op_handle, completed_indices=completed_indices)
+        _write_done_notification(
+            op_handle, completed_indices=completed_indices, success=success
+        )
     ]
     assert _poll_until(target, bool) == [
         (op_handle, _op_entries(dict.fromkeys(keys, False)))
@@ -523,6 +530,22 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     )
     assert list(target.poll_completed()) == [(retry_handle, _op_entries({key: False}))]
     assert target_control.sent == []
+
+    other_destination = [_mem_descriptor(addr=256)]
+    mixed_handle = target.deliver(
+        {key: [_mem_descriptor()], other_group: other_destination}, request_id="req"
+    )
+    _wait_until(lambda: bool(target_control.sent))
+    message = _decode_control_message(target_control.sent[0][1])
+    assert message["keys"] == [other_group]
+    assert message["dst_descriptors"] == msgspec.to_builtins([other_destination])
+    target_agent.notifs["source"] = [_write_done_notification(mixed_handle)]
+    assert _poll_until(target, bool) == [
+        (mixed_handle, _op_entries({key: False, other_group: True}))
+    ]
+    assert target.query((key,), "req") == [(QueryStatus.MISS, None)]
+    assert not _has_outstanding_operations(target)
+
     target.submit_hint(_router_hint("tcp://source:1"), request_id="other")
     assert target.query((key,), "other") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)

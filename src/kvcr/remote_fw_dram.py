@@ -93,6 +93,7 @@ class _TargetPullOp(_RemoteOp):
     local_fill: bool
     remote_ctrl_ep: str
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
+    # Keys sent to the source; keys also includes remembered misses.
     ordered_keys: tuple[BlockKey, ...] = ()
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...] = ()
     request_id: str | None = None
@@ -134,7 +135,7 @@ class _TargetPullOp(_RemoteOp):
             _TargetPullState.WAITING_WRITE_DONE,
             _TargetPullState.WAITING_TERMINAL,
         ) and isinstance(event, Mapping):
-            success = bool(event.get("success")) and (
+            success = event.get("success") is True and (
                 not self.local_fill
                 or (
                     self.state is _TargetPullState.WAITING_WRITE_DONE
@@ -493,13 +494,12 @@ class _RemoteFWDram:
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
-        keys = tuple(blocks)
         scope = "remote_fetch" if local_fill else "remote_deliver"
         current_hint = (
             self._request_hints.get(request_id) if request_id is not None else None
         )
         if current_hint is not None and (
-            current_hint.failed or current_hint.missing_keys.issuperset(keys)
+            current_hint.failed or current_hint.missing_keys.issuperset(blocks)
         ):
             kvcr._record_duration(scope, started_at, "failed")
             return False
@@ -507,6 +507,7 @@ class _RemoteFWDram:
         if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
             return False
+        keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
             self._request_hints[request_id] = replace(current_hint, submitted_at=None)
@@ -514,7 +515,7 @@ class _RemoteFWDram:
         op = _TargetPullOp(
             state=_TargetPullState.START_WRITE,
             local_fill=local_fill,
-            keys=set(keys),
+            keys=set(blocks),
             started_at=started_at,
             deadline=deadline,
             op_id=("target", op_handle),
@@ -595,7 +596,7 @@ class _RemoteFWDram:
                         raise RuntimeError(
                             "non-local target pull is waiting for terminal state"
                         )
-                    self._kvcr._discard_local_dram_fill(item.ordered_keys)
+                    self._kvcr._discard_local_dram_fill(item.keys)
                 elif item.state is _TargetPullState.FINISHED:
                     self._finish_target_pull(item)
                 else:
@@ -681,7 +682,7 @@ class _RemoteFWDram:
                 )
             if completed_keys != op.keys:
                 kvcr._complete_local_dram_fill(
-                    tuple(key for key in op.ordered_keys if key not in completed_keys),
+                    op.keys - completed_keys,
                     success=False,
                 )
             return
