@@ -39,7 +39,6 @@ from .types import (
     PinHandle,
     PinRequestId,
     PinResult,
-    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -109,6 +108,7 @@ class _TargetPullOp(_RemoteOp):
     ) -> tuple[bool, bool]:
         backend = self._backend
         now = backend._kvcr._clock()
+        cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
         if self.state is _TargetPullState.START_WRITE:
             self.source_incarnation = backend._dangling_ops.sources.get(
@@ -139,16 +139,18 @@ class _TargetPullOp(_RemoteOp):
             self.state = _TargetPullState.WAITING_WRITE_DONE
             return False, True
 
-        if self.state in (
-            _TargetPullState.WAITING_WRITE_DONE,
-            _TargetPullState.WAITING_TERMINAL,
-        ) and isinstance(event, Mapping):
-            success = event.get("success") is True and (
-                not self.local_fill
-                or (
-                    self.state is _TargetPullState.WAITING_WRITE_DONE
-                    and now < self.deadline
-                )
+        if (
+            self.state
+            in (_TargetPullState.WAITING_WRITE_DONE, _TargetPullState.WAITING_TERMINAL)
+            and isinstance(event, Mapping)
+            and event.get("terminal", True) is True
+        ):
+            # After cancellation, native success only permits cleanup.
+            success = (
+                event.get("success") is True
+                and not cancelled
+                and self.state is _TargetPullState.WAITING_WRITE_DONE
+                and (not self.local_fill or now < self.deadline)
             )
             try:
                 if success:
@@ -183,7 +185,9 @@ class _TargetPullOp(_RemoteOp):
             backend._record_progress_duration(scope, self.started_at, result)
             return True, True
 
-        if now >= self.deadline:
+        if now >= self.deadline or (
+            cancelled and self.state is _TargetPullState.WAITING_WRITE_DONE
+        ):
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 backend._dangling_ops.abandon(progress, self)
                 self.state = _TargetPullState.FINISHED
@@ -648,8 +652,8 @@ class _RemoteFWDram:
                     )
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
-            elif isinstance(item, TransferError):
-                self._kvcr._transfer_errors.append(item)
+            elif isinstance(item, Exception):
+                self._kvcr._resilience_errors.append(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -771,8 +775,11 @@ class _RemoteFWDram:
         # Warning suppression can be added if persistent backend faults
         # cause excessive polling logs.
         observed_work |= self._process_control_messages(progress)
-        # A real notification outranks a refusal for the same operation.
-        events = {**self._refused_writes, **self._poll_notifications(progress)}
+        # Only terminal notifications outrank a refusal for the same operation.
+        events = self._poll_notifications(progress)
+        for op_id, refusal in self._refused_writes.items():
+            if not events.get(op_id, {}).get("terminal"):
+                events[op_id] = refusal
         self._dangling_ops.expire()
         self._refused_writes.clear()
         observed_work |= bool(events)
@@ -1621,23 +1628,31 @@ class _RemoteFWDram:
                     payload = _decode_notif(raw)
                     if payload is None or payload.get("type") != "write_done":
                         continue
-                    if payload.get("terminal", True) is not True:
-                        continue  # Cancellation attempted, not confirmed.
                     try:
                         op_handle = int(payload["op_handle"])
                     except (KeyError, TypeError, ValueError):
                         continue
                     op_id = ("target", op_handle)
-                    # A cancellation notice must not overwrite a completed write.
-                    if not events.get(op_id, {}).get("success"):
-                        payload["source_agent"] = source_agent
-                        events[op_id] = payload
+                    previous = events.get(op_id, {})
+                    terminal = payload.get("terminal", True) is True
+                    cancelled = previous.get("cancelled", False) or not terminal
+                    terminal |= previous.get("terminal", False)
+                    # Preserve native success for diagnostics, even if cancelled.
+                    if previous.get("success"):
+                        payload = previous
+                    payload.update(
+                        source_agent=source_agent,
+                        terminal=terminal,
+                        cancelled=cancelled,
+                    )
+                    events[op_id] = payload
         except Exception:
             logger.warning("KVCR notification receive failed", exc_info=True)
             return {}
         # Outside the receive-error handler: late writes must reach the framework.
         for op_id, payload in events.items():
-            self._dangling_ops.notification(progress, op_id[1], payload)
+            if payload["terminal"]:
+                self._dangling_ops.notification(progress, op_id[1], payload)
         return events
 
     def _record_transfer_telemetry(self, telemetry: Any | None) -> None:

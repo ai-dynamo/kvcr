@@ -423,6 +423,7 @@ def _write_done_notification(
     *,
     success: bool = True,
     completed_indices: tuple[int, ...] = (0,),
+    terminal: bool = True,
 ) -> bytes:
     payload = {
         "type": "write_done",
@@ -431,6 +432,8 @@ def _write_done_notification(
     }
     if success:
         payload["completed_indices"] = completed_indices
+    if not terminal:
+        payload["terminal"] = False
     return b"KVCR:" + msgspec.msgpack.encode(payload)
 
 

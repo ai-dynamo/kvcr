@@ -133,11 +133,13 @@ names are reused; it is not proof of process death.
 Remote `fetch` and `deliver` use NIXL writes from the source to the destination.
 At `operation_timeout_ms` (`T`), the destination probes the source, which blocks
 unsubmitted work and attempts cancellation. The separate `abandon_timeout_ms`
-deadline is measured from operation start and must exceed `T` (defaults: 1s and 5s).
+deadline is measured from operation start and must be at least `2T` (defaults: 1s and 5s).
 At abandonment, the source releases content pins without waiting for the destination,
 but continues native-transfer cleanup. The destination abandons any unresolved write,
 releases its memory, and sends a final cleanup probe. Nonterminal replies do not
 extend this deadline.
+Once cancellation is observed, the pending operation stays failed; a later native
+success only completes cleanup, never restores success.
 
 A per-operation tombstone retains destination descriptors, not memory pins, so
 new work can continue even if both the source and its Guard die. A terminal reply
@@ -155,6 +157,8 @@ keys. A custom handler may raise to the caller without stopping progress. Writes
 without a notification, or after tombstone expiry, cannot be diagnosed this way.
 Rare late writes may corrupt reused memory; stronger NIXL cancellation support
 would reduce this risk.
+Source progress stalls are reported once as a `RuntimeError` through the same
+callback. New source writes remain disabled until restart; native cleanup continues.
 
 ---
 

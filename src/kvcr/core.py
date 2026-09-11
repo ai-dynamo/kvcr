@@ -39,7 +39,6 @@ from .types import (
     RecoveryMirrorError,
     ReleaseHandle,
     ReleaseResult,
-    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -123,8 +122,10 @@ class _KVCRCore:
         self._block_sizes = dict(self.pool_layouts)
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
-        if self.config.abandon_timeout_ms <= self.config.operation_timeout_ms:
-            raise ValueError("abandon_timeout_ms must exceed operation_timeout_ms")
+        if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
+            raise ValueError(
+                "abandon_timeout_ms must be at least twice operation_timeout_ms"
+            )
         if self.config.inventory_report_interval_ms < 0:
             raise ValueError("inventory_report_interval_ms must be non-negative")
         if not 0 <= self.config.capacity_low_watermark_percent <= 100:
@@ -175,7 +176,7 @@ class _KVCRCore:
         ] = {}
 
         self._completion_queue: list[OpResult] = []
-        self._transfer_errors: deque[TransferError] = deque()
+        self._resilience_errors: deque[Exception] = deque()
         self._joined_completions: dict[
             OpHandle, tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
         ] = {}
@@ -206,11 +207,11 @@ class _KVCRCore:
         )
 
         # Import lazily to keep the concrete backend private to KVCR setup.
-        from .dangling_ops import _log_transfer_error
+        from .dangling_ops import _log_error
         from .remote_fw_dram import _RemoteFWDram
 
         self._on_error_callback = (
-            _log_transfer_error if bindings.on_error is None else bindings.on_error
+            _log_error if bindings.on_error is None else bindings.on_error
         )
         self._local_dram = (
             _LocalDram(self, local_dram_config)
@@ -511,8 +512,8 @@ class _KVCRCore:
         self._flush_inventory()
         # Apply the whole batch before invoking user code; a raising handler must
         # not lose completions or stop the progress thread.
-        while self._transfer_errors:
-            error = self._transfer_errors.popleft()
+        while self._resilience_errors:
+            error = self._resilience_errors.popleft()
             self._on_error_callback(error)
         completed = self._completion_queue
         self._completion_queue = []

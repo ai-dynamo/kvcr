@@ -119,11 +119,17 @@ def test_write_probe_fences_write_waiting_on_framework_pin() -> None:
     assert agent.xfers == []
 
 
-def test_stalled_source_refuses_queued_and_future_writes(kvcr_caplog) -> None:
+def test_stalled_source_refuses_queued_and_future_writes() -> None:
+    errors = []
+
+    def on_error(error):
+        errors.append(error)
+        raise error
+
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl()
-    source = _new_kvcr(agent, pinning, control, name="source")
+    source = _new_kvcr(agent, pinning, control, name="source", on_error=on_error)
 
     stalled_for = 0.0
     with patch(
@@ -138,17 +144,16 @@ def test_stalled_source_refuses_queued_and_future_writes(kvcr_caplog) -> None:
                 _poll_until(source, lambda _: bool(pinning.searches))
                 stalled_for = 2.0
                 pinning.complete(0)
+                with pytest.raises(RuntimeError, match="source progress stalled"):
+                    _poll_until(source, lambda _: bool(errors))
             assert _poll_until(source, lambda _: len(agent.sent_notifs) == handle) == []
             assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
     assert agent.xfers == []
     assert pinning.searches == [(BlockKey(b"k0"),)]
     assert pinning.unpins == ["pin"]
-    error = next(
-        record for record in kvcr_caplog.records if record.levelno == logging.ERROR
-    )
-    gap_ms, timeout_ms = error.args
-    assert gap_ms >= 2000
-    assert timeout_ms == 1000
+    assert len(errors) == 1  # A raising callback must not stop native cleanup.
+    assert "timeout: 1000 ms" in str(errors[0])
+    assert "new source writes disabled until restart" in str(errors[0])
 
 
 def test_kvcr_close_cleans_pending_pin_operations():

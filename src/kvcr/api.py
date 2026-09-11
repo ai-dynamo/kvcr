@@ -38,7 +38,6 @@ from .types import (
     QueryStatus,
     ReleaseHandle,
     ReleaseResult,
-    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +73,7 @@ class KVCRBindings:
     policy: "KVCachePolicy | None" = None
 
     # Called by poll_completed; None logs at ERROR. A handler may raise to its caller.
-    on_error: Callable[[TransferError], None] | None = None
+    on_error: Callable[[Exception], None] | None = None
 
 
 class KVCR:

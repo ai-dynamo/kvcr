@@ -713,15 +713,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert list(kvcr.poll_completed()) == []
     if source_responsive:
         agent.notifs["source"] = [
-            b"KVCR:"
-            + msgspec.msgpack.encode(
-                {
-                    "type": "write_done",
-                    "op_handle": handle,
-                    "success": False,
-                    "terminal": False,
-                }
-            )
+            _write_done_notification(handle, success=False, terminal=False)
         ]
         control.incoming.append(
             msgspec.msgpack.encode(
@@ -783,8 +775,10 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     _wait_until(lambda: handle not in dangling_ops.tombstones)
 
 
-@pytest.mark.parametrize("outcome", ["on_time", "log", "raise"])
-def test_remote_write_reports_success_only_before_destination_release(
+@pytest.mark.parametrize(
+    "outcome", ["cancelled", "cancelled_same_poll", "terminal", "log", "raise"]
+)
+def test_remote_write_cancellation_and_late_completion(
     outcome,
     caplog,
 ):
@@ -817,6 +811,20 @@ def test_remote_write_reports_success_only_before_destination_release(
             for _, raw in control.sent
         )
     )
+    if outcome in ("cancelled", "cancelled_same_poll"):
+        # The source can cancel before the target's own timeout.
+        now = 0.5
+        cancelled = _write_done_notification(handle, success=False, terminal=False)
+        notifications = [_write_done_notification(handle)]
+        if outcome == "cancelled":
+            agent.notifs["source"] = [cancelled]
+            _wait_until(lambda: not agent.notifs)
+            assert list(kvcr.poll_completed()) == []
+        else:
+            notifications.append(cancelled)
+        agent.notifs["source"] = notifications
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        return
     now = 1.0
     _wait_until(
         lambda: any(
@@ -824,7 +832,7 @@ def test_remote_write_reports_success_only_before_destination_release(
             for _, raw in control.sent
         )
     )
-    if outcome == "on_time":
+    if outcome == "terminal":
         # The Guard's reply and a completed write may be observed in one poll.
         # The destination is still held, so this is not a late write.
         def guard_reply():
@@ -858,7 +866,8 @@ def test_remote_write_reports_success_only_before_destination_release(
             ]
 
         control.recv = guard_reply
-        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        assert "late remote write" not in caplog.text
         return
     now = 5.0
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
@@ -874,7 +883,9 @@ def test_remote_write_reports_success_only_before_destination_release(
     # Model an already-posted write arriving after the framework reuses the buffer.
     ctypes.memmove(descriptor.addr, b"A" * 16, 16)
     agent.notifs["source"] = [
+        _write_done_notification(handle, success=False, terminal=False),
         _write_done_notification(handle),
+        _write_done_notification(handle, success=False, terminal=False),
         _write_done_notification(other_handle),
     ]
     if outcome == "raise":

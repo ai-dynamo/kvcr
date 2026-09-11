@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .remote_fw_dram import _RemoteFWDram, _SourceWriteOp, _TargetPullOp
 
 
-def _log_transfer_error(error: TransferError) -> None:
+def _log_error(error: Exception) -> None:
     logger.error("%s", error)
 
 
@@ -62,11 +62,12 @@ class _DanglingOps:
         if gap_ms >= timeout_ms:
             # Stay disabled so queued pre-stall requests cannot get fresh deadlines.
             self._source_stalled = True
-            logger.error(
-                "KVCR source progress stalled for %.1f ms (timeout: %d ms); "
-                "new source writes disabled until restart",
-                gap_ms,
-                timeout_ms,
+            self._backend._progress_outbound.append(
+                RuntimeError(
+                    f"KVCR source progress stalled for {gap_ms:.1f} ms "
+                    f"(timeout: {timeout_ms} ms); "
+                    "new source writes disabled until restart"
+                )
             )
         return not self._source_stalled
 
