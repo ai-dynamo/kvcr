@@ -59,6 +59,7 @@ class _RequestHint:
     block_hashes: frozenset[int]
     submitted_at: float | None
     failed: bool = False
+    missing_keys: frozenset[BlockKey] = frozenset()
 
 
 class _TargetPullState(Enum):
@@ -141,15 +142,15 @@ class _TargetPullOp(_RemoteOp):
                 )
             )
             try:
-                if success and "completed_count" in event:
-                    completed_count = _notification_completed_count(
+                if success:
+                    completed_indices = _notification_completed_indices(
                         event, len(self.ordered_keys)
                     )
-                    if set(self.ordered_keys) != self.keys:
-                        raise TypeError("missing ordered keys")
-                    completed_keys = set(self.ordered_keys[:completed_count])
+                    completed_keys = {
+                        self.ordered_keys[index] for index in completed_indices
+                    }
                 else:
-                    completed_keys = set(self.keys) if success else set()
+                    completed_keys = set()
             except TypeError:
                 success = False
                 completed_keys = set()
@@ -225,14 +226,13 @@ class _SourceWriteOp(_RemoteOp):
     state: _SourceWriteState
     remote_agent: bytes
     op_handle: int
-    ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     framework_pins: set[PinHandle] = field(default_factory=set)
     src_descriptors: tuple[tuple[MemDescriptor, ...], ...] = ()
     transfer_id: int | None = None
     success: bool = False
-    completed_count: int = 0
+    completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
 
     def progress(
@@ -266,22 +266,28 @@ class _SourceWriteOp(_RemoteOp):
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
                 return False, True
+            if not self.src_descriptors:
+                backend._send_write_done(
+                    progress, self.remote_agent, self.op_handle, True
+                )
+                self.success = True
+                self.state = _SourceWriteState.FINISHED
+                backend._record_progress_duration(
+                    "source_write", self.started_at, "failed"
+                )
+                return True, True
             submit_started_at = backend._kvcr._timer()
             try:
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
                     tuple(chain.from_iterable(self.src_descriptors)),
-                    tuple(
-                        chain.from_iterable(
-                            self.dst_descriptors[: self.completed_count]
-                        )
-                    ),
+                    tuple(chain.from_iterable(self.dst_descriptors)),
                     remote_side_agent=self.remote_agent,
                     backend=backend._options.backend,
                     notif_msg=_write_done_notif(
                         self.op_handle,
                         True,
-                        completed_count=self.completed_count,
+                        completed_indices=self.completed_indices,
                     ),
                     capture_telemetry=backend._telemetry_enabled,
                 )
@@ -465,6 +471,7 @@ class _RemoteFWDram:
             request_hint is None
             or request_hint.source is None
             or request_hint.failed
+            or key in request_hint.missing_keys
             or adapter is None
         ):
             return False
@@ -491,7 +498,9 @@ class _RemoteFWDram:
         current_hint = (
             self._request_hints.get(request_id) if request_id is not None else None
         )
-        if current_hint is not None and current_hint.failed:
+        if current_hint is not None and (
+            current_hint.failed or current_hint.missing_keys.issuperset(keys)
+        ):
             kvcr._record_duration(scope, started_at, "failed")
             return False
 
@@ -654,17 +663,26 @@ class _RemoteFWDram:
         kvcr = self._kvcr
         kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
-        if completed_keys != op.keys:
+        if not op.success:
             self._fail_request_hint(op.request_id)
+        elif (
+            op.request_id is not None
+            and (hint := self._request_hints.get(op.request_id)) is not None
+        ):
+            self._request_hints[op.request_id] = replace(
+                hint,
+                missing_keys=(hint.missing_keys | op.keys) - completed_keys,
+            )
         if op.local_fill:
-            completed_count = len(completed_keys)
-            if completed_count:
+            if completed_keys:
                 kvcr._complete_local_dram_fill(
-                    op.ordered_keys[:completed_count], success=True
+                    tuple(key for key in op.ordered_keys if key in completed_keys),
+                    success=True,
                 )
-            if completed_count < len(op.ordered_keys):
+            if completed_keys != op.keys:
                 kvcr._complete_local_dram_fill(
-                    op.ordered_keys[completed_count:], success=False
+                    tuple(key for key in op.ordered_keys if key not in completed_keys),
+                    success=False,
                 )
             return
         kvcr._complete(
@@ -672,7 +690,7 @@ class _RemoteFWDram:
             {
                 key: OpEntryResult(
                     OpEntryStatus.SUCCESS
-                    if bool(op.success) and key in completed_keys
+                    if key in completed_keys
                     else OpEntryStatus.FAILED
                 )
                 for key in op.keys
@@ -979,12 +997,12 @@ class _RemoteFWDram:
             and record.fw_mem is not None
         }
         sources = {} if force_failure else {**framework_sources, **local_sources}
-        completed_count = 0
+        completed_indices = []
         for index, key in enumerate(source_pin.ordered_keys):
             source = sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if source is None:
-                break
+                continue
             if [descriptor.info for descriptor in source] != [
                 descriptor.info for descriptor in destination
             ]:
@@ -993,9 +1011,11 @@ class _RemoteFWDram:
                     source_pin.op_handle,
                     key,
                 )
-                break
-            completed_count += 1
-        completed_keys = source_pin.ordered_keys[:completed_count]
+                continue
+            completed_indices.append(index)
+        completed_keys = tuple(
+            source_pin.ordered_keys[index] for index in completed_indices
+        )
 
         kvcr._release_local_dram_sources(
             source_pin.op_id, local_sources.keys() - set(completed_keys)
@@ -1019,7 +1039,7 @@ class _RemoteFWDram:
         source_write = _SourceWriteOp(
             state=(
                 _SourceWriteState.READY_TO_WRITE
-                if completed_keys
+                if not force_failure
                 else _SourceWriteState.NOTIFY_FAILURE
             ),
             keys=set(completed_keys or source_pin.ordered_keys),
@@ -1028,13 +1048,14 @@ class _RemoteFWDram:
             op_id=source_pin.op_id,
             remote_agent=source_pin.remote_agent,
             op_handle=source_pin.op_handle,
-            ordered_keys=source_pin.ordered_keys,
-            dst_descriptors=source_pin.dst_descriptors,
+            dst_descriptors=tuple(
+                source_pin.dst_descriptors[index] for index in completed_indices
+            ),
             route=source_pin.route,
             _backend=self,
             framework_pins=framework_pins,
             src_descriptors=tuple(tuple(sources[key]) for key in completed_keys),
-            completed_count=len(completed_keys),
+            completed_indices=tuple(completed_indices),
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1635,29 +1656,33 @@ def _message_keys(payload: Mapping[str, Any]) -> tuple[BlockKey, ...]:
 def _write_done_notif(
     op_handle: OpHandle,
     success: bool,
-    completed_count: int | None = None,
+    completed_indices: tuple[int, ...] = (),
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": "write_done",
         "op_handle": op_handle,
         "success": success,
     }
-    if completed_count is not None:
-        payload["completed_count"] = completed_count
+    if success:
+        payload["completed_indices"] = completed_indices
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)
 
 
-def _notification_completed_count(
+def _notification_completed_indices(
     payload: Mapping[str, Any], requested_count: int
-) -> int:
-    completed_count = payload.get("completed_count")
+) -> list[int]:
+    indices = payload.get("completed_indices")
     if (
-        isinstance(completed_count, bool)
-        or not isinstance(completed_count, int)
-        or not 0 <= completed_count <= requested_count
+        not isinstance(indices, list)
+        or len(indices) > requested_count
+        or any(
+            type(index) is not int or not 0 <= index < requested_count
+            for index in indices
+        )
+        or len(set(indices)) != len(indices)
     ):
-        raise TypeError("invalid completed count")
-    return completed_count
+        raise TypeError("invalid completed indices")
+    return indices
 
 
 def _decode_notif(notif: bytes) -> dict[str, Any] | None:

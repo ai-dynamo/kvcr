@@ -318,13 +318,13 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
 
 
-def test_remote_staging_commits_available_prefix() -> None:
+def test_remote_staging_commits_available_keys() -> None:
     block_size = 16
-    local = ctypes.create_string_buffer(block_size * 2)
+    local = ctypes.create_string_buffer(block_size * 3)
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     events: list[InventoryEvent] = []
-    keys = (BlockKey(b"k0"), BlockKey(b"k1"))
+    keys = tuple(BlockKey(f"k{i}".encode()) for i in range(3))
     target = _new_kvcr(
         agent,
         FakePrimaryPinning(),
@@ -339,23 +339,56 @@ def test_remote_staging_commits_available_prefix() -> None:
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
     agent.notifs["source"] = [
-        _write_done_notification(message["op_handle"], completed_count=1)
+        _write_done_notification(message["op_handle"], completed_indices=(0, 2))
     ]
 
     completed = _poll_until(target, lambda results: bool(results))
     assert len(completed) == 1 and completed[0][0] == fetch
     results = completed[0][1]
-    assert results[keys[0]].success
-    assert results[keys[0]].descriptors is not None
-    release_handle = results[keys[0]].release_handle
-    assert release_handle is not None
-    assert results[keys[1]] == OpEntryResult(OpEntryStatus.FAILED)
+    available = (keys[0], keys[2])
+    release_handles = []
+    for key in keys:
+        if key in available:
+            assert results[key].success
+            assert results[key].descriptors is not None
+            assert results[key].release_handle is not None
+            release_handles.append(results[key].release_handle)
+        else:
+            assert results[key] == OpEntryResult(OpEntryStatus.FAILED)
     assert target.query(keys, "req") == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
-    assert events == [InventoryEvent(keys[:1], CacheTier.LOCAL_G2, False)]
-    assert target.release((release_handle,)) == [(release_handle, True)]
+    assert events == [InventoryEvent(available, CacheTier.LOCAL_G2, False)]
+    assert target.release(release_handles) == [
+        (handle, True) for handle in release_handles
+    ]
+
+
+@pytest.mark.parametrize("completed_indices", [(-1,), (2,), (True,), (0, 0)])
+def test_remote_completion_rejects_invalid_indices(completed_indices) -> None:
+    agent = FakeNixlAgent()
+    control = FakeBytesControl()
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    keys = (BlockKey(b"k0"), BlockKey(b"k1"))
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    op_handle = target.deliver(
+        {key: [_mem_descriptor()] for key in keys}, request_id="req"
+    )
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [
+        _write_done_notification(op_handle, completed_indices=completed_indices)
+    ]
+    assert _poll_until(target, bool) == [
+        (op_handle, _op_entries(dict.fromkeys(keys, False)))
+    ]
+    assert not _has_outstanding_operations(target)
 
 
 @pytest.mark.parametrize(
@@ -436,6 +469,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         FakePrimaryPinning(),
         target_control,
         KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
     source = _new_kvcr(
@@ -446,7 +480,8 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         name="source",
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
-    key = BlockKey(b"k0")
+    key = _make_block_key(b"k0", 0)
+    other_group = _make_block_key(b"k0", 1)
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     op_handle = target.deliver(
@@ -468,14 +503,18 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert _decode_notif(source_agent.sent_notifs[0][1]) == {
         "type": "write_done",
         "op_handle": op_handle,
-        "success": False,
+        "success": True,
+        "completed_indices": [],
     }
 
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
     assert _poll_until(target, lambda completed: bool(completed)) == [
         (op_handle, _op_entries({key: False}))
     ]
-    assert target._core._remote_fw_dram._request_hints["req"].failed
+    assert target.query((key, other_group), "req") == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
+    ]
 
     target_control.sent = []
     retry_handle = target.deliver(
@@ -484,6 +523,12 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     )
     assert list(target.poll_completed()) == [(retry_handle, _op_entries({key: False}))]
     assert target_control.sent == []
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="other")
+    assert target.query((key,), "other") == [
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+    ]
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
 
 
 def _acked_deliver(control, kvcr, source, key):
@@ -761,17 +806,17 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
 
 
 @pytest.mark.parametrize(
-    ("eager_ctrl_connect", "missing_indices", "completed_count"),
+    ("eager_ctrl_connect", "missing_indices"),
     [
-        (False, (), 2),
-        (True, (), 2),
-        (False, (1,), 1),
+        (False, ()),
+        (True, ()),
+        (False, (1,)),
+        (False, (0,)),
     ],
 )
-def test_remote_framework_dram_transfers_available_prefix(
+def test_remote_framework_dram_transfers_available_keys(
     eager_ctrl_connect: bool,
     missing_indices: tuple[int, ...],
-    completed_count: int,
 ) -> None:
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_agent = FakeNixlAgent(metadata=b"source-md")
@@ -805,10 +850,14 @@ def test_remote_framework_dram_transfers_available_prefix(
         remote_options=RemoteFWDramOptions(backend="REMOTE"),
     )
     source._core._clock = lambda: 0.0
-    keys = (BlockKey(b"k0"), BlockKey(b"k1"))
+    keys = tuple(_make_block_key(b"k0", index) for index in range(3))
+    completed_indices = [
+        index for index in range(len(keys)) if index not in missing_indices
+    ]
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query(keys, "req") == [
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
     ]
@@ -830,7 +879,9 @@ def test_remote_framework_dram_transfers_available_prefix(
 
     assert _poll_until(source, lambda _: bool(source_agent.xfers)) == []
     assert source_agent.xfer_backends == [["REMOTE"]]
-    assert source_agent.xfers[0][2] == list(range(completed_count))
+    assert source_agent.xfers[0][3] == [
+        (8192 + index * 16, 16, 0) for index in completed_indices
+    ]
     notification = source_agent.xfers[0][5]
     assert notification is not None
 
@@ -843,9 +894,15 @@ def test_remote_framework_dram_transfers_available_prefix(
         (
             op_handle,
             _op_entries(
-                {key: index < completed_count for index, key in enumerate(keys)}
+                {key: index in completed_indices for index, key in enumerate(keys)}
             ),
         )
+    ]
+    assert target.query(keys, "req") == [
+        (QueryStatus.MISS, None)
+        if index in missing_indices
+        else (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+        for index in range(len(keys))
     ]
 
     source_stats = source.get_stats()
@@ -861,6 +918,6 @@ def test_remote_framework_dram_transfers_available_prefix(
     assert (
         "counter",
         TRANSFER_BLOCKS_METRIC,
-        completed_count,
+        len(completed_indices),
         ("remote_deliver",),
     ) in target_stats.records
