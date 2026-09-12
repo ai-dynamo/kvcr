@@ -265,6 +265,7 @@ class _SourceWriteOp(_RemoteOp):
     state: _SourceWriteState
     remote_agent: bytes
     op_handle: int
+    source_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     framework_pins: set[PinHandle] = field(default_factory=set)
@@ -322,6 +323,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
+                backend._dangling_ops.finish_source(self)
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -1167,6 +1169,7 @@ class _RemoteFWDram:
             route=source_pin.route,
             _backend=self,
             framework_pins=framework_pins,
+            source_keys=completed_keys,
             src_descriptors=tuple(tuple(sources[key]) for key in completed_keys),
             completed_indices=tuple(completed_indices),
         )

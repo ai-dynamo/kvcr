@@ -574,6 +574,8 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
     ]
+    assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
+    assert not source._core._remote_fw_dram._dangling_ops.source_writes
 
     target_control.sent = []
     retry_handle = target.deliver(

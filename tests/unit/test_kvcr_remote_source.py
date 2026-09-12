@@ -6,6 +6,7 @@ import ctypes
 import logging
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -514,7 +515,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     agent, control, errors = FakeNixlAgent(), FakeBytesControl(), []
     source = _new_kvcr(
         agent,
-        FakePrimaryPinning(),
+        FakePrimaryPinning(missing_indices=(0,)),
         control,
         name="source",
         on_resilience_event=errors.append,
@@ -522,16 +523,29 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     )
     source._core._clock = lambda: now
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
+    missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
+    expected_sources = {
+        key: [replace(descriptor, end_point_name="source")],
+        framework_hit: [_mem_descriptor(addr=0)],
+    }
     try:
         agent.state = "DONE"
         deposit = source.deposit({key: [descriptor]})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         agent.state = "PROC"
-        control.incoming.append(_start_write_message(12, key, target_agent="target"))
+        payload = msgspec.msgpack.decode(
+            _start_write_message(12, key, target_agent="target")
+        )
+        payload["keys"] = [key, missing, framework_hit]
+        payload["dst_descriptors"] = [
+            [_mem_descriptor(128 + 16 * index).__dict__] for index in range(3)
+        ]
+        control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
         now = 5.0
         assert _poll_until(source, lambda _: bool(errors)) == []
         assert [error.state for error in errors] == ["uncertain"]
+        assert errors[0].source_blocks == expected_sources
         blocked = source.deposit({replacement: [descriptor]})
         assert list(source.poll_completed()) == [
             (blocked, _op_entries({replacement: False}))
@@ -541,7 +555,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         assert _poll_until(source, lambda _: len(errors) == 2) == []
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert source._core._block_record_map[key].local_dram.claim_count == 0
-        assert errors[0].source_blocks == errors[1].source_blocks
+        assert errors[1].source_blocks == expected_sources
         deposit = source.deposit({replacement: [descriptor]})
         assert _poll_until(source, bool) == [
             (deposit, _op_entries({replacement: True}))

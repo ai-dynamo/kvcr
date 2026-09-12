@@ -109,7 +109,7 @@ class _DanglingOps:
                 state=state,
                 source_blocks={
                     key: list(descriptors)
-                    for key, descriptors in zip(op.ordered_keys, op.src_descriptors)
+                    for key, descriptors in zip(op.source_keys, op.src_descriptors)
                 },
             )
         )
