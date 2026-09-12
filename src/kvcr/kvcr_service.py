@@ -405,12 +405,17 @@ class _ThreadingUnixServer(
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
             )
+        liveness.incarnation = request.incarnation
+        # Retain the Guard across a concurrent close; claim validates the request.
+        guard = self.registry._guards.get(request.guard_index)
         spec, pools, listener_fd, lease = self.registry.claim(
             request.guard_index,
             request.tier_config,
             liveness,
             (request.control_host, request.control_port),
         )
+        if guard is None:
+            raise KVCRServiceError("KVCR claim succeeded without a Guard")
         return (
             _Granted(
                 request.guard_index,
@@ -418,6 +423,7 @@ class _ThreadingUnixServer(
                 request.tier_config,
                 pools,
                 _PROTOCOL_VERSION,
+                dead_incarnations=guard.dead_incarnations,
             ),
             (request.guard_index, listener_fd, lease),
         )

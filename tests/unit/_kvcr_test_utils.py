@@ -423,6 +423,7 @@ def _write_done_notification(
     *,
     success: bool = True,
     completed_indices: tuple[int, ...] = (0,),
+    terminal: bool = True,
 ) -> bytes:
     payload = {
         "type": "write_done",
@@ -431,6 +432,8 @@ def _write_done_notification(
     }
     if success:
         payload["completed_indices"] = completed_indices
+    if not terminal:
+        payload["terminal"] = False
     return b"KVCR:" + msgspec.msgpack.encode(payload)
 
 
@@ -477,6 +480,7 @@ def _new_kvcr(
     inventory_sink=None,
     capacity_needed_callback=None,
     policy=None,
+    on_resilience_event=None,
 ) -> KVCR:
     config = replace(
         config
@@ -501,6 +505,7 @@ def _new_kvcr(
                 inventory_sink=inventory_sink,
                 capacity_needed_callback=capacity_needed_callback,
                 policy=policy,
+                on_resilience_event=on_resilience_event,
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),
             KVCRBackendConfigs(

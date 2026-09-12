@@ -124,6 +124,7 @@ class KVCRConfig:
     pool_layouts: PoolBlockLayouts
     enable_telemetry: bool = False
     operation_timeout_ms: int = 1000
+    abandon_timeout_ms: int = 5000
     inventory_report_interval_ms: int = 10
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None

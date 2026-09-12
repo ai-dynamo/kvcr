@@ -72,6 +72,9 @@ class KVCRBindings:
     stats_factory: Callable[[], TelemetryStats] | None = None
     policy: "KVCachePolicy | None" = None
 
+    # Resilience failures and transfer lifecycle events; defaults to logging.
+    on_resilience_event: Callable[[Exception], None] | None = None
+
 
 class KVCR:
     """Framework-facing KV Cache Runner."""

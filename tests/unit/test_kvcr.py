@@ -50,7 +50,7 @@ from kvcr.types import BlockKey
 def _fake_hold(**fields: Any) -> SimpleNamespace:
     """A hold double that hands its listener over exactly like the real one."""
     fields.setdefault("_pools", ())
-    hold = SimpleNamespace(**fields)
+    hold = SimpleNamespace(_incarnation=None, _dead_incarnations=(), **fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
 
@@ -450,6 +450,14 @@ def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> N
     client.assert_not_called()
 
 
+@pytest.mark.parametrize("abandon_timeout_ms", [1999, 2000])
+def test_kvcr_validates_abandon_timeout(abandon_timeout_ms):
+    config = KVCRConfig("target", [("", 16)], abandon_timeout_ms=abandon_timeout_ms)
+    expected = pytest.raises(ValueError, match="abandon_timeout_ms")
+    with expected if abandon_timeout_ms == 1999 else nullcontext():
+        _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl(), config)
+
+
 def test_kvcr_rejects_no_dram_backends() -> None:
     with pytest.raises(ValueError, match="at least one DRAM backend"):
         KVCR(
@@ -600,6 +608,9 @@ class _StubProgress:
 
     def is_quiescent(self) -> bool:
         return self._quiescent
+
+    def take_completed(self) -> list[object]:
+        return []
 
 
 def test_close_cleans_backends_once_when_progress_is_quiescent(

@@ -657,6 +657,7 @@ one local DP rank and uses illustrative capacities and ports:
         "control_advertise_host": "127.0.0.1",
         "eager_ctrl_connect": true,
         "operation_timeout_ms": 1000,
+        "abandon_timeout_ms": 5000,
         "enable_telemetry": true
       }
     ]
@@ -694,7 +695,8 @@ The important fields are:
 | `eager_ctrl_connect` | Establishes peer control earlier; disabling it moves setup onto the request path |
 | `local_dram_backend` | NIXL backend used for local DRAM transfers |
 | `remote_fw_dram_backend` | NIXL backend used for peer DRAM transfers |
-| `operation_timeout_ms` | Deadline for KVCR operations; timeout begins safe cancellation and cleanup |
+| `operation_timeout_ms` | Deadline for KVCR operations; timeout begins cancellation and cleanup |
+| `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `5000`, at least twice `operation_timeout_ms` |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 
 For several local DP ranks, provide one `control_ports` entry per local rank in

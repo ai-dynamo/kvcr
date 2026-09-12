@@ -373,6 +373,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
             nixl_listen_port=0,
             inventory_report_interval_ms=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
+            abandon_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 2000,
         ),
         KVCRBindings(
             target_pinning.request_pin,
@@ -514,11 +515,15 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
         replacement.release()
 
 
-@pytest.mark.parametrize("recovery", ["kept", "given-up"])
+@pytest.mark.parametrize(
+    ("recovery", "late_promotion"),
+    [("kept", False), ("kept", True), ("given-up", True)],
+)
 def test_request_timeout_during_promotion_then_retry_uses_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     recovery: str,
+    late_promotion: bool,
     live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
 ) -> None:
     """A retry after promotion is served warm or refused cold, never left hanging."""
@@ -569,6 +574,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
                 nixl_agent_name="target",
                 pool_layouts=[("", page_size)],
                 operation_timeout_ms=5000,
+                abandon_timeout_ms=10_000,
             ),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
             framework_dram=FrameworkDramInput(
@@ -581,7 +587,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         key = BlockKey(b"resident-b")
         stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
         target.submit_hint(_router_hint(source_endpoint), request_id="stalled")
-        target.deliver(
+        stalled_operation = target.deliver(
             {key: [_mem_descriptor(ctypes.addressof(stalled_destination), page_size)]},
             request_id="stalled",
         )
@@ -609,11 +615,27 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         assert list(target.poll_completed()) == []
         assert _has_outstanding_operations(target)
 
+        if late_promotion:
+            now[0] = 10.0
+            completed = _poll_until(target, bool, timeout=2)
+            assert completed[0][0] == stalled_operation
+            assert not completed[0][1][key].success
         continue_promotion.set()
         _wait_until(lambda: guard._serving, timeout=2)
+        assert guard._core is not None
+        _wait_until(
+            lambda: (
+                target._core._remote_fw_dram._dangling_ops.sources.get(source_endpoint)
+                == guard._core._remote_fw_dram._dangling_ops.incarnation
+            ),
+            timeout=2,
+        )
+        if not late_promotion:
+            completed = _poll_until(target, bool, timeout=2)
+            assert completed[0][0] == stalled_operation
+            assert not completed[0][1][key].success
 
         # A real core either way, answering on the endpoint it inherited.
-        assert guard._core is not None
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
         target.submit_hint(_router_hint(source_endpoint), request_id="retry")
         operation = target.deliver(
@@ -669,6 +691,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     idle = spawn("_primary_child", service.socket_path, g3_path, control_port, "idle")
     _await_marker(idle, "ready")
     first_guard = service._registry._guards[0]
+    idle_incarnation = first_guard._pool_lease.current.incarnation
     idle.kill()
     idle.wait(timeout=_TIMEOUT_SECONDS)
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
@@ -684,6 +707,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
         "_primary_child", service.socket_path, g3_path, control_port, "held"
     )
     _await_marker(primary, "ready")
+    primary_incarnation = first_guard._pool_lease.current.incarnation
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -703,6 +727,10 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
         agent=replacement_agent,
     )
     try:
+        assert replacement._core._remote_fw_dram._dangling_ops.dead_incarnations == {
+            idle_incarnation,
+            primary_incarnation,
+        }
         for key, payload in (
             (BlockKey(b"resident-a"), b"A" * page_size),
             (BlockKey(b"resident-b"), b"B" * page_size),

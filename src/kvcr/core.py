@@ -5,6 +5,7 @@
 import functools
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from math import ceil
@@ -121,6 +122,10 @@ class _KVCRCore:
         self._block_sizes = dict(self.pool_layouts)
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
+        if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
+            raise ValueError(
+                "abandon_timeout_ms must be at least twice operation_timeout_ms"
+            )
         if self.config.inventory_report_interval_ms < 0:
             raise ValueError("inventory_report_interval_ms must be non-negative")
         if not 0 <= self.config.capacity_low_watermark_percent <= 100:
@@ -171,6 +176,8 @@ class _KVCRCore:
         ] = {}
 
         self._completion_queue: list[OpResult] = []
+        self._resilience_errors: deque[Exception] = deque()
+        self._pending_progress_items: list[object] = []
         self._joined_completions: dict[
             OpHandle, tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
         ] = {}
@@ -201,8 +208,14 @@ class _KVCRCore:
         )
 
         # Import lazily to keep the concrete backend private to KVCR setup.
+        from .dangling_ops import _log_resilience_event
         from .remote_fw_dram import _RemoteFWDram
 
+        self._on_resilience_event_callback = (
+            _log_resilience_event
+            if bindings.on_resilience_event is None
+            else bindings.on_resilience_event
+        )
         self._local_dram = (
             _LocalDram(self, local_dram_config)
             if local_dram_config is not None
@@ -493,7 +506,10 @@ class _KVCRCore:
 
     # TODO: Expose individual entry completions as they become available.
     def poll_completed(self) -> Iterable[OpResult]:
-        progress_items = self._progress.take_completed()
+        self._progress.raise_if_failed()
+        self._notify_transfer_errors(self._progress.take_completed())
+        progress_items = self._pending_progress_items
+        self._pending_progress_items = []
         if self._g3 is not None:
             progress_items = self._g3.poll_main(progress_items)
         if self._local_dram is not None:
@@ -503,6 +519,17 @@ class _KVCRCore:
         completed = self._completion_queue
         self._completion_queue = []
         return completed
+
+    def _notify_transfer_errors(self, progress_items: list[object]) -> None:
+        # Notify before cleanup can return a buffer to its allocator. Retain the
+        # batch if user code raises, consuming each notification exactly once.
+        for item in progress_items:
+            if isinstance(item, Exception):
+                self._resilience_errors.append(item)
+            else:
+                self._pending_progress_items.append(item)
+        while self._resilience_errors:
+            self._on_resilience_event_callback(self._resilience_errors.popleft())
 
     def abort(
         self,
@@ -544,6 +571,12 @@ class _KVCRCore:
             self._progress.close()
         except BaseException as error:  # noqa: BLE001 - re-raised below
             progress_error = error
+
+        # Shutdown can observe native completion after the last public poll.
+        # Deliver those lifecycle notifications before returning any memory.
+        self._notify_transfer_errors([])
+        while progress_items := self._progress.take_completed():
+            self._notify_transfer_errors(progress_items)
 
         # Cleanup mutates backend state native operations still reference, and
         # a stopped thread does not prove they are done with it. The caller

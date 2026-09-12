@@ -5,7 +5,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Annotated, NewType
+from typing import Annotated, Literal, NewType
 
 import msgspec
 
@@ -45,6 +45,34 @@ class MemDescriptor:
 
 
 PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]] | None
+
+
+class TransferError(RuntimeError):
+    """Lifecycle report for memory exposed by a failed transfer.
+
+    Source reports identify the original keys and local buffers. Destination
+    reports contain only local regions. ``quiesced`` clears this operation's
+    hazard; it never makes the failed data valid or clears other operations.
+    Handles are local to this KVCR instance and report side (source/destination).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        op_handle: OpHandle,
+        *,
+        state: Literal["uncertain", "quiesced"] = "uncertain",
+        source_blocks: dict[BlockKey, list[MemDescriptor]] | None = None,
+        destination_regions: list[MemDescriptor] | None = None,
+    ) -> None:
+        self.op_handle = op_handle
+        self.state = state
+        self.source_blocks = source_blocks
+        self.destination_regions = destination_regions
+        super().__init__(
+            f"{message}: state={state}, op={op_handle}, sources={source_blocks!r}, "
+            f"destinations={destination_regions!r}"
+        )
 
 
 class OpEntryStatus(Enum):

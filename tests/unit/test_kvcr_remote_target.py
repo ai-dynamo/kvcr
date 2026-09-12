@@ -5,7 +5,8 @@
 import ctypes
 import logging
 import time
-from unittest.mock import Mock
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import DEFAULT, Mock
 
 import msgspec
 import pytest
@@ -60,9 +61,10 @@ def test_submit_hint_filters_unlisted_hash():
 
 
 def test_kvcr_opportunistic_query_accepts_key_outside_hint():
+    agent = FakeNixlAgent()
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
-        FakeNixlAgent(),
+        agent,
         FakePrimaryPinning(),
         control,
         key_adapter=_ConstantHashAdapter(),
@@ -77,13 +79,15 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     assert target.query((requested_key,), "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
     ]
-    target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
+    op_handle = target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
 
     assert list(target.poll_completed()) == []
     _wait_until(lambda: bool(control.sent))
     assert _decode_control_message(control.sent[0][1])["keys"] == [requested_key]
     target.discard_hint("req")
     assert target.query((requested_key,), "req") == [(QueryStatus.MISS, None)]
+    agent.notifs["source"] = [_write_done_notification(op_handle)]
+    _poll_until(target, bool)
 
 
 def test_remote_fetch_uses_local_then_framework_sources() -> None:
@@ -399,11 +403,12 @@ def test_remote_completion_rejects_invalid_notification(
 
 
 @pytest.mark.parametrize(
-    "completion_before_timeout", [False, True], ids=["late", "queued"]
+    "resolution", ["queued", "late", "notification", "probe", "guard", "unknown"]
 )
 def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
-    completion_before_timeout: bool,
+    resolution,
 ) -> None:
+    errors = []
     now = 0.0
     block_size = 16
     local = ctypes.create_string_buffer(block_size)
@@ -417,8 +422,10 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         KVCRConfig(
             nixl_agent_name="target",
             pool_layouts=[("", 16)],
-            operation_timeout_ms=10,
+            operation_timeout_ms=1000,
+            abandon_timeout_ms=2000,
         ),
+        on_resilience_event=errors.append,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
@@ -429,31 +436,77 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
 
-    if completion_before_timeout:
+    progress = target._core._progress
+    _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
+    operation = progress._in_flight_ops[("target", message["op_handle"])]
+    assert not operation.close(progress)
+    with pytest.raises(RuntimeError, match="unresolved operations"):
+        progress._close_nixl()
+    assert agent.deregistered == []
+    if resolution != "unknown":
+        control.incoming.append(
+            msgspec.msgpack.encode(
+                {
+                    "type": "target_metadata_ack",
+                    "sender_control_endpoint": "tcp://source:1",
+                    "sender_incarnation": "source",
+                    "op_handle": message["op_handle"],
+                }
+            )
+        )
+        _wait_until(lambda: operation.source_incarnation == "source")
+    if resolution == "queued":
         # Progress accepts success before expiry; main consumes it after expiry.
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         _wait_until(lambda: not target._core._progress._completed.empty())
 
-    now = 0.02
+    now = 1.5  # Past T, but still inside the destination's grace period.
     assert _poll_until(target, lambda completed: bool(completed)) == [
         (fetch, _op_entries({key: False}))
     ]
-    if not completion_before_timeout:
+    if resolution != "queued":
         assert target.query((key,), "req") == [
             (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
         ]
         assert _has_outstanding_operations(target)
+        assert not operation.close(progress)
+        if resolution != "late":
+            now = 2.0
+            assert _poll_until(target, lambda _: bool(errors)) == []
+            assert [error.state for error in errors] == ["uncertain"]
+            control.incoming.append(
+                _probe_ack(
+                    message["op_handle"],
+                    sender_incarnation="new",
+                    terminal=True,
+                    dead_incarnation="source" if resolution == "unknown" else None,
+                )
+            )
+            _wait_until(lambda: not control.incoming)
+            now = 100.0  # Time and a replacement incarnation cannot free the slot.
+            assert list(target.poll_completed()) == []
         blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
         assert list(target.poll_completed()) == [
             (blocked, _op_entries({replacement: False}))
         ]
 
-        agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
+        if resolution in ("probe", "guard"):
+            fields = {"terminal": True}
+            if resolution == "guard":
+                fields.update(sender_incarnation="guard", dead_incarnation="source")
+            control.incoming.append(_probe_ack(message["op_handle"], **fields))
+        else:
+            agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         assert (
             _poll_until(target, lambda _: not _has_outstanding_operations(target)) == []
         )
+    if resolution not in ("queued", "late"):
+        assert [error.state for error in errors] == ["uncertain", "quiesced"]
+        assert all(error.op_handle == message["op_handle"] for error in errors)
+        assert errors[0].destination_regions == errors[1].destination_regions
     assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
+    assert operation.close(progress)
 
     # The terminal completion makes the single slot reusable.
     primary = ctypes.create_string_buffer(b"a" * block_size, block_size)
@@ -522,6 +575,8 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
     ]
+    assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
+    assert not source._core._remote_fw_dram._dangling_ops.source_writes
 
     target_control.sent = []
     retry_handle = target.deliver(
@@ -554,15 +609,30 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
 
 
+def _probe_ack(handle, source="tcp://source:1", **fields):
+    return msgspec.msgpack.encode(
+        {
+            "type": "write_probe_ack",
+            "sender_control_endpoint": source,
+            "sender_incarnation": "source",
+            "op_handle": handle,
+            "terminal": False,
+            **fields,
+        }
+    )
+
+
 def _acked_deliver(control, kvcr, source, key):
     """Drive a deliver whose start_write carries no metadata, and return it."""
     kvcr.submit_hint(_router_hint(source), request_id="metadata")
     _wait_until(lambda: len(control.sent) == 1)
-    control.incoming.append(
-        msgspec.msgpack.encode(
-            {"type": "target_metadata_ack", "sender_control_endpoint": source}
-        )
-    )
+    ack = {
+        "type": "target_metadata_ack",
+        "sender_control_endpoint": source,
+        "target_agent": "source",
+        "sender_incarnation": "source",
+    }
+    control.incoming.append(msgspec.msgpack.encode(ack))
     _wait_until(lambda: not control.incoming)
     control.sent = []
 
@@ -672,10 +742,9 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     ] == ["target_metadata"]
 
 
-@pytest.mark.parametrize("terminal_success", [False, True])
-def test_kvcr_deliver_timeout_waits_for_terminal_notification(
-    terminal_success: bool,
-) -> None:
+@pytest.mark.parametrize("source_responsive", [False, True])
+def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
+    errors = []
     now = 0.0
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl()
@@ -687,38 +756,221 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
             nixl_agent_name="target",
             pool_layouts=[("", 16)],
             operation_timeout_ms=1000,
+            abandon_timeout_ms=7000,
         ),
+        on_resilience_event=errors.append,
     )
     kvcr._core._clock = lambda: now
-    key = BlockKey(b"k0")
+    key, source = BlockKey(b"k0"), "tcp://source:1"
+    handle, _ = _acked_deliver(control, kvcr, source, key)
+    control.sent.clear()
+    control.send = Mock(wraps=control.send, side_effect=[False, DEFAULT])
+    now = 1.0
+    _wait_until(lambda: control.send.call_count == 2)
+    control.send.side_effect = None
+    assert list(kvcr.poll_completed()) == []
+    if source_responsive:
+        agent.notifs["source"] = [
+            _write_done_notification(handle, success=False, terminal=False)
+        ]
+        control.incoming.append(_probe_ack(handle, source))
+        _wait_until(lambda: not control.incoming and not agent.notifs)
+        assert list(kvcr.poll_completed()) == []
+    now = 6.0
+    time.sleep(0.01)
+    assert list(kvcr.poll_completed()) == []
+    now = 7.0
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    assert control.send.call_count == 3  # Retry at T, then cleanup at abandonment.
+    assert [error.state for error in errors] == ["uncertain"]
+    assert errors[0].op_handle == handle
 
-    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
+    # An abandoned operation must not blacklist the endpoint for fresh work.
+    kvcr.submit_hint(_router_hint(source), request_id="retry")
+    retry = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
     _wait_until(
         lambda: any(
-            _decode_control_message(message)["type"] == "start_write"
-            for _, message in control.sent
+            _decode_control_message(raw).get("op_handle") == retry
+            for _, raw in control.sent
         )
     )
-    _wait_until(
-        lambda: "tcp://source:1" in kvcr._core._remote_fw_dram._metadata_retry_after
-    )
+    agent.notifs["source"] = [_write_done_notification(retry)]
+    assert _poll_until(kvcr, bool) == [(retry, _op_entries({key: True}))]
 
-    now = 2.0
-    _wait_until(
-        lambda: "tcp://source:1" not in kvcr._core._remote_fw_dram._metadata_retry_after
+    control.incoming.append(
+        _probe_ack(handle, source, sender_incarnation="guard", terminal=True)
     )
+    _wait_until(lambda: not control.incoming)
+    now = 100.0
     assert list(kvcr.poll_completed()) == []
     assert _has_outstanding_operations(kvcr)
+    assert len(errors) == 1
+    control.incoming.append(
+        _probe_ack(
+            handle, source, sender_incarnation="guard", dead_incarnation="source"
+        )
+    )
+    assert _poll_until(kvcr, lambda _: len(errors) == 2) == []
+    assert not _has_outstanding_operations(kvcr)
+    assert [error.state for error in errors] == ["uncertain", "quiesced"]
+    assert errors[0].destination_regions == errors[1].destination_regions
 
-    agent.notifs["source"] = [
-        _write_done_notification(op_handle, success=terminal_success)
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "cancelled",
+        "cancelled_same_poll",
+        "failed_first",
+        "failed_last",
+        "terminal",
+        "log",
+        "raise",
+        "shutdown",
+        "shutdown_probe",
+    ],
+)
+def test_remote_write_cancellation_and_late_completion(
+    outcome,
+    caplog,
+):
+    caplog.set_level(logging.INFO, logger="kvcr.core")
+    shutting_down = outcome.startswith("shutdown")
+    errors = []
+
+    def on_resilience_event(error):
+        errors.append(error)
+        raise error
+
+    now = 0.0
+    descriptor = _mem_descriptor()
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="target", pool_layouts=[("", 16)], operation_timeout_ms=1000
+        ),
+        on_resilience_event=on_resilience_event if outcome == "raise" else None,
+    )
+    kvcr._core._clock = lambda: now
+    key, source = BlockKey(b"k0"), "tcp://source:1"
+    handle, _ = _acked_deliver(control, kvcr, source, key)
+    if outcome in ("cancelled", "cancelled_same_poll", "failed_first", "failed_last"):
+        # The source can cancel before the target's own timeout.
+        now = 0.5
+        cancelled = _write_done_notification(
+            handle, success=False, terminal=outcome in ("failed_first", "failed_last")
+        )
+        notifications = [_write_done_notification(handle)]
+        if outcome == "cancelled":
+            agent.notifs["source"] = [cancelled]
+            _wait_until(lambda: not agent.notifs)
+            assert list(kvcr.poll_completed()) == []
+        elif outcome == "failed_first":
+            notifications.insert(0, cancelled)
+        else:
+            notifications.append(cancelled)
+        agent.notifs["source"] = notifications
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        return
+    now = 1.0
+    _wait_until(
+        lambda: any(
+            _decode_control_message(raw).get("type") == "write_probe"
+            for _, raw in control.sent
+        )
+    )
+    if outcome == "terminal":
+        # The Guard's reply and a completed write may be observed in one poll.
+        # The destination is still held, so this is not a late write.
+        def guard_reply():
+            control.recv = lambda: []
+            agent.notifs["source"] = [
+                _write_done_notification(handle, success=False),
+                _write_done_notification(handle),
+                _write_done_notification(handle, success=False),
+            ]
+            return [
+                _probe_ack(
+                    handle,
+                    source,
+                    sender_incarnation="guard",
+                    dead_incarnation="source",
+                ),
+            ]
+
+        control.recv = guard_reply
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        return
+    now = 5.0
+    if outcome == "raise":
+        with pytest.raises(RuntimeError):
+            _poll_until(kvcr, bool)
+        assert [error.state for error in errors] == ["uncertain"]
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    kvcr.submit_hint(_router_hint(source), request_id="retry")
+    other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+    _wait_until(
+        lambda: any(
+            _decode_control_message(raw).get("op_handle") == other_handle
+            for _, raw in control.sent
+        )
+    )
+    notifications = [
+        _write_done_notification(handle, success=False, terminal=False),
+        _write_done_notification(handle),
+        _write_done_notification(handle, success=False, terminal=False),
+        _write_done_notification(other_handle),
     ]
-    assert _poll_until(kvcr, lambda completed: bool(completed)) == [
-        (op_handle, _op_entries({key: terminal_success}))
-    ]
-    assert not kvcr._core._remote_fw_dram._source_pin_ops
-    assert not kvcr._core._block_record_map
+    if shutting_down:
+        # Drain framework jobs, then resolve the old quarantine during close.
+        agent.notifs["source"] = [_write_done_notification(other_handle)]
+        assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            closing = executor.submit(kvcr.close)
+            _wait_until(lambda: kvcr._core._progress._startup_stage == "cleanup")
+            if outcome == "shutdown_probe":
+
+                def guard_reply(_endpoint, message):
+                    if _decode_control_message(message)["type"] == "write_probe":
+                        control.incoming.append(
+                            _probe_ack(
+                                handle,
+                                source,
+                                sender_incarnation="guard",
+                                dead_incarnation="source",
+                            )
+                        )
+                    return True
+
+                control.send = guard_reply
+                now = 6.0
+            else:
+                agent.notifs["source"] = notifications
+            closing.result(timeout=6)
+        assert kvcr._core.is_quiescent()
+    else:
+        agent.notifs["source"] = notifications
+    if outcome == "raise":
+        with pytest.raises(RuntimeError):
+            _poll_until(kvcr, bool)
+    # Even a raising handler must not kill progress or lose another completion.
+    if not shutting_down:
+        assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
+    if outcome == "log" or shutting_down:
+        errors = [
+            record.args[0]
+            for record in caplog.records
+            if record.args and getattr(record.args[0], "op_handle", None) == handle
+        ]
+    assert [error.state for error in errors] == ["uncertain", "quiesced"]
+    for error in errors:
+        assert error.op_handle == handle
+        assert error.destination_regions == [descriptor]
+        assert error.source_blocks is None
+    kvcr.close()
 
 
 def test_kvcr_target_ignores_unknown_op_handle_notification():
@@ -826,6 +1078,11 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
         "tcp://source-B:1",
     ]
     assert {("target", op_a), ("target", op_b)} <= _block_op_ids(kvcr)
+    agent.notifs["source"] = [
+        _write_done_notification(op_a),
+        _write_done_notification(op_b),
+    ]
+    _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
 
 
 @pytest.mark.parametrize(

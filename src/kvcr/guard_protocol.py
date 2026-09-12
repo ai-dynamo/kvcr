@@ -9,6 +9,7 @@ import mmap
 import os
 import socket
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
@@ -88,6 +89,7 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim"):
     control_host: str
     control_port: Annotated[int, msgspec.Meta(ge=1, le=65535)]
     version: ProtocolVersion
+    incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
 
     def __post_init__(self) -> None:
         # A literal address, because the service binds this holding the lock
@@ -115,6 +117,7 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     tier_config: _TierConfig
     pools: tuple[_PoolDescriptor, ...]
     version: ProtocolVersion
+    dead_incarnations: tuple[str, ...] = ()
 
 
 class _Released(msgspec.Struct, frozen=True, tag="released"):
@@ -137,6 +140,7 @@ class PidfdLiveness:
 
     def __init__(self, pidfd: int) -> None:
         self._pidfd = pidfd
+        self.incarnation: str | None = None
         self._close_lock = threading.Lock()
 
     @classmethod
@@ -183,6 +187,8 @@ class KVCRPoolHold:
     _attachment: KVCRPoolAttachment
     _connection: FramedConnection
     _control_listener_fd: int | None = None
+    _incarnation: str | None = None
+    _dead_incarnations: tuple[str, ...] = ()
     _release_attempted: bool = field(default=False, init=False, repr=False)
 
     def hand_listener_to(self, adopt: Callable[[int], None]) -> None:
@@ -256,6 +262,7 @@ class KVCRClient:
                 "control_host": control_bind[0],
                 "control_port": control_bind[1],
                 "version": _PROTOCOL_VERSION,
+                "incarnation": uuid.uuid4().hex,
             },
             type=_Claim,
         )
@@ -296,6 +303,8 @@ class KVCRClient:
                 _attachment=attachment,
                 _connection=connection,
                 _control_listener_fd=listener_fd,
+                _incarnation=request.incarnation,
+                _dead_incarnations=response.dead_incarnations,
             )
         except BaseException as error:
             # Release the lease only after local access has stopped, or the

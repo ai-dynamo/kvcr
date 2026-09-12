@@ -104,7 +104,7 @@ A KVCR-owned DRAM pool may be allocated by the framework and passed to KVCR, or 
 
 `compatibility_manifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible.
 
-If the engine or GPU fails, KVCR-Guard fences the failed owner before activating its backup KVCR. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
+If the engine or GPU fails, KVCR-Guard verifies that the owning process has died before activating its backup KVCR; a timeout alone is not sufficient. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
 
 ### State Model
 
@@ -124,7 +124,22 @@ The event loop owns KVCR metadata mutations and never performs blocking external
 
 The active in-process KVCR owns the NIXL agent used for KVCR-owned memory and framework memory exposed through the KVCR bindings. A future integration may instead coordinate with a framework-owned agent. When resilience is enabled, the backup KVCR has its own agent but uses it only after a fenced takeover.
 
-Each operation is bounded by a deadline. When an operation times out or is cancelled, KVCR reports caller-visible completion and begins safe release immediately. Framework pins are released as soon as their dependent work finishes, minimizing interference with framework scheduling. If NIXL may still access an underlying descriptor, physical release waits until the transfer has quiesced. Expired pins are not reused; any still-needed keys are acquired again. If physical cleanup extends beyond the deadline, it does so only for safe release, not further KVCR scheduling.
+Each operation is bounded by a deadline. When an operation times out or is cancelled, KVCR begins failure handling and cleanup. Logical failure and memory reuse are separate: backing allocations and NIXL registrations remain valid until native access has quiesced. Framework pins may be handed back under the uncertainty contract below; KVCR-owned memory stays claimed while unresolved. Expired pins are not reused; any still-needed keys are acquired again. Cleanup beyond the deadline does not schedule further work for the failed operation.
+
+### Failed Peers and Dangling Operations
+
+An internal per-instance identifier distinguishes processes even when NIXL agent names are reused; it is not proof of process death. Remote `fetch` and `deliver` use NIXL writes from the source to the destination. Both deadlines are measured from operation start: `operation_timeout_ms` (`T`, default 1000) begins cancellation, and `abandon_timeout_ms` (`A`, default 5000) must be at least `2T`. At `T`, the destination probes the source; cancellation blocks unsubmitted work and sends an advisory while native cleanup continues. At `A`, unresolved operations report uncertainty before handing framework memory back. Nonterminal replies do not extend either deadline. Once cancelled, the operation stays failed; later native success only completes cleanup.
+
+`KVCRBindings.on_resilience_event` receives `TransferError` events during `poll_completed()` and may receive final cleanup events during `close()`:
+
+- `state="uncertain"` identifies regions that native work may still access. It arrives before KVCR relinquishes framework source pins or returns a completion for a framework destination.
+- `state="quiesced"` carries the same `op_handle` and regions when that operation can no longer access them. It permits reclamation of that operation's hold, without restoring success or clearing other operations' overlapping holds.
+
+Source events identify original keys and local buffers; destination events identify regions, not their current keys. `op_handle` is local to the reporting KVCR; `source_blocks` or `destination_regions` identifies its role. Pair the two states by that local handle and role; their regions are unchanged. The framework owns quarantine and capacity policy for its memory. It may return `False` from `release_pin` to leave release pending, or `True` to accept responsibility while keeping the allocation quarantined. By default, `uncertain` logs at ERROR and `quiesced` at INFO. A custom callback may raise to its caller; pending releases and completions are retained for a later poll or close attempt. Callback failure does not stop native progress. Framework quarantine is opt-in; without a custom handler, events are only logged and framework-owned memory is not quarantined by KVCR.
+
+The source retains its existing native operation state until NIXL reports `DONE`; pending states, `ERR`, and state-query failures do not establish quiescence. Releasing a handle is not proof that native access stopped. The destination keeps its existing operation in `QUARANTINED` state as the tombstone, retaining the original source incarnation and local regions. After `A`, it probes every `T` until a matching terminal reply or Guard-confirmed death of that original source process resolves it. There is no separate tombstone registry or expiry deadline. Process-death resolution relies on the supported transport's process-lifetime contract; it is not a general revocation guarantee for persistent RDMA transports. Neither heartbeat timeout, a reused agent name, nor elapsed retention time resolves uncertainty. Guard takeover fails old operations rather than replaying them.
+
+KVCR-owned local G2 source claims and discarded destination fills remain held while unresolved, even indefinitely. Their slots cannot be evicted or reused until quiescence; framework quarantine alone cannot protect KVCR's allocator. Source progress stalls are reported once as a `RuntimeError` through the same callback. New source writes remain disabled until restart; native cleanup continues.
 
 ---
 
@@ -162,12 +177,7 @@ framework.cancel_pin_request(pin_request_id)                                    
 framework.release_pin(pin_handle)                                                 # release an acquired framework-owned source pin
 ```
 
-The list-shaped API allows a key to span multiple pools. A descriptor's `info`
-can identify its pool and may be extended for other descriptor metadata.
-`fetch` may receive the expected layout shared by its keys as an ordered list
-of pool names so KVCR can allocate the destinations. Repeated names represent
-multiple descriptors from the same pool. A single-pool caller using the empty
-pool name may omit it.
+The list-shaped API allows a key to span multiple pools. A descriptor's `info` can identify its pool and may be extended for other descriptor metadata. `fetch` may receive the expected layout shared by its keys as an ordered list of pool names so KVCR can allocate the destinations. Repeated names represent multiple descriptors from the same pool. A single-pool caller using the empty pool name may omit it.
 
 ### Operating flow
 
@@ -197,8 +207,7 @@ These statuses describe current KVCR knowledge, not a reservation or guarantee. 
 
 `deposit` copies from framework-owned memory into the KVCR's pool, while `deliver` places data into a framework-provided destination. `deliver` does not name a source; source selection remains with the KVCR and router. The KVCR does not allocate or free framework memory.
 
-To serve from framework-owned memory, the KVCR acquires a pin asynchronously through `request_pin` and `poll_pin_results`, reusing covered keys and requesting only the remainder; the framework keeps it valid until the KVCR calls `release_pin`.
-`release_pin` must be safely retryable: `False` or an exception leaves release pending; `True` means the framework accepts responsibility for completing release.
+To serve from framework-owned memory, the KVCR acquires a pin asynchronously through `request_pin` and `poll_pin_results`, reusing covered keys and requesting only the remainder; the framework keeps it valid until `release_pin` accepts release. `release_pin` must be safely retryable: `False` or an exception leaves release pending; `True` means the framework accepts responsibility for completing release, including retaining uncertain allocations until the matching `quiesced` event.
 
 A deployment may choose to use only framework-owned memory. In that case, it uses the pinning mechanism together with `deliver` and does not use `deposit`, `fetch`, or `release`.
 
@@ -253,7 +262,7 @@ The router is never on the data path: KVCR instances execute transfers peer-to-p
 
 Peer transfers use a separate control channel for connection metadata, acknowledgements, and transfer control; payload bytes move directly through NIXL and never traverse the router or control channel. Peer-protocol versioning and compatibility checks may be added as needed.
 
-The engine and router already maintain engine liveness, so loss of an in-process KVCR is covered by the engine's existing heartbeat path and does not require another KVCR heartbeat. KVCR-Guard sends its own heartbeat to the main process. If a future recovery design requires KVCR-Guard to advertise liveness or takeover directly to the router, that channel can be added then.
+The engine and router already maintain engine liveness, so loss of an in-process KVCR is covered by the engine's existing heartbeat path and does not require another periodic KVCR heartbeat. If a future recovery design requires KVCR-Guard to advertise liveness or takeover directly to the router, that channel can be added then.
 
 ---
 
