@@ -354,9 +354,9 @@ class _KVCRProgress:
             events, _ = self._poll(self, [])
             for op_id, op in list(self._in_flight_ops.items()):
                 closed = op.close(self)
-                # A peer reply can settle an operation that close alone cannot.
-                if not closed and op_id in events:
-                    closed, _ = op.progress(self, events[op_id])
+                # Pending cleanup still needs timers and peer replies.
+                if not closed:
+                    closed, _ = op.progress(self, events.get(op_id))
                 if closed:
                     self._in_flight_ops.pop(op_id, None)
             if not self._in_flight_ops:

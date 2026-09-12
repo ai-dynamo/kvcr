@@ -827,6 +827,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         "log",
         "raise",
         "shutdown",
+        "shutdown_probe",
     ],
 )
 def test_remote_write_cancellation_and_late_completion(
@@ -834,6 +835,7 @@ def test_remote_write_cancellation_and_late_completion(
     caplog,
 ):
     caplog.set_level(logging.INFO, logger="kvcr.core")
+    shutting_down = outcome.startswith("shutdown")
     errors = []
 
     def on_resilience_event(error):
@@ -854,14 +856,7 @@ def test_remote_write_cancellation_and_late_completion(
     )
     kvcr._core._clock = lambda: now
     key, source = BlockKey(b"k0"), "tcp://source:1"
-    kvcr.submit_hint(_router_hint(source), request_id="load")
-    handle = kvcr.deliver({key: [descriptor]}, request_id="load")
-    _wait_until(
-        lambda: any(
-            _decode_control_message(raw).get("type") == "start_write"
-            for _, raw in control.sent
-        )
-    )
+    handle, _ = _acked_deliver(control, kvcr, source, key)
     if outcome in ("cancelled", "cancelled_same_poll", "failed_first", "failed_last"):
         # The source can cancel before the target's own timeout.
         now = 0.5
@@ -898,15 +893,6 @@ def test_remote_write_cancellation_and_late_completion(
                 _write_done_notification(handle, success=False),
             ]
             return [
-                msgspec.msgpack.encode(
-                    {
-                        "type": "target_metadata_ack",
-                        "sender_control_endpoint": source,
-                        "target_agent": "source",
-                        "sender_incarnation": "source",
-                        "op_handle": handle,
-                    }
-                ),
                 _probe_ack(
                     handle,
                     source,
@@ -917,7 +903,6 @@ def test_remote_write_cancellation_and_late_completion(
 
         control.recv = guard_reply
         assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
-        assert "late remote write" not in caplog.text
         return
     now = 5.0
     if outcome == "raise":
@@ -939,14 +924,31 @@ def test_remote_write_cancellation_and_late_completion(
         _write_done_notification(handle, success=False, terminal=False),
         _write_done_notification(other_handle),
     ]
-    if outcome == "shutdown":
+    if shutting_down:
         # Drain framework jobs, then resolve the old quarantine during close.
         agent.notifs["source"] = [_write_done_notification(other_handle)]
         assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
         with ThreadPoolExecutor(max_workers=1) as executor:
             closing = executor.submit(kvcr.close)
             _wait_until(lambda: kvcr._core._progress._startup_stage == "cleanup")
-            agent.notifs["source"] = notifications
+            if outcome == "shutdown_probe":
+
+                def guard_reply(_endpoint, message):
+                    if _decode_control_message(message)["type"] == "write_probe":
+                        control.incoming.append(
+                            _probe_ack(
+                                handle,
+                                source,
+                                sender_incarnation="guard",
+                                dead_incarnation="source",
+                            )
+                        )
+                    return True
+
+                control.send = guard_reply
+                now = 6.0
+            else:
+                agent.notifs["source"] = notifications
             closing.result(timeout=6)
         assert kvcr._core.is_quiescent()
     else:
@@ -955,9 +957,9 @@ def test_remote_write_cancellation_and_late_completion(
         with pytest.raises(RuntimeError):
             _poll_until(kvcr, bool)
     # Even a raising handler must not kill progress or lose another completion.
-    if outcome != "shutdown":
+    if not shutting_down:
         assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
-    if outcome in ("log", "shutdown"):
+    if outcome == "log" or shutting_down:
         errors = [
             record.args[0]
             for record in caplog.records

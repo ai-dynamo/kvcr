@@ -196,7 +196,8 @@ class _TargetPullOp(_RemoteOp):
             return True, True
 
         if self.state is _TargetPullState.QUARANTINED:
-            # The retained operation is its own tombstone and shutdown guard.
+            # Retain this tombstone indefinitely until quiescence is proven;
+            # elapsed time alone cannot make its destination safe to reuse.
             return False, backend._dangling_ops.poll_target(progress, self, now)
 
         if now >= self.deadline or (
@@ -829,6 +830,11 @@ class _RemoteFWDram:
         return outbound
 
     def close_progress(self) -> None:
+        # Accepted writes may still be waiting for main-thread pin acquisition.
+        for (target, handle), status in self._dangling_ops.source_writes.items():
+            cached = self._remote_agents_by_target.get(target)
+            if not status.submitted and cached is not None:
+                self._send_write_done(self._kvcr._progress, cached[1], handle, False)
         close_control = getattr(self._control, "close", None)
         if close_control is not None:
             close_control()

@@ -56,7 +56,7 @@ class _DanglingOps:
         gap_ms = (time.monotonic() - self._last_progress_at) * 1000
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:
-            # Stay disabled so queued pre-stall requests cannot get fresh deadlines.
+            # Require restart so queued pre-stall requests cannot get fresh deadlines.
             self._source_stalled = True
             self._backend._progress_outbound.append(
                 RuntimeError(

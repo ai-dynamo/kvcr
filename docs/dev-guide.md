@@ -657,6 +657,7 @@ one local DP rank and uses illustrative capacities and ports:
         "control_advertise_host": "127.0.0.1",
         "eager_ctrl_connect": true,
         "operation_timeout_ms": 1000,
+        "abandon_timeout_ms": 5000,
         "enable_telemetry": true
       }
     ]
