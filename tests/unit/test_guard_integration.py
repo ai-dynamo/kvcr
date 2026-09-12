@@ -691,6 +691,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     idle = spawn("_primary_child", service.socket_path, g3_path, control_port, "idle")
     _await_marker(idle, "ready")
     first_guard = service._registry._guards[0]
+    idle_incarnation = first_guard._pool_lease.current.incarnation
     idle.kill()
     idle.wait(timeout=_TIMEOUT_SECONDS)
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
@@ -706,6 +707,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
         "_primary_child", service.socket_path, g3_path, control_port, "held"
     )
     _await_marker(primary, "ready")
+    primary_incarnation = first_guard._pool_lease.current.incarnation
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -725,6 +727,10 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
         agent=replacement_agent,
     )
     try:
+        assert replacement._core._remote_fw_dram._dangling_ops.dead_incarnations == {
+            idle_incarnation,
+            primary_incarnation,
+        }
         for key, payload in (
             (BlockKey(b"resident-a"), b"A" * page_size),
             (BlockKey(b"resident-b"), b"B" * page_size),

@@ -411,6 +411,12 @@ class _Guard:
             self._phase = _Phase.FAILED
         self._escalate(error)
 
+    @property
+    def dead_incarnations(self) -> tuple[str, ...]:
+        """Snapshot confirmed deaths for a replacement primary's claim."""
+        with self._phase_lock:
+            return tuple(sorted(self._dead_incarnations))
+
     def start(self) -> None:
         """Attach the pool and begin the lifecycle thread, before any claim."""
         if self._started:
@@ -624,7 +630,8 @@ class _Guard:
                 # second server over a live mapping.
                 raise OSError(f"pidfd poll returned without POLLIN: {flags:#x}")
             if lease.incarnation is not None:
-                self._dead_incarnations.add(lease.incarnation)
+                with self._phase_lock:
+                    self._dead_incarnations.add(lease.incarnation)
             self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)

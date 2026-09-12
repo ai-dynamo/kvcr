@@ -257,7 +257,11 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
 ) -> None:
     """A claim/release round-trips typed wire messages, geometry, and ownership."""
     events: list[str] = []
-    connection = _RecordingConnection([_grant(), _Released(1)], events)
+    grant = msgspec.structs.replace(_grant(), dead_incarnations=("dead-primary",))
+    decoded = protocol_module._CLAIM_RESPONSE_DECODER.decode(
+        msgspec.msgpack.encode(grant)
+    )
+    connection = _RecordingConnection([decoded, _Released(1)], events)
     attachment = _Attachment(events)
     attach = Mock(return_value=attachment)
     _connect_with(monkeypatch, connection)
@@ -268,6 +272,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     )
 
     assert hold._incarnation
+    assert hold._dead_incarnations == ("dead-primary",)
     assert msgspec.to_builtins(connection.sent[0]) == {
         "type": "claim",
         "guard_index": _GUARD_INDEX,
@@ -282,7 +287,8 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "version": 1,
         "incarnation": hold._incarnation,
     }
-    grant_wire = msgspec.to_builtins(_grant())
+    grant_wire = msgspec.to_builtins(grant)
+    assert grant_wire["dead_incarnations"] == ("dead-primary",)
     assert grant_wire["type"] == "granted"
     assert grant_wire["version"] == 1
     assert grant_wire["guard_index"] == _GUARD_INDEX
@@ -292,7 +298,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "remote_fw_dram_backend": "UCX",
     }
     assert grant_wire["pools"] == msgspec.to_builtins(_WIRE_POOLS)
-    attach.assert_called_once_with(_grant().spec)
+    attach.assert_called_once_with(grant.spec)
     assert hold.local_dram == _local_dram()
     # The endpoint a Guard will answer on, handed over with the grant.
     assert hold._control_listener_fd == connection.handed_fd

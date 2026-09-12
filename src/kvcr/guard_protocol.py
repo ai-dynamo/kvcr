@@ -117,6 +117,7 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     tier_config: _TierConfig
     pools: tuple[_PoolDescriptor, ...]
     version: ProtocolVersion
+    dead_incarnations: tuple[str, ...] = ()
 
 
 class _Released(msgspec.Struct, frozen=True, tag="released"):
@@ -187,6 +188,7 @@ class KVCRPoolHold:
     _connection: FramedConnection
     _control_listener_fd: int | None = None
     _incarnation: str | None = None
+    _dead_incarnations: tuple[str, ...] = ()
     _release_attempted: bool = field(default=False, init=False, repr=False)
 
     def hand_listener_to(self, adopt: Callable[[int], None]) -> None:
@@ -302,6 +304,7 @@ class KVCRClient:
                 _connection=connection,
                 _control_listener_fd=listener_fd,
                 _incarnation=request.incarnation,
+                _dead_incarnations=response.dead_incarnations,
             )
         except BaseException as error:
             # Release the lease only after local access has stopped, or the

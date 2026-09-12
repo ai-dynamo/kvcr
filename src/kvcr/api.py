@@ -72,8 +72,8 @@ class KVCRBindings:
     stats_factory: Callable[[], TelemetryStats] | None = None
     policy: "KVCachePolicy | None" = None
 
-    # Called by poll_completed; None logs at ERROR. A handler may raise to its caller.
-    on_error: Callable[[Exception], None] | None = None
+    # Resilience failures and transfer lifecycle events; defaults to logging.
+    on_resilience_event: Callable[[Exception], None] | None = None
 
 
 class KVCR:

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Bounded handling of dangling operations and late-completion diagnostics."""
+"""Cancellation, quarantine, and lifecycle events for unresolved remote writes."""
 
-import heapq
 import time
 import uuid
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from itertools import chain
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from .core import logger
 from .types import OpHandle, TransferError
@@ -16,8 +16,13 @@ if TYPE_CHECKING:
     from .remote_fw_dram import _RemoteFWDram, _SourceWriteOp, _TargetPullOp
 
 
-def _log_error(error: Exception) -> None:
-    logger.error("%s", error)
+def _log_resilience_event(error: Exception) -> None:
+    log = (
+        logger.info
+        if isinstance(error, TransferError) and error.state == "quiesced"
+        else logger.error
+    )
+    log("%s", error)
 
 
 @dataclass
@@ -28,14 +33,8 @@ class _SourceWriteStatus:
     abandoned: bool = False
 
 
-@dataclass
-class _Tombstone:
-    operation: "_TargetPullOp"
-    expires_at: float | None = None
-
-
 class _DanglingOps:
-    """Progress-thread state for probes, stalled sources, and tombstones."""
+    """Progress-thread resilience policy for operations that retain their memory."""
 
     def __init__(self, backend: "_RemoteFWDram") -> None:
         self._backend = backend
@@ -43,9 +42,6 @@ class _DanglingOps:
         self.dead_incarnations: set[str] = set()
         self.sources: dict[str, str] = {}
         self.source_writes: dict[tuple[str, OpHandle], _SourceWriteStatus] = {}
-        # TODO: Add a retention limit if unresolved tombstones accumulate.
-        self.tombstones: dict[OpHandle, _Tombstone] = {}
-        self._expirations: list[tuple[float, OpHandle]] = []
         self._last_progress_at: float | None = None
         self._source_stalled = False
 
@@ -75,37 +71,74 @@ class _DanglingOps:
         self, progress: "_KVCRProgress", op: "_SourceWriteOp", *, cancelling: bool
     ) -> tuple[bool, Any | None] | None:
         status = self.source_writes[(op.route[0], op.op_handle)]
-        first_attempt = cancelling and status.cancel_deadline is None
-        if first_attempt:
+        if cancelling and status.cancel_deadline is None:
             config = self._backend._kvcr.config
             status.cancel_deadline = (
                 op.deadline
                 + (config.abandon_timeout_ms - config.operation_timeout_ms) / 1000
             )
+            self._backend._send_write_done(
+                progress, op.remote_agent, op.op_handle, False, terminal=False
+            )
         result = progress.poll_transfer(
-            cast(int, op.transfer_id), cancellation_requested=cancelling
+            cast(int, op.transfer_id), require_completion=True
         )
-        if result is None and cancelling:
-            if first_attempt:
-                self._backend._send_write_done(
-                    progress, op.remote_agent, op.op_handle, False, terminal=False
-                )
-            if not status.abandoned and self._backend._kvcr._clock() >= cast(
-                float, status.cancel_deadline
-            ):
-                status.abandoned = True
-                # Release content pins, not the registration or native work.
-                # The CANCEL_PENDING snapshot is a release request, not terminal proof.
-                error = TransferError(
-                    "KVCR source cancellation timed out",
-                    op.op_handle,
-                    source_blocks={
-                        key: list(descriptors)
-                        for key, descriptors in zip(op.ordered_keys, op.src_descriptors)
-                    },
-                )
-                self._backend._progress_outbound.extend([replace(op), error])
+        if (
+            result is None
+            and cancelling
+            and not status.abandoned
+            and self._backend._kvcr._clock() >= cast(float, status.cancel_deadline)
+        ):
+            status.abandoned = True
+            self.report_source(op, "uncertain")
+            self._backend._progress_outbound.append(replace(op))
         return result
+
+    def finish_source(self, op: "_SourceWriteOp") -> None:
+        status = self.source_writes.pop((op.route[0], op.op_handle), None)
+        if status is not None and status.abandoned:
+            self.report_source(op, "quiesced")
+
+    def report_source(
+        self, op: "_SourceWriteOp", state: Literal["uncertain", "quiesced"]
+    ) -> None:
+        self._backend._progress_outbound.append(
+            TransferError(
+                "KVCR source write memory",
+                OpHandle(op.op_id[1]),
+                state=state,
+                source_blocks={
+                    key: list(descriptors)
+                    for key, descriptors in zip(op.ordered_keys, op.src_descriptors)
+                },
+            )
+        )
+
+    def poll_target(
+        self, progress: "_KVCRProgress", op: "_TargetPullOp", now: float
+    ) -> bool:
+        first_poll = not op.uncertain
+        if first_poll:
+            op.uncertain = True
+            self.report_target(op, "uncertain")
+            self._backend._progress_outbound.append(replace(op))
+            self._backend._invalidate_control_peer(op.remote_ctrl_ep)
+        if first_poll or now >= op.deadline:
+            op.deadline = now + self._backend._kvcr.config.operation_timeout_ms / 1000
+            return self.probe(progress, op)
+        return False
+
+    def report_target(
+        self, op: "_TargetPullOp", state: Literal["uncertain", "quiesced"]
+    ) -> None:
+        self._backend._progress_outbound.append(
+            TransferError(
+                "KVCR remote write memory",
+                op.op_id[1],
+                state=state,
+                destination_regions=list(chain.from_iterable(op.dst_descriptors)),
+            )
+        )
 
     def probe(self, progress: "_KVCRProgress", op: "_TargetPullOp") -> bool:
         return self._backend._send_control(
@@ -117,41 +150,6 @@ class _DanglingOps:
                 "source_incarnation": op.source_incarnation,
             },
         )
-
-    def abandon(self, progress: "_KVCRProgress", op: "_TargetPullOp") -> None:
-        # Best effort, not a transport fence. The caller may reuse these addresses.
-        self.tombstones[op.op_id[1]] = _Tombstone(op)
-        self._backend._invalidate_control_peer(op.remote_ctrl_ep)
-        self.probe(progress, op)  # Cleanup only: never extends the operation deadline.
-
-    def notification(
-        self, progress: "_KVCRProgress", op_handle: OpHandle, payload: dict[str, Any]
-    ) -> None:
-        tombstone = self.tombstones.get(op_handle)
-        if tombstone is None:
-            return
-        if (
-            payload.get("success") is True
-            and ("target", op_handle) not in progress._in_flight_ops
-        ):
-            self._backend._progress_outbound.append(
-                TransferError(
-                    f"KVCR late remote write from {payload.get('source_agent')!r}",
-                    op_handle,
-                    destination_regions=[
-                        descriptor
-                        for descriptors in tombstone.operation.dst_descriptors
-                        for descriptor in descriptors
-                    ],
-                )
-            )
-        self.tombstones.pop(op_handle)
-
-    def expire(self) -> None:
-        now = self._backend._kvcr._clock()
-        while self._expirations and self._expirations[0][0] <= now:
-            _, handle = heapq.heappop(self._expirations)
-            self.tombstones.pop(handle, None)
 
     def handle_probe(self, progress: "_KVCRProgress", payload: dict[str, Any]) -> None:
         target_agent = payload.get("target_agent")
@@ -171,7 +169,12 @@ class _DanglingOps:
         ):
             return
         status = self.source_writes.get((target_agent, handle))
-        if status is not None and expected in (None, self.incarnation):
+        if expected in (None, self.incarnation):
+            # A probe can overtake start_write after a control reconnect. Keep
+            # this small cancellation fence until restart, even if no op exists.
+            status = self.source_writes.setdefault(
+                (target_agent, handle), _SourceWriteStatus()
+            )
             status.cancel_requested = True
         response = {
             "type": "write_probe_ack",
@@ -199,29 +202,15 @@ class _DanglingOps:
             or not incarnation
         ):
             return
-        active = cast(
+        op = cast(
             "_TargetPullOp | None", progress._in_flight_ops.get(("target", handle))
         )
-        tombstone = self.tombstones.get(handle)
-        op = tombstone.operation if tombstone is not None else active
         if op is None or op.remote_ctrl_ep != endpoint:
             return
         expected = op.source_incarnation
         if expected and payload.get("dead_incarnation") == expected:
-            if tombstone is None:
-                tombstone = self.tombstones[handle] = _Tombstone(op)
-            if tombstone.expires_at is None:
-                # One metadata-only grace period after confirmed process death.
-                # Expiry ends late-write diagnostics; it does not establish a fence.
-                tombstone.expires_at = (
-                    self._backend._kvcr._clock()
-                    + self._backend._kvcr.config.operation_timeout_ms / 1000
-                )
-                heapq.heappush(self._expirations, (tombstone.expires_at, handle))
+            # Guard verifies death of this process, not just an expired heartbeat.
             self.sources[endpoint] = incarnation
-            if active is not None:
-                self._backend._refused_writes[("target", handle)] = {"success": False}
+            self._backend._refused_writes[("target", handle)] = {"success": False}
         elif expected == incarnation and terminal:
-            self.tombstones.pop(handle, None)
-            if active is not None:
-                self._backend._refused_writes[("target", handle)] = {"success": False}
+            self._backend._refused_writes[("target", handle)] = {"success": False}

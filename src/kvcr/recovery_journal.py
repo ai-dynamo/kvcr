@@ -502,7 +502,9 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
     """
     hold = claimed.hold
     if hold._incarnation is not None:
-        core._remote_fw_dram._dangling_ops.incarnation = hold._incarnation
+        dangling = core._remote_fw_dram._dangling_ops
+        dangling.incarnation = hold._incarnation
+        dangling.dead_incarnations.update(hold._dead_incarnations)
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
     _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)

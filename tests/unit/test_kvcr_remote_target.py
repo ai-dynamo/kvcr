@@ -402,11 +402,12 @@ def test_remote_completion_rejects_invalid_notification(
 
 
 @pytest.mark.parametrize(
-    "completion_before_timeout", [False, True], ids=["late", "queued"]
+    "resolution", ["queued", "late", "notification", "probe", "guard", "unknown"]
 )
 def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
-    completion_before_timeout: bool,
+    resolution,
 ) -> None:
+    errors = []
     now = 0.0
     block_size = 16
     local = ctypes.create_string_buffer(block_size)
@@ -420,8 +421,10 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         KVCRConfig(
             nixl_agent_name="target",
             pool_layouts=[("", 16)],
-            operation_timeout_ms=10,
+            operation_timeout_ms=1000,
+            abandon_timeout_ms=2000,
         ),
+        on_resilience_event=errors.append,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
@@ -439,30 +442,67 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     with pytest.raises(RuntimeError, match="unresolved operations"):
         progress._close_nixl()
     assert agent.deregistered == []
-    if completion_before_timeout:
+    if resolution != "unknown":
+        control.incoming.append(
+            msgspec.msgpack.encode(
+                {
+                    "type": "target_metadata_ack",
+                    "sender_control_endpoint": "tcp://source:1",
+                    "sender_incarnation": "source",
+                    "op_handle": message["op_handle"],
+                }
+            )
+        )
+        _wait_until(lambda: operation.source_incarnation == "source")
+    if resolution == "queued":
         # Progress accepts success before expiry; main consumes it after expiry.
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         _wait_until(lambda: not target._core._progress._completed.empty())
 
-    now = 0.015  # Past T, but still inside the destination's grace period.
+    now = 1.5  # Past T, but still inside the destination's grace period.
     assert _poll_until(target, lambda completed: bool(completed)) == [
         (fetch, _op_entries({key: False}))
     ]
-    if not completion_before_timeout:
+    if resolution != "queued":
         assert target.query((key,), "req") == [
             (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
         ]
         assert _has_outstanding_operations(target)
         assert not operation.close(progress)
+        if resolution != "late":
+            now = 2.0
+            assert _poll_until(target, lambda _: bool(errors)) == []
+            assert [error.state for error in errors] == ["uncertain"]
+            control.incoming.append(
+                _probe_ack(
+                    message["op_handle"],
+                    sender_incarnation="new",
+                    terminal=True,
+                    dead_incarnation="source" if resolution == "unknown" else None,
+                )
+            )
+            _wait_until(lambda: not control.incoming)
+            now = 100.0  # Time and a replacement incarnation cannot free the slot.
+            assert list(target.poll_completed()) == []
         blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
         assert list(target.poll_completed()) == [
             (blocked, _op_entries({replacement: False}))
         ]
 
-        agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
+        if resolution in ("probe", "guard"):
+            fields = {"terminal": True}
+            if resolution == "guard":
+                fields.update(sender_incarnation="guard", dead_incarnation="source")
+            control.incoming.append(_probe_ack(message["op_handle"], **fields))
+        else:
+            agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         assert (
             _poll_until(target, lambda _: not _has_outstanding_operations(target)) == []
         )
+    if resolution not in ("queued", "late"):
+        assert [error.state for error in errors] == ["uncertain", "quiesced"]
+        assert all(error.op_handle == message["op_handle"] for error in errors)
+        assert errors[0].destination_regions == errors[1].destination_regions
     assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
     assert operation.close(progress)
@@ -564,6 +604,19 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     ]
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+
+
+def _probe_ack(handle, source="tcp://source:1", **fields):
+    return msgspec.msgpack.encode(
+        {
+            "type": "write_probe_ack",
+            "sender_control_endpoint": source,
+            "sender_incarnation": "source",
+            "op_handle": handle,
+            "terminal": False,
+            **fields,
+        }
+    )
 
 
 def _acked_deliver(control, kvcr, source, key):
@@ -688,6 +741,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
 
 @pytest.mark.parametrize("source_responsive", [False, True])
 def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
+    errors = []
     now = 0.0
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl()
@@ -701,6 +755,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
             operation_timeout_ms=1000,
             abandon_timeout_ms=7000,
         ),
+        on_resilience_event=errors.append,
     )
     kvcr._core._clock = lambda: now
     key, source = BlockKey(b"k0"), "tcp://source:1"
@@ -715,18 +770,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         agent.notifs["source"] = [
             _write_done_notification(handle, success=False, terminal=False)
         ]
-        control.incoming.append(
-            msgspec.msgpack.encode(
-                {
-                    "type": "write_probe_ack",
-                    "sender_control_endpoint": source,
-                    "target_agent": "source",
-                    "sender_incarnation": "source",
-                    "op_handle": handle,
-                    "terminal": False,
-                }
-            )
-        )
+        control.incoming.append(_probe_ack(handle, source))
         _wait_until(lambda: not control.incoming and not agent.notifs)
         assert list(kvcr.poll_completed()) == []
     now = 6.0
@@ -735,6 +779,8 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     now = 7.0
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
     assert control.send.call_count == 3  # Retry at T, then cleanup at abandonment.
+    assert [error.state for error in errors] == ["uncertain"]
+    assert errors[0].op_handle == handle
 
     # An abandoned operation must not blacklist the endpoint for fresh work.
     kvcr.submit_hint(_router_hint(source), request_id="retry")
@@ -748,49 +794,50 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     agent.notifs["source"] = [_write_done_notification(retry)]
     assert _poll_until(kvcr, bool) == [(retry, _op_entries({key: True}))]
 
-    dangling_ops = kvcr._core._remote_fw_dram._dangling_ops
-    # A new instance is not death proof, even if it reuses the source's name.
-    reply = {
-        "type": "write_probe_ack",
-        "sender_control_endpoint": source,
-        "sender_incarnation": "guard",
-        "op_handle": handle,
-        "terminal": True,
-    }
-    for agent_name in ("guard", "source"):
-        reply["target_agent"] = agent_name
-        control.incoming.append(msgspec.msgpack.encode(reply))
-        _wait_until(lambda: not control.incoming)
-        assert handle in dangling_ops.tombstones
-        assert dangling_ops.tombstones[handle].expires_at is None
-    reply["dead_incarnation"] = "source"
-    control.incoming.append(msgspec.msgpack.encode(reply))
-    _wait_until(lambda: dangling_ops.tombstones[handle].expires_at is not None)
-    assert dangling_ops.tombstones[handle].expires_at == 8.0
-    now = 7.5
-    control.incoming.append(msgspec.msgpack.encode(reply))
+    control.incoming.append(
+        _probe_ack(handle, source, sender_incarnation="guard", terminal=True)
+    )
     _wait_until(lambda: not control.incoming)
-    assert dangling_ops.tombstones[handle].expires_at == 8.0  # Not a renewable lease.
-    now = 8.0
-    _wait_until(lambda: handle not in dangling_ops.tombstones)
+    now = 100.0
+    assert list(kvcr.poll_completed()) == []
+    assert _has_outstanding_operations(kvcr)
+    assert len(errors) == 1
+    control.incoming.append(
+        _probe_ack(
+            handle, source, sender_incarnation="guard", dead_incarnation="source"
+        )
+    )
+    assert _poll_until(kvcr, lambda _: len(errors) == 2) == []
+    assert not _has_outstanding_operations(kvcr)
+    assert [error.state for error in errors] == ["uncertain", "quiesced"]
+    assert errors[0].destination_regions == errors[1].destination_regions
 
 
 @pytest.mark.parametrize(
-    "outcome", ["cancelled", "cancelled_same_poll", "terminal", "log", "raise"]
+    "outcome",
+    [
+        "cancelled",
+        "cancelled_same_poll",
+        "failed_first",
+        "failed_last",
+        "terminal",
+        "log",
+        "raise",
+    ],
 )
 def test_remote_write_cancellation_and_late_completion(
     outcome,
     caplog,
 ):
+    caplog.set_level(logging.INFO, logger="kvcr.core")
     errors = []
 
-    def on_error(error):
+    def on_resilience_event(error):
         errors.append(error)
         raise error
 
     now = 0.0
-    memory = ctypes.create_string_buffer(16)
-    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    descriptor = _mem_descriptor()
     agent, control = FakeNixlAgent(), FakeBytesControl()
     kvcr = _new_kvcr(
         agent,
@@ -799,7 +846,7 @@ def test_remote_write_cancellation_and_late_completion(
         KVCRConfig(
             nixl_agent_name="target", pool_layouts=[("", 16)], operation_timeout_ms=1000
         ),
-        on_error=on_error if outcome == "raise" else None,
+        on_resilience_event=on_resilience_event if outcome == "raise" else None,
     )
     kvcr._core._clock = lambda: now
     key, source = BlockKey(b"k0"), "tcp://source:1"
@@ -811,15 +858,19 @@ def test_remote_write_cancellation_and_late_completion(
             for _, raw in control.sent
         )
     )
-    if outcome in ("cancelled", "cancelled_same_poll"):
+    if outcome in ("cancelled", "cancelled_same_poll", "failed_first", "failed_last"):
         # The source can cancel before the target's own timeout.
         now = 0.5
-        cancelled = _write_done_notification(handle, success=False, terminal=False)
+        cancelled = _write_done_notification(
+            handle, success=False, terminal=outcome in ("failed_first", "failed_last")
+        )
         notifications = [_write_done_notification(handle)]
         if outcome == "cancelled":
             agent.notifs["source"] = [cancelled]
             _wait_until(lambda: not agent.notifs)
             assert list(kvcr.poll_completed()) == []
+        elif outcome == "failed_first":
+            notifications.insert(0, cancelled)
         else:
             notifications.append(cancelled)
         agent.notifs["source"] = notifications
@@ -852,16 +903,11 @@ def test_remote_write_cancellation_and_late_completion(
                         "op_handle": handle,
                     }
                 ),
-                msgspec.msgpack.encode(
-                    {
-                        "type": "write_probe_ack",
-                        "sender_control_endpoint": source,
-                        "target_agent": "guard",
-                        "sender_incarnation": "guard",
-                        "dead_incarnation": "source",
-                        "op_handle": handle,
-                        "terminal": False,
-                    }
+                _probe_ack(
+                    handle,
+                    source,
+                    sender_incarnation="guard",
+                    dead_incarnation="source",
                 ),
             ]
 
@@ -870,6 +916,10 @@ def test_remote_write_cancellation_and_late_completion(
         assert "late remote write" not in caplog.text
         return
     now = 5.0
+    if outcome == "raise":
+        with pytest.raises(RuntimeError):
+            _poll_until(kvcr, bool)
+        assert [error.state for error in errors] == ["uncertain"]
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
@@ -879,9 +929,6 @@ def test_remote_write_cancellation_and_late_completion(
             for _, raw in control.sent
         )
     )
-    memory.raw = b"B" * 16
-    # Model an already-posted write arriving after the framework reuses the buffer.
-    ctypes.memmove(descriptor.addr, b"A" * 16, 16)
     agent.notifs["source"] = [
         _write_done_notification(handle, success=False, terminal=False),
         _write_done_notification(handle),
@@ -889,7 +936,7 @@ def test_remote_write_cancellation_and_late_completion(
         _write_done_notification(other_handle),
     ]
     if outcome == "raise":
-        with pytest.raises(RuntimeError, match="late remote write"):
+        with pytest.raises(RuntimeError):
             _poll_until(kvcr, bool)
     # Even a raising handler must not kill progress or lose another completion.
     assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
@@ -897,14 +944,13 @@ def test_remote_write_cancellation_and_late_completion(
         errors = [
             record.args[0]
             for record in caplog.records
-            if "late remote write" in record.getMessage()
+            if record.args and getattr(record.args[0], "op_handle", None) == handle
         ]
-    assert len(errors) == 1
-    error = errors[0]
-    assert memory.raw == b"A" * 16
-    assert error.op_handle == handle
-    assert error.destination_regions == [descriptor]
-    assert error.source_blocks is None
+    assert [error.state for error in errors] == ["uncertain", "quiesced"]
+    for error in errors:
+        assert error.op_handle == handle
+        assert error.destination_regions == [descriptor]
+        assert error.source_blocks is None
     kvcr.close()
 
 

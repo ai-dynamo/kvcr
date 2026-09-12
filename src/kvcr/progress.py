@@ -134,6 +134,7 @@ class _KVCRProgress:
         transfer_id: int,
         *,
         cancellation_requested: bool = False,
+        require_completion: bool = False,
     ) -> tuple[bool, Any | None] | None:
         """Advance a transfer and return its result after releasing its handle."""
         state = self._active_transfers.get(transfer_id)
@@ -141,19 +142,23 @@ class _KVCRProgress:
             raise KeyError(f"unknown transfer {transfer_id}")
         agent = self.nixl_agent
         outcome = state.outcome
-        if outcome is None:
+        if outcome is None or (require_completion and not outcome):
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
             except Exception:
-                logger.warning(
-                    "NIXL transfer progress failed",
-                    exc_info=True,
-                )
+                if state.outcome is not False:
+                    logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
+            # Releasing a pending NIXL/UCX handle can leave DMA running and lose
+            # its completion signal. Remote writes retain it until actual DONE.
+            if require_completion and xfer_state != "DONE":
+                if xfer_state not in ("PROC", "PEND"):
+                    state.outcome = False
+                return None
             pending = xfer_state in ("PROC", "PEND")
             if pending and not cancellation_requested:
                 return None
-            outcome = xfer_state == "DONE"
+            outcome = xfer_state == "DONE" and state.outcome is not False
             if not pending:
                 state.outcome = outcome
         if outcome and state.capture_telemetry:
@@ -270,7 +275,6 @@ class _KVCRProgress:
         self._submissions.put(item)
 
     def take_completed(self) -> list[object]:
-        self.raise_if_failed()
         completed: list[object] = []
         while len(completed) < self._batch_size:
             try:
@@ -331,9 +335,13 @@ class _KVCRProgress:
                     self._close_progress_ops()
                 finally:
                     try:
-                        self._close()
+                        self._completed_backlog.extend(self._flush())
+                        self._publish_completed(sys.maxsize)
                     finally:
-                        self._close_nixl()
+                        try:
+                            self._close()
+                        finally:
+                            self._close_nixl()
             except BaseException as error:
                 if self._failure is None:
                     self._failure = error

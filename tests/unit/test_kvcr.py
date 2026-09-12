@@ -50,7 +50,7 @@ from kvcr.types import BlockKey
 def _fake_hold(**fields: Any) -> SimpleNamespace:
     """A hold double that hands its listener over exactly like the real one."""
     fields.setdefault("_pools", ())
-    hold = SimpleNamespace(_incarnation=None, **fields)
+    hold = SimpleNamespace(_incarnation=None, _dead_incarnations=(), **fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
 
@@ -608,6 +608,9 @@ class _StubProgress:
 
     def is_quiescent(self) -> bool:
         return self._quiescent
+
+    def take_completed(self) -> list[object]:
+        return []
 
 
 def test_close_cleans_backends_once_when_progress_is_quiescent(

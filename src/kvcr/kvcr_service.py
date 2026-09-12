@@ -406,6 +406,7 @@ class _ThreadingUnixServer(
                 "KVCR compatibility digest does not match the service"
             )
         liveness.incarnation = request.incarnation
+        guard = self.registry._guard(request.guard_index)
         spec, pools, listener_fd, lease = self.registry.claim(
             request.guard_index,
             request.tier_config,
@@ -419,6 +420,7 @@ class _ThreadingUnixServer(
                 request.tier_config,
                 pools,
                 _PROTOCOL_VERSION,
+                dead_incarnations=guard.dead_incarnations,
             ),
             (request.guard_index, listener_fd, lease),
         )

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """KVCR remote framework-DRAM source-side tests."""
 
+import ctypes
 import logging
 import threading
 import time
@@ -21,23 +22,25 @@ from _kvcr_test_utils import (
     _has_outstanding_operations,
     _mem_descriptor,
     _new_kvcr,
+    _op_entries,
     _poll_until,
     _start_write_message,
     _wait_until,
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.config import KVCRConfig
+from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.progress import _STOP
 from kvcr.remote_fw_dram import _FwMemResidency, _RemoteFWDram, _SourcePinOp
 from kvcr.types import BlockKey, PinHandle, PinRequestId
 
 
-def _write_probe_message(op_handle: int) -> bytes:
+def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     return msgspec.msgpack.encode(
         {
             "type": "write_probe",
+            "source_incarnation": incarnation,
             "op_handle": op_handle,
             "target_agent": "target",
             "sender_control_endpoint": "tcp://target:1",
@@ -100,36 +103,63 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
     }
 
 
-def test_write_probe_fences_write_waiting_on_framework_pin() -> None:
+@pytest.mark.parametrize("incarnation", [None, "matching", "other"])
+@pytest.mark.parametrize("before_start", [False, True])
+def test_write_probe_fences_write_waiting_on_framework_pin(
+    incarnation, before_start
+) -> None:
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl("tcp://source:1")
     source = _new_kvcr(agent, pinning, control, name="source")
-    control.incoming.append(
-        _start_write_message(9, BlockKey(b"k0"), target_agent="target")
-    )
-    _poll_until(source, lambda _: bool(pinning.pending))
+    start = _start_write_message(9, BlockKey(b"k0"), target_agent="target")
+    if not before_start:
+        control.incoming.append(start)
+        _poll_until(source, lambda _: bool(pinning.pending))
 
-    control.incoming.append(_write_probe_message(9))
+    if incarnation == "matching":
+        incarnation = source._core._remote_fw_dram._dangling_ops.incarnation
+    control.incoming.append(_write_probe_message(9, incarnation))
     _wait_until(lambda: bool(control.sent))
-    assert _decode_control_message(control.sent[-1][1])["terminal"] is True
+    assert _decode_control_message(control.sent[-1][1])["terminal"] is (
+        incarnation != "other"
+    )
 
+    if before_start:
+        if incarnation != "other":
+            for metadata in (b"target-md", b"reconnected-target-md"):
+                payload = msgspec.msgpack.decode(start)
+                payload["target_agent_metadata"] = metadata
+                control.incoming.append(msgspec.msgpack.encode(payload))
+                _wait_until(lambda: not control.incoming)
+                time.sleep(0.01)
+                assert list(source.poll_completed()) == []
+                assert pinning.searches == []
+            assert agent.xfers == []
+            return
+        control.incoming.append(start)
+        _poll_until(source, lambda _: bool(pinning.pending))
     pinning.complete(0)
-    assert _poll_until(source, lambda _: bool(agent.sent_notifs)) == []
-    assert agent.xfers == []
+    if incarnation == "other":
+        assert _poll_until(source, lambda _: bool(agent.xfers)) == []
+        agent.state = "DONE"
+    assert _poll_until(source, lambda _: bool(pinning.unpins)) == []
+    assert len(agent.xfers) == (1 if incarnation == "other" else 0)
 
 
 def test_stalled_source_refuses_queued_and_future_writes() -> None:
     errors = []
 
-    def on_error(error):
+    def on_resilience_event(error):
         errors.append(error)
         raise error
 
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl()
-    source = _new_kvcr(agent, pinning, control, name="source", on_error=on_error)
+    source = _new_kvcr(
+        agent, pinning, control, name="source", on_resilience_event=on_resilience_event
+    )
 
     stalled_for = 0.0
     with patch(
@@ -270,11 +300,15 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     control.incoming.append(_start_write_message(5, key))
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
 
+    if failure != "initialize":
+        _poll_until(kvcr, lambda _: bool(source_agent.sent_notifs))
+        assert pinning.unpins == []
+        assert source_agent.released_xfers == []
+        source_agent.state = "DONE"
     assert _poll_until(kvcr, lambda _: pinning.unpins == ["pin"]) == []
 
     assert source_agent.transfers == ([] if failure == "initialize" else [1])
-    assert len(source_agent.sent_notifs) == 1
-    agent_name, notif = source_agent.sent_notifs[0]
+    agent_name, notif = source_agent.sent_notifs[-1]
     assert agent_name == b"remote-1"
     assert _decode_notif(notif) == {
         "type": "write_done",
@@ -297,6 +331,12 @@ def test_kvcr_source_async_transfer_error_notifies_failure():
     assert source_agent.sent_notifs == []
 
     source_agent.state = "ERR"
+    source_agent.check_xfer_state = Mock(wraps=source_agent.check_xfer_state)
+    _wait_until(lambda: source_agent.check_xfer_state.called)
+    assert list(kvcr.poll_completed()) == []
+    assert pinning.unpins == []
+    assert source_agent.released_xfers == []
+    source_agent.state = "DONE"
     assert (
         _poll_until(
             kvcr,
@@ -307,8 +347,7 @@ def test_kvcr_source_async_transfer_error_notifies_failure():
         == []
     )
 
-    assert len(source_agent.sent_notifs) == 1
-    agent_name, notif = source_agent.sent_notifs[0]
+    agent_name, notif = source_agent.sent_notifs[-1]
     assert agent_name == b"remote-1"
     assert _decode_notif(notif) == {
         "type": "write_done",
@@ -338,125 +377,178 @@ def test_kvcr_source_ignores_malformed_control_messages():
 
 
 @pytest.mark.parametrize(
-    "terminal_state",
-    [None, "ERR", "DONE", "shutdown", "unresolved"],
-    ids=["cancelled", "failed", "completed", "shutdown", "unresolved"],
+    ("terminal_state", "abandon", "raises"),
+    [
+        ("ERR", False, False),
+        ("DONE", False, False),
+        ("DONE", True, False),
+        ("DONE", True, True),
+        ("shutdown", True, False),
+    ],
 )
 def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
-    terminal_state: str | None,
-    caplog,
-) -> None:
-    class DelayedReleaseAgent(FakeNixlAgent):
-        def __init__(self):
-            super().__init__(metadata=b"source-md")
-            self.release_attempts = 0
-            self.allow_release = False
-
-        def release_xfer_handle(self, handle):
-            self.release_attempts += 1
-            if self.release_attempts == 1:
-                raise RuntimeError("busy")
-            if not self.allow_release:
-                return False
-            super().release_xfer_handle(handle)
-
+    terminal_state,
+    abandon,
+    raises,
+):
     now = 0.0
-    source_agent = DelayedReleaseAgent()
-    pinning = FakePrimaryPinning()
-    control = FakeBytesControl()
-    key = BlockKey(b"k0")
+    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    errors = []
+
+    def on_resilience_event(error):
+        if not errors:
+            assert pinning.unpins == []
+        errors.append(error)
+        if raises:
+            raise RuntimeError("callback failed")
+
     kvcr = _new_kvcr(
-        source_agent,
-        pinning,
-        control,
-        KVCRConfig(
-            nixl_agent_name="source",
-            pool_layouts=[("", 16)],
-            operation_timeout_ms=1000,
-            enable_telemetry=True,
-        ),
-        name="source",
+        agent, pinning, control, name="source", on_resilience_event=on_resilience_event
     )
     kvcr._core._clock = lambda: now
-    control.incoming.append(_start_write_message(12, key, target_agent="target"))
-
-    assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
-    # Late polling must not restart the abandonment deadline.
-    now = 1.5 if terminal_state == "unresolved" else 1.0
-    if terminal_state != "unresolved":
-        control.incoming.append(_write_probe_message(12))
-        _wait_until(lambda: bool(control.sent))
-        assert _decode_control_message(control.sent[-1][1])["terminal"] is False
-    if terminal_state == "shutdown":
-        kvcr._core._progress._submissions.put(_STOP)
-    _wait_until(lambda: source_agent.release_attempts > 0)
-    assert source_agent.released_xfers == []
-    _wait_until(lambda: bool(source_agent.sent_notifs))
-    assert _decode_notif(source_agent.sent_notifs[0][1]) == {
-        "type": "write_done",
-        "op_handle": 12,
-        "success": False,
-        "terminal": False,
-    }
-    assert pinning.unpins == []
-    assert _has_outstanding_operations(kvcr)
-
-    if terminal_state == "unresolved":
-        attempts = source_agent.release_attempts
-        now = 4.0
-        _wait_until(lambda: source_agent.release_attempts > attempts)
-        assert list(kvcr.poll_completed()) == []
+    key = BlockKey(b"k0")
+    try:
+        control.incoming.append(_start_write_message(12, key, target_agent="target"))
+        assert _poll_until(kvcr, lambda _: bool(agent.xfers)) == []
+        source_handle = next(iter(kvcr._core._progress._in_flight_ops))[1]
+        now = 1.5  # A late first poll must not restart the abandonment deadline.
+        _wait_until(lambda: bool(agent.sent_notifs))
+        assert _decode_notif(agent.sent_notifs[0][1]).get("terminal", True) is False
+        # Releasing a PROC handle is not evidence that the native write stopped.
+        assert agent.released_xfers == []
         assert pinning.unpins == []
-        now = 5.0
-        assert _poll_until(kvcr, lambda _: pinning.unpins) == []
-        assert source_agent.released_xfers == []
-        error = next(
-            record.args[0]
-            for record in caplog.records
-            if "source cancellation timed out" in record.getMessage()
-        )
-        assert error.op_handle == 12
-        assert error.source_blocks == {key: [_mem_descriptor(addr=0)]}
-        assert error.destination_regions is None
-        # Releasing source contents must not claim that the native write stopped.
-        control.incoming.append(_write_probe_message(12))
-        _wait_until(lambda: bool(control.sent))
-        assert _decode_control_message(control.sent[-1][1])["terminal"] is False
-        # Reacquire the same slot while the old native transfer is still pending.
-        control.incoming.append(_start_write_message(13, key, target_agent="target"))
-        assert _poll_until(kvcr, lambda _: len(source_agent.xfers) == 2) == []
-        assert pinning.searches == [(key,), (key,)]
+        if abandon:
+            now = 5.0
+            if raises:
+                with pytest.raises(RuntimeError, match="callback failed"):
+                    _poll_until(kvcr, lambda _: bool(errors))
+                assert pinning.unpins == []
+            assert _poll_until(kvcr, lambda _: bool(pinning.unpins)) == []
+            assert [error.state for error in errors] == ["uncertain"]
+            assert agent.released_xfers == []
+            control.incoming.append(_write_probe_message(12))
+            _wait_until(lambda: bool(control.sent))
+            assert _decode_control_message(control.sent[-1][1])["terminal"] is False
+        if terminal_state == "shutdown":
+            kvcr._core._progress._submissions.put(_STOP)
+            _wait_until(lambda: kvcr._core._progress._startup_stage == "cleanup")
+            assert agent.released_xfers == []
+        if terminal_state == "ERR":
+            agent.check_xfer_state = Mock(wraps=agent.check_xfer_state)
+            agent.state = "ERR"
+            _wait_until(lambda: agent.check_xfer_state.called)
+            assert list(kvcr.poll_completed()) == []
+            assert pinning.unpins == []
+            assert agent.released_xfers == []
+        agent.state = "DONE"
+        if terminal_state == "shutdown":
+            kvcr.close()
+            assert not kvcr._core._framework_pin_keys
+            assert not kvcr._core._local_dram_sources_by_op
+        else:
+            if raises:
+                with pytest.raises(RuntimeError, match="callback failed"):
+                    _poll_until(kvcr, lambda _: len(errors) == 2)
+            assert (
+                _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
+            )
         assert pinning.unpins == ["pin"]
-        now = 6.0
-        source_agent.state = "DONE"
-
-    if terminal_state not in (None, "shutdown", "unresolved"):
-        source_agent.state = terminal_state
-    source_agent.allow_release = True
-    if terminal_state == "shutdown":
+        assert agent.released_xfers == [1]
+        assert [error.state for error in errors] == (
+            ["uncertain", "quiesced"] if abandon else []
+        )
+        for error in errors:
+            assert error.op_handle == source_handle
+            assert error.source_blocks == {key: [_mem_descriptor(addr=0)]}
+            assert error.destination_regions is None
+    finally:
+        agent.state = "DONE"
         kvcr.close()
-    else:
-        assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
-        assert kvcr._core._outstanding_operations == 0
-    assert not kvcr._core._remote_fw_dram._source_pin_ops
-    assert pinning.unpins == (
-        ["pin", "pin"] if terminal_state == "unresolved" else ["pin"]
+
+
+def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
+    now = 0.0
+    agent, control, errors, done = FakeNixlAgent(), FakeBytesControl(), [], set()
+    agent.check_xfer_state = lambda handle: "DONE" if handle in done else "PROC"
+    source = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        name="source",
+        on_resilience_event=errors.append,
     )
-    expected_handles = [1, 2] if terminal_state == "unresolved" else [1]
-    assert source_agent.released_xfers == expected_handles
-    assert sum(
-        "source cancellation timed out" in record.getMessage()
-        for record in caplog.records
-    ) == (1 if terminal_state == "unresolved" else 0)
-    if terminal_state not in ("DONE", "unresolved"):
-        assert _decode_notif(source_agent.sent_notifs[-1][1]) == {
-            "type": "write_done",
-            "op_handle": 12,
-            "success": False,
-        }
-    else:
-        assert len(source_agent.sent_notifs) == 1  # Only the cancellation advisory.
-        assert source_agent.telemetry_handles == expected_handles
+    source._core._clock = lambda: now
+    key = BlockKey(b"shared")
+    try:
+        for target in ("target-a", "target-b"):
+            control.incoming.append(_start_write_message(12, key, target_agent=target))
+        _poll_until(source, lambda _: len(agent.xfers) == 2)
+        now = 5.0
+        _poll_until(source, lambda _: len(errors) == 2)
+        pending = {error.op_handle for error in errors}
+        assert len(pending) == 2
+        assert [error.state for error in errors] == ["uncertain", "uncertain"]
+        assert (
+            errors[0].source_blocks
+            == errors[1].source_blocks
+            == {key: [_mem_descriptor(addr=0)]}
+        )
+        for native_handle in (1, 2):
+            done.add(native_handle)
+            _poll_until(source, lambda _: len(errors) == 2 + native_handle)
+            event = errors[-1]
+            assert event.state == "quiesced"
+            assert event.source_blocks == errors[0].source_blocks
+            pending.remove(event.op_handle)
+            assert len(pending) == 2 - native_handle
+        assert not _has_outstanding_operations(source)
+    finally:
+        done.update((1, 2))
+        source.close()
+
+
+def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
+    now = 0.0
+    memory = ctypes.create_string_buffer(16)
+    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    agent, control, errors = FakeNixlAgent(), FakeBytesControl(), []
+    source = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        name="source",
+        on_resilience_event=errors.append,
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    source._core._clock = lambda: now
+    key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit({key: [descriptor]})
+        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        agent.state = "PROC"
+        control.incoming.append(_start_write_message(12, key, target_agent="target"))
+        _poll_until(source, lambda _: len(agent.xfers) == 2)
+        now = 5.0
+        assert _poll_until(source, lambda _: bool(errors)) == []
+        assert [error.state for error in errors] == ["uncertain"]
+        blocked = source.deposit({replacement: [descriptor]})
+        assert list(source.poll_completed()) == [
+            (blocked, _op_entries({replacement: False}))
+        ]
+        assert source._core._block_record_map[key].local_dram.claim_count == 1
+        agent.state = "DONE"
+        assert _poll_until(source, lambda _: len(errors) == 2) == []
+        assert [error.state for error in errors] == ["uncertain", "quiesced"]
+        assert source._core._block_record_map[key].local_dram.claim_count == 0
+        assert errors[0].source_blocks == errors[1].source_blocks
+        deposit = source.deposit({replacement: [descriptor]})
+        assert _poll_until(source, bool) == [
+            (deposit, _op_entries({replacement: True}))
+        ]
+    finally:
+        agent.state = "DONE"
+        source.close()
 
 
 @pytest.mark.parametrize("failure", [False, None, 1, RuntimeError("release failed")])
@@ -583,10 +675,12 @@ def test_framework_pin_poll_failures_are_logged_without_escaping(kvcr_caplog):
     assert any("framework pin result polling failed" in message for message in warnings)
 
 
-def test_kvcr_source_poll_failure_is_terminal_and_logged(kvcr_caplog):
+def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(kvcr_caplog):
     class RaisingAgent(FakeNixlAgent):
         def check_xfer_state(self, handle):
-            raise RuntimeError("boom")
+            if self.state != "DONE":
+                raise RuntimeError("boom")
+            return self.state
 
     source_agent = RaisingAgent(metadata=b"source-md")
     pinning = FakePrimaryPinning()
@@ -595,6 +689,16 @@ def test_kvcr_source_poll_failure_is_terminal_and_logged(kvcr_caplog):
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
 
     control.incoming.append(_start_write_message(5, key))
+    _poll_until(
+        kvcr,
+        lambda _: any(
+            "transfer progress failed" in rec.getMessage()
+            for rec in kvcr_caplog.records
+        ),
+    )
+    assert source_agent.released_xfers == []
+    assert pinning.unpins == []
+    source_agent.state = "DONE"
     assert (
         _poll_until(
             kvcr,
@@ -606,7 +710,7 @@ def test_kvcr_source_poll_failure_is_terminal_and_logged(kvcr_caplog):
     )
     assert source_agent.released_xfers == [1]
     assert pinning.unpins == ["pin"]
-    assert _decode_notif(source_agent.sent_notifs[0][1]) == {
+    assert _decode_notif(source_agent.sent_notifs[-1][1]) == {
         "type": "write_done",
         "op_handle": 5,
         "success": False,
@@ -690,6 +794,8 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
         )
         assert set(pinning.unpins) == expected_unpins
     assert pinning.searches == expected_searches
+    agent.state = "DONE"
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
 
 
 def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:

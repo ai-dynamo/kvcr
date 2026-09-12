@@ -67,6 +67,7 @@ class _TargetPullState(Enum):
     START_WRITE = auto()
     WAITING_WRITE_DONE = auto()
     WAITING_TERMINAL = auto()
+    QUARANTINED = auto()
     FINISHED = auto()
 
 
@@ -102,6 +103,7 @@ class _TargetPullOp(_RemoteOp):
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
     source_incarnation: str | None = None
+    uncertain: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -141,10 +143,18 @@ class _TargetPullOp(_RemoteOp):
 
         if (
             self.state
-            in (_TargetPullState.WAITING_WRITE_DONE, _TargetPullState.WAITING_TERMINAL)
+            in (
+                _TargetPullState.WAITING_WRITE_DONE,
+                _TargetPullState.WAITING_TERMINAL,
+                _TargetPullState.QUARANTINED,
+            )
             and isinstance(event, Mapping)
             and event.get("terminal", True) is True
         ):
+            if self.uncertain:
+                backend._dangling_ops.report_target(self, "quiesced")
+                self.state = _TargetPullState.FINISHED
+                return True, True
             # After cancellation, native success only permits cleanup.
             success = (
                 event.get("success") is True
@@ -185,14 +195,18 @@ class _TargetPullOp(_RemoteOp):
             backend._record_progress_duration(scope, self.started_at, result)
             return True, True
 
+        if self.state is _TargetPullState.QUARANTINED:
+            # The retained operation is its own tombstone and shutdown guard.
+            return False, backend._dangling_ops.poll_target(progress, self, now)
+
         if now >= self.deadline or (
             cancelled and self.state is _TargetPullState.WAITING_WRITE_DONE
         ):
             if self.state is _TargetPullState.WAITING_TERMINAL:
-                backend._dangling_ops.abandon(progress, self)
-                self.state = _TargetPullState.FINISHED
+                self.state = _TargetPullState.QUARANTINED
+                backend._dangling_ops.poll_target(progress, self, now)
                 backend._record_progress_duration(scope, self.started_at, "failed")
-                return True, True
+                return False, True
             self.state = _TargetPullState.WAITING_TERMINAL
             config = backend._kvcr.config
             self.deadline += (
@@ -285,7 +299,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
-                backend._finish_source_write(write_id)
+                backend._dangling_ops.finish_source(self)
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
@@ -358,7 +372,7 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "failed"
                 )
                 self.state = _SourceWriteState.FINISHED
-                backend._finish_source_write(write_id)
+                backend._dangling_ops.finish_source(self)
                 return True, True
 
         transfer_id = self.transfer_id
@@ -369,16 +383,18 @@ class _SourceWriteOp(_RemoteOp):
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
             observed_work = True
+        cancelling = self.state is _SourceWriteState.CANCEL_PENDING
         transfer_result = backend._dangling_ops.poll_source(
-            progress,
-            self,
-            cancelling=self.state is _SourceWriteState.CANCEL_PENDING,
+            progress, self, cancelling=cancelling
         )
         if transfer_result is None:
+            if progress._active_transfers[transfer_id].outcome is False:
+                self.state = _SourceWriteState.CANCEL_PENDING
             return False, observed_work
         self.transfer_id = None
         success, telemetry = transfer_result
-        if success:
+        self.success = success and not cancelling
+        if self.success:
             backend._record_transfer_telemetry(telemetry)
             backend._record_progress_counter(
                 TRANSFER_BLOCKS_METRIC,
@@ -387,22 +403,24 @@ class _SourceWriteOp(_RemoteOp):
             )
         else:
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
-        self.success = success and not status.abandoned
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
         self.state = _SourceWriteState.FINISHED
-        backend._finish_source_write(write_id)
+        backend._dangling_ops.finish_source(self)
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
         if self.transfer_id is not None:
-            if not progress.cancel_transfer(self.transfer_id):
+            if (
+                progress.poll_transfer(self.transfer_id, require_completion=True)
+                is None
+            ):
                 return False
             self.transfer_id = None
         self._backend._send_write_done(
             progress, self.remote_agent, self.op_handle, False
         )
-        self._backend._finish_source_write((self.route[0], self.op_handle))
+        self._backend._dangling_ops.finish_source(self)
         return True
 
 
@@ -620,17 +638,18 @@ class _RemoteFWDram:
                     _SourceWriteState.FINISHED,
                     _SourceWriteState.CANCEL_PENDING,
                 ):
-                    # An abandoned write already returned its pins.
-                    if item.op_id not in self._fw_pins_by_op:
-                        continue
-                    self._fw_pins_by_op.pop(item.op_id, None)
-                    self._kvcr._remove_block_dependencies(item)
-                    if item.success:
-                        self._kvcr._record_access(
-                            self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
-                        )
-                    self._kvcr._release_local_dram_sources(item.op_id)
-                    self._release_framework_pins(item.framework_pins)
+                    # Framework ownership can be handed back after uncertainty;
+                    # KVCR-owned contents stay claimed until native quiescence.
+                    pins = self._fw_pins_by_op.pop(item.op_id, None)
+                    if item.state is _SourceWriteState.FINISHED:
+                        self._kvcr._remove_block_dependencies(item)
+                        if item.success:
+                            self._kvcr._record_access(
+                                self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
+                            )
+                        self._kvcr._release_local_dram_sources(item.op_id)
+                    if pins is not None:
+                        self._release_framework_pins(pins)
                 else:
                     raise RuntimeError(
                         f"KVCR source operation {item.op_id!r} returned to main "
@@ -643,6 +662,12 @@ class _RemoteFWDram:
                             "non-local target pull is waiting for terminal state"
                         )
                     self._kvcr._discard_local_dram_fill(item.keys)
+                elif item.state is _TargetPullState.QUARANTINED:
+                    self._finish_target_pull(item)
+                elif item.state is _TargetPullState.FINISHED and item.uncertain:
+                    self._kvcr._remove_block_dependencies(item)
+                    if item.local_fill:
+                        self._kvcr._complete_local_dram_fill(item.keys, success=False)
                 elif item.state is _TargetPullState.FINISHED:
                     self._finish_target_pull(item)
                 else:
@@ -652,8 +677,6 @@ class _RemoteFWDram:
                     )
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
-            elif isinstance(item, Exception):
-                self._kvcr._resilience_errors.append(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -710,7 +733,8 @@ class _RemoteFWDram:
 
     def _finish_target_pull(self, op: _TargetPullOp) -> None:
         kvcr = self._kvcr
-        kvcr._remove_block_dependencies(op)
+        if op.state is not _TargetPullState.QUARANTINED:
+            kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
         if not op.success:
             self._fail_request_hint(op.request_id)
@@ -723,6 +747,8 @@ class _RemoteFWDram:
                 missing_keys=(hint.missing_keys | op.keys) - completed_keys,
             )
         if op.local_fill:
+            if op.state is _TargetPullState.QUARANTINED:
+                return  # DISCARDING already failed callers, but still owns the slots.
             if completed_keys:
                 kvcr._complete_local_dram_fill(
                     tuple(key for key in op.ordered_keys if key in completed_keys),
@@ -780,7 +806,6 @@ class _RemoteFWDram:
         for op_id, refusal in self._refused_writes.items():
             if not events.get(op_id, {}).get("terminal"):
                 events[op_id] = refusal
-        self._dangling_ops.expire()
         self._refused_writes.clear()
         observed_work |= bool(events)
         return events, observed_work
@@ -1030,7 +1055,9 @@ class _RemoteFWDram:
             return
 
         write_id = (target_agent, OpHandle(op_handle))
-        if write_id in self._dangling_ops.source_writes:
+        if status := self._dangling_ops.source_writes.get(write_id):
+            if status.cancel_requested and not status.submitted:
+                self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.get("source_incarnation")
         if not self._dangling_ops.check_source_progress() or (
@@ -1147,9 +1174,6 @@ class _RemoteFWDram:
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
         kvcr._progress.submit(source_write)
         self._release_framework_pins(unused_pins)
-
-    def _finish_source_write(self, write_id: tuple[str, OpHandle]) -> None:
-        self._dangling_ops.source_writes.pop(write_id, None)
 
     def _notify_start_write_failure(
         self,
@@ -1623,7 +1647,7 @@ class _RemoteFWDram:
             return {}
         events: dict[_OpId, dict[str, Any]] = {}
         try:
-            for source_agent, notifs in get_new_notifs().items():
+            for notifs in get_new_notifs().values():
                 for raw in notifs:
                     payload = _decode_notif(raw)
                     if payload is None or payload.get("type") != "write_done":
@@ -1635,24 +1659,15 @@ class _RemoteFWDram:
                     op_id = ("target", op_handle)
                     previous = events.get(op_id, {})
                     terminal = payload.get("terminal", True) is True
-                    cancelled = previous.get("cancelled", False) or not terminal
-                    terminal |= previous.get("terminal", False)
-                    # Preserve native success for diagnostics, even if cancelled.
-                    if previous.get("success"):
-                        payload = previous
-                    payload.update(
-                        source_agent=source_agent,
-                        terminal=terminal,
-                        cancelled=cancelled,
+                    cancelled = previous.get("cancelled", False) or not payload.get(
+                        "success", False
                     )
+                    terminal |= previous.get("terminal", False)
+                    payload.update(terminal=terminal, cancelled=cancelled)
                     events[op_id] = payload
         except Exception:
             logger.warning("KVCR notification receive failed", exc_info=True)
             return {}
-        # Outside the receive-error handler: late writes must reach the framework.
-        for op_id, payload in events.items():
-            if payload["terminal"]:
-                self._dangling_ops.notification(progress, op_id[1], payload)
         return events
 
     def _record_transfer_telemetry(self, telemetry: Any | None) -> None:
