@@ -19,6 +19,10 @@ without editing source code in any of those projects.
 For source builds, editable installs, API development, or test workflows, use
 the [developer guide](dev-guide.md).
 
+For a proposed Kubernetes deployment with an optional KVCR-Service sidecar, see
+[Dynamo PR #14695](https://github.com/ai-dynamo/dynamo/pull/14695).
+That example requires a compatible prebuilt Dynamo vLLM runtime image.
+
 ---
 
 ## Prerequisites
@@ -47,7 +51,7 @@ Pass the public repository and exact revision explicitly:
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-export KVCR_VLLM_REF=35ab7457aafa89d6849e40d01401c69ffff8e33a
+export KVCR_VLLM_REF=dea52723218de41d9252dca5d88f325f492c1868
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \
@@ -136,7 +140,6 @@ export KV_TRANSFER_CONFIG='{
   "kv_connector_extra_config": {
     "spec_name": "TieringOffloadingSpec",
     "cpu_bytes_to_use": 2000000000,
-    "enable_external_pinning": true,
     "self_describing_kv_events": true,
     "secondary_tiers": [
       {
@@ -183,7 +186,6 @@ The important relationships are:
 | Setting | Requirement |
 | --- | --- |
 | `cpu_bytes_to_use` | Capacity of vLLM's primary host-pinned tier, per the adapter's configured scope |
-| `enable_external_pinning` | Lets KVCR safely serve framework-owned host blocks to a peer |
 | `self_describing_kv_events` | Supplies block metadata needed by Dynamo's tier-aware index |
 | `router_capabilities` | Advertises that the tier accepts `router_hint` plans |
 | `control_ports` | Contains one unique port per local DP rank, in rank order |

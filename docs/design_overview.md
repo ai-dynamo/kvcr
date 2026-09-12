@@ -66,7 +66,7 @@ Figure 1 summarizes the component boundaries.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-detailed-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-detailed-light.svg">
-  <img src="docs/figures/kv-architecture-detailed-light.svg" alt="KV Cache Runner Design Diagram">
+  <img src="figures/kv-architecture-detailed-light.svg" alt="KV Cache Runner Design Diagram">
 </picture>
 
 **Framework / Engine**
@@ -297,7 +297,7 @@ class PlacementAction:
 PlacementDecision = tuple[PlacementAction, CacheTier | None]
 ```
 
-At initialization, an integration selects one built-in policy or supplies an external `KVCachePolicy` instance; otherwise the default policy is LRU. Policy calls must complete quickly and never block. A policy declares its configuration dependencies through `required_tiers`; KVCR rejects initialization if any declared tier is not configured. `CacheTier` identifies the relevant framework memory, KVCR-managed storage, peer memory, or object-store tier.
+At initialization, an integration selects one built-in policy or supplies an external `KVCachePolicy` instance; otherwise the default policy is LRU, with G3 spill when G3 is configured. Policy calls must complete quickly and never block. A policy declares its configuration dependencies through `required_tiers`; KVCR rejects initialization if any declared tier is not configured. `CacheTier` identifies the relevant framework memory, KVCR-managed storage, peer memory, or object-store tier.
 
 `meta` is a read-only snapshot of the block's identity, size, access history, and current managed residency. `failure` describes the attempted placement, its source, the failure reason, and the number of previous failures.
 
