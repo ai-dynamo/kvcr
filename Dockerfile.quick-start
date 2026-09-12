@@ -41,11 +41,12 @@ RUN mkdir -p /overlay \
       vllm/v1/kv_offload/tiering/kvcr/manager.py \
       /overlay/
 
-# Build Dynamo at the first revision that accepts one KVCR control port per
-# vLLM data-parallel rank.
+# Pin Dynamo PR #14695, including the versioned KV hint protocol and
+# per-rank KVCR control ports.
 FROM build-base AS dynamo-builder
-ARG DYNAMO_REF=dcdc9d0f11a9ae6e731d68e07a71dfb0f26ce85b
+ARG DYNAMO_REF=010fc8d8754a6930c9e13c693d30c80d298746c2
 RUN git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git /src/dynamo \
+ && git -C /src/dynamo fetch --depth 1 origin "${DYNAMO_REF}" \
  && git -C /src/dynamo checkout --detach "${DYNAMO_REF}"
 RUN python3 -m venv /venv \
  && /venv/bin/pip install --no-cache-dir "maturin[patchelf]"
