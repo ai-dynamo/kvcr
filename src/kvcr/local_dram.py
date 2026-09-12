@@ -543,6 +543,7 @@ class _LocalDram:
                 if (
                     residency_op is not None
                     and key in residency_op.keys
+                    and key not in residency_op.results
                     # Capacity waiters never owned this fill, and the slot it
                     # holds is exactly what they are queued for.
                     and key not in residency_op.capacity_waiters
@@ -550,7 +551,11 @@ class _LocalDram:
                     residency_op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                     residency_ops[op_id] = residency_op
                 deliver_op = self._pending_deliver_ops.get(op_id)
-                if deliver_op is not None and key in deliver_op.keys:
+                if (
+                    deliver_op is not None
+                    and key in deliver_op.keys
+                    and key not in deliver_op.results
+                ):
                     deliver_op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                     deliver_ops[op_id] = deliver_op
 
@@ -638,9 +643,14 @@ class _LocalDram:
                 self._free(residency.slots)
                 failed.append(key)
 
+            # A batch waiting on other keys may have already resolved this key.
             for op_id in record.active_op_ids:
                 residency_op = self._pending_residency_ops.get(op_id)
-                if residency_op is not None and key in residency_op.keys:
+                if (
+                    residency_op is not None
+                    and key in residency_op.keys
+                    and key not in residency_op.results
+                ):
                     if key_success and (
                         residency_op.op_id[0] == "deposit"
                         or now < residency_op.deadline
@@ -664,7 +674,11 @@ class _LocalDram:
                     # just freed; _resume_capacity_waiters retries it below.
 
                 deliver_op = self._pending_deliver_ops.get(op_id)
-                if deliver_op is not None and key in deliver_op.keys:
+                if (
+                    deliver_op is not None
+                    and key in deliver_op.keys
+                    and key not in deliver_op.results
+                ):
                     if key_success:
                         deliver_keys.setdefault(op_id, []).append(key)
                     else:
@@ -819,6 +833,9 @@ class _LocalDram:
 
     def _expire_pending_ops(self, now: float) -> None:
         for residency_op in list(self._pending_residency_ops.values()):
+            # discard_fill() can finish other operations from this snapshot.
+            if residency_op.op_id not in self._pending_residency_ops:
+                continue
             if now < residency_op.deadline:
                 continue
             if residency_op.op_id[0] == "deposit":
