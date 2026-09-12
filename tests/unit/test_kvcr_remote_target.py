@@ -5,6 +5,7 @@
 import ctypes
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import DEFAULT, Mock
 
 import msgspec
@@ -825,6 +826,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         "terminal",
         "log",
         "raise",
+        "shutdown",
     ],
 )
 def test_remote_write_cancellation_and_late_completion(
@@ -931,18 +933,31 @@ def test_remote_write_cancellation_and_late_completion(
             for _, raw in control.sent
         )
     )
-    agent.notifs["source"] = [
+    notifications = [
         _write_done_notification(handle, success=False, terminal=False),
         _write_done_notification(handle),
         _write_done_notification(handle, success=False, terminal=False),
         _write_done_notification(other_handle),
     ]
+    if outcome == "shutdown":
+        # Drain framework jobs, then resolve the old quarantine during close.
+        agent.notifs["source"] = [_write_done_notification(other_handle)]
+        assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            closing = executor.submit(kvcr.close)
+            _wait_until(lambda: kvcr._core._progress._startup_stage == "cleanup")
+            agent.notifs["source"] = notifications
+            closing.result(timeout=6)
+        assert kvcr._core.is_quiescent()
+    else:
+        agent.notifs["source"] = notifications
     if outcome == "raise":
         with pytest.raises(RuntimeError):
             _poll_until(kvcr, bool)
     # Even a raising handler must not kill progress or lose another completion.
-    assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
-    if outcome == "log":
+    if outcome != "shutdown":
+        assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
+    if outcome in ("log", "shutdown"):
         errors = [
             record.args[0]
             for record in caplog.records

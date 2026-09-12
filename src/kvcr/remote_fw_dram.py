@@ -1062,8 +1062,10 @@ class _RemoteFWDram:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.get("source_incarnation")
-        if not self._dangling_ops.check_source_progress() or (
-            expected is not None and expected != self._dangling_ops.incarnation
+        if (
+            progress._stop_requested
+            or not self._dangling_ops.check_source_progress()
+            or (expected is not None and expected != self._dangling_ops.incarnation)
         ):
             self._send_write_done(progress, remote_agent, op_handle, False)
             return

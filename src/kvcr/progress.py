@@ -348,10 +348,16 @@ class _KVCRProgress:
             self._ready.set()
 
     def _close_progress_ops(self) -> None:
+        self._stop_requested = True
         deadline = time.monotonic() + _OP_CLEANUP_TIMEOUT_SECONDS
         while self._in_flight_ops:
+            events, _ = self._poll(self, [])
             for op_id, op in list(self._in_flight_ops.items()):
-                if op.close(self):
+                closed = op.close(self)
+                # A peer reply can settle an operation that close alone cannot.
+                if not closed and op_id in events:
+                    closed, _ = op.progress(self, events[op_id])
+                if closed:
                     self._in_flight_ops.pop(op_id, None)
             if not self._in_flight_ops:
                 return
