@@ -433,6 +433,8 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     target._core._clock = lambda: now
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch((key,), request_id="req")
+    # Both callers share the pending fill and must each complete once.
+    second_fetch = target.fetch((key,), request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
 
@@ -461,9 +463,10 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         _wait_until(lambda: not target._core._progress._completed.empty())
 
     now = 1.5  # Past T, but still inside the destination's grace period.
-    assert _poll_until(target, lambda completed: bool(completed)) == [
-        (fetch, _op_entries({key: False}))
-    ]
+    assert dict(_poll_until(target, lambda completed: len(completed) == 2)) == {
+        fetch: _op_entries({key: False}),
+        second_fetch: _op_entries({key: False}),
+    }
     if resolution != "queued":
         assert target.query((key,), "req") == [
             (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
