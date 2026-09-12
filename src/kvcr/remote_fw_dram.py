@@ -1014,10 +1014,9 @@ class _RemoteFWDram:
     ) -> None:
         started_at = self._kvcr._timer()
         received_at = self._kvcr._clock()
-        try:
-            op_handle = int(payload["op_handle"])
-        except (KeyError, TypeError, ValueError):
-            logger.warning("KVCR malformed start_write: missing op_handle")
+        op_handle = payload.get("op_handle")
+        if type(op_handle) is not int:
+            logger.warning("KVCR malformed start_write: invalid op_handle")
             return
         try:
             remaining_timeout_ms = payload["remaining_timeout_ms"]

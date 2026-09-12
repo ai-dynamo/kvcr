@@ -229,6 +229,9 @@ runner = KVCR(
 The callback names above represent services implemented by the framework
 adapter; they are not provided by KVCR itself.
 
+For `on_resilience_event` and optional framework-memory quarantine, see the
+[resilience contract](design_overview.md#failed-peers-and-dangling-operations).
+
 The main calls are:
 
 | API | Purpose |
@@ -236,13 +239,16 @@ The main calls are:
 | `submit_hint()` / `discard_hint()` | Install and remove request-scoped router source information |
 | `query()` | Read current local knowledge without blocking on the router or a transfer |
 | `deposit()` | Copy framework-owned data into KVCR-managed storage |
-| `fetch()` | Acquire data into KVCR-managed storage and return a releasable claim |
+| `fetch()` | Start acquiring data into KVCR-managed storage; return an operation handle |
 | `deliver()` | Place data into framework-provided destination descriptors |
-| `poll_completed()` | Drain asynchronous per-entry outcomes |
+| `poll_completed()` | Drain completed operations with per-key results |
 | `release()` | Release KVCR residency claims returned by fetch or no-evict deposit |
-| `abort()` | Best-effort cancellation of an operation or selected entries |
+| `abort()` | Best-effort cancellation of an operation or selected entries (currently unimplemented) |
 | `get_stats()` | Return a telemetry snapshot when telemetry is enabled |
-| `close()` | Drain and synchronously tear down the runtime |
+| `close()` | Synchronous teardown after framework-submitted jobs are drained |
+
+Successful `fetch()` results from `poll_completed()` contain the descriptors
+and a `release_handle`; pass the release handles to `release()` when finished.
 
 `query()` reports current knowledge rather than reserving data. A `HIT` can be
 evicted before a later operation claims it, and a hinted remote source can
@@ -320,10 +326,13 @@ The KVCR service daemon owns pool lifecycle. It pre-allocates
 `--guard-count` Guard-owned pool groups before exposing its socket. Every
 group has the same ordered set of usable pool sizes from `--pool-sizes-gb`.
 A worker claims a whole group by Guard index; its pools outlive that worker
-but not the service:
+but not the service.
+
+Before starting, ensure `/run/kvcr` and `/dev/shm/kvcr` exist and are writable
+by the user running the service:
 
 ```bash
-python -m kvcr.kvcr_service \
+uv run python -m kvcr.kvcr_service \
   --socket-path /run/kvcr/memory.sock \
   --pool-dir /dev/shm/kvcr \
   --guard-count 1 \
@@ -400,10 +409,9 @@ its recovered records rather than rebuilding them. Either handover costs time
 linear in the number of recovered blocks, so size it against how much cache
 the group holds.
 
-Recovered blocks are ranked for eviction as they are installed, so a fully
-recovered group still accepts new deposits. They carry no access history, so a
-recovered block ranks below anything this process has served and is evicted
-first.
+Recovered blocks have no claims, so they enter the eviction list. Their old
+access timestamps are not preserved. Reusing a block gives it a new timestamp;
+the configured policy decides how that affects eviction.
 
 Recovery covers new requests only. An operation already active when the
 claimant dies is not resumed, and may fail or remain incomplete; caller-level
@@ -471,6 +479,7 @@ uv run pytest \
 Enable telemetry in `KVCRConfig` and provide a framework-specific
 `stats_factory` through `KVCRBindings`. `get_stats()` should then expose
 bounded counters, gauges, and duration observations.
+Each call returns the current interval snapshot and starts a fresh one.
 
 The package exports metric definitions including `DURATION_METRIC`,
 `TRANSFER_BLOCKS_METRIC`, `TRANSFER_BYTES_METRIC`, and `STATE_METRIC`.
@@ -487,6 +496,14 @@ telemetry leaves the runtime behavior unchanged.
 
 Complete the standalone setup and validation first so framework, router, and native-runtime
 failures are not confused with KVCR core failures.
+
+Select a vLLM revision that includes the KVCR secondary-tier adapter
+(`"type": "kvcr"`, [PR #53624](https://github.com/vllm-project/vllm/pull/53624)), such as
+[`dea5272`](https://github.com/vllm-project/vllm/commit/dea52723218de41d9252dca5d88f325f492c1868).
+Pair it with Dynamo [`010fc8d`](https://github.com/ai-dynamo/dynamo/commit/010fc8d8754a6930c9e13c693d30c80d298746c2) from
+[PR #14695](https://github.com/ai-dynamo/dynamo/pull/14695), which supports the versioned KV hint contract and
+one KVCR control port per local data-parallel rank. The
+[quick start](quick-start.md) records a pinned combination for its container.
 
 ### Build and install Dynamo
 
@@ -510,7 +527,7 @@ uv pip install -e .
 
 This builds the Rust/Python bindings and installs the Dynamo Python packages.
 Install backend extras only when needed. In particular, a Dynamo vLLM extra
-may install its own released vLLM dependency and replace a customized editable
+may install its own released vLLM dependency and replace the selected editable
 vLLM checkout.
 
 ### Build a shared Dynamo, vLLM, and KVCR integration environment
@@ -533,7 +550,7 @@ Build in this order:
 
 1. **Dynamo first.** Build its Rust bindings and install its Python package and
    required backend extras.
-2. **vLLM second.** Install the compatible customized vLLM checkout in editable
+2. **vLLM second.** Install the compatible vLLM checkout in editable
    mode. This restores the intended source tree if a Dynamo extra installed a
    released vLLM package.
 3. **KVCR last.** Install the current checkout in editable mode into the same
@@ -568,17 +585,17 @@ commit/variant or a native build. Do not silently use the newest unrelated
 wheel. Select the closest compatible artifact for the source revision, or use
 the branch's documented native build.
 
-The reference workspace scripts use the same ordering and then verify import
-provenance and the complete native-runtime matrix. Their exact CUDA, PyTorch,
-FlashInfer, and vLLM pins are examples for that workspace, not universal KVCR
-requirements.
+The [quick start](quick-start.md) provides a pinned integration build. Its
+CUDA, PyTorch, FlashInfer, and vLLM versions describe that environment rather
+than universal KVCR requirements. Verify import provenance and native-runtime
+compatibility for the environment you build.
 
 ### Verify Dynamo
 
 From the Dynamo checkout, using the environment into which Dynamo was built:
 
 ```bash
-.venv/bin/python -m dynamo.frontend --help
+python -m dynamo.frontend --help
 ```
 
 The command should print frontend help and exit successfully. For a shared
@@ -608,6 +625,9 @@ for name in modules:
 
 for distribution in ["nvidia-kvcr", "vllm", "nixl"]:
     print(f"{distribution}=={metadata.version(distribution)}")
+
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+print("KVCR secondary tier:", SecondaryTierFactory.get_tier_class({"type": "kvcr"}))
 
 import torch
 print("torch:", torch.__version__)
@@ -646,7 +666,6 @@ one local DP rank and uses illustrative capacities and ports:
   "kv_connector_extra_config": {
     "spec_name": "TieringOffloadingSpec",
     "cpu_bytes_to_use": 1073741824,
-    "enable_external_pinning": true,
     "self_describing_kv_events": true,
     "secondary_tiers": [
       {
@@ -685,7 +704,6 @@ The important fields are:
 | Field | Meaning |
 | --- | --- |
 | `cpu_bytes_to_use` | Capacity of vLLM's primary host-pinned offload tier, not an additional KVCR pool |
-| `enable_external_pinning` | Allows KVCR to serve framework-owned host blocks while vLLM holds the required pins |
 | `self_describing_kv_events` | Includes enough metadata for the router to interpret published KV events |
 | `type="kvcr"` | Selects the KVCR secondary-tier manager |
 | `router_capabilities` | Opts the tier into Dynamo router-hint source and destination planning |
@@ -705,7 +723,10 @@ peers, and every port must be unique on that host.
 
 The secondary tier can optionally own local G2 capacity through
 `secondary_g2_slots`, attach to a service-owned pool through
-`kvcr_memory_server_socket`, or configure file-backed storage through `g3`.
+`kvcr_service_socket_path` together with `compatibility_digest`, or configure
+file-backed storage through `g3`.
+The vLLM adapter uses one unnamed pool per Guard, so start its service with
+one pool size, for example `--pool-sizes-gb 48`.
 Do not enable all capacity mechanisms blindly: a memory-service pool takes
 precedence over an in-process `secondary_g2_slots` allocation. Policy names and
 diagnostic options must match the KVCR and vLLM revisions being tested.
@@ -775,7 +796,7 @@ for module in [dynamo.vllm, vllm, kvcr]:
 PY
 ```
 
-If vLLM resolves to an unintended released package, reinstall the customized
+If vLLM resolves to an unintended released package, reinstall the selected
 vLLM checkout after Dynamo and its extras, then reinstall KVCR. This is why the
 integration build order is Dynamo → vLLM → KVCR.
 
