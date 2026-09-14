@@ -5,8 +5,8 @@ inference engines such as vLLM, but are new to KV Cache Runner (KVCR).
 It covers the local development path from environment setup through
 standalone validation.
 
-To evaluate KVCR with an existing Dynamo Router and vLLM stack without changing
-its source, follow the [quick start](quick-start.md) instead.
+To try the integrated stack without modifying source, follow the
+[quick start](quick-start.md).
 
 ---
 
@@ -91,7 +91,7 @@ editable development mode.
 
 ## Verify the installation
 
-### Verify standalone editable provenance
+### Verify editable install
 
 Run from the KVCR checkout:
 
@@ -150,7 +150,7 @@ uv sync
 
 ## Develop with KVCR
 
-### Use the public API lifecycle correctly
+### API lifecycle
 
 KVCR is constructed by a framework adapter, which supplies runtime
 configuration, backend memory descriptions, and callbacks:
@@ -262,13 +262,15 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--socket-path` | *(required)* | Unix socket the workers connect to |
-| `--pool-dir` | *(required)* | Writable directory holding the pool files |
-| `--guard-count` | *(required)* | Number of Guard-owned pool groups available by index |
-| `--pool-sizes-gb` | *(required)* | Comma-separated usable sizes of the ordered pools in every group |
-| `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
+All flags below are required.
+
+| Flag | Meaning |
+| --- | --- |
+| `--socket-path` | Unix socket the workers connect to |
+| `--pool-dir` | Writable directory holding the pool files |
+| `--guard-count` | Number of Guard-owned pool groups available by index |
+| `--pool-sizes-gb` | Comma-separated usable sizes of the ordered pools in every group |
+| `--compatibility-digest` | Exact digest every claimant must provide |
 
 Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the
 listed usable sizes. The example therefore creates one mapping of 64 GiB plus
@@ -365,8 +367,9 @@ telemetry leaves the runtime behavior unchanged.
 
 ## Integrate with vLLM and Dynamo (optional)
 
-Complete the standalone setup and validation first so framework, router, and native-runtime
-failures are not confused with KVCR core failures.
+Complete standalone setup and validation first. Use a separate shared environment
+for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone
+development loop.
 
 Select a vLLM revision that includes the KVCR secondary-tier adapter
 (`"type": "kvcr"`, [PR #53624](https://github.com/vllm-project/vllm/pull/53624)), such as
@@ -377,11 +380,9 @@ which supports the versioned KV hint contract and one KVCR control port per
 local data-parallel rank. The
 [quick start](quick-start.md) records a pinned combination for its container.
 
-### Build a shared Dynamo, vLLM, and KVCR integration environment
+### Build the integration environment
 
-Use one shared virtual environment only for integration testing. Keep the
-standalone KVCR `.venv` separate so framework dependencies cannot obscure
-standalone failures. For more detail on Dynamo's Rust/Python build, see
+For details on Dynamo's Rust/Python build, see
 [Building from source](https://github.com/ai-dynamo/dynamo#building-from-source).
 
 A practical workspace is:
@@ -427,16 +428,10 @@ VLLM_USE_PRECOMPILED=1 \
 uv pip install --editable ./kvcr
 ```
 
-The precompiled vLLM path is valid only when the checkout and available wheel
-artifacts are compatible. A customized branch may require an explicit wheel
-commit/variant or a native build. Do not silently use the newest unrelated
-wheel. Select the closest compatible artifact for the source revision, or use
-the branch's documented native build.
-
-The [quick start](quick-start.md) provides a pinned integration build. Its
-CUDA, PyTorch, FlashInfer, and vLLM versions describe that environment rather
-than universal KVCR requirements. Verify import provenance and native-runtime
-compatibility for the environment you build.
+Precompiled vLLM artifacts must be compatible with the checkout. A customized
+branch may require an explicit wheel commit/variant or its documented native
+build. The quick start's CUDA, PyTorch, FlashInfer, and vLLM versions describe
+that validated environment rather than universal KVCR requirements.
 
 ### Verify a shared integration environment
 
@@ -491,10 +486,9 @@ revisions; use the name expected by that checkout's own verification or tests.
 
 ### Configure and validate the integration
 
-Keep this validation separate from the standalone development loop. Run it
-when changing public KVCR contracts, the vLLM tier adapter, router hints,
-control endpoints, block-key translation, framework pinning, or remote
-transfers.
+Run integration validation when changing public KVCR contracts, the vLLM tier
+adapter, router hints, control endpoints, block-key translation, framework
+pinning, or remote transfers.
 
 #### Minimal vLLM configuration
 

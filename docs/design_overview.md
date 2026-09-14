@@ -128,18 +128,18 @@ Each operation is bounded by a deadline. When an operation times out or is cance
 
 ### Failed Peers and Dangling Operations
 
-An internal per-instance identifier distinguishes processes even when NIXL agent names are reused; it is not proof of process death. Remote `fetch` and `deliver` use NIXL writes from the source to the destination. Both deadlines are measured from operation start: `operation_timeout_ms` (`T`, default 1000) begins cancellation, and `abandon_timeout_ms` (`A`, default 5000) must be at least `2T`. At `T`, the destination probes the source; cancellation blocks unsubmitted work and sends an advisory while native cleanup continues. At `A`, unresolved operations report uncertainty before handing framework memory back. Nonterminal replies do not extend either deadline. Once cancelled, the operation stays failed; later native success only completes cleanup.
+When a framework instance goes down, its peers can be left waiting on dangling operations. KVCR must bound that wait while protecting memory that outstanding transfers may still access. It uses two deadlines, both measured from operation start:
 
-`KVCRBindings.on_resilience_event` receives `TransferError` events during `poll_completed()` and may receive final cleanup events during `close()`:
+- **Operation deadline:** KVCR stops unsubmitted work and begins cancellation. The target probes the source once while transfer cleanup continues.
+- **Abandonment deadline:** if cleanup is still unresolved at this later deadline, the target sends a second probe to the source. KVCR notifies the local framework that affected memory may remain in use before returning a failed completion or handing that memory back.
 
-- `state="uncertain"` identifies regions that native work may still access. It arrives before KVCR relinquishes framework source pins or returns a completion for a framework destination.
-- `state="quiesced"` carries the same `op_handle` and regions when that operation can no longer access them. It permits reclamation of that operation's hold, without restoring success or clearing other operations' overlapping holds.
+Cleanup may continue after failure is reported. Intermediate replies do not extend either deadline, and late transfer completion cannot turn a failed operation into a success.
 
-Source events identify original keys and local buffers; destination events identify regions, not their current keys. `op_handle` is local to the reporting KVCR; `source_blocks` or `destination_regions` identifies its role. Pair the two states by that local handle and role; their regions are unchanged. The framework owns quarantine and capacity policy for its memory. It may return `False` from `release_pin` to leave release pending, or `True` to accept responsibility while keeping the allocation quarantined. By default, `uncertain` logs at ERROR and `quiesced` at INFO. A custom callback may raise to its caller; pending releases and completions are retained for a later poll or close attempt. Callback failure does not stop native progress. Framework quarantine is opt-in; without a custom handler, events are only logged and framework-owned memory is not quarantined by KVCR.
+Until safety is established, KVCR prevents affected allocations in its own pool from being evicted or reused, and the framework controls quarantine of its own memory. KVCR reports uncertain regions and notifies the framework if it later confirms that a transfer can no longer access them. A region is safe to reuse only after every transfer that could access it has stopped.
 
-The source retains its existing native operation state until NIXL reports `DONE`; pending states, `ERR`, and state-query failures do not establish quiescence. Releasing a handle is not proof that native access stopped. The destination keeps its existing operation in `QUARANTINED` state as the tombstone, retaining the original source incarnation and local regions. After `A`, it probes every `T` until a matching terminal reply or Guard-confirmed death of that original source process resolves it. There is no separate tombstone registry or expiry deadline. Process-death resolution relies on the supported transport's process-lifetime contract; it is not a general revocation guarantee for persistent RDMA transports. Neither heartbeat timeout, a reused agent name, nor elapsed retention time resolves uncertainty. Guard takeover fails old operations rather than replaying them.
+A transport error, a missed heartbeat, or a replacement peer at the same address does not prove that access has stopped. Confirmed death of the original source, for example through its KVCR Guard, permits reclamation only when the transport guarantees that its accesses have ended.
 
-KVCR-owned local G2 source claims and discarded destination fills remain held while unresolved, even indefinitely. Their slots cannot be evicted or reused until quiescence; framework quarantine alone cannot protect KVCR's allocator. Source progress stalls are reported once as a `RuntimeError` through the same callback. New source writes remain disabled until restart; native cleanup continues.
+Some underlying failures may require restarting the affected process. KVCR makes a best effort to complete cleanup without a restart, but unresolved memory may remain unavailable indefinitely. A stalled source stops accepting new writes until restart while cleanup continues. If a Guard takes over, it serves new requests and fails old operations without replaying them.
 
 ---
 
@@ -183,9 +183,9 @@ The list-shaped API allows a key to span multiple pools. A descriptor's `info` c
 
 **Using KVCR-owned DRAM**
 
-`deposit`/`deliver` — framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable KVCR copy; its callback, when provided, fires when the source pointer is safe to reuse. `deliver` requests that the KVCR place a block into a framework-provided GPU or host-memory destination; its callback, when provided, fires when the destination is ready.
+`deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
-`fetch`/`release` — framework asks the KVCR to make a block resident in its KVCR-owned DRAM pool and pin it there. On success, `fetch` returns the resident pointer and a release handle; the framework calls `deliver` to place the block into a framework-provided destination and calls `release` when the pool claim is no longer needed.
+`fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
 `deposit` also accepts a `no_evict` flag (batch-level, applies to all entries): when set, the KVCR keeps every completed slot non-evictable and returns a release handle per entry. A framework that wants guaranteed local DRAM residency behavior for selected KV blocks can get that behavior through `no_evict`, while the KVCR still handles sharing, routing visibility, transfer setup, and tiering policy. The framework calls `release` with the corresponding handle to clear the no-evict claim.
 

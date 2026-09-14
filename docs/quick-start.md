@@ -198,8 +198,9 @@ local persistence.
 
 ## 5. Verify a KVCR peer to peer transfer
 
-First make a real inference request and read the registered worker ID shared by
-the two DP ranks from the response:
+In the host request terminal, set `MODEL` to the same value used in Step 4;
+replace the example below if you chose a different model. Then make an inference
+request to read the registered worker ID shared by both DP ranks:
 
 ```bash
 export MODEL=Qwen/Qwen3-0.6B
@@ -311,10 +312,8 @@ invalidate the matching successful transfer above.
 The explicit rank selection is only for this deterministic mechanism test. In
 a normal deployment, omit the two routing headers. KVCR transfers can occur
 when load, availability, or routing constraints cause the KV router to select a
-target other than the cache-owning worker. Confirm each such transfer in the
-post-request `KV Transfer metrics`: the source reports `transfer=success` and
-`source_write=success`, the destination reports `remote_deliver=success`, and
-their transferred block and byte counts match.
+target other than the cache-owning worker. Verify transfers using the same
+telemetry criteria above.
 
 ---
 
