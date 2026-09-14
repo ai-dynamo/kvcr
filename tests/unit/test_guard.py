@@ -242,9 +242,10 @@ def test_standby_guard_failure_releases_adopted_listener() -> None:
 
 
 def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ) -> None:
     """The Guard's whole life: each stage hands the next exactly what it left."""
+    caplog.set_level(logging.INFO, logger="kvcr.guard")
     first, second, g3_only, fresh = (
         BlockKey(b"first"),
         BlockKey(b"second"),
@@ -378,6 +379,13 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert set(guard._recovery._g3_records) == {fresh}
         assert guard._recovery._g3_records[fresh].slot == 7
         assert order[3:] == [("adopt", (second, fresh)), "clear", "start"]
+        events = [
+            message
+            for message in caplog.messages
+            if message.startswith("KVCR_EVENT guard_promoted ")
+        ]
+        assert len(events) == 2
+        assert all("recovered_blocks=2" in event for event in events)
 
         guard._thread.start()
         _wait_until(lambda: cores[-1].poll_completed.call_count > 0, timeout=2)

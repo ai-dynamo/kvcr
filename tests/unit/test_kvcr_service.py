@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import os
 import select
 import signal
@@ -289,13 +290,15 @@ def test_client_claims_one_grouped_allocation_with_independent_strides(
 
 
 def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
-    tmp_path: Path,
+    tmp_path: Path, caplog
 ) -> None:
     """Pools lease independently; close keeps, names, and can retry a wedged one."""
+    caplog.set_level(logging.DEBUG, logger="kvcr.guard")
     registry = _new_registry(tmp_path, guard_count=2)
     guard = registry._guards[0]
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
     first_spec, stale = _claim(registry, 0, first)
+    assert any("KVCR_EVENT primary_attached " in message for message in caplog.messages)
     _spec, _pools, _fd, _lease = registry.claim(
         1,
         _TierConfig([("pool0", _TEST_BLOCK_SIZE_BYTES * 2)], None),
