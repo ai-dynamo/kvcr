@@ -13,7 +13,7 @@ without editing source code in any of those projects.
 For source builds, editable installs, API development, or test workflows, use
 the [developer guide](dev-guide.md).
 
-For a proposed Kubernetes deployment with an optional KVCR-Service sidecar, see
+For a proposed Kubernetes deployment with an optional KVCR guard service sidecar, see
 [Dynamo PR #14695](https://github.com/ai-dynamo/dynamo/pull/14695).
 That example requires a compatible prebuilt Dynamo vLLM runtime image.
 
@@ -337,12 +337,12 @@ their transferred block and byte counts match.
 
 - Verify that the package imports as `kvcr`.
 - Verify that vLLM registers the `"kvcr"` secondary tier; installing
-  `nvidia-kvcr` alone does not add the adapter to vLLM.
+  `kvcr` alone does not add the adapter to vLLM.
 - Ensure shared memory covers every per-rank `cpu_bytes_to_use` allocation plus
   vLLM IPC; this two-rank example provisions 8 GB.
 - Make `control_ports` a list with exactly one entry per local DP rank.
 - Check that every control and KV-events port is unique and available.
-- Confirm that the installed NIXL version matches the `nvidia-kvcr` pin.
+- Confirm that the installed NIXL version matches the `kvcr` pin.
 
 ### Dynamo does not produce router hints
 

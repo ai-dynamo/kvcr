@@ -151,7 +151,7 @@ print("KVCR adapter:", manager.__file__)
 for distribution in (
     "ai-dynamo",
     "vllm",
-    "nvidia-kvcr",
+    "kvcr",
     "nixl",
     "nvidia-nccl-cu13",
 ):

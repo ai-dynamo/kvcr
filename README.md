@@ -112,7 +112,7 @@ for source installation and verification.
 ### Development
 
 For local development, API lifecycle guidance, validation, integration, and
-KVCR service usage, see the [developer guide](docs/dev-guide.md).
+KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
 
 ## License
 
@@ -126,12 +126,12 @@ build retain their Apache-2.0 contributor headers.
 ## Third-party software
 
 vLLM and Dynamo are installed separately in the quick-start image and are not
-bundled into the `nvidia-kvcr` wheel. The build uses the public sources and
+bundled into the `kvcr` wheel. The build uses the public sources and
 pinned revisions described in the [quick start](docs/quick-start.md).
 
 KVCR declares runtime dependencies on `msgspec`, `pyzmq`, and `nixl`. Each is
 installed from its own distribution under its own license. None of them are
-redistributed by this repository or bundled into the `nvidia-kvcr` wheel, which
+redistributed by this repository or bundled into the `kvcr` wheel, which
 packages only `src/kvcr`.
 
 ## Contributing
