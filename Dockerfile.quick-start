@@ -2,30 +2,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG VLLM_IMAGE=vllm/vllm-openai:nightly-8efa13b700f1836657699cae2503dc2feab27fa0@sha256:83be0b4f532c5a851c655e914dc3a276e52265e4045402d2e36316a11e4b5dc9
+ARG VLLM_IMAGE=vllm/vllm-openai:nightly-2a02f6efe319c885e3ccbcecde402e0028f9ec1e@sha256:96b234afa2867031ad0a226b149a06483861e613e3a3083da53398d347b5ffbd
 
-# The pinned vLLM image is the compatibility base used by the KVCR adapter. The
-# latest released Dynamo vLLM runtime image (1.4.2) pins vLLM 0.26.0 and also
-# predates Dynamo's per-DP-rank `control_ports` contract, so using it would
-# still require patching both vLLM and Dynamo.
+# The vLLM image, adapter source, and Dynamo revision below are one validated
+# compatibility set. Change them together and repeat the end-to-end test.
 FROM rust:1.93-bookworm AS build-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake git libclang-dev libhwloc-dev libudev-dev pkg-config \
+    cmake git libclang-dev libhwloc-dev libprotobuf-dev libudev-dev pkg-config \
     protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
 
-# Require callers to select an immutable public adapter revision explicitly.
-# These placeholders keep an accidental unpinned build fail-closed.
+# Pin the public vLLM integration PR to an exact commit SHA.
 FROM build-base AS vllm-kvcr-source
-ARG KVCR_VLLM_REPO=PUBLIC_VLLM_PR_REPOSITORY_PENDING
-ARG KVCR_VLLM_REF=PUBLIC_VLLM_PR_COMMIT_PENDING
-RUN if [ "${KVCR_VLLM_REPO}" = "PUBLIC_VLLM_PR_REPOSITORY_PENDING" ] \
-      || [ "${KVCR_VLLM_REF}" = "PUBLIC_VLLM_PR_COMMIT_PENDING" ]; then \
-      echo "Set KVCR_VLLM_REPO to the public vLLM repository." >&2; \
-      echo "Set KVCR_VLLM_REF to a specific pinned KVCR adapter commit SHA." >&2; \
-      exit 1; \
-    fi \
- && git init /src/vllm-kvcr \
+ARG KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG KVCR_VLLM_REF=a48bbcfcdd2ac09cb729cf595026c5aec9b69ea0
+RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr remote add origin "${KVCR_VLLM_REPO}" \
  && git -C /src/vllm-kvcr fetch --depth 1 origin "${KVCR_VLLM_REF}" \
  && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
@@ -41,10 +32,10 @@ RUN mkdir -p /overlay \
       vllm/v1/kv_offload/tiering/kvcr/manager.py \
       /overlay/
 
-# Pin Dynamo PR #14695, including the versioned KV hint protocol and
+# Pin a landed Dynamo revision with the versioned KV hint protocol and
 # per-rank KVCR control ports.
 FROM build-base AS dynamo-builder
-ARG DYNAMO_REF=010fc8d8754a6930c9e13c693d30c80d298746c2
+ARG DYNAMO_REF=58f1e01f76cbcf46a08963ffcab85c774da32a43
 RUN git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git /src/dynamo \
  && git -C /src/dynamo fetch --depth 1 origin "${DYNAMO_REF}" \
  && git -C /src/dynamo checkout --detach "${DYNAMO_REF}"
@@ -106,19 +97,49 @@ ENV DYN_REQUEST_PLANE=tcp \
 RUN python3 - <<'PY'
 from importlib import metadata
 import inspect
+from types import SimpleNamespace
 
 import dynamo.vllm
-import dynamo.vllm.router_hints as router_hints
 import kvcr
 import vllm
-from vllm.v1.kv_offload.tiering.kvcr import manager
+from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
+from dynamo.llm import WorkerType
+from dynamo.vllm.kv_hints import resolve_kv_transfer_hint_sources
+from vllm.v1.kv_offload.base import OffloadPolicy
+from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.kvcr import manager
 
 assert metadata.version("nixl") == "1.3.2"
 assert metadata.version("nvidia-nccl-cu13") == "2.30.7"
 assert metadata.version("numpy").startswith("2.")
 assert int(metadata.version("protobuf").split(".", 1)[0]) < 7
-assert "control_ports" in inspect.getsource(router_hints)
+assert "abandon_timeout_ms" in inspect.signature(
+    manager.KVCRSecondaryTierManager.__init__
+).parameters
+assert "chunk_ids" in TransferJob.__dataclass_fields__
+assert OffloadPolicy.CHUNK_LEVEL.value == "chunk_level"
+assert KV_HINT_TRANSFER_CAPABILITY_KEY == "router_hint"
+engine_args = SimpleNamespace(
+    kv_transfer_config=SimpleNamespace(
+        kv_connector_extra_config={
+            "secondary_tiers": [{
+                "type": "kvcr",
+                "router_capabilities": [KV_HINT_TRANSFER_CAPABILITY_KEY],
+                "control_advertise_host": "127.0.0.1",
+                "control_ports": [17771, 17772],
+            }],
+        }
+    )
+)
+sources = resolve_kv_transfer_hint_sources(
+    engine_args, WorkerType.Aggregated, dp_range=(0, 2)
+)
+assert sources is not None
+assert {
+    rank: source.source_control_endpoint for rank, source in sources.items()
+} == {0: "tcp://127.0.0.1:17771", 1: "tcp://127.0.0.1:17772"}
+assert {source.worker_type for source in sources.values()} == {"aggregated"}
 assert (
     SecondaryTierFactory.get_tier_class({"type": "kvcr"})
     is manager.KVCRSecondaryTierManager
