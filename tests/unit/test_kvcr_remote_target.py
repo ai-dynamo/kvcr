@@ -1209,3 +1209,9 @@ def test_remote_framework_dram_transfers_available_keys(
         len(completed_indices),
         ("remote_deliver",),
     ) in target_stats.records
+    assert (
+        "counter",
+        TRANSFER_BYTES_METRIC,
+        completed_count * _mem_descriptor().size,
+        ("remote_deliver",),
+    ) in target_stats.records
