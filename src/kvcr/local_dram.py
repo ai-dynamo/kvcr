@@ -883,7 +883,8 @@ class _LocalDram:
             return
         self._resuming_capacity_waiters = True
         try:
-            while self._capacity_waiters:
+            # One pass lets other waiters run while discarded fills retain slots.
+            for _ in range(len(self._capacity_waiters)):
                 waiter = self._capacity_waiters[0]
                 op = waiter.op
                 if (
@@ -906,6 +907,9 @@ class _LocalDram:
                 record = self._kvcr._block_record(waiter.key)
                 residency = record.local_dram
                 if residency is not None:
+                    if residency.state is _LocalDramState.DISCARDING:
+                        self._capacity_waiters.rotate(-1)
+                        continue
                     self._capacity_waiters.popleft()
                     op.capacity_waiters.remove(waiter.key)
                     if residency.layout != waiter.layout:
@@ -920,8 +924,6 @@ class _LocalDram:
                             if op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
-                    elif residency.state is _LocalDramState.DISCARDING:
-                        op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
                     self._finish_residency_if_ready(op)
                     continue
 

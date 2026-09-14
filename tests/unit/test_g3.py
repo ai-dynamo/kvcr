@@ -881,11 +881,12 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 2)
     primary.raw = b"a" * page_size + b"b" * page_size
-    local = ctypes.create_string_buffer(page_size)
+    local = ctypes.create_string_buffer(page_size * 2)
     first, second = BlockKey(b"first"), BlockKey(b"second")
+    third, other_key = BlockKey(b"third"), BlockKey(b"other")
     agent = _StuckReadAgent()
     policy = _MoveLocalToG3Policy()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy)
+    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy, slot_count=2)
 
     assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
     assert _deposit(
@@ -894,6 +895,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
         ctypes.addressof(primary) + page_size,
         page_size,
     ).success
+    assert _deposit(kvcr, third, ctypes.addressof(primary), page_size).success
     _poll_until(kvcr, lambda _: kvcr._core._block_record_map[first].g3 is not None)
     policy.move = False  # later evictions drop instead of spilling
 
@@ -902,7 +904,9 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     fetch = kvcr.fetch((first,))
     _poll_until(
         kvcr,
-        lambda _: any(op.kind == "fill" for op in kvcr._core._g3._active.values()),
+        lambda _: any(
+            agent.xfers[handle - 1][0] == "READ" for handle in agent.transfers
+        ),
     )
     now[0] = 100.0
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
@@ -916,7 +920,15 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     # The abandoned fill still owns the slot, so the retry waits for it.
     retry = kvcr.fetch((first,))
     assert retry not in dict(kvcr.poll_completed())
+    # An unrelated spill must not fail this retry or be blocked behind it.
+    policy.move = True
+    other = kvcr.deposit(
+        {other_key: [_mem_descriptor(ctypes.addressof(primary), page_size)]}
+    )
+    completed = dict(_poll_until(kvcr, lambda done: other in dict(done)))
     agent.stuck = False
+    assert set(completed) == {other}
+    assert completed[other][other_key].success
     retry_result = dict(_poll_until(kvcr, lambda done: retry in dict(done)))[retry][
         first
     ]
