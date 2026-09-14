@@ -499,10 +499,11 @@ failures are not confused with KVCR core failures.
 
 Select a vLLM revision that includes the KVCR secondary-tier adapter
 (`"type": "kvcr"`, [PR #53624](https://github.com/vllm-project/vllm/pull/53624)), such as
-[`dea5272`](https://github.com/vllm-project/vllm/commit/dea52723218de41d9252dca5d88f325f492c1868).
-Pair it with Dynamo [`010fc8d`](https://github.com/ai-dynamo/dynamo/commit/010fc8d8754a6930c9e13c693d30c80d298746c2) from
-[PR #14695](https://github.com/ai-dynamo/dynamo/pull/14695), which supports the versioned KV hint contract and
-one KVCR control port per local data-parallel rank. The
+[`a48bbcf`](https://github.com/vllm-project/vllm/commit/a48bbcfcdd2ac09cb729cf595026c5aec9b69ea0).
+Pair it with a landed Dynamo revision such as
+[`58f1e01`](https://github.com/ai-dynamo/dynamo/commit/58f1e01f76cbcf46a08963ffcab85c774da32a43),
+which supports the versioned KV hint contract and one KVCR control port per
+local data-parallel rank. The
 [quick start](quick-start.md) records a pinned combination for its container.
 
 ### Build and install Dynamo

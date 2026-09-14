@@ -102,13 +102,11 @@ the future.
 
 ### Quick start
 
-The [quick start](docs/quick-start.md) builds and runs KVCR with vLLM, Dynamo,
-and NIXL using pinned source revisions and a compatible base image.
-
-vLLM must include the KVCR secondary-tier adapter (`"type": "kvcr"`) from
-[PR #53624](https://github.com/vllm-project/vllm/pull/53624). A compatible vLLM
-`main` checkout or release containing that integration can also be used; see
-the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
+The [quick start](docs/quick-start.md) is a public preview that builds and runs
+KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible
+base image. It currently uses the still-open vLLM
+[PR #53624](https://github.com/vllm-project/vllm/pull/53624); see the
+[developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
 for source installation and verification.
 
 ### Development
