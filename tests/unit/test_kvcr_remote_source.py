@@ -348,14 +348,21 @@ def test_kvcr_source_ignores_malformed_control_messages():
     control.incoming.append(b"\xff\xff\xff not msgpack")
     control.incoming.append(msgspec.msgpack.encode(b"top-level-not-dict"))
     control.incoming.append(msgspec.msgpack.encode({"type": "unknown"}))
+    control.incoming.append(
+        msgspec.msgpack.encode({"type": "start_write", "op_handle": float("inf")})
+    )
+    key = BlockKey(b"valid")
+    control.incoming.append(_start_write_message(1, key))
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
 
-    time.sleep(0.01)
-    assert list(kvcr.poll_completed()) == []
-    kvcr._core._progress.raise_if_failed()
-    assert source_agent.xfers == []
+    assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
+    assert pinning.searches == [(key,)]
+    assert len(source_agent.xfers) == 1
     assert source_agent.sent_notifs == []
     assert pinning.unpins == []
+    source_agent.state = "DONE"
+    assert _poll_until(kvcr, lambda _: bool(pinning.unpins)) == []
+    assert pinning.unpins == ["pin"]
 
 
 @pytest.mark.parametrize(

@@ -211,7 +211,6 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
     source = ctypes.create_string_buffer(16)
     agent = FakeNixlAgent()
-    agent.state = "DONE"
     kvcr = _two_pool_kvcr(agent, pools)
     full, swa, grouped = (BlockKey(name) for name in (b"full", b"swa", b"grouped"))
     descriptors = [
@@ -219,9 +218,17 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
         _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
     ]
 
-    for key, descriptor in ((full, descriptors[0]), (swa, descriptors[1])):
-        operation = kvcr.deposit({key: [descriptor]}, no_evict=key == swa)
-        _poll_until(kvcr, lambda done: operation in dict(done))
+    kvcr.deposit({full: [descriptors[0]], swa: [descriptors[1]]})
+    # Both batches reject full; only swa should be claimed after the fill.
+    fetch = kvcr.fetch((full, swa), expected_layout=["swa"])
+    duplicate = kvcr.deposit({full: [descriptors[1]], swa: [descriptors[1]]})
+    assert list(kvcr.poll_completed()) == []
+    agent.state = "DONE"
+    completed = dict(_poll_until(kvcr, lambda results: len(results) == 3))
+    assert completed[duplicate] == _op_entries({full: False, swa: True})
+    assert completed[fetch][full].status is OpEntryStatus.FAILED
+    claim = completed[fetch][swa]
+    assert claim.success
 
     operation = kvcr.deposit({grouped: descriptors})
     result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
@@ -234,6 +241,7 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     assert dict(_poll_until(kvcr, lambda done: retry in dict(done)))[retry][
         grouped
     ].success
+    kvcr.release([claim.release_handle])
 
 
 def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
