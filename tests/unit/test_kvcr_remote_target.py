@@ -342,9 +342,14 @@ def test_remote_staging_commits_available_keys() -> None:
     fetch = target.fetch(keys, request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
+    # Malformed handles must not fail the fill or discard its valid completion.
     agent.notifs["source"] = [
-        _write_done_notification(message["op_handle"], completed_indices=(0, 2))
-    ]
+        b"KVCR:"
+        + msgspec.msgpack.encode(
+            {"type": "write_done", "op_handle": handle, "success": False}
+        )
+        for handle in (str(message["op_handle"]), float("inf"))
+    ] + [_write_done_notification(message["op_handle"], completed_indices=(0, 2))]
 
     completed = _poll_until(target, lambda results: bool(results))
     assert len(completed) == 1 and completed[0][0] == fetch

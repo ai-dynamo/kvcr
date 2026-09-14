@@ -1662,9 +1662,9 @@ class _RemoteFWDram:
                     payload = _decode_notif(raw)
                     if payload is None or payload.get("type") != "write_done":
                         continue
-                    try:
-                        op_handle = int(payload["op_handle"])
-                    except (KeyError, TypeError, ValueError):
+                    # op_handle must be an integer.
+                    op_handle = payload.get("op_handle")
+                    if type(op_handle) is not int:
                         continue
                     op_id = ("target", op_handle)
                     previous = events.get(op_id, {})
