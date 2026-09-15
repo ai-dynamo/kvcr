@@ -114,17 +114,13 @@ class _DanglingOps:
             )
         )
 
-    def poll_target(
-        self, progress: "_KVCRProgress", op: "_TargetPullOp", now: float
-    ) -> bool:
+    def poll_target(self, progress: "_KVCRProgress", op: "_TargetPullOp") -> bool:
         first_poll = not op.uncertain
         if first_poll:
             op.uncertain = True
             self.report_target(op, "uncertain")
             self._backend._progress_outbound.append(replace(op))
             self._backend._invalidate_control_peer(op.remote_ctrl_ep)
-        if first_poll or now >= op.deadline:
-            op.deadline = now + self._backend._kvcr.config.operation_timeout_ms / 1000
             return self.probe(progress, op)
         return False
 

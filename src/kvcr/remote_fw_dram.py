@@ -198,14 +198,14 @@ class _TargetPullOp(_RemoteOp):
         if self.state is _TargetPullState.QUARANTINED:
             # Retain this tombstone indefinitely until quiescence is proven;
             # elapsed time alone cannot make its destination safe to reuse.
-            return False, backend._dangling_ops.poll_target(progress, self, now)
+            return False, backend._dangling_ops.poll_target(progress, self)
 
         if now >= self.deadline or (
             cancelled and self.state is _TargetPullState.WAITING_WRITE_DONE
         ):
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 self.state = _TargetPullState.QUARANTINED
-                backend._dangling_ops.poll_target(progress, self, now)
+                backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
             self.state = _TargetPullState.WAITING_TERMINAL

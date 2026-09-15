@@ -773,6 +773,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     handle, _ = _acked_deliver(control, kvcr, source, key)
     control.sent.clear()
     control.send = Mock(wraps=control.send, side_effect=[False, DEFAULT])
+    control.recv = Mock(wraps=control.recv)
     now = 1.0
     _wait_until(lambda: control.send.call_count == 2)
     control.send.side_effect = None
@@ -810,6 +811,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     )
     _wait_until(lambda: not control.incoming)
     now = 100.0
+    received = control.recv.call_count
+    # Two receives ensure a full progress pass has observed the advanced clock.
+    _wait_until(lambda: control.recv.call_count >= received + 2)
     assert list(kvcr.poll_completed()) == []
     assert _has_outstanding_operations(kvcr)
     assert len(errors) == 1
@@ -822,6 +826,11 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert not _has_outstanding_operations(kvcr)
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
     assert errors[0].destination_regions == errors[1].destination_regions
+    assert [
+        message["op_handle"]
+        for _, raw in control.sent
+        if (message := _decode_control_message(raw))["type"] == "write_probe"
+    ] == [handle, handle]
 
 
 @pytest.mark.parametrize(
@@ -835,7 +844,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         "log",
         "raise",
         "shutdown",
-        "shutdown_probe",
+        "shutdown_probe_reply",
     ],
 )
 def test_remote_write_cancellation_and_late_completion(
@@ -939,22 +948,15 @@ def test_remote_write_cancellation_and_late_completion(
         with ThreadPoolExecutor(max_workers=1) as executor:
             closing = executor.submit(kvcr.close)
             _wait_until(lambda: kvcr._core._progress._startup_stage == "cleanup")
-            if outcome == "shutdown_probe":
-
-                def guard_reply(_endpoint, message):
-                    if _decode_control_message(message)["type"] == "write_probe":
-                        control.incoming.append(
-                            _probe_ack(
-                                handle,
-                                source,
-                                sender_incarnation="guard",
-                                dead_incarnation="source",
-                            )
-                        )
-                    return True
-
-                control.send = guard_reply
-                now = 6.0
+            if outcome == "shutdown_probe_reply":
+                control.incoming.append(
+                    _probe_ack(
+                        handle,
+                        source,
+                        sender_incarnation="guard",
+                        dead_incarnation="source",
+                    )
+                )
             else:
                 agent.notifs["source"] = notifications
             closing.result(timeout=6)
