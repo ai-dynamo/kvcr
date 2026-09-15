@@ -1142,6 +1142,8 @@ def test_remote_framework_dram_transfers_available_keys(
         remote_options=RemoteFWDramOptions(backend="REMOTE"),
     )
     source._core._clock = lambda: 0.0
+    source_op_handle = 17
+    source._core._remote_fw_dram._next_source_op_id = source_op_handle
     keys = tuple(_make_block_key(b"k0", index) for index in range(3))
     completed_indices = [
         index for index in range(len(keys)) if index not in missing_indices
@@ -1218,17 +1220,23 @@ def test_remote_framework_dram_transfers_available_keys(
         for record in caplog.records
         if record.getMessage().startswith("KVCR_EVENT")
     ]
+    source_ops = f"op={op_handle} source_op={source_op_handle}"
     assert any(
         "target_transfer_started" in event and "blocks=3 bytes=48" in event
         for event in events
     )
     assert any(
-        "source_transfer_requested" in event and "blocks=3 bytes=48" in event
+        "source_transfer_requested" in event
+        and source_ops in event
+        and "blocks=3 bytes=48" in event
         for event in events
     )
     completed = f"blocks={len(completed_indices)} bytes={16 * len(completed_indices)}"
     assert any(
-        "source_transfer_completed" in event and completed in event for event in events
+        "source_transfer_completed" in event
+        and source_ops in event
+        and completed in event
+        for event in events
     )
     assert any(
         "target_transfer_completed" in event and completed in event for event in events

@@ -429,9 +429,10 @@ class _SourceWriteOp(_RemoteOp):
         backend._record_progress_duration("source_write", self.started_at, result)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "KVCR_EVENT source_transfer_completed op=%d target=%s blocks=%d "
-                "bytes=%d result=%s",
+                "KVCR_EVENT source_transfer_completed op=%d source_op=%d target=%s "
+                "blocks=%d bytes=%d result=%s",
                 self.op_handle,
+                self.op_id[1],
                 self.route[0],
                 len(self.source_keys) if self.success else 0,
                 _descriptor_bytes(self.src_descriptors) if self.success else 0,
@@ -1115,19 +1116,20 @@ class _RemoteFWDram:
             self._send_write_done(progress, remote_agent, op_handle, False)
             return
         self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
+        op_id = ("source", self._next_source_op_id)
+        self._next_source_op_id += 1
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "KVCR_EVENT source_transfer_requested op=%d target=%s blocks=%d "
-                "bytes=%d",
+                "KVCR_EVENT source_transfer_requested op=%d source_op=%d target=%s "
+                "blocks=%d bytes=%d",
                 op_handle,
+                op_id[1],
                 target_agent,
                 len(keys),
                 _descriptor_bytes(dst_descriptors),
             )
 
-        op_id = ("source", self._next_source_op_id)
-        self._next_source_op_id += 1
         self._progress_outbound.append(
             _SourcePinOp(
                 op_id=op_id,
