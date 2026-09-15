@@ -662,6 +662,13 @@ class _Guard:
                 if not self._closing and not self._refusing():
                     self._pool_lease.current = liveness
                     self._phase = _Phase.PRIMARY
+                    logger.debug(
+                        "KVCR_EVENT primary_attached guard=%d pool=%s control=%s:%d",
+                        self._guard_index,
+                        self._spec.pool_id,
+                        bind[0],
+                        bind[1],
+                    )
                     return self._spec, self._recovery.pools, granted_fd, liveness
             # Refused at the commit: a closing service must not grant a pool.
             # Everything adopted goes back as a release would have put it.
@@ -856,6 +863,7 @@ class _Guard:
         the replacement. A new NIXL agent name keeps peers off the dead one's.
         """
         records = self._recovery.prepare_to_serve(records)
+        recovered_blocks = len(records)
 
         def reject_pin(keys: object) -> int:
             raise RuntimeError("Guard has no framework-owned memory")
@@ -871,9 +879,10 @@ class _Guard:
             ],
             self._configured.remote_fw_dram_backend,
         )
+        agent_name = f"KVCR-Guard-{uuid.uuid4()}"
         core = _KVCRCore(
             KVCRConfig(
-                nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
+                nixl_agent_name=agent_name,
                 pool_layouts=self._configured.pool_layouts,
                 inventory_report_interval_ms=0,
                 nixl_listen_port=0,
@@ -902,6 +911,19 @@ class _Guard:
         self._recovery.release_snapshot_region()
         core.start()
         self._serving = True
+        endpoint = self._pool_lease.bind_address
+        control_endpoint = (
+            "unbound" if endpoint is None else f"{endpoint[0]}:{endpoint[1]}"
+        )
+        logger.info(
+            "KVCR_EVENT guard_promoted guard=%d pool=%s recovered_blocks=%d "
+            "agent=%s control=%s",
+            self._guard_index,
+            self._spec.pool_id,
+            recovered_blocks,
+            agent_name,
+            control_endpoint,
+        )
 
     def _hand_back(self) -> None:
         """Stop serving, leaving this pool group's state where the next primary looks.

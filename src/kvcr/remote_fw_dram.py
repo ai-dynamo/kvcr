@@ -11,9 +11,10 @@ Target: hint/query -> fetch/deliver -> start_write -> write_done.
 Source: start_write -> local claim/framework pin -> write -> write_done.
 """
 
+import logging
 import math
 import time
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -193,6 +194,24 @@ class _TargetPullOp(_RemoteOp):
                 else "failed"
             )
             backend._record_progress_duration(scope, self.started_at, result)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KVCR_EVENT target_transfer_completed scope=%s request_id=%s "
+                    "op=%d source=%s blocks=%d bytes=%d result=%s",
+                    scope,
+                    self.request_id,
+                    self.op_id[1],
+                    self.remote_ctrl_ep,
+                    len(completed_keys),
+                    _descriptor_bytes(
+                        descriptors
+                        for key, descriptors in zip(
+                            self.ordered_keys, self.dst_descriptors
+                        )
+                        if key in completed_keys
+                    ),
+                    result,
+                )
             return True, True
 
         if self.state is _TargetPullState.QUARANTINED:
@@ -408,6 +427,17 @@ class _SourceWriteOp(_RemoteOp):
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KVCR_EVENT source_transfer_completed op=%d source_op=%d target=%s "
+                "blocks=%d bytes=%d result=%s",
+                self.op_handle,
+                self.op_id[1],
+                self.route[0],
+                len(self.source_keys) if self.success else 0,
+                _descriptor_bytes(self.src_descriptors) if self.success else 0,
+                result,
+            )
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
         return True, True
@@ -586,6 +616,17 @@ class _RemoteFWDram:
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             request_id=request_id,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "
+                "source=%s blocks=%d bytes=%d",
+                scope,
+                request_id,
+                op_handle,
+                current_hint.source,
+                len(keys),
+                _descriptor_bytes(op.dst_descriptors),
+            )
         kvcr._add_block_dependencies(op, new_operation=True)
         kvcr._progress.submit(op)
         return True
@@ -1075,9 +1116,20 @@ class _RemoteFWDram:
             self._send_write_done(progress, remote_agent, op_handle, False)
             return
         self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
-
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KVCR_EVENT source_transfer_requested op=%d source_op=%d target=%s "
+                "blocks=%d bytes=%d",
+                op_handle,
+                op_id[1],
+                target_agent,
+                len(keys),
+                _descriptor_bytes(dst_descriptors),
+            )
+
         self._progress_outbound.append(
             _SourcePinOp(
                 op_id=op_id,
@@ -1777,6 +1829,10 @@ class _RemoteFWDram:
 # Control wire-format helpers.
 
 _NOTIF_PREFIX = b"KVCR:"
+
+
+def _descriptor_bytes(groups: Iterable[Iterable[MemDescriptor]]) -> int:
+    return sum(descriptor.size for group in groups for descriptor in group)
 
 
 def _message_keys(payload: Mapping[str, Any]) -> tuple[BlockKey, ...]:

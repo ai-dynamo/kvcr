@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import os
 import select
 import signal
@@ -289,13 +290,15 @@ def test_client_claims_one_grouped_allocation_with_independent_strides(
 
 
 def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
-    tmp_path: Path,
+    tmp_path: Path, caplog
 ) -> None:
     """Pools lease independently; close keeps, names, and can retry a wedged one."""
+    caplog.set_level(logging.DEBUG, logger="kvcr.guard")
     registry = _new_registry(tmp_path, guard_count=2)
     guard = registry._guards[0]
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
     first_spec, stale = _claim(registry, 0, first)
+    assert any("KVCR_EVENT primary_attached " in message for message in caplog.messages)
     _spec, _pools, _fd, _lease = registry.claim(
         1,
         _TierConfig([("pool0", _TEST_BLOCK_SIZE_BYTES * 2)], None),
@@ -1282,6 +1285,14 @@ def test_pool_size_list_preserves_order_and_floors_each_item_to_pages() -> None:
 
     expected = (2 * _PAGE_BLOCK_SIZE_BYTES, 3 * _PAGE_BLOCK_SIZE_BYTES)
     assert parsed.pool_sizes_bytes == expected
+
+
+def test_service_log_level_accepts_cli_and_environment(monkeypatch) -> None:
+    monkeypatch.setenv("KVCR_LOG_LEVEL", "warning")
+    assert _parse_args(_service_args("1")).log_level == "WARNING"
+    assert _parse_args(_service_args("1") + ["--log-level", "debug"]).log_level == (
+        "DEBUG"
+    )
 
 
 @pytest.mark.parametrize(
