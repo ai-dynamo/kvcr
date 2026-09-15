@@ -70,7 +70,7 @@ RUN python3 -m pip install --no-cache-dir \
  && rm -rf /tmp/dynamo-wheels
 
 # Install KVCR from the checkout used as the Docker build context.
-COPY pyproject.toml README.md /opt/kvcr-src/
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
 COPY src /opt/kvcr-src/src
 RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
  && python3 -m pip install --no-cache-dir \

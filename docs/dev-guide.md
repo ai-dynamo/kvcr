@@ -71,16 +71,17 @@ dependency set described by `pyproject.toml`.
 ### KVCR wheel (optional)
 
 Build a wheel when changing package metadata or validating the distributable
-artifact. After `uv sync` has installed the declared dependencies, build and
-temporarily replace the editable install, assuming it was written under `dist/`:
+artifact. After `uv sync` has installed the declared dependencies, build into a
+fresh temporary directory and replace the editable install with that wheel:
 
 ```bash
-uv build --wheel
+KVCR_WHEEL_DIR=$(mktemp -d)
+uv build --wheel --out-dir "$KVCR_WHEEL_DIR"
 uv pip install \
   --python .venv/bin/python \
   --reinstall \
   --no-deps \
-  dist/kvcr-*.whl
+  "$KVCR_WHEEL_DIR"/kvcr-*.whl
 ```
 
 Use `--no-deps` only after `uv sync` has installed the declared dependencies.
