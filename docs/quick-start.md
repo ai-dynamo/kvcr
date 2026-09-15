@@ -162,10 +162,12 @@ export KV_EVENTS_CONFIG='{
 }'
 ```
 
-Launch two data-parallel ranks:
+Launch two data-parallel ranks with DEBUG logging to show transfer metrics even
+when the source rank is idle:
 
 ```bash
-env -u NATS_SERVER CUDA_VISIBLE_DEVICES=0,1 python3 -m dynamo.vllm \
+env -u NATS_SERVER CUDA_VISIBLE_DEVICES=0,1 VLLM_LOGGING_LEVEL=DEBUG \
+  python3 -m dynamo.vllm \
   --model "$MODEL" \
   --tensor-parallel-size 1 \
   --data-parallel-size 2 \
