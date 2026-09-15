@@ -2,9 +2,11 @@
   <img src="docs/figures/kvcr-masthead.jpg" alt="KV Cache Runner — Data Plane Architecture" width="100%">
 </p>
 
-> [!WARNING]
-> **Under Active Development.** This project is incomplete and may contain breaking changes. It is not yet recommended for production use.
-> 
+> [!NOTE]
+> **Initial release.** KVCR supports cross-node DRAM sharing, local disk caching,
+> and resiliency for vLLM. Future releases will add SGLang and TRT-LLM integrations
+> and object storage support.
+>
 > Feedback and contributions are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 # KV Cache Runner
@@ -74,8 +76,7 @@ the future.
 - SGLang
   - [[RFC] First-Class, Versioned KV Hint Envelope for SGLang #36224](https://github.com/sgl-project/sglang/issues/36224)
 
-- Dynamo KV Router
-  - [Refactor(router): define typed KV hint contract #13134](https://github.com/ai-dynamo/dynamo/pull/13134)
+- Dynamo KV Router — supported
 
 ### Engine support
 
@@ -85,8 +86,6 @@ the future.
 
 - vLLM
   - [[KV Offload] Add KVCR secondary-tier adapter #53624](https://github.com/vllm-project/vllm/pull/53624)
-  - [[KV Offload] Preserve KV event metadata until final residency removal #52068](https://github.com/vllm-project/vllm/pull/52068)
-  - [[KV Offload] Forward ownership in KV cache events #52067](https://github.com/vllm-project/vllm/pull/52067)
 
 - SGLang
   - [[RFC] KVCR as a HiCacheStorage backend for peer-to-peer KV reuse #32903](https://github.com/sgl-project/sglang/issues/32903)
