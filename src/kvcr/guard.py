@@ -884,7 +884,6 @@ class _Guard:
             KVCRConfig(
                 nixl_agent_name=agent_name,
                 pool_layouts=self._configured.pool_layouts,
-                inventory_report_interval_ms=0,
                 nixl_listen_port=0,
             ),
             KVCRBindings(

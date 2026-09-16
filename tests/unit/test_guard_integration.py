@@ -125,7 +125,6 @@ def _make_kvcr(
                 nixl_agent_name=agent_name,
                 pool_layouts=pool_layouts or [("", page_size)],
                 nixl_listen_port=0,
-                inventory_report_interval_ms=0,
             ),
             KVCRBindings(
                 pinning.request_pin,
@@ -371,7 +370,6 @@ def test_promoted_guard_serves_real_nixl_transfers(
             nixl_agent_name="real-target",
             pool_layouts=list(dict(layout).items()),
             nixl_listen_port=0,
-            inventory_report_interval_ms=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
             abandon_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 2000,
         ),

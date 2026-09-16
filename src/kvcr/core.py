@@ -126,8 +126,6 @@ class _KVCRCore:
             raise ValueError(
                 "abandon_timeout_ms must be at least twice operation_timeout_ms"
             )
-        if self.config.inventory_report_interval_ms < 0:
-            raise ValueError("inventory_report_interval_ms must be non-negative")
         if not 0 <= self.config.capacity_low_watermark_percent <= 100:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")
 
@@ -165,8 +163,6 @@ class _KVCRCore:
         if g3_config is not None and local_dram_config is None:
             raise ValueError("G3 requires configured local DRAM")
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
-        self._pending_inventory_events: list[InventoryEvent] = []
-        self._inventory_flush_deadline: float | None = None
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
@@ -189,9 +185,6 @@ class _KVCRCore:
 
         # Operational clock and optional telemetry clock.
         self._clock: _Clock = time.monotonic
-        self._inventory_report_interval = (
-            self.config.inventory_report_interval_ms / 1000
-        )
         stats_factory = self._stats_factory if self.config.enable_telemetry else None
         telemetry_enabled = stats_factory is not None
         self._stats = stats_factory() if stats_factory is not None else None
@@ -515,7 +508,6 @@ class _KVCRCore:
         if self._local_dram is not None:
             progress_items = self._local_dram.poll_main(progress_items)
         self._remote_fw_dram.poll_main(progress_items)
-        self._flush_inventory()
         completed = self._completion_queue
         self._completion_queue = []
         return completed
@@ -565,7 +557,6 @@ class _KVCRCore:
         if self._closed:
             return
         # Assumption: the framework drains submitted jobs before close.
-        self._flush_inventory(force=True)
         progress_error: BaseException | None = None
         try:
             self._progress.close()
@@ -639,18 +630,6 @@ class _KVCRCore:
         if not keys:
             return True
         event = InventoryEvent(tuple(keys), tier, removed)
-        if self._inventory_report_interval == 0:
-            return self._send_inventory(event)
-        if self._inventory_sink_callback is None:
-            return False
-        self._pending_inventory_events.append(event)
-        if self._inventory_flush_deadline is None:
-            self._inventory_flush_deadline = (
-                self._clock() + self._inventory_report_interval
-            )
-        return True
-
-    def _send_inventory(self, event: InventoryEvent) -> bool:
         callback = self._inventory_sink_callback
         if callback is None:
             return False
@@ -660,16 +639,6 @@ class _KVCRCore:
             logger.warning("KVCR inventory sink failed", exc_info=True)
             return False
         return True
-
-    def _flush_inventory(self, *, force: bool = False) -> None:
-        deadline = self._inventory_flush_deadline
-        if deadline is None or (not force and self._clock() < deadline):
-            return
-        events = self._pending_inventory_events
-        self._pending_inventory_events = []
-        self._inventory_flush_deadline = None
-        for event in events:
-            self._send_inventory(event)
 
     def _update_capacity_pressure(self, reclaimable_slots: Mapping[str, int]) -> None:
         callback = self._capacity_needed_callback

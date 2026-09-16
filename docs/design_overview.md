@@ -244,7 +244,7 @@ The router maintains an eventually-consistent global prefix inventory for cache-
 
 Framework-owned memory is reported through the framework's existing router event path. If needed, `tier_enter`/`tier_exit` reporting or `inventory_snapshot()` can be added to the KVCR API later.
 
-KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. Events may be batched and are tier-specific because one block may be present in several tiers at once.
+KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
 
 ### Request-scoped hints
 

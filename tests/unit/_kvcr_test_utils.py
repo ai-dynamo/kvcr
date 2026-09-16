@@ -487,7 +487,6 @@ def _new_kvcr(
         or KVCRConfig(
             nixl_agent_name=name,
             pool_layouts=[("", 16)],
-            inventory_report_interval_ms=0,
         ),
         nixl_agent_name=name,
         nixl_listen_port=1,
@@ -536,7 +535,6 @@ def _new_local_kvcr(
                 nixl_agent_name="target",
                 pool_layouts=[("", len(local) // slot_count)],
                 nixl_listen_port=1,
-                inventory_report_interval_ms=0,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
             ),
             KVCRBindings(
