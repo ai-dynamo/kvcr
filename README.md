@@ -84,8 +84,7 @@ the future.
   - [[RFC]: Router Hint initiated P2P KV Cache Transfer Between TRT-LLM Workers #18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)
   - [Router Hint initiated P2P KV Cache Transfer Between TRT-LLM Workers #18158](https://github.com/NVIDIA/TensorRT-LLM/pull/18158)
 
-- vLLM
-  - [[KV Offload] Add KVCR secondary-tier adapter #53624](https://github.com/vllm-project/vllm/pull/53624)
+- vLLM — supported
 
 - SGLang
   - [[RFC] KVCR as a HiCacheStorage backend for peer-to-peer KV reuse #32903](https://github.com/sgl-project/sglang/issues/32903)
@@ -103,8 +102,7 @@ the future.
 
 The [quick start](docs/quick-start.md) is a public preview that builds and runs
 KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible
-base image. It currently uses the still-open vLLM
-[PR #53624](https://github.com/vllm-project/vllm/pull/53624); see the
+base image. See the
 [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
 for source installation and verification.
 
