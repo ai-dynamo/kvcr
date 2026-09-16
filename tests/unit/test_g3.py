@@ -173,7 +173,6 @@ def _new_g3_kvcr(
             nixl_agent_name="target",
             pool_layouts=[("", len(local) // slot_count)],
             enable_telemetry=telemetry,
-            inventory_report_interval_ms=10 if telemetry else 0,
         ),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
