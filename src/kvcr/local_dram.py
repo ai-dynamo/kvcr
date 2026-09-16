@@ -141,7 +141,7 @@ class _LocalCopyOp(_ProgressOp):
 
 
 class _LocalDram:
-    """Main-thread metadata for KVCR-owned DRAM pools."""
+    """Caller-owned DRAM metadata, with synchronized progress-side source claims."""
 
     def __init__(
         self,
@@ -474,7 +474,7 @@ class _LocalDram:
         return results
 
     def acquire_sources(
-        self, keys: Collection[BlockKey]
+        self, keys: Collection[BlockKey], *, notify_capacity: bool = True
     ) -> dict[BlockKey, list[MemDescriptor]]:
         sources: dict[BlockKey, list[MemDescriptor]] = {}
         for key in keys:
@@ -486,7 +486,8 @@ class _LocalDram:
                 continue
             self._acquire_claim(key, residency)
             sources[key] = self._descriptors(residency.slots)
-        self._update_capacity_pressure()
+        if notify_capacity:
+            self._update_capacity_pressure()
         return sources
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
@@ -569,6 +570,8 @@ class _LocalDram:
         self._public_claims.clear()
 
     def poll_main(self, items: Collection[object]) -> list[object]:
+        # Progress-side source claims defer framework callbacks to the caller.
+        self._update_capacity_pressure()
         unhandled: list[object] = []
         for item in items:
             if isinstance(item, _LocalCopyOp):

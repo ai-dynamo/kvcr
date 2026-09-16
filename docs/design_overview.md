@@ -120,7 +120,7 @@ Claims are attached to concrete residencies. They prevent KVCR-owned memory from
 
 ### Asynchronous Execution
 
-The event loop owns KVCR metadata mutations and never performs blocking external calls. A dedicated progress thread owns the NIXL agent, submits and polls transfers, and posts completions back to the event loop. Framework-agent and storage work follow the same asynchronous completion pattern.
+The event loop owns most KVCR metadata mutations and never performs blocking external calls. A dedicated progress thread owns the NIXL agent, submits and polls transfers, and posts completions back to the event loop. It may also claim ready local DRAM sources under a shared lock. Framework-agent and storage work follow the same asynchronous completion pattern.
 
 The active in-process KVCR owns the NIXL agent used for KVCR-owned memory and framework memory exposed through the KVCR bindings. A future integration may instead coordinate with a framework-owned agent. When resilience is enabled, the backup KVCR has its own agent but uses it only after a fenced takeover.
 

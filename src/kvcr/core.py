@@ -4,6 +4,7 @@
 
 import functools
 import logging
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Mapping
@@ -56,6 +57,15 @@ _Timer = Callable[[], float | None]
 _Clock = Callable[[], float]
 _RecordDuration = Callable[[str, float | None, str], None]
 _RecordTransfer = Callable[[str, float | None, bool, int, int], None]
+
+
+def _with_state_lock(method: Callable) -> Callable:
+    @functools.wraps(method)
+    def locked(self: "_KVCRCore", *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
 
 
 def _noop_timer() -> None:
@@ -162,6 +172,8 @@ class _KVCRCore:
         # Common KVCR state tables.
         if g3_config is not None and local_dram_config is None:
             raise ValueError("G3 requires configured local DRAM")
+        # Serialize caller metadata transactions with progress-side source claims.
+        self._state_lock = threading.RLock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
@@ -370,6 +382,7 @@ class _KVCRCore:
         return statuses
 
     # TODO: Add optional completion callbacks to movement APIs.
+    @_with_state_lock
     def deliver(
         self,
         blocks: Mapping[BlockKey, list[MemDescriptor]],
@@ -414,6 +427,7 @@ class _KVCRCore:
             self._complete(op_handle, {})
         return op_handle
 
+    @_with_state_lock
     def deposit(
         self,
         blocks: Mapping[BlockKey, list[MemDescriptor]],
@@ -439,6 +453,7 @@ class _KVCRCore:
             )
         return op_handle
 
+    @_with_state_lock
     def fetch(
         self,
         keys: Collection[BlockKey],
@@ -492,12 +507,14 @@ class _KVCRCore:
             )
         return op_handle
 
+    @_with_state_lock
     def release(self, handles: Collection[ReleaseHandle]) -> list[ReleaseResult]:
         if self._local_dram is None:
             return [(handle, False) for handle in handles]
         return self._local_dram.release(handles)
 
     # TODO: Expose individual entry completions as they become available.
+    @_with_state_lock
     def poll_completed(self) -> Iterable[OpResult]:
         self._progress.raise_if_failed()
         self._notify_transfer_errors(self._progress.take_completed())
@@ -531,6 +548,7 @@ class _KVCRCore:
         # TODO: Implement best-effort cancellation for fetch and deliver entries.
         return False
 
+    @_with_state_lock
     def get_stats(self) -> TelemetryStats | None:
         self._progress.raise_if_failed()
         stats = self._stats
@@ -708,12 +726,17 @@ class _KVCRCore:
             self._complete_local_dram_fill(blocks, success=False)
 
     def _claim_local_dram_sources(
-        self, op_id: _OpId, keys: Collection[BlockKey]
+        self,
+        op_id: _OpId,
+        keys: Collection[BlockKey],
+        *,
+        notify_capacity: bool = True,
     ) -> Mapping[BlockKey, list[MemDescriptor]]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
-                tuple(key for key in keys if key not in sources)
+                tuple(key for key in keys if key not in sources),
+                notify_capacity=notify_capacity,
             )
             if claimed:
                 sources.update(claimed)
