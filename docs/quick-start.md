@@ -5,10 +5,9 @@ Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack
 without editing source code in any of those projects.
 
 > [!IMPORTANT]
-> This is a public preview based on the still-open vLLM
-> [PR #53624](https://github.com/vllm-project/vllm/pull/53624). The container
-> recipe pins the exact adapter, vLLM base image, and landed Dynamo revision
-> validated together for this guide.
+> This is a public preview using vLLM's supported KVCR secondary-tier adapter.
+> The container recipe pins the exact adapter, vLLM base image, and landed
+> Dynamo revision validated together for this guide.
 
 For source builds, editable installs, API development, or test workflows, use
 the [developer guide](dev-guide.md).
@@ -48,7 +47,7 @@ Pass the public repository and exact revision explicitly:
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-export KVCR_VLLM_REF=a48bbcfcdd2ac09cb729cf595026c5aec9b69ea0
+export KVCR_VLLM_REF=000c7df9ffd3e470980fd4cd6b8ec1b0585500ff
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \

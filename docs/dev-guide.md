@@ -373,9 +373,10 @@ Complete standalone setup and validation first. Use a separate shared environmen
 for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone
 development loop.
 
-Select a vLLM revision that includes the KVCR secondary-tier adapter
-(`"type": "kvcr"`, [PR #53624](https://github.com/vllm-project/vllm/pull/53624)), such as
-[`a48bbcf`](https://github.com/vllm-project/vllm/commit/a48bbcfcdd2ac09cb729cf595026c5aec9b69ea0).
+Select a vLLM revision that includes the merged KVCR secondary-tier adapter
+(`"type": "kvcr"`), starting with
+[`000c7df`](https://github.com/vllm-project/vllm/commit/000c7df9ffd3e470980fd4cd6b8ec1b0585500ff)
+on `main`.
 Pair it with a landed Dynamo revision such as
 [`58f1e01`](https://github.com/ai-dynamo/dynamo/commit/58f1e01f76cbcf46a08963ffcab85c774da32a43),
 which supports the versioned KV hint contract and one KVCR control port per

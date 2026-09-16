@@ -12,10 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
 
-# Pin the public vLLM integration PR to an exact commit SHA.
+# Pin the merged vLLM KVCR integration to an exact commit SHA.
 FROM build-base AS vllm-kvcr-source
 ARG KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG KVCR_VLLM_REF=a48bbcfcdd2ac09cb729cf595026c5aec9b69ea0
+ARG KVCR_VLLM_REF=000c7df9ffd3e470980fd4cd6b8ec1b0585500ff
 RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr remote add origin "${KVCR_VLLM_REPO}" \
  && git -C /src/vllm-kvcr fetch --depth 1 origin "${KVCR_VLLM_REF}" \
