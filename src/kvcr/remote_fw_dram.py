@@ -992,6 +992,11 @@ class _RemoteFWDram:
         # Whatever answered is not the process our metadata was loaded into, so
         # drop the snapshot and let the next request republish it.
         self._invalidate_control_peer(endpoint)
+        # Refresh the generation for future writes, not already in-flight ones.
+        # A delayed refusal must not evict a generation learned after this op.
+        refused_incarnation = getattr(op, "source_incarnation", None)
+        if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
+            self._dangling_ops.sources.pop(endpoint, None)
         # A refusal is only sent before a write is submitted, so it is as terminal as a
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
