@@ -60,6 +60,19 @@ def save_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def log_window_boundary(original: bytes) -> int:
+    """Keep a final engine header if its metric line has not been written yet."""
+    complete_end = original.rfind(b"\n") + 1
+    cursor = complete_end
+    while cursor:
+        start = original.rfind(b"\n", 0, cursor - 1) + 1
+        line = ANSI.sub("", original[start:cursor].decode(errors="replace")).strip()
+        if line:
+            return start if re.search(r"\bEngine (\d+):", line) else complete_end
+        cursor = start
+    return complete_end
+
+
 def parse_metrics(text: str, *, line_offset: int = 0) -> dict[str, Any]:
     """Parse complete physical log lines, retaining strict engine attribution.
 
@@ -622,8 +635,8 @@ class Runner:
         if not self.worker_log.is_file():
             raise ValidationError(f"worker log does not exist: {self.worker_log}")
         original = self.worker_log.read_bytes()
-        # Start on a complete line; retain a partially written previous line.
-        offset = original.rfind(b"\n") + 1
+        # Retain any partial line and its immediately preceding engine context.
+        offset = log_window_boundary(original)
         self.log_offset = offset
         line_offset = original[:offset].count(b"\n")
         stat = self.worker_log.stat()

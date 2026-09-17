@@ -104,6 +104,17 @@ def test_missing_engine_context_prevents_attribution():
     assert "engine context" in result["failures"][0]
 
 
+def test_boundary_keeps_engine_header_before_partial_metrics():
+    text = successful_log().encode()
+    first_newline = text.index(b"\n") + 1
+    prefix = b"older unrelated log line\n"
+    original = prefix + text[: first_newline + 12]
+    offset = runner.log_window_boundary(original)
+    assert offset == len(prefix)
+    assert runner.parse_metrics((prefix + text)[offset:].decode())["parse_errors"] == []
+    assert runner.log_window_boundary(prefix + text) == len(prefix + text)
+
+
 def test_old_timeline_cannot_prove_current_retrieval():
     old = successful_log().replace("22:42:13Z", "22:41:13Z")
     result = assess(old)
