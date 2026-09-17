@@ -3,7 +3,8 @@
 </p>
 
 > [!NOTE]
-> **Initial release.** KVCR supports cross-node DRAM sharing, local disk caching,
+> **Experimental release.** KVCR 0.1.0 is an early release and is not yet intended
+> for production use. It supports cross-node DRAM sharing, local disk caching,
 > and resiliency for vLLM. Future releases will add SGLang and TRT-LLM integrations
 > and object storage support.
 >
