@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: vLLM E2E
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kvcr-vllm-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-image:
+    # Operations enables this after admitting KVCR to the builder, registry,
+    # and GPU runner. Public fork code must not receive builder credentials.
+    if: >-
+      vars.KVCR_GPU_CI_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.KVCR_E2E_BUILD_RUNNER || 'prod-builder-v3' }}
+    timeout-minutes: 90
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      digest: ${{ steps.build.outputs.digest }}
+      kvcr_sha: ${{ steps.build.outputs.kvcr_sha }}
+      dynamo_sha: ${{ steps.build.outputs.dynamo_sha }}
+      vllm_sha: ${{ steps.build.outputs.vllm_sha }}
+    env:
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ vars.KVCR_E2E_REPOSITORY }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+      BUILDKIT_ENDPOINT: ${{ vars.KVCR_BUILDKIT_ENDPOINT }}
+      E2E_BUILD_OUTPUT: ${{ github.workspace }}/artifacts/build
+    steps:
+      - name: Check out the tested merge commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require operations configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ECR_REGISTRY:?Set the approved ECR registry}"
+          : "${ECR_REPOSITORY:?Set the dedicated KVCR E2E repository}"
+          : "${AWS_DEFAULT_REGION:?Set the registry region}"
+          : "${BUILDKIT_ENDPOINT:?Set the approved remote BuildKit endpoint}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Connect to the approved builder
+        id: builder
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: remote
+          endpoint: ${{ vars.KVCR_BUILDKIT_ENDPOINT }}
+      - name: Authenticate the builder to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - name: Build and publish the PR image
+        id: build
+        shell: bash
+        env:
+          KVCR_E2E_IMAGE: ${{ vars.ECR_REGISTRY }}/${{ vars.KVCR_E2E_REPOSITORY }}
+          KVCR_BUILDER: ${{ steps.builder.outputs.name }}
+          KVCR_PUSH: "1"
+        run: bash .github/scripts/build_vllm_e2e.sh
+      - name: Retain source revisions and build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vllm-e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/build/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove the job's registry login
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "$ECR_REGISTRY" ]]; then docker logout "$ECR_REGISTRY"; fi
+
+  two-gpu-e2e:
+    needs: build-image
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    timeout-minutes: 30
+    # Kubernetes runner hooks must configure GPU access, private-image pulls,
+    # /dev/shm, and memlock. Docker-only options are deliberately not assumed.
+    container:
+      image: ${{ needs.build-image.outputs.image_uri }}
+    env:
+      EXPECTED_KVCR_SHA: ${{ needs.build-image.outputs.kvcr_sha }}
+      EXPECTED_DYNAMO_SHA: ${{ needs.build-image.outputs.dynamo_sha }}
+      EXPECTED_VLLM_SHA: ${{ needs.build-image.outputs.vllm_sha }}
+      TESTED_IMAGE: ${{ needs.build-image.outputs.image_uri }}
+    steps:
+      - name: Check out the same tests without reinstalling KVCR
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.build-image.outputs.kvcr_sha }}
+          persist-credentials: false
+      - name: Verify image source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/e2e
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path("/opt/kvcr-build/source-revisions.json").read_text())
+          for key, expected in (
+              ("kvcr_commit", "EXPECTED_KVCR_SHA"),
+              ("dynamo_commit", "EXPECTED_DYNAMO_SHA"),
+              ("vllm_adapter_commit", "EXPECTED_VLLM_SHA"),
+          ):
+              assert manifest[key] == os.environ[expected], (key, manifest[key])
+          Path("artifacts/e2e/image-provenance.json").write_text(
+              json.dumps({"image": os.environ["TESTED_IMAGE"], **manifest}, indent=2) + "\n"
+          )
+          PY
+      - name: Verify two-rank KVCR reuse
+        shell: bash
+        env:
+          HF_HOME: ${{ runner.temp }}/kvcr-hf-cache
+        run: >-
+          python3 tests/e2e/run_vllm.py
+          --output-dir artifacts/e2e/run --timeout 1200
+          --check-output-consistency
+      - name: Retain requests, responses, logs, and validation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vllm-e2e-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e/
+          if-no-files-found: warn
+          retention-days: 14

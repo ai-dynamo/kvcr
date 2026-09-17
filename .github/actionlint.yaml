@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+self-hosted-runner:
+  labels:
+    - prod-builder-v3
+    - prod-kvcr-tester-amd-gpu-2-v1
