@@ -493,7 +493,63 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
     kvcr.fetch((BlockKey(b"key"),), expected_layout=["named"])
 
 
-def test_get_stats_emits_public_state_metric_name() -> None:
+def _assert_state_lock_available(core) -> None:
+    acquired = []
+
+    def try_lock() -> None:
+        acquired.append(core._state_lock.acquire(blocking=False))
+        if acquired[-1]:
+            core._state_lock.release()
+
+    thread = threading.Thread(target=try_lock)
+    thread.start()
+    thread.join(timeout=1)
+    assert acquired == [True]
+
+
+@pytest.mark.parametrize("method", ["deliver", "deposit", "fetch", "poll_completed"])
+def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> None:
+    local = ctypes.create_string_buffer(16)
+    primary = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(agent, local, 1)
+    core = kvcr._core
+    owner = core._progress if method == "poll_completed" else core
+    boundary = {
+        "deliver": "_normalize_descriptors",
+        "deposit": "_normalize_descriptors",
+        "fetch": "_validate_block_layout",
+        "poll_completed": "take_completed",
+    }[method]
+    original = getattr(owner, boundary)
+
+    def prepare(*args):
+        _assert_state_lock_available(core)
+        return original(*args)
+
+    monkeypatch.setattr(owner, boundary, prepare)
+    if method == "poll_completed":
+        errors = []
+
+        def notify(error):
+            _assert_state_lock_available(core)
+            errors.append(error)
+
+        monkeypatch.setattr(core, "_on_resilience_event_callback", notify)
+        error = RuntimeError("transfer failed")
+        core._progress._completed.put(error)
+        assert list(kvcr.poll_completed()) == []
+        assert errors == [error]
+    else:
+        key = BlockKey(b"key")
+        blocks = {key: [_mem_descriptor(ctypes.addressof(primary), 16)]}
+        handle = getattr(kvcr, method)((key,) if method == "fetch" else blocks)
+        result = dict(_poll_until(kvcr, lambda done: handle in dict(done)))[handle]
+        assert result[key].success is (method == "deposit")
+
+
+def test_get_stats_emits_public_state_metric_name(monkeypatch) -> None:
     kvcr = _new_kvcr(
         FakeNixlAgent(),
         FakePrimaryPinning(),
@@ -505,10 +561,24 @@ def test_get_stats_emits_public_state_metric_name() -> None:
         ),
     )
 
+    core = kvcr._core
+    original_gauge = core._stats.set_gauge
+
+    def set_gauge(*args):
+        _assert_state_lock_available(core)
+        original_gauge(*args)
+
+    def factory():
+        _assert_state_lock_available(core)
+        return FakeTelemetryStats()
+
+    monkeypatch.setattr(core._stats, "set_gauge", set_gauge)
+    monkeypatch.setattr(core, "_stats_factory", factory)
     stats = kvcr.get_stats()
 
     assert isinstance(stats, FakeTelemetryStats)
     assert {record[1] for record in stats.records} == {"kvcr_state"}
+    assert core._stats is not stats
 
 
 @pytest.mark.parametrize(

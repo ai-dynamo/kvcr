@@ -30,6 +30,7 @@ from .core import (
     logger,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
+from .local_dram import _LocalDramState
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
 from .types import (
     BlockKey,
@@ -1047,7 +1048,8 @@ class _RemoteFWDram:
             return
 
     # -------------------------------------------------------------------------
-    # Source side: progress parses, main pins, then progress writes to the target.
+    # Source side: progress claims ready local DRAM or queues source acquisition
+    # to main; progress writes to the target.
     # -------------------------------------------------------------------------
 
     def _handle_start_write(
@@ -1130,19 +1132,70 @@ class _RemoteFWDram:
                 _descriptor_bytes(dst_descriptors),
             )
 
-        self._progress_outbound.append(
-            _SourcePinOp(
-                op_id=op_id,
-                keys=set(keys),
-                started_at=started_at,
-                deadline=deadline,
-                remote_agent=remote_agent,
-                op_handle=op_handle,
-                ordered_keys=keys,
-                dst_descriptors=dst_descriptors,
-                route=(target_agent, self._route_generation.get(target_agent, 0)),
-            )
+        source_pin = _SourcePinOp(
+            op_id=op_id,
+            keys=set(keys),
+            started_at=started_at,
+            deadline=deadline,
+            remote_agent=remote_agent,
+            op_handle=op_handle,
+            ordered_keys=keys,
+            dst_descriptors=dst_descriptors,
+            route=(target_agent, self._route_generation.get(target_agent, 0)),
         )
+        if not self._try_local_source_write(progress, source_pin):
+            self._progress_outbound.append(source_pin)
+
+    def _try_local_source_write(
+        self, progress: _KVCRProgress, source_pin: _SourcePinOp
+    ) -> bool:
+        kvcr = self._kvcr
+        if kvcr._local_dram is None:
+            return False
+        layouts = [
+            [descriptor.info for descriptor in destination]
+            for destination in source_pin.dst_descriptors
+        ]
+        if not kvcr._state_lock.acquire(blocking=False):
+            # Use the caller queue on contention; add a progress-side
+            # second attempt if contention makes this fallback too frequent.
+            return False
+        try:
+            for key, layout in zip(source_pin.ordered_keys, layouts):
+                record = kvcr._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if (
+                    residency is None
+                    or residency.state is not _LocalDramState.READY
+                    or residency.layout != layout
+                ):
+                    return False
+            sources = kvcr._claim_local_dram_sources(
+                source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
+            )
+            kvcr._add_block_dependencies(source_pin, new_operation=True)
+        finally:
+            kvcr._state_lock.release()
+        # Claims keep the sources stable while the write is assembled unlocked.
+        source_write = _SourceWriteOp(
+            state=_SourceWriteState.READY_TO_WRITE,
+            op_id=source_pin.op_id,
+            keys=source_pin.keys,
+            started_at=source_pin.started_at,
+            deadline=source_pin.deadline,
+            remote_agent=source_pin.remote_agent,
+            op_handle=source_pin.op_handle,
+            source_keys=source_pin.ordered_keys,
+            src_descriptors=tuple(
+                tuple(sources[key]) for key in source_pin.ordered_keys
+            ),
+            dst_descriptors=source_pin.dst_descriptors,
+            completed_indices=tuple(range(len(source_pin.ordered_keys))),
+            route=source_pin.route,
+            _backend=self,
+        )
+        progress.submit(source_write)
+        return True
 
     def _submit_prepared_source_write(
         self,

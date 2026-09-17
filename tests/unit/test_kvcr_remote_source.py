@@ -6,6 +6,7 @@ import ctypes
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -33,7 +34,12 @@ from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.progress import _STOP
-from kvcr.remote_fw_dram import _FwMemResidency, _RemoteFWDram, _SourcePinOp
+from kvcr.remote_fw_dram import (
+    _FwMemResidency,
+    _RemoteFWDram,
+    _SourcePinOp,
+    _SourceWriteOp,
+)
 from kvcr.types import BlockKey, PinHandle, PinRequestId
 
 
@@ -48,6 +54,145 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
             "source_control_endpoint": "tcp://source:1",
         }
     )
+
+
+def test_local_source_starts_without_caller_poll_and_holds_its_slot():
+    memory = ctypes.create_string_buffer(16)
+    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    callbacks = []
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        KVCRConfig(
+            nixl_agent_name="source",
+            pool_layouts=[("", 16)],
+            capacity_low_watermark_percent=100,
+        ),
+        name="source",
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        capacity_needed_callback=lambda request: callbacks.append(
+            (threading.get_ident(), request)
+        ),
+    )
+    key = BlockKey(b"local")
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit({key: [descriptor]})
+        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        callbacks.clear()
+        agent.state = "PROC"
+        request = msgspec.msgpack.decode(_start_write_message(12, key))
+        request["keys"] *= 2
+        request["dst_descriptors"] *= 2
+        preparing, resume = threading.Event(), threading.Event()
+        initialize_write = _SourceWriteOp.__init__
+
+        def pause_write_preparation(op, *args, **kwargs):
+            preparing.set()
+            assert resume.wait(timeout=2)
+            initialize_write(op, *args, **kwargs)
+
+        with patch.object(_SourceWriteOp, "__init__", pause_write_preparation):
+            control.incoming.append(msgspec.msgpack.encode(request))
+            try:
+                assert preparing.wait(timeout=1)
+                # Claims and dependencies protect the source while P builds the
+                # write, but M must be able to acquire the metadata lock already.
+                assert source._core._state_lock.acquire(blocking=False)
+                try:
+                    record = source._core._block_record_map[key]
+                    assert record.local_dram.claim_count == 1
+                    assert record.in_flight_ops
+                finally:
+                    source._core._state_lock.release()
+            finally:
+                resume.set()
+            _wait_until(lambda: len(agent.xfers) == 2)
+
+        # The peer request must be served without another caller-side poll.
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.claim_count == 1
+        assert len(agent.xfers[-1][1]) == 2
+        assert pinning.searches == []
+        assert not source._core._remote_fw_dram._source_pin_ops
+        assert callbacks == []
+        assert list(source.poll_completed()) == []
+        assert callbacks == [(threading.get_ident(), [("", 1)])]
+
+        agent.state = "DONE"
+        _wait_until(lambda: len(agent.released_xfers) == 2)
+        assert residency.claim_count == 1  # Native completion does not release it.
+        assert _poll_until(source, lambda _: residency.claim_count == 0) == []
+        assert not source._core._local_dram_sources_by_op
+    finally:
+        agent.state = "DONE"
+        source.close()
+
+
+def test_local_source_falls_back_during_fill_publication_without_blocking_progress():
+    memory = ctypes.create_string_buffer(16)
+    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    local = source._core._local_dram
+    key = BlockKey(b"local")
+    publishing, resume = threading.Event(), threading.Event()
+    make_evictable = local._make_evictable
+
+    def pause_publication(key):
+        # READY is already set, but the caller's fill transaction is unfinished.
+        publishing.set()
+        assert resume.wait(timeout=2)
+        make_evictable(key)
+
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit({key: [descriptor]})
+        _wait_until(lambda: not source._core._progress._completed.empty())
+        with (
+            patch.object(local, "_make_evictable", side_effect=pause_publication),
+            ThreadPoolExecutor(max_workers=1) as caller,
+        ):
+            completion = caller.submit(source.poll_completed)
+            try:
+                assert publishing.wait(timeout=1)
+                agent.state = "PROC"
+                control.incoming.extend(
+                    [
+                        _start_write_message(12, key, target_agent="target"),
+                        _write_probe_message(99),
+                    ]
+                )
+                _wait_until(
+                    lambda: any(
+                        _decode_control_message(raw).get("type") == "write_probe_ack"
+                        for _, raw in control.sent
+                    )
+                )
+                assert len(agent.xfers) == 1
+                assert source._core._block_record_map[key].local_dram.claim_count == 0
+            finally:
+                resume.set()
+            assert completion.result(timeout=1) == [(deposit, _op_entries({key: True}))]
+
+        # Unlocking alone does not retry: this request is owned by the caller queue.
+        assert len(agent.xfers) == 1
+        assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
+        assert source._core._block_record_map[key].local_dram.claim_count == 1
+        assert local.telemetry_state()["local_g2_evictable_slots"] == 0
+        assert pinning.searches == []
+    finally:
+        resume.set()
+        agent.state = "DONE"
+        source.close()
 
 
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
