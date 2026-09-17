@@ -73,6 +73,26 @@ def log_window_boundary(original: bytes) -> int:
     return complete_end
 
 
+def check_port_available(port: int) -> None:
+    """Reject active TCP listeners while allowing reuse after a prior service."""
+    try:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+    except OSError:
+        pass
+    else:
+        connection.close()
+        raise ValidationError(f"required TCP port {port} has an active listener")
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind(("0.0.0.0", port))
+            listener.listen(1)
+        except OSError as error:
+            raise ValidationError(
+                f"required TCP port {port} is unavailable: {error}"
+            ) from error
+
+
 def parse_metrics(text: str, *, line_offset: int = 0) -> dict[str, Any]:
     """Parse complete physical log lines, retaining strict engine attribution.
 
@@ -411,8 +431,7 @@ class Runner:
     def launch(self) -> None:
         self.gpu_preflight()
         for port in (self.args.http_port, 17771, 17772, 20081, 20082):
-            with socket.socket() as listener:
-                listener.bind(("0.0.0.0", port))
+            check_port_available(port)
         self.discovery = tempfile.TemporaryDirectory(prefix="kvcr-e2e-")
         environment = os.environ.copy()
         environment.pop("NATS_SERVER", None)

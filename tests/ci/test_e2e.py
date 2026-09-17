@@ -3,6 +3,7 @@
 """CPU evidence-validation tests; these never claim a real transfer occurred."""
 
 import importlib.util
+import socket
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,30 @@ def test_boundary_keeps_engine_header_before_partial_metrics():
     assert offset == len(prefix)
     assert runner.parse_metrics((prefix + text)[offset:].decode())["parse_errors"] == []
     assert runner.log_window_boundary(prefix + text) == len(prefix + text)
+
+
+def test_port_probe_rejects_active_listener():
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with pytest.raises(runner.ValidationError, match=f"port {port}"):
+            runner.check_port_available(port)
+
+
+def test_port_probe_allows_reuse_after_connection_closes():
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            accepted, _ = listener.accept()
+            accepted.shutdown(socket.SHUT_RDWR)
+            accepted.close()
+            assert client.recv(1) == b""
+    runner.check_port_available(port)
 
 
 def test_old_timeline_cannot_prove_current_retrieval():
