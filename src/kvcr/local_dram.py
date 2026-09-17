@@ -689,6 +689,12 @@ class _LocalDram:
                     affected_deliver_ops[op_id] = deliver_op
 
         self._update_capacity_pressure()
+        self._kvcr._log_key_history(
+            "ready", committed, tier=CacheTier.LOCAL_G2.value, last_access=now
+        )
+        self._kvcr._log_key_history(
+            "fill_failed", failed, tier=CacheTier.LOCAL_G2.value
+        )
         self._kvcr._publish_inventory(committed, CacheTier.LOCAL_G2, removed=False)
         for residency_op in affected_residency_ops.values():
             self._finish_residency_if_ready(residency_op)
@@ -1014,6 +1020,13 @@ class _LocalDram:
         residency.claim_count -= 1
         if residency.claim_count == 0:
             if residency.retire_on_release:
+                self._kvcr._log_key_history(
+                    "remove",
+                    (key,),
+                    tier=CacheTier.LOCAL_G2.value,
+                    reason="retire_on_release",
+                    last_access=record.last_access,
+                )
                 record.local_dram = None
                 self._residency_observer(key, record)
                 self._free(residency.slots)
@@ -1090,6 +1103,13 @@ class _LocalDram:
                 deficient = short()
 
         for key, record, residency, size_bytes in victims:
+            self._kvcr._log_key_history(
+                "remove",
+                (key,),
+                tier=CacheTier.LOCAL_G2.value,
+                reason="capacity_eviction",
+                last_access=record.last_access,
+            )
             self._remove_evictable(key, residency)
             record.local_dram = None
             self._residency_observer(key, record)

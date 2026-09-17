@@ -3,12 +3,16 @@
 """KVCR lifecycle and state implementation."""
 
 import functools
+import hashlib
+import json
 import logging
+import os
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
+from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
 
@@ -117,6 +121,8 @@ class _KVCRCore:
         bindings: "KVCRBindings",
         backend_configs: KVCRBackendConfigs,
     ) -> None:
+        self._key_history_enabled = os.getenv("KVCR_KEY_HISTORY", "0") == "1"
+        self._key_history_sequence = 0
         self.config = config
         self.pool_layouts = list(config.pool_layouts)
         _validate_pool_layouts(self.pool_layouts)
@@ -312,6 +318,11 @@ class _KVCRCore:
         local_dram.adopt_recovery_slots(records)
         if g3 is not None:
             g3.adopt_recovery_slots(records)
+        self._log_key_history(
+            "recovered_ready",
+            (key for key, record in records.items() if record.local_dram is not None),
+            tier=CacheTier.LOCAL_G2.value,
+        )
 
         # One admission per block: _on_ingest fires only for a single-tier block,
         # so routing through it would skip everything recovered into both.
@@ -645,13 +656,66 @@ class _KVCRCore:
         event = InventoryEvent(tuple(keys), tier, removed)
         callback = self._inventory_sink_callback
         if callback is None:
+            self._log_key_history(
+                "inventory_callback",
+                event.keys,
+                tier=tier.value,
+                removed=removed,
+                outcome="no_callback",
+            )
             return False
         try:
             callback(event)
         except Exception:
+            self._log_key_history(
+                "inventory_callback",
+                event.keys,
+                tier=tier.value,
+                removed=removed,
+                outcome="failed",
+            )
             logger.warning("KVCR inventory sink failed", exc_info=True)
             return False
+        self._log_key_history(
+            "inventory_callback",
+            event.keys,
+            tier=tier.value,
+            removed=removed,
+            outcome="accepted",
+        )
         return True
+
+    def _log_key_history(self, event: str, keys: Iterable[BlockKey], **fields) -> None:
+        """Emit bounded, opt-in hashed-key lifecycle records.
+
+        Sequence numbers are scoped to this core process and help detect a
+        missing log line, but logger transport can still drop records.
+        """
+        if not self._key_history_enabled:
+            return
+        iterator = iter(keys)
+        offset = 0
+        while batch := tuple(islice(iterator, 32)):
+            self._key_history_sequence += 1
+            logger.info(
+                "KVCR_KEY_HISTORY %s",
+                json.dumps(
+                    {
+                        "event": event,
+                        "sequence": self._key_history_sequence,
+                        "epoch_ns": time.time_ns(),
+                        "pid": os.getpid(),
+                        "agent": self.nixl_agent_name,
+                        "batch_offset": offset,
+                        "key_sha256": [
+                            hashlib.sha256(bytes(key)).hexdigest() for key in batch
+                        ],
+                        **fields,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            offset += len(batch)
 
     def _update_capacity_pressure(self, reclaimable_slots: Mapping[str, int]) -> None:
         callback = self._capacity_needed_callback
