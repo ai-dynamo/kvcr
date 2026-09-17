@@ -79,7 +79,8 @@ class _KVCRProgress:
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
-        memory_regions: tuple[tuple[int, int], ...] = (),
+        # (address, length, NIXL memory type, device index) per region.
+        memory_regions: tuple[tuple[int, int, str, int], ...] = (),
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -422,14 +423,27 @@ class _KVCRProgress:
             )
 
     def _register_memory_regions(self) -> None:
+        """Register every framework and pool region, one NIXL call per endpoint.
+
+        A NIXL registration list carries a single memory type, and VRAM entries
+        must name their device, so regions are grouped by (type, device) in
+        first-seen order. A failing group raises after earlier groups
+        registered; cleanup deregisters whatever was recorded.
+        """
         if self._nixl_agent is None or not self._memory_regions:
             return
-        self._memory_registrations.append(
-            self._nixl_agent.register_memory(
-                [(address, size, 0, "") for address, size in self._memory_regions],
-                mem_type="DRAM",
+        grouped: dict[tuple[str, int], list[tuple[int, int, int, str]]] = {}
+        for address, size, mem_type, device_id in self._memory_regions:
+            grouped.setdefault((mem_type, device_id), []).append(
+                (address, size, device_id, "")
             )
-        )
+        for (mem_type, _device_id), descriptors in grouped.items():
+            registration = self._nixl_agent.register_memory(
+                descriptors, mem_type=mem_type
+            )
+            if registration is None:
+                raise RuntimeError(f"NIXL refused to register {mem_type} memory")
+            self._memory_registrations.append(registration)
 
     def _capture_agent_metadata(self) -> None:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)

@@ -77,6 +77,30 @@ class _CapacityWaiter:
     layout: list[str]
 
 
+# One block's copy: its slots plus aligned source and destination spans.
+_LocalCopyEntry = tuple[
+    BlockKey,
+    tuple[tuple[str, int], ...],
+    tuple[MemDescriptor, ...],
+    tuple[MemDescriptor, ...],
+]
+
+
+def _copy_endpoints(entry: _LocalCopyEntry) -> tuple[str, int, str, int]:
+    """The (source, destination) memory type and device a copy moves between.
+
+    A NIXL descriptor list carries one memory type, so blocks are batched into
+    one transfer only when both of their endpoints agree.
+    """
+    _, _, sources, destinations = entry
+    return (
+        sources[0].mem_type,
+        sources[0].device_Id,
+        destinations[0].mem_type,
+        destinations[0].device_Id,
+    )
+
+
 @dataclass
 class _LocalCopyOp(_ProgressOp):
     deliver_op_id: _OpId | None
@@ -287,10 +311,7 @@ class _LocalDram:
         self._pending_residency_ops[op.op_id] = op
         self._kvcr._add_block_dependencies(op, new_operation=True)
 
-        copy_keys: list[BlockKey] = []
-        slots: list[tuple[tuple[str, int], ...]] = []
-        src_descriptors: list[MemDescriptor] = []
-        dst_descriptors: list[MemDescriptor] = []
+        copies: list[_LocalCopyEntry] = []
         evicted: list[BlockKey] = []
         for key, sources in blocks.items():
             record = self._kvcr._block_record(key)
@@ -334,24 +355,53 @@ class _LocalDram:
             self._kvcr._block_record(key).local_dram = _LocalDramResidency(
                 locations, _LocalDramState.FILLING
             )
-            copy_keys.append(key)
-            slots.append(tuple(locations))
-            src_descriptors.extend(sources)
-            dst_descriptors.extend(self._descriptors(locations))
+            copies.append(
+                (
+                    key,
+                    tuple(locations),
+                    tuple(sources),
+                    tuple(self._descriptors(locations)),
+                )
+            )
 
         self._update_capacity_pressure()
         self._kvcr._publish_inventory(evicted, CacheTier.LOCAL_G2, removed=True)
         self._finish_residency_if_ready(op)
-        if copy_keys:
+        self._submit_local_copies(copies, deliver_op_id=None, deadline=deadline)
+
+    def _submit_local_copies(
+        self,
+        copies: list[_LocalCopyEntry],
+        *,
+        deliver_op_id: _OpId | None,
+        deadline: float,
+    ) -> None:
+        """Submit one NIXL transfer per (source, destination) endpoint pair.
+
+        Blocks stay in submission order inside each group; groups are ordered
+        by first appearance so a homogeneous batch is still one transfer.
+        """
+        grouped: dict[tuple[str, int, str, int], list[_LocalCopyEntry]] = {}
+        for entry in copies:
+            grouped.setdefault(_copy_endpoints(entry), []).append(entry)
+        for entries in grouped.values():
             self._kvcr._progress.submit(
                 _LocalCopyOp(
                     op_id=("local_copy", self._next_copy_id),
-                    keys=set(copy_keys),
-                    deliver_op_id=None,
-                    ordered_keys=tuple(copy_keys),
-                    local_slots=tuple(slots),
-                    src_descriptors=tuple(src_descriptors),
-                    dst_descriptors=tuple(dst_descriptors),
+                    keys={key for key, _, _, _ in entries},
+                    deliver_op_id=deliver_op_id,
+                    ordered_keys=tuple(key for key, _, _, _ in entries),
+                    local_slots=tuple(slots for _, slots, _, _ in entries),
+                    src_descriptors=tuple(
+                        descriptor
+                        for _, _, sources, _ in entries
+                        for descriptor in sources
+                    ),
+                    dst_descriptors=tuple(
+                        descriptor
+                        for _, _, _, destinations in entries
+                        for descriptor in destinations
+                    ),
                     deadline=deadline,
                     backend=self._backend,
                     clock=self._kvcr._clock,
@@ -744,10 +794,7 @@ class _LocalDram:
     def _start_deliveries(
         self, op: _PendingDeliverOp, keys: Collection[BlockKey]
     ) -> None:
-        copy_keys: list[BlockKey] = []
-        local_slots: list[tuple[tuple[str, int], ...]] = []
-        src_descriptors: list[MemDescriptor] = []
-        dst_descriptors: list[MemDescriptor] = []
+        copies: list[_LocalCopyEntry] = []
         now = self._kvcr._clock()
         for key in keys:
             if key in op.results or key in op.active_keys:
@@ -768,29 +815,17 @@ class _LocalDram:
             else:
                 self._acquire_claim(key, residency)
                 op.active_keys.add(key)
-                copy_keys.append(key)
-                local_slots.append(tuple(residency.slots))
-                src_descriptors.extend(self._descriptors(residency.slots))
-                dst_descriptors.extend(op.destinations[key])
+                copies.append(
+                    (
+                        key,
+                        tuple(residency.slots),
+                        tuple(self._descriptors(residency.slots)),
+                        tuple(op.destinations[key]),
+                    )
+                )
 
         self._update_capacity_pressure()
-        if copy_keys:
-            self._kvcr._progress.submit(
-                _LocalCopyOp(
-                    op_id=("local_copy", self._next_copy_id),
-                    keys=set(copy_keys),
-                    deliver_op_id=op.op_id,
-                    ordered_keys=tuple(copy_keys),
-                    local_slots=tuple(local_slots),
-                    src_descriptors=tuple(src_descriptors),
-                    dst_descriptors=tuple(dst_descriptors),
-                    deadline=op.deadline,
-                    backend=self._backend,
-                    clock=self._kvcr._clock,
-                    started_at=self._kvcr._timer(),
-                )
-            )
-            self._next_copy_id += 1
+        self._submit_local_copies(copies, deliver_op_id=op.op_id, deadline=op.deadline)
         self._finish_deliver_if_ready(op)
 
     def _finish_delivery_copy(self, copy: _LocalCopyOp) -> None:
