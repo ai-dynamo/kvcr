@@ -42,7 +42,8 @@ bash .github/scripts/run_vllm_e2e.sh --gpus 0,1 \
 
 Use only GPUs assigned to the run and a new output directory. The wrapper runs
 the built image; the build metadata determines its identity. Inside that image,
-the same harness can be invoked directly:
+the same harness can be invoked directly when the matching checkout is mounted
+and the working directory is its repository root:
 
 ```bash
 python3 tests/e2e/run_vllm.py --output-dir /artifacts/e2e \

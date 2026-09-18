@@ -171,7 +171,8 @@ requires exclusive test traffic and the shared log of the same worker; package
 versions recorded on the client do not describe the remote server. Always use
 a new, empty output directory.
 
-The evidence-check tests need only pytest and Python 3.12:
+The CI orchestration and evidence-check tests need Git, Bash, pytest and
+Python 3.12. Docker calls are mocked, so they need no Docker daemon or GPUs:
 
 ```bash
 python3 -m pytest tests/ci -q
