@@ -143,10 +143,15 @@ def _use_nixl_agent(agent):
         agent.name = name
         return agent
 
-    with patch.multiple(
-        kvcr_progress,
-        nixl_agent=create_agent,
-        nixl_agent_config=lambda **kwargs: kwargs,
+    # Fake agents label host buffers as VRAM, so the CUDA copy engine must stay
+    # out of the way for every local copy to reach the fake transfer path.
+    with (
+        patch.multiple(
+            kvcr_progress,
+            nixl_agent=create_agent,
+            nixl_agent_config=lambda **kwargs: kwargs,
+        ),
+        patch("kvcr.local_dram.create_device_copy_engine", lambda regions: None),
     ):
         yield
 
@@ -459,7 +464,7 @@ def _start_write_message(
         "remaining_timeout_ms": remaining_timeout_ms,
         "target_agent_metadata": b"target-md",
         "keys": [key],
-        "dst_descriptors": [[_mem_descriptor().__dict__]],
+        "dst_descriptors": [[msgspec.structs.asdict(_mem_descriptor())]],
     }
     if target_agent is not None:
         payload["target_agent"] = target_agent

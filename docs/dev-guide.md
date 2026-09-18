@@ -191,6 +191,17 @@ alive until the registration is released at `close()`. The legacy
 refused. KVCR reports a transfer complete when NIXL reports it done; a consumer
 reading a GPU destination must order its stream after that completion.
 
+Local copies between a registered VRAM region and KVCR's own DRAM never leave
+the process, and NIXL's UCX loopback has no device-memory lane for them (it
+falls back to software emulation over TCP at a fraction of PCIe bandwidth).
+KVCR therefore issues those copies through the CUDA runtime instead:
+`cudaMemcpyBatchAsync` on KVCR-owned streams, completion by event, bound with
+ctypes so no framework import is needed. VRAM spans must still lie inside a
+registered `framework_regions` entry; an unregistered span fails its operation
+without touching the device. `LocalDramOptions(device_copy=False)` forces every
+local copy back through NIXL. The engine loads `libcudart` lazily and logs a
+warning and falls back to NIXL when it is unavailable.
+
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 

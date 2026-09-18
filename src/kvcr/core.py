@@ -9,7 +9,9 @@ import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
+from itertools import repeat
 from math import ceil
+from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from .config import (
@@ -43,6 +45,14 @@ from .types import (
     ReleaseHandle,
     ReleaseResult,
 )
+
+_info = attrgetter("info")
+_size = attrgetter("size")
+_mem_type = attrgetter("mem_type")
+_device = attrgetter("device_Id")
+# Distinct block layouts are few (one per pool group); the bound only guards
+# against a caller that invents layouts.
+_LAYOUT_SIZE_CACHE_LIMIT = 64
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
@@ -123,6 +133,7 @@ class _KVCRCore:
         self.pool_layouts = list(config.pool_layouts)
         _validate_pool_layouts(self.pool_layouts)
         self._block_sizes = dict(self.pool_layouts)
+        self._layout_sizes: dict[tuple[str, ...], list[int]] = {}
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
@@ -214,6 +225,12 @@ class _KVCRCore:
             if bindings.on_resilience_event is None
             else bindings.on_resilience_event
         )
+        # Retained until close so a registered framework allocation cannot be
+        # recycled while NIXL still holds its address. Resolved before local
+        # DRAM so its device copy engine knows the VRAM regions it may touch.
+        self._framework_regions: tuple[FrameworkMemoryRegion, ...] = (
+            resolve_framework_regions(backend_configs)
+        )
         self._local_dram = (
             _LocalDram(self, local_dram_config)
             if local_dram_config is not None
@@ -243,11 +260,6 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        # Retained until close so a registered framework allocation cannot be
-        # recycled while NIXL still holds its address.
-        self._framework_regions: tuple[FrameworkMemoryRegion, ...] = (
-            resolve_framework_regions(backend_configs)
-        )
         memory_regions: list[tuple[int, int, str, int]] = [
             (region.address, region.length, region.mem_type, region.device_id)
             for region in self._framework_regions
@@ -275,7 +287,11 @@ class _KVCRCore:
                 if self._g3 is not None:
                     self._g3.close_progress()
             finally:
-                self._remote_fw_dram.close_progress()
+                try:
+                    self._remote_fw_dram.close_progress()
+                finally:
+                    if self._local_dram is not None:
+                        self._local_dram.close_progress()
 
         self._progress = _KVCRProgress(
             initialize_progress,
@@ -756,24 +772,30 @@ class _KVCRCore:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
         if not descriptors or not all(
-            isinstance(descriptor, MemDescriptor) for descriptor in descriptors
+            map(isinstance, descriptors, repeat(MemDescriptor))
         ):
             raise ValueError("each block requires at least one descriptor")
-        self._validate_block_layout(
-            [descriptor.info for descriptor in descriptors],
-            "block descriptors must use configured pools",
-        )
+        # A page carries one span per layer buffer, so per-span work stays in
+        # C-level maps and the expected sizes are cached per layout.
+        layout = tuple(map(_info, descriptors))
+        expected_sizes = self._layout_sizes.get(layout)
+        if expected_sizes is None:
+            self._validate_block_layout(
+                list(layout), "block descriptors must use configured pools"
+            )
+            expected_sizes = [self._block_sizes[name] for name in layout]
+            if len(self._layout_sizes) >= _LAYOUT_SIZE_CACHE_LIMIT:
+                self._layout_sizes.clear()
+            self._layout_sizes[layout] = expected_sizes
+        if list(map(_size, descriptors)) != expected_sizes:
+            raise ValueError("block descriptor has the wrong byte count")
         # One NIXL descriptor list carries one memory type, so a block's spans
         # move as one transfer only when they share an endpoint.
-        endpoint = (descriptors[0].mem_type, descriptors[0].device_Id)
-        for descriptor in descriptors:
-            block_size = self._block_sizes[descriptor.info]
-            if descriptor.size != block_size:
-                raise ValueError("block descriptor has the wrong byte count")
-            if (descriptor.mem_type, descriptor.device_Id) != endpoint:
-                raise ValueError(
-                    "block descriptors must share one memory type and device"
-                )
+        if (
+            len(set(map(_mem_type, descriptors))) != 1
+            or len(set(map(_device, descriptors))) != 1
+        ):
+            raise ValueError("block descriptors must share one memory type and device")
         return list(descriptors)
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:

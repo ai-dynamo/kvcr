@@ -37,6 +37,10 @@ def _validate_pool_layouts(pool_layouts: PoolBlockLayouts) -> None:
 class LocalDramOptions:
     pools: LocalDramRegions
     backend: str = "UCX"
+    # Copy between registered VRAM regions and local DRAM with the CUDA runtime
+    # instead of a NIXL transfer to this agent itself, whose UCX loopback has no
+    # device-memory lane. Disable to force every local copy through NIXL.
+    device_copy: bool = True
 
 
 @dataclass(frozen=True)

@@ -19,8 +19,7 @@ LocalDramRegions = list[tuple[str, int, int]]  # name, address, size in bytes
 PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
-@dataclass(frozen=True)
-class MemDescriptor:
+class MemDescriptor(msgspec.Struct, frozen=True, gc=False):
     """Transport-addressable memory span for a pinned KV block.
 
     Field constraints are enforced by msgspec only when decoding or converting
@@ -34,6 +33,10 @@ class MemDescriptor:
     ``info`` currently identifies the descriptor's pool in ``pool_layouts``; an empty
     string names the single unnamed pool. This generic field may support additional
     metadata conventions later.
+
+    A layer-major KV pool yields thousands of spans per operation, so this is a
+    msgspec Struct: construction runs in C and instances are not GC-tracked,
+    which keeps descriptor-heavy calls from triggering collections.
     """
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]

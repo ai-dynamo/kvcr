@@ -85,7 +85,14 @@ def _wait(kvcr: KVCR, handle: int):
     raise AssertionError("KVCR operation did not complete")
 
 
-def _make_kvcr(name: str, pool_layouts, local_pool: torch.Tensor, regions):
+def _make_kvcr(
+    name: str,
+    pool_layouts,
+    local_pool: torch.Tensor,
+    regions,
+    *,
+    device_copy: bool = True,
+):
     pool_address = local_pool.data_ptr()
     offset = 0
     pools = []
@@ -109,7 +116,7 @@ def _make_kvcr(name: str, pool_layouts, local_pool: torch.Tensor, regions):
         ),
         KVCRBackendConfigs(
             framework_regions=tuple(regions),
-            local_dram=LocalDramOptions(pools, backend="UCX"),
+            local_dram=LocalDramOptions(pools, backend="UCX", device_copy=device_copy),
         ),
     )
 
@@ -165,6 +172,65 @@ def test_gpu_deposit_then_deliver_round_trips_bytes() -> None:
         # Bytes did land in KVCR-owned DRAM, not only in the destination.
         host_view = local_pool[: span * 4].view(2, 2, span)
         assert torch.equal(host_view[0].cpu(), layer_a.cpu())
+    finally:
+        kvcr.close()
+
+
+@pytest.mark.parametrize("device_copy", [True, False])
+def test_gpu_copies_take_the_device_engine_or_nixl_by_configuration(
+    device_copy: bool,
+) -> None:
+    # Many small spans per page mirror a layer-major KV pool; both transports
+    # must land identical bytes, and the engine must be the one doing the work
+    # when it is enabled.
+    name = f"kvcr-gpu-{uuid.uuid4().hex[:8]}"
+    span = 4096
+    layers = 24
+    pages = 3
+    source = torch.randint(
+        0, 255, (pages, layers, span), dtype=torch.uint8, device="cuda"
+    )
+    restore = torch.zeros_like(source)
+    torch.cuda.synchronize()
+    local_pool = torch.empty(
+        span * layers * pages * 2, dtype=torch.uint8, pin_memory=True
+    )
+    layouts = [(f"l{i}", span) for i in range(layers)]
+    kvcr = _make_kvcr(
+        name,
+        layouts,
+        local_pool,
+        [_region(source), _region(restore)],
+        device_copy=device_copy,
+    )
+    engine = kvcr._core._local_dram._device_copy
+    assert (engine is not None) is device_copy
+    try:
+        keys = [BlockKey(f"page{page}".encode()) for page in range(pages)]
+
+        def spans(tensor: torch.Tensor, page: int):
+            return _descriptors(
+                name,
+                tensor,
+                [
+                    ((page * layers + layer) * span, span, f"l{layer}")
+                    for layer in range(layers)
+                ],
+            )
+
+        entries = _wait(
+            kvcr, kvcr.deposit({k: spans(source, p) for p, k in enumerate(keys)})
+        )
+        assert all(e.status is OpEntryStatus.SUCCESS for e in entries.values())
+        entries = _wait(
+            kvcr, kvcr.deliver({k: spans(restore, p) for p, k in enumerate(keys)})
+        )
+        assert all(e.success for e in entries.values())
+        torch.cuda.synchronize()
+        assert torch.equal(restore, source)
+        if engine is not None:
+            assert engine.completed == 2 and engine.failed == 0
+            assert engine.bytes_completed == 2 * source.numel()
     finally:
         kvcr.close()
 

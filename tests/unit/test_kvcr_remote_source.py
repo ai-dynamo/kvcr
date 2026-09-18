@@ -7,7 +7,6 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -650,7 +649,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
     expected_sources = {
-        key: [replace(descriptor, end_point_name="source")],
+        key: [msgspec.structs.replace(descriptor, end_point_name="source")],
         framework_hit: [_mem_descriptor(addr=0)],
     }
     try:
@@ -663,7 +662,8 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_mem_descriptor(128 + 16 * index).__dict__] for index in range(3)
+            [msgspec.structs.asdict(_mem_descriptor(128 + 16 * index))]
+            for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -874,7 +874,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     "target_agent_metadata": b"target-md",
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_mem_descriptor(addr=128 + index * 16).__dict__]
+                        [msgspec.structs.asdict(_mem_descriptor(addr=128 + index * 16))]
                         for index in range(len(op_keys))
                     ],
                 }
