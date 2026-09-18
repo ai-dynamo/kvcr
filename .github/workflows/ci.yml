@@ -41,4 +41,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e . --group dev
-      - run: python -m pytest tests/unit tests/ci -q
+      - run: python -m pytest tests/unit tests/ci -q --junitxml=artifacts/unit/junit.xml
+      - name: Retain unit and CI test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unit-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/unit/
+          if-no-files-found: warn
+          retention-days: 14

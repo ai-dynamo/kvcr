@@ -14,6 +14,9 @@ The workflow is disabled until operations completes the setup below. A skipped
 job is not a successful functionality test. Ordinary lint and CPU unit tests
 continue to run independently.
 
+The [test plan](test-plan.md) defines the implemented acceptance checks and
+separates them from proposed native-transfer and recovery coverage.
+
 ## What the jobs verify
 
 1. Check out `github.sha`. For `pull_request`, this is GitHub's synthetic PR
@@ -96,9 +99,10 @@ The dedicated GPU runner needs the following:
   needs no Hugging Face token. An optional managed model cache may reduce startup
   time. Keep each job's discovery files and local ports isolated.
 
-CI builds run as root inside the job container so the Actions workspace and
-artifact directories are writable. The ordinary quick-start image continues to
-default to the `vllm` user. Do not grant the GPU test registry-push credentials.
+The CI image defaults to root; an Actions Kubernetes hook can override its UID.
+Verify that the actual job UID can write the Actions workspace, artifact
+directory, and model cache. The ordinary quick-start image continues to default
+to the `vllm` user. The GPU test needs registry-pull access only.
 
 Enable the variable only after the operations PR is approved and these settings
 are verified. Run one reviewed PR or `workflow_dispatch`, inspect both jobs and
@@ -125,6 +129,30 @@ bash .github/scripts/build_vllm_e2e.sh
 Set `KVCR_BUILDER` to an existing buildx builder if needed. Local mode loads the
 image into Docker; `KVCR_PUSH=1` publishes after registry authentication.
 `E2E_BUILD_OUTPUT` overrides the default `artifacts/build` directory.
+
+Run that locally loaded image on two explicitly selected, allocated GPUs:
+
+```bash
+bash .github/scripts/run_vllm_e2e.sh --gpus 0,1
+```
+
+The wrapper reads `artifacts/build/image-identity.json` and
+`artifacts/build/source-revisions.json`, verifies that the image and checkout
+match, and runs the same E2E harness in a new container. It mounts the committed
+test script read-only, supplies shared memory and memlock settings, publishes no host ports,
+and removes only its own container. It requires an explicit pair of device
+indices or full GPU UUIDs; there is no implicit access to all host GPUs.
+Use `--help` for artifact-directory overrides and published-image execution.
+On a shared Slurm host, also pass `--cpus`, `--cpuset-cpus`, and `--memory`
+within the assigned allocation; Docker containers may not inherit the invoking
+Slurm step's CPU and memory cgroup. The wrapper applies the memory limit to
+memory plus swap as well. Use the allocation's GPU UUIDs when host indices and
+Slurm-visible indices differ.
+
+Building and running are separate commands because the build may happen on a
+CPU machine while testing happens on a GPU machine. When using different
+machines, publish the image and transfer the source-revisions manifest and
+matching Git checkout; use the wrapper's digest-pinned `--image` mode.
 
 Inside the resulting image, with exactly two assigned GPUs, sufficient shared
 memory, and the matching checkout mounted for the test script:
@@ -156,7 +184,11 @@ build log, build metadata, and verified image identity. The image itself carries
 
 The GPU artifact includes image provenance, launch configuration, preflight
 results, exact HTTP requests and responses, frontend/worker logs, the bounded
-worker-log window, parsed interval metrics, and `result.json`. Read the result
+worker-log window, parsed interval metrics, `result.json`, and `junit.xml`.
+JUnit represents the full transfer check as one case; readiness, validation,
+or cleanup failures fail that case and return a nonzero process exit code.
+CPU CI also retains a JUnit report for `tests/unit` and `tests/ci`.
+Read the result
 and HTTP evidence first, then the worker logs. Missing telemetry, wrong rank,
 zero remote cache reuse, or source/destination disagreement must remain failed
 checks; do not fall back to a successful `nvidia-smi` result.

@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,47 @@ def save_json(path: Path, value: Any) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
     temporary.replace(path)
+
+
+def write_junit(output: Path, result: dict[str, Any]) -> None:
+    """Expose the complete transfer contract as one CI test, including cleanup."""
+    passed = result.get("status") == "passed"
+    started = datetime.fromisoformat(result["started_at"])
+    finished = datetime.fromisoformat(result["finished_at"])
+    elapsed = str(max(0.0, (finished - started).total_seconds()))
+    suite = ET.Element(
+        "testsuite",
+        name="kvcr.vllm_e2e",
+        tests="1",
+        failures="0" if passed else "1",
+        errors="0",
+        skipped="0",
+        time=elapsed,
+    )
+    case = ET.SubElement(
+        suite,
+        "testcase",
+        classname="kvcr.vllm_e2e",
+        name="rank0_seed_rank1_retrieval",
+        time=elapsed,
+    )
+    if not passed:
+        # Keep arbitrary logs and URLs out of the XML; detailed, sanitized
+        # evidence is retained separately beside this report.
+        failure = ET.SubElement(
+            case,
+            "failure",
+            type="KVCRValidationFailure",
+            message="KVCR end-to-end validation failed; inspect result.json",
+        )
+        failure.text = (
+            "The complete contract includes environment readiness, rank identity, "
+            "cache reuse, peer transfer counters, output consistency when enabled, "
+            "and process cleanup. See result.json and telemetry.json."
+        )
+    temporary = output / "junit.xml.tmp"
+    ET.ElementTree(suite).write(temporary, encoding="utf-8", xml_declaration=True)
+    temporary.replace(output / "junit.xml")
 
 
 def log_window_boundary(original: bytes) -> int:
@@ -889,6 +931,11 @@ def main() -> int:
             runner.result.update(status="failed", artifact_error=str(error))
         runner.result["finished_at"] = utc_now()
         runner.save()
+        try:
+            write_junit(runner.output, runner.result)
+        except Exception as error:
+            runner.result.update(status="failed", report_error=str(error))
+            runner.save()
         for number, handler in previous.items():
             signal.signal(number, handler)
     print(

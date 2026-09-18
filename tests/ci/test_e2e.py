@@ -3,7 +3,11 @@
 """CPU evidence-validation tests; these never claim a real transfer occurred."""
 
 import importlib.util
+import json
 import socket
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -220,3 +224,57 @@ def test_artifact_sanitization_keeps_lines_and_redacts_signed_queries(tmp_path):
         "download https://cdn.example/model?[REDACTED]\nmetric=3\n"
     )
     assert (tmp_path / "log-sanitization.json").is_file()
+
+
+@pytest.mark.parametrize("status", ["passed", "failed", "running"])
+def test_junit_only_reports_a_completed_pass_as_success(tmp_path, status):
+    runner.write_junit(
+        tmp_path,
+        {
+            "status": status,
+            "started_at": "2026-09-18T00:00:00+00:00",
+            "finished_at": "2026-09-18T00:00:02+00:00",
+        },
+    )
+    suite = ET.parse(tmp_path / "junit.xml").getroot()
+    assert suite.attrib["tests"] == "1"
+    assert suite.attrib["time"] == "2.0"
+    assert suite.attrib["failures"] == ("0" if status == "passed" else "1")
+    assert (suite.find("testcase/failure") is None) == (status == "passed")
+
+
+def test_cli_readiness_failure_returns_nonzero_and_emits_junit(tmp_path):
+    output = tmp_path / "run"
+    worker_log = tmp_path / "worker.log"
+    worker_log.write_text("")
+    # Reserve an unused local port without listening; no real service is touched.
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_PATH),
+                "--output-dir",
+                str(output),
+                "--base-url",
+                f"http://127.0.0.1:{port}",
+                "--worker-log",
+                str(worker_log),
+                "--timeout",
+                "0.2",
+                "--readiness-timeout",
+                "0.1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    assert result.returncode == 1, result.stdout + result.stderr
+    evidence = json.loads((output / "result.json").read_text())
+    assert evidence["status"] == "failed"
+    assert evidence["peer_transfer_verified"] is False
+    suite = ET.parse(output / "junit.xml").getroot()
+    assert suite.attrib["failures"] == "1"
+    assert suite.find("testcase/failure") is not None
+    assert json.loads((output / "cleanup.json").read_text())["owned_processes"] == []
