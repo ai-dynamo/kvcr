@@ -131,6 +131,7 @@ class BlockMeta:
     access_count: int
     last_access: float | None
     resident_tiers: frozenset[CacheTier]
+    position: int = -1
 
 
 class PlacementAction(Enum):
