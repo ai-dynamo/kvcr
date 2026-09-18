@@ -88,8 +88,15 @@ class _MemcpyAttributes(ctypes.Structure):
 class CudaRuntime:
     """The CUDA runtime entry points the copy engine uses."""
 
-    def __init__(self, library: ctypes.CDLL) -> None:
+    def __init__(
+        self, library: ctypes.CDLL, releasing_library: ctypes.CDLL | None = None
+    ) -> None:
+        # ``library`` keeps the GIL across each call (PyDLL); the batch copy,
+        # whose driver-side validation grows with the span count, is bound
+        # through ``releasing_library`` (CDLL) so a long enqueue does not
+        # stall other Python threads.
         self._lib = library
+        self._releasing_lib = releasing_library or library
         pointer = ctypes.c_void_p
         size = ctypes.c_size_t
         self._bind("cudaSetDevice", [ctypes.c_int])
@@ -119,13 +126,16 @@ class CudaRuntime:
                     size,
                     pointer,
                 ],
+                library=self._releasing_lib,
             )
         self._batch_attributes = (_MemcpyAttributes * 1)()
         self._batch_attributes[0].srcAccessOrder = _SRC_ACCESS_ORDER_STREAM
         self._batch_attribute_index = (ctypes.c_size_t * 1)(0)
 
-    def _bind(self, name: str, argtypes: list) -> None:
-        function = getattr(self._lib, name)
+    def _bind(
+        self, name: str, argtypes: list, library: ctypes.CDLL | None = None
+    ) -> None:
+        function = getattr(library if library is not None else self._lib, name)
         function.argtypes = argtypes
         function.restype = ctypes.c_int
 
@@ -140,12 +150,12 @@ class CudaRuntime:
         errors: list[str] = []
         for candidate in candidates:
             try:
-                # PyDLL keeps the GIL across each call. The calls take
-                # microseconds, and releasing the GIL for every one of them
-                # would cost a switch interval to get it back whenever another
-                # Python thread is busy, which is the normal state of a serving
-                # process.
-                return cls(ctypes.PyDLL(candidate))
+                # PyDLL keeps the GIL across the microsecond calls: releasing
+                # it for every one of them would cost a switch interval to get
+                # it back whenever another Python thread is busy, which is the
+                # normal state of a serving process. The batch copy alone goes
+                # through a releasing handle.
+                return cls(ctypes.PyDLL(candidate), ctypes.CDLL(candidate))
             except (OSError, AttributeError) as error:
                 errors.append(f"{candidate}: {error}")
         raise OSError("CUDA runtime library not found: " + "; ".join(errors))
@@ -207,7 +217,7 @@ class CudaRuntime:
         self, dsts: np.ndarray, srcs: np.ndarray, sizes: np.ndarray, stream: int
     ) -> int:
         """Issue one batch from contiguous uint64 address and size arrays."""
-        return self._lib.cudaMemcpyBatchAsync(
+        return self._releasing_lib.cudaMemcpyBatchAsync(
             dsts.ctypes.data_as(_PointerArray),
             srcs.ctypes.data_as(_PointerArray),
             sizes.ctypes.data_as(_SizeArray),
