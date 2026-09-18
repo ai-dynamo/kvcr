@@ -19,6 +19,7 @@ from .types import BlockKey, MemDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
+_ACTIVE_WAIT_SECONDS = 0.0001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
@@ -326,7 +327,13 @@ class _KVCRProgress:
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration():
-                    time.sleep(_IDLE_WAIT_SECONDS)
+                    # A copy in flight completes within a few milliseconds, so
+                    # poll it on a short cadence; sleep longer only when idle.
+                    time.sleep(
+                        _ACTIVE_WAIT_SECONDS
+                        if self._in_flight_ops
+                        else _IDLE_WAIT_SECONDS
+                    )
         except BaseException as error:
             self._failure = error
         finally:
