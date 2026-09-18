@@ -337,14 +337,22 @@ class DeviceCopyEngine:
         try:
             runtime.set_device(device_id)
             streams = self._streams_for(device_id, len(request.sizes))
-            for lane, (dsts, srcs, lengths) in enumerate(
-                zip(
-                    np.array_split(request.dst_addresses, len(streams)),
-                    np.array_split(request.src_addresses, len(streams)),
-                    np.array_split(request.sizes, len(streams)),
+            if len(streams) == 1:
+                self._enqueue(
+                    request.dst_addresses,
+                    request.src_addresses,
+                    request.sizes,
+                    streams[0],
                 )
-            ):
-                self._enqueue(dsts, srcs, lengths, streams[lane])
+            else:
+                for lane, (dsts, srcs, lengths) in enumerate(
+                    zip(
+                        np.array_split(request.dst_addresses, len(streams)),
+                        np.array_split(request.src_addresses, len(streams)),
+                        np.array_split(request.sizes, len(streams)),
+                    )
+                ):
+                    self._enqueue(dsts, srcs, lengths, streams[lane])
         except CudaError as error:
             handle.error = str(error)
         # Spans accepted before a failure are still in flight, so events are
