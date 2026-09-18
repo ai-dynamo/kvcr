@@ -6,7 +6,6 @@ __pycache__/
 
 /.uv-cache/
 /.venv/
-uv.lock
 
 /.coverage
 /build/
