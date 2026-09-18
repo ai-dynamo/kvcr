@@ -12,6 +12,11 @@ description = "Framework-neutral KV Cache Runner"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
 dependencies = [
   "msgspec>=0.21.0,<1",
   "pyzmq>=25.0.0,<28",
@@ -41,3 +46,7 @@ extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.uv]
+# nSpect reads uv.lock only when the project is marked uv-managed.
+managed = true
