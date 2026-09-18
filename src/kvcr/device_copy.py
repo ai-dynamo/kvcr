@@ -140,7 +140,12 @@ class CudaRuntime:
         errors: list[str] = []
         for candidate in candidates:
             try:
-                return cls(ctypes.CDLL(candidate))
+                # PyDLL keeps the GIL across each call. The calls take
+                # microseconds, and releasing the GIL for every one of them
+                # would cost a switch interval to get it back whenever another
+                # Python thread is busy, which is the normal state of a serving
+                # process.
+                return cls(ctypes.PyDLL(candidate))
             except (OSError, AttributeError) as error:
                 errors.append(f"{candidate}: {error}")
         raise OSError("CUDA runtime library not found: " + "; ".join(errors))

@@ -261,6 +261,8 @@ class _LocalDram:
         self._pool_slot_size = {
             name: slot_size for name, (_, _, slot_size) in self._pools.items()
         }
+        # Slot counts per pool for each block layout seen; layouts are few.
+        self._required_cache: dict[tuple[str, ...], Counter[str]] = {}
         ranges = sorted(
             (address, address + length) for address, length, _ in self._pools.values()
         )
@@ -1192,12 +1194,11 @@ class _LocalDram:
     def _allocate_slots(
         self, pool_names: list[str], protected: set[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
-        required = Counter(pool_names)
-        if all(
-            len(self._free_slots[name]) >= count for name, count in required.items()
-        ):
+        free_slots = self._free_slots
+        required = self._required_slots(pool_names)
+        if all(len(free_slots[name]) >= count for name, count in required.items()):
             return (
-                [(name, self._free_slots[name].popleft()) for name in pool_names],
+                [(name, free_slots[name].popleft()) for name in pool_names],
                 [],
                 False,
             )
@@ -1206,17 +1207,24 @@ class _LocalDram:
         self._retry_unscored()
         victims: list[tuple[BlockKey, "_BlockRecord", _LocalDramResidency, int]] = []
         freed: Counter[str] = Counter()
+        # Pools still short, by count. Free slots only grow while evicting, so
+        # a pool that is satisfied stays satisfied and only the short ones are
+        # rechecked; a page has one slot per pool, so this is usually one pass.
+        deficit = {
+            name: count - len(free_slots[name])
+            for name, count in required.items()
+            if count > len(free_slots[name])
+        }
 
-        def short() -> set[str]:
+        def still_short() -> dict[str, int]:
             return {
-                name
-                for name, count in required.items()
-                if len(self._free_slots[name]) + freed[name] < count
+                name: missing
+                for name in deficit
+                if (missing := required[name] - len(free_slots[name]) - freed[name]) > 0
             }
 
-        deficient = short()
         with closing(self._evictable.candidates(protected)) as candidates:
-            while deficient:
+            while deficit:
                 key = next(candidates, None)
                 if key is None:
                     return None, [], False
@@ -1229,7 +1237,7 @@ class _LocalDram:
                     or residency.claim_count
                 ):
                     raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-                if not any(name in deficient for name, _ in residency.slots):
+                if deficit.keys().isdisjoint(residency.layout):
                     continue
                 size_bytes = self._size_bytes(residency.slots)
                 decision, eviction_pending = self._kvcr._decide_eviction(
@@ -1237,8 +1245,9 @@ class _LocalDram:
                     CacheTier.LOCAL_G2,
                     deadline,
                 )
-                deficient = short()
-                if not deficient:
+                # The policy may have freed slots itself.
+                deficit = still_short()
+                if not deficit:
                     break
                 if eviction_pending:
                     self._capacity_eviction_key = key
@@ -1246,8 +1255,8 @@ class _LocalDram:
                 if decision[0] is PlacementAction.KEEP:
                     continue
                 victims.append((key, record, residency, size_bytes))
-                freed.update(name for name, _ in residency.slots)
-                deficient = short()
+                freed.update(residency.layout)
+                deficit = still_short()
 
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
@@ -1261,6 +1270,16 @@ class _LocalDram:
             [victim[0] for victim in victims],
             False,
         )
+
+    def _required_slots(self, pool_names: list[str]) -> Counter[str]:
+        layout = tuple(pool_names)
+        required = self._required_cache.get(layout)
+        if required is None:
+            required = Counter(pool_names)
+            if len(self._required_cache) >= 64:
+                self._required_cache.clear()
+            self._required_cache[layout] = required
+        return required
 
     def _make_evictable(self, key: BlockKey) -> None:
         record = self._kvcr._block_record_map.get(key)
@@ -1309,7 +1328,7 @@ class _LocalDram:
             self._free_slots[pool_name].append(slot)
 
     def _size_bytes(self, locations: Collection[tuple[str, int]]) -> int:
-        return sum(self._pools[pool_name][2] for pool_name, _ in locations)
+        return sum(map(self._pool_slot_size.__getitem__, map(itemgetter(0), locations)))
 
     def _update_capacity_pressure(self) -> None:
         if self._kvcr._capacity_needed_callback is None:
