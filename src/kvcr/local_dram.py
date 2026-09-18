@@ -1106,18 +1106,24 @@ class _LocalDram:
         record = self._kvcr._block_record_map.get(key)
         if record is None:
             raise RuntimeError(f"missing block record for {key!r}")
+        residency = record.local_dram
+        if (
+            residency is None
+            or residency.state is not _LocalDramState.READY
+            or residency.claim_count
+        ):
+            return
         score = self._kvcr._policy.eviction_score(
-            self._kvcr._block_meta(
-                key, record, self._size_bytes(record.local_dram.slots)
-            ),
+            self._kvcr._block_meta(key, record, self._size_bytes(residency.slots)),
             CacheTier.LOCAL_G2,
+            previous_score=self._evictable.score(key),
         )
         if score is None:
             self._unscored.add(key)
             return
         self._unscored.discard(key)
-        self._evictable.insert(key, score)
-        self._evictable_slots.update(name for name, _ in record.local_dram.slots)
+        if self._evictable.insert(key, score):
+            self._evictable_slots.update(name for name, _ in residency.slots)
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)

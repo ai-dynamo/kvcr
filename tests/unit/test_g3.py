@@ -400,8 +400,10 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     assert replacement_destination.raw == payloads[4]
 
 
+@pytest.mark.parametrize("policy", [G3FIFOPolicy(), G3LRUPolicy()], ids=["fifo", "lru"])
 def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     tmp_path,
+    policy,
 ) -> None:
     """Recovery rebuilds free slots and spills observably evict recovered blocks."""
     page_size = os.sysconf("SC_PAGE_SIZE")
@@ -409,7 +411,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     local = ctypes.create_string_buffer(page_size)
     destination = ctypes.create_string_buffer(page_size)
     agent = _FakeG3Agent()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, g3_slot_count=3)
+    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy, g3_slot_count=3)
     g3 = kvcr._core._g3
     assert g3 is not None
     first, second = BlockKey(b"first"), BlockKey(b"second")
@@ -417,8 +419,8 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     install_recovery_records(
         kvcr._core,
         {
-            first: _BlockRecord(g3=_G3Residency(0)),
-            second: _BlockRecord(g3=_G3Residency(2)),
+            first: _BlockRecord(g3=_G3Residency(0), last_access=3.0),
+            second: _BlockRecord(g3=_G3Residency(2), last_access=1.0),
         },
     )
     # _free_slots is the allocator's free list: recovery must rebuild it as the
@@ -426,6 +428,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     assert tuple(g3._free_slots) == (1,)
     assert kvcr._core._block_record_map[first].g3 == _G3Residency(0)
     assert kvcr._core._block_record_map[second].g3 == _G3Residency(2)
+    kvcr._core._clock = lambda: 5.0
     survivor = g3._descriptor(2)
     agent._file_data[(survivor.device_Id, survivor.addr)] = b"s" * page_size
 
@@ -435,6 +438,10 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         observed.append((key, None if record.g3 is None else record.g3.slot))
 
     g3.observe_residency(observe)
+    # Alignment publishes positions and refreshes LRU scores, preserving FIFO.
+    kvcr.align_sequence([second, first])
+    assert observed == [(second, 2), (first, 0)]
+    observed.clear()
 
     # The first spill lands in the rebuilt free slot; the next can only land by
     # evicting a recovered block, and every move is reported before exposure.

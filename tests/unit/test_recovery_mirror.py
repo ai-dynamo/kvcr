@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from dataclasses import replace
+
 import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record
@@ -27,7 +29,7 @@ def _payload(record: _BlockRecord) -> bytes:
     return _RECOVERY_ENCODER.encode(_project_recovery_record(record))
 
 
-# Every live-only field set, to prove projection strips all of it.
+# Live-only fields are stripped; settled slots and position survive.
 _FULLY_LOADED_RECORD = _BlockRecord(
     fw_mem=object(),
     local_dram=_LocalDramResidency(
@@ -40,6 +42,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
     in_flight_ops={("deposit", 7)},
     access_count=8,
     last_access=9.0,
+    position=3,
 )
 
 
@@ -49,30 +52,35 @@ _FULLY_LOADED_RECORD = _BlockRecord(
         (
             _FULLY_LOADED_RECORD,
             _ONE_POOL,
-            [[["", 3]], 5],
-            _recovered_record(g2=[("", 3)], g3=5),
+            [[["", 3]], 5, 3],
+            replace(_recovered_record(g2=[("", 3)], g3=5), position=3),
         ),
         (
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
             _TWO_POOLS,
-            [[["full", 7], ["full", 2], ["swa", 9]], 5],
+            [[["full", 7], ["full", 2], ["swa", 9]], 5, -1],
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
         ),
-        (_BlockRecord(), _ONE_POOL, [None, None], _BlockRecord()),
+        (_BlockRecord(), _ONE_POOL, [None, None, -1], _BlockRecord()),
         (
-            _recovered_record(g2=[("", 3)]),
+            replace(_recovered_record(g2=[("", 3)]), position=4),
             _ONE_POOL,
-            [[["", 3]], None],
-            _recovered_record(g2=[("", 3)]),
+            [[["", 3]], None, 4],
+            replace(_recovered_record(g2=[("", 3)]), position=4),
         ),
-        (_recovered_record(g3=5), _ONE_POOL, [None, 5], _recovered_record(g3=5)),
+        (
+            replace(_recovered_record(g3=5), position=6),
+            _ONE_POOL,
+            [None, 5, 6],
+            replace(_recovered_record(g3=5), position=6),
+        ),
         # A G2 slot still FILLING or DISCARDING never settled, so it must not wire.
         (
             _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             ),
             _ONE_POOL,
-            [None, None],
+            [None, None, -1],
             _BlockRecord(),
         ),
         (
@@ -80,18 +88,18 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.DISCARDING)
             ),
             _ONE_POOL,
-            [None, None],
+            [None, None, -1],
             _BlockRecord(),
         ),
     ],
 )
-def test_recovery_wire_round_trip_keeps_only_settled_slots(
+def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
     record: _BlockRecord,
     pool_names: tuple[str, ...],
     wire: list[object],
     recovered: _BlockRecord,
 ) -> None:
-    """Only settled G2/G3 slots reach the wire; decode rebuilds fresh live state."""
+    """Settled slots and position survive; decode rebuilds other live state."""
     encoded = _payload(record)
 
     # The outer record stays positional; G2 locations carry their pool names.
@@ -105,14 +113,23 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     class _RecoveryBlockV2(msgspec.Struct, frozen=True, array_like=True):
         g2: list[tuple[str, int]] | None = None
         g3: int | None = None
+        position: int = -1
         appended: int = 0
 
-    today = _payload(_recovered_record(g2=[("", 3)], g3=5))
+    legacy = msgspec.msgpack.encode([[["", 3]], 5])
+    assert _decode_recovery_record(legacy, _ONE_POOL) == _recovered_record(
+        g2=[("", 3)], g3=5
+    )
+    positioned = replace(_recovered_record(g2=[("", 3)], g3=5), position=6)
+    today = _payload(positioned)
 
     upgraded = msgspec.msgpack.Decoder(_RecoveryBlockV2).decode(today)
     assert upgraded.g2 == [("", 3)]
     assert upgraded.g3 == 5
+    assert upgraded.position == 6
     assert upgraded.appended == 0
+    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, 42))
+    assert _decode_recovery_record(future, _ONE_POOL) == positioned
 
 
 @pytest.mark.parametrize(
@@ -125,6 +142,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode([[["other", 0]], None]),
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),
+        msgspec.msgpack.encode([None, 5, -2]),
     ],
 )
 def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:
@@ -182,6 +200,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
             in_flight_ops={("target", 7)},
             access_count=12,
             last_access=99.5,
+            position=7,
         ),
         spilled: _BlockRecord(g3=_G3Residency(3, claim_count=2)),
         filling: _BlockRecord(
@@ -215,7 +234,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records is served
     assert mirror._records == framed
     assert mirror._records == {
-        ready: _recovered_record(g2=[("full", 0), ("swa", 10)]),
+        ready: replace(_recovered_record(g2=[("full", 0), ("swa", 10)]), position=7),
         spilled: _recovered_record(g3=3),
         filling_spill: _recovered_record(g3=4),
         discarding_spill: _recovered_record(g3=5),

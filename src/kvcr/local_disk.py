@@ -591,7 +591,9 @@ class _G3:
         if record is None or residency is None or residency.claim_count:
             return
         score = self._kvcr._policy.eviction_score(
-            self._kvcr._block_meta(key, record, self._slot_size), CacheTier.G3
+            self._kvcr._block_meta(key, record, self._slot_size),
+            CacheTier.G3,
+            previous_score=self._evictable.score(key),
         )
         if score is None:
             self._unscored.add(key)

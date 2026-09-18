@@ -87,6 +87,7 @@ class _BlockRecord:
     in_flight_ops: set[_OpId] | None = None
     access_count: int = 0
     last_access: float | None = None
+    position: int = -1
 
     def add_in_flight_op(self, op_id: _OpId) -> None:
         if self.in_flight_ops is None:
@@ -371,6 +372,61 @@ class _KVCRCore:
             else:
                 statuses.append((QueryStatus.MISS, None))
         return statuses
+
+    def align_sequence(
+        self, ordered_keys: list[BlockKey], use_current_time: bool = False
+    ) -> None:
+        with self._state_lock:
+            records: dict[BlockKey, tuple[int, _BlockRecord]] = {}
+            for position, key in enumerate(ordered_keys):
+                if key in records:
+                    continue
+                record = self._block_record_map.get(key)
+                if record is None:
+                    continue
+                residency = record.local_dram
+                if record.g3 is None and (
+                    residency is None or residency.state is not _LocalDramState.READY
+                ):
+                    continue
+                records[key] = (position, record)
+            if not records:
+                return
+
+            timestamp = (
+                self._clock()
+                if use_current_time
+                else max(
+                    (
+                        record.last_access
+                        for _, record in records.values()
+                        if record.last_access is not None
+                    ),
+                    default=None,
+                )
+            )
+            blocks = []
+            local_dram, g3 = self._local_dram, self._g3
+            for key, (position, record) in records.items():
+                record.last_access = timestamp
+                if record.position != position:
+                    record.position = position
+                    tier = local_dram if record.local_dram is not None else g3
+                    tier._residency_observer(key, record)
+                size_bytes = (
+                    local_dram._size_bytes(record.local_dram.slots)
+                    if record.local_dram is not None
+                    else g3._slot_size
+                )
+                blocks.append(self._block_meta(key, record, size_bytes))
+            self._policy.on_align_sequence(blocks, use_current_time)
+            for key in records:
+                if local_dram is not None:
+                    local_dram._make_evictable(key)
+                if g3 is not None:
+                    g3._make_evictable(key)
+            if local_dram is not None:
+                local_dram._update_capacity_pressure()
 
     # TODO: Add optional completion callbacks to movement APIs.
     def deliver(
@@ -848,6 +904,7 @@ class _KVCRCore:
             access_count=record.access_count,
             last_access=record.last_access,
             resident_tiers=frozenset(resident_tiers),
+            position=record.position,
         )
 
     def _record_access(self, keys: Collection[BlockKey]) -> None:

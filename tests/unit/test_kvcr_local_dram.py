@@ -26,13 +26,16 @@ from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
-from kvcr.policy_runtime import _EvictionQueue
+from kvcr.policy_runtime import _EvictionQueue, _PolicyInvoker
 from kvcr.recovery_journal import (
     RecoveryMirrorError,
+    _attach_journal,
+    _RecoveryMirror,
     install_recovery_records,
 )
 from kvcr.types import (
     BlockKey,
+    BlockMeta,
     CacheTier,
     InventoryEvent,
     OpEntryStatus,
@@ -317,24 +320,61 @@ def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     assert list(queue.candidates(set())) == [first, excluded, churned]
 
 
+def test_lru_float_score_uses_small_tail_first_bias() -> None:
+    policy = _PolicyInvoker(LRUPolicy())
+
+    def score(timestamp, position):
+        return policy.eviction_score(
+            BlockMeta(BlockKey(b"key"), 16, 0, timestamp, frozenset(), position),
+            CacheTier.LOCAL_G2,
+        )
+
+    # Position must remain visible at a realistic clock value.
+    timestamp = 1_000_000.0
+    assert isinstance(score(timestamp, 0), float)
+    assert score(timestamp, -1) == score(timestamp, 0)
+    assert score(timestamp, 2) < score(timestamp, 1) < score(timestamp, 0)
+    assert score(timestamp, 0) < score(timestamp + 0.001, 4096)
+    assert score(None, 1) < score(None, 0) < score(0, 4096)
+
+
 @pytest.mark.parametrize(
-    ("policy", "evicted_index"),
-    [(FIFOPolicy(), 1), (LRUPolicy(), 0), (None, 0)],
-    ids=["fifo", "lru", "default-lru"],
+    ("policy", "use_current_time", "keep_claim", "evicted_index"),
+    [
+        (FIFOPolicy(), None, False, 1),
+        (LRUPolicy(), None, False, 0),
+        (None, None, False, 0),
+        (None, False, False, 1),
+        (None, True, False, 2),
+        (None, False, True, 0),
+        (FIFOPolicy(), False, False, 1),
+    ],
+    ids=[
+        "fifo",
+        "lru",
+        "default-lru",
+        "aligned",
+        "current-time",
+        "claimed",
+        "aligned-fifo",
+    ],
 )
 def test_builtin_policy_eviction_order(
-    policy: FIFOPolicy | None, evicted_index: int
+    policy: FIFOPolicy | None,
+    use_current_time: bool | None,
+    keep_claim: bool,
+    evicted_index: int,
 ) -> None:
     block_size = 16
-    primary = ctypes.create_string_buffer(block_size * 3)
-    local = ctypes.create_string_buffer(block_size * 2)
+    primary = ctypes.create_string_buffer(block_size * 4)
+    local = ctypes.create_string_buffer(block_size * 3)
     primary_addr = ctypes.addressof(primary)
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _new_local_kvcr(agent, local, 2, policy=policy)
+    kvcr = _new_local_kvcr(agent, local, 3, policy=policy)
     now = 0.0
     kvcr._core._clock = lambda: now
-    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    keys = [BlockKey(f"k{index}".encode()) for index in range(4)]
 
     kvcr.deposit(
         {
@@ -351,16 +391,89 @@ def test_builtin_policy_eviction_order(
     second_fetch = kvcr.fetch((keys[1],))
     second_claim = dict(kvcr.poll_completed())[second_fetch][keys[1]].release_handle
     assert first_claim is not None and second_claim is not None
-    kvcr.release((second_claim, first_claim))
+    kvcr.release((first_claim,) if keep_claim else (second_claim, first_claim))
 
+    now = 3.0
     kvcr.deposit({keys[2]: [_mem_descriptor(primary_addr + 2 * block_size)]})
-    _poll_until(kvcr, lambda results: bool(results))
+    _poll_until(kvcr, bool)
+    now = 4.0
+    if use_current_time is not None:
+        kvcr.align_sequence(keys[:2], use_current_time=use_current_time)
+    kvcr.deposit({keys[3]: [_mem_descriptor(primary_addr + 3 * block_size)]})
+    _poll_until(kvcr, bool)
+
     statuses = kvcr.query(keys)
     assert statuses.pop(evicted_index) == (QueryStatus.MISS, None)
-    assert statuses == [
-        (QueryStatus.HIT, CacheTier.LOCAL_G2),
-        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    assert statuses == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 3
+    if keep_claim:
+        kvcr.release((second_claim,))
+
+
+@pytest.mark.parametrize(
+    ("access_first", "use_current_time", "expected_time"),
+    [(False, False, None), (True, False, 3.0), (False, True, 5.0), (True, True, 5.0)],
+)
+def test_align_sequence_updates_metadata_before_policy_callback_and_rescoring(
+    access_first: bool, use_current_time: bool, expected_time: float | None
+) -> None:
+    events = []
+
+    class RecordingLRUPolicy(LRUPolicy):
+        def on_align_sequence(self, blocks, use_current_time):
+            events.append(("align", tuple(blocks), use_current_time))
+
+        def eviction_score(self, meta, source):
+            events.append(("score", meta, source))
+            return super().eviction_score(meta, source)
+
+    local = ctypes.create_string_buffer(32)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 2, policy=RecordingLRUPolicy())
+    records = _g2_recovered(first=0, last=1)
+    first, last = records
+    records[first].last_access = 3.0 if access_first else None
+    records[first].access_count = int(access_first)
+    install_recovery_records(kvcr._core, records)
+    missing = BlockKey(b"missing")
+    assert all(event[1].position == -1 for event in events)
+    events.clear()
+    journal = Mock()
+    journal.publish.return_value = True
+    _attach_journal(kvcr._core._local_dram, journal)
+
+    kvcr._core._clock = lambda: 5.0
+    kvcr.align_sequence([])
+    kvcr.align_sequence([missing])
+    kvcr.align_sequence(
+        [missing, first, first, last], use_current_time=use_current_time
+    )
+
+    assert [event[0] for event in events] == ["align", "score", "score"]
+    _, blocks, callback_flag = events[0]
+    assert callback_flag is use_current_time
+    assert [
+        (meta.block_key, meta.position, meta.last_access, meta.access_count)
+        for meta in blocks
+    ] == [
+        (first, 1, expected_time, int(access_first)),
+        (last, 3, expected_time, 0),
     ]
+    assert set(kvcr._core._block_record_map) == {first, last}
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 2
+    assert {event[1].block_key: event[1] for event in events[1:]} == {
+        meta.block_key: meta for meta in blocks
+    }
+    mirror = _RecoveryMirror(("",))
+    assert journal.publish.call_count == 2
+    for call in journal.publish.call_args_list:
+        mirror.apply(*call.args)
+    assert {
+        key: (record.position, record.last_access, record.access_count)
+        for key, record in mirror.take_records().items()
+    } == {first: (1, None, 0), last: (3, None, 0)}
+    # Timestamp-only updates do not need another recovery record.
+    kvcr._core._clock = lambda: 6.0
+    kvcr.align_sequence([missing, first, first, last], use_current_time=True)
+    assert journal.publish.call_count == 2
 
 
 def test_local_deposit_applies_optional_admission() -> None:
@@ -413,6 +526,7 @@ def test_policy_lifecycle_hook_failures_are_logged(caplog) -> None:
     policy = FIFOPolicy()
     policy.on_ingest = Mock(side_effect=RuntimeError("ingest hook failed"))
     policy.on_remove = Mock(side_effect=RuntimeError("remove hook failed"))
+    policy.on_align_sequence = Mock(side_effect=RuntimeError("alignment hook failed"))
     kvcr = _new_local_kvcr(agent, local, 1, policy=policy)
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
 
@@ -424,12 +538,14 @@ def test_policy_lifecycle_hook_failures_are_logged(caplog) -> None:
             assert _poll_until(kvcr, lambda results: bool(results)) == [
                 (op_handle, _op_entries({key: True}))
             ]
+            kvcr.align_sequence([key])
 
     assert policy.on_ingest.call_count == 2
     policy.on_remove.assert_called_once()
     warnings = [record.getMessage() for record in caplog.records]
     assert warnings.count("KVCR on_ingest failed") == 2
     assert warnings.count("KVCR on_remove failed") == 1
+    assert warnings.count("KVCR on_align_sequence failed") == 2
 
 
 def test_local_claims_fetch_deliver_release_and_capacity() -> None:

@@ -3,7 +3,7 @@
 """Public policy API for controlling KVCR placement and eviction."""
 
 import logging
-from sys import float_info
+from math import ulp
 
 from .types import (
     BlockMeta,
@@ -60,6 +60,12 @@ class KVCachePolicy:
 
     def on_remove(self, meta: BlockMeta) -> None:
         """Observe removal of the block's final managed residency."""
+        pass
+
+    def on_align_sequence(
+        self, blocks: list[BlockMeta], use_current_time: bool
+    ) -> None:
+        """Observe aligned blocks in caller order, before eviction scores refresh."""
         pass
 
     # Optional recovery override.
@@ -128,7 +134,9 @@ class LRUPolicy(FIFOPolicy):
         meta: BlockMeta,
         source: CacheTier,
     ) -> float:
-        return meta.last_access if meta.last_access is not None else -float_info.max
+        timestamp = meta.last_access if meta.last_access is not None else -1.0
+        # A small tail-first bias; very close access times can also reorder.
+        return timestamp - max(meta.position, 0) * ulp(timestamp)
 
 
 class G3LRUPolicy(LRUPolicy):
