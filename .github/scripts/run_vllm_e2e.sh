@@ -163,8 +163,17 @@ try:
         raise Failure("Actual image lacks the requested repository digest")
     if identity and not identity["published"]:
         metadata = read_json(args.build_output / "build-metadata.json")
-        if metadata.get("containerimage.config.digest") != image_id:
-            raise Failure("Actual local image ID differs from the recorded build configuration digest")
+        if identity.get("local_image_id") != image_id:
+            raise Failure("Actual local image ID differs from the verified build identity")
+        # Classic Docker stores identify images by config digest; containerd
+        # stores can return the manifest digest and omit config from metadata.
+        build_digests = [metadata[key] for key in (
+            "containerimage.config.digest", "containerimage.digest"
+        ) if key in metadata]
+        if (not build_digests or
+                any(not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                    for value in build_digests) or image_id not in build_digests):
+            raise Failure("Actual local image ID differs from the recorded build digests")
     result.update(image_uri=image, image_id=image_id, kvcr_commit=head)
     save_json(output / "image-identity.json", {"image_uri": image, "image_id": image_id,
                                               "verified_labels": expected})

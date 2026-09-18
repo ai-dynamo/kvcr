@@ -111,6 +111,7 @@ def local_run(tmp_path):
             {
                 "published": False,
                 "image_uri": "local/kvcr:fixture",
+                "local_image_id": IMAGE_ID,
                 "verified_labels": labels,
             }
         )
@@ -276,4 +277,43 @@ def test_local_image_config_digest_must_match_build(local_run):
     )
     result, commands = invoke("--gpus", "0,1")
     assert result.returncode != 0
+    assert not any(call[0] == "create" for call in commands)
+
+
+@pytest.mark.parametrize("with_config", [False, True])
+def test_containerd_manifest_image_id_matches_build(local_run, with_config):
+    invoke, _, _, build = local_run
+    metadata = {"containerimage.digest": DIGEST}
+    if with_config:
+        metadata["containerimage.config.digest"] = IMAGE_ID
+    (build / "build-metadata.json").write_text(json.dumps(metadata))
+    identity_file = build / "image-identity.json"
+    identity = json.loads(identity_file.read_text())
+    identity["local_image_id"] = DIGEST
+    identity_file.write_text(json.dumps(identity))
+    result, commands = invoke("--gpus", "0,1", image_id=DIGEST)
+    assert result.returncode == 0, result.stdout + result.stderr
+    create = next(call for call in commands if call[0] == "create")
+    assert DIGEST in create
+
+
+@pytest.mark.parametrize("metadata", [{}, {"containerimage.digest": "invalid"}])
+def test_missing_or_invalid_build_digests_prevent_container_creation(
+    local_run, metadata
+):
+    invoke, _, _, build = local_run
+    (build / "build-metadata.json").write_text(json.dumps(metadata))
+    result, commands = invoke("--gpus", "0,1")
+    assert result.returncode != 0
+    assert not any(call[0] == "create" for call in commands)
+
+
+def test_changed_image_id_cannot_reuse_verified_build_identity(local_run):
+    invoke, _, _, build = local_run
+    (build / "build-metadata.json").write_text(
+        json.dumps({"containerimage.digest": DIGEST})
+    )
+    result, commands = invoke("--gpus", "0,1", image_id=DIGEST)
+    assert result.returncode != 0
+    assert "verified build identity" in result.stdout
     assert not any(call[0] == "create" for call in commands)

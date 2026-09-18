@@ -45,10 +45,13 @@ with open(os.environ["MOCK_DOCKER_CALLS"], "a") as stream:
 root = pathlib.Path(os.environ["E2E_BUILD_OUTPUT"])
 if arguments[:2] == ["buildx", "build"]:
     metadata = pathlib.Path(arguments[arguments.index("--metadata-file") + 1])
-    metadata.write_text(json.dumps({
+    digests = {
         "containerimage.digest": "sha256:" + "a" * 64,
         "containerimage.config.digest": "sha256:" + "c" * 64,
-    }))
+    }
+    if "MOCK_METADATA_JSON" in os.environ:
+        digests = json.loads(os.environ["MOCK_METADATA_JSON"])
+    metadata.write_text(json.dumps(digests))
     print("Mock image build; no Docker daemon or registry is contacted")
 elif (arguments[:2] == ["image", "inspect"] or
       arguments[:3] == ["buildx", "imagetools", "inspect"]):
@@ -62,7 +65,8 @@ elif (arguments[:2] == ["image", "inspect"] or
     if os.environ.get("MOCK_WRONG_LABEL"):
         labels["io.ai-dynamo.kvcr.vllm.sha"] = "f" * 40
     if arguments[0] == "image":
-        print(json.dumps([{"Id": "sha256:" + "c" * 64, "Architecture": "amd64",
+        local_id = os.environ.get("MOCK_LOCAL_IMAGE_ID", "sha256:" + "c" * 64)
+        print(json.dumps([{"Id": local_id, "Architecture": "amd64",
                            "Os": "linux", "Config": {"Labels": labels}}]))
     else:
         configuration = {
@@ -216,8 +220,69 @@ class BuildVllmE2ETests(unittest.TestCase):
         self.assertIn("github.com:140.82.116.3", build)
         identity = json.loads((self.output / "image-identity.json").read_text())
         self.assertFalse(identity["published"])
+        self.assertEqual(identity["local_image_id"], CONFIG_DIGEST)
         self.assertTrue(identity["image_uri"].endswith(self.sha + "-run-42-3"))
         self.assertEqual(len(self.calls("git")), 2)
+
+    def test_containerd_load_accepts_manifest_id_without_config_digest(self):
+        result = self.run_script(
+            KVCR_PUSH="0",
+            MOCK_METADATA_JSON=json.dumps({"containerimage.digest": MANIFEST_DIGEST}),
+            MOCK_LOCAL_IMAGE_ID=MANIFEST_DIGEST,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads((self.output / "image-identity.json").read_text())
+        self.assertEqual(identity["local_image_id"], MANIFEST_DIGEST)
+        self.assertEqual(identity["digest"], MANIFEST_DIGEST)
+
+    def test_classic_load_accepts_config_only_metadata(self):
+        result = self.run_script(
+            KVCR_PUSH="0",
+            MOCK_METADATA_JSON=json.dumps(
+                {"containerimage.config.digest": CONFIG_DIGEST}
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads((self.output / "image-identity.json").read_text())
+        self.assertEqual(identity["local_image_id"], CONFIG_DIGEST)
+        self.assertEqual(identity["digest"], CONFIG_DIGEST)
+
+    def test_local_load_rejects_unrecorded_id_or_missing_digests(self):
+        for metadata in (
+            {"containerimage.digest": MANIFEST_DIGEST},
+            {
+                "containerimage.digest": MANIFEST_DIGEST,
+                "containerimage.config.digest": CONFIG_DIGEST,
+            },
+            {},
+        ):
+            with self.subTest(metadata=metadata):
+                result = self.run_script(
+                    KVCR_PUSH="0",
+                    MOCK_METADATA_JSON=json.dumps(metadata),
+                    MOCK_LOCAL_IMAGE_ID="sha256:" + "f" * 64,
+                )
+                self.assert_failed_without_outputs(result)
+                self.assertIn("does not match any recorded build digest", result.stderr)
+
+    def test_invalid_metadata_or_local_id_rejects_outputs(self):
+        cases = (
+            {"MOCK_LOCAL_IMAGE_ID": "invalid"},
+            {
+                "MOCK_METADATA_JSON": json.dumps(
+                    {
+                        "containerimage.digest": MANIFEST_DIGEST,
+                        "containerimage.config.digest": "invalid",
+                    }
+                )
+            },
+            {"MOCK_METADATA_JSON": json.dumps({"containerimage.digest": 123})},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                result = self.run_script(KVCR_PUSH="0", **overrides)
+                self.assert_failed_without_outputs(result)
+                self.assertIn("invalid", result.stderr)
 
     def test_mock_publish_emits_only_verified_digest_reference(self):
         result = self.run_script(KVCR_PUSH="1", MOCK_PLATFORM_MAP="1")
@@ -230,6 +295,8 @@ class BuildVllmE2ETests(unittest.TestCase):
         self.assertIn("kvcr_sha=" + self.sha, output)
         self.assertIn("dynamo_sha=" + DYNAMO_SHA, output)
         self.assertIn("vllm_sha=" + VLLM_SHA, output)
+        identity = json.loads((self.output / "image-identity.json").read_text())
+        self.assertNotIn("local_image_id", identity)
 
     def test_wrong_provenance_label_rejects_outputs(self):
         result = self.run_script(KVCR_PUSH="0", MOCK_WRONG_LABEL="1")

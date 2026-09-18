@@ -212,9 +212,14 @@ manifest = json.loads(Path(manifest_name).read_text())
 metadata = json.loads(Path(metadata_name).read_text())
 if hashlib.sha256(Path("Dockerfile.quick-start").read_bytes()).hexdigest() != manifest["dockerfile_sha256"]:
     raise SystemExit("Dockerfile changed after source resolution")
-digest = metadata.get("containerimage.digest")
-if digest is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-    raise SystemExit("Build metadata contains an invalid image digest")
+metadata_digests = {}
+for key in ("containerimage.digest", "containerimage.config.digest"):
+    if key in metadata:
+        value = metadata[key]
+        if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise SystemExit(f"Build metadata contains an invalid image digest: {key}")
+        metadata_digests[key] = value
+digest = metadata_digests.get("containerimage.digest")
 
 def invoke(arguments):
     try:
@@ -252,12 +257,13 @@ for key, value in expected_labels.items():
         raise SystemExit(f"Image provenance label does not match resolved sources: {key}")
 if publish != "1":
     local_id = config.get("Id")
-    expected_id = metadata.get("containerimage.config.digest")
-    if expected_id and local_id != expected_id:
-        raise SystemExit("Loaded image configuration digest differs from build metadata")
+    if not isinstance(local_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", local_id):
+        raise SystemExit("Loaded image has an invalid local image ID")
+    # Classic Docker identifies images by configuration digest; the containerd
+    # image store can use the manifest digest and omit the configuration field.
+    if local_id not in metadata_digests.values():
+        raise SystemExit("Loaded image ID does not match any recorded build digest")
     digest = digest or local_id
-    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        raise SystemExit("No valid local image digest is available")
 
 identity = {
     "schema_version": 1, "verified_at": datetime.now(timezone.utc).isoformat(),
@@ -266,6 +272,8 @@ identity = {
     "platform": "linux/amd64", "verified_labels": expected_labels,
     "verification": "Inspected image identity and provenance labels match the resolved source manifest",
 }
+if publish != "1":
+    identity["local_image_id"] = local_id
 Path(identity_name).write_text(json.dumps(identity, indent=2) + "\n")
 if github_output:
     values = {
