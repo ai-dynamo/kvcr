@@ -206,6 +206,7 @@ class BuildVllmE2ETests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         build = self.calls("docker")[0]
         self.assertIn("--load", build)
+        self.assertEqual(build[build.index("--ulimit") + 1], "nofile=65536:65536")
         self.assertNotIn("--push", build)
         self.assertNotIn("--secret", build)
         self.assertIn("KVCR_RUNTIME_USER=root", build)

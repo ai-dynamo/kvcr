@@ -169,6 +169,7 @@ sha_uri="${image}:${kvcr_sha}"
 unique_uri="${image}:${unique_tag}"
 
 build_command=(docker buildx build --platform linux/amd64
+    --ulimit nofile=65536:65536
     --file Dockerfile.quick-start --progress plain --metadata-file "$metadata_file"
     --tag "$sha_uri" --tag "$unique_uri"
     --build-arg "VLLM_IMAGE=$base_image"

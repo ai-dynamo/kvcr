@@ -73,7 +73,9 @@ The builder runner needs Git, Python 3, Docker/buildx, AWS CLI, and an existing
 AWS identity allowed to authenticate and push to the dedicated repository. Its
 BuildKit service needs enough CPU, memory, disk, and network access to compile
 Dynamo and assemble the large vLLM image. The workflow does not forward registry
-credentials or BuildKit secrets to Dockerfile commands. Configure lifecycle
+credentials or BuildKit secrets to Dockerfile commands. Build steps request a
+`nofile` limit of 65,536; the BuildKit service's hard limit must permit this to
+avoid file-descriptor exhaustion during parallel Rust compilation. Configure lifecycle
 retention for CI images. The SHA tag must permit replacement when upstream
 revisions advance; the unique run tag and digest preserve each tested build.
 
