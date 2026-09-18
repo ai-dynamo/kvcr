@@ -632,6 +632,9 @@ def _probe_ack(handle, source="tcp://source:1", **fields):
 
 def _acked_deliver(control, kvcr, source, key):
     """Drive a deliver whose start_write carries no metadata, and return it."""
+    # Each wait below expects exactly the message it triggered, so start clean:
+    # a leftover would satisfy the wait before this request is even sent.
+    control.sent.clear()
     kvcr.submit_hint(_router_hint(source), request_id="metadata")
     _wait_until(lambda: len(control.sent) == 1)
     ack = {
@@ -667,14 +670,16 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     source = "tcp://source:1"
     key = BlockKey(b"k0")
     handle, op_handle = _acked_deliver(control, kvcr, source, key)
+    sources = kvcr._core._remote_fw_dram._dangling_ops.sources
+    assert sources[source] == "source"
 
-    def refuse(sender: str) -> None:
+    def refuse(sender: str, refused_handle: int = op_handle) -> None:
         control.incoming.append(
             msgspec.msgpack.encode(
                 {
                     "type": "write_refused",
                     "sender_control_endpoint": sender,
-                    "op_handle": op_handle,
+                    "op_handle": refused_handle,
                 }
             )
         )
@@ -687,10 +692,23 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
         time.sleep(0.002)
     assert completed == []
 
+    refuse(source, op_handle + 10)
+    assert sources[source] == "source"
+
     refuse(source)
     assert _poll_until(kvcr, lambda done: bool(done)) == [
         (handle, _op_entries({key: False}))
     ]
+    # The refusing peer replaced the one we cached, so the next write re-learns
+    # its generation instead of quoting the dead one and being refused again.
+    assert source not in sources
+
+    # A delayed refusal only reports on the generation its own operation quoted,
+    # so it must not evict one learned after that operation started.
+    _, later_handle = _acked_deliver(control, kvcr, source, BlockKey(b"k1"))
+    sources[source] = "replacement"
+    refuse(source, later_handle)
+    assert sources[source] == "replacement"
 
 
 def test_kvcr_metadata_ack_retry_lifecycle():
