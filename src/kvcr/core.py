@@ -13,10 +13,12 @@ from math import ceil
 from typing import TYPE_CHECKING
 
 from .config import (
+    FrameworkMemoryRegion,
     KVCRBackendConfigs,
     KVCRConfig,
     TelemetryStats,
     _validate_pool_layouts,
+    resolve_framework_regions,
 )
 from .hint_parser import _KVFetchHint
 from .local_disk import _G3, _G3Residency
@@ -241,12 +243,20 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        framework_dram = backend_configs.framework_dram
-        memory_regions: list[tuple[int, int]] = []
-        if framework_dram is not None:
-            memory_regions.append((framework_dram.address, framework_dram.length))
+        # Retained until close so a registered framework allocation cannot be
+        # recycled while NIXL still holds its address.
+        self._framework_regions: tuple[FrameworkMemoryRegion, ...] = (
+            resolve_framework_regions(backend_configs)
+        )
+        memory_regions: list[tuple[int, int, str, int]] = [
+            (region.address, region.length, region.mem_type, region.device_id)
+            for region in self._framework_regions
+        ]
         if self._local_dram is not None:
-            memory_regions.extend(self._local_dram.memory_regions)
+            memory_regions.extend(
+                (address, length, "DRAM", 0)
+                for address, length in self._local_dram.memory_regions
+            )
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
@@ -602,6 +612,8 @@ class _KVCRCore:
         except BaseException as error:
             # The progress failure came first and explains this one.
             raise error from progress_error
+        # Registrations are gone (quiescent above), so the owners may be freed.
+        self._framework_regions = ()
         if progress_error is not None:
             raise progress_error
 
@@ -751,10 +763,17 @@ class _KVCRCore:
             [descriptor.info for descriptor in descriptors],
             "block descriptors must use configured pools",
         )
+        # One NIXL descriptor list carries one memory type, so a block's spans
+        # move as one transfer only when they share an endpoint.
+        endpoint = (descriptors[0].mem_type, descriptors[0].device_Id)
         for descriptor in descriptors:
             block_size = self._block_sizes[descriptor.info]
             if descriptor.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
+            if (descriptor.mem_type, descriptor.device_Id) != endpoint:
+                raise ValueError(
+                    "block descriptors must share one memory type and device"
+                )
         return list(descriptors)
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:

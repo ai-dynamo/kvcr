@@ -45,6 +45,97 @@ class FrameworkDramInput:
     length: int
 
 
+# NIXL memory segment names a framework endpoint may use. Storage segments
+# (FILE, BLOCK, OBJ) are KVCR-owned tiers, never framework transfer endpoints.
+FRAMEWORK_MEMORY_TYPES = frozenset({"DRAM", "VRAM"})
+
+
+@dataclass(frozen=True)
+class FrameworkMemoryRegion:
+    """One framework-owned allocation KVCR registers as a transfer endpoint.
+
+    ``mem_type`` and ``device_id`` are the NIXL segment type and device index
+    of the allocation; a GPU allocation is ``("VRAM", cuda_device_index)``.
+    ``owner`` is an opaque reference (for example the tensor whose storage this
+    region describes) that KVCR keeps alive until the registration is released,
+    so the address cannot be recycled while NIXL still knows it.
+    """
+
+    address: int
+    length: int
+    mem_type: str = "DRAM"
+    device_id: int = 0
+    owner: object | None = field(default=None, compare=False, hash=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.address) is not int or self.address <= 0:
+            raise ValueError("framework region address must be a positive integer")
+        if type(self.length) is not int or self.length <= 0:
+            raise ValueError("framework region length must be a positive integer")
+        if self.mem_type not in FRAMEWORK_MEMORY_TYPES:
+            raise ValueError(
+                "framework region mem_type must be one of "
+                f"{sorted(FRAMEWORK_MEMORY_TYPES)}, got {self.mem_type!r}"
+            )
+        if type(self.device_id) is not int or self.device_id < 0:
+            raise ValueError("framework region device_id must be a non-negative int")
+
+    @property
+    def endpoint(self) -> tuple[str, int]:
+        return (self.mem_type, self.device_id)
+
+    @property
+    def end(self) -> int:
+        return self.address + self.length
+
+
+def resolve_framework_regions(
+    backend_configs: "KVCRBackendConfigs",
+) -> tuple[FrameworkMemoryRegion, ...]:
+    """Return the framework endpoints to register, deduplicated and validated.
+
+    ``framework_dram`` is the legacy single DRAM region; ``framework_regions``
+    is the typed list. Configuring both is refused rather than merged, so one
+    allocation can never be registered twice through two spellings. Exact
+    duplicates (two views of one allocation) collapse to one registration;
+    partially overlapping regions of the same endpoint are refused because
+    NIXL cannot tell which registration a descriptor inside the overlap means.
+    """
+    legacy = backend_configs.framework_dram
+    typed = tuple(backend_configs.framework_regions)
+    if legacy is not None and typed:
+        raise ValueError(
+            "configure either framework_dram or framework_regions, not both"
+        )
+    if legacy is not None:
+        typed = (FrameworkMemoryRegion(legacy.address, legacy.length),)
+    if not all(isinstance(region, FrameworkMemoryRegion) for region in typed):
+        raise TypeError("framework_regions must contain FrameworkMemoryRegion values")
+
+    unique: list[FrameworkMemoryRegion] = []
+    seen: set[tuple[int, int, str, int]] = set()
+    for region in typed:
+        identity = (region.address, region.length, region.mem_type, region.device_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(region)
+
+    by_endpoint: dict[tuple[str, int], list[FrameworkMemoryRegion]] = {}
+    for region in unique:
+        by_endpoint.setdefault(region.endpoint, []).append(region)
+    for regions in by_endpoint.values():
+        ordered = sorted(regions, key=lambda region: region.address)
+        for left, right in zip(ordered, ordered[1:]):
+            if left.end > right.address:
+                raise ValueError(
+                    "framework regions must not overlap: "
+                    f"[{left.address:#x}, {left.end:#x}) and "
+                    f"[{right.address:#x}, {right.end:#x}) on {left.endpoint}"
+                )
+    return tuple(unique)
+
+
 # Early pinning optimization was considered, but its complexity outweighed the benefit.
 @dataclass(frozen=True)
 class RemoteFWDramOptions:
@@ -66,7 +157,9 @@ class G3Options:
 
 @dataclass(frozen=True)
 class KVCRBackendConfigs:
+    # Legacy single DRAM endpoint; prefer framework_regions. Setting both is refused.
     framework_dram: FrameworkDramInput | None = None
+    framework_regions: tuple[FrameworkMemoryRegion, ...] = ()
     local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
     remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)
