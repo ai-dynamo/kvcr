@@ -1761,6 +1761,11 @@ class _RemoteFWDram:
     def _poll_notifications(
         self, progress: _KVCRProgress
     ) -> dict[_OpId, dict[str, Any]]:
+        # Notifications only ever come from peers, and peers only exist through
+        # the framework control channel; without one this NIXL call is pure
+        # overhead on every progress iteration.
+        if self._control is None:
+            return {}
         agent = progress.nixl_agent
         get_new_notifs = getattr(agent, "get_new_notifs", None)
         if get_new_notifs is None:
