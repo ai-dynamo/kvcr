@@ -452,3 +452,27 @@ def test_engine_rejects_regions_on_invisible_devices() -> None:
         assert create_device_copy_engine((_region_over(gpu, device_id=5),)) is None
         engine = create_device_copy_engine((_region_over(gpu, device_id=1),))
     assert engine is not None and engine.devices == (1,)
+
+
+def test_request_coalesces_spans_contiguous_on_both_sides() -> None:
+    from kvcr.device_copy import _coalesce_operands
+
+    # Three pages with adjacent device rows and adjacent slots merge into one
+    # span; a gap on either side starts a new run; sizes add up exactly.
+    size = 128
+    dst = np.array([1000, 1128, 1256, 5000, 5128, 9000], dtype=np.uint64)
+    src = np.array([2000, 2128, 2256, 6000, 6300, 9500], dtype=np.uint64)
+    sizes = np.full(6, size, dtype=np.uint64)
+    merged_dst, merged_src, merged_sizes = _coalesce_operands(dst, src, sizes)
+    assert merged_dst.tolist() == [1000, 5000, 5128, 9000]
+    assert merged_src.tolist() == [2000, 6000, 6300, 9500]
+    assert merged_sizes.tolist() == [3 * size, size, size, size]
+    assert int(merged_sizes.sum()) == int(sizes.sum())
+
+    request = DeviceCopyEngine.request(0, dst, sizes, src, sizes)
+    assert not isinstance(request, str)
+    assert len(request.sizes) == 4 and request.byte_count == 6 * size
+    # Fully contiguous operands collapse to one span; a single span is kept.
+    one_dst, one_src, one_sizes = _coalesce_operands(dst[:3], src[:3], sizes[:3])
+    assert one_dst.tolist() == [1000] and one_sizes.tolist() == [3 * size]
+    assert _coalesce_operands(dst[:1], src[:1], sizes[:1])[2].tolist() == [size]

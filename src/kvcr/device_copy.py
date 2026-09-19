@@ -239,6 +239,34 @@ class DeviceCopyHandle:
     error: str | None = None
 
 
+def _coalesce_operands(
+    dst: np.ndarray, src: np.ndarray, sizes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge runs of consecutive spans contiguous in both address spaces.
+
+    Vectorised: a break starts wherever the next span does not begin exactly
+    where the previous one ends on either side; runs are then reduced with
+    one cumulative sum, so the cost stays a few microseconds per thousand
+    spans while the batch copy's per-span host cost drops with the count.
+    """
+    count = len(sizes)
+    if count < 2:
+        return dst, src, sizes
+    dst = np.asarray(dst, dtype=np.uint64)
+    src = np.asarray(src, dtype=np.uint64)
+    sizes = np.asarray(sizes, dtype=np.uint64)
+    ends_dst = dst[:-1] + sizes[:-1]
+    ends_src = src[:-1] + sizes[:-1]
+    breaks = (dst[1:] != ends_dst) | (src[1:] != ends_src)
+    if not breaks.any():
+        return dst[:1], src[:1], np.array([sizes.sum()], dtype=np.uint64)
+    starts = np.concatenate(([0], np.flatnonzero(breaks) + 1))
+    cumulative = np.cumsum(sizes, dtype=np.uint64)
+    run_ends = cumulative[np.concatenate((starts[1:] - 1, [count - 1]))]
+    run_begins = cumulative[starts] - sizes[starts]
+    return dst[starts], src[starts], (run_ends - run_begins).astype(np.uint64)
+
+
 @dataclass(frozen=True)
 class DeviceCopyRequest:
     """Aligned copy operands for one operation, validated before submission."""
@@ -329,13 +357,21 @@ class DeviceCopyEngine:
         src_addresses: np.ndarray,
         src_sizes: np.ndarray,
     ) -> DeviceCopyRequest | str:
-        """Pair aligned operand arrays, or say why they do not align."""
+        """Pair aligned operand arrays, or say why they do not align.
+
+        Consecutive spans that are contiguous on both sides are merged: the
+        CUDA batch copy costs host time per span, and pages allocated in
+        sequence usually have adjacent device rows and adjacent slots.
+        """
         if len(src_sizes) != len(dst_sizes):
             return "source and destination span counts differ"
         if not np.array_equal(src_sizes, dst_sizes):
             index = int(np.argmax(src_sizes != dst_sizes))
             return f"span sizes differ ({src_sizes[index]} vs {dst_sizes[index]})"
-        return DeviceCopyRequest(device_id, dst_addresses, src_addresses, src_sizes)
+        dst_addresses, src_addresses, sizes = _coalesce_operands(
+            dst_addresses, src_addresses, src_sizes
+        )
+        return DeviceCopyRequest(device_id, dst_addresses, src_addresses, sizes)
 
     def submit(self, request: DeviceCopyRequest) -> DeviceCopyHandle:
         """Enqueue a request on device streams and record completion events."""
