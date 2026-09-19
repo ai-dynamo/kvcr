@@ -66,11 +66,14 @@ class _RequestHint:
 
 
 # Adjacent spans that are contiguous on both sides are merged into one NIXL
-# descriptor up to this size. A page's spans in a KVCR slot are contiguous, so
-# a page with 147 small spans (DeepSeek V4) becomes a handful of descriptors;
-# the cap keeps enough descriptors for UCX to spread the copy over its workers,
-# where 128 KiB to 512 KiB pieces measured fastest.
-_COALESCE_MAX_BYTES = 512 << 10
+# descriptor up to this size. UCX puts of up to 128 KiB are posted
+# asynchronously and spread over its worker threads, larger ones copy inline
+# in the posting thread (measured on the H100 host: same wall time per byte
+# either way for large lists, but a mixed list gains nothing from merging
+# above the threshold). Merging stops at the threshold, so 128 KiB spans
+# (dense models) are left alone and only smaller spans (DeepSeek V4's 1.7 KB
+# to 65 KB pools) are combined; spans already above it are never merged.
+_COALESCE_MAX_BYTES = 128 << 10
 
 
 def _coalesce_transfer_spans(
