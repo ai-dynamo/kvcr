@@ -72,14 +72,18 @@ class _RequestHint:
 # either way for large lists, but a mixed list gains nothing from merging
 # above the threshold). Merging stops at the threshold, so 128 KiB spans
 # (dense models) are left alone and only smaller spans (DeepSeek V4's 1.7 KB
-# to 65 KB pools) are combined; spans already above it are never merged.
+# to 65 KB pools) are combined. Spans already above it are copied inline
+# whatever their size, so runs of them merge up to the inline cap (DeepSeek
+# V4's 146 KB sliding-window spans go from 43 to 15 descriptors per page).
 _COALESCE_MAX_BYTES = 128 << 10
+_COALESCE_INLINE_MAX_BYTES = 512 << 10
 
 
 def _coalesce_transfer_spans(
     sources: tuple[MemDescriptor, ...],
     destinations: tuple[MemDescriptor, ...],
     max_bytes: int,
+    inline_max_bytes: int | None = None,
 ) -> tuple[tuple[MemDescriptor, ...], tuple[MemDescriptor, ...]]:
     """Merge aligned source and destination spans that are contiguous on both.
 
@@ -87,17 +91,28 @@ def _coalesce_transfer_spans(
     NIXL request creation and posting cost per descriptor; merging runs that
     are contiguous in both address spaces (same memory type and device on
     each side) keeps the transfer identical while cutting that cost.
+
+    A run that starts at or below ``max_bytes`` (UCX's asynchronous put size)
+    never grows past it, so spans that would have been posted asynchronously
+    stay that way; a run that starts above it is already copied inline and
+    only takes further inline-sized spans, up to ``inline_max_bytes``.
     """
     if len(sources) < 2:
         return sources, destinations
+    inline_max = max_bytes if inline_max_bytes is None else inline_max_bytes
     merged_src: list[MemDescriptor] = []
     merged_dst: list[MemDescriptor] = []
     run_src = sources[0]
     run_dst = destinations[0]
     run_size = run_src.size
+    run_inline = run_size > max_bytes
     for src, dst in zip(sources[1:], destinations[1:]):
         if (
-            run_size + src.size <= max_bytes
+            (
+                run_size + src.size <= max_bytes
+                if not run_inline
+                else src.size > max_bytes and run_size + src.size <= inline_max
+            )
             and src.addr == run_src.addr + run_size
             and dst.addr == run_dst.addr + run_size
             and src.size == dst.size
@@ -111,6 +126,7 @@ def _coalesce_transfer_spans(
         merged_src.append(_resized(run_src, run_size))
         merged_dst.append(_resized(run_dst, run_size))
         run_src, run_dst, run_size = src, dst, src.size
+        run_inline = run_size > max_bytes
     merged_src.append(_resized(run_src, run_size))
     merged_dst.append(_resized(run_dst, run_size))
     return tuple(merged_src), tuple(merged_dst)
@@ -410,6 +426,7 @@ class _SourceWriteOp(_RemoteOp):
                     tuple(chain.from_iterable(self.src_descriptors)),
                     tuple(chain.from_iterable(self.dst_descriptors)),
                     _COALESCE_MAX_BYTES,
+                    _COALESCE_INLINE_MAX_BYTES,
                 )
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",

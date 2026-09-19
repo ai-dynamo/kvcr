@@ -1180,3 +1180,28 @@ def test_coalesce_transfer_spans_merges_runs_contiguous_on_both_sides() -> None:
     assert [(d.addr, d.size) for d in merged_src][:2] == [(1000, 16), (1016, 16)]
     single_src, single_dst = _coalesce_transfer_spans(src[:1], dst[:1], 1 << 20)
     assert single_src == src[:1] and single_dst == dst[:1]
+
+
+def test_coalesce_keeps_async_spans_async_and_merges_inline_runs() -> None:
+    from kvcr.remote_fw_dram import _coalesce_transfer_spans
+
+    async_max, inline_max = 128, 512
+    # Four 128-byte spans (at the async limit) stay separate: merging any two
+    # would push them onto the inline path.
+    src = tuple(_mem_descriptor(addr=1000 + 128 * i, size=128) for i in range(4))
+    dst = tuple(_mem_descriptor(addr=5000 + 128 * i, size=128) for i in range(4))
+    merged_src, _ = _coalesce_transfer_spans(src, dst, async_max, inline_max)
+    assert [d.size for d in merged_src] == [128, 128, 128, 128]
+    # Four 146-byte spans are already inline and merge three at a time.
+    src = tuple(_mem_descriptor(addr=1000 + 146 * i, size=146) for i in range(4))
+    dst = tuple(_mem_descriptor(addr=5000 + 146 * i, size=146) for i in range(4))
+    merged_src, merged_dst = _coalesce_transfer_spans(src, dst, async_max, inline_max)
+    assert [d.size for d in merged_src] == [438, 146]
+    assert [d.addr for d in merged_dst] == [5000, 5438]
+    # Small spans merge up to the async limit; an inline span ends the run.
+    sizes = [32, 32, 32, 32, 32, 146, 32]
+    offsets = [sum(sizes[:i]) for i in range(len(sizes))]
+    src = tuple(_mem_descriptor(addr=1000 + o, size=s) for o, s in zip(offsets, sizes))
+    dst = tuple(_mem_descriptor(addr=5000 + o, size=s) for o, s in zip(offsets, sizes))
+    merged_src, _ = _coalesce_transfer_spans(src, dst, async_max, inline_max)
+    assert [d.size for d in merged_src] == [128, 32, 146, 32]
