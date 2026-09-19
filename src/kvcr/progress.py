@@ -3,7 +3,9 @@
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
 import logging
+import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -20,6 +22,11 @@ from .types import BlockKey, MemDescriptor
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
 _ACTIVE_WAIT_SECONDS = 0.0001
+# With nothing in flight the loop parks until a submission or a control
+# message arrives; this bounds the park so backend timers still run. Every
+# wake-up is a GIL hand-off in the framework process, so the idle loop must
+# not spin on a fixed cadence.
+_IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
@@ -100,6 +107,13 @@ class _KVCRProgress:
         self._memory_registrations: list[Any] = []
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
+        # Submissions from other threads wake a parked loop through this pipe;
+        # a backend with its own event source (the peer control channel)
+        # installs idle_waiter to wait on both at once.
+        self._wake_read, self._wake_write = os.pipe()
+        os.set_blocking(self._wake_read, False)
+        os.set_blocking(self._wake_write, False)
+        self.idle_waiter: Callable[[float, int], None] | None = None
         self._completed: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
@@ -275,6 +289,32 @@ class _KVCRProgress:
     def submit(self, item: object) -> None:
         self.raise_if_failed()
         self._submissions.put(item)
+        self._wake()
+
+    def _wake(self) -> None:
+        try:
+            os.write(self._wake_write, b"\0")
+        except (BlockingIOError, OSError):
+            # A full pipe already guarantees a wake-up; a closed one means
+            # the loop has stopped and drains the queue no more.
+            pass
+
+    def _idle_wait(self) -> None:
+        """Park until a submission, a backend event, or the bounded timeout."""
+        waiter = self.idle_waiter
+        try:
+            if waiter is not None:
+                waiter(_IDLE_WAIT_MAX_SECONDS, self._wake_read)
+            else:
+                select.select([self._wake_read], [], [], _IDLE_WAIT_MAX_SECONDS)
+        except (OSError, ValueError):
+            time.sleep(_IDLE_WAIT_SECONDS)
+        while True:
+            try:
+                if not os.read(self._wake_read, 4096):
+                    break
+            except (BlockingIOError, OSError):
+                break
 
     def take_completed(self) -> list[object]:
         completed: list[object] = []
@@ -328,12 +368,12 @@ class _KVCRProgress:
             while not self._stop_requested:
                 if not self._run_one_iteration():
                     # A copy in flight completes within a few milliseconds, so
-                    # poll it on a short cadence; sleep longer only when idle.
-                    time.sleep(
-                        _ACTIVE_WAIT_SECONDS
-                        if self._in_flight_ops
-                        else _IDLE_WAIT_SECONDS
-                    )
+                    # poll it on a short cadence; with nothing in flight park
+                    # until a submission or a control message arrives.
+                    if self._in_flight_ops:
+                        time.sleep(_ACTIVE_WAIT_SECONDS)
+                    else:
+                        self._idle_wait()
         except BaseException as error:
             self._failure = error
         finally:
@@ -354,6 +394,11 @@ class _KVCRProgress:
                 if self._failure is None:
                     self._failure = error
             self._ready.set()
+            for fd in (self._wake_read, self._wake_write):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _close_progress_ops(self) -> None:
         self._stop_requested = True

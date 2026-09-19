@@ -825,6 +825,11 @@ class _RemoteFWDram:
         initialize_control = getattr(self._control, "initialize", None)
         if initialize_control is not None:
             initialize_control()
+        # Peer requests arrive on the control channel; let the parked progress
+        # loop wake for them instead of polling on a fixed cadence.
+        wait = getattr(self._control, "wait", None)
+        if wait is not None:
+            _progress.idle_waiter = wait
 
     def poll_progress(
         self, progress: _KVCRProgress, submissions: list[object]

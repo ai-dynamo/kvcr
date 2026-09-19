@@ -242,6 +242,8 @@ class ZmqPeerControlChannel:
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.PULL)
         self._socket.linger = 0
+        self._poller: zmq.Poller | None = None
+        self._poller_wake_fd: int | None = None
         adopted_fd = os.dup(self._listener.fileno())
         try:
             self._socket.setsockopt(zmq.USE_FD, adopted_fd)
@@ -281,6 +283,26 @@ class ZmqPeerControlChannel:
             self._outgoing.pop(endpoint, None)
             return False
         return True
+
+    def wait(self, timeout_s: float, wake_fd: int) -> None:
+        """Block until a peer message, a byte on ``wake_fd``, or the timeout.
+
+        The progress loop parks here when nothing is in flight; ZMQ's own
+        poller sees both its socket and the loop's wake-up pipe, so a peer's
+        ``start_write`` and a local submission are both served at once
+        instead of on a fixed cadence.
+        """
+        socket = self._socket
+        if socket is None:
+            raise RuntimeError("KVCR control channel is not initialized")
+        poller = self._poller
+        if poller is None or self._poller_wake_fd != wake_fd:
+            poller = zmq.Poller()
+            poller.register(socket, zmq.POLLIN)
+            poller.register(wake_fd, zmq.POLLIN)
+            self._poller = poller
+            self._poller_wake_fd = wake_fd
+        poller.poll(max(0, int(timeout_s * 1000)))
 
     def recv(self) -> list[bytes]:
         socket = self._socket
