@@ -563,6 +563,7 @@ class _LocalDram:
         *,
         hints: object | None,
         layout: list[str],
+        layouts: Mapping[BlockKey, list[str]] | None = None,
     ) -> dict[BlockKey, list[MemDescriptor]]:
         ordered_keys = tuple(dict.fromkeys(keys))
         key_set = set(ordered_keys)
@@ -579,8 +580,11 @@ class _LocalDram:
         )
         self._pending_residency_ops[op.op_id] = op
         self._kvcr._add_block_dependencies(op, new_operation=True)
+        # Keys without an entry in ``layouts`` use the operation's layout.
+        layout_of = layouts.get if layouts else (lambda key, default: default)
         to_reserve: list[BlockKey] = []
         for key in ordered_keys:
+            key_layout = layout_of(key, layout)
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if residency is None:
@@ -588,7 +592,7 @@ class _LocalDram:
                     to_reserve.append(key)
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
-            elif residency.layout != layout:
+            elif residency.layout != key_layout:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.READY:
                 self._kvcr._record_access((key,))
@@ -600,7 +604,7 @@ class _LocalDram:
                 # reserved yet. Wait for the slot instead of failing a key a
                 # lower tier can still serve.
                 if key in sources:
-                    self._enqueue_capacity_waiter(op, key, sources[key], layout)
+                    self._enqueue_capacity_waiter(op, key, sources[key], key_layout)
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
         destinations, eviction_pending = self.reserve_fill(
@@ -610,10 +614,11 @@ class _LocalDram:
             deadline=deadline,
             framework_hints=hints,
             layout=layout,
+            layouts=layouts,
         )
         op.remote_fill_keys.update(destinations)
         for key in eviction_pending:
-            self._enqueue_capacity_waiter(op, key, sources[key], layout)
+            self._enqueue_capacity_waiter(op, key, sources[key], layout_of(key, layout))
         for key in to_reserve:
             if key not in destinations and key not in eviction_pending:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -899,21 +904,29 @@ class _LocalDram:
         deadline: float,
         framework_hints: object | None = None,
         layout: list[str],
+        layouts: Mapping[BlockKey, list[str]] | None = None,
     ) -> tuple[dict[BlockKey, list[MemDescriptor]], set[BlockKey]]:
         keys = tuple(dict.fromkeys(keys))
         protected = set(keys)
         destinations: dict[BlockKey, list[MemDescriptor]] = {}
         eviction_pending: set[BlockKey] = set()
         evicted: list[BlockKey] = []
-        size_bytes = sum(self._pools[name][2] for name in layout)
+        pools = self._pools
+        size_bytes = sum(pools[name][2] for name in layout)
         for key in keys:
+            key_layout = layouts.get(key, layout) if layouts else layout
+            key_size = (
+                size_bytes
+                if key_layout is layout
+                else sum(pools[name][2] for name in key_layout)
+            )
             record = self._kvcr._block_record_map.get(key)
             if record is None:
                 raise RuntimeError(f"missing block record for {key!r}")
             if record.local_dram is not None:
                 continue
             decision = self._kvcr._policy.decide_ingest(
-                self._kvcr._block_meta(key, record, size_bytes),
+                self._kvcr._block_meta(key, record, key_size),
                 sources[key],
                 required_local,
                 framework_hints=framework_hints,
@@ -921,7 +934,7 @@ class _LocalDram:
             if decision[0] is PlacementAction.DROP:
                 continue
             locations, evicted_keys, waiting = self._allocate_slots(
-                layout, protected, deadline
+                key_layout, protected, deadline
             )
             evicted.extend(evicted_keys)
             if locations is None:

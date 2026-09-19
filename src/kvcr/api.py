@@ -171,9 +171,16 @@ class KVCR:
         request_id: str | None = None,
         expected_layout: list[str] | None = None,
         hints: object | None = None,
+        expected_layouts: Mapping[BlockKey, list[str]] | None = None,
     ) -> OpHandle:
-        """Asynchronously fetch blocks into KVCR-managed storage."""
-        return self._core.fetch(keys, request_id, expected_layout, hints)
+        """Asynchronously fetch blocks into KVCR-managed storage.
+
+        ``expected_layouts`` gives keys their own span layout when one
+        operation covers pages from several pools.
+        """
+        return self._core.fetch(
+            keys, request_id, expected_layout, hints, expected_layouts
+        )
 
     def release(
         self,

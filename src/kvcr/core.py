@@ -478,11 +478,28 @@ class _KVCRCore:
         request_id: str | None = None,
         expected_layout: list[str] | None = None,
         hints: object | None = None,
+        expected_layouts: Mapping[BlockKey, list[str]] | None = None,
     ) -> OpHandle:
+        """Fetch ``keys`` into local DRAM and claim them.
+
+        ``expected_layout`` names the pools of every key's spans; keys whose
+        pages differ (a framework with several physical pools per page) pass
+        their own layouts in ``expected_layouts`` so one operation, one peer
+        write, and one notification cover the whole page range.
+        """
         expected_layout = [""] if expected_layout is None else list(expected_layout)
         self._validate_block_layout(
             expected_layout, "expected layout must use configured pools"
         )
+        layouts: dict[BlockKey, list[str]] | None = None
+        if expected_layouts:
+            layouts = {}
+            for key, layout in expected_layouts.items():
+                layout = list(layout)
+                self._validate_block_layout(
+                    layout, "expected layouts must use configured pools"
+                )
+                layouts[key] = layout
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -514,6 +531,7 @@ class _KVCRCore:
                 deadline,
                 hints=hints,
                 layout=expected_layout,
+                layouts=layouts,
             )
             for source in (CacheTier.G3, CacheTier.REMOTE_G2):
                 self._start_local_fill(
