@@ -188,6 +188,9 @@ def test_batch_copy_lands_when_its_event_completes() -> None:
 
 def test_large_batches_split_across_streams() -> None:
     runtime = FakeRuntime(latency=1)
+    # The fake spans are tiny; let the span count alone decide the streams.
+    patcher = patch("kvcr.device_copy._MIN_BYTES_PER_STREAM", 1)
+    patcher.start()
     count = _MIN_SPANS_PER_STREAM * _STREAMS_PER_DEVICE
     gpu = _buffers(count, 3)
     dram = _buffers(count, 0)
@@ -209,6 +212,8 @@ def test_large_batches_split_across_streams() -> None:
     )
     assert _drain(engine, small) is True
     assert runtime._streams == _STREAMS_PER_DEVICE
+
+    patcher.stop()
 
 
 def test_deliver_direction_uses_destination_device() -> None:
@@ -476,3 +481,21 @@ def test_request_coalesces_spans_contiguous_on_both_sides() -> None:
     one_dst, one_src, one_sizes = _coalesce_operands(dst[:3], src[:3], sizes[:3])
     assert one_dst.tolist() == [1000] and one_sizes.tolist() == [3 * size]
     assert _coalesce_operands(dst[:1], src[:1], sizes[:1])[2].tolist() == [size]
+
+
+def test_small_copies_stay_on_one_stream() -> None:
+    runtime = FakeRuntime(latency=1)
+    count = _MIN_SPANS_PER_STREAM * _STREAMS_PER_DEVICE
+    gpu = _buffers(count, 5)
+    dram = _buffers(count, 0)
+    engine = _engine(runtime, *gpu)
+    # Many spans but few bytes: one batch call and one event, not four.
+    handle = _submit(
+        engine,
+        [_descriptor(b, "VRAM") for b in gpu],
+        [_descriptor(b, "DRAM") for b in dram],
+    )
+    assert len(handle.events) == 1
+    assert len(runtime.calls) == 1
+    assert _drain(engine, handle) is True
+    assert all(buffer.raw == bytes([5]) * _SPAN for buffer in dram)

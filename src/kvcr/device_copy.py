@@ -48,6 +48,9 @@ _SRC_ACCESS_ORDER_STREAM = 0x1
 # only adds launches, so batches below the threshold stay on one stream.
 _STREAMS_PER_DEVICE = 4
 _MIN_SPANS_PER_STREAM = 64
+# Each stream costs one batch call and one event (about 0.35 ms of host time
+# together); a small copy finishes faster on one stream than split four ways.
+_MIN_BYTES_PER_STREAM = 16 << 20
 
 _LIBRARY_NAMES = ("libcudart.so.13", "libcudart.so.12", "libcudart.so")
 # Python wheels carry the runtime under site-packages when no system CUDA
@@ -382,7 +385,9 @@ class DeviceCopyEngine:
         streams: list[int] = []
         try:
             runtime.set_device(device_id)
-            streams = self._streams_for(device_id, len(request.sizes))
+            streams = self._streams_for(
+                device_id, len(request.sizes), request.byte_count
+            )
             if len(streams) == 1:
                 self._enqueue(
                     request.dst_addresses,
@@ -464,8 +469,12 @@ class DeviceCopyEngine:
             f"{device_id} is not a registered framework region"
         )
 
-    def _streams_for(self, device_id: int, span_count: int) -> list[int]:
+    def _streams_for(
+        self, device_id: int, span_count: int, byte_count: int = 0
+    ) -> list[int]:
         wanted = max(1, min(_STREAMS_PER_DEVICE, span_count // _MIN_SPANS_PER_STREAM))
+        if byte_count:
+            wanted = max(1, min(wanted, byte_count // _MIN_BYTES_PER_STREAM))
         streams = self._streams.setdefault(device_id, [])
         while len(streams) < wanted:
             streams.append(self._runtime.stream_create())
