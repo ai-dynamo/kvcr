@@ -65,6 +65,60 @@ class _RequestHint:
     missing_keys: frozenset[BlockKey] = frozenset()
 
 
+# Adjacent spans that are contiguous on both sides are merged into one NIXL
+# descriptor up to this size. A page's spans in a KVCR slot are contiguous, so
+# a page with 147 small spans (DeepSeek V4) becomes a handful of descriptors;
+# the cap keeps enough descriptors for UCX to spread the copy over its workers,
+# where 128 KiB to 512 KiB pieces measured fastest.
+_COALESCE_MAX_BYTES = 512 << 10
+
+
+def _coalesce_transfer_spans(
+    sources: tuple[MemDescriptor, ...],
+    destinations: tuple[MemDescriptor, ...],
+    max_bytes: int,
+) -> tuple[tuple[MemDescriptor, ...], tuple[MemDescriptor, ...]]:
+    """Merge aligned source and destination spans that are contiguous on both.
+
+    Descriptor lists are built per span so the layout check stays exact, but
+    NIXL request creation and posting cost per descriptor; merging runs that
+    are contiguous in both address spaces (same memory type and device on
+    each side) keeps the transfer identical while cutting that cost.
+    """
+    if len(sources) < 2:
+        return sources, destinations
+    merged_src: list[MemDescriptor] = []
+    merged_dst: list[MemDescriptor] = []
+    run_src = sources[0]
+    run_dst = destinations[0]
+    run_size = run_src.size
+    for src, dst in zip(sources[1:], destinations[1:]):
+        if (
+            run_size + src.size <= max_bytes
+            and src.addr == run_src.addr + run_size
+            and dst.addr == run_dst.addr + run_size
+            and src.size == dst.size
+            and src.mem_type == run_src.mem_type
+            and src.device_Id == run_src.device_Id
+            and dst.mem_type == run_dst.mem_type
+            and dst.device_Id == run_dst.device_Id
+        ):
+            run_size += src.size
+            continue
+        merged_src.append(_resized(run_src, run_size))
+        merged_dst.append(_resized(run_dst, run_size))
+        run_src, run_dst, run_size = src, dst, src.size
+    merged_src.append(_resized(run_src, run_size))
+    merged_dst.append(_resized(run_dst, run_size))
+    return tuple(merged_src), tuple(merged_dst)
+
+
+def _resized(descriptor: MemDescriptor, size: int) -> MemDescriptor:
+    if size == descriptor.size:
+        return descriptor
+    return msgspec.structs.replace(descriptor, size=size)
+
+
 class _TargetPullState(Enum):
     START_WRITE = auto()
     WAITING_WRITE_DONE = auto()
@@ -349,10 +403,15 @@ class _SourceWriteOp(_RemoteOp):
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
             try:
-                transfer_id, submitted = progress.submit_transfer(
-                    "WRITE",
+                src_spans, dst_spans = _coalesce_transfer_spans(
                     tuple(chain.from_iterable(self.src_descriptors)),
                     tuple(chain.from_iterable(self.dst_descriptors)),
+                    _COALESCE_MAX_BYTES,
+                )
+                transfer_id, submitted = progress.submit_transfer(
+                    "WRITE",
+                    src_spans,
+                    dst_spans,
                     remote_side_agent=self.remote_agent,
                     backend=backend._options.backend,
                     notif_msg=_write_done_notif(

@@ -1144,3 +1144,39 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
         progress,
         {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
     ) == ("worker-a", kept)
+
+
+def test_coalesce_transfer_spans_merges_runs_contiguous_on_both_sides() -> None:
+    from kvcr.remote_fw_dram import _coalesce_transfer_spans
+
+    # Two pages of three 16-byte spans each; the destination slots are
+    # contiguous per page but the second page sits elsewhere on both sides.
+    src = tuple(
+        _mem_descriptor(addr=base + 16 * i, size=16, info=f"p{i}")
+        for base in (1000, 5000)
+        for i in range(3)
+    )
+    dst = tuple(
+        _mem_descriptor(addr=base + 16 * i, size=16, info=f"p{i}")
+        for base in (9000, 3000)
+        for i in range(3)
+    )
+    merged_src, merged_dst = _coalesce_transfer_spans(src, dst, 1 << 20)
+    assert [(d.addr, d.size) for d in merged_src] == [(1000, 48), (5000, 48)]
+    assert [(d.addr, d.size) for d in merged_dst] == [(9000, 48), (3000, 48)]
+    assert merged_src[0].info == "p0" and merged_src[0].mem_type == "DRAM"
+
+    # The cap splits a run; a destination gap prevents merging even when the
+    # source is contiguous; mismatched sizes are never merged.
+    merged_src, _ = _coalesce_transfer_spans(src, dst, 32)
+    assert [(d.addr, d.size) for d in merged_src] == [
+        (1000, 32),
+        (1032, 16),
+        (5000, 32),
+        (5032, 16),
+    ]
+    gapped = dst[:1] + (_mem_descriptor(addr=9032, size=16),) + dst[2:]
+    merged_src, _ = _coalesce_transfer_spans(src, gapped, 1 << 20)
+    assert [(d.addr, d.size) for d in merged_src][:2] == [(1000, 16), (1016, 16)]
+    single_src, single_dst = _coalesce_transfer_spans(src[:1], dst[:1], 1 << 20)
+    assert single_src == src[:1] and single_dst == dst[:1]
