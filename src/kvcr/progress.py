@@ -29,7 +29,10 @@ _ACTIVE_WAIT_SECONDS = 0.0001
 _IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
-_STARTUP_TIMEOUT_SECONDS = 30.0
+# NIXL memory registration scales with the framework's pools: registering
+# tens of GB of GPU and pinned host memory with an RDMA NIC can take longer
+# than the default; deployments override it through the environment.
+_STARTUP_TIMEOUT_SECONDS = float(os.environ.get("KVCR_STARTUP_TIMEOUT_S", "30"))
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
