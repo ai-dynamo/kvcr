@@ -177,6 +177,31 @@ runner = KVCR(
 The callback names above represent services implemented by the framework
 adapter; they are not provided by KVCR itself.
 
+`KVCRBackendConfigs.framework_regions` lists the framework-owned allocations
+KVCR registers with NIXL as transfer endpoints, each as a
+`FrameworkMemoryRegion(address, length, mem_type, device_id, owner=...)`.
+`mem_type` is the NIXL segment type (`"DRAM"` or `"VRAM"`) and `device_id` the
+device index, so GPU KV buffers can be `deposit()` sources and `deliver()`
+destinations without a host staging copy. Register the actual allocations
+(one region per tensor storage, deduplicated by address); registration runs on
+the progress thread, one NIXL call per `(mem_type, device_id)`, and the agent
+metadata is captured only after every group registered. KVCR keeps `owner`
+alive until the registration is released at `close()`. The legacy
+`framework_dram` field remains a single DRAM region; configuring both is
+refused. KVCR reports a transfer complete when NIXL reports it done; a consumer
+reading a GPU destination must order its stream after that completion.
+
+Local copies between a registered VRAM region and KVCR's own DRAM never leave
+the process, and NIXL's UCX loopback has no device-memory lane for them (it
+falls back to software emulation over TCP at a fraction of PCIe bandwidth).
+KVCR therefore issues those copies through the CUDA runtime instead:
+`cudaMemcpyBatchAsync` on KVCR-owned streams, completion by event, bound with
+ctypes so no framework import is needed. VRAM spans must still lie inside a
+registered `framework_regions` entry; an unregistered span fails its operation
+without touching the device. `LocalDramOptions(device_copy=False)` forces every
+local copy back through NIXL. The engine loads `libcudart` lazily and logs a
+warning and falls back to NIXL when it is unavailable.
+
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 

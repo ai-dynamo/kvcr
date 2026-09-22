@@ -758,3 +758,31 @@ def test_adopt_recovery_slots_rejects_invalid_or_unsettled_rows(
 
     with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
         local_dram.adopt_recovery_slots(records)
+
+
+def test_fetch_accepts_a_layout_per_key() -> None:
+    # One operation covers keys whose pages live in different pools, as a
+    # framework with several physical pools per page issues them.
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
+    source = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    kvcr = _two_pool_kvcr(agent, pools)
+    full, swa = BlockKey(b"full"), BlockKey(b"swa")
+    descriptors = [
+        _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+        _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+    ]
+    deposit = kvcr.deposit({full: [descriptors[0]], swa: [descriptors[1]]})
+    agent.state = "DONE"
+    _poll_until(kvcr, lambda done: deposit in dict(done))
+
+    with pytest.raises(ValueError, match="configured pools"):
+        kvcr.fetch((full, swa), expected_layouts={swa: ["unknown"]})
+    fetch = kvcr.fetch(
+        (full, swa), expected_layout=["full"], expected_layouts={swa: ["swa"]}
+    )
+    result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))[fetch]
+    assert result[full].success and result[swa].success
+    assert [d.info for d in result[full].descriptors] == ["full"]
+    assert [d.info for d in result[swa].descriptors] == ["swa"]
+    kvcr.release([result[full].release_handle, result[swa].release_handle])

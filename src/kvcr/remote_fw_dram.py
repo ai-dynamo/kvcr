@@ -65,6 +65,79 @@ class _RequestHint:
     missing_keys: frozenset[BlockKey] = frozenset()
 
 
+# Adjacent spans that are contiguous on both sides are merged into one NIXL
+# descriptor up to this size. UCX puts of up to 128 KiB are posted
+# asynchronously and spread over its worker threads, larger ones copy inline
+# in the posting thread (measured on the H100 host: same wall time per byte
+# either way for large lists, but a mixed list gains nothing from merging
+# above the threshold). Merging stops at the threshold, so 128 KiB spans
+# (dense models) are left alone and only smaller spans (DeepSeek V4's 1.7 KB
+# to 65 KB pools) are combined. Spans already above it are copied inline
+# whatever their size, so runs of them merge up to the inline cap (DeepSeek
+# V4's 146 KB sliding-window spans go from 43 to 15 descriptors per page).
+_COALESCE_MAX_BYTES = 128 << 10
+_COALESCE_INLINE_MAX_BYTES = 512 << 10
+
+
+def _coalesce_transfer_spans(
+    sources: tuple[MemDescriptor, ...],
+    destinations: tuple[MemDescriptor, ...],
+    max_bytes: int,
+    inline_max_bytes: int | None = None,
+) -> tuple[tuple[MemDescriptor, ...], tuple[MemDescriptor, ...]]:
+    """Merge aligned source and destination spans that are contiguous on both.
+
+    Descriptor lists are built per span so the layout check stays exact, but
+    NIXL request creation and posting cost per descriptor; merging runs that
+    are contiguous in both address spaces (same memory type and device on
+    each side) keeps the transfer identical while cutting that cost.
+
+    A run that starts at or below ``max_bytes`` (UCX's asynchronous put size)
+    never grows past it, so spans that would have been posted asynchronously
+    stay that way; a run that starts above it is already copied inline and
+    only takes further inline-sized spans, up to ``inline_max_bytes``.
+    """
+    if len(sources) < 2:
+        return sources, destinations
+    inline_max = max_bytes if inline_max_bytes is None else inline_max_bytes
+    merged_src: list[MemDescriptor] = []
+    merged_dst: list[MemDescriptor] = []
+    run_src = sources[0]
+    run_dst = destinations[0]
+    run_size = run_src.size
+    run_inline = run_size > max_bytes
+    for src, dst in zip(sources[1:], destinations[1:]):
+        if (
+            (
+                run_size + src.size <= max_bytes
+                if not run_inline
+                else src.size > max_bytes and run_size + src.size <= inline_max
+            )
+            and src.addr == run_src.addr + run_size
+            and dst.addr == run_dst.addr + run_size
+            and src.size == dst.size
+            and src.mem_type == run_src.mem_type
+            and src.device_Id == run_src.device_Id
+            and dst.mem_type == run_dst.mem_type
+            and dst.device_Id == run_dst.device_Id
+        ):
+            run_size += src.size
+            continue
+        merged_src.append(_resized(run_src, run_size))
+        merged_dst.append(_resized(run_dst, run_size))
+        run_src, run_dst, run_size = src, dst, src.size
+        run_inline = run_size > max_bytes
+    merged_src.append(_resized(run_src, run_size))
+    merged_dst.append(_resized(run_dst, run_size))
+    return tuple(merged_src), tuple(merged_dst)
+
+
+def _resized(descriptor: MemDescriptor, size: int) -> MemDescriptor:
+    if size == descriptor.size:
+        return descriptor
+    return msgspec.structs.replace(descriptor, size=size)
+
+
 class _TargetPullState(Enum):
     START_WRITE = auto()
     WAITING_WRITE_DONE = auto()
@@ -349,10 +422,16 @@ class _SourceWriteOp(_RemoteOp):
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
             try:
-                transfer_id, submitted = progress.submit_transfer(
-                    "WRITE",
+                src_spans, dst_spans = _coalesce_transfer_spans(
                     tuple(chain.from_iterable(self.src_descriptors)),
                     tuple(chain.from_iterable(self.dst_descriptors)),
+                    _COALESCE_MAX_BYTES,
+                    _COALESCE_INLINE_MAX_BYTES,
+                )
+                transfer_id, submitted = progress.submit_transfer(
+                    "WRITE",
+                    src_spans,
+                    dst_spans,
                     remote_side_agent=self.remote_agent,
                     backend=backend._options.backend,
                     notif_msg=_write_done_notif(
@@ -825,6 +904,11 @@ class _RemoteFWDram:
         initialize_control = getattr(self._control, "initialize", None)
         if initialize_control is not None:
             initialize_control()
+        # Peer requests arrive on the control channel; let the parked progress
+        # loop wake for them instead of polling on a fixed cadence.
+        wait = getattr(self._control, "wait", None)
+        if wait is not None:
+            _progress.idle_waiter = wait
 
     def poll_progress(
         self, progress: _KVCRProgress, submissions: list[object]
@@ -1761,6 +1845,11 @@ class _RemoteFWDram:
     def _poll_notifications(
         self, progress: _KVCRProgress
     ) -> dict[_OpId, dict[str, Any]]:
+        # Notifications only ever come from peers, and peers only exist through
+        # the framework control channel; without one this NIXL call is pure
+        # overhead on every progress iteration.
+        if self._control is None:
+            return {}
         agent = progress.nixl_agent
         get_new_notifs = getattr(agent, "get_new_notifs", None)
         if get_new_notifs is None:

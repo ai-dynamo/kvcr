@@ -7,7 +7,6 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -650,7 +649,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
     expected_sources = {
-        key: [replace(descriptor, end_point_name="source")],
+        key: [msgspec.structs.replace(descriptor, end_point_name="source")],
         framework_hit: [_mem_descriptor(addr=0)],
     }
     try:
@@ -663,7 +662,8 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_mem_descriptor(128 + 16 * index).__dict__] for index in range(3)
+            [msgspec.structs.asdict(_mem_descriptor(128 + 16 * index))]
+            for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -874,7 +874,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     "target_agent_metadata": b"target-md",
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_mem_descriptor(addr=128 + index * 16).__dict__]
+                        [msgspec.structs.asdict(_mem_descriptor(addr=128 + index * 16))]
                         for index in range(len(op_keys))
                     ],
                 }
@@ -1144,3 +1144,64 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
         progress,
         {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
     ) == ("worker-a", kept)
+
+
+def test_coalesce_transfer_spans_merges_runs_contiguous_on_both_sides() -> None:
+    from kvcr.remote_fw_dram import _coalesce_transfer_spans
+
+    # Two pages of three 16-byte spans each; the destination slots are
+    # contiguous per page but the second page sits elsewhere on both sides.
+    src = tuple(
+        _mem_descriptor(addr=base + 16 * i, size=16, info=f"p{i}")
+        for base in (1000, 5000)
+        for i in range(3)
+    )
+    dst = tuple(
+        _mem_descriptor(addr=base + 16 * i, size=16, info=f"p{i}")
+        for base in (9000, 3000)
+        for i in range(3)
+    )
+    merged_src, merged_dst = _coalesce_transfer_spans(src, dst, 1 << 20)
+    assert [(d.addr, d.size) for d in merged_src] == [(1000, 48), (5000, 48)]
+    assert [(d.addr, d.size) for d in merged_dst] == [(9000, 48), (3000, 48)]
+    assert merged_src[0].info == "p0" and merged_src[0].mem_type == "DRAM"
+
+    # The cap splits a run; a destination gap prevents merging even when the
+    # source is contiguous; mismatched sizes are never merged.
+    merged_src, _ = _coalesce_transfer_spans(src, dst, 32)
+    assert [(d.addr, d.size) for d in merged_src] == [
+        (1000, 32),
+        (1032, 16),
+        (5000, 32),
+        (5032, 16),
+    ]
+    gapped = dst[:1] + (_mem_descriptor(addr=9032, size=16),) + dst[2:]
+    merged_src, _ = _coalesce_transfer_spans(src, gapped, 1 << 20)
+    assert [(d.addr, d.size) for d in merged_src][:2] == [(1000, 16), (1016, 16)]
+    single_src, single_dst = _coalesce_transfer_spans(src[:1], dst[:1], 1 << 20)
+    assert single_src == src[:1] and single_dst == dst[:1]
+
+
+def test_coalesce_keeps_async_spans_async_and_merges_inline_runs() -> None:
+    from kvcr.remote_fw_dram import _coalesce_transfer_spans
+
+    async_max, inline_max = 128, 512
+    # Four 128-byte spans (at the async limit) stay separate: merging any two
+    # would push them onto the inline path.
+    src = tuple(_mem_descriptor(addr=1000 + 128 * i, size=128) for i in range(4))
+    dst = tuple(_mem_descriptor(addr=5000 + 128 * i, size=128) for i in range(4))
+    merged_src, _ = _coalesce_transfer_spans(src, dst, async_max, inline_max)
+    assert [d.size for d in merged_src] == [128, 128, 128, 128]
+    # Four 146-byte spans are already inline and merge three at a time.
+    src = tuple(_mem_descriptor(addr=1000 + 146 * i, size=146) for i in range(4))
+    dst = tuple(_mem_descriptor(addr=5000 + 146 * i, size=146) for i in range(4))
+    merged_src, merged_dst = _coalesce_transfer_spans(src, dst, async_max, inline_max)
+    assert [d.size for d in merged_src] == [438, 146]
+    assert [d.addr for d in merged_dst] == [5000, 5438]
+    # Small spans merge up to the async limit; an inline span ends the run.
+    sizes = [32, 32, 32, 32, 32, 146, 32]
+    offsets = [sum(sizes[:i]) for i in range(len(sizes))]
+    src = tuple(_mem_descriptor(addr=1000 + o, size=s) for o, s in zip(offsets, sizes))
+    dst = tuple(_mem_descriptor(addr=5000 + o, size=s) for o, s in zip(offsets, sizes))
+    merged_src, _ = _coalesce_transfer_spans(src, dst, async_max, inline_max)
+    assert [d.size for d in merged_src] == [128, 32, 146, 32]

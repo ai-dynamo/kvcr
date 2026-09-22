@@ -298,3 +298,24 @@ def test_an_adopted_listener_serves_conflicts_primary_and_guard() -> None:
                 time.sleep(0.01)
                 received.extend(guard.recv())
             assert b"guard" in received
+
+
+def test_wait_returns_on_peer_message_or_wake_byte() -> None:
+    port = free_port()
+    with _channel(port) as channel, _pipe() as (read_fd, write_fd):
+        channel.initialize()
+        started = time.monotonic()
+        channel.wait(0.05, read_fd)
+        assert 0.04 <= time.monotonic() - started < 1.0
+        with _push_socket() as sender:
+            sender.connect(f"tcp://127.0.0.1:{port}")
+            time.sleep(0.05)
+            sender.send(b"hello")
+            started = time.monotonic()
+            channel.wait(1.0, read_fd)
+            assert time.monotonic() - started < 0.5
+            assert channel.recv() == [b"hello"]
+        os.write(write_fd, b"\0")
+        started = time.monotonic()
+        channel.wait(1.0, read_fd)
+        assert time.monotonic() - started < 0.5
