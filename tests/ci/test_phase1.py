@@ -226,7 +226,8 @@ def test_junit_marks_blocked_as_skipped_and_fail_as_failure(tmp_path):
 # -- stack configuration -----------------------------------------------------
 
 
-def test_guard_and_nonguard_tier_configs(tmp_path):
+def test_guard_and_nonguard_tier_configs(tmp_path, monkeypatch):
+    monkeypatch.setattr(stack.Stack, "advertise_host", staticmethod(lambda: "10.0.0.5"))
     settings = stack.Settings(model="m", output=tmp_path, mode=stack.GUARD)
     guard = stack.Stack(settings, tmp_path / "g")
     tier = guard.tier_config(1)
@@ -300,3 +301,29 @@ def test_discovery_instance_ids_reads_url_encoded_record_names(tmp_path):
     assert s.discovery_instance_ids() == {str(0xC69D07089B72B3C9), str(0x4EE6)}
     assert str(0xC69D07089B72B3C9) == "14311602924402422729"
     s.reset_discovery()
+
+
+def test_state_agent_config_only_in_guard_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(stack.Stack, "advertise_host", staticmethod(lambda: "10.0.0.5"))
+    guard = stack.Stack(
+        stack.Settings(model="m", output=tmp_path, mode=stack.GUARD), tmp_path / "g"
+    )
+    extra = guard.transfer_config(1)["kv_connector_extra_config"]
+    agent = extra["dynamo_state_agent"]
+    assert agent["raw_advertise_host"] == "10.0.0.5"
+    assert agent["cache_owner_ids"] == {"0": stack.Stack.cache_owner_id(1)}
+    assert stack.Stack.cache_owner_id(1).endswith("/" + "0" * 31 + "1")
+    plain = stack.Stack(
+        stack.Settings(model="m", output=tmp_path, mode=stack.NON_GUARD), tmp_path / "n"
+    )
+    assert (
+        "dynamo_state_agent"
+        not in plain.transfer_config(0)["kv_connector_extra_config"]
+    )
+    off = stack.Stack(
+        stack.Settings(model="m", output=tmp_path, mode=stack.GUARD, state_agent=False),
+        tmp_path / "o",
+    )
+    assert (
+        "dynamo_state_agent" not in off.transfer_config(0)["kv_connector_extra_config"]
+    )

@@ -102,6 +102,7 @@ class Runner:
             pool_gb=args.pool_gb,
             compatibility_digest=args.compatibility_digest or "",
             batch_invariant=args.batch_invariant,
+            state_agent=not args.no_state_agent,
             readiness_timeout=args.readiness_timeout,
             request_timeout=args.request_timeout,
         )
@@ -120,6 +121,7 @@ class Runner:
             "prompt_tag": self.tag,
             "max_tokens": args.max_tokens,
             "batch_invariant": args.batch_invariant,
+            "state_agent": not args.no_state_agent,
             "selected_cases": list(args.cases),
             "cases": [],
             "reference": {},
@@ -226,6 +228,8 @@ class Runner:
         if self.settings.mode == GUARD:
             for index in (0, 1):
                 stack.start_service(index)
+            if stack.uses_state_agent():
+                stack.start_state_agent()
         stack.start_frontend(self.settings.http_port)
         for index in (0, 1):
             stack.start_worker(index)
@@ -360,6 +364,11 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-invariant", action="store_true", help="Set VLLM_BATCH_INVARIANT=1"
+    )
+    parser.add_argument(
+        "--no-state-agent",
+        action="store_true",
+        help="Guard mode: do not run dynamo.kv_state_agent (TC-04 then has no hint)",
     )
     parser.add_argument(
         "--timeout", type=float, default=2400, help="Overall deadline in seconds"

@@ -47,6 +47,10 @@ DISABLED = "disabled"
 MODES = (GUARD, NON_GUARD)
 MIN_GUARD_KERNEL = (6, 5)
 GUARD_PROMOTED = "KVCR_EVENT guard_promoted"
+STATE_AGENT_READY = "KV state-agent host started"
+CACHE_OWNER_DOMAIN = (
+    "01010101010101010101010101010101:02020202020202020202020202020202/0303030303030303"
+)
 RECOVERY_DISABLED = "KVCR pool recovery disabled"
 
 
@@ -93,6 +97,7 @@ class Settings:
     gpu_memory_utilization: float = 0.8
     compatibility_digest: str = ""
     batch_invariant: bool = False
+    state_agent: bool = True
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
@@ -170,6 +175,7 @@ class Stack:
         self.children: list[Managed] = []
         self.discovery: tempfile.TemporaryDirectory | None = None
         self.services: dict[int, Managed] = {}
+        self.state_agent: Managed | None = None
         self.workers: dict[int, Managed] = {}
         self.worker_ids: dict[int, str] = {}
         self.retired_ids: set[str] = set()
@@ -277,16 +283,40 @@ class Stack:
             tier["secondary_g2_slots"] = self.settings.g2_slots
         return tier
 
+    @staticmethod
+    def cache_owner_id(slot: int) -> str:
+        """Stable per-slot CacheOwnerId; a replacement worker reuses its slot."""
+        return f"{CACHE_OWNER_DOMAIN}/{slot:032x}"
+
+    @staticmethod
+    def advertise_host() -> str:
+        """A non-loopback address of this host for the state agent's raw ZMQ link."""
+        host = socket.gethostbyname(socket.gethostname())
+        if host.startswith("127."):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("10.255.255.255", 1))
+                host = probe.getsockname()[0]
+        return host
+
+    def uses_state_agent(self) -> bool:
+        return self.settings.mode == GUARD and self.settings.state_agent
+
     def transfer_config(self, index: int) -> dict[str, Any]:
+        extra: dict[str, Any] = {
+            "spec_name": "TieringOffloadingSpec",
+            "cpu_bytes_to_use": self.settings.cpu_bytes_to_use,
+            "self_describing_kv_events": True,
+            "secondary_tiers": [self.tier_config(index)],
+        }
+        if self.uses_state_agent():
+            extra["dynamo_state_agent"] = {
+                "raw_advertise_host": self.advertise_host(),
+                "cache_owner_ids": {"0": self.cache_owner_id(index)},
+            }
         return {
             "kv_connector": "OffloadingConnector",
             "kv_role": "kv_both",
-            "kv_connector_extra_config": {
-                "spec_name": "TieringOffloadingSpec",
-                "cpu_bytes_to_use": self.settings.cpu_bytes_to_use,
-                "self_describing_kv_events": True,
-                "secondary_tiers": [self.tier_config(index)],
-            },
+            "kv_connector_extra_config": extra,
         }
 
     def events_config(self, index: int) -> dict[str, Any]:
@@ -367,6 +397,26 @@ class Stack:
         self.frontend = self._spawn(name, command, self.base_env())
         return self.frontend
 
+    def start_state_agent(self) -> Managed:
+        """Run Dynamo's KV state-agent host so a dead engine's cache stays routable.
+
+        Without it the router drops a vanished worker's blocks and never hints
+        at its Guard. One host serves both worker slots.
+        """
+        command = [
+            sys.executable,
+            "-m",
+            "dynamo.kv_state_agent",
+            "--max-slots",
+            "2",
+        ]
+        env = self.base_env()
+        env["DYN_SYSTEM_PORT"] = str(self.settings.system_ports[1] + 1)
+        agent = self._spawn("kv-state-agent", command, env)
+        self.state_agent = agent
+        self.wait_log(agent, STATE_AGENT_READY, 120)
+        return agent
+
     def start_service(self, index: int) -> Managed:
         if self.settings.mode != GUARD:
             raise ValidationError("KVCR services are only launched in Guard mode")
@@ -436,7 +486,9 @@ class Stack:
                         f"{child.name} exited early with status "
                         f"{child.process.returncode}"
                     )
-            elif child in self.services.values() and not child.alive():
+            elif (
+                child in self.services.values() or child is self.state_agent
+            ) and not child.alive():
                 raise ValidationError(
                     f"{child.name} exited with status {child.process.returncode}"
                 )
