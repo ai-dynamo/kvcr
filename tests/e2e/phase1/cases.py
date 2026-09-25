@@ -41,6 +41,7 @@ from .telemetry import (
     TIER_WRITE_BYTES,
     TRANSFER,
     Window,
+    duration_count,
     latest_gauge,
     read_window,
 )
@@ -103,6 +104,10 @@ class Prompts:
     def tc04_fresh(self) -> str:
         return self.prefix(self.tag + "i", 0, 80) + self.tail
 
+    @property
+    def tc04_second(self) -> str:
+        return self.prefix(self.tag + "j", 0, 80) + self.tail
+
     def all(self) -> dict[str, str]:
         return {
             name: getattr(self, name)
@@ -115,6 +120,7 @@ class Prompts:
                 "tc03_isolated",
                 "tc04",
                 "tc04_fresh",
+                "tc04_second",
             )
         }
 
@@ -262,8 +268,14 @@ class Context:
         start: str,
         hit_blocks: int,
         label: str,
+        allow_partial: bool = False,
     ) -> None:
-        """Source write and target delivery must agree with the reported hit."""
+        """Source write and target delivery must agree with the reported hit.
+
+        allow_partial accepts a delivery the target reports as 'partial' and the
+        matching source pin miss for the uncovered key; both are the expected
+        signals when the request shares only part of the seeded prefix.
+        """
         target_window = self.wait_window(
             target,
             start,
@@ -286,14 +298,19 @@ class Context:
             written == delivered and written > 0,
             f"source_write={written}, remote_deliver={delivered}",
         )
+        partial = target_window.get(duration_count(REMOTE_DELIVER, "partial"))
+        delivered_ok = target_window.successes(REMOTE_DELIVER) + (
+            partial if allow_partial else 0
+        )
         result.check(
             f"{label}: transfer/source_write/remote_deliver successes recorded",
             source_window.successes(TRANSFER) >= 1
             and source_window.successes(SOURCE_WRITE) >= 1
-            and target_window.successes(REMOTE_DELIVER) >= 1,
+            and delivered_ok >= 1,
             f"transfer={source_window.successes(TRANSFER)}, "
             f"source_write={source_window.successes(SOURCE_WRITE)}, "
-            f"remote_deliver={target_window.successes(REMOTE_DELIVER)}",
+            f"remote_deliver success={target_window.successes(REMOTE_DELIVER)} "
+            f"partial={partial}",
         )
         source_bytes = source_window.bytes(SOURCE_WRITE)
         target_bytes = target_window.get(TIER_READ_BYTES)
@@ -302,10 +319,24 @@ class Context:
             source_bytes == target_bytes and source_bytes > 0,
             f"source_write bytes={source_bytes}, kvcr tier read bytes={target_bytes}",
         )
+        failures = source_window.peer_failures + target_window.peer_failures
+        if allow_partial:
+            expected = (
+                duration_count(REMOTE_DELIVER, "partial"),
+                duration_count("framework_pin_wait", "failed"),
+            )
+            failures = [
+                entry
+                for entry in failures
+                if not any(
+                    entry["metric"].startswith(name[: -len("_count")])
+                    for name in expected
+                )
+            ]
         result.check(
-            f"{label}: no positive KVCR failed/partial metrics",
-            not source_window.peer_failures and not target_window.peer_failures,
-            str(source_window.peer_failures + target_window.peer_failures),
+            f"{label}: no unexpected KVCR failed/partial metrics",
+            not failures,
+            str(failures),
         )
         result.measurements[label] = {
             "source_window": source_window.totals,
@@ -415,6 +446,7 @@ def tc02(ctx: Context) -> CaseResult:
             start=partial.started_at,
             hit_blocks=blocks,
             label="tc02 partial deliver",
+            allow_partial=True,
         )
 
     # present: the remainder (P2) still has to come from worker 0's KVCR pool.
@@ -543,6 +575,15 @@ def tc04(ctx: Context) -> CaseResult:
         result, 0, seed.started_at, "tc04 protected commit"
     )
     committed_blocks = committed.blocks(LOCAL_FILL)
+    second_seed = ctx.request("tc04-protect-second-w0", p.tc04_second, 0)
+    result.evidence += [second_seed.request_file, second_seed.response_file]
+    if ctx.require_ok(result, second_seed, 0):
+        ctx.compare(result, second_seed, "tc04_second")
+        ctx.check_cold(result, second_seed)
+        second = ctx.local_commit_checks(
+            result, 0, second_seed.started_at, "tc04 protected commit (second prompt)"
+        )
+        committed_blocks += second.blocks(LOCAL_FILL)
     result.check(
         "tc04: warm recovery still enabled before failure",
         RECOVERY_DISABLED not in service.log_text()
@@ -576,22 +617,32 @@ def tc04(ctx: Context) -> CaseResult:
         f"recovered_blocks={recovered}, committed local_fill blocks={committed_blocks}",
     )
 
-    # Takeover: worker 1 reads the preserved prefix from the Guard.
-    served = ctx.request("tc04-guard-served-w1", p.tc04, 1)
-    result.evidence += [served.request_file, served.response_file]
-    result.measurements["guard_served_request_latency_seconds"] = round(
-        served.latency_seconds, 3
-    )
-    if ctx.require_ok(result, served, 1):
-        ctx.compare(result, served, "tc04")
+    # Takeover: worker 1 reads preserved prefixes from the Guard. Worker 1 had
+    # already exchanged NIXL metadata with the dead primary at this endpoint, so
+    # the first and second requests are checked separately.
+    for attempt, (stage, key) in enumerate(
+        (
+            ("tc04-guard-served-w1", "tc04"),
+            ("tc04-guard-served-second-w1", "tc04_second"),
+        ),
+        start=1,
+    ):
+        served = ctx.request(stage, getattr(p, key), 1)
+        result.evidence += [served.request_file, served.response_file]
+        result.measurements[f"guard_served_request_{attempt}_latency_seconds"] = round(
+            served.latency_seconds, 3
+        )
+        if not ctx.require_ok(result, served, 1):
+            continue
+        ctx.compare(result, served, key)
         blocks = ctx.check_hit(result, served)
         window = ctx.wait_window(
             1,
             served.started_at,
-            lambda w: w.blocks(REMOTE_DELIVER) >= blocks and blocks > 0,
+            lambda w, b=blocks: w.blocks(REMOTE_DELIVER) >= b and b > 0,
         )
         result.check(
-            "tc04: Guard-served blocks delivered to worker 1 (remote_deliver)",
+            f"{stage}: Guard-served blocks delivered to worker 1 (remote_deliver)",
             window.blocks(REMOTE_DELIVER) == blocks
             and window.successes(REMOTE_DELIVER) >= 1,
             f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
@@ -599,11 +650,16 @@ def tc04(ctx: Context) -> CaseResult:
             f"tier read bytes={window.get(TIER_READ_BYTES)}",
         )
         result.check(
-            "tc04: no positive KVCR failed/partial metrics while Guard served",
+            f"{stage}: no positive KVCR failed/partial metrics while Guard served",
             not window.peer_failures,
             str(window.peer_failures),
         )
-        result.measurements["guard_served_window"] = window.totals
+        result.measurements[f"guard_served_window_{attempt}"] = window.totals
+        result.measurements[f"guard_service_log_after_request_{attempt}"] = [
+            line[:300]
+            for line in service.log_text().splitlines()
+            if "WARNING" in line or "Error" in line
+        ][-6:]
 
     # Re-attach: a replacement worker claims the pool group back.
     ctx.stack.start_worker(0, tag="-replacement")

@@ -476,6 +476,8 @@ class Stack:
             parts = key.lower().split("/")
             if "instances" not in parts and "models" not in parts:
                 continue
+            if len(parts) < 2 or parts[-2] != "generate":
+                continue
             if re.fullmatch(r"[0-9a-f]{1,16}", parts[-1]):
                 found.add(str(int(parts[-1], 16)))
         return found

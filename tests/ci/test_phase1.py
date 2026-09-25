@@ -292,6 +292,9 @@ def test_discovery_instance_ids_reads_url_encoded_record_names(tmp_path):
     ):
         (root / "v1" / "instances" / name).write_text("{}")
     (root / "v1" / "models" / "dynamo%2Fbackend%2Fgenerate%2F4ee6").write_text("{}")
+    (
+        root / "v1" / "instances" / "dynamo%2Fbackend%2Fworker%5Fkv%5Fquery%2Fabcd"
+    ).write_text("{}")
     (root / "other").mkdir()
     (root / "other" / "ff").write_text("{}")
     assert s.discovery_instance_ids() == {str(0xC69D07089B72B3C9), str(0x4EE6)}
