@@ -142,3 +142,37 @@ jobs:
           path: artifacts/e2e/
           if-no-files-found: warn
           retention-days: 14
+
+  two-gpu-phase1:
+    # KVCR test plan v7 Phase 1: TC-01 -> TC-04 in Guard mode. Runs after the
+    # peer-reuse smoke test on the same image. Guard mode needs a runner host
+    # kernel of 6.5 or newer; otherwise the harness reports BLOCKED and fails.
+    needs: [build-image, two-gpu-e2e]
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.build-image.outputs.image_uri }}
+    env:
+      EXPECTED_KVCR_SHA: ${{ needs.build-image.outputs.kvcr_sha }}
+      TESTED_IMAGE: ${{ needs.build-image.outputs.image_uri }}
+    steps:
+      - name: Check out the same tests without reinstalling KVCR
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.build-image.outputs.kvcr_sha }}
+          persist-credentials: false
+      - name: Run Phase 1 (TC-01, TC-02, TC-03 same-node, TC-04) in Guard mode
+        shell: bash
+        env:
+          HF_HOME: ${{ runner.temp }}/kvcr-hf-cache
+        run: >-
+          python3 tests/e2e/run_phase1.py
+          --output-dir artifacts/phase1/run --mode guard --timeout 2400
+      - name: Retain Phase 1 evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kvcr-phase1-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/phase1/
+          if-no-files-found: warn
+          retention-days: 14

@@ -14,6 +14,9 @@ The workflow is disabled until operations completes the setup below. A skipped
 job is not a successful functionality test. Ordinary lint and CPU unit tests
 continue to run independently.
 
+The [Phase 1 plan](test-plan-phase1.md) maps TC-01 → TC-04 of the KVCR test
+plan v7 to `tests/e2e/run_phase1.py` and the `two-gpu-phase1` job.
+
 The [test plan](test-plan.md) defines the implemented acceptance checks and
 separates them from proposed native-transfer and recovery coverage.
 

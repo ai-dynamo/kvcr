@@ -105,6 +105,14 @@ particular machine. The Python files link to the test definitions named here.
 | Guard ownership and journal recovery | [test_guard.py](../tests/unit/test_guard.py), [test_recovery_journal.py](../tests/unit/test_recovery_journal.py), [test_guard_integration.py](../tests/unit/test_guard_integration.py): `test_promoted_guard_serves_real_nixl_transfers` | The latter already kills a real primary, transfers host-memory bytes through UCX and checks replacement handback. It is conditional and does not prove GPU DMA safety during a crash. |
 | Adapter integration and evidence correctness | [run_vllm.py](../tests/e2e/run_vllm.py), [test_e2e.py](../tests/ci/test_e2e.py), [test_build_vllm_e2e.py](../tests/ci/test_build_vllm_e2e.py) | Implemented in this branch; requires a new image and GPU run for this source revision. CPU tests of the harness are not a GPU pass. |
 
+## Phase 1 of the KVCR test plan v7
+
+TC-01 → TC-04 (integration correctness, local DRAM flow, same-node peer
+transfer, Guard takeover and re-attach) are implemented by
+[`tests/e2e/run_phase1.py`](../tests/e2e/run_phase1.py) and described in
+[test-plan-phase1.md](test-plan-phase1.md). They compare generated token IDs
+against a KVCR-disabled reference and require transfer telemetry per path.
+
 ## Bounded next tests, not implemented by this CI change
 
 Keep the initial expansion to the following six cases. Use fixed seeds, bounded

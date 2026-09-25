@@ -1,0 +1,662 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Phase 1 test cases TC-01 .. TC-04 from the KVCR test plan v7.
+
+Each case receives the running stack, the reference token samples, and an
+evidence directory. A case records checks; the runner derives PASS/FAIL.
+BlockedError marks the combination BLOCKED with the missing condition.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from .client import Client, Response
+from .common import (
+    BLOCK_SIZE,
+    BlockedError,
+    CaseResult,
+    TokenSample,
+    ValidationError,
+    cached_tokens,
+    compare_tokens,
+    expected_hit_blocks,
+    extract_sample,
+    save_json,
+    utc_now,
+    worker_identity,
+)
+from .stack import GUARD, GUARD_PROMOTED, RECOVERY_DISABLED, Stack
+from .telemetry import (
+    LOCAL_DELIVER,
+    LOCAL_FILL,
+    REMOTE_DELIVER,
+    SOURCE_WRITE,
+    TIER_READ_BYTES,
+    TIER_WRITE_BYTES,
+    TRANSFER,
+    Window,
+    latest_gauge,
+    read_window,
+)
+
+PROMOTED = re.compile(
+    r"KVCR_EVENT guard_promoted guard=(\d+) pool=(\S+) recovered_blocks=(\d+)"
+)
+
+
+@dataclass(frozen=True)
+class Prompts:
+    """Deterministic prompt texts derived from one recorded run tag."""
+
+    tag: str
+
+    @staticmethod
+    def section(tag: str, index: int) -> str:
+        return f"{tag} section{index} cache routing data"
+
+    def prefix(self, tag: str, start: int, stop: int) -> str:
+        return " ".join(self.section(tag, i) for i in range(start, stop))
+
+    @property
+    def tail(self) -> str:
+        return " Continue the list:"
+
+    @property
+    def tc01(self) -> str:
+        return self.prefix(self.tag + "a", 0, 80) + self.tail
+
+    @property
+    def tc02_p1(self) -> str:
+        return self.prefix(self.tag + "b", 0, 40)
+
+    @property
+    def tc02_full(self) -> str:
+        return self.tc02_p1 + " " + self.prefix(self.tag + "c", 40, 80) + self.tail
+
+    @property
+    def tc02_partial(self) -> str:
+        return self.tc02_p1 + " " + self.prefix(self.tag + "d", 40, 80) + self.tail
+
+    @property
+    def tc02_absent(self) -> str:
+        return self.prefix(self.tag + "e", 0, 80) + self.tail
+
+    @property
+    def tc03(self) -> str:
+        return self.prefix(self.tag + "f", 0, 80) + self.tail
+
+    @property
+    def tc03_isolated(self) -> str:
+        return self.prefix(self.tag + "g", 0, 80) + self.tail
+
+    @property
+    def tc04(self) -> str:
+        return self.prefix(self.tag + "h", 0, 80) + self.tail
+
+    @property
+    def tc04_fresh(self) -> str:
+        return self.prefix(self.tag + "i", 0, 80) + self.tail
+
+    def all(self) -> dict[str, str]:
+        return {
+            name: getattr(self, name)
+            for name in (
+                "tc01",
+                "tc02_full",
+                "tc02_partial",
+                "tc02_absent",
+                "tc03",
+                "tc03_isolated",
+                "tc04",
+                "tc04_fresh",
+            )
+        }
+
+
+def parse_iso(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+
+class Context:
+    """Everything a case needs; also the single place that talks to the stack."""
+
+    def __init__(
+        self,
+        stack: Stack,
+        client: Client,
+        prompts: Prompts,
+        references: dict[str, TokenSample],
+        *,
+        index_wait: float,
+        telemetry_timeout: float,
+        recovery_timeout: float,
+    ) -> None:
+        self.stack = stack
+        self.client = client
+        self.prompts = prompts
+        self.references = references
+        self.index_wait = index_wait
+        self.telemetry_timeout = telemetry_timeout
+        self.recovery_timeout = recovery_timeout
+
+    # -- request helpers ---------------------------------------------------
+
+    def request(self, stage: str, prompt: str, worker_index: int) -> Response:
+        self.stack.check_children()
+        worker_id = self.stack.worker_ids[worker_index]
+        return self.client.completion(stage, prompt, worker=worker_id)
+
+    def require_ok(
+        self, result: CaseResult, response: Response, worker_index: int
+    ) -> bool:
+        ok = result.check(
+            f"{response.stage}: HTTP 200 with JSON body",
+            response.ok,
+            response.error or f"status {response.http_status}",
+        )
+        if not ok:
+            return False
+        worker, _ = worker_identity(response.body or {})
+        return result.check(
+            f"{response.stage}: served by worker {worker_index}",
+            worker == self.stack.worker_ids[worker_index],
+            f"decode_worker_id={worker}",
+        )
+
+    def compare(
+        self, result: CaseResult, response: Response, reference_key: str
+    ) -> bool:
+        if not response.ok or response.body is None:
+            return result.check(
+                f"{response.stage}: tokens equal reference", False, "no body"
+            )
+        sample = extract_sample(response.body)
+        problems = compare_tokens(self.references[reference_key], sample)
+        return result.check(
+            f"{response.stage}: tokens equal reference ({reference_key})",
+            not problems,
+            "; ".join(problems)
+            or f"{sample.length} tokens, finish={sample.finish_reason}",
+        )
+
+    def cached(self, response: Response) -> int:
+        value = cached_tokens(response.body or {})
+        if value is None:
+            raise ValidationError(f"{response.stage}: response lacks cached_tokens")
+        return value
+
+    def check_cold(self, result: CaseResult, response: Response) -> None:
+        cached = self.cached(response)
+        result.check(
+            f"{response.stage}: cold request has 0 cached tokens",
+            cached == 0,
+            str(cached),
+        )
+
+    def check_hit(
+        self, result: CaseResult, response: Response, *, max_blocks: int | None = None
+    ) -> int:
+        cached = self.cached(response)
+        aligned = cached > 0 and cached % BLOCK_SIZE == 0
+        detail = f"cached_tokens={cached}"
+        if max_blocks is not None:
+            detail += f", upper bound {max_blocks * BLOCK_SIZE}"
+            aligned = aligned and cached <= max_blocks * BLOCK_SIZE
+        result.check(
+            f"{response.stage}: cache hit is positive and block-aligned",
+            aligned,
+            detail,
+        )
+        return cached // BLOCK_SIZE
+
+    # -- telemetry helpers -------------------------------------------------
+
+    def wait_window(
+        self,
+        worker_index: int,
+        start: str,
+        predicate,
+        *,
+        tag: str = "",
+    ) -> Window:
+        """Poll a worker's log until the summed window satisfies predicate.
+
+        The engine emits one interval sample per logging period; the sample
+        that covers a request can arrive several seconds after the response.
+        """
+        started = parse_iso(start)
+        deadline = time.monotonic() + self.telemetry_timeout
+        log = self.stack.workers[worker_index].log_path
+        result = read_window(log, started)
+        while time.monotonic() < deadline:
+            result = read_window(log, started)
+            if predicate(result):
+                break
+            time.sleep(1)
+        return result
+
+    def settle(self, worker_index: int, start: str) -> Window:
+        """Wait one extra interval so the window includes the request's sample."""
+        started = parse_iso(start)
+        log = self.stack.workers[worker_index].log_path
+        deadline = time.monotonic() + self.telemetry_timeout
+        while time.monotonic() < deadline:
+            current = read_window(log, started)
+            if current.samples >= 2:
+                return current
+            time.sleep(1)
+        return read_window(log, started)
+
+    def peer_transfer_checks(
+        self,
+        result: CaseResult,
+        *,
+        source: int,
+        target: int,
+        start: str,
+        hit_blocks: int,
+        label: str,
+    ) -> None:
+        """Source write and target delivery must agree with the reported hit."""
+        target_window = self.wait_window(
+            target,
+            start,
+            lambda w: w.blocks(REMOTE_DELIVER) >= hit_blocks and hit_blocks > 0,
+        )
+        source_window = self.wait_window(
+            source,
+            start,
+            lambda w: w.blocks(SOURCE_WRITE) >= hit_blocks and hit_blocks > 0,
+        )
+        delivered = target_window.blocks(REMOTE_DELIVER)
+        written = source_window.blocks(SOURCE_WRITE)
+        result.check(
+            f"{label}: target remote_deliver blocks == cached blocks",
+            delivered == hit_blocks,
+            f"remote_deliver={delivered}, cached blocks={hit_blocks}",
+        )
+        result.check(
+            f"{label}: source source_write blocks == target remote_deliver blocks",
+            written == delivered and written > 0,
+            f"source_write={written}, remote_deliver={delivered}",
+        )
+        result.check(
+            f"{label}: transfer/source_write/remote_deliver successes recorded",
+            source_window.successes(TRANSFER) >= 1
+            and source_window.successes(SOURCE_WRITE) >= 1
+            and target_window.successes(REMOTE_DELIVER) >= 1,
+            f"transfer={source_window.successes(TRANSFER)}, "
+            f"source_write={source_window.successes(SOURCE_WRITE)}, "
+            f"remote_deliver={target_window.successes(REMOTE_DELIVER)}",
+        )
+        source_bytes = source_window.bytes(SOURCE_WRITE)
+        target_bytes = target_window.get(TIER_READ_BYTES)
+        result.check(
+            f"{label}: source bytes == target tier read bytes",
+            source_bytes == target_bytes and source_bytes > 0,
+            f"source_write bytes={source_bytes}, kvcr tier read bytes={target_bytes}",
+        )
+        result.check(
+            f"{label}: no positive KVCR failed/partial metrics",
+            not source_window.peer_failures and not target_window.peer_failures,
+            str(source_window.peer_failures + target_window.peer_failures),
+        )
+        result.measurements[label] = {
+            "source_window": source_window.totals,
+            "target_window": target_window.totals,
+        }
+
+    def local_commit_checks(
+        self, result: CaseResult, worker_index: int, start: str, label: str
+    ):
+        """The cold request's blocks were stored and committed into the KVCR tier."""
+        window = self.wait_window(
+            worker_index, start, lambda w: w.blocks(LOCAL_FILL) > 0
+        )
+        fills = window.blocks(LOCAL_FILL)
+        result.check(
+            f"{label}: KVCR local_fill committed blocks after cold request",
+            fills > 0 and window.successes(LOCAL_FILL) >= 1,
+            f"local_fill blocks={fills}, successes={window.successes(LOCAL_FILL)}, "
+            f"tier write bytes={window.get(TIER_WRITE_BYTES)}",
+        )
+        result.check(
+            f"{label}: no positive KVCR failed/partial metrics",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
+        result.measurements[label] = window.totals
+        return window
+
+    def save(self, result: CaseResult, name: str, value: Any) -> None:
+        path = self.client.evidence / f"{result.case}.{name}.json"
+        save_json(path, value)
+        result.evidence.append(path.name)
+
+
+# -- cases -------------------------------------------------------------------
+
+
+def tc01(ctx: Context) -> CaseResult:
+    result = CaseResult("TC-01", "Integration generation correctness", "R1")
+    prompt = ctx.prompts.tc01
+    cold = ctx.request("tc01-cold-w0", prompt, 0)
+    result.evidence += [cold.request_file, cold.response_file]
+    if not ctx.require_ok(result, cold, 0):
+        result.finish()
+        return result
+    ctx.compare(result, cold, "tc01")
+    ctx.check_cold(result, cold)
+    ctx.local_commit_checks(result, 0, cold.started_at, "tc01 store->commit")
+    time.sleep(ctx.index_wait)
+    reuse = ctx.request("tc01-reuse-w0", prompt, 0)
+    result.evidence += [reuse.request_file, reuse.response_file]
+    if ctx.require_ok(result, reuse, 0):
+        ctx.compare(result, reuse, "tc01")
+        ctx.check_hit(result, reuse)
+        window = ctx.settle(0, reuse.started_at)
+        result.check(
+            "tc01-reuse-w0: no positive KVCR failed/partial metrics",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
+        result.measurements["reuse_window"] = window.totals
+        result.measurements["reuse_kvcr_local_deliver_blocks"] = window.blocks(
+            LOCAL_DELIVER
+        )
+    result.finish()
+    return result
+
+
+def tc02(ctx: Context) -> CaseResult:
+    result = CaseResult("TC-02", "Local DRAM full flow", "R2")
+    p = ctx.prompts
+    seed = ctx.request("tc02-seed-full-w0", p.tc02_full, 0)
+    result.evidence += [seed.request_file, seed.response_file]
+    if not ctx.require_ok(result, seed, 0):
+        result.finish()
+        return result
+    ctx.compare(result, seed, "tc02_full")
+    ctx.check_cold(result, seed)
+    ctx.local_commit_checks(result, 0, seed.started_at, "tc02 store->commit on w0")
+    time.sleep(ctx.index_wait)
+
+    # partial hit: worker 1 is cold; only the shared P1 blocks can be delivered.
+    partial = ctx.request("tc02-partial-w1", p.tc02_partial, 1)
+    result.evidence += [partial.request_file, partial.response_file]
+    if ctx.require_ok(result, partial, 1):
+        ctx.compare(result, partial, "tc02_partial")
+        full_ids = extract_sample(seed.body or {}).prompt_token_ids
+        part_ids = extract_sample(partial.body or {}).prompt_token_ids
+        shared = 0
+        for left, right in zip(full_ids, part_ids):
+            if left != right:
+                break
+            shared += 1
+        bound = expected_hit_blocks(len(part_ids), shared)
+        result.measurements["tc02_partial_shared_prefix_tokens"] = shared
+        blocks = ctx.check_hit(result, partial, max_blocks=bound)
+        result.check(
+            "tc02-partial-w1: hit covers fewer blocks than the seeded prompt",
+            blocks < (len(full_ids) - 1) // BLOCK_SIZE,
+            f"hit blocks={blocks}, "
+            f"seeded prompt blocks={(len(full_ids) - 1) // BLOCK_SIZE}",
+        )
+        ctx.peer_transfer_checks(
+            result,
+            source=0,
+            target=1,
+            start=partial.started_at,
+            hit_blocks=blocks,
+            label="tc02 partial deliver",
+        )
+
+    # present: the remainder (P2) still has to come from worker 0's KVCR pool.
+    present = ctx.request("tc02-present-w1", p.tc02_full, 1)
+    result.evidence += [present.request_file, present.response_file]
+    if ctx.require_ok(result, present, 1):
+        ctx.compare(result, present, "tc02_full")
+        blocks = ctx.check_hit(result, present)
+        window = ctx.wait_window(
+            1, present.started_at, lambda w: w.blocks(REMOTE_DELIVER) > 0
+        )
+        result.check(
+            "tc02-present-w1: remaining blocks delivered from worker 0 via KVCR",
+            window.blocks(REMOTE_DELIVER) > 0 and window.successes(REMOTE_DELIVER) >= 1,
+            f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
+            f"hit blocks={blocks}",
+        )
+        result.check(
+            "tc02-present-w1: no positive KVCR failed/partial metrics",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
+        result.measurements["tc02 present deliver"] = window.totals
+
+    # absent: never-seen data must not be reported as a hit anywhere.
+    absent = ctx.request("tc02-absent-w1", p.tc02_absent, 1)
+    result.evidence += [absent.request_file, absent.response_file]
+    if ctx.require_ok(result, absent, 1):
+        ctx.compare(result, absent, "tc02_absent")
+        ctx.check_cold(result, absent)
+        window = ctx.settle(1, absent.started_at)
+        result.check(
+            "tc02-absent-w1: no remote delivery for a miss",
+            window.blocks(REMOTE_DELIVER) == 0,
+            f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}",
+        )
+
+    # release: consumers finished; the source still owns its committed blocks.
+    settle = ctx.settle(0, absent.started_at)
+    allocated = latest_gauge(ctx.stack.workers[0].log_path, "local_g2_allocated_slots")
+    pinned = latest_gauge(ctx.stack.workers[0].log_path, "pinned_keys")
+    result.check(
+        "tc02 release: source pool still holds committed blocks after delivery",
+        allocated is not None and allocated > 0,
+        f"local_g2_allocated_slots={allocated}",
+    )
+    result.check(
+        "tc02 release: source framework pins released after delivery",
+        pinned == 0,
+        f"pinned_keys={pinned}",
+    )
+    result.measurements["release_window"] = settle.totals
+    result.finish()
+    return result
+
+
+def tc03(ctx: Context) -> CaseResult:
+    result = CaseResult("TC-03", "Request hints and peer transfer, same-node", "R4")
+    p = ctx.prompts
+    seed = ctx.request("tc03-seed-w0", p.tc03, 0)
+    result.evidence += [seed.request_file, seed.response_file]
+    if not ctx.require_ok(result, seed, 0):
+        result.finish()
+        return result
+    ctx.compare(result, seed, "tc03")
+    ctx.check_cold(result, seed)
+    ctx.local_commit_checks(result, 0, seed.started_at, "tc03 source commits prefix")
+    before = read_window(ctx.stack.workers[1].log_path, parse_iso(seed.started_at))
+    result.check(
+        "tc03: target worker 1 is cold for this prefix",
+        before.blocks(REMOTE_DELIVER) == 0,
+        f"remote_deliver before request={before.blocks(REMOTE_DELIVER)}",
+    )
+    time.sleep(ctx.index_wait)
+
+    # Two requests reach worker 1 together: one hinted (seeded on worker 0) and
+    # one fresh. Hints are request-scoped, so the fresh one must not benefit.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        hinted_future = pool.submit(ctx.request, "tc03-hinted-w1", p.tc03, 1)
+        isolated_future = pool.submit(
+            ctx.request, "tc03-isolated-w1", p.tc03_isolated, 1
+        )
+        hinted = hinted_future.result()
+        isolated = isolated_future.result()
+    result.evidence += [
+        hinted.request_file,
+        hinted.response_file,
+        isolated.request_file,
+        isolated.response_file,
+    ]
+    blocks = 0
+    if ctx.require_ok(result, hinted, 1):
+        ctx.compare(result, hinted, "tc03")
+        blocks = ctx.check_hit(result, hinted)
+    if ctx.require_ok(result, isolated, 1):
+        ctx.compare(result, isolated, "tc03_isolated")
+        ctx.check_cold(result, isolated)
+    start = min(hinted.started_at, isolated.started_at)
+    if blocks:
+        ctx.peer_transfer_checks(
+            result,
+            source=0,
+            target=1,
+            start=start,
+            hit_blocks=blocks,
+            label="tc03 transfer",
+        )
+    result.finish()
+    return result
+
+
+def tc04(ctx: Context) -> CaseResult:
+    result = CaseResult("TC-04", "Guard protection, takeover, re-attach", "R3")
+    if ctx.stack.settings.mode != GUARD:
+        raise BlockedError("TC-04 runs only in Guard mode")
+    p = ctx.prompts
+    service = ctx.stack.services[0]
+    seed = ctx.request("tc04-protect-w0", p.tc04, 0)
+    result.evidence += [seed.request_file, seed.response_file]
+    if not ctx.require_ok(result, seed, 0):
+        result.finish()
+        return result
+    ctx.compare(result, seed, "tc04")
+    ctx.check_cold(result, seed)
+    committed = ctx.local_commit_checks(
+        result, 0, seed.started_at, "tc04 protected commit"
+    )
+    committed_blocks = committed.blocks(LOCAL_FILL)
+    result.check(
+        "tc04: warm recovery still enabled before failure",
+        RECOVERY_DISABLED not in service.log_text()
+        and RECOVERY_DISABLED not in ctx.stack.workers[0].log_text(),
+        "no 'KVCR pool recovery disabled' in service or worker log",
+    )
+    time.sleep(ctx.index_wait)
+
+    # Engine failure: the whole worker process group dies; its service survives.
+    promotions_before = service.log_text().count(GUARD_PROMOTED)
+    kill = ctx.stack.kill_worker(0)
+    ctx.save(result, "kill", kill)
+    killed = time.monotonic()
+    text = ctx.stack.wait_log(
+        service, GUARD_PROMOTED, ctx.recovery_timeout, promotions_before + 1
+    )
+    promoted_after = time.monotonic() - killed
+    match = PROMOTED.findall(text)[-1] if PROMOTED.findall(text) else None
+    recovered = int(match[2]) if match else -1
+    result.measurements["guard_promotion_seconds_after_kill"] = round(promoted_after, 3)
+    result.measurements["guard_recovered_blocks"] = recovered
+    result.measurements["committed_blocks_before_failure"] = committed_blocks
+    result.check(
+        "tc04: service kept running and promoted its Guard after engine death",
+        service.alive() and match is not None,
+        f"guard_promoted after {promoted_after:.1f}s: {match}",
+    )
+    result.check(
+        "tc04: Guard recovered the committed blocks",
+        recovered >= committed_blocks > 0,
+        f"recovered_blocks={recovered}, committed local_fill blocks={committed_blocks}",
+    )
+
+    # Takeover: worker 1 reads the preserved prefix from the Guard.
+    served = ctx.request("tc04-guard-served-w1", p.tc04, 1)
+    result.evidence += [served.request_file, served.response_file]
+    result.measurements["guard_served_request_latency_seconds"] = round(
+        served.latency_seconds, 3
+    )
+    if ctx.require_ok(result, served, 1):
+        ctx.compare(result, served, "tc04")
+        blocks = ctx.check_hit(result, served)
+        window = ctx.wait_window(
+            1,
+            served.started_at,
+            lambda w: w.blocks(REMOTE_DELIVER) >= blocks and blocks > 0,
+        )
+        result.check(
+            "tc04: Guard-served blocks delivered to worker 1 (remote_deliver)",
+            window.blocks(REMOTE_DELIVER) == blocks
+            and window.successes(REMOTE_DELIVER) >= 1,
+            f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
+            f"hit blocks={blocks}, "
+            f"tier read bytes={window.get(TIER_READ_BYTES)}",
+        )
+        result.check(
+            "tc04: no positive KVCR failed/partial metrics while Guard served",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
+        result.measurements["guard_served_window"] = window.totals
+
+    # Re-attach: a replacement worker claims the pool group back.
+    ctx.stack.start_worker(0, tag="-replacement")
+    reattached = time.monotonic()
+    ctx.stack.wait_model(ctx.client)
+    ctx.stack.discover_worker(ctx.client, 0)
+    result.measurements["replacement_ready_seconds"] = round(
+        time.monotonic() - reattached, 3
+    )
+    replacement = ctx.stack.workers[0]
+    result.check(
+        "tc04: replacement attached without a second promotion (single owner)",
+        service.alive()
+        and service.log_text().count(GUARD_PROMOTED) == promotions_before + 1
+        and RECOVERY_DISABLED not in replacement.log_text(),
+        f"guard_promoted events={service.log_text().count(GUARD_PROMOTED)}",
+    )
+    fresh = ctx.request("tc04-fresh-w0-replacement", p.tc04_fresh, 0)
+    result.evidence += [fresh.request_file, fresh.response_file]
+    if ctx.require_ok(result, fresh, 0):
+        ctx.compare(result, fresh, "tc04_fresh")
+        ctx.check_cold(result, fresh)
+        ctx.local_commit_checks(
+            result, 0, fresh.started_at, "tc04 replacement commits new data"
+        )
+    again = ctx.request("tc04-preserved-w0-replacement", p.tc04, 0)
+    result.evidence += [again.request_file, again.response_file]
+    if ctx.require_ok(result, again, 0):
+        ctx.compare(result, again, "tc04")
+        result.measurements["replacement_preserved_prefix_cached_tokens"] = ctx.cached(
+            again
+        )
+    result.finish()
+    return result
+
+
+CASES = {"TC-01": tc01, "TC-02": tc02, "TC-03": tc03, "TC-04": tc04}
+
+
+def run_case(name: str, ctx: Context) -> CaseResult:
+    started = utc_now()
+    try:
+        result = CASES[name](ctx)
+    except BlockedError as blocked:
+        result = CaseResult(name, name, "")
+        result.status = "BLOCKED"
+        result.error = str(blocked)
+        result.started_at = started
+        result.finish()
+    except Exception as error:  # noqa: BLE001 - every failure becomes evidence
+        result = CaseResult(name, name, "")
+        result.status = "FAIL"
+        result.error = f"{type(error).__name__}: {error}"
+        result.started_at = started
+        result.finish()
+    return result
