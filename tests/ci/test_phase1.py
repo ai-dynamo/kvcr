@@ -279,16 +279,21 @@ def test_runner_refuses_non_empty_output(tmp_path):
         runner.Runner(args)
 
 
-def test_discovery_instance_ids_reads_hex_record_names(tmp_path):
+def test_discovery_instance_ids_reads_url_encoded_record_names(tmp_path):
     settings = stack.Settings(model="m", output=tmp_path, mode=stack.NON_GUARD)
     s = stack.Stack(settings, tmp_path / "s")
     s.base_env()
     root = Path(s.discovery.name)
-    (root / "v1" / "models" / "ns" / "backend" / "generate").mkdir(parents=True)
-    (root / "v1" / "models" / "ns" / "backend" / "generate" / "4ee6").write_text("{}")
-    (root / "v1" / "instances" / "ns" / "backend").mkdir(parents=True)
-    (root / "v1" / "instances" / "ns" / "backend" / "4ee6").write_text("{}")
+    (root / "v1" / "instances").mkdir(parents=True)
+    (root / "v1" / "models").mkdir(parents=True)
+    for name in (
+        "dynamo%2Fbackend%2Fgenerate%2Fc69d07089b72b3c9",
+        "dynamo%2Fbackend%2Fclear%5Fkv%5Fblocks%2Fc69d07089b72b3c9",
+    ):
+        (root / "v1" / "instances" / name).write_text("{}")
+    (root / "v1" / "models" / "dynamo%2Fbackend%2Fgenerate%2F4ee6").write_text("{}")
     (root / "other").mkdir()
     (root / "other" / "ff").write_text("{}")
-    assert s.discovery_instance_ids() == {str(0x4EE6)}
+    assert s.discovery_instance_ids() == {str(0xC69D07089B72B3C9), str(0x4EE6)}
+    assert str(0xC69D07089B72B3C9) == "14311602924402422729"
     s.reset_discovery()

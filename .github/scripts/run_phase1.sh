@@ -81,10 +81,10 @@ mounts = [
     "--mount", f"type=bind,src={tests},dst=/kvcr-tests,readonly",
     "--mount", f"type=bind,src={output},dst=/evidence",
 ]
-env = ["--env", "HF_HOME=/tmp/kvcr-hf-cache"]
+env = ["--env", "HF_HOME=/tmp/phase1-hf-cache"]
 if args.hf_cache:
     args.hf_cache.mkdir(parents=True, exist_ok=True)
-    mounts += ["--mount", f"type=bind,src={args.hf_cache.resolve()},dst=/tmp/kvcr-hf-cache"]
+    mounts += ["--mount", f"type=bind,src={args.hf_cache.resolve()},dst=/tmp/phase1-hf-cache"]
 harness = [
     "python3", "/kvcr-tests/run_phase1.py",
     "--output-dir", "/evidence/run",

@@ -182,9 +182,15 @@ class Runner:
             else:
                 self.references[name] = runs[0]
         kvcr_mentions = len(re.findall(r"(?i)kvcr", worker.log_text()))
+        kvcr_lines = [
+            line[:200]
+            for line in worker.log_text().splitlines()
+            if re.search(r"(?i)kvcr", line)
+        ][:10]
         self.result["reference"] = {
             "kvcr_disabled_in_launch": bypass,
             "kvcr_mentions_in_worker_log": kvcr_mentions,
+            "kvcr_lines_in_worker_log": kvcr_lines,
             "prompts": {
                 name: {
                     "prompt_tokens": runs[0].prompt_token_ids.__len__(),

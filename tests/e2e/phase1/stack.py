@@ -29,6 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote
 
 from .client import Client
 from .common import (
@@ -173,8 +174,8 @@ class Stack:
         self.worker_ids: dict[int, str] = {}
         self.retired_ids: set[str] = set()
         self.frontend: Managed | None = None
-        self.kvcr_run_dir = Path(tempfile.mkdtemp(prefix="kvcr-phase1-run-"))
-        self.pool_dir = Path("/dev/shm/kvcr-phase1-" + uuid.uuid4().hex[:8])
+        self.kvcr_run_dir = Path(tempfile.mkdtemp(prefix="phase1-run-"))
+        self.pool_dir = Path("/dev/shm/phase1-pool-" + uuid.uuid4().hex[:8])
         self.deadline_check: Callable[[], None] = lambda: None
 
     # -- preflight ---------------------------------------------------------
@@ -236,7 +237,7 @@ class Stack:
 
     def base_env(self) -> dict[str, str]:
         if self.discovery is None:
-            self.discovery = tempfile.TemporaryDirectory(prefix="kvcr-phase1-disc-")
+            self.discovery = tempfile.TemporaryDirectory(prefix="phase1-disc-")
         env = os.environ.copy()
         env.pop("NATS_SERVER", None)
         env.update(
@@ -471,11 +472,12 @@ class Stack:
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            parts = path.relative_to(root).as_posix().lower()
+            key = unquote(path.relative_to(root).as_posix())
+            parts = key.lower().split("/")
             if "instances" not in parts and "models" not in parts:
                 continue
-            if re.fullmatch(r"[0-9a-f]{1,16}", path.name):
-                found.add(str(int(path.name, 16)))
+            if re.fullmatch(r"[0-9a-f]{1,16}", parts[-1]):
+                found.add(str(int(parts[-1], 16)))
         return found
 
     def discover_worker(self, client: Client, index: int) -> str:

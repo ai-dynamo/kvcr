@@ -65,7 +65,7 @@ class Prompts:
 
     @property
     def tail(self) -> str:
-        return " Continue the list:"
+        return " Repeat the first word of this text exactly, then continue the list:"
 
     @property
     def tc01(self) -> str:
