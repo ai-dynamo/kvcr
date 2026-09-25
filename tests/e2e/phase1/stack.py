@@ -458,21 +458,51 @@ class Stack:
             time.sleep(2)
         raise ValidationError(f"model readiness timed out: {last}")
 
-    def discover_worker(self, client: Client, index: int, *, attempts: int = 90) -> str:
-        """Learn the instance ID of worker[index] by probing until a new ID appears.
+    def discovery_instance_ids(self) -> set[str]:
+        """Instance IDs registered in the file discovery store (decimal strings).
+
+        Dynamo's file store names model/instance records by hex instance ID, so
+        the directory itself lists every registered worker.
+        """
+        if self.discovery is None:
+            return set()
+        found: set[str] = set()
+        root = Path(self.discovery.name)
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            parts = path.relative_to(root).as_posix().lower()
+            if "instances" not in parts and "models" not in parts:
+                continue
+            if re.fullmatch(r"[0-9a-f]{1,16}", path.name):
+                found.add(str(int(path.name, 16)))
+        return found
+
+    def discover_worker(self, client: Client, index: int) -> str:
+        """Learn the instance ID of worker[index].
 
         Workers start one at a time, so the first unknown decode_worker_id
-        belongs to the worker most recently launched.
+        belongs to the worker most recently launched. Unhinted probes let the
+        router choose; when it keeps choosing a known worker, candidates from
+        the discovery store are confirmed with a pinned probe instead.
         """
         known = {wid for i, wid in self.worker_ids.items() if i != index}
         known |= self.retired_ids
         errors = 0
-        for attempt in range(attempts):
+        attempt = 0
+        deadline = time.monotonic() + self.settings.readiness_timeout
+        while time.monotonic() < deadline:
+            attempt += 1
             self.deadline_check()
             self.check_children()
+            candidates = [
+                wid for wid in self.discovery_instance_ids() if wid not in known
+            ]
+            pinned = candidates[0] if attempt % 2 and len(candidates) == 1 else None
             probe = client.completion(
                 f"probe-w{index}-{attempt:02d}",
                 f"identity probe {uuid.uuid4().hex}",
+                worker=pinned,
                 max_tokens=1,
                 extra_fields=["worker_id"],
             )
@@ -483,10 +513,11 @@ class Stack:
                     return worker
             else:
                 errors += 1
-            time.sleep(2)
+            time.sleep(3)
         raise ValidationError(
-            f"worker {index} was never selected by the router in {attempts} probes "
-            f"({errors} probe errors)"
+            f"worker {index} was never selected by the router in {attempt} probes "
+            f"({errors} probe errors; discovery candidates "
+            f"{sorted(self.discovery_instance_ids() - known)})"
         )
 
     # -- failure injection -------------------------------------------------

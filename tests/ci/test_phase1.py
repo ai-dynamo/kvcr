@@ -277,3 +277,18 @@ def test_runner_refuses_non_empty_output(tmp_path):
     args = runner.arguments(["--output-dir", str(tmp_path)])
     with pytest.raises(common.ValidationError):
         runner.Runner(args)
+
+
+def test_discovery_instance_ids_reads_hex_record_names(tmp_path):
+    settings = stack.Settings(model="m", output=tmp_path, mode=stack.NON_GUARD)
+    s = stack.Stack(settings, tmp_path / "s")
+    s.base_env()
+    root = Path(s.discovery.name)
+    (root / "v1" / "models" / "ns" / "backend" / "generate").mkdir(parents=True)
+    (root / "v1" / "models" / "ns" / "backend" / "generate" / "4ee6").write_text("{}")
+    (root / "v1" / "instances" / "ns" / "backend").mkdir(parents=True)
+    (root / "v1" / "instances" / "ns" / "backend" / "4ee6").write_text("{}")
+    (root / "other").mkdir()
+    (root / "other" / "ff").write_text("{}")
+    assert s.discovery_instance_ids() == {str(0x4EE6)}
+    s.reset_discovery()
