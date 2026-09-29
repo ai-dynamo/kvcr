@@ -102,6 +102,39 @@ def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
     return progress
 
 
+@pytest.mark.parametrize("peer", ["transfer-test", b"transfer-test", "other"])
+def test_debug_trace_identifies_agent_and_memory_types(monkeypatch, caplog, peer):
+    monkeypatch.setenv("NIXL_LOG_LEVEL", "DEBUG")
+    progress = _transfer_progress(_TransferAgent())
+    progress._nixl_agent_name = "transfer-test"
+    with caplog.at_level("INFO", logger="kvcr.progress"):
+        transfer, _ = progress.submit_transfer(
+            "WRITE",
+            (_mem(128, mem_type="VRAM"),),
+            (_mem(256),),
+            remote_side_agent=peer,
+            backend="UCX",
+        )
+    assert f"same_agent={peer != 'other'}" in caplog.text
+    assert "local_mem=VRAM remote_mem=DRAM spans=1 bytes=128" in caplog.text
+    assert "requested_backend=UCX" in caplog.text
+    assert progress.poll_transfer(transfer)[0]
+
+
+def test_transfer_diagnostics_are_off_by_default(monkeypatch, caplog):
+    monkeypatch.delenv("NIXL_LOG_LEVEL", raising=False)
+    progress = _transfer_progress(_TransferAgent())
+    with caplog.at_level("INFO", logger="kvcr.progress"):
+        transfer, _ = progress.submit_transfer(
+            "WRITE",
+            (_mem(128),),
+            (_mem(256),),
+            remote_side_agent="other",
+        )
+    assert "KVCR NIXL submit" not in caplog.text
+    assert progress.poll_transfer(transfer)[0]
+
+
 @pytest.mark.parametrize(
     ("transfer_result", "polls_state"),
     [("PROC", True), ("DONE", False)],
