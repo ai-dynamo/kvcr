@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # KVCR test plan v7, Phase 1 implementation
 
-This document maps the Phase 1 critical path of the KVCR test plan
-(TC-01 → TC-02 → TC-03 same-node → TC-04, Guard mode) to the runnable harness
+This document maps Phase 1 of the KVCR test plan (TC-01 → TC-02 → TC-03
+same-node → TC-04 in Guard mode, plus the performance cases TC-05 and TC-06 that
+the plan places in the same round) to the runnable harness
 in [`tests/e2e/run_phase1.py`](../tests/e2e/run_phase1.py). It complements the
 peer-reuse smoke test described in [test-plan.md](test-plan.md); it does not
 replace it.
@@ -25,10 +26,11 @@ Path evidence is required in addition to equal tokens.
 | KVCR (Guard mode) | one `kvcr.kvcr_service` per worker (`--guard-count 1 --pool-sizes-gb 2`); the worker's tier sets `kvcr_service_socket_path` and `compatibility_digest` |
 | KVCR (non-Guard) | tier sets `secondary_g2_slots` instead; no service, TC-04 is BLOCKED |
 | KV state agent (Guard mode) | one `dynamo.kv_state_agent --max-slots 2`; each worker sets `dynamo_state_agent` with a stable per-slot `cache_owner_ids` entry so the router keeps a dead engine's blocks routable to its Guard (`--no-state-agent` disables) |
-| Model | `Qwen/Qwen3-0.6B`, bf16, `--block-size 64`, `--enforce-eager` |
+| Model | dense `Qwen/Qwen3-0.6B` and hybrid attention `Qwen/Qwen3.5-0.8B` (Gated DeltaNet + attention), bf16, `--block-size 64`; `--enforce-eager` unless `--no-enforce-eager`; the hybrid model needs `--worker-arg=--mamba-cache-mode=align` and `--keep-hybrid-kv-cache-manager` |
 | Decoding | `temperature 0`, `seed 0`, fixed `max_tokens` (default 32) |
 | Token capture | `nvext.extra_fields: ["prompt_token_ids", "completion_token_ids", "worker_id", "detailed_finish_reason"]` through the Dynamo frontend; a build without these fields is BLOCKED |
-| Determinism | optional `--batch-invariant` sets `VLLM_BATCH_INVARIANT=1`; an unstable reference is an error |
+| Determinism | optional `--batch-invariant` sets `VLLM_BATCH_INVARIANT=1`; an unstable reference is an error (required for the dense model, rejected by Qwen3.5's GDN layers) |
+| Performance (TC-05/06) | `--perf-repeats 5` distinct prompts per arm, `--perf-max-tokens 128`, `--perf-concurrency 1`; streamed completions timed on the client, token IDs taken from each chunk's `nvext.completion_token_ids`, `cached_tokens` from the final `usage` chunk |
 
 Each worker is pinned by request header `x-dynamo-worker-instance-id`, so
 every stage names the worker that served it and the response proves it.
@@ -38,13 +40,20 @@ every stage names the worker that served it and the response proves it.
 1. **Preflight.** Two usable CUDA devices, free `/dev/shm`, kernel 6.5+ and
    `libatomic` for Guard mode, free ports. Missing prerequisites → BLOCKED.
 2. **Reference.** A KVCR-disabled worker on GPU 0 behind its own router
-   generates every prompt twice. The launch command is checked for the
+   generates every prompt twice. Performance prompts are first streamed cold
+   and then warm (vLLM prefix-cache hit) to record the KVCR-disabled TTFT/TPOT
+   baseline; all repeats must agree. The launch command is checked for the
    absence of `--kv-transfer-config` and the worker log for the absence of
-   "kvcr". Unequal repeats fail the run.
+   "kvcr". Unequal repeats fail the run and `result.json` records which run
+   diverged at which token.
 3. **Stack.** Guard services, router, then worker 0 and worker 1 started one
    at a time so each instance ID is learned unambiguously.
-4. **Cases.** TC-01 → TC-04. Each case records checks, evidence files, and
-   measurements into `result.json`; JUnit mirrors PASS/FAIL/BLOCKED.
+4. **Cases.** Default order TC-01, TC-02, TC-03, TC-05, TC-04, TC-06: the
+   performance case runs before the Guard case because TC-04 replaces worker 0
+   at the same endpoint and the first peer transfer afterwards fails (finding 1
+   below), which would pollute the remote-hit sample. Each case records checks,
+   evidence files, and measurements into `result.json`; JUnit mirrors
+   PASS/FAIL/BLOCKED.
 5. **Cleanup.** Owned process groups, discovery directory, service sockets,
    and `/dev/shm` pool files are removed in the same run.
 
@@ -56,6 +65,9 @@ every stage names the worker that served it and the response proves it.
 | TC-02 Local DRAM full flow (R2) | only committed data delivered; miss not a hit; partial hit; release per API contract; tokens match | seed full prompt on worker 0 (commit evidence); **partial**: cold worker 1 requests a prompt sharing only the first half → hit ≤ shared-prefix blocks and < seeded blocks, `remote_deliver == source_write == hit blocks`, bytes equal; **present**: full prompt on worker 1 → remaining blocks arrive via `remote_deliver`; **absent**: never-seen prompt → `cached_tokens == 0`, no `remote_deliver`; **release**: worker 0 `local_g2_allocated_slots > 0` and `pinned_keys == 0` after consumers finished |
 | TC-03 Request hints and peer transfer, same-node (R4) | hints isolated per request; data from expected source; transfer counts verifiable | seed on worker 0; two concurrent requests to worker 1, one hinted and one fresh: hinted has a block-aligned hit with `remote_deliver == source_write == hit blocks` and equal bytes; fresh has `cached_tokens == 0`; `transfer`, `source_write`, `remote_deliver` success counts ≥ 1; no failed/partial |
 | TC-04 Guard protection, takeover, re-attach (R3) | preserved data available; evidence for Guard serving and re-attach; tokens match; no dual owner | commit two prompts on worker 0, recovery not disabled; SIGKILL worker 0's process group; service logs `KVCR_EVENT guard_promoted` with `recovered_blocks ≥ committed`; worker 1 requests both prompts in turn, each checked for tokens equal reference and hit blocks == `remote_deliver`; replacement worker 0 starts, attaches without a second promotion, serves a fresh prompt (tokens equal reference, commits) and the preserved prompt (tokens equal reference; cached tokens recorded) |
+
+| TC-05 Cold-path overhead and reuse latency (perf) | TTFT, TPOT, ITL, throughput for KVCR disabled vs cold vs local hit vs remote hit; transfer time; DRAM and GPU usage | five prompts per arm, streamed: KVCR-disabled cold and warm (from the reference phase), KVCR cold on worker 0 (`cached_tokens == 0`, `local_fill` committed), local hit on worker 0 (block-aligned hit), remote hit on worker 1 (`remote_deliver == cached blocks`, source bytes == tier read bytes, no failed/partial); every stream's tokens equal the reference; p50/p95 per arm plus derived cold-path overhead and hit gains; pool gauges and `nvidia-smi` memory before/after |
+| TC-06 Guard recovery timing (perf) | engine failure → first correct response; takeover; re-attach; post-recovery TTFT and TPOT | seed and warm five prompts on worker 0; SIGKILL; `t1` = first Guard-served response with correct tokens and a positive hit (polled); remaining prompts served by the Guard; replacement starts, `t2` = model ready and discovered, single owner; post-recovery streams on the replacement compared with pre-failure |
 
 Recorded measurements, not thresholds: Guard promotion delay after the kill,
 Guard-served request latency, replacement readiness time, and the cached
@@ -94,8 +106,22 @@ bash .github/scripts/run_phase1.sh --gpus GPU-…,GPU-… --image <ref> \
 ```
 
 `--cases TC-01,TC-03` selects cases; `--mode nonguard` runs the non-Guard
-compatibility path (TC-04 BLOCKED). The [GPU workflow](../.github/workflows/vllm-e2e.yml)
-runs Phase 1 as `two-gpu-phase1` after the peer-reuse smoke test.
+compatibility path (TC-04 BLOCKED). `--harness-arg` forwards any
+`run_phase1.py` option, e.g. `--harness-arg=--batch-invariant`,
+`--harness-arg=--model=Qwen/Qwen3.5-0.8B`,
+`--harness-arg=--worker-arg=--mamba-cache-mode=align`,
+`--harness-arg=--keep-hybrid-kv-cache-manager`, `--harness-arg=--no-enforce-eager`.
+The [GPU workflow](../.github/workflows/vllm-e2e.yml) runs Phase 1 as
+`two-gpu-phase1` after the peer-reuse smoke test.
+
+On dlcluster, [`scripts/dlcluster/submit.sh`](../scripts/dlcluster/submit.sh)
+bundles the committed HEAD, ships it and
+[`phase1.sbatch`](../scripts/dlcluster/phase1.sbatch) to the login node and
+submits an exclusive `2GPU & x86_64 & UB24.04` H100 job that reuses or builds
+the image and runs the `dense` and `hybrid` configurations; evidence lands in
+`~/kvcr-runs/<jobid>/` and `<jobid>.tgz`. `--image local/kvcr-phase1:<sha>`
+reuses an image already on the node, `--extra "--harness-arg=..."` applies to
+every configuration, `--matrix dense` picks one.
 
 ## Known limits
 
@@ -147,3 +173,83 @@ Findings for the KVCR and Dynamo teams:
 Measured, not thresholds: Guard promotion 2.0 s after SIGKILL; Guard-served
 request latency 0.45 s; replacement worker ready and re-attached in 30 s;
 replacement reports 1408 cached tokens for the preserved prefix after handback.
+
+## Second execution (2026-09-29)
+
+Node `2u2g-gen-0857` on dlcluster (two H100 NVL 94 GB, Linux 6.17, Docker
+29.6), exclusive. Image `local/kvcr-phase1:fc773069…` built from KVCR main
+`317e62f` + this branch, Dynamo main `6822bab`, vLLM PR 53624 head `7015687c`.
+Harness commits `c039956`–`ea33c94` added TC-05/TC-06, the streaming client,
+`--perf-*`, `--worker-arg`, `--keep-hybrid-kv-cache-manager`,
+`--no-enforce-eager` and the dlcluster scripts. Evidence:
+`~/outputs/kvcr-phase1-ci-20260929/` (`*-result.json`, `*.tgz`, `REPORT.md`).
+
+| Config | TC-01 | TC-02 | TC-03 | TC-04 | TC-05 | TC-06 | Job |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dense Qwen3-0.6B, Guard, `--batch-invariant` | PASS | PASS | PASS | FAIL (a) | PASS | PASS | 2329563 |
+| hybrid Qwen3.5-0.8B, Guard, CUDA graphs | PASS | FAIL (b) | FAIL (b) | FAIL (b) | FAIL (b) | FAIL (b) | 2329871 |
+
+(a) finding 1 of 2026-09-25, reproduced: only the first hinted request after
+Guard promotion misses. (b) one root cause, finding 3 below: no peer transfer
+ever runs for the hybrid model.
+
+Performance, p50 of five prompts (1344 input tokens, 128 output tokens):
+
+| Arm | dense TTFT | dense TPOT | hybrid TTFT | hybrid TPOT |
+| --- | --- | --- | --- | --- |
+| KVCR disabled, cold | 35.1 ms | 14.3 ms | 41.5 ms | 1.62 ms |
+| KVCR disabled, vLLM prefix-cache hit | 35.3 ms | 14.4 ms | 23.1 ms | 1.62 ms |
+| KVCR cold (store + commit) | 39.4 ms (+4.2) | 15.0 ms (+0.7) | 44.9 ms (+3.5) | 1.78 ms (+0.15) |
+| KVCR local hit (GPU prefix cache answers) | 37.6 ms | 15.0 ms | 23.7 ms | 1.73 ms |
+| KVCR remote hit, same node | 67.3 ms (+28) | 15.2 ms | 45.9 ms (= miss) | 1.79 ms |
+| Guard-served hit after kill | 75.2 ms | 15.5 ms | 44.3 ms (4/5 miss) | 1.78 ms |
+| replacement hit from reclaimed pool | 73.0 ms | 15.0 ms | 38.2 ms | 1.74 ms |
+
+Dense ran with `VLLM_BATCH_INVARIANT=1` and `--enforce-eager`, hybrid with CUDA
+graphs and no batch invariance; compare within a column only. Guard timeline
+(TC-06): promotion 1.0 s after SIGKILL in both; first correct Guard-served
+response 4.1 s (dense) / 2.3 s (hybrid); replacement serving after 44.5 s
+(dense, 30 s engine start) / 70 s (hybrid, 66 s incl. CUDA graph capture);
+TPOT unchanged across recovery. A remote hit moves 123 MB per request
+(84 blocks × 1,468,006 B over four successful requests; source bytes equal
+target tier read bytes). At 0.6B parameters and 1.3k tokens prefill costs
+~3 ms, so no hit shortens TTFT here; this round measures correctness and
+overhead, not benefit.
+
+Findings for the KVCR, Dynamo and vLLM teams:
+
+1. **First request to a replaced peer at the same endpoint is refused**
+   (dense TC-04; TC-05 remote arm when run after TC-04). Same mechanism as
+   2026-09-25: the target skips NIXL metadata for an already-acked endpoint,
+   the promoted Guard is a new NIXL agent and raises `missing target agent
+   metadata` (`remote_fw_dram.py` `_remote_agent`, line 1748). One miss and
+   recomputation per peer after every takeover or replacement; tokens stay
+   correct.
+2. **`--disable-hybrid-kv-cache-manager` cannot run Qwen3.5.** vLLM's
+   `unify_hybrid_kv_cache_specs` fails with "Failed to promote local KV cache
+   specs to one unified type" because GDN and attention layers cannot share one
+   KV group (job 2329349). The hybrid configuration keeps the manager on.
+3. **With multiple KV cache groups no peer transfer happens.** The Dynamo
+   plugin call `get_kv_cache_group_metadata` fails on this vLLM
+   (`'EngineCoreProc' object has no attribute`) and falls back to
+   `cache_config.block_size` (also in dense, harmless there); vLLM's
+   `OffloadingEventsTracker` emits placeholder `BlockStored` payloads for
+   non-full-attention groups; `dynamo.kv_state_agent` quarantines the ingress
+   (`KVCR block size is incompatible`, `CacheOwner residency failed closed`)
+   and the frontend logs `KV state-agent recovery query failed` (391× in
+   2329871). Without a block index the router never hints, so every
+   cross-worker check sees `cached_tokens 0` and `remote_deliver 0`. KVCR's
+   local store and commit work for the hybrid model (TC-01 PASS); one
+   Guard-served hit did land in TC-06, so the path is intermittent rather than
+   absent.
+4. **Determinism.** On the KVCR-disabled dense engine the cold-prefill
+   generation differs from every later prefix-cache-hit generation (first
+   divergence at token 1–33 across five prompts; the hits agree with each
+   other); `VLLM_BATCH_INVARIANT=1` makes them identical. Qwen3.5 rejects
+   batch-invariant mode (`not supported for GDN_ATTN`) yet its references were
+   stable without it (19 prompts). Under `--enforce-eager` Qwen3.5 decodes at
+   ~520 ms/token; CUDA graphs give 1.7 ms.
+
+Not covered: disaggregated deployment, more than one TC-05 concurrency level,
+a forced GPU-cache eviction so the local-hit arm exercises KVCR's DRAM read,
+non-Guard reruns (Phase 3).
