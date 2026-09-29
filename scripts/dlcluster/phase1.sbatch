@@ -2,6 +2,8 @@
 #SBATCH --job-name=doxu-kvcr-phase1
 #SBATCH --partition=general
 #SBATCH --gres=gpu:H100:2
+#SBATCH --constraint=2GPU
+#SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=160G
@@ -9,6 +11,8 @@
 #SBATCH --output=/home/doxu/kvcr-runs/%j.out
 #
 # KVCR test plan Phase 1 (TC-01..TC-06) on one dlcluster node with 2x H100.
+# Exclusive 2-GPU node: shared 8-GPU nodes hand out GPUs with other tenants'
+# memory on them and vLLM's 0.8 utilization check then fails at startup.
 # Inputs (env, set by submit.sh):
 #   KVCR_BUNDLE   git bundle of the kvcr-phase1-ci branch (in $HOME)
 #   KVCR_REF      commit to check out from the bundle
