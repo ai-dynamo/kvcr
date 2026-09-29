@@ -50,6 +50,19 @@ if TYPE_CHECKING:
 _MEM_DESCRIPTOR_LISTS_TYPE = tuple[tuple[MemDescriptor, ...], ...]
 
 
+def _source_span_indices(
+    layout: list[str], destination: list[str]
+) -> tuple[int, ...] | None:
+    if layout == destination:
+        return tuple(range(len(layout)))
+    # Partial deliveries select unique named spans in stored order.
+    if not destination or "" in layout or len(set(layout)) != len(layout):
+        return None
+    names = set(destination)
+    indices = tuple(index for index, name in enumerate(layout) if name in names)
+    return indices if [layout[index] for index in indices] == destination else None
+
+
 @dataclass(slots=True)
 class _FwMemResidency:
     descriptors: list[MemDescriptor]
@@ -1166,15 +1179,16 @@ class _RemoteFWDram:
             # second attempt if contention makes this fallback too frequent.
             return False
         try:
+            selections = []
             for key, layout in zip(source_pin.ordered_keys, layouts):
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
-                if (
-                    residency is None
-                    or residency.state is not _LocalDramState.READY
-                    or residency.layout != layout
-                ):
+                if residency is None or residency.state is not _LocalDramState.READY:
                     return False
+                indices = _source_span_indices(residency.layout, layout)
+                if indices is None:
+                    return False
+                selections.append(indices)
             sources = kvcr._claim_local_dram_sources(
                 source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
             )
@@ -1192,7 +1206,8 @@ class _RemoteFWDram:
             op_handle=source_pin.op_handle,
             source_keys=source_pin.ordered_keys,
             src_descriptors=tuple(
-                tuple(sources[key]) for key in source_pin.ordered_keys
+                tuple(sources[key][index] for index in indices)
+                for key, indices in zip(source_pin.ordered_keys, selections)
             ),
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
@@ -1230,14 +1245,17 @@ class _RemoteFWDram:
         }
         sources = {} if force_failure else {**framework_sources, **local_sources}
         completed_indices = []
+        selected_sources = []
         for index, key in enumerate(source_pin.ordered_keys):
             source = sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if source is None:
                 continue
-            if [descriptor.info for descriptor in source] != [
-                descriptor.info for descriptor in destination
-            ]:
+            indices = _source_span_indices(
+                [descriptor.info for descriptor in source],
+                [descriptor.info for descriptor in destination],
+            )
+            if indices is None:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",
                     source_pin.op_handle,
@@ -1245,6 +1263,7 @@ class _RemoteFWDram:
                 )
                 continue
             completed_indices.append(index)
+            selected_sources.append(tuple(source[index] for index in indices))
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
         )
@@ -1287,7 +1306,7 @@ class _RemoteFWDram:
             _backend=self,
             framework_pins=framework_pins,
             source_keys=completed_keys,
-            src_descriptors=tuple(tuple(sources[key]) for key in completed_keys),
+            src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)

@@ -6,6 +6,7 @@ import ctypes
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from unittest.mock import DEFAULT, Mock
 
 import msgspec
@@ -15,6 +16,7 @@ from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
     FakeTelemetryStats,
+    PendingPrimaryPinning,
     _block_op_ids,
     _ConstantHashAdapter,
     _decode_control_message,
@@ -219,17 +221,27 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
 
 
 @pytest.mark.parametrize(
-    ("layout", "expected_layout", "success"),
+    ("layout", "expected_layout", "success", "deliver"),
     [
-        ([("full", 16), ("swa", 8)], ["swa", "full"], False),
-        ([("full", 16), ("swa", 8)], ["full", "swa"], True),
-        ([("", 16), ("", 16)], ["", ""], True),
+        ([("full", 16), ("swa", 8)], ["swa", "full"], False, False),
+        ([("full", 16), ("swa", 8)], ["full", "swa"], True, False),
+        ([("", 16), ("", 16)], ["", ""], True, False),
+        ([("full", 16), ("swa", 8)], ["swa"], True, True),
+        ([("full", 16), ("swa", 8), ("state", 16)], ["full", "state"], True, True),
+        ([("full", 16), ("swa", 8)], ["full", "full"], False, True),
+        ([("full", 16), ("swa", 8)], ["swa", "full"], False, True),
+        ([("full", 16), ("full", 16)], ["full", "full"], True, True),
+        ([("full", 16), ("full", 16)], ["full"], False, True),
+        ([("", 16), ("", 16)], [""], False, True),
     ],
 )
-def test_remote_fetch_preserves_block_layout_and_bytes(
+@pytest.mark.parametrize("framework_source", [False, True])
+def test_remote_fetch_and_deliver_preserve_block_layout_and_bytes(
     layout: list[tuple[str, int]],
     expected_layout: list[str],
     success: bool,
+    deliver: bool,
+    framework_source: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class CopyingWriteAgent(FakeNixlAgent):
@@ -269,13 +281,14 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
             ]
         )
 
+    pinning = PendingPrimaryPinning()
     source = _new_kvcr(
         source_agent,
-        FakePrimaryPinning(),
+        pinning,
         source_control,
         config,
         name="source",
-        local_dram=dram(source_local),
+        local_dram=None if framework_source else dram(source_local),
     )
     target = _new_kvcr(
         target_agent,
@@ -291,22 +304,67 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         _mem_descriptor(ctypes.addressof(memory), size, info=name)
         for (name, size), memory in zip(layout, source_primary, strict=True)
     ]
-    source_agent.state = "DONE"
-    deposit = source.deposit({key: descriptors})
-    assert dict(_poll_until(source, bool))[deposit][key].success
-    source_agent.state = "PROC"
+    if not framework_source:
+        source_agent.state = "DONE"
+        deposit = source.deposit({key: descriptors})
+        assert dict(_poll_until(source, bool))[deposit][key].success
+        source_agent.state = "PROC"
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = target.fetch((key,), "req", expected_layout=expected_layout)
+    destination = [
+        ctypes.create_string_buffer(dict(layout)[name]) for name in expected_layout
+    ]
+    if deliver:
+        fetch = target.deliver(
+            {
+                key: [
+                    replace(
+                        _mem_descriptor(
+                            ctypes.addressof(memory), len(memory), info=name
+                        ),
+                        mem_type="VRAM",
+                        device_Id=3,
+                    )
+                    for name, memory in zip(expected_layout, destination, strict=True)
+                ]
+            },
+            request_id="req",
+        )
+    else:
+        fetch = target.fetch((key,), "req", expected_layout=expected_layout)
     _wait_until(lambda: bool(target_control.sent))
     source_control.incoming.extend(message for _, message in target_control.sent)
+    if framework_source:
+        _poll_until(source, lambda _: bool(pinning.pending))
+        request = next(iter(pinning.pending))
+        pinning.completed.append((request, ("pin", {key: descriptors})))
     if success:
-        _poll_until(source, lambda _: len(source_agent.xfers) == 2)
-        source_xfer = source_agent.xfers[1]
-        assert len(source_xfer[1]) == len(source_xfer[3]) == 2
+        transfer_count = 1 if framework_source else 2
+        if framework_source:
+            _poll_until(source, lambda _: len(source_agent.xfers) == transfer_count)
+            assert pinning.unpins == []
+        else:
+            # The local source path also serves subsets without caller polling.
+            _wait_until(lambda: len(source_agent.xfers) == transfer_count)
+            residency = source._core._block_record_map[key].local_dram
+            assert residency.claim_count == 1
+            assert residency.layout == [name for name, _ in layout]
+        source_xfer = source_agent.xfers[-1]
+        assert len(source_xfer[1]) == len(source_xfer[3]) == len(expected_layout)
+        if deliver:
+            assert all(device == 3 for _, _, device in source_xfer[3])
         notification = source_xfer[5]
         source_agent.state = "DONE"
+        _wait_until(lambda: len(source_agent.released_xfers) == transfer_count)
+        if framework_source:
+            assert pinning.unpins == []
+        else:
+            assert residency.claim_count == 1
         _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        if framework_source:
+            assert pinning.unpins == ["pin"]
+        else:
+            assert residency.claim_count == 0
     else:
         _poll_until(source, lambda _: bool(source_agent.sent_notifs))
         notification = source_agent.sent_notifs[0][1]
@@ -314,12 +372,21 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     target_agent.notifs["source"] = [notification]
     result = dict(_poll_until(target, bool))[fetch][key]
     assert result.success is success
-    if success:
+    if success and deliver:
+        selected = [
+            data
+            for (name, _), data in zip(layout, payloads, strict=True)
+            if name in expected_layout
+        ]
+        assert [memory.raw for memory in destination] == selected
+    elif success:
         assert [
             (descriptor.info, descriptor.size)
             for descriptor in result.descriptors or ()
         ] == layout
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
+    elif deliver:
+        assert all(memory.raw == bytes(len(memory)) for memory in destination)
 
 
 def test_remote_staging_commits_available_keys() -> None:

@@ -998,7 +998,8 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
     ) in stats.records
 
 
-def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
+@pytest.mark.parametrize("selections", [((0, 1),), ((1,),), ((0,), (1,))])
+def test_a_resumed_write_holds_a_pin_another_operation_acquired(selections) -> None:
     """fw_mem belongs to the block, so two writes can want the same pin."""
     backend = object.__new__(_RemoteFWDram)
     kvcr = object.__new__(_KVCRCore)
@@ -1019,7 +1020,10 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     key = BlockKey(b"shared")
     borrowed = PinHandle("pinned-by-the-other-operation")
     sources = [_mem_descriptor(info="full"), _mem_descriptor(info="swa")]
-    destinations = tuple(_mem_descriptor(info=item.info) for item in sources)
+    destinations = tuple(
+        tuple(_mem_descriptor(info=sources[index].info) for index in selected)
+        for selected in selections
+    )
     kvcr._block_record_map[key] = _BlockRecord(
         fw_mem=_FwMemResidency(sources, borrowed)
     )
@@ -1031,8 +1035,8 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
         deadline=10.0,
         remote_agent=b"peer",
         op_handle=1,
-        ordered_keys=(key,),
-        dst_descriptors=(destinations,),
+        ordered_keys=(key,) * len(selections),
+        dst_descriptors=destinations,
         op_id=("source", 1),
         keys={key},
         framework_pins={stale},
@@ -1042,8 +1046,10 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     backend._submit_prepared_source_write(("source", 1), waiting)
 
     submitted = kvcr._progress.submit.call_args.args[0]
-    assert submitted.src_descriptors == (tuple(sources),)
-    assert submitted.dst_descriptors == (destinations,)
+    assert submitted.src_descriptors == tuple(
+        tuple(sources[index] for index in selected) for selected in selections
+    )
+    assert submitted.dst_descriptors == destinations
     assert borrowed in submitted.framework_pins, (
         "the resumed write reads through this pin but does not hold it"
     )
