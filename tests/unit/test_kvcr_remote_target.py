@@ -219,17 +219,20 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
 
 
 @pytest.mark.parametrize(
-    ("layout", "expected_layout", "success"),
+    ("layout", "expected_layout", "success", "operation"),
     [
-        ([("full", 16), ("swa", 8)], ["swa", "full"], False),
-        ([("full", 16), ("swa", 8)], ["full", "swa"], True),
-        ([("", 16), ("", 16)], ["", ""], True),
+        ([("full", 16), ("swa", 8)], ["swa", "full"], False, "fetch"),
+        ([("full", 16), ("swa", 8)], ["full", "swa"], True, "fetch"),
+        ([("", 16), ("", 16)], ["", ""], True, "fetch"),
+        ([("full", 16), ("swa", 8)], ["swa"], False, "fetch"),
+        ([("full", 16), ("swa", 8)], ["swa"], True, "deliver"),
     ],
 )
 def test_remote_fetch_preserves_block_layout_and_bytes(
     layout: list[tuple[str, int]],
     expected_layout: list[str],
     success: bool,
+    operation: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class CopyingWriteAgent(FakeNixlAgent):
@@ -297,7 +300,22 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     source_agent.state = "PROC"
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = target.fetch((key,), "req", expected_layout=expected_layout)
+    if operation == "fetch":
+        fetch = target.fetch((key,), "req", expected_layout=expected_layout)
+    else:
+        fetch = target.deliver(
+            {
+                key: [
+                    _mem_descriptor(
+                        ctypes.addressof(target_local[name]),
+                        dict(layout)[name],
+                        info=name,
+                    )
+                    for name in expected_layout
+                ]
+            },
+            "req",
+        )
     _wait_until(lambda: bool(target_control.sent))
     source_control.incoming.extend(message for _, message in target_control.sent)
     if success:
@@ -307,7 +325,9 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         # the lists stay aligned and cover the block's bytes exactly.
         assert len(source_xfer[1]) == len(source_xfer[3]) <= 2
         assert [s for _, s, _ in source_xfer[1]] == [s for _, s, _ in source_xfer[3]]
-        assert sum(s for _, s, _ in source_xfer[1]) == sum(size for _, size in layout)
+        assert sum(s for _, s, _ in source_xfer[1]) == sum(
+            dict(layout)[name] for name in expected_layout
+        )
         notification = source_xfer[5]
         source_agent.state = "DONE"
         _poll_until(source, lambda _: not _has_outstanding_operations(source))
@@ -318,12 +338,15 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     target_agent.notifs["source"] = [notification]
     result = dict(_poll_until(target, bool))[fetch][key]
     assert result.success is success
-    if success:
+    if success and operation == "fetch":
         assert [
             (descriptor.info, descriptor.size)
             for descriptor in result.descriptors or ()
         ] == layout
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
+    elif success:
+        for name in expected_layout:
+            assert target_local[name].raw == pool_data[name]
 
 
 def test_remote_staging_commits_available_keys() -> None:

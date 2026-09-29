@@ -23,6 +23,7 @@ from .device_copy import (
 )
 from .policy_runtime import _EvictionQueue
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
+from .span_layout import delivery_indices
 from .types import (
     BlockKey,
     CacheTier,
@@ -486,6 +487,18 @@ class _LocalDram:
             started_at=self._kvcr._timer(),
         )
         self._next_copy_id += 1
+        # Claims and completion checks retain the whole residency, but a
+        # delivery can copy just its uniquely named layer spans.
+        if not fill:
+            projected_slots = []
+            for _, object_slots, spans in entries:
+                indices = delivery_indices(
+                    tuple(name for name, _ in object_slots),
+                    tuple(span.info for span in spans),
+                )
+                assert indices is not None  # Validated before acquiring the claim.
+                projected_slots.append(tuple(object_slots[index] for index in indices))
+            slots = tuple(projected_slots)
         engine = self._device_copy
         if engine is None or framework[0].mem_type != "VRAM":
             slot_spans = tuple(self._descriptors(chain.from_iterable(slots)))
@@ -970,7 +983,10 @@ class _LocalDram:
                 continue
             elif (
                 residency.state is _LocalDramState.DISCARDING
-                or residency.layout != list(map(_info, op.destinations[key]))
+                or delivery_indices(
+                    tuple(residency.layout), tuple(map(_info, op.destinations[key]))
+                )
+                is None
                 or now >= op.deadline
             ):
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
