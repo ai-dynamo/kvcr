@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Run KVCR test plan v7 Phase 1 (TC-01 -> TC-04) on one node with two GPUs.
+"""Run KVCR test plan v7 Phase 1 (TC-01 -> TC-06) on one node with two GPUs.
 
 Sequence:
   1. preflight        GPUs, shared memory, kernel (Guard), ports
-  2. reference        KVCR disabled worker; every prompt generated twice
+  2. reference        KVCR disabled worker; every prompt generated twice;
+                      perf prompts are also streamed cold + warm for the
+                      KVCR-disabled TTFT/TPOT baseline (TC-05)
   3. stack            per-worker kvcr_service (Guard) + KV router + 2 workers
-  4. cases            TC-01, TC-02, TC-03 same-node, TC-04 (Guard only)
+  4. cases            TC-01, TC-02, TC-03 same-node, TC-04 (Guard only),
+                      TC-05 perf (cold/local/remote), TC-06 Guard recovery timing
   5. evidence         result.json, junit.xml, all requests/responses/logs
 
 Exit status is 0 only when every selected case is PASS. BLOCKED cases are
@@ -33,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from phase1.cases import CASES, Context, Prompts, run_case  # noqa: E402
 from phase1.client import Client  # noqa: E402
+from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
 from phase1.common import (  # noqa: E402
     BLOCKED,
     FAIL,
@@ -47,6 +51,9 @@ from phase1.common import (  # noqa: E402
     write_junit,
 )
 from phase1.stack import GUARD, MODES, Settings, Stack  # noqa: E402
+
+CASES.update(PERF_CASES)
+PERF_CASE_NAMES = set(PERF_CASES)
 
 
 def provenance(args: argparse.Namespace) -> dict[str, Any]:
@@ -105,12 +112,15 @@ class Runner:
             state_agent=not args.no_state_agent,
             readiness_timeout=args.readiness_timeout,
             request_timeout=args.request_timeout,
+            extra_worker_args=list(args.worker_arg),
         )
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
         self.tag = args.prompt_tag or uuid.uuid4().hex[:12]
-        self.prompts = Prompts(self.tag)
+        self.prompts = Prompts(self.tag, perf_count=args.perf_repeats)
         self.references: dict[str, TokenSample] = {}
+        self.baseline_timings: dict[str, Any] = {}
+        self.wants_perf = bool(PERF_CASE_NAMES & set(args.cases))
         self.result: dict[str, Any] = {
             "plan": "KVCR Test Plan v7, Phase 1 (Guard-mode critical path)",
             "started_at": utc_now(),
@@ -120,6 +130,12 @@ class Runner:
             "model": args.model,
             "prompt_tag": self.tag,
             "max_tokens": args.max_tokens,
+            "perf": {
+                "repeats": args.perf_repeats,
+                "max_tokens": args.perf_max_tokens,
+                "concurrency": args.perf_concurrency,
+            },
+            "worker_args": list(args.worker_arg),
             "batch_invariant": args.batch_invariant,
             "state_agent": not args.no_state_agent,
             "selected_cases": list(args.cases),
@@ -167,11 +183,35 @@ class Runner:
         bypass = "--kv-transfer-config" not in launch["command"]
         samples: dict[str, list[TokenSample]] = {}
         unstable = []
+        perf_names = set(self.prompts.perf_names()) if self.wants_perf else set()
         for name, prompt in self.prompts.all().items():
             runs = []
+            if name in perf_names:
+                # First contact with this prompt: KVCR-disabled cold TTFT/TPOT.
+                # Second stream: vLLM's own prefix-cache hit, the natural
+                # comparison for KVCR's local hit. Both must reproduce tokens.
+                timings: dict[str, Any] = {}
+                for kind in ("cold", "warm"):
+                    streamed = client.stream_completion(
+                        f"ref-{name}-{kind}",
+                        prompt,
+                        worker=stack.worker_ids[0],
+                        max_tokens=self.args.perf_max_tokens,
+                        extra_fields=STREAM_FIELDS,
+                    )
+                    if not streamed.ok:
+                        raise ValidationError(
+                            f"reference stream {name} ({kind}) failed: {streamed.error}"
+                        )
+                    timings[kind] = streamed.metrics()
+                    runs.append(streamed.sample())
+                self.baseline_timings[name] = timings
             for repeat in (1, 2):
                 response = client.completion(
-                    f"ref-{name}-{repeat}", prompt, worker=stack.worker_ids[0]
+                    f"ref-{name}-{repeat}",
+                    prompt,
+                    worker=stack.worker_ids[0],
+                    max_tokens=self.args.perf_max_tokens if name in perf_names else None,
                 )
                 if not response.ok or response.body is None:
                     raise ValidationError(
@@ -179,10 +219,17 @@ class Runner:
                     )
                 runs.append(extract_sample(response.body))
             samples[name] = runs
-            if compare_tokens(runs[0], runs[1]):
+            # The non-streaming runs carry prompt IDs; streamed runs may not.
+            canonical = runs[-1]
+            mismatched = [
+                run
+                for run in runs
+                if [p for p in compare_tokens(canonical, run) if "prompt token IDs" not in p]
+            ]
+            if mismatched:
                 unstable.append(name)
             else:
-                self.references[name] = runs[0]
+                self.references[name] = canonical
         kvcr_mentions = len(re.findall(r"(?i)kvcr", worker.log_text()))
         kvcr_lines = [
             line[:200]
@@ -195,7 +242,7 @@ class Runner:
             "kvcr_lines_in_worker_log": kvcr_lines,
             "prompts": {
                 name: {
-                    "prompt_tokens": runs[0].prompt_token_ids.__len__(),
+                    "prompt_tokens": max(len(run.prompt_token_ids) for run in runs),
                     "completion_tokens": [run.length for run in runs],
                     "finish_reason": [run.finish_reason for run in runs],
                     "stable": name not in unstable,
@@ -207,6 +254,9 @@ class Runner:
             evidence / "reference-tokens.json",
             {name: sample.__dict__ for name, sample in self.references.items()},
         )
+        if self.baseline_timings:
+            self.result["reference"]["kvcr_disabled_timings"] = self.baseline_timings
+            save_json(evidence / "baseline-timings.json", self.baseline_timings)
         self.save()
         stack.stop(worker, stack.frontend)  # type: ignore[arg-type]
         stack.reset_discovery()
@@ -252,6 +302,9 @@ class Runner:
             index_wait=self.args.index_wait,
             telemetry_timeout=self.args.telemetry_timeout,
             recovery_timeout=self.args.recovery_timeout,
+            perf_max_tokens=self.args.perf_max_tokens,
+            perf_concurrency=self.args.perf_concurrency,
+            baseline_timings=self.baseline_timings,
         )
         for name in self.args.cases:
             self.check_deadline()
@@ -351,7 +404,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gpus", default="0,1", help="Two CUDA device indices, e.g. 0,1"
     )
-    parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04")
+    parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04,TC-05,TC-06")
     parser.add_argument("--http-port", type=int, default=8000)
     parser.add_argument("--reference-http-port", type=int, default=8001)
     parser.add_argument(
@@ -359,6 +412,21 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--compatibility-digest", default=None)
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument(
+        "--perf-repeats", type=int, default=5, help="perf prompts per arm (TC-05/06)"
+    )
+    parser.add_argument(
+        "--perf-max-tokens", type=int, default=128, help="output tokens per perf request"
+    )
+    parser.add_argument(
+        "--perf-concurrency", type=int, default=1, help="parallel perf requests per arm"
+    )
+    parser.add_argument(
+        "--worker-arg",
+        action="append",
+        default=[],
+        help="extra dynamo.vllm argument, repeatable (e.g. --worker-arg=--mamba-cache-mode=align)",
+    )
     parser.add_argument(
         "--prompt-tag", default=None, help="Fixed tag for reproducible prompts"
     )
@@ -409,6 +477,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--index-wait must be between 0 and 300 seconds")
     if not 1 <= args.max_tokens <= 512 or not 1 <= args.pool_gb <= 64:
         parser.error("--max-tokens must be 1..512 and --pool-gb 1..64")
+    if not 1 <= args.perf_repeats <= 32 or not 1 <= args.perf_max_tokens <= 2048:
+        parser.error("--perf-repeats must be 1..32 and --perf-max-tokens 1..2048")
+    if not 1 <= args.perf_concurrency <= 64:
+        parser.error("--perf-concurrency must be 1..64")
     if args.http_port == args.reference_http_port:
         parser.error("--http-port and --reference-http-port must differ")
     return args

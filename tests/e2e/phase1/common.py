@@ -210,3 +210,34 @@ def write_junit(output: Path, run: dict[str, Any]) -> None:
     ET.ElementTree(suite).write(
         output / "junit.xml", encoding="unicode", xml_declaration=True
     )
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    """Nearest-rank percentile; None for an empty list."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, int(round(fraction * len(ordered) + 0.5)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def summarize(values: list[float]) -> dict[str, Any]:
+    """n / median / p95 / min / max / mean, rounded, for a latency series."""
+    clean = [float(v) for v in values if v is not None]
+    if not clean:
+        return {"n": 0}
+    ordered = sorted(clean)
+    mid = len(ordered) // 2
+    median = (
+        ordered[mid]
+        if len(ordered) % 2
+        else (ordered[mid - 1] + ordered[mid]) / 2
+    )
+    return {
+        "n": len(ordered),
+        "median": round(median, 6),
+        "p95": round(percentile(ordered, 0.95) or 0.0, 6),
+        "min": round(ordered[0], 6),
+        "max": round(ordered[-1], 6),
+        "mean": round(sum(ordered) / len(ordered), 6),
+    }

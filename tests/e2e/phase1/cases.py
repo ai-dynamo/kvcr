@@ -56,6 +56,7 @@ class Prompts:
     """Deterministic prompt texts derived from one recorded run tag."""
 
     tag: str
+    perf_count: int = 5
 
     @staticmethod
     def section(tag: str, index: int) -> str:
@@ -108,8 +109,25 @@ class Prompts:
     def tc04_second(self) -> str:
         return self.prefix(self.tag + "j", 0, 80) + self.tail
 
+    # -- performance prompts (TC-05 / TC-06) --------------------------------
+    # Each perf sample needs its own never-seen prefix so the cold arm is
+    # really cold; the same prompt is then reused for the local and remote
+    # hit arms. Names are stable so reference tokens exist for every one.
+
+    def perf(self, index: int) -> str:
+        return self.prefix(f"{self.tag}p{index}", 0, 80) + self.tail
+
+    def perf_names(self) -> list[str]:
+        return [f"perf_{i}" for i in range(self.perf_count)]
+
+    def tc06(self, index: int) -> str:
+        return self.prefix(f"{self.tag}r{index}", 0, 80) + self.tail
+
+    def tc06_names(self) -> list[str]:
+        return [f"tc06_{i}" for i in range(self.perf_count)]
+
     def all(self) -> dict[str, str]:
-        return {
+        prompts = {
             name: getattr(self, name)
             for name in (
                 "tc01",
@@ -123,6 +141,10 @@ class Prompts:
                 "tc04_second",
             )
         }
+        for index in range(self.perf_count):
+            prompts[f"perf_{index}"] = self.perf(index)
+            prompts[f"tc06_{index}"] = self.tc06(index)
+        return prompts
 
 
 def parse_iso(stamp: str) -> datetime:
@@ -142,6 +164,9 @@ class Context:
         index_wait: float,
         telemetry_timeout: float,
         recovery_timeout: float,
+        perf_max_tokens: int = 128,
+        perf_concurrency: int = 1,
+        baseline_timings: dict[str, Any] | None = None,
     ) -> None:
         self.stack = stack
         self.client = client
@@ -150,6 +175,11 @@ class Context:
         self.index_wait = index_wait
         self.telemetry_timeout = telemetry_timeout
         self.recovery_timeout = recovery_timeout
+        self.perf_max_tokens = perf_max_tokens
+        self.perf_concurrency = perf_concurrency
+        # KVCR-disabled timings recorded during the reference phase, keyed by
+        # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
+        self.baseline_timings = baseline_timings or {}
 
     # -- request helpers ---------------------------------------------------
 
