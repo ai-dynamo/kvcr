@@ -2,7 +2,7 @@
 #SBATCH --job-name=doxu-kvcr-phase1
 #SBATCH --partition=general
 #SBATCH --gres=gpu:H100:2
-#SBATCH --constraint=2GPU
+#SBATCH --constraint="2GPU&x86_64"
 #SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=16
