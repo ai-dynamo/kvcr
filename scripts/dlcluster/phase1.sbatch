@@ -47,6 +47,14 @@ if ! command -v docker >/dev/null; then
   exit 3
 fi
 docker info --format 'docker {{.ServerVersion}} driver={{.Driver}} cgroup={{.CgroupDriver}}' | tee "$RUNS/docker.txt"
+# Containers run under dockerd, not the Slurm job cgroup: a cancelled earlier job
+# can leave a harness container holding the GPUs and ports. Sweep ours (node is
+# exclusive) and make sure this job's own container dies with the job.
+sweep() { docker ps -aq --filter label=io.ai-dynamo.kvcr.phase1-run | xargs -r docker rm -f >/dev/null 2>&1 || true; }
+leftover=$(docker ps -q --filter label=io.ai-dynamo.kvcr.phase1-run | wc -l)
+[[ "$leftover" -eq 0 ]] || log "removing $leftover leftover phase1 container(s)"
+sweep
+trap 'log "job ending (signal/exit); removing phase1 containers"; sweep' EXIT TERM INT
 df -h /tmp /var/lib/docker /dev/shm | tee -a "$RUNS/docker.txt"
 docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}} {{.CreatedSince}}' | grep -i kvcr | tee "$RUNS/images-before.txt" || true
 
