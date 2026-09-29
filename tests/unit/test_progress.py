@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _ProgressOp
 from kvcr.types import MemDescriptor
 
@@ -100,6 +101,74 @@ def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
     )
     progress._nixl_agent = agent
     return progress
+
+
+@pytest.mark.parametrize("activate", [False, True])
+def test_prepare_registers_memory_before_backend_activation(
+    monkeypatch, activate
+) -> None:
+    events: list[str] = []
+
+    class Agent:
+        def register_memory(self, _descs, mem_type="DRAM"):
+            events.append(f"register:{mem_type}")
+            return 1
+
+        def deregister_memory(self, _handle):
+            events.append("deregister")
+
+        def get_agent_metadata(self):
+            events.append("metadata")
+            return b"metadata"
+
+    monkeypatch.setattr(progress_module, "nixl_agent_config", lambda **_: {})
+    monkeypatch.setattr(progress_module, "nixl_agent", lambda *_: Agent())
+    progress = _KVCRProgress(
+        lambda _: events.append("initialize"),
+        lambda _, __: ({}, False),
+        list,
+        lambda: events.append("close"),
+        nixl_agent_name="guard",
+        nixl_listen_port=0,
+        memory_regions=((1, 4096),),
+    )
+
+    progress.prepare()
+    assert events == ["register:DRAM"]
+
+    if activate:
+        progress.start()
+        assert events[:3] == ["register:DRAM", "initialize", "metadata"]
+    progress.close()
+    assert "deregister" in events
+    if not activate:
+        assert "initialize" not in events and "metadata" not in events
+
+
+def test_close_drains_queued_submissions(monkeypatch) -> None:
+    entered, resume, stopping = (threading.Event() for _ in range(3))
+    received = []
+
+    def poll(_progress, items):
+        entered.set()
+        assert resume.wait(5)
+        received.extend(items)
+        return {}, False
+
+    progress = _KVCRProgress(lambda _: None, poll, list, lambda: None)
+    progress.start()
+    assert entered.wait(5)
+    progress.submit("queued")
+    monkeypatch.setattr(progress._activate, "set", stopping.set)
+    closer = threading.Thread(target=progress.close)
+    closer.start()
+    try:
+        assert stopping.wait(5)
+    finally:
+        resume.set()
+        closer.join(5)
+    assert not closer.is_alive()
+    assert received == ["queued"]
 
 
 @pytest.mark.parametrize(
@@ -325,6 +394,7 @@ def test_progress_cleanup_continues_after_operation_close_failure(
         lambda: cleaned.append("backend"),
     )
     progress._stop_requested = True
+    progress._activate.set()
 
     def fail_operation_cleanup() -> None:
         raise RuntimeError("operation cleanup failed")
