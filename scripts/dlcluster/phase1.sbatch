@@ -23,6 +23,8 @@
 #   KVCR_CASES    cases per run (default TC-01..TC-06)
 #   KVCR_TIMEOUT  harness timeout per run in seconds (default 3600)
 #   KVCR_IMAGE    optional existing local image to reuse instead of building
+#   KVCR_EXTRA    optional extra run_phase1.sh args for every config, e.g.
+#                 "--harness-arg=--batch-invariant"
 set -euo pipefail
 
 : "${KVCR_BUNDLE:?}" "${KVCR_REF:?}"
@@ -117,10 +119,11 @@ PY
 }
 
 for cfg in $MATRIX; do
+  # shellcheck disable=SC2086
   case $cfg in
-    dense)  run_config dense  --harness-arg=--model=Qwen/Qwen3-0.6B ;;
+    dense)  run_config dense  --harness-arg=--model=Qwen/Qwen3-0.6B ${KVCR_EXTRA:-} ;;
     hybrid) run_config hybrid --harness-arg=--model=Qwen/Qwen3.5-0.8B \
-                              --harness-arg=--worker-arg=--mamba-cache-mode=align ;;
+                              --harness-arg=--worker-arg=--mamba-cache-mode=align ${KVCR_EXTRA:-} ;;
     *) log "unknown config $cfg"; exit 5 ;;
   esac
 done
