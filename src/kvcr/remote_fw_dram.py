@@ -32,6 +32,7 @@ from .core import (
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
 from .local_dram import _LocalDramState
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
+from .span_layout import select_delivery_spans
 from .types import (
     BlockKey,
     MemDescriptor,
@@ -201,6 +202,8 @@ class _TargetPullOp(_RemoteOp):
                 self.remote_ctrl_ep,
                 {
                     "type": "start_write",
+                    # Fetch fills a whole object; only deliver may project it.
+                    "allow_layout_subset": not self.local_fill,
                     "op_handle": self.op_id[1],
                     "remaining_timeout_ms": (self.deadline - now) * 1000,
                     "source_incarnation": self.source_incarnation,
@@ -339,6 +342,7 @@ class _SourcePinOp(_Op):
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
     route: tuple[str, int] = ("", 0)
+    allow_layout_subset: bool = False
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -1231,6 +1235,7 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=dst_descriptors,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
+            allow_layout_subset=payload.get("allow_layout_subset") is True,
         )
         if not self._try_local_source_write(progress, source_pin):
             self._progress_outbound.append(source_pin)
@@ -1241,25 +1246,28 @@ class _RemoteFWDram:
         kvcr = self._kvcr
         if kvcr._local_dram is None:
             return False
-        layouts = [
-            [descriptor.info for descriptor in destination]
-            for destination in source_pin.dst_descriptors
-        ]
         if not kvcr._state_lock.acquire(blocking=False):
             # Use the caller queue on contention; add a progress-side
             # second attempt if contention makes this fallback too frequent.
             return False
         try:
-            for key, layout in zip(source_pin.ordered_keys, layouts):
+            selected_sources = {}
+            for key, destination in zip(
+                source_pin.ordered_keys, source_pin.dst_descriptors
+            ):
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
-                if (
-                    residency is None
-                    or residency.state is not _LocalDramState.READY
-                    or residency.layout != layout
-                ):
+                if residency is None or residency.state is not _LocalDramState.READY:
                     return False
-            sources = kvcr._claim_local_dram_sources(
+                selected = select_delivery_spans(
+                    kvcr._local_dram._descriptors(residency.slots),
+                    destination,
+                    allow_subset=source_pin.allow_layout_subset,
+                )
+                if selected is None:
+                    return False
+                selected_sources[key] = selected
+            kvcr._claim_local_dram_sources(
                 source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
             )
             kvcr._add_block_dependencies(source_pin, new_operation=True)
@@ -1276,15 +1284,35 @@ class _RemoteFWDram:
             op_handle=source_pin.op_handle,
             source_keys=source_pin.ordered_keys,
             src_descriptors=tuple(
-                tuple(sources[key]) for key in source_pin.ordered_keys
+                selected_sources[key] for key in source_pin.ordered_keys
             ),
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
             _backend=self,
         )
-        progress.submit(source_write)
+        self._submit_source_write_inline(progress, source_write)
         return True
+
+    def _submit_source_write_inline(
+        self, progress: _KVCRProgress, source_write: _SourceWriteOp
+    ) -> None:
+        """Start progress-owned writes while decoding peer control messages.
+
+        Posting early layers now overlaps their transfer with decoding later
+        layers instead of taking another submission-queue round trip. Claims
+        still return through poll_main for normal dependency/ownership cleanup.
+        Only the progress thread may call this helper.
+        """
+        if source_write.op_id in progress._in_flight_ops:
+            raise RuntimeError(
+                f"duplicate KVCR source operation {source_write.op_id!r}"
+            )
+        done, _ = source_write.progress(progress, None)
+        if done:
+            self._progress_outbound.append(source_write)
+        else:
+            progress._in_flight_ops[source_write.op_id] = source_write
 
     def _submit_prepared_source_write(
         self,
@@ -1314,20 +1342,23 @@ class _RemoteFWDram:
         }
         sources = {} if force_failure else {**framework_sources, **local_sources}
         completed_indices = []
+        selected_sources = {}
         for index, key in enumerate(source_pin.ordered_keys):
             source = sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if source is None:
                 continue
-            if [descriptor.info for descriptor in source] != [
-                descriptor.info for descriptor in destination
-            ]:
+            selected = select_delivery_spans(
+                source, destination, allow_subset=source_pin.allow_layout_subset
+            )
+            if selected is None:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",
                     source_pin.op_handle,
                     key,
                 )
                 continue
+            selected_sources[key] = selected
             completed_indices.append(index)
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
@@ -1371,7 +1402,7 @@ class _RemoteFWDram:
             _backend=self,
             framework_pins=framework_pins,
             source_keys=completed_keys,
-            src_descriptors=tuple(tuple(sources[key]) for key in completed_keys),
+            src_descriptors=tuple(selected_sources[key] for key in completed_keys),
             completed_indices=tuple(completed_indices),
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)

@@ -207,6 +207,37 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     ]
 
 
+def test_local_delivery_can_project_one_named_span_and_hold_whole_object() -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
+    source = ctypes.create_string_buffer(b"aaaaaaaaBBBBBBBB", 16)
+    target = ctypes.create_string_buffer(8)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    with closing(_two_pool_kvcr(agent, pools)) as kvcr:
+        key = BlockKey(b"object")
+        op = kvcr.deposit(
+            {
+                key: [
+                    _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+                    _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+                ]
+            }
+        )
+        _poll_until(kvcr, lambda done: op in dict(done))
+        agent.state = "PROC"
+        op = kvcr.deliver(
+            {key: [_mem_descriptor(ctypes.addressof(target), 8, info="swa")]}
+        )
+        _wait_until(lambda: len(agent.transfers) == 2)
+        residency = kvcr._core._block_record_map[key].local_dram
+        assert residency.claim_count == 1
+        assert len(residency.slots) == 2
+        agent.state = "DONE"
+        assert dict(_poll_until(kvcr, lambda done: op in dict(done)))[op][key].success
+        assert target.raw == b"BBBBBBBB"
+        assert residency.claim_count == 0
+
+
 def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
     source = ctypes.create_string_buffer(16)
@@ -294,6 +325,67 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
+
+
+def test_disjoint_layout_eviction_skips_unrelated_pool(monkeypatch) -> None:
+    pools = [ctypes.create_string_buffer(8 * 128), ctypes.create_string_buffer(8)]
+    source = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    with closing(_two_pool_kvcr(agent, pools)) as kvcr:
+        full = [BlockKey(f"full{i}".encode()) for i in range(128)]
+        swa = BlockKey(b"swa")
+        spans = [
+            _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+            _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+        ]
+        op = kvcr.deposit({**{key: spans[:1] for key in full}, swa: spans[1:]})
+        _poll_until(kvcr, lambda done: op in dict(done))
+        local = kvcr._core._local_dram
+        # A public claim removes an entry from both indexes; release restores it.
+        fetch = kvcr.fetch([swa], expected_layout=["swa"])
+        claim = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))[fetch][swa]
+        assert ("swa",) not in local._evictable_by_layout
+        kvcr.release([claim.release_handle])
+        assert len(local._evictable_by_layout[("swa",)]) == 1
+        pops = Mock(wraps=heapq.heappop)
+        monkeypatch.setattr(heapq, "heappop", pops)
+        for i in range(8):
+            key = BlockKey(f"replacement{i}".encode())
+            op = kvcr.deposit({key: spans[1:]})
+            assert dict(_poll_until(kvcr, lambda done: op in dict(done)))[op][
+                key
+            ].success
+        assert pops.call_count == 8
+        assert kvcr.query(full) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 128
+        assert len(local._evictable_by_layout[("swa",)]) == 1
+        assert len(local._evictable) == 129
+
+
+def test_overlapping_layout_keeps_global_victim_order() -> None:
+    pools = [ctypes.create_string_buffer(16), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    with closing(_two_pool_kvcr(agent, pools)) as kvcr:
+        grouped, single, replacement = map(BlockKey, (b"grouped", b"single", b"new"))
+        spans = [
+            _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+            _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+        ]
+        for key, descriptors in ((grouped, spans), (single, spans[1:])):
+            op = kvcr.deposit({key: descriptors})
+            _poll_until(kvcr, lambda done: op in dict(done))
+        op = kvcr.deposit({replacement: spans[1:]})
+        assert dict(_poll_until(kvcr, lambda done: op in dict(done)))[op][
+            replacement
+        ].success
+        # The older grouped object must win, even though an exact queue exists.
+        assert kvcr.query([grouped, single]) == [
+            (QueryStatus.MISS, None),
+            (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        ]
+        assert ("full", "swa") not in kvcr._core._local_dram._evictable_by_layout
 
 
 def test_eviction_heap_compaction_preserves_active_candidates() -> None:

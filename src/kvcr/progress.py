@@ -101,6 +101,9 @@ class _KVCRProgress:
         self._close = close
         self._batch_size = batch_size or sys.maxsize
         self._nixl_agent_name = nixl_agent_name
+        # Opt-in diagnostics only. Avoid summing descriptor bytes on the normal
+        # hot path; native NIXL/UCX logs determine the actual transport selected.
+        self._trace_nixl = os.environ.get("NIXL_LOG_LEVEL", "").upper() == "DEBUG"
         self._nixl_agent: Any | None = None
         self._active_transfers: dict[int, _TransferState] = {}
         self._next_transfer_id = 0
@@ -209,6 +212,26 @@ class _KVCRProgress:
         if not isinstance(remote_side_agent, (str, bytes)) or not remote_side_agent:
             raise ValueError("NIXL remote-side agent must be non-empty")
         agent = self.nixl_agent
+        if self._trace_nixl:
+            peer_name = (
+                remote_side_agent.decode("utf-8", errors="replace")
+                if isinstance(remote_side_agent, bytes)
+                else remote_side_agent
+            )
+            logger.info(
+                "KVCR NIXL submit agent=%s peer=%s same_agent=%s op=%s "
+                "requested_backend=%s local_mem=%s remote_mem=%s "
+                "spans=%d bytes=%d",
+                self._nixl_agent_name,
+                peer_name,
+                peer_name == self._nixl_agent_name,
+                operation,
+                backend or "auto",
+                local_descriptors[0].mem_type,
+                remote_descriptors[0].mem_type,
+                len(local_descriptors),
+                sum(desc.size for desc in local_descriptors),
+            )
         handle = agent.initialize_xfer(
             operation,
             self._make_transfer_descriptors(local_descriptors),
@@ -476,6 +499,18 @@ class _KVCRProgress:
                     backends=self._dram_backends,
                 ),
             )
+            if self._trace_nixl:
+                logger.info(
+                    "KVCR NIXL initialized agent=%s num_threads=4 backends=%s "
+                    "region_count=%d UCX_TLS=%s UCX_LOG_LEVEL=%s "
+                    "UCX_PROTO_INFO=%s",
+                    self._nixl_agent_name,
+                    self._dram_backends,
+                    len(self._memory_regions),
+                    os.environ.get("UCX_TLS", "<default>"),
+                    os.environ.get("UCX_LOG_LEVEL", "<default>"),
+                    os.environ.get("UCX_PROTO_INFO", "<default>"),
+                )
 
     def _register_memory_regions(self) -> None:
         """Register every framework and pool region, one NIXL call per endpoint.

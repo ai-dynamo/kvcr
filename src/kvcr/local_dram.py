@@ -23,6 +23,7 @@ from .device_copy import (
 )
 from .policy_runtime import _EvictionQueue
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
+from .span_layout import delivery_indices
 from .types import (
     BlockKey,
     CacheTier,
@@ -272,6 +273,11 @@ class _LocalDram:
         ):
             raise ValueError("local DRAM pools must not overlap")
         self._evictable = _EvictionQueue()
+        # Most framework object layouts use disjoint physical subpools. Keep
+        # the global policy queue for arbitrary overlapping layouts, but also
+        # index evictable entries by exact layout so a full hybrid-model pool
+        # does not repeatedly scan victims belonging to every other pool.
+        self._evictable_by_layout: dict[tuple[str, ...], _EvictionQueue] = {}
         self._evictable_slots: Counter[str] = Counter()
         self._unscored: set[BlockKey] = set()
         self._pending_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -481,6 +487,18 @@ class _LocalDram:
             started_at=self._kvcr._timer(),
         )
         self._next_copy_id += 1
+        # Claims and completion checks retain the whole residency, but a
+        # delivery can copy just its uniquely named layer spans.
+        if not fill:
+            projected_slots = []
+            for _, object_slots, spans in entries:
+                indices = delivery_indices(
+                    tuple(name for name, _ in object_slots),
+                    tuple(span.info for span in spans),
+                )
+                assert indices is not None  # Validated before acquiring the claim.
+                projected_slots.append(tuple(object_slots[index] for index in indices))
+            slots = tuple(projected_slots)
         engine = self._device_copy
         if engine is None or framework[0].mem_type != "VRAM":
             slot_spans = tuple(self._descriptors(chain.from_iterable(slots)))
@@ -965,7 +983,10 @@ class _LocalDram:
                 continue
             elif (
                 residency.state is _LocalDramState.DISCARDING
-                or residency.layout != list(map(_info, op.destinations[key]))
+                or delivery_indices(
+                    tuple(residency.layout), tuple(map(_info, op.destinations[key]))
+                )
+                is None
                 or now >= op.deadline
             ):
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -1236,7 +1257,23 @@ class _LocalDram:
                 if (missing := required[name] - len(free_slots[name]) - freed[name]) > 0
             }
 
-        with closing(self._evictable.candidates(protected)) as candidates:
+        requested_layout = tuple(pool_names)
+        candidates_queue = self._evictable
+        exact_queue = self._evictable_by_layout.get(requested_layout)
+        if exact_queue is not None:
+            # The exact-layout fast path is policy-equivalent only when every
+            # currently evictable entry that could satisfy this deficit has
+            # that layout. Fall back to the global queue for overlapping
+            # layouts, preserving the generic KVCR placement contract.
+            overlapping_layouts = (
+                layout
+                for layout, queue in self._evictable_by_layout.items()
+                if len(queue) and not deficit.keys().isdisjoint(layout)
+            )
+            if all(layout == requested_layout for layout in overlapping_layouts):
+                candidates_queue = exact_queue
+
+        with closing(candidates_queue.candidates(protected)) as candidates:
             while deficit:
                 key = next(candidates, None)
                 if key is None:
@@ -1309,11 +1346,22 @@ class _LocalDram:
             return
         self._unscored.discard(key)
         self._evictable.insert(key, score)
+        layout = tuple(record.local_dram.layout)
+        self._evictable_by_layout.setdefault(layout, _EvictionQueue()).insert(
+            key, score
+        )
         self._evictable_slots.update(name for name, _ in record.local_dram.slots)
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)
-        if self._evictable.remove(key):
+        removed = self._evictable.remove(key)
+        layout = tuple(residency.layout)
+        layout_queue = self._evictable_by_layout.get(layout)
+        if layout_queue is not None:
+            layout_queue.remove(key)
+            if not len(layout_queue):
+                self._evictable_by_layout.pop(layout, None)
+        if removed:
             self._evictable_slots.subtract(name for name, _ in residency.slots)
 
     def _retry_unscored(self) -> None:

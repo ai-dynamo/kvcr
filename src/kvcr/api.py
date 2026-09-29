@@ -153,7 +153,15 @@ class KVCR:
         blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None = None,
     ) -> OpHandle:
-        """Asynchronously deliver blocks to caller-provided destinations."""
+        """Asynchronously deliver blocks to caller-provided destinations.
+
+        Destinations may select an ordered subset of a stored object's spans
+        when all source and destination ``info`` names are unique and nonempty.
+        Each selected span must retain its configured byte size. Repeated or
+        unnamed layouts still require an exact match. This does not change
+        deposit/fetch object identity, and query does not reserve a source:
+        callers must handle eviction before delivery starts as a failed entry.
+        """
         return self._core.deliver(blocks, request_id)
 
     def deposit(
