@@ -1291,8 +1291,28 @@ class _RemoteFWDram:
             route=source_pin.route,
             _backend=self,
         )
-        progress.submit(source_write)
+        self._submit_source_write_inline(progress, source_write)
         return True
+
+    def _submit_source_write_inline(
+        self, progress: _KVCRProgress, source_write: _SourceWriteOp
+    ) -> None:
+        """Start progress-owned writes while decoding peer control messages.
+
+        Posting early layers now overlaps their transfer with decoding later
+        layers instead of taking another submission-queue round trip. Claims
+        still return through poll_main for normal dependency/ownership cleanup.
+        Only the progress thread may call this helper.
+        """
+        if source_write.op_id in progress._in_flight_ops:
+            raise RuntimeError(
+                f"duplicate KVCR source operation {source_write.op_id!r}"
+            )
+        done, _ = source_write.progress(progress, None)
+        if done:
+            self._progress_outbound.append(source_write)
+        else:
+            progress._in_flight_ops[source_write.op_id] = source_write
 
     def _submit_prepared_source_write(
         self,

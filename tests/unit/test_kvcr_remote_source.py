@@ -55,6 +55,21 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     )
 
 
+@pytest.mark.parametrize("done", [True, False])
+def test_inline_source_write_preserves_completion_ownership(done):
+    backend = _RemoteFWDram.__new__(_RemoteFWDram)
+    backend._progress_outbound = []
+    progress = SimpleNamespace(_in_flight_ops={})
+    op = SimpleNamespace(op_id=("source", 1), progress=Mock(return_value=(done, True)))
+    backend._submit_source_write_inline(progress, op)
+    op.progress.assert_called_once_with(progress, None)
+    assert backend._progress_outbound == ([op] if done else [])
+    assert progress._in_flight_ops == ({} if done else {op.op_id: op})
+    if not done:
+        with pytest.raises(RuntimeError, match="duplicate"):
+            backend._submit_source_write_inline(progress, op)
+
+
 def test_local_source_starts_without_caller_poll_and_holds_its_slot():
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(ctypes.addressof(memory))
