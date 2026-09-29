@@ -11,6 +11,7 @@ from .types import (
     BlockKey,
     InventoryEvent,
     LocalDramRegions,
+    MemDescriptor,
     PoolBlockLayouts,
 )
 
@@ -39,10 +40,7 @@ class LocalDramOptions:
     backend: str = "UCX"
 
 
-@dataclass(frozen=True)
-class FrameworkDramInput:
-    address: int
-    length: int
+FrameworkDramInput = list[MemDescriptor]
 
 
 # Early pinning optimization was considered, but its complexity outweighed the benefit.
@@ -66,7 +64,7 @@ class G3Options:
 
 @dataclass(frozen=True)
 class KVCRBackendConfigs:
-    framework_dram: FrameworkDramInput | None = None
+    framework_regions: FrameworkDramInput = field(default_factory=list)
     local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
     remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)

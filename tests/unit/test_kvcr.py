@@ -30,7 +30,6 @@ from kvcr import api as kvcr_api
 from kvcr import progress as kvcr_progress
 from kvcr import recovery_journal as kvcr_recovery
 from kvcr.config import (
-    FrameworkDramInput,
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
@@ -44,7 +43,7 @@ from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.memory import KVCRPoolSpec
 from kvcr.remote_fw_dram import _FwMemResidency
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, MemDescriptor
 
 
 def _fake_hold(**fields: Any) -> SimpleNamespace:
@@ -627,7 +626,11 @@ def test_nixl_lifecycle_stays_on_progress_thread(
             ),
         ),
         KVCRBackendConfigs(
-            framework_dram=FrameworkDramInput(128, 256),
+            framework_regions=[
+                MemDescriptor("target", "VRAM", 1024, 256, 2),
+                MemDescriptor("target", "DRAM", 128, 256, 0),
+                MemDescriptor("target", "VRAM", 4096, 256, 3),
+            ],
             local_dram=LocalDramOptions(
                 [("full", 384, 128), ("swa", 512, 64)], "LOCAL"
             ),
@@ -645,9 +648,13 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     assert len(set(lifecycle_threads)) == 1
     assert lifecycle_threads[0] != main_thread
     assert agent.registrations == [
-        ([(128, 256, 0, ""), (384, 128, 0, ""), (512, 64, 0, "")], "DRAM"),
+        ([(1024, 256, 2, "")], "VRAM"),
+        ([(128, 256, 0, "")], "DRAM"),
+        ([(4096, 256, 3, "")], "VRAM"),
+        ([(384, 128, 0, "")], "DRAM"),
+        ([(512, 64, 0, "")], "DRAM"),
     ]
-    assert agent.deregistered == [1]
+    assert agent.deregistered == [5, 4, 3, 2, 1]
 
 
 @pytest.fixture

@@ -33,7 +33,6 @@ from _kvcr_test_utils import (
 from kvcr import KVCR, KVCRBindings, KVCRClient
 from kvcr import progress as kvcr_progress
 from kvcr.config import (
-    FrameworkDramInput,
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
@@ -45,7 +44,7 @@ from kvcr.guard import _Guard
 from kvcr.kvcr_service import _KVCRService
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.recovery_journal import RecoveryJournal, _recovery_frames, read_handback
-from kvcr.types import BlockKey, CacheTier, QueryStatus
+from kvcr.types import BlockKey, CacheTier, MemDescriptor, QueryStatus
 
 _TIMEOUT_SECONDS = 5
 # A real NIXL agent and its UCX backend dominate a child's startup.
@@ -135,10 +134,18 @@ def _make_kvcr(
                 ),
             ),
             KVCRBackendConfigs(
-                framework_dram=(
-                    FrameworkDramInput(ctypes.addressof(framework), len(framework))
+                framework_regions=(
+                    [
+                        MemDescriptor(
+                            agent_name,
+                            "DRAM",
+                            ctypes.addressof(framework),
+                            len(framework),
+                            0,
+                        )
+                    ]
                     if framework is not None
-                    else None
+                    else []
                 ),
                 g3=G3Options(
                     paths=(Path(g3_path),),
@@ -382,9 +389,15 @@ def test_promoted_guard_serves_real_nixl_transfers(
             ),
         ),
         KVCRBackendConfigs(
-            framework_dram=FrameworkDramInput(
-                ctypes.addressof(target_memory), len(target_memory)
-            ),
+            framework_regions=[
+                MemDescriptor(
+                    "real-target",
+                    "DRAM",
+                    ctypes.addressof(target_memory),
+                    len(target_memory),
+                    0,
+                )
+            ],
             remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
         ),
     )
@@ -575,9 +588,15 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
                 abandon_timeout_ms=10_000,
             ),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-            framework_dram=FrameworkDramInput(
-                ctypes.addressof(target_memory), len(target_memory)
-            ),
+            framework_regions=[
+                MemDescriptor(
+                    "target",
+                    "DRAM",
+                    ctypes.addressof(target_memory),
+                    len(target_memory),
+                    0,
+                )
+            ],
         )
         now = [0.0]
         target._core._clock = lambda: now[0]

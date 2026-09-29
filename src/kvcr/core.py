@@ -241,12 +241,12 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        framework_dram = backend_configs.framework_dram
-        memory_regions: list[tuple[int, int]] = []
-        if framework_dram is not None:
-            memory_regions.append((framework_dram.address, framework_dram.length))
+        memory_regions = list(backend_configs.framework_regions)
         if self._local_dram is not None:
-            memory_regions.extend(self._local_dram.memory_regions)
+            memory_regions.extend(
+                MemDescriptor(self.nixl_agent_name, "DRAM", address, size, 0)
+                for address, size in self._local_dram.memory_regions
+            )
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)

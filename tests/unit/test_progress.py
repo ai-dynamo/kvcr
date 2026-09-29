@@ -477,6 +477,22 @@ def test_startup_failure_is_reported_to_main() -> None:
     assert exc_info.value is expected
 
 
+def test_registration_failure_releases_preceding_memory_types(monkeypatch) -> None:
+    agent = _TransferAgent()
+    registrations = iter([1, None])
+    monkeypatch.setattr(
+        agent, "register_memory", lambda *_, **__: next(registrations), raising=False
+    )
+    progress = _transfer_progress(agent)
+    progress._memory_regions = (_mem(128), _mem(256, mem_type="VRAM"))
+
+    with pytest.raises(RuntimeError, match="failed to register VRAM memory"):
+        progress.start()
+
+    assert agent.deregistered == [1]
+    assert progress.is_quiescent()
+
+
 def test_loop_failure_is_reported_to_main() -> None:
     expected = RuntimeError("loop failed")
     stepped = threading.Event()
