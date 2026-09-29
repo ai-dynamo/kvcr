@@ -5,6 +5,7 @@
 #                               [--timeout 3600] [--nodelist NODE] [--partition P]
 #
 # Requires a clean, committed worktree: the image build refuses dirty source.
+# KVCR_CASES is passed colon-separated because sbatch --export splits on commas.
 set -euo pipefail
 HOST=dlcluster
 MATRIX="dense hybrid"; CASES=TC-01,TC-02,TC-03,TC-04,TC-05,TC-06; TIMEOUT=3600
@@ -26,5 +27,5 @@ bundle="kvcr-phase1-${ref:0:12}.bundle"
 git bundle create "/tmp/$bundle" HEAD >/dev/null
 scp -q "/tmp/$bundle" scripts/dlcluster/phase1.sbatch "$HOST:~/"
 ssh "$HOST" "mkdir -p ~/kvcr-runs && sbatch ${EXTRA[*]:-} \
-  --export=ALL,KVCR_BUNDLE=\$HOME/$bundle,KVCR_REF=$ref,KVCR_MATRIX='$MATRIX',KVCR_CASES=$CASES,KVCR_TIMEOUT=$TIMEOUT \
+  --export=ALL,KVCR_BUNDLE=\$HOME/$bundle,KVCR_REF=$ref,KVCR_MATRIX='$MATRIX',KVCR_CASES=${CASES//,/:},KVCR_TIMEOUT=$TIMEOUT \
   ~/phase1.sbatch"

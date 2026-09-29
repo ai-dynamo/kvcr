@@ -19,7 +19,8 @@ set -euo pipefail
 
 : "${KVCR_BUNDLE:?}" "${KVCR_REF:?}"
 MATRIX=${KVCR_MATRIX:-"dense hybrid"}
-CASES=${KVCR_CASES:-TC-01,TC-02,TC-03,TC-04,TC-05,TC-06}
+CASES=${KVCR_CASES:-TC-01:TC-02:TC-03:TC-04:TC-05:TC-06}
+CASES=${CASES//:/,}   # sbatch --export splits on commas, so submit.sh sends colons
 TIMEOUT=${KVCR_TIMEOUT:-3600}
 RUNS=/home/doxu/kvcr-runs/$SLURM_JOB_ID
 W=/tmp/doxu-kvcr-$SLURM_JOB_ID
