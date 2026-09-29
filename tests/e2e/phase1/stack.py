@@ -98,6 +98,10 @@ class Settings:
     compatibility_digest: str = ""
     batch_invariant: bool = False
     state_agent: bool = True
+    # KVCR's quick-start disables vLLM's hybrid KV cache manager. Models with
+    # non-attention layers (Qwen3.5 GDN, Mamba hybrids) cannot be unified into
+    # one KV group, so they need the manager kept on.
+    disable_hybrid_kv_cache_manager: bool = True
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
@@ -343,7 +347,11 @@ class Stack:
             "--max-model-len",
             str(self.settings.max_model_len),
             "--enable-prefix-caching",
-            "--disable-hybrid-kv-cache-manager",
+            *(
+                ["--disable-hybrid-kv-cache-manager"]
+                if self.settings.disable_hybrid_kv_cache_manager
+                else []
+            ),
             "--enforce-eager",
             "--gpu-memory-utilization",
             str(self.settings.gpu_memory_utilization),
