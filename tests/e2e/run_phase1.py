@@ -183,6 +183,7 @@ class Runner:
         bypass = "--kv-transfer-config" not in launch["command"]
         samples: dict[str, list[TokenSample]] = {}
         unstable = []
+        unstable_detail: dict[str, Any] = {}
         perf_names = set(self.prompts.perf_names()) if self.wants_perf else set()
         for name, prompt in self.prompts.all().items():
             runs = []
@@ -221,13 +222,27 @@ class Runner:
             samples[name] = runs
             # The non-streaming runs carry prompt IDs; streamed runs may not.
             canonical = runs[-1]
-            mismatched = [
-                run
-                for run in runs
-                if [p for p in compare_tokens(canonical, run) if "prompt token IDs" not in p]
-            ]
-            if mismatched:
+            labels = (["cold", "warm"] if name in perf_names else []) + ["1", "2"]
+            divergence = {}
+            for label, run in zip(labels, runs):
+                problems = [
+                    p for p in compare_tokens(canonical, run) if "prompt token IDs" not in p
+                ]
+                if problems:
+                    first = next(
+                        (
+                            i
+                            for i, (x, y) in enumerate(
+                                zip(canonical.completion_token_ids, run.completion_token_ids)
+                            )
+                            if x != y
+                        ),
+                        min(canonical.length, run.length),
+                    )
+                    divergence[label] = {"first_divergent_token": first, "problems": problems}
+            if divergence:
                 unstable.append(name)
+                unstable_detail[name] = divergence
             else:
                 self.references[name] = canonical
         kvcr_mentions = len(re.findall(r"(?i)kvcr", worker.log_text()))
@@ -238,6 +253,8 @@ class Runner:
         ][:10]
         self.result["reference"] = {
             "kvcr_disabled_in_launch": bypass,
+            "batch_invariant": self.settings.batch_invariant,
+            "unstable": unstable_detail,
             "kvcr_mentions_in_worker_log": kvcr_mentions,
             "kvcr_lines_in_worker_log": kvcr_lines,
             "prompts": {
