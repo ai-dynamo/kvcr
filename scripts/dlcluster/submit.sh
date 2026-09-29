@@ -9,7 +9,7 @@
 # KVCR_CASES is passed colon-separated because sbatch --export splits on commas.
 set -euo pipefail
 HOST=dlcluster
-MATRIX="dense hybrid"; CASES=TC-01,TC-02,TC-03,TC-04,TC-05,TC-06; TIMEOUT=3600; IMAGE=""; EXTRA_ARGS=""
+MATRIX="dense hybrid"; CASES=TC-01,TC-02,TC-03,TC-05,TC-04,TC-06; TIMEOUT=3600; IMAGE=""; EXTRA_ARGS=""
 EXTRA=()
 while [[ $# -gt 0 ]]; do
   case $1 in

@@ -187,6 +187,9 @@ class Runner:
         unstable = []
         unstable_detail: dict[str, Any] = {}
         perf_names = set(self.prompts.perf_names()) if self.wants_perf else set()
+        # TC-06 prompts are generated with the perf token budget too, but need no
+        # KVCR-disabled timing baseline.
+        long_names = perf_names | (set(self.prompts.tc06_names()) if self.wants_perf else set())
         for name, prompt in self.prompts.all().items():
             runs = []
             if name in perf_names:
@@ -214,7 +217,7 @@ class Runner:
                     f"ref-{name}-{repeat}",
                     prompt,
                     worker=stack.worker_ids[0],
-                    max_tokens=self.args.perf_max_tokens if name in perf_names else None,
+                    max_tokens=self.args.perf_max_tokens if name in long_names else None,
                 )
                 if not response.ok or response.body is None:
                     raise ValidationError(

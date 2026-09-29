@@ -29,7 +29,10 @@ set -euo pipefail
 
 : "${KVCR_BUNDLE:?}" "${KVCR_REF:?}"
 MATRIX=${KVCR_MATRIX:-"dense hybrid"}
-CASES=${KVCR_CASES:-TC-01:TC-02:TC-03:TC-04:TC-05:TC-06}
+# TC-05 runs before TC-04 on purpose: TC-04 replaces worker 0 at the same endpoint
+# and the first peer transfer afterwards fails (KVCR stale-peer bug), which would
+# pollute the remote-hit latency sample. Numbering is unchanged.
+CASES=${KVCR_CASES:-TC-01:TC-02:TC-03:TC-05:TC-04:TC-06}
 CASES=${CASES//:/,}   # sbatch --export splits on commas, so submit.sh sends colons
 TIMEOUT=${KVCR_TIMEOUT:-3600}
 RUNS=/home/doxu/kvcr-runs/$SLURM_JOB_ID
