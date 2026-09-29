@@ -199,11 +199,7 @@ class KVCR:
         return self._core.get_stats()
 
     def close(self) -> None:
-        """Stop progress and release controller-held resources.
-
-        A core that failed to close but reached quiescence still gives the pool
-        back: nothing is moving through it.
-        """
+        """Stop progress and release controller-held resources."""
         try:
             self._core.close()
         except BaseException:

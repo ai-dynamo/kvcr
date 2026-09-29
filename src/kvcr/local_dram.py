@@ -761,19 +761,29 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.FILLING:
                 continue
-            elif (
-                residency.state is _LocalDramState.DISCARDING
-                or residency.layout
-                != [descriptor.info for descriptor in op.destinations[key]]
-                or now >= op.deadline
-            ):
+            elif residency.state is _LocalDramState.DISCARDING or now >= op.deadline:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             else:
+                sources = residency.slots
+                layout = residency.layout
+                destination = [span.info for span in op.destinations[key]]
+                if layout != destination:
+                    # Partial deliveries select unique named spans in stored order.
+                    names = set(destination)
+                    sources = [slot for slot in sources if slot[0] in names]
+                    if (
+                        "" in layout
+                        or len(set(layout)) != len(layout)
+                        or [name for name, _ in sources] != destination
+                    ):
+                        op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                        continue
                 self._acquire_claim(key, residency)
                 op.active_keys.add(key)
                 copy_keys.append(key)
+                # Claims and completion checks retain the whole residency.
                 local_slots.append(tuple(residency.slots))
-                src_descriptors.extend(self._descriptors(residency.slots))
+                src_descriptors.extend(self._descriptors(sources))
                 dst_descriptors.extend(op.destinations[key])
 
         self._update_capacity_pressure()

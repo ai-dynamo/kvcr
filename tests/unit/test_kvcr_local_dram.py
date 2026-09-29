@@ -207,6 +207,101 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "source_layout,destination_layout,expected",
+    [
+        (("a", "b", "c"), ("b",), b"BBBBBBBB"),
+        (("a", "b", "c"), ("a", "c"), b"AAAAAAAACCCCCCCC"),
+        (("a", "b", "c"), ("c", "a"), None),
+        (("a", "b"), ("b", "a"), None),
+        (("a", "b", "c"), ("a", "a"), None),
+        (("a", "b"), ("missing",), None),
+        (("a", "a", "b"), ("b",), None),
+        (("", ""), ("",), None),
+        (("a", "a"), ("a", "a"), b"AAAAAAAABBBBBBBB"),
+        (("", ""), ("", ""), b"AAAAAAAABBBBBBBB"),
+    ],
+)
+def test_local_delivery_selects_only_unambiguous_ordered_spans(
+    source_layout, destination_layout, expected
+) -> None:
+    names = dict.fromkeys((*source_layout, *destination_layout))
+    pools = [ctypes.create_string_buffer(24) for _ in names]
+    source = ctypes.create_string_buffer(b"AAAAAAAABBBBBBBBCCCCCCCC", 24)
+    target = ctypes.create_string_buffer(b"?" * (8 * len(destination_layout)))
+    before = target.raw
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    config = KVCRConfig(
+        nixl_agent_name="target", pool_layouts=[(name, 8) for name in names]
+    )
+    with closing(_two_pool_kvcr(agent, pools, config)) as kvcr:
+        key = BlockKey(b"object")
+        deposit = kvcr.deposit(
+            {
+                key: [
+                    _mem_descriptor(ctypes.addressof(source) + 8 * i, 8, info=name)
+                    for i, name in enumerate(source_layout)
+                ]
+            }
+        )
+        _poll_until(kvcr, lambda done: deposit in dict(done))
+        deliver = kvcr.deliver(
+            {
+                key: [
+                    _mem_descriptor(ctypes.addressof(target) + 8 * i, 8, info=name)
+                    for i, name in enumerate(destination_layout)
+                ]
+            }
+        )
+        result = dict(_poll_until(kvcr, lambda done: deliver in dict(done)))[deliver]
+        assert result[key].success is (expected is not None)
+        assert target.raw == (before if expected is None else expected + b"\0")
+
+
+def test_fetch_claim_protects_whole_object_across_partial_deliveries() -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
+    source = ctypes.create_string_buffer(b"aaaaaaaaBBBBBBBB", 16)
+    target = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    with closing(_two_pool_kvcr(agent, pools)) as kvcr:
+        key, replacement = BlockKey(b"object"), BlockKey(b"replacement")
+        sources = [
+            _mem_descriptor(ctypes.addressof(source), 8, info="full"),
+            _mem_descriptor(ctypes.addressof(source) + 8, 8, info="swa"),
+        ]
+        deposit = kvcr.deposit({key: sources})
+        _poll_until(kvcr, lambda done: deposit in dict(done))
+        fetch = kvcr.fetch([key], expected_layout=["full", "swa"])
+        claim = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))[fetch][key]
+        residency = kvcr._core._block_record_map[key].local_dram
+        for i, name in enumerate(("full", "swa")):
+            agent.state = "PROC"
+            deliver = kvcr.deliver(
+                {key: [_mem_descriptor(ctypes.addressof(target) + 8 * i, 8, info=name)]}
+            )
+            assert residency.claim_count == 2
+            assert len(residency.slots) == 2
+            blocked = kvcr.deposit({replacement: sources})
+            assert not dict(kvcr.poll_completed())[blocked][replacement].success
+            agent.state = "DONE"
+            result = dict(_poll_until(kvcr, lambda done: deliver in dict(done)))[
+                deliver
+            ]
+            assert result[key].success
+            assert residency.claim_count == 1
+            blocked = kvcr.deposit({replacement: sources})
+            assert not dict(kvcr.poll_completed())[blocked][replacement].success
+        assert target.raw == b"aaaaaaaaBBBBBBBB"
+        kvcr.release([claim.release_handle])
+        deposit = kvcr.deposit({replacement: sources})
+        assert dict(_poll_until(kvcr, lambda done: deposit in dict(done)))[deposit][
+            replacement
+        ].success
+        assert kvcr.query([key]) == [(QueryStatus.MISS, None)]
+
+
 def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
     source = ctypes.create_string_buffer(16)
