@@ -853,9 +853,13 @@ class _Guard:
         self._resumable = False
         if self._failure is not None:
             raise self._failure
-        self._serve(self._recovery.take_for_promotion())
+        started = time.monotonic()
+        records = self._recovery.take_for_promotion()
+        self._serve(records, started, time.monotonic())
 
-    def _serve(self, records: dict[BlockKey, _BlockRecord]) -> None:
+    def _serve(
+        self, records: dict[BlockKey, _BlockRecord], started: float, drained: float
+    ) -> None:
         """Answer on this pool group's endpoint, with whatever came back from it.
 
         Serving nothing is still serving: answering refuses peers that staying
@@ -908,7 +912,9 @@ class _Guard:
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
         self._recovery.release_snapshot_region()
+        start_started = time.monotonic()
         core.start()
+        serving = time.monotonic()
         self._serving = True
         endpoint = self._pool_lease.bind_address
         control_endpoint = (
@@ -916,12 +922,17 @@ class _Guard:
         )
         logger.info(
             "KVCR_EVENT guard_promoted guard=%d pool=%s recovered_blocks=%d "
-            "agent=%s control=%s",
+            "agent=%s control=%s recovery_ms=%.3f setup_ms=%.3f "
+            "start_ms=%.3f promotion_ms=%.3f",
             self._guard_index,
             self._spec.pool_id,
             recovered_blocks,
             agent_name,
             control_endpoint,
+            (drained - started) * 1000,
+            (start_started - drained) * 1000,
+            (serving - start_started) * 1000,
+            (serving - started) * 1000,
         )
 
     def _hand_back(self) -> None:

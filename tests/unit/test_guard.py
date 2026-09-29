@@ -9,13 +9,15 @@ import os
 import queue
 import select
 import socket
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record, _wait_until
 
+from kvcr import guard as guard_module
 from kvcr.config import LocalDramOptions
 from kvcr.control_channels import KVCRServiceError, ZmqPeerControlChannel
 from kvcr.core import _BlockRecord
@@ -64,6 +66,21 @@ def _tier(
     backend: str = "UCX",
 ) -> _TierConfig:
     return _TierConfig([("", block_size_bytes)], g3, backend)
+
+
+@contextmanager
+def _phase_clock(*ticks: float):
+    """Drive the four promotion clock readings with known values.
+
+    Scoped to guard's own module reference so the real clock stays in place for
+    anything else, including the background thread checked later.
+    """
+    original = guard_module.time
+    guard_module.time = SimpleNamespace(monotonic=iter(ticks).__next__)
+    try:
+        yield
+    finally:
+        guard_module.time = original
 
 
 def _guard(spec: KVCRPoolSpec = _TEST_SPEC, failure_callback=None, **kwargs) -> _Guard:
@@ -330,7 +347,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
             guard._refuse_incompatible(_tier(16))
 
         promoted_records = guard._recovery.mirror._records
-        guard._promote()
+        with _phase_clock(10.0, 10.25, 10.75, 11.5):
+            guard._promote()
 
         assert journal.pending == []
         assert order == [
@@ -373,7 +391,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
                 _frame(fresh, _recovered_record(g2=[("", 0)], g3=7)),
             ]
         )
-        guard._promote()
+        with _phase_clock(10.0, 10.25, 10.75, 11.5):
+            guard._promote()
 
         assert len(set(agent_names)) == 2
         assert set(guard._recovery._g3_records) == {fresh}
@@ -386,6 +405,13 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         ]
         assert len(events) == 2
         assert all("recovered_blocks=2" in event for event in events)
+        # Fixed readings pin the arithmetic and units, not just the field names.
+        # They cannot catch a reading moved across the work it brackets.
+        assert all(
+            "recovery_ms=250.000 setup_ms=500.000 start_ms=750.000 "
+            "promotion_ms=1500.000" in event
+            for event in events
+        )
 
         guard._thread.start()
         _wait_until(lambda: cores[-1].poll_completed.call_count > 0, timeout=2)
@@ -415,7 +441,7 @@ def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     written: list[object] = []
     guard._recovery._write_handback = lambda records: written.append(records)
     served: list[dict] = []
-    guard._serve = served.append
+    guard._serve = lambda records, *_timing: served.append(records)
     reported: list[BaseException] = []
     guard._failure_callback = lambda _guard, failure: reported.append(failure)
 
