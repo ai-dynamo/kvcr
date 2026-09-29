@@ -135,7 +135,8 @@ for cfg in $MATRIX; do
     dense)  run_config dense  --harness-arg=--model=Qwen/Qwen3-0.6B ${KVCR_EXTRA:-} ;;
     hybrid) run_config hybrid --harness-arg=--model=Qwen/Qwen3.5-0.8B \
                               --harness-arg=--worker-arg=--mamba-cache-mode=align \
-                              --harness-arg=--keep-hybrid-kv-cache-manager ${KVCR_EXTRA:-} ;;
+                              --harness-arg=--keep-hybrid-kv-cache-manager \
+                              --harness-arg=--no-enforce-eager ${KVCR_EXTRA:-} ;;
     *) log "unknown config $cfg"; exit 5 ;;
   esac
 done

@@ -114,6 +114,7 @@ class Runner:
             request_timeout=args.request_timeout,
             extra_worker_args=list(args.worker_arg),
             disable_hybrid_kv_cache_manager=not args.keep_hybrid_kv_cache_manager,
+            enforce_eager=not args.no_enforce_eager,
         )
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
@@ -138,6 +139,7 @@ class Runner:
             },
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
+            "enforce_eager": not args.no_enforce_eager,
             "batch_invariant": args.batch_invariant,
             "state_agent": not args.no_state_agent,
             "selected_cases": list(args.cases),
@@ -448,6 +450,11 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="do not pass --disable-hybrid-kv-cache-manager to vLLM (needed for "
         "SSM/linear-attention hybrids such as Qwen3.5)",
+    )
+    parser.add_argument(
+        "--no-enforce-eager",
+        action="store_true",
+        help="let vLLM use CUDA graphs (much faster decode for GDN/Mamba hybrids)",
     )
     parser.add_argument(
         "--worker-arg",

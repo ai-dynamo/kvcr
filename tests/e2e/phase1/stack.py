@@ -102,6 +102,9 @@ class Settings:
     # non-attention layers (Qwen3.5 GDN, Mamba hybrids) cannot be unified into
     # one KV group, so they need the manager kept on.
     disable_hybrid_kv_cache_manager: bool = True
+    # Eager mode keeps the stack simple, but GDN/Mamba layers without CUDA
+    # graphs decode very slowly (Qwen3.5 reference phase took ~40 min).
+    enforce_eager: bool = True
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
@@ -352,7 +355,7 @@ class Stack:
                 if self.settings.disable_hybrid_kv_cache_manager
                 else []
             ),
-            "--enforce-eager",
+            *(["--enforce-eager"] if self.settings.enforce_eager else []),
             "--gpu-memory-utilization",
             str(self.settings.gpu_memory_utilization),
             *self.settings.extra_worker_args,
