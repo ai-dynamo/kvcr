@@ -102,6 +102,8 @@ class _KVCRProgress:
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
         self._ready = threading.Event()
+        self._prepared = threading.Event()
+        self._activate = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -262,10 +264,22 @@ class _KVCRProgress:
         return True
 
     def start(self) -> None:
-        self._thread.start()
+        self._activate.set()
+        if not self._thread.is_alive():
+            self._thread.start()
         if not self._ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
             raise RuntimeError(
                 "KVCR progress initialization timed out after "
+                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+            )
+        self.raise_if_failed()
+
+    def prepare(self) -> None:
+        """Create the agent and register memory without starting backends."""
+        self._thread.start()
+        if not self._prepared.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+            raise RuntimeError(
+                "KVCR progress preparation timed out after "
                 f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
             )
         self.raise_if_failed()
@@ -301,6 +315,8 @@ class _KVCRProgress:
 
     def close(self) -> None:
         if self._thread.is_alive():
+            self._stop_requested = True
+            self._activate.set()
             self._submissions.put(_STOP)
             # An interrupt can cut join() short, so the recheck below is
             # what callers rely on, not that join() returned.
@@ -313,12 +329,23 @@ class _KVCRProgress:
         try:
             self._startup_stage = "NIXL agent initialization"
             self._initialize_nixl()
-            # Let KVCR backends initialize NIXL resources before common
-            # memory registration.
-            self._startup_stage = "backend initialization"
-            self._initialize(self)
-            self._startup_stage = "memory registration"
-            self._register_memory_regions()
+            if not self._activate.is_set() and not self._stop_requested:
+                self._startup_stage = "memory registration"
+                self._register_memory_regions()
+                self._prepared.set()
+                self._activate.wait()
+                if self._stop_requested:
+                    return
+                self._startup_stage = "backend initialization"
+                self._initialize(self)
+            else:
+                # Preserve the normal ordering for backends that create NIXL
+                # resources before common memory registration.
+                self._startup_stage = "backend initialization"
+                self._initialize(self)
+                self._startup_stage = "memory registration"
+                self._register_memory_regions()
+                self._prepared.set()
             self._startup_stage = "agent metadata capture"
             self._capture_agent_metadata()
             self._startup_stage = "ready"
@@ -329,6 +356,7 @@ class _KVCRProgress:
         except BaseException as error:
             self._failure = error
         finally:
+            self._prepared.set()
             self._startup_stage = "cleanup"
             try:
                 try:

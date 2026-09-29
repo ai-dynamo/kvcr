@@ -333,6 +333,15 @@ def test_promoted_guard_serves_real_nixl_transfers(
     monkeypatch.setattr(
         kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", _REAL_NIXL_TIMEOUT_SECONDS
     )
+    promotion_seconds: list[float] = []
+    promote = _Guard._promote
+
+    def timed_promote(guard: _Guard) -> None:
+        started = time.monotonic()
+        promote(guard)
+        promotion_seconds.append(time.monotonic() - started)
+
+    monkeypatch.setattr(_Guard, "_promote", timed_promote)
     # Not a decorator: children import this module, and NIXL logs to their stdout.
     if not _real_nixl_available():
         pytest.skip("no runnable NIXL agent on this machine")
@@ -359,6 +368,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
     primary.wait(timeout=_TIMEOUT_SECONDS)
     # Promotion builds a real agent under a new name over the same pool.
     _wait_until(lambda: guard._serving, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
+    assert promotion_seconds[0] < 0.1
     assert set(guard._core._block_record_map) == {BlockKey(b"resident-b")}
 
     # A real UCX read through the Guard: the agent did not exist at write time.

@@ -783,6 +783,11 @@ class _Guard:
             self._record_background_failure(error)
             raise
         self._control = control
+        try:
+            self._prepare_core()
+        except BaseException as error:
+            self._record_background_failure(error)
+            raise
 
     def _release(self) -> None:
         """Give up the current primary. The mirror is written out and dropped:
@@ -795,7 +800,9 @@ class _Guard:
             self._hand_back()
             # Re-adopt lets start_primary() retain or replace the mirror.
             self._recovery.mirror = None
-        elif self._recovery.mirror is not None:
+        else:
+            self._close_core()
+        if self._recovery.mirror is not None:
             self._recovery.release()
         if self._control is not None:
             self._control.close()
@@ -865,42 +872,10 @@ class _Guard:
         records = self._recovery.prepare_to_serve(records)
         recovered_blocks = len(records)
 
-        def reject_pin(keys: object) -> int:
-            raise RuntimeError("Guard has no framework-owned memory")
-
-        dram = LocalDramOptions(
-            [
-                (
-                    pool.name,
-                    self._recovery.attachment.address + pool.offset_bytes,
-                    pool.size_bytes,
-                )
-                for pool in self._recovery.pools
-            ],
-            self._configured.remote_fw_dram_backend,
-        )
-        agent_name = f"KVCR-Guard-{uuid.uuid4()}"
-        core = _KVCRCore(
-            KVCRConfig(
-                nixl_agent_name=agent_name,
-                pool_layouts=self._configured.pool_layouts,
-                nixl_listen_port=0,
-            ),
-            KVCRBindings(
-                reject_pin,
-                lambda: (),
-                lambda _handle: False,
-                framework_control=self._control,
-            ),
-            KVCRBackendConfigs(
-                local_dram=dram,
-                g3=None,
-                remote_fw_dram=RemoteFWDramOptions(
-                    backend=self._configured.remote_fw_dram_backend
-                ),
-            ),
-        )
-        self._core = core
+        core = self._core
+        if core is None:
+            raise RecoveryMirrorError("Guard transport was not prepared")
+        agent_name = core.nixl_agent_name
         core._remote_fw_dram._dangling_ops.dead_incarnations = (
             self._dead_incarnations.copy()
         )
@@ -923,6 +898,51 @@ class _Guard:
             agent_name,
             control_endpoint,
         )
+
+    def _prepare_core(self) -> None:
+        """Register the Guard's pool without accepting control traffic."""
+        def reject_pin(keys: object) -> int:
+            raise RuntimeError("Guard has no framework-owned memory")
+
+        dram = LocalDramOptions(
+            [
+                (
+                    pool.name,
+                    self._recovery.attachment.address + pool.offset_bytes,
+                    pool.size_bytes,
+                )
+                for pool in self._recovery.pools
+            ],
+            self._configured.remote_fw_dram_backend,
+        )
+        core = _KVCRCore(
+            KVCRConfig(
+                nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
+                pool_layouts=self._configured.pool_layouts,
+                nixl_listen_port=0,
+            ),
+            KVCRBindings(
+                reject_pin,
+                lambda: (),
+                lambda _handle: False,
+                framework_control=self._control,
+            ),
+            KVCRBackendConfigs(
+                local_dram=dram,
+                g3=None,
+                remote_fw_dram=RemoteFWDramOptions(
+                    backend=self._configured.remote_fw_dram_backend
+                ),
+            ),
+        )
+        self._core = core
+        core.prepare()
+
+    def _close_core(self) -> None:
+        if self._core is not None:
+            self._core.close()
+            self._core = None
+            self._control = None
 
     def _hand_back(self) -> None:
         """Stop serving, leaving this pool group's state where the next primary looks.
