@@ -15,6 +15,7 @@
 #   KVCR_MATRIX   space-separated config names to run (default: dense hybrid)
 #   KVCR_CASES    cases per run (default TC-01..TC-06)
 #   KVCR_TIMEOUT  harness timeout per run in seconds (default 3600)
+#   KVCR_IMAGE    optional existing local image to reuse instead of building
 set -euo pipefail
 
 : "${KVCR_BUNDLE:?}" "${KVCR_REF:?}"
@@ -50,7 +51,10 @@ cd "$W/repo"
 IMAGE_REPO=local/kvcr-phase1
 export KVCR_E2E_IMAGE=$IMAGE_REPO KVCR_PUSH=0 E2E_BUILD_OUTPUT="$W/artifacts/build"
 mkdir -p "$E2E_BUILD_OUTPUT"
-if docker image inspect "$IMAGE_REPO:$KVCR_REF" >/dev/null 2>&1; then
+if [[ -n ${KVCR_IMAGE:-} ]] && docker image inspect "$KVCR_IMAGE" >/dev/null 2>&1; then
+  log "reusing requested image $KVCR_IMAGE (harness code is bind-mounted, so scripts-only commits need no rebuild)"
+  IMAGE_ARG=(--image "$KVCR_IMAGE")
+elif docker image inspect "$IMAGE_REPO:$KVCR_REF" >/dev/null 2>&1; then
   log "reusing image $IMAGE_REPO:$KVCR_REF"
   IMAGE_ARG=(--image "$IMAGE_REPO:$KVCR_REF")
 else
