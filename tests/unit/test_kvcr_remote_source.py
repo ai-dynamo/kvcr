@@ -1037,6 +1037,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(selections) -> N
         op_handle=1,
         ordered_keys=(key,) * len(selections),
         dst_descriptors=destinations,
+        allow_layout_subset=True,
         op_id=("source", 1),
         keys={key},
         framework_pins={stale},

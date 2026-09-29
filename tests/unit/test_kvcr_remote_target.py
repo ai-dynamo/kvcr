@@ -224,6 +224,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     ("layout", "expected_layout", "success", "deliver"),
     [
         ([("full", 16), ("swa", 8)], ["swa", "full"], False, False),
+        ([("full", 16), ("swa", 8)], ["swa"], False, False),
         ([("full", 16), ("swa", 8)], ["full", "swa"], True, False),
         ([("", 16), ("", 16)], ["", ""], True, False),
         ([("full", 16), ("swa", 8)], ["swa"], True, True),

@@ -51,10 +51,12 @@ _MEM_DESCRIPTOR_LISTS_TYPE = tuple[tuple[MemDescriptor, ...], ...]
 
 
 def _source_span_indices(
-    layout: list[str], destination: list[str]
+    layout: list[str], destination: list[str], *, allow_subset: bool
 ) -> tuple[int, ...] | None:
     if layout == destination:
         return tuple(range(len(layout)))
+    if not allow_subset:
+        return None
     # Partial deliveries select unique named spans in stored order.
     if not destination or "" in layout or len(set(layout)) != len(layout):
         return None
@@ -146,6 +148,7 @@ class _TargetPullOp(_RemoteOp):
                     "source_incarnation": self.source_incarnation,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
+                    "allow_layout_subset": not self.local_fill,
                 },
             )
             if not sent:
@@ -278,6 +281,7 @@ class _SourcePinOp(_Op):
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
+    allow_layout_subset: bool = False
     route: tuple[str, int] = ("", 0)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
@@ -1159,6 +1163,7 @@ class _RemoteFWDram:
             op_handle=op_handle,
             ordered_keys=keys,
             dst_descriptors=dst_descriptors,
+            allow_layout_subset=payload.get("allow_layout_subset") is True,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
         )
         if not self._try_local_source_write(progress, source_pin):
@@ -1185,7 +1190,11 @@ class _RemoteFWDram:
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
                     return False
-                indices = _source_span_indices(residency.layout, layout)
+                indices = _source_span_indices(
+                    residency.layout,
+                    layout,
+                    allow_subset=source_pin.allow_layout_subset,
+                )
                 if indices is None:
                     return False
                 selections.append(indices)
@@ -1254,6 +1263,7 @@ class _RemoteFWDram:
             indices = _source_span_indices(
                 [descriptor.info for descriptor in source],
                 [descriptor.info for descriptor in destination],
+                allow_subset=source_pin.allow_layout_subset,
             )
             if indices is None:
                 logger.warning(
