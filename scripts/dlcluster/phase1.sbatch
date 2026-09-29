@@ -2,7 +2,7 @@
 #SBATCH --job-name=doxu-kvcr-phase1
 #SBATCH --partition=general
 #SBATCH --gres=gpu:H100:2
-#SBATCH --constraint="2GPU&x86_64"
+#SBATCH --constraint="2GPU&x86_64&UB24.04"
 #SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=16
@@ -13,6 +13,9 @@
 # KVCR test plan Phase 1 (TC-01..TC-06) on one dlcluster node with 2x H100.
 # Exclusive 2-GPU node: shared 8-GPU nodes hand out GPUs with other tenants'
 # memory on them and vLLM's 0.8 utilization check then fails at startup.
+# x86_64: the linux/amd64 image build segfaults under QEMU on aarch64 nodes.
+# UB24.04: kernel 6.8 (Guard needs >= 6.5); the UB22.04 nodes run 5.15 and the
+# ones seen so far also cannot reach github.com for the source resolve step.
 # Inputs (env, set by submit.sh):
 #   KVCR_BUNDLE   git bundle of the kvcr-phase1-ci branch (in $HOME)
 #   KVCR_REF      commit to check out from the bundle
