@@ -34,6 +34,7 @@ _PROTOCOL_VERSION: ProtocolVersion = 1
 # SO_PEERPIDFD requires Linux 6.5 or later.
 _SO_PEERPIDFD_FALLBACK = 77
 _SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", _SO_PEERPIDFD_FALLBACK)
+_CLAIM_TIMEOUT_SECONDS = 180.0
 
 
 class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -266,7 +267,9 @@ class KVCRClient:
             },
             type=_Claim,
         )
-        connection = FramedConnection.connect(self._socket_path)
+        connection = FramedConnection.connect(
+            self._socket_path, timeout=_CLAIM_TIMEOUT_SECONDS
+        )
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
         grant_received = False

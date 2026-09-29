@@ -138,6 +138,29 @@ def test_prepare_registers_memory_before_backend_activation(monkeypatch) -> None
     progress.close()
 
 
+def test_prepare_has_its_own_registration_timeout(monkeypatch) -> None:
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        nixl_agent_name="guard",
+        nixl_listen_port=0,
+    )
+    monkeypatch.setattr(progress._thread, "start", lambda: None)
+    observed = []
+
+    def wait(timeout):
+        observed.append(timeout)
+        return False
+
+    monkeypatch.setattr(progress._prepared, "wait", wait)
+    monkeypatch.setattr(progress_module, "_PREPARE_TIMEOUT_SECONDS", 0.125)
+    with pytest.raises(RuntimeError, match="preparation timed out after 0.125s"):
+        progress.prepare()
+    assert observed == [0.125]
+
+
 @pytest.mark.parametrize(
     ("transfer_result", "polls_state"),
     [("PROC", True), ("DONE", False)],

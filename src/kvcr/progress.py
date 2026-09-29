@@ -22,6 +22,7 @@ _IDLE_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
+_PREPARE_TIMEOUT_SECONDS = 120.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
@@ -277,10 +278,10 @@ class _KVCRProgress:
     def prepare(self) -> None:
         """Create the agent and register memory without starting backends."""
         self._thread.start()
-        if not self._prepared.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+        if not self._prepared.wait(timeout=_PREPARE_TIMEOUT_SECONDS):
             raise RuntimeError(
                 "KVCR progress preparation timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+                f"{_PREPARE_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
             )
         self.raise_if_failed()
 

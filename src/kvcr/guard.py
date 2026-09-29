@@ -901,6 +901,7 @@ class _Guard:
 
     def _prepare_core(self) -> None:
         """Register the Guard's pool without accepting control traffic."""
+
         def reject_pin(keys: object) -> int:
             raise RuntimeError("Guard has no framework-owned memory")
 

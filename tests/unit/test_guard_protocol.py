@@ -209,10 +209,14 @@ def _connect_with(
     monkeypatch: pytest.MonkeyPatch,
     connection: _RecordingConnection,
 ) -> None:
+    def connect(_endpoint, *, timeout):
+        assert timeout == 180
+        return connection
+
     monkeypatch.setattr(
         protocol_module.FramedConnection,
         "connect",
-        lambda _endpoint: connection,
+        connect,
     )
 
 

@@ -59,10 +59,11 @@ class FramedConnection:
     def connect(
         cls,
         endpoint: str | os.PathLike[str],
+        timeout: float = _TIMEOUT_SECONDS,
     ) -> "FramedConnection":
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            connection.settimeout(_TIMEOUT_SECONDS)
+            connection.settimeout(timeout)
             connection.connect(os.fspath(endpoint))
         except OSError as error:
             connection.close()

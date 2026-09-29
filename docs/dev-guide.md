@@ -282,6 +282,9 @@ Pool sizes are rounded down to the native memory-page boundary.
 A worker calls
 `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)`
 with its Guard's control address and each ordered pool's name and block size.
+The Guard prepares and registers its memory before granting the claim; large
+pool registrations have a 120-second preparation and 180-second claim budget.
+Ordinary KVCR progress startup retains its 30-second budget.
 The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped
 pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block
 sizes may differ. The pre-release wire protocol remains version 1.
