@@ -90,7 +90,15 @@ fi
 cp -r "$E2E_BUILD_OUTPUT" "$RUNS/build" 2>/dev/null || true
 
 # --- GPUs handed to the container (UUIDs of the two allocated devices) --------
-mapfile -t GPU_UUIDS < <(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -2)
+# Only the GPUs Slurm allocated: some nodes lack device-cgroup isolation, so
+# nvidia-smi also lists another tenant's GPU (job 2333497 ran a worker on one).
+ALLOC=${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}}}
+if [[ -n "$ALLOC" ]]; then
+  mapfile -t GPU_UUIDS < <(for i in ${ALLOC//,/ }; do nvidia-smi -i "$i" --query-gpu=uuid --format=csv,noheader; done | head -2)
+else
+  mapfile -t GPU_UUIDS < <(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -2)
+fi
+log "allocated GPUs (${ALLOC:-all visible}): ${GPU_UUIDS[*]}"
 case "${#GPU_UUIDS[@]}" in
   2) GPUS="${GPU_UUIDS[0]},${GPU_UUIDS[1]}"; GPU_ARGS=() ;;
   1) # single allocated GPU: both workers share it at reduced utilization
