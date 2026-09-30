@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,6 +97,12 @@ class Settings:
     cpu_bytes_to_use: int = 2_000_000_000
     max_model_len: int = 32000
     gpu_memory_utilization: float = 0.8
+    # Two-node run: worker index -> node-agent URL on the other node
+    # (tests/e2e/phase1/node_agent.py); that node also hosts the worker's
+    # kvcr_service sidecar. Needs etcd_endpoints: Dynamo's file discovery
+    # watches with inotify, which does not cross nodes.
+    remote_workers: dict[int, str] | None = None
+    etcd_endpoints: str | None = None
     compatibility_digest: str = ""
     batch_invariant: bool = False
     state_agent: bool = True
@@ -178,6 +186,102 @@ class Managed:
         return self.log_path.read_text(errors="replace")
 
 
+class _RemoteProcess:
+    """The subset of subprocess.Popen the harness touches, backed by a node agent."""
+
+    def __init__(self, owner: "RemoteManaged") -> None:
+        self._owner = owner
+        self.pid = owner.pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        status = self._owner.agent("GET", f"/status/{self._owner.name}")
+        self.returncode = status.get("returncode")
+        return None if status.get("alive") else self.returncode
+
+    def wait(self, timeout: float = 30) -> int | None:
+        outcome = self._owner.agent("POST", f"/wait/{self._owner.name}", {"timeout": timeout})
+        if not outcome.get("exited"):
+            raise subprocess.TimeoutExpired(self._owner.command, timeout)
+        self.returncode = outcome.get("returncode")
+        return self.returncode
+
+
+class RemoteManaged:
+    """A child process on another node, driven through node_agent.py.
+
+    Same surface as Managed; the log lives on a volume both nodes mount, so
+    the checks read it like a local file.
+    """
+
+    def __init__(self, name: str, command: list[str], env: dict[str, str],
+                 log: Path, agent_url: str) -> None:
+        self.name = name
+        self.command = command
+        self.log_path = log
+        self.agent_url = agent_url.rstrip("/")
+        self.started_at = utc_now()
+        self.stopped = False
+        reply = self.agent("POST", "/spawn", {"name": name, "command": command,
+                                              "env": env, "log": str(log)})
+        self.pid = int(reply["pid"])
+        self.process = _RemoteProcess(self)
+
+    def agent(self, method: str, route: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return node_agent_call(self.agent_url, method, route, body)
+
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
+    def signal_group(self, number: int) -> bool:
+        return bool(self.agent("POST", f"/signal/{self.name}", {"signal": int(number)}).get("ok"))
+
+    def stop(self, grace: float = 20) -> dict[str, Any]:
+        outcome: dict[str, Any] = {"name": self.name, "pid": self.pid, "remote": self.agent_url}
+        self.stopped = True
+        self.signal_group(signal.SIGTERM)
+        try:
+            self.process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            outcome["sigkill"] = True
+        self.signal_group(signal.SIGKILL)
+        try:
+            outcome["exit_code"] = self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            outcome["error"] = "process did not exit"
+        return outcome
+
+    def log_text(self) -> str:
+        try:
+            return self.log_path.read_text(errors="replace")
+        except OSError:
+            pass
+        try:
+            return node_agent_text(self.agent_url, f"/log/{self.name}")
+        except (OSError, ValueError):
+            return ""
+
+
+def node_agent_call(base: str, method: str, route: str,
+                    body: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(base.rstrip("/") + route, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise ValidationError(f"node agent {base}{route} -> {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise ValidationError(f"node agent {base}{route} unreachable: {error.reason}") from error
+
+
+def node_agent_text(base: str, route: str, timeout: float = 60) -> str:
+    with urllib.request.urlopen(base.rstrip("/") + route, timeout=timeout) as response:
+        return response.read().decode(errors="replace")
+
+
 class ExternalService:
     """A kvcr_service that lives in another container; observed, not owned.
 
@@ -186,14 +290,22 @@ class ExternalService:
     belongs to the orchestrator, which is exactly what TC-04 relies on.
     """
 
-    def __init__(self, name: str, socket_path: Path, log_path: Path) -> None:
+    def __init__(self, name: str, socket_path: Path, log_path: Path,
+                 agent_url: str | None = None) -> None:
         self.name = name
         self.socket_path = socket_path
         self.log_path = log_path
+        self.agent_url = agent_url  # socket lives on another node: probe via its agent
         self.stopped = False
         self.started_at = utc_now()
 
     def alive(self) -> bool:
+        if self.agent_url is not None:
+            try:
+                return bool(node_agent_call(self.agent_url, "GET",
+                                            f"/socket?path={self.socket_path}").get("alive"))
+            except ValidationError:
+                return False
         try:
             probe = socket.socket(socket.AF_UNIX)
             probe.settimeout(1)
@@ -229,6 +341,7 @@ class Stack:
         self.kvcr_run_dir = Path(tempfile.mkdtemp(prefix="phase1-run-"))
         self.pool_dir = Path("/dev/shm/phase1-pool-" + uuid.uuid4().hex[:8])
         self.deadline_check: Callable[[], None] = lambda: None
+        self._remote_info: dict[int, dict[str, Any]] = {}
 
     # -- preflight ---------------------------------------------------------
 
@@ -267,6 +380,17 @@ class Stack:
                     f"{MIN_GUARD_KERNEL[0]}.{MIN_GUARD_KERNEL[1]}+ "
                     f"(SO_PEERPIDFD); this node runs {platform.release()}"
                 )
+            for index, agent in sorted((self.settings.remote_workers or {}).items()):
+                info = node_agent_call(agent, "GET", "/info")
+                self._remote_info[index] = info
+                data.setdefault("remote_nodes", {})[str(index)] = info
+                found = re.match(r"(\d+)\.(\d+)", str(info.get("kernel", "")))
+                if found is None or (int(found[1]), int(found[2])) < MIN_GUARD_KERNEL:
+                    raise BlockedError(
+                        f"remote node for worker {index} ({info.get('hostname')}) runs "
+                        f"{info.get('kernel')}; Guard needs Linux "
+                        f"{MIN_GUARD_KERNEL[0]}.{MIN_GUARD_KERNEL[1]}+"
+                    )
             if data["libatomic"] is None:
                 raise BlockedError("Guard mode needs the system libatomic runtime")
             needed = 2 * (self.settings.pool_gb * 1024**3 + 128 * 1024**2)
@@ -296,11 +420,20 @@ class Stack:
         env.update(
             DYN_REQUEST_PLANE="tcp",
             DYN_EVENT_PLANE="zmq",
-            DYN_DISCOVERY_BACKEND="file",
-            DYN_FILE_KV=self.discovery.name,
             PYTHONHASHSEED="0",
             VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES="1",
         )
+        if self.settings.etcd_endpoints:
+            env["DYN_DISCOVERY_BACKEND"] = "etcd"
+            env["ETCD_ENDPOINTS"] = self.settings.etcd_endpoints
+        else:
+            env["DYN_DISCOVERY_BACKEND"] = "file"
+            env["DYN_FILE_KV"] = self.discovery.name
+        if self.settings.remote_workers:
+            # Peers on other nodes must reach this process: advertise a real
+            # address (Dynamo's event plane defaults to 127.0.0.1).
+            env["DYN_EVENT_PLANE_HOST"] = self.advertise_host()
+            env["DYN_TCP_RPC_HOST"] = self.advertise_host()
         if self.settings.batch_invariant:
             env["VLLM_BATCH_INVARIANT"] = "1"
         return env
@@ -318,7 +451,7 @@ class Stack:
             "router_capabilities": ["router_hint"],
             "control_host": "0.0.0.0",
             "control_ports": [self.settings.control_ports[index]],
-            "control_advertise_host": "127.0.0.1",
+            "control_advertise_host": self.worker_host(index),
             "operation_timeout_ms": 5000,
             "abandon_timeout_ms": 10000,
             "enable_telemetry": True,
@@ -344,6 +477,20 @@ class Stack:
                 probe.connect(("10.255.255.255", 1))
                 host = probe.getsockname()[0]
         return host
+
+    def remote_agent(self, index: int) -> str | None:
+        return (self.settings.remote_workers or {}).get(index)
+
+    def worker_host(self, index: int) -> str:
+        """Address peers use for worker[index]'s KVCR control endpoint."""
+        if not self.settings.remote_workers:
+            return "127.0.0.1"
+        agent = self.remote_agent(index)
+        if agent is None:
+            return self.advertise_host()
+        if index not in self._remote_info:
+            self._remote_info[index] = node_agent_call(agent, "GET", "/info")
+        return str(self._remote_info[index]["ip"])
 
     def uses_state_agent(self) -> bool:
         return self.settings.mode == GUARD and self.settings.state_agent
@@ -417,10 +564,14 @@ class Stack:
     def attach_service(self, index: int) -> ExternalService:
         """Sidecar topology: wait for the shared socket instead of launching."""
         assert self.settings.external_services is not None
+        agent = self.remote_agent(index)
         service = ExternalService(
             f"kvcr-service-{index}",
             self.service_socket(index),
-            self.settings.external_services / f"kvcr-service-{index}.log",
+            # A remote sidecar writes its log into the shared evidence tree.
+            (self.evidence if agent else self.settings.external_services)
+            / f"kvcr-service-{index}.log",
+            agent_url=agent,
         )
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
@@ -439,15 +590,23 @@ class Stack:
 
     # -- launching ---------------------------------------------------------
 
-    def _spawn(self, name: str, command: list[str], env: dict[str, str]) -> Managed:
+    def _spawn(self, name: str, command: list[str], env: dict[str, str],
+               agent_url: str | None = None) -> Managed:
         log = self.evidence / f"{name}.log"
-        child = Managed(name, command, env, log)
+        if agent_url is not None:
+            # Only pass what differs from the agent's own environment: the
+            # other node keeps its HF cache path, PATH and CUDA setup.
+            overrides = {k: v for k, v in env.items() if os.environ.get(k) != v}
+            child: Managed = RemoteManaged(name, command, overrides, log, agent_url)  # type: ignore[assignment]
+        else:
+            child = Managed(name, command, env, log)
         self.children.append(child)
         save_json(
             self.evidence / f"{name}.launch.json",
             {
                 "command": command,
                 "pid": child.pid,
+                "remote": agent_url,
                 "started_at": child.started_at,
                 "environment_overrides": {
                     key: env[key]
@@ -545,7 +704,14 @@ class Stack:
             self.evidence / f"{name}.kv-transfer-config.json",
             self.transfer_config(index) if kvcr else None,
         )
-        worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env)
+        agent = self.remote_agent(index)
+        if agent is not None:
+            host = self.worker_host(index)
+            env["DYN_EVENT_PLANE_HOST"] = host
+            env["DYN_TCP_RPC_HOST"] = host
+            worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env, agent_url=agent)
+        else:
+            worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env)
         self.workers[index] = worker
         previous = self.worker_ids.pop(index, None)
         if previous is not None:

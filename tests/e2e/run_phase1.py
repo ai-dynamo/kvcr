@@ -117,6 +117,8 @@ class Runner:
             disable_hybrid_kv_cache_manager=not args.keep_hybrid_kv_cache_manager,
             enforce_eager=not args.no_enforce_eager,
             external_services=args.external_services,
+            remote_workers=args.remote_workers or None,
+            etcd_endpoints=args.etcd,
         )
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
@@ -142,7 +144,10 @@ class Runner:
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
-            "topology": "sidecar" if args.external_services else "single-container",
+            "topology": ("two-node" if args.remote_workers
+                         else "sidecar" if args.external_services else "single-container"),
+            "remote_workers": args.remote_workers or None,
+            "discovery": "etcd" if args.etcd else "file",
             "external_services": str(args.external_services) if args.external_services else None,
             "batch_invariant": args.batch_invariant,
             "state_agent": not args.no_state_agent,
@@ -473,6 +478,22 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "launching the services (Guard mode only)",
     )
     parser.add_argument(
+        "--remote-worker",
+        action="append",
+        default=[],
+        metavar="INDEX=URL",
+        help="two-node topology: run worker INDEX (and expect its kvcr_service sidecar) on "
+        "the node whose phase1.node_agent listens at URL; repeatable; requires "
+        "--external-services and --etcd",
+    )
+    parser.add_argument(
+        "--etcd",
+        default=None,
+        metavar="ENDPOINTS",
+        help="use Dynamo etcd discovery at these endpoints instead of the file store "
+        "(required across nodes: the file store's inotify watch is node-local)",
+    )
+    parser.add_argument(
         "--worker-arg",
         action="append",
         default=[],
@@ -539,6 +560,20 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--external-services requires --mode guard")
         if not args.compatibility_digest:
             parser.error("--external-services needs --compatibility-digest matching the sidecars")
+    remote: dict[int, str] = {}
+    for item in args.remote_worker:
+        index, sep, url = item.partition("=")
+        if not sep or index not in ("0", "1") or not url.startswith("http"):
+            parser.error(f"--remote-worker expects 0=http://host:port or 1=http://host:port, got {item!r}")
+        remote[int(index)] = url
+    args.remote_workers = remote
+    if remote:
+        if args.external_services is None:
+            parser.error("--remote-worker needs --external-services (the remote kvcr_service is a sidecar)")
+        if not args.etcd:
+            parser.error("--remote-worker needs --etcd (file discovery does not cross nodes)")
+        if len(remote) == 2:
+            parser.error("at least one worker must run on the harness node")
     return args
 
 
