@@ -96,8 +96,20 @@ class Runner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.output = args.output_dir.resolve()
-        if self.output.exists() and any(self.output.iterdir()):
-            raise ValidationError(f"output directory must be empty: {self.output}")
+        if self.output.exists():
+            # A remote kvcr_service sidecar (two-node run) logs into
+            # <output>/stack before the harness starts; anything else is stale.
+            stray = [
+                p for p in self.output.rglob("*")
+                if p.is_file() and not (
+                    p.parent == self.output / "stack"
+                    and re.fullmatch(r"kvcr-service-\d\.log", p.name)
+                )
+            ]
+            if stray:
+                raise ValidationError(
+                    f"output directory must be empty: {self.output} (found {stray[0]})"
+                )
         self.output.mkdir(parents=True, exist_ok=True)
         self.deadline = time.monotonic() + args.timeout
         self.settings = Settings(
