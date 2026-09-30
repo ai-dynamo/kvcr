@@ -43,6 +43,7 @@ ref=$(git rev-parse HEAD)
 bundle="kvcr-phase1-${ref:0:12}.bundle"
 git bundle create "/tmp/$bundle" HEAD >/dev/null
 scp -q "/tmp/$bundle" scripts/dlcluster/phase1.sbatch "$HOST:~/"
-ssh "$HOST" "mkdir -p ~/kvcr-runs && sbatch ${EXTRA[*]:-} \
+extra_q=""; for a in "${EXTRA[@]}"; do extra_q+=" $(printf %q "$a")"; done  # '&' in constraints must reach sbatch, not the remote shell
+ssh "$HOST" "mkdir -p ~/kvcr-runs && sbatch $extra_q \
   --export=ALL,KVCR_BUNDLE=\$HOME/$bundle,KVCR_REF=$ref,KVCR_MATRIX='$MATRIX',KVCR_CASES=${CASES//,/:},KVCR_TIMEOUT=$TIMEOUT,KVCR_IMAGE=$IMAGE,KVCR_EXTRA='$EXTRA_ARGS',KVCR_TOPOLOGY=$TOPOLOGY,KVCR_GPU_UTIL=$GPU_UTIL \
   ~/phase1.sbatch"
