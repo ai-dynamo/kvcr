@@ -26,6 +26,7 @@ import json
 import platform
 import os
 import re
+import socket
 import signal
 import sys
 import time
@@ -277,10 +278,11 @@ class Runner:
         # Filesystem paths the harness itself chose may contain "kvcr" (an HF
         # cache under /cache/doxu-kvcr/, the evidence tree); they say nothing
         # about the engine, so blank them before counting mentions.
-        own_paths = [p for p in (str(self.output), os.environ.get("HF_HOME", "")) if p and "kvcr" in p.lower()]
+        own_names = [str(self.output), os.environ.get("HF_HOME", ""), socket.gethostname(),
+                     self.settings.etcd_endpoints or "", *(self.settings.remote_workers or {}).values()]
         scrubbed = worker.log_text()
-        for path in own_paths:
-            scrubbed = scrubbed.replace(path, "<harness-path>")
+        for name in sorted({n for n in own_names if n and "kvcr" in n.lower()}, key=len, reverse=True):
+            scrubbed = scrubbed.replace(name, "<harness-name>")
         kvcr_mentions = len(re.findall(r"(?i)kvcr", scrubbed))
         kvcr_lines = [
             line[:200]
