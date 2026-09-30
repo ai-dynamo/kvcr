@@ -120,8 +120,9 @@ start_sidecars() {
   done
   log "sidecars up: $(docker ps --format '{{.Names}} {{.Status}}' | grep kvcr-svc- | tr '\n' ';')"
   SIDECAR_ARGS=(--network host
-    --docker-arg "-v" --docker-arg "$RUNKVCR:/run/kvcr"
-    --docker-arg "-v" --docker-arg "$SHM:/dev/shm/kvcr"
+    # "--docker-arg=-v" form: argparse would otherwise read a bare "-v" as an option
+    --docker-arg=-v "--docker-arg=$RUNKVCR:/run/kvcr"
+    --docker-arg=-v "--docker-arg=$SHM:/dev/shm/kvcr"
     --harness-arg=--external-services=/run/kvcr
     --harness-arg="--compatibility-digest=$digest")
 }
