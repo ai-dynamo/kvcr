@@ -24,6 +24,7 @@ import hashlib
 import importlib.metadata
 import json
 import platform
+import os
 import re
 import signal
 import sys
@@ -261,10 +262,17 @@ class Runner:
                 unstable_detail[name] = divergence
             else:
                 self.references[name] = canonical
-        kvcr_mentions = len(re.findall(r"(?i)kvcr", worker.log_text()))
+        # Filesystem paths the harness itself chose may contain "kvcr" (an HF
+        # cache under /cache/doxu-kvcr/, the evidence tree); they say nothing
+        # about the engine, so blank them before counting mentions.
+        own_paths = [p for p in (str(self.output), os.environ.get("HF_HOME", "")) if p and "kvcr" in p.lower()]
+        scrubbed = worker.log_text()
+        for path in own_paths:
+            scrubbed = scrubbed.replace(path, "<harness-path>")
+        kvcr_mentions = len(re.findall(r"(?i)kvcr", scrubbed))
         kvcr_lines = [
             line[:200]
-            for line in worker.log_text().splitlines()
+            for line in scrubbed.splitlines()
             if re.search(r"(?i)kvcr", line)
         ][:10]
         self.result["reference"] = {
@@ -527,7 +535,9 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     if len(gpus) != 2 or not all(part.isdecimal() for part in gpus):
         parser.error("--gpus needs two CUDA device indices (same index = one shared GPU)")
     args.gpus = [int(part) for part in gpus]
-    if args.gpus[0] == args.gpus[1] and args.gpu_memory_utilization > 0.45:
+    # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
+    if (args.gpus[0] == args.gpus[1] and not args.remote_worker
+            and args.gpu_memory_utilization > 0.45):
         parser.error("two workers on one GPU need --gpu-memory-utilization <= 0.45")
     if not 0.05 <= args.gpu_memory_utilization <= 0.95:
         parser.error("--gpu-memory-utilization must be within 0.05..0.95")
