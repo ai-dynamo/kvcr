@@ -709,6 +709,34 @@ def _acked_deliver(control, kvcr, source, key, destination=None):
     return op_handle, sent["op_handle"]
 
 
+def _write_refused(
+    sender: str, op_handle: int, reason: str | None = "missing_target_agent_metadata"
+) -> bytes:
+    payload = {
+        "type": "write_refused",
+        "sender_control_endpoint": sender,
+        "op_handle": op_handle,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    return msgspec.msgpack.encode(payload)
+
+
+def _refused_deliver():
+    """A target with one acked deliver in flight and control.sent cleared."""
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+    )
+    handle, op_handle = _acked_deliver(control, kvcr, "tcp://source:1", BlockKey(b"k0"))
+    control.sent.clear()
+    return kvcr, control, agent, handle, op_handle
+
+
 def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     """A deliver has no other way out, and no other sender may take it."""
     control = FakeBytesControl()
@@ -727,15 +755,7 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     assert sources[source] == "source"
 
     def refuse(sender: str, refused_handle: int = op_handle) -> None:
-        control.incoming.append(
-            msgspec.msgpack.encode(
-                {
-                    "type": "write_refused",
-                    "sender_control_endpoint": sender,
-                    "op_handle": refused_handle,
-                }
-            )
-        )
+        control.incoming.append(_write_refused(sender, refused_handle))
         _wait_until(lambda: not control.incoming)
 
     refuse("tcp://stranger:9999")
@@ -748,6 +768,10 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     refuse(source, op_handle + 10)
     assert sources[source] == "source"
 
+    # The first refusal from the real source re-sends start_write (#51); only
+    # a second refusal is terminal.
+    refuse(source)
+    _wait_until(lambda: len(control.sent) == 2)
     refuse(source)
     assert _poll_until(kvcr, lambda done: bool(done)) == [
         (handle, _op_entries({key: False}))
@@ -758,10 +782,53 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
 
     # A delayed refusal only reports on the generation its own operation quoted,
     # so it must not evict one learned after that operation started.
-    _, later_handle = _acked_deliver(control, kvcr, source, BlockKey(b"k1"))
+    later, later_handle = _acked_deliver(control, kvcr, source, BlockKey(b"k1"))
     sources[source] = "replacement"
     refuse(source, later_handle)
     assert sources[source] == "replacement"
+    # The retry quotes the current generation, so refusing it is terminal.
+    _wait_until(lambda: len(control.sent) == 2)
+    refuse(source, later_handle)
+    assert _poll_until(kvcr, bool) == [(later, _op_entries({BlockKey(b"k1"): False}))]
+
+
+def test_refused_start_write_is_resent_once_with_metadata():
+    """A peer that replaced the one we cached refuses once; the same operation
+    re-sends start_write carrying our metadata instead of failing (#51)."""
+    kvcr, control, _, handle, op_handle = _refused_deliver()
+    control.incoming.append(_write_refused("tcp://source:1", op_handle))
+    _wait_until(lambda: len(control.sent) == 1)
+    resent = _decode_control_message(control.sent[0][1])
+    assert resent["type"] == "start_write"
+    assert resent["op_handle"] == op_handle
+    assert resent["target_agent_metadata"] == b"target-md"
+    assert list(kvcr.poll_completed()) == []
+
+    # A second refusal of the same operation is terminal, as before.
+    control.incoming.append(_write_refused("tcp://source:1", op_handle))
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({BlockKey(b"k0"): False}))]
+
+
+@pytest.mark.parametrize("reason", [None, "other"])
+def test_refusal_without_missing_metadata_reason_is_terminal(reason):
+    """Only a refusal that names the missing metadata earns the one re-send."""
+    kvcr, control, _, handle, op_handle = _refused_deliver()
+    control.incoming.append(_write_refused("tcp://source:1", op_handle, reason))
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({BlockKey(b"k0"): False}))]
+    assert control.sent == []
+
+
+def test_write_done_in_the_same_poll_outranks_a_refusal():
+    """A write the old peer finished before its replacement refused is kept:
+    the completion wins over the refusal instead of being dropped by a retry."""
+    kvcr, control, agent, handle, op_handle = _refused_deliver()
+    # Notifications are read after control messages within one poll, so the
+    # write_done is seen in the same cycle as the refusal or in an earlier one.
+    agent.notifs["source"] = [_write_done_notification(op_handle)]
+    control.incoming.append(_write_refused("tcp://source:1", op_handle))
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({BlockKey(b"k0"): True}))]
+    _wait_until(lambda: not control.incoming)
+    assert control.sent == []
 
 
 def test_kvcr_metadata_ack_retry_lifecycle():
