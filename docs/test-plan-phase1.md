@@ -216,6 +216,22 @@ target tier read bytes). At 0.6B parameters and 1.3k tokens prefill costs
 ~3 ms, so no hit shortens TTFT here; this round measures correctness and
 overhead, not benefit.
 
+### Sidecar run (2026-09-30, job 2333497, node `2u2g-gen-0859`)
+
+`submit.sh --topology sidecar`: `kvcr_service` per worker in its own
+container, host dirs shared at `/run/kvcr` and `/dev/shm/kvcr`, host network,
+separate PID namespaces (Dynamo PR 14695 layout); harness attaches with
+`--external-services`. Same outcome as single-container: TC-01/02/03/05/06
+PASS, TC-04 FAIL on finding 1 only. Guard promotion across containers worked
+(`guard_promoted` 1.0 s after kill, first correct Guard response 4.0 s,
+replacement serving 44.7 s). TC-05 p50: KVCR cold 40.3 ms (+5.1), remote hit
+71.2 ms (+31). Runner fixes from this run: `--docker-arg=-v` form for argparse
+(`a7cbdb3`); `--gpus 1` single-GPU mode (`1e6470d`, both workers on one GPU at
+0.35 utilization, not yet exercised — the node lacked device-cgroup isolation
+and the container saw two GPUs); only Slurm-allocated GPU UUIDs are handed to
+docker (`388f12b`). Guard cannot run on aws-iad-cs-002 / eos / cw-pdx-cs-001
+(kernels 5.15/5.19: `SO_PEERPIDFD` → `ENOPROTOOPT`, KVCR fails closed).
+
 Findings for the KVCR, Dynamo and vLLM teams:
 
 1. **First request to a replaced peer at the same endpoint is refused**
