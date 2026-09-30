@@ -246,9 +246,10 @@ class Stack:
             "devices": [],
         }
         save_json(self.evidence / "preflight.json", data)
-        if not data["cuda_available"] or data["device_count"] < 2:
-            raise BlockedError("Phase 1 needs two usable CUDA GPUs on one node")
-        for index in self.settings.gpus:
+        needed = max(self.settings.gpus) + 1
+        if not data["cuda_available"] or data["device_count"] < needed:
+            raise BlockedError(f"Phase 1 needs {needed} usable CUDA GPU(s) on one node")
+        for index in sorted(set(self.settings.gpus)):
             value = torch.ones(16, device=f"cuda:{index}").sum().item()
             data["devices"].append(
                 {

@@ -3,7 +3,6 @@
 #SBATCH --partition=general
 #SBATCH --gres=gpu:H100:2
 #SBATCH --constraint="2GPU&x86_64&UB24.04"
-#SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=160G
@@ -11,8 +10,10 @@
 #SBATCH --output=/home/doxu/kvcr-runs/%j.out
 #
 # KVCR test plan Phase 1 (TC-01..TC-06) on one dlcluster node with 2x H100.
-# Exclusive 2-GPU node: shared 8-GPU nodes hand out GPUs with other tenants'
-# memory on them and vLLM's 0.8 utilization check then fails at startup.
+# submit.sh adds --exclusive for the 2-GPU request: shared 8-GPU nodes hand out
+# GPUs with other tenants' memory on them and vLLM's 0.8 utilization check then
+# fails at startup. With --gpus 1 (submit.sh) both workers share one GPU at
+# KVCR_GPU_UTIL (default 0.35), which tolerates a shared node.
 # x86_64: the linux/amd64 image build segfaults under QEMU on aarch64 nodes.
 # UB24.04: kernel 6.8 (Guard needs >= 6.5); the UB22.04 nodes run 5.15 and the
 # ones seen so far also cannot reach github.com for the source resolve step.
@@ -90,8 +91,13 @@ cp -r "$E2E_BUILD_OUTPUT" "$RUNS/build" 2>/dev/null || true
 
 # --- GPUs handed to the container (UUIDs of the two allocated devices) --------
 mapfile -t GPU_UUIDS < <(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -2)
-test "${#GPU_UUIDS[@]}" -eq 2 || { log "FATAL: need two GPUs, saw ${GPU_UUIDS[*]}"; exit 4; }
-GPUS="${GPU_UUIDS[0]},${GPU_UUIDS[1]}"
+case "${#GPU_UUIDS[@]}" in
+  2) GPUS="${GPU_UUIDS[0]},${GPU_UUIDS[1]}"; GPU_ARGS=() ;;
+  1) # single allocated GPU: both workers share it at reduced utilization
+     GPUS="${GPU_UUIDS[0]}"; GPU_ARGS=("--harness-arg=--gpu-memory-utilization=${KVCR_GPU_UTIL:-0.35}")
+     log "one GPU allocated: both workers share $GPUS at utilization ${KVCR_GPU_UTIL:-0.35}" ;;
+  *) log "FATAL: need one or two GPUs, saw ${GPU_UUIDS[*]}"; exit 4 ;;
+esac
 CPUS=$(nproc); MEM_G=$(( $(free -g | awk '/^Mem:/{print $2}') * 8 / 10 ))
 mkdir -p "$W/hf-cache"
 
@@ -147,7 +153,7 @@ run_config() {
     --output-dir "$out" \
     --cpus "$CPUS" --memory "${MEM_G}g" \
     --hf-cache "$W/hf-cache" --timeout "$TIMEOUT" \
-    --cases "$CASES" "${SIDECAR_ARGS[@]}" "$@" 2>&1 | tail -5
+    --cases "$CASES" "${GPU_ARGS[@]}" "${SIDECAR_ARGS[@]}" "$@" 2>&1 | tail -5
   local rc=${PIPESTATUS[0]}
   set -e
   log "=== run $name exit=$rc ==="

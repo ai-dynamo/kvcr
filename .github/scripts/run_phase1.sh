@@ -27,7 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 parser = argparse.ArgumentParser(prog="run_phase1.sh")
-parser.add_argument("--gpus", required=True, help="two GPU indices or UUIDs, comma separated")
+parser.add_argument("--gpus", required=True,
+                    help="one or two GPU indices or UUIDs, comma separated (one = both workers share it)")
 parser.add_argument("--image", help="image reference; default from artifacts/build")
 parser.add_argument("--build-output", type=Path, default=Path("artifacts/build"))
 parser.add_argument("--output-dir", type=Path)
@@ -48,10 +49,12 @@ args = parser.parse_args()
 
 devices = [part.strip() for part in args.gpus.split(",")]
 uuid_form = r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
-if len(devices) != 2 or len(set(devices)) != 2 or any(
+if len(devices) not in (1, 2) or len(set(devices)) != len(devices) or any(
     not re.fullmatch(r"[0-9]+|" + uuid_form, item) for item in devices
 ):
-    parser.error("--gpus requires exactly two distinct indices or full GPU UUIDs")
+    parser.error("--gpus requires one or two distinct indices or full GPU UUIDs")
+# One device: both workers share it (harness index 0,0; caller lowers utilization).
+harness_gpus = "0,1" if len(devices) == 2 else "0,0"
 if not 60 <= args.timeout <= 7200:
     parser.error("--timeout must be between 60 and 7200 seconds")
 
@@ -94,7 +97,7 @@ harness = [
     "--mode", args.mode,
     "--cases", args.cases,
     "--timeout", str(args.timeout),
-    "--gpus", "0,1",
+    "--gpus", harness_gpus,
     *(["--allow-blocked"] if args.allow_blocked else []),
     *args.harness_arg,
 ]

@@ -108,6 +108,7 @@ class Runner:
             reference_http_port=args.reference_http_port,
             pool_gb=args.pool_gb,
             compatibility_digest=args.compatibility_digest or "",
+            gpu_memory_utilization=args.gpu_memory_utilization,
             batch_invariant=args.batch_invariant,
             state_agent=not args.no_state_agent,
             readiness_timeout=args.readiness_timeout,
@@ -438,6 +439,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--pool-gb", type=int, default=2, help="Guard pool size per worker"
     )
     parser.add_argument("--compatibility-digest", default=None)
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.8,
+        help="vLLM --gpu-memory-utilization per worker (<= 0.45 when both share one GPU)",
+    )
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
         "--perf-repeats", type=int, default=5, help="perf prompts per arm (TC-05/06)"
@@ -498,13 +503,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     gpus = [part.strip() for part in args.gpus.split(",")]
-    if (
-        len(gpus) != 2
-        or not all(part.isdecimal() for part in gpus)
-        or gpus[0] == gpus[1]
-    ):
-        parser.error("--gpus needs two distinct CUDA device indices")
+    if len(gpus) != 2 or not all(part.isdecimal() for part in gpus):
+        parser.error("--gpus needs two CUDA device indices (same index = one shared GPU)")
     args.gpus = [int(part) for part in gpus]
+    if args.gpus[0] == args.gpus[1] and args.gpu_memory_utilization > 0.45:
+        parser.error("two workers on one GPU need --gpu-memory-utilization <= 0.45")
+    if not 0.05 <= args.gpu_memory_utilization <= 0.95:
+        parser.error("--gpu-memory-utilization must be within 0.05..0.95")
     cases = [part.strip().upper() for part in args.cases.split(",") if part.strip()]
     unknown = [case for case in cases if case not in CASES]
     if unknown or not cases:
