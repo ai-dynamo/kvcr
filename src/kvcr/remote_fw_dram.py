@@ -106,6 +106,9 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    # One start_write re-send after a refusal from a peer that replaced the
+    # process our metadata was loaded into (a promoted Guard, a replacement).
+    republished: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -998,6 +1001,24 @@ class _RemoteFWDram:
         refused_incarnation = getattr(op, "source_incarnation", None)
         if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
             self._dangling_ops.sources.pop(endpoint, None)
+        if (
+            isinstance(op, _TargetPullOp)
+            and not op.republished
+            and op.state is _TargetPullState.WAITING_WRITE_DONE
+            and self._kvcr._clock() < op.deadline
+        ):
+            # The peer could not resolve us because it never saw our metadata:
+            # a promoted Guard or a replacement adopted the endpoint without the
+            # old peer table. The endpoint was just un-acked, so re-sending the
+            # same start_write publishes the metadata with it and this request
+            # keeps its hit instead of paying a full recomputation. Once only:
+            # a second refusal means something other than a missing snapshot.
+            op.republished = True
+            op.state = _TargetPullState.START_WRITE
+            logger.info(
+                "KVCR_EVENT start_write_republished op=%d source=%s", op_handle, endpoint
+            )
+            return
         # A refusal is only sent before a write is submitted, so it is as terminal as a
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
@@ -1319,6 +1340,8 @@ class _RemoteFWDram:
                         "type": "write_refused",
                         "sender_control_endpoint": reflected_self,
                         "op_handle": op_handle,
+                        # Tells the target why: it can republish its metadata.
+                        "reason": "missing_target_agent_metadata",
                     },
                 )
             return
