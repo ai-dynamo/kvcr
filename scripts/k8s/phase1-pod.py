@@ -43,7 +43,16 @@ p.add_argument("--two-node", action="store_true")
 p.add_argument("--etcd-image", default="quay.io/coreos/etcd:v3.5.14")
 p.add_argument("--agent-port", type=int, default=9800)
 p.add_argument("--gpu-type", default="H100", help="node label nvidia.com/gpu.product substring, '' to skip")
+p.add_argument("--extra-env", action="append", default=[], metavar="KEY=VALUE",
+               help="environment for every container, e.g. PYTHONPATH=/cache/doxu-kvcr/fix51/src "
+                    "to test a patched KVCR without rebuilding the image; repeatable")
 args = p.parse_args()
+extra_env = []
+for item in args.extra_env:
+    key, sep, value = item.partition("=")
+    if not sep or not key:
+        p.error(f"--extra-env expects KEY=VALUE, got {item!r}")
+    extra_env.append({"name": key, "value": value})
 
 run_id = args.name or f"kvcr-phase1-{time.strftime('%m%d-%H%M')}"
 ns = args.namespace
@@ -105,6 +114,7 @@ def sidecar(i: int, log_path: str) -> dict:
         "restartPolicy": "Always",  # native sidecar: up before main, stopped after it
         "command": ["sh", "-c", cmd],
         "securityContext": {"runAsUser": 0},
+        **({"env": extra_env} if extra_env else {}),
         "resources": {
             "requests": {"cpu": "1", "memory": "2Gi"},
             "limits": {"cpu": "4", "memory": f"{args.pool_gb * 2 + 4}Gi"},
@@ -135,7 +145,7 @@ def etcd_sidecar() -> dict:
     }
 
 
-def gpu_main(name: str, command: list, extra_env: list | None = None, probe: dict | None = None) -> dict:
+def gpu_main(name: str, command: list, probe: dict | None = None) -> dict:
     return {
         "name": name,
         "image": args.image,
@@ -146,7 +156,7 @@ def gpu_main(name: str, command: list, extra_env: list | None = None, probe: dic
         "env": [
             {"name": "HF_HOME", "value": "/cache/doxu-kvcr/hf"},
             {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
-            *(extra_env or []),
+            *extra_env,
         ],
         "resources": {
             "requests": {"cpu": "12", "memory": "48Gi", "nvidia.com/gpu": str(gpus_per_pod)},
