@@ -381,7 +381,16 @@ class Stack:
                     f"(SO_PEERPIDFD); this node runs {platform.release()}"
                 )
             for index, agent in sorted((self.settings.remote_workers or {}).items()):
-                info = node_agent_call(agent, "GET", "/info")
+                # The other node's pod may still be pulling its image.
+                deadline = time.monotonic() + self.settings.readiness_timeout
+                while True:
+                    try:
+                        info = node_agent_call(agent, "GET", "/info", timeout=10)
+                        break
+                    except ValidationError as error:
+                        if time.monotonic() > deadline:
+                            raise BlockedError(f"node agent for worker {index} never answered: {error}") from error
+                        time.sleep(5)
                 self._remote_info[index] = info
                 data.setdefault("remote_nodes", {})[str(index)] = info
                 found = re.match(r"(\d+)\.(\d+)", str(info.get("kernel", "")))
