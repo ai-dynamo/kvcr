@@ -115,6 +115,7 @@ class Runner:
             extra_worker_args=list(args.worker_arg),
             disable_hybrid_kv_cache_manager=not args.keep_hybrid_kv_cache_manager,
             enforce_eager=not args.no_enforce_eager,
+            external_services=args.external_services,
         )
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
@@ -140,6 +141,8 @@ class Runner:
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
+            "topology": "sidecar" if args.external_services else "single-container",
+            "external_services": str(args.external_services) if args.external_services else None,
             "batch_invariant": args.batch_invariant,
             "state_agent": not args.no_state_agent,
             "selected_cases": list(args.cases),
@@ -457,6 +460,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="let vLLM use CUDA graphs (much faster decode for GDN/Mamba hybrids)",
     )
     parser.add_argument(
+        "--external-services",
+        type=Path,
+        default=None,
+        help="sidecar topology: directory shared with kvcr_service containers holding "
+        "memory-<i>.sock and kvcr-service-<i>.log; the harness attaches instead of "
+        "launching the services (Guard mode only)",
+    )
+    parser.add_argument(
         "--worker-arg",
         action="append",
         default=[],
@@ -518,6 +529,11 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--perf-concurrency must be 1..64")
     if args.http_port == args.reference_http_port:
         parser.error("--http-port and --reference-http-port must differ")
+    if args.external_services is not None:
+        if args.mode != GUARD:
+            parser.error("--external-services requires --mode guard")
+        if not args.compatibility_digest:
+            parser.error("--external-services needs --compatibility-digest matching the sidecars")
     return args
 
 

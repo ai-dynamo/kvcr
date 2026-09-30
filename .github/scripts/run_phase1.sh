@@ -41,6 +41,9 @@ parser.add_argument("--hf-cache", type=Path, help="host directory reused as HF_H
 parser.add_argument("--allow-blocked", action="store_true")
 parser.add_argument("--harness-arg", action="append", default=[],
                     help="extra run_phase1.py argument, repeatable")
+parser.add_argument("--docker-arg", action="append", default=[],
+                    help="extra docker run argument (e.g. --network=host, -v host:ctr), repeatable")
+parser.add_argument("--network", default="bridge", help="docker network mode")
 args = parser.parse_args()
 
 devices = [part.strip() for part in args.gpus.split(",")]
@@ -101,8 +104,8 @@ command = [
     *limits,
     "--gpus", '"device=' + ",".join(devices) + '"',
     "--shm-size", "16g", "--ulimit", "memlock=-1", "--ulimit", "stack=67108864",
-    "--network", "bridge", "--user", "root", "--workdir", "/tmp",
-    *mounts, *env,
+    "--network", args.network, "--user", "root", "--workdir", "/tmp",
+    *mounts, *env, *args.docker_arg,
     "--entrypoint", harness[0], image, *harness[1:],
 ]
 record = {

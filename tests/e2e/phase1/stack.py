@@ -105,6 +105,10 @@ class Settings:
     # Eager mode keeps the stack simple, but GDN/Mamba layers without CUDA
     # graphs decode very slowly (Qwen3.5 reference phase took ~40 min).
     enforce_eager: bool = True
+    # Sidecar topology: kvcr_service instances run in their own containers and
+    # share this directory (sockets + logs) with the vLLM container. None means
+    # the harness launches the services itself in-process.
+    external_services: Path | None = None
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
@@ -174,6 +178,41 @@ class Managed:
         return self.log_path.read_text(errors="replace")
 
 
+class ExternalService:
+    """A kvcr_service that lives in another container; observed, not owned.
+
+    Liveness is a connect() to its Unix socket; its log is a file the sidecar
+    writes into the shared directory. stop() is a no-op: the sidecar's lifetime
+    belongs to the orchestrator, which is exactly what TC-04 relies on.
+    """
+
+    def __init__(self, name: str, socket_path: Path, log_path: Path) -> None:
+        self.name = name
+        self.socket_path = socket_path
+        self.log_path = log_path
+        self.stopped = False
+        self.started_at = utc_now()
+
+    def alive(self) -> bool:
+        try:
+            probe = socket.socket(socket.AF_UNIX)
+            probe.settimeout(1)
+            probe.connect(str(self.socket_path))
+            probe.close()
+            return True
+        except OSError:
+            return False
+
+    def log_text(self) -> str:
+        try:
+            return self.log_path.read_text(errors="replace")
+        except OSError:
+            return ""
+
+    def stop(self, grace: float = 0) -> dict[str, Any]:
+        return {"name": self.name, "external": True}
+
+
 class Stack:
     def __init__(self, settings: Settings, evidence: Path) -> None:
         self.settings = settings
@@ -230,7 +269,7 @@ class Stack:
             if data["libatomic"] is None:
                 raise BlockedError("Guard mode needs the system libatomic runtime")
             needed = 2 * (self.settings.pool_gb * 1024**3 + 128 * 1024**2)
-            if data["shm_available_bytes"] < needed:
+            if self.settings.external_services is None and data["shm_available_bytes"] < needed:
                 raise BlockedError(
                     f"/dev/shm has {data['shm_available_bytes']} bytes free; two Guard "
                     f"pools need at least {needed}"
@@ -370,7 +409,32 @@ class Stack:
         return command
 
     def service_socket(self, index: int) -> Path:
+        if self.settings.external_services is not None:
+            return self.settings.external_services / f"memory-{index}.sock"
         return self.kvcr_run_dir / f"memory-{index}.sock"
+
+    def attach_service(self, index: int) -> ExternalService:
+        """Sidecar topology: wait for the shared socket instead of launching."""
+        assert self.settings.external_services is not None
+        service = ExternalService(
+            f"kvcr-service-{index}",
+            self.service_socket(index),
+            self.settings.external_services / f"kvcr-service-{index}.log",
+        )
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if service.alive():
+                self.services[index] = service  # type: ignore[assignment]
+                save_json(
+                    self.evidence / f"{service.name}.launch.json",
+                    {"external": True, "socket": str(service.socket_path),
+                     "log": str(service.log_path), "attached_at": utc_now()},
+                )
+                return service
+            time.sleep(1)
+        raise ValidationError(
+            f"external kvcr_service {index} socket {service.socket_path} not reachable"
+        )
 
     # -- launching ---------------------------------------------------------
 
@@ -431,6 +495,8 @@ class Stack:
     def start_service(self, index: int) -> Managed:
         if self.settings.mode != GUARD:
             raise ValidationError("KVCR services are only launched in Guard mode")
+        if self.settings.external_services is not None:
+            return self.attach_service(index)  # type: ignore[return-value]
         pool_dir = self.pool_dir / str(index)
         pool_dir.mkdir(parents=True, exist_ok=True)
         command = [
@@ -498,7 +564,7 @@ class Stack:
                         f"{child.process.returncode}"
                     )
             elif (
-                child in self.services.values() or child is self.state_agent
+                child in list(self.services.values()) or child is self.state_agent
             ) and not child.alive():
                 raise ValidationError(
                     f"{child.name} exited with status {child.process.returncode}"

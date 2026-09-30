@@ -25,6 +25,10 @@
 #   KVCR_IMAGE    optional existing local image to reuse instead of building
 #   KVCR_EXTRA    optional extra run_phase1.sh args for every config, e.g.
 #                 "--harness-arg=--batch-invariant"
+#   KVCR_TOPOLOGY single (default) or sidecar: kvcr_service per worker in its
+#                 own container, sharing /run/kvcr and /dev/shm/kvcr with the
+#                 vLLM container and the host network namespace (Dynamo PR 14695
+#                 pod layout); PID namespaces stay separate.
 set -euo pipefail
 
 : "${KVCR_BUNDLE:?}" "${KVCR_REF:?}"
@@ -91,10 +95,50 @@ GPUS="${GPU_UUIDS[0]},${GPU_UUIDS[1]}"
 CPUS=$(nproc); MEM_G=$(( $(free -g | awk '/^Mem:/{print $2}') * 8 / 10 ))
 mkdir -p "$W/hf-cache"
 
+TOPOLOGY=${KVCR_TOPOLOGY:-single}
+IMAGE_REF=${KVCR_IMAGE:-}
+[[ -n "$IMAGE_REF" ]] || IMAGE_REF=$(python3 -c "import json;d=json.load(open('$E2E_BUILD_OUTPUT/image-identity.json'));print(d.get('local_image_id') or d['image_uri'])")
+SIDECAR_ARGS=()
+
+start_sidecars() {
+  local name=$1 digest=$2
+  RUNKVCR="$W/run-kvcr-$name"; SHM="/dev/shm/kvcr-phase1-$SLURM_JOB_ID-$name"
+  mkdir -p "$RUNKVCR" "$SHM/0" "$SHM/1"; chmod 1777 "$RUNKVCR" "$SHM"
+  for i in 0 1; do
+    docker run -d --name "kvcr-svc-$name-$i" \
+      --label "io.ai-dynamo.kvcr.phase1-run=sidecar-$SLURM_JOB_ID" \
+      --network host --user root --ulimit memlock=-1 \
+      -v "$RUNKVCR:/run/kvcr" -v "$SHM:/dev/shm/kvcr" \
+      --entrypoint python3 "$IMAGE_REF" -m kvcr.kvcr_service \
+        --socket-path "/run/kvcr/memory-$i.sock" --pool-dir "/dev/shm/kvcr/$i" \
+        --guard-count 1 --pool-sizes-gb 2 --compatibility-digest "$digest" --log-level DEBUG >/dev/null
+    docker logs -f "kvcr-svc-$name-$i" > "$RUNKVCR/kvcr-service-$i.log" 2>&1 &
+  done
+  for i in 0 1; do
+    for _ in $(seq 1 60); do [[ -S "$RUNKVCR/memory-$i.sock" ]] && break; sleep 1; done
+    [[ -S "$RUNKVCR/memory-$i.sock" ]] || { log "FATAL: sidecar $i socket never appeared"; docker logs "kvcr-svc-$name-$i" | tail -20; exit 6; }
+  done
+  log "sidecars up: $(docker ps --format '{{.Names}} {{.Status}}' | grep kvcr-svc- | tr '\n' ';')"
+  SIDECAR_ARGS=(--network host
+    --docker-arg "-v" --docker-arg "$RUNKVCR:/run/kvcr"
+    --docker-arg "-v" --docker-arg "$SHM:/dev/shm/kvcr"
+    --harness-arg=--external-services=/run/kvcr
+    --harness-arg="--compatibility-digest=$digest")
+}
+
+stop_sidecars() {
+  local name=$1
+  docker ps -aq --filter "name=kvcr-svc-$name-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+  mkdir -p "$RUNS/phase1-$name"; cp "$RUNKVCR"/kvcr-service-*.log "$RUNS/phase1-$name/" 2>/dev/null || true
+  rm -rf "$SHM" 2>/dev/null || true
+}
+
 run_config() {
   local name=$1; shift
   local out="$W/artifacts/phase1-$name"
-  log "=== run $name: cases=$CASES ==="
+  SIDECAR_ARGS=()
+  if [[ "$TOPOLOGY" == sidecar ]]; then start_sidecars "$name" "kvcr-phase1-$SLURM_JOB_ID-$name"; fi
+  log "=== run $name ($TOPOLOGY): cases=$CASES ==="
   set +e
   bash .github/scripts/run_phase1.sh \
     --gpus "$GPUS" "${IMAGE_ARG[@]}" \
@@ -102,11 +146,12 @@ run_config() {
     --output-dir "$out" \
     --cpus "$CPUS" --memory "${MEM_G}g" \
     --hf-cache "$W/hf-cache" --timeout "$TIMEOUT" \
-    --cases "$CASES" "$@" 2>&1 | tail -5
+    --cases "$CASES" "${SIDECAR_ARGS[@]}" "$@" 2>&1 | tail -5
   local rc=${PIPESTATUS[0]}
   set -e
   log "=== run $name exit=$rc ==="
   cp -r "$out" "$RUNS/phase1-$name"
+  if [[ "$TOPOLOGY" == sidecar ]]; then stop_sidecars "$name"; fi
   python3 - "$out/run/result.json" <<'PY' | tee "$RUNS/phase1-$name.summary.txt" || true
 import json, sys
 r = json.load(open(sys.argv[1]))
