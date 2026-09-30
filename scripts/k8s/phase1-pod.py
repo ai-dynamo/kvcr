@@ -123,10 +123,11 @@ def etcd_sidecar() -> dict:
         "image": args.etcd_image,
         "imagePullPolicy": "IfNotPresent",
         "restartPolicy": "Always",
-        "command": ["sh", "-c",
-                    "exec etcd --data-dir /tmp/etcd --listen-client-urls http://0.0.0.0:2379 "
-                    "--advertise-client-urls http://$(POD_IP):2379 "
-                    "--listen-peer-urls http://127.0.0.1:2380"],
+        # distroless image, no shell; kubelet expands $(POD_IP) from env
+        "command": ["etcd", "--data-dir", "/tmp/etcd",
+                    "--listen-client-urls", "http://0.0.0.0:2379",
+                    "--advertise-client-urls", "http://$(POD_IP):2379",
+                    "--listen-peer-urls", "http://127.0.0.1:2380"],
         "env": [{"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}],
         "resources": {"requests": {"cpu": "500m", "memory": "512Mi"},
                       "limits": {"cpu": "2", "memory": "2Gi"}},
