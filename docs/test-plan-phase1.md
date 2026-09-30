@@ -232,6 +232,22 @@ and the container saw two GPUs); only Slurm-allocated GPU UUIDs are handed to
 docker (`388f12b`). Guard cannot run on aws-iad-cs-002 / eos / cw-pdx-cs-001
 (kernels 5.15/5.19: `SO_PEERPIDFD` → `ENOPROTOOPT`, KVCR fails closed).
 
+### Kubernetes runs (2026-09-30, dynamo-aws-dev-02)
+
+`scripts/k8s/phase1-pod.py` renders the sidecar layout as a pod (two
+`kvcr_service` native sidecars + main) and, with `--two-node`, two pods on two
+nodes: pod `b` runs `tests/e2e/phase1/node_agent.py` and worker 1's sidecar,
+pod `a` runs etcd (Dynamo discovery; the file store's inotify watch is
+node-local), worker 0's sidecar and the harness with
+`--remote-worker 1=http://<run>-b…:9800 --etcd http://<run>-a…:2379`.
+Results: single node 5/6 (TC-04 = finding 1, remote hit 114 ms); two nodes
+5/6 (cross-node remote hit 244 ms, 183 MB per request); with the fix for
+finding 1 (`ai-dynamo/kvcr` PR #52) on `PYTHONPATH` via `--extra-env`, both
+layouts 6/6 PASS and TC-06's first Guard-served response drops from 5.7 s to
+1.3 s. Do not put "kvcr" in run names, cache paths or hostnames: the
+reference phase greps the engine log for it (now scrubbed for known
+harness names).
+
 Findings for the KVCR, Dynamo and vLLM teams:
 
 1. **First request to a replaced peer at the same endpoint is refused**
