@@ -44,7 +44,7 @@ from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.memory import KVCRPoolSpec
 from kvcr.remote_fw_dram import _FwMemResidency
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, KVCRStartupError
 
 
 def _fake_hold(**fields: Any) -> SimpleNamespace:
@@ -254,8 +254,9 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     [None, _GUARD_CONFIG],
     ids=["local-backends", "service-pool"],
 )
+@pytest.mark.parametrize("interrupt", [None, KeyboardInterrupt, SystemExit])
 def test_startup_timeout_retains_nonquiescent_resources(
-    monkeypatch, guard_config
+    monkeypatch, guard_config, interrupt
 ) -> None:
     # A guard_config now requires a control that can hand its endpoint over.
     guarded_control = Mock()
@@ -279,6 +280,8 @@ def test_startup_timeout_retains_nonquiescent_resources(
 
         def wait_for_ready(timeout):
             assert entered.wait(timeout=1)
+            if interrupt is not None:
+                raise interrupt("interrupted startup")
             return ready_wait(timeout)
 
         monkeypatch.setattr(core._progress._ready, "wait", wait_for_ready)
@@ -306,8 +309,10 @@ def test_startup_timeout_retains_nonquiescent_resources(
 
     try:
         with pytest.raises(
-            RuntimeError, match="timed out after 0s .*NIXL agent initialization"
-        ):
+            interrupt or KVCRStartupError,
+            match=("interrupted startup" if interrupt
+                   else "timed out after 0s .*NIXL agent initialization"),
+        ) as exc_info:
             KVCR(
                 KVCRConfig(
                     nixl_agent_name="target",
@@ -326,6 +331,10 @@ def test_startup_timeout_retains_nonquiescent_resources(
                 guard_config,
             )
 
+        if interrupt is None:
+            assert isinstance(exc_info.value.__cause__, RuntimeError)
+        else:
+            assert type(exc_info.value) is interrupt
         assert len(cores) == 1
         core = cores[0]
         assert not core.is_quiescent()

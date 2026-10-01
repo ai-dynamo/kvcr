@@ -47,6 +47,10 @@ class MemDescriptor:
 PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]] | None
 
 
+class KVCRStartupError(RuntimeError):
+    """Startup could not stop native work; retain caller buffers until process exit."""
+
+
 class TransferError(RuntimeError):
     """Lifecycle report for memory exposed by a failed transfer.
 

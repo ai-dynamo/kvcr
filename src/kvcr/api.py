@@ -29,6 +29,7 @@ from .guard_protocol import KVCRPoolHold
 from .types import (
     BlockKey,
     CacheTier,
+    KVCRStartupError,
     MemDescriptor,
     OpHandle,
     OpResult,
@@ -104,7 +105,7 @@ class KVCR:
                 _recovery.adopt_claimed_pool(core, claimed)
             core.start()
             _recovery.commit_claimed_pool(claimed)
-        except BaseException:
+        except BaseException as exc:
             close_failed = False
             if core is not None:
                 try:
@@ -117,6 +118,8 @@ class KVCR:
                 # split the endpoint. Retained until this process dies, when
                 # the pidfd frees the pool.
                 _NONQUIESCENT_STARTUP_RESOURCES.append((core, pool_hold))
+                if isinstance(exc, Exception):
+                    raise KVCRStartupError(str(exc)) from exc
             elif pool_hold is not None:
                 with contextlib.suppress(BaseException):
                     pool_hold.release(activated=False)
