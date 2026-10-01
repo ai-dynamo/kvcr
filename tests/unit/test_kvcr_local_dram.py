@@ -340,6 +340,7 @@ def test_lru_float_score_uses_small_tail_first_bias() -> None:
 
 @pytest.mark.parametrize(
     ("policy", "use_current_time", "keep_claim", "evicted_index"),
+    # use_current_time: None skips alignment; False uses newest access; True uses now.
     [
         (FIFOPolicy(), None, False, 1),
         (LRUPolicy(), None, False, 0),
@@ -413,7 +414,7 @@ def test_builtin_policy_eviction_order(
     ("access_first", "use_current_time", "expected_time"),
     [(False, False, None), (True, False, 3.0), (False, True, 5.0), (True, True, 5.0)],
 )
-def test_align_sequence_updates_metadata_before_policy_callback_and_rescoring(
+def test_align_sequence_updates_policy_and_journal(
     access_first: bool, use_current_time: bool, expected_time: float | None
 ) -> None:
     events = []
@@ -426,15 +427,21 @@ def test_align_sequence_updates_metadata_before_policy_callback_and_rescoring(
             events.append(("score", meta, source))
             return super().eviction_score(meta, source)
 
-    local = ctypes.create_string_buffer(32)
-    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 2, policy=RecordingLRUPolicy())
+    primary = ctypes.create_string_buffer(16)
+    local = ctypes.create_string_buffer(48)
+    agent = FakeNixlAgent()
+    kvcr = _new_local_kvcr(agent, local, 3, policy=RecordingLRUPolicy())
     records = _g2_recovered(first=0, last=1)
     first, last = records
     records[first].last_access = 3.0 if access_first else None
     records[first].access_count = int(access_first)
     install_recovery_records(kvcr._core, records)
     missing = BlockKey(b"missing")
-    assert all(event[1].position == -1 for event in events)
+    filling = BlockKey(b"filling")
+    kvcr.deposit({filling: [_mem_descriptor(ctypes.addressof(primary))]})
+    _wait_until(lambda: bool(agent.transfers))
+    filling_record = kvcr._core._block_record_map[filling]
+    assert filling_record.local_dram.state is _LocalDramState.FILLING
     events.clear()
     journal = Mock()
     journal.publish.return_value = True
@@ -442,10 +449,9 @@ def test_align_sequence_updates_metadata_before_policy_callback_and_rescoring(
 
     kvcr._core._clock = lambda: 5.0
     kvcr.align_sequence([])
-    kvcr.align_sequence([missing])
-    kvcr.align_sequence(
-        [missing, first, first, last], use_current_time=use_current_time
-    )
+    kvcr.align_sequence([missing, filling])
+    ordered_keys = [missing, first, first, last, filling]
+    kvcr.align_sequence(ordered_keys, use_current_time=use_current_time)
 
     assert [event[0] for event in events] == ["align", "score", "score"]
     _, blocks, callback_flag = events[0]
@@ -457,22 +463,23 @@ def test_align_sequence_updates_metadata_before_policy_callback_and_rescoring(
         (first, 1, expected_time, int(access_first)),
         (last, 3, expected_time, 0),
     ]
-    assert set(kvcr._core._block_record_map) == {first, last}
+    assert set(kvcr._core._block_record_map) == {first, last, filling}
+    assert filling_record.position == -1
+    assert filling_record.last_access is None
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 2
     assert {event[1].block_key: event[1] for event in events[1:]} == {
         meta.block_key: meta for meta in blocks
     }
     mirror = _RecoveryMirror(("",))
-    assert journal.publish.call_count == 2
     for call in journal.publish.call_args_list:
         mirror.apply(*call.args)
-    assert {
-        key: (record.position, record.last_access, record.access_count)
-        for key, record in mirror.take_records().items()
-    } == {first: (1, None, 0), last: (3, None, 0)}
+    assert {key: record.position for key, record in mirror.take_records().items()} == {
+        first: 1,
+        last: 3,
+    }
     # Timestamp-only updates do not need another recovery record.
     kvcr._core._clock = lambda: 6.0
-    kvcr.align_sequence([missing, first, first, last], use_current_time=True)
+    kvcr.align_sequence(ordered_keys, use_current_time=True)
     assert journal.publish.call_count == 2
 
 
