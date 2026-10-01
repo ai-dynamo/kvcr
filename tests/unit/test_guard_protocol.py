@@ -72,7 +72,7 @@ def test_a_peer_pidfd_serves_polling_until_closed_then_refuses_use() -> None:
     """A peer pidfd polls until closed, then is refused; old kernels get why."""
     accepted, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        liveness = PidfdLiveness.from_peer_socket(accepted)
+        liveness = PidfdLiveness.from_peer_socket(accepted, os.pidfd_open(os.getpid()))
         poller = select.poll()
         poller.register(liveness.fileno(), select.POLLIN)
         assert poller.poll(0) == []  # the holder (this process) is still alive
@@ -93,11 +93,10 @@ def test_a_peer_pidfd_serves_polling_until_closed_then_refuses_use() -> None:
         stubborn.fileno()
     stubborn.close()
 
-    # A kernel without SO_PEERPIDFD gets a supported refusal, not an internal
-    # error the operator cannot act on.
+    # A legacy kernel still requires the worker to supply its own pidfd.
     unsupported = Mock()
     unsupported.getsockopt.side_effect = OSError(errno.ENOPROTOOPT, "not supported")
-    with pytest.raises(KVCRServiceError, match="Linux 6.5"):
+    with pytest.raises(KVCRServiceError, match="worker pidfd is required"):
         PidfdLiveness.from_peer_socket(unsupported)
 
 
@@ -306,7 +305,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     hold.release()
 
     # Released rather than disowned, so the hold closes what it was given.
-    assert connection.sent_fds == []
+    assert len(connection.sent_fds) == 1  # The claim carried the worker pidfd.
     assert msgspec.to_builtins(connection.sent[-1]) == {
         "type": "release",
         "version": 1,

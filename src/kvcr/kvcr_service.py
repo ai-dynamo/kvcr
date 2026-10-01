@@ -274,7 +274,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         try:
-            request = self.channel.receive(_CLAIM_DECODER)
+            request, worker_pidfd = self.channel.receive_with_fd(_CLAIM_DECODER)
         except (EOFError, OSError):
             return
         except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
@@ -284,7 +284,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         liveness: PidfdLiveness | None = None
         grant: "tuple[int, int, _Lease] | None" = None
         try:
-            liveness = PidfdLiveness.from_peer_socket(self.request)
+            liveness = PidfdLiveness.from_peer_socket(self.request, worker_pidfd)
             response, grant = self.server.dispatch(request, liveness)
         except KVCRServiceError as error:
             response = _Error(str(error), _PROTOCOL_VERSION)
@@ -472,6 +472,13 @@ class _KVCRService:
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
     ) -> None:
+        try:
+            probe_pidfd = os.pidfd_open(os.getpid())
+        except (AttributeError, OSError) as error:
+            raise KVCRServiceError(
+                "KVCR-Service requires pidfd_open (Linux 5.3+)"
+            ) from error
+        os.close(probe_pidfd)
         self.socket_path = Path(socket_path).resolve()
         if not self.socket_path.parent.is_dir():
             raise ValueError(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import errno
 import logging
 import os
 import select
@@ -22,7 +23,7 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _wait_until, free_port, listening_socket
 
-from kvcr import KVCRClient, KVCRServiceError
+from kvcr import KVCRClient, KVCRServiceError, guard_protocol
 from kvcr.config import G3Options
 from kvcr.control_channels import FramedConnection
 from kvcr.guard import _Command, _Phase
@@ -257,6 +258,102 @@ def test_socket_is_private(tmp_path: Path) -> None:
         assert stat.S_IMODE(harness.server.socket_path.stat().st_mode) == 0o600
 
 
+def test_client_claims_with_worker_pidfd_when_peer_option_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unknown option makes the host behave like Linux 5.15 for this claim.
+    monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    with _running_server(tmp_path) as harness:
+        hold = harness.client.claim(
+            0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+        )
+        assert harness.server._registry._guards[0]._pool_lease.current is not None
+        hold.release()
+
+
+def test_client_claims_without_own_pidfd_when_server_has_peer_pidfd(
+    tmp_path: Path,
+) -> None:
+    probe, peer = socket.socketpair()
+    try:
+        try:
+            os.close(probe.getsockopt(socket.SOL_SOCKET, guard_protocol._SO_PEERPIDFD))
+        except OSError:
+            pytest.skip("SO_PEERPIDFD is unavailable")
+    finally:
+        probe.close()
+        peer.close()
+    with _running_server(tmp_path) as harness:
+        with patch(
+            "kvcr.guard_protocol.os.pidfd_open",
+            side_effect=OSError(errno.EPERM, "blocked"),
+        ):
+            hold = harness.client.claim(
+                0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+            )
+        hold.release()
+
+
+def test_legacy_service_refuses_client_without_own_pidfd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    with _running_server(tmp_path) as harness:
+        with patch(
+            "kvcr.guard_protocol.os.pidfd_open",
+            side_effect=OSError(errno.EPERM, "blocked"),
+        ):
+            with pytest.raises(KVCRServiceError, match="worker pidfd is required"):
+                harness.client.claim(
+                    0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+                )
+
+
+def test_legacy_claim_rejects_wrong_process_or_non_pidfd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    with _running_server(tmp_path, guard_count=1) as harness:
+        open_fds = len(os.listdir("/proc/self/fd"))
+        for descriptor_type in ("wrong-pid", "not-pidfd"):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.connect(str(harness.server.socket_path))
+                channel = FramedConnection(connection)
+                descriptor = (
+                    os.pidfd_open(os.getppid())
+                    if descriptor_type == "wrong-pid"
+                    else os.open(os.devnull, os.O_RDONLY)
+                )
+                try:
+                    channel.send_with_fd(_claim_request(), descriptor)
+                finally:
+                    os.close(descriptor)
+                response = channel.receive(_CLAIM_RESPONSE_DECODER)
+                assert isinstance(response, _Error)
+                assert "does not match socket peer" in response.message
+                assert _holders_of(harness.server._registry) == {}
+        _wait_until(lambda: len(os.listdir("/proc/self/fd")) <= open_fds, timeout=2)
+
+
+def test_service_refuses_startup_without_pidfd_open(tmp_path: Path) -> None:
+    socket_path = _test_socket_path()
+    pool_dir = tmp_path / "pools"
+    pool_dir.mkdir()
+    with patch(
+        "kvcr.kvcr_service.os.pidfd_open",
+        side_effect=OSError(errno.ENOSYS, "not implemented"),
+    ):
+        with pytest.raises(KVCRServiceError, match="pidfd_open"):
+            _KVCRService(
+                socket_path,
+                pool_dir,
+                guard_count=1,
+                pool_sizes_bytes=_TEST_POOL_SIZES_BYTES,
+                compatibility_digest=_TEST_DIGEST,
+            )
+    assert not socket_path.exists()
+
+
 def test_client_claims_one_grouped_allocation_with_independent_strides(
     tmp_path: Path,
 ) -> None:
@@ -386,7 +483,11 @@ def test_recognized_messages_ignore_unknown_fields(
             channel = FramedConnection(connection)
             claim = msgspec.to_builtins(_claim_request())
             claim["future"] = {"ignored": True}
-            channel.send(claim)
+            worker_pidfd = os.pidfd_open(os.getpid())
+            try:
+                channel.send_with_fd(claim, worker_pidfd)
+            finally:
+                os.close(worker_pidfd)
             response = channel.receive(_CLAIM_RESPONSE_DECODER)
             assert isinstance(response, _Granted)
             assert 0 in _holders_of(harness.server._registry)
@@ -669,7 +770,11 @@ def test_held_connection_accepts_only_release(tmp_path: Path) -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(str(harness.server.socket_path))
             channel = FramedConnection(connection)
-            channel.send(_claim_request())
+            worker_pidfd = os.pidfd_open(os.getpid())
+            try:
+                channel.send_with_fd(_claim_request(), worker_pidfd)
+            finally:
+                os.close(worker_pidfd)
             assert isinstance(channel.receive(_CLAIM_RESPONSE_DECODER), _Granted)
 
             channel.send(_claim_request())
@@ -706,9 +811,14 @@ def test_a_release_refused_by_a_closing_registry_is_not_fatal() -> None:
     handler.channel.send.assert_called_once()
 
 
+@pytest.mark.parametrize("legacy_peer_option", [False, True])
 def test_fork_and_exec_do_not_preserve_claimant_access(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_peer_option: bool,
 ) -> None:
+    if legacy_peer_option:
+        monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
     with _running_server(tmp_path) as harness:
         exec_program = "import time; print('execed', flush=True); time.sleep(60)"
         program = "\n".join(
@@ -920,6 +1030,9 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         def receive(self, _decoder: object):
             return self.messages.pop(0)
 
+        def receive_with_fd(self, _decoder: object):
+            return self.messages.pop(0), os.pidfd_open(os.getpid())
+
         def send(self, response: object) -> None:
             self.sent.append(response)
 
@@ -979,13 +1092,14 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     monkeypatch.setattr(
         PidfdLiveness,
         "from_peer_socket",
-        classmethod(lambda _cls, _sock: PidfdLiveness(os.pidfd_open(child.pid))),
+        classmethod(lambda _cls, _sock, _fd: PidfdLiveness(os.pidfd_open(child.pid))),
     )
     handler = object.__new__(_RequestHandler)
     handler.request = Mock()
     handler.server = server
     handler.channel = Mock()
-    handler.channel.receive.side_effect = [_claim_request(), EOFError()]
+    handler.channel.receive_with_fd.return_value = (_claim_request(), None)
+    handler.channel.receive.side_effect = [EOFError()]
     handler.channel.send_with_fd.side_effect = RuntimeError("undelivered")
     try:
         # Delivery fails and the connection then EOFs; handle() returns with

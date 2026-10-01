@@ -8,6 +8,7 @@ import logging
 import mmap
 import os
 import socket
+import struct
 import threading
 import uuid
 from collections.abc import Callable
@@ -135,6 +136,31 @@ _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
 _RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
 
 
+def _verify_peer_pidfd(connection: socket.socket, worker_pidfd: int) -> None:
+    """Refuse a descriptor that is not a pidfd for this socket's peer.
+
+    With /proc mounted for the service's PID namespace, SO_PEERCRED and fdinfo
+    report comparable PIDs. A non-pidfd has no Pid: line and a peer outside
+    the namespace reads as 0; both fail closed.
+    """
+    try:
+        peer_pid = struct.unpack(
+            "3i",
+            connection.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            ),
+        )[0]
+        with open(f"/proc/self/fdinfo/{worker_pidfd}") as info:
+            worker_pid = next(
+                (int(line.split()[1]) for line in info if line.startswith("Pid:")),
+                None,
+            )
+    except (OSError, ValueError) as error:
+        raise KVCRServiceError("cannot verify worker pidfd") from error
+    if peer_pid <= 0 or worker_pid != peer_pid:
+        raise KVCRServiceError("worker pidfd does not match socket peer")
+
+
 class PidfdLiveness:
     """Own the pidfd returned for an accepted Unix-socket peer."""
 
@@ -144,18 +170,27 @@ class PidfdLiveness:
         self._close_lock = threading.Lock()
 
     @classmethod
-    def from_peer_socket(cls, connection: socket.socket) -> "PidfdLiveness":
-        try:
-            pidfd = connection.getsockopt(socket.SOL_SOCKET, _SO_PEERPIDFD)
-        except OSError as error:
-            if error.errno != errno.ENOPROTOOPT:
-                raise
-            # A refusal with its reason, not an internal error: the kernel is
-            # too old for this service and the claimant should be told so.
-            message = "SO_PEERPIDFD requires Linux 6.5 or later"
-            logger.warning(message)
-            raise KVCRServiceError(message) from error
-        return cls(pidfd)
+    def from_peer_socket(
+        cls, connection: socket.socket, worker_pidfd: int | None = None
+    ) -> "PidfdLiveness":
+        """Prefer the kernel's peer pidfd; fall back to a verified transferred one."""
+        with contextlib.ExitStack() as transferred:
+            if worker_pidfd is not None:
+                transferred.callback(os.close, worker_pidfd)
+            try:
+                pidfd = connection.getsockopt(socket.SOL_SOCKET, _SO_PEERPIDFD)
+            except OSError as error:
+                if error.errno != errno.ENOPROTOOPT:
+                    raise
+                if worker_pidfd is None:
+                    message = "worker pidfd is required without SO_PEERPIDFD"
+                    logger.warning(message)
+                    raise KVCRServiceError(message) from error
+                _verify_peer_pidfd(connection, worker_pidfd)
+                liveness = cls(worker_pidfd)
+                transferred.pop_all()
+                return liveness
+            return cls(pidfd)
 
     def fileno(self) -> int:
         if self._pidfd < 0:
@@ -271,7 +306,15 @@ class KVCRClient:
         listener_fd: int | None = None
         grant_received = False
         try:
-            connection.send(request)
+            try:
+                worker_pidfd = os.pidfd_open(os.getpid())
+            except (AttributeError, OSError):
+                connection.send(request)
+            else:
+                try:
+                    connection.send_with_fd(request, worker_pidfd)
+                finally:
+                    os.close(worker_pidfd)
             response, listener_fd = connection.receive_with_fd(_CLAIM_RESPONSE_DECODER)
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
