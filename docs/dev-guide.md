@@ -264,7 +264,7 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-All flags except `--log-level` are required.
+All flags except `--log-level` and `--heartbeat-timeout-ms` are required.
 
 | Flag | Meaning |
 | --- | --- |
@@ -273,7 +273,10 @@ All flags except `--log-level` are required.
 | `--guard-count` | Number of Guard-owned pool groups available by index |
 | `--pool-sizes-gb` | Comma-separated usable sizes of the ordered pools in every group |
 | `--compatibility-digest` | Exact digest every claimant must provide |
+| `--heartbeat-timeout-ms` | Opt in to Guard promotion after a missed heartbeat; omitted means pidfd-only detection. Workers send heartbeats every 50 ms; minimum timeout is 200 ms. |
 | `--log-level` | Service and Guard logging threshold; defaults to `$KVCR_LOG_LEVEL` or `INFO` |
+
+Heartbeat promotion is speculative: a live but stalled worker can overlap with Guard serving until its resumed heartbeat is processed. Pidfd-only detection avoids that overlap and remains the default.
 
 Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the
 listed usable sizes. The example therefore creates one mapping of 64 GiB plus

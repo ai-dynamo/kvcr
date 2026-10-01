@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, Mock
 
 import msgspec
 import pytest
+from _kvcr_test_utils import _wait_until
 
 from kvcr import guard_protocol as protocol_module
 from kvcr.config import LocalDramOptions
@@ -26,6 +27,7 @@ from kvcr.guard_protocol import (
     _Error,
     _G3Config,
     _Granted,
+    _Heartbeat,
     _PoolDescriptor,
     _Release,
     _Released,
@@ -436,3 +438,42 @@ def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> N
         "receive",
         "connection.close",
     ]
+
+
+def test_failed_unmap_keeps_heartbeat_armed() -> None:
+    attachment = _Attachment(close_error=BufferError("mapping is exported"))
+    connection = _RecordingConnection([_Released(1)])
+    hold = KVCRPoolHold(
+        local_dram=_local_dram(attachment.address),
+        _pools=_WIRE_POOLS,
+        _attachment=attachment,
+        _connection=connection,
+        _heartbeat_enabled=True,
+    )
+    try:
+        with pytest.raises(BufferError, match="mapping is exported"):
+            hold.release()
+        assert not hold._heartbeat_stop.is_set()
+        _wait_until(
+            lambda: any(isinstance(message, _Heartbeat) for message in connection.sent),
+            timeout=1,
+        )
+    finally:
+        attachment._close_error = None
+        hold.release()
+
+
+def test_pool_hold_starts_heartbeat_only_when_granted(monkeypatch) -> None:
+    thread = Mock()
+    monkeypatch.setattr(protocol_module.threading, "Thread", Mock(return_value=thread))
+    kwargs = dict(
+        local_dram=_local_dram(),
+        _pools=_WIRE_POOLS,
+        _attachment=_Attachment(),
+        _connection=_RecordingConnection([]),
+    )
+
+    KVCRPoolHold(**kwargs)
+    thread.start.assert_not_called()
+    KVCRPoolHold(**kwargs, _heartbeat_enabled=True)
+    thread.start.assert_called_once_with()

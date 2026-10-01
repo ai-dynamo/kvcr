@@ -30,12 +30,14 @@ from .control_channels import (
 from .guard import _Guard, _Lease
 from .guard_protocol import (
     _CLAIM_DECODER,
+    _HOLD_DECODER,
+    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
     _PROTOCOL_VERSION,
-    _RELEASE_DECODER,
     PidfdLiveness,
     _Claim,
     _Error,
     _Granted,
+    _Heartbeat,
     _PoolDescriptor,
     _Released,
     _TierConfig,
@@ -76,6 +78,7 @@ class _PoolRegistry:
         pool_sizes_bytes: tuple[int, ...],
         journal_bytes: int,
         compatibility_digest: str,
+        heartbeat_timeout_seconds: float | None = None,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -108,6 +111,7 @@ class _PoolRegistry:
                         pool_sizes_bytes=pool_sizes_bytes,
                         owner=owner,
                         refusing=self._refusing.is_set,
+                        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
                     )
                 except BaseException:
                     # Nothing has recorded this pool group yet, so the sweep
@@ -198,6 +202,9 @@ class _PoolRegistry:
 
     def release(self, guard_index: int, lease: "_Lease") -> None:
         self._guard(guard_index).release(lease)
+
+    def heartbeat(self, guard_index: int, lease: "_Lease") -> None:
+        self._guard(guard_index).heartbeat(lease)
 
     def abort_grant(self, guard_index: int, lease: "_Lease") -> None:
         """Take back a grant its claimant declared it never served."""
@@ -328,20 +335,23 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         self._await_release(guard_index, lease)
 
     def _await_release(self, guard_index: int, lease: "_Lease") -> None:
-        """Wait for the one message a held connection may send: its release.
+        """Keep the lease alive with heartbeats until its release.
 
         The Guard actor watches the pidfd, not this thread. EOF only ends the
         connection; the lease outlives it, and a death still promotes.
         """
         while True:
             try:
-                release = self.channel.receive(_RELEASE_DECODER)
+                message = self.channel.receive(_HOLD_DECODER)
             except (EOFError, OSError):
                 return
             except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                 self._send_error(error)
                 continue
-            if self._release_or_fail(guard_index, lease, release.activated):
+            if isinstance(message, _Heartbeat):
+                self.server.registry.heartbeat(guard_index, lease)
+                continue
+            if self._release_or_fail(guard_index, lease, message.activated):
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))
             return
@@ -434,6 +444,7 @@ class _ThreadingUnixServer(
                 pools,
                 _PROTOCOL_VERSION,
                 dead_incarnations=guard.dead_incarnations,
+                heartbeat_enabled=guard.heartbeat_enabled,
             ),
             (request.guard_index, listener_fd, lease),
         )
@@ -480,6 +491,7 @@ class _KVCRService:
         pool_sizes_bytes: tuple[int, ...],
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
+        heartbeat_timeout_seconds: float | None = None,
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -497,7 +509,12 @@ class _KVCRService:
         # per pod and clears the path before starting it.
         _unlink_stale_socket(self.socket_path)
         self._registry = _PoolRegistry(
-            pool_dir, guard_count, pool_sizes_bytes, journal_bytes, compatibility_digest
+            pool_dir,
+            guard_count,
+            pool_sizes_bytes,
+            journal_bytes,
+            compatibility_digest,
+            heartbeat_timeout_seconds,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -637,6 +654,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--compatibility-digest", required=True)
     parser.add_argument(
+        "--heartbeat-timeout-ms",
+        type=float,
+        help="opt in to early Guard promotion (minimum 200 ms; default: pidfd-only)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str.upper,
         choices=_LOG_LEVELS,
@@ -645,6 +667,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.guard_count < 1:
         parser.error("--guard-count must be at least 1")
+    if args.heartbeat_timeout_ms is not None and not (
+        _MIN_HEARTBEAT_TIMEOUT_SECONDS * 1000
+        <= args.heartbeat_timeout_ms
+        < float("inf")
+    ):
+        parser.error("--heartbeat-timeout-ms must be at least 200 and finite")
     return args
 
 
@@ -665,6 +693,11 @@ def main() -> None:
             guard_count=args.guard_count,
             pool_sizes_bytes=args.pool_sizes_bytes,
             compatibility_digest=args.compatibility_digest,
+            heartbeat_timeout_seconds=(
+                args.heartbeat_timeout_ms / 1000
+                if args.heartbeat_timeout_ms is not None
+                else None
+            ),
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logger.info(

@@ -26,7 +26,12 @@ from .config import (
 )
 from .control_channels import KVCRServiceError, ZmqPeerControlChannel
 from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import PidfdLiveness, _PoolDescriptor, _TierConfig
+from .guard_protocol import (
+    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
+    PidfdLiveness,
+    _PoolDescriptor,
+    _TierConfig,
+)
 from .local_disk import _G3Residency
 from .memory import (
     KVCRPoolAttachment,
@@ -373,7 +378,12 @@ class _Guard:
         pool_sizes_bytes: tuple[int, ...],
         owner: _KVCRPoolOwner | None = None,
         refusing: Callable[[], bool] = lambda: False,
+        heartbeat_timeout_seconds: float | None = None,
     ) -> None:
+        if heartbeat_timeout_seconds is not None and not (
+            _MIN_HEARTBEAT_TIMEOUT_SECONDS <= heartbeat_timeout_seconds < float("inf")
+        ):
+            raise ValueError("KVCR Guard heartbeat timeout must be at least 200 ms")
         self._spec = spec
         self._guard_index = guard_index
         # Owned here, not by the registry: one thread owns one pool group, so a
@@ -393,6 +403,7 @@ class _Guard:
             "release": self._stand_down,
             "abort": self._abort,
             "close": self._close,
+            "resumed": self._invalidate_speculative_promotion,
         }
         self._thread = threading.Thread(
             target=self._run, name=f"kvcr-guard-{spec.pool_id}", daemon=True
@@ -406,6 +417,14 @@ class _Guard:
         self._closing = False
         self._failure: BaseException | None = None
         self._failure_callback = failure_callback or (lambda guard, error: None)
+        self._last_heartbeat: float | None = None
+        self._heartbeat_timeout = heartbeat_timeout_seconds
+        self._resumption_pending = False
+        self._heartbeat_invalidated = False
+
+    @property
+    def heartbeat_enabled(self) -> bool:
+        return self._heartbeat_timeout is not None
 
     def _fail(self, error: BaseException) -> None:
         with self._phase_lock:
@@ -443,6 +462,54 @@ class _Guard:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
         self._end_lease(lease, "release")
 
+    def heartbeat(self, lease: "_Lease") -> None:
+        with self._phase_lock:
+            if (
+                self._heartbeat_timeout is None
+                or self._heartbeat_invalidated
+                or self._pool_lease.current is not lease
+            ):
+                return
+            if not (self._serving or self._reserved is _Phase.PROMOTING):
+                self._last_heartbeat = time.monotonic()
+                return
+            # The primary is alive after all. One command undoes the promotion;
+            # the flag keeps 50 ms heartbeats from flooding the queue until the
+            # actor has run it.
+            if not self._resumption_pending:
+                self._resumption_pending = True
+                self._commands.put(_Command("resumed", (lease,)))
+
+    def _invalidate_speculative_promotion(self, lease: "_Lease") -> None:
+        with self._phase_lock:
+            self._resumption_pending = False
+        if self._pool_lease.current is not lease or not self._serving:
+            return
+        if self._pool_lease.poll_pidfd(lease) is not None:
+            return
+        core, self._core = self._core, None
+        self._serving = False
+        self._resumable = False
+        try:
+            core.close()
+            with socket.socket(
+                fileno=os.dup(self._pool_lease.listener.fileno())
+            ) as listener:
+                self._control = ZmqPeerControlChannel.from_shared_listener(listener)
+        except BaseException as error:
+            # Already not serving: a failed rebuild must not look like one.
+            self._fail(error)
+            raise
+        self._recovery.invalidate_journal()
+        self._recovery.mirror = None
+        with self._phase_lock:
+            self._last_heartbeat = None
+            self._heartbeat_invalidated = True
+        logger.warning(
+            "KVCR Guard %d invalidated after heartbeat resumed from live primary",
+            self._guard_index,
+        )
+
     def abort_grant(self, lease: "_Lease") -> None:
         """Roll back a lease its claimant declared it never served.
         Sent only after the claimant stopped local access, so a stood-down
@@ -459,10 +526,13 @@ class _Guard:
                 return
             if self._reserved is not None:
                 if self._reserved is _Phase.PROMOTING:
-                    # The death of this same lease got here first; it wins.
-                    return
-                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
-            self._reserved = _Phase.RELEASING
+                    # Only confirmed death makes this release moot.
+                    if self._pool_lease.poll_pidfd(lease) is not None:
+                        return
+                else:
+                    raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
+            else:
+                self._reserved = _Phase.RELEASING
         self._submit(_Command(operation, (lease,)))
 
     def close(self) -> None:
@@ -591,6 +661,16 @@ class _Guard:
                 self._observe_holder()
                 draining = self._poll()
                 continue
+            if command.operation in ("release", "abort"):
+                with self._phase_lock:
+                    current = self._pool_lease.current is command.args[0]
+                    if current:
+                        # A speculative promotion may have cleared its reservation
+                        # before this deferred command reached the actor.
+                        self._reserved = _Phase.RELEASING
+                if not current:
+                    command.future.set_result(None)
+                    continue
             failed: BaseException | None = None
             try:
                 result = self._ops[command.operation](*command.args)
@@ -598,11 +678,13 @@ class _Guard:
                 failed = error
                 with self._phase_lock:
                     # The one rollback point: success commits a stable phase itself.
-                    self._reserved = None
+                    if command.operation != "resumed":
+                        self._reserved = None
                 command.future.set_exception(error)
             else:
                 with self._phase_lock:
-                    self._reserved = None
+                    if command.operation != "resumed":
+                        self._reserved = None
                 command.future.set_result(result)
             if command.operation == "close":
                 if failed is not None:
@@ -625,8 +707,6 @@ class _Guard:
                 return
             lease = self._pool_lease.current
         flags = self._pool_lease.poll_pidfd(lease)
-        if flags is None:
-            return
         with self._phase_lock:
             if (
                 self._pool_lease.current is not lease
@@ -635,16 +715,31 @@ class _Guard:
             ):
                 # Interpret only while this lease is current and no transition began.
                 return
+            if flags is None and (
+                self._heartbeat_timeout is None
+                or self._last_heartbeat is None
+                or time.monotonic() - self._last_heartbeat < self._heartbeat_timeout
+            ):
+                return
             self._reserved = _Phase.PROMOTING
         try:
-            if not flags & select.POLLIN:
+            if flags is not None and not flags & select.POLLIN:
                 # The process may still be alive: promoting could seat a
                 # second server over a live mapping.
                 raise OSError(f"pidfd poll returned without POLLIN: {flags:#x}")
-            if lease.incarnation is not None:
+            if flags is None:
+                self._promote()
                 with self._phase_lock:
-                    self._dead_incarnations.add(lease.incarnation)
-            self._promote_for(lease)
+                    self._last_heartbeat = None
+                logger.warning(
+                    "KVCR Guard %d promoted after heartbeat timeout",
+                    self._guard_index,
+                )
+            else:
+                if lease.incarnation is not None:
+                    with self._phase_lock:
+                        self._dead_incarnations.add(lease.incarnation)
+                self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)
         finally:
@@ -673,6 +768,9 @@ class _Guard:
             with self._phase_lock:
                 if not self._closing and not self._refusing():
                     self._pool_lease.current = liveness
+                    # Arm early promotion only after the claimant's first heartbeat.
+                    self._last_heartbeat = None
+                    self._heartbeat_invalidated = False
                     self._phase = _Phase.PRIMARY
                     logger.debug(
                         "KVCR_EVENT primary_attached guard=%d pool=%s control=%s:%d",
@@ -703,7 +801,7 @@ class _Guard:
 
     def _stand_down(self, lease: "_Lease") -> None:
         """End this lease, keeping what it left for the next primary.
-        Staleness was decided at submission; here the lease is current.
+        Staleness was decided at actor dispatch; here the lease is current.
         """
         try:
             self._release()
@@ -735,7 +833,8 @@ class _Guard:
     def _promote_for(self, lease: "_Lease") -> None:
         """Take the pool over from the primary that just died."""
         try:
-            self._promote()
+            if not self._serving:
+                self._promote()
         finally:
             lease.close()
             with self._phase_lock:

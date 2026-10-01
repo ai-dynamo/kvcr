@@ -9,6 +9,7 @@ import os
 import queue
 import select
 import socket
+import threading
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -21,6 +22,7 @@ from kvcr import guard as guard_module
 from kvcr.config import LocalDramOptions
 from kvcr.control_channels import KVCRServiceError, ZmqPeerControlChannel
 from kvcr.core import _BlockRecord
+from kvcr.dangling_ops import _DanglingOps
 from kvcr.guard import (
     _Command,
     _Guard,
@@ -134,11 +136,16 @@ def _give_serving_core(guard: _Guard) -> Mock:
     return core
 
 
-def _configurable_guard() -> _Guard:
+def _configurable_guard(**kwargs) -> _Guard:
     """A Guard past preparation, with nothing held and no thread running."""
-    guard = _guard()
+    guard = _guard(**kwargs)
     guard._phase = _Phase.IDLE
     return guard
+
+
+def test_guard_rejects_too_short_heartbeat_timeout() -> None:
+    with pytest.raises(ValueError, match="at least 200 ms"):
+        _configurable_guard(heartbeat_timeout_seconds=0.01)
 
 
 def test_a_wait_timeout_racing_the_answer_returns_the_answer() -> None:
@@ -198,6 +205,219 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
     guard._promote_for.assert_not_called()
     assert guard._reserved is None
     assert guard._phase is _Phase.PRIMARY
+
+
+def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
+    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    guard._promote = Mock(side_effect=lambda: setattr(guard, "_serving", True))
+    now = [10.0]
+    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
+
+    now[0] += 2.0
+    guard._observe_holder()
+    guard._promote.assert_not_called()
+    guard.heartbeat(lease)
+    now[0] += 0.75
+    guard._observe_holder()
+    guard._promote.assert_not_called()
+    now[0] += 0.251
+    guard._observe_holder()
+
+    guard._promote.assert_called_once_with()
+    assert guard._pool_lease.current is lease
+    assert guard._phase is _Phase.PRIMARY
+    guard._pool_lease.poll_pidfd.return_value = select.POLLIN
+    guard._observe_holder()
+    guard._promote.assert_called_once_with()
+    assert guard._pool_lease.current is None
+
+
+def test_live_release_during_speculative_promotion_is_honored() -> None:
+    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._reserved = _Phase.PROMOTING
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    guard._release = Mock()
+    guard._submit = Mock(
+        side_effect=lambda command: guard._ops[command.operation](*command.args)
+    )
+
+    guard.release(lease)
+
+    guard._release.assert_called_once_with()
+    assert guard._pool_lease.current is None
+
+
+@pytest.mark.parametrize("operation", ["release", "abort"])
+def test_delayed_lease_end_cannot_touch_a_replacement(operation) -> None:
+    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
+    lease = Mock(incarnation="old")
+    replacement = Mock(incarnation="replacement")
+    guard._phase = _Phase.PRIMARY
+    guard._reserved = _Phase.PROMOTING
+    guard._serving = True
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    guard._release = Mock()
+    guard._close_resources = Mock()
+    submitting, proceed = threading.Event(), threading.Event()
+    submit = guard._submit
+
+    def delayed_submit(command):
+        if command.operation == operation:
+            submitting.set()
+            assert proceed.wait(2)
+        return submit(command)
+
+    guard._submit = delayed_submit
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+        result = caller.submit(guard._end_lease, lease, operation)
+        try:
+            assert submitting.wait(2)
+            # Promotion finishes, then death allows a replacement to commit
+            # while the old handler has not yet published its command.
+            guard._reserved = None
+            guard._pool_lease.poll_pidfd.return_value = select.POLLIN
+            guard._observe_holder()
+            guard._reserve_claim()
+            guard._pool_lease.current = replacement
+            guard._phase = _Phase.PRIMARY
+            # The replacement's own release has reserved, but not queued, work.
+            guard._reserved = _Phase.RELEASING
+            proceed.set()
+            _wait_until(lambda: not guard._commands.empty(), timeout=2)
+            guard._started = True
+            guard._thread.start()
+            result.result(timeout=2)
+
+            guard._release.assert_not_called()
+            assert guard._pool_lease.current is replacement
+            assert guard._phase is _Phase.PRIMARY
+            assert guard._reserved is _Phase.RELEASING
+        finally:
+            proceed.set()
+            guard.close()
+
+
+def test_resumption_command_keeps_a_pending_release_reserved() -> None:
+    guard = _configurable_guard()
+    guard._reserved = _Phase.RELEASING
+    guard._ops["resumed"] = Mock()
+    guard._close_resources = Mock()
+    guard._started = True
+    guard._thread.start()
+    try:
+        guard._submit(_Command("resumed", (Mock(),)))
+        assert guard._reserved is _Phase.RELEASING
+    finally:
+        guard.close()
+
+
+def test_heartbeat_arriving_during_pidfd_poll_prevents_early_promotion(
+    monkeypatch,
+) -> None:
+    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._promote = Mock()
+    now = [10.0]
+    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
+    guard.heartbeat(lease)
+    now[0] += 1.1
+    guard._pool_lease.poll_pidfd = Mock(
+        side_effect=lambda _lease: (guard.heartbeat(lease), None)[1]
+    )
+
+    guard._observe_holder()
+
+    guard._promote.assert_not_called()
+
+
+def test_default_guard_waits_for_pidfd_without_heartbeats() -> None:
+    guard = _configurable_guard()
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    guard._promote = Mock()
+
+    guard.heartbeat(lease)
+    guard._observe_holder()
+
+    guard._promote.assert_not_called()
+    assert guard._last_heartbeat is None
+
+
+def test_resumed_live_primary_invalidates_speculative_guard() -> None:
+    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    listener = socket.create_server(("127.0.0.1", 0))
+    guard._pool_lease.listener = listener
+    core = _give_serving_core(guard)
+    guard._recovery._journal = Mock()
+    guard._recovery.mirror = Mock()
+
+    try:
+        guard.heartbeat(lease)
+        command = guard._commands.get_nowait()
+        assert guard._commands.empty()
+        guard._ops[command.operation](*command.args)
+
+        core.close.assert_called_once_with()
+        guard._recovery._journal.invalidate.assert_called_once_with()
+        assert guard._recovery.mirror is None
+        assert guard._core is None
+        assert not guard._serving
+        assert guard._pool_lease.current is lease
+        guard.heartbeat(lease)
+        assert guard._commands.empty()
+        guard._observe_holder()
+        assert not guard._serving
+    finally:
+        guard._control.close()
+        listener.close()
+
+
+def test_resumed_primary_can_still_be_promoted_after_real_death() -> None:
+    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    listener = socket.create_server(("127.0.0.1", 0))
+    guard._pool_lease.listener = listener
+    original_control = ZmqPeerControlChannel.from_shared_listener(
+        socket.socket(fileno=os.dup(listener.fileno()))
+    )
+    guard._control = original_control
+    core = _give_serving_core(guard)
+    core.close.side_effect = original_control.close
+    guard._recovery._journal = Mock()
+    guard._recovery.mirror = Mock()
+    guard._serve = Mock(side_effect=lambda *_args: guard._control.initialize())
+    try:
+        guard.heartbeat(lease)
+        command = guard._commands.get_nowait()
+        guard._ops[command.operation](*command.args)
+        guard._pool_lease.poll_pidfd.return_value = select.POLLIN
+
+        guard._observe_holder()
+
+        assert guard._failure is None
+        guard._serve.assert_called_once()
+    finally:
+        guard._control.close()
+        listener.close()
 
 
 def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> None:
@@ -298,6 +518,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # A Guard serves G2 and holds G3 records for the returning primary.
         assert backends.g3 is None
         core = Mock(_local_dram=Mock(), _g3=None, _block_record_map={})
+        core._remote_fw_dram._dangling_ops = _DanglingOps(core._remote_fw_dram)
 
         def adopt(records) -> None:
             core._block_record_map = records
@@ -329,7 +550,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         backend_options={},
     )
     tier = _tier(_PAGE_BLOCK_SIZE_BYTES, g3_config, "REMOTE")
-    guard = _guard(_PAGE_SPEC)
+    guard = _guard(_PAGE_SPEC, heartbeat_timeout_seconds=1.0)
     # Driven directly, then the thread starts already busy: the actor blocks
     # on an empty mailbox when idle, so mutating around a sleeping thread
     # would race its wakeup instead of testing the ordering.
@@ -349,8 +570,13 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
             guard._refuse_incompatible(_tier(16))
 
         promoted_records = guard._recovery.mirror._records
-        with _phase_clock(10.0, 10.25, 10.75, 11.5):
-            guard._promote()
+        lease = Mock(incarnation="primary")
+        guard._pool_lease.current = lease
+        guard._pool_lease.poll_pidfd = Mock(return_value=None)
+        guard._phase = _Phase.PRIMARY
+        guard._last_heartbeat = 8.0
+        with _phase_clock(10.0, 10.0, 10.25, 10.75, 11.5):
+            guard._observe_holder()
 
         assert journal.pending == []
         assert order == [
@@ -361,6 +587,24 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         ]
         assert cores[0].adopt_recovery_records.call_args.args[0] is promoted_records
         assert set(guard._recovery._g3_records) == {first, g3_only}
+
+        # Speculative serving cannot certify death, but the same core must
+        # publish the tombstone once pidfd confirms the primary has exited.
+        backend = cores[0]._remote_fw_dram
+        probe = {
+            "target_agent": "target",
+            "op_handle": 1,
+            "sender_control_endpoint": "tcp://target:1",
+            "source_control_endpoint": "tcp://source:1",
+            "source_incarnation": "primary",
+        }
+        backend._dangling_ops.handle_probe(Mock(), probe)
+        assert "dead_incarnation" not in backend._send_control.call_args.args[2]
+        guard._pool_lease.poll_pidfd.return_value = select.POLLIN
+        guard._observe_holder()
+        assert guard._core is cores[0] and len(cores) == 1
+        backend._dangling_ops.handle_probe(Mock(), probe)
+        assert backend._send_control.call_args.args[2]["dead_incarnation"] == "primary"
 
         # A replacement claims the pool. What is kept must be what a replay
         # gives: the half-written G2 slot is dropped, and the G3 halves are

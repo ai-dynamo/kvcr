@@ -1383,6 +1383,7 @@ def test_a_pidfd_that_breaks_while_its_process_lives_is_service_fatal(
             )
 
         guard._promote.assert_not_called()
+        _wait_until(lambda: len(uncontained) == 1, timeout=5)
         (error,) = uncontained
         assert isinstance(error, OSError) and "without POLLIN" in str(error)
     finally:
@@ -1478,6 +1479,28 @@ def test_service_log_level_accepts_cli_and_environment(monkeypatch) -> None:
     assert _parse_args(_service_args("1")).log_level == "WARNING"
     assert _parse_args(_service_args("1") + ["--log-level", "debug"]).log_level == (
         "DEBUG"
+    )
+
+
+def test_service_heartbeat_timeout_is_opt_in() -> None:
+    assert _parse_args(_service_args("1")).heartbeat_timeout_ms is None
+    assert (
+        _parse_args(
+            _service_args("1") + ["--heartbeat-timeout-ms", "1000"]
+        ).heartbeat_timeout_ms
+        == 1000
+    )
+    with pytest.raises(SystemExit):
+        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "0"])
+    with pytest.raises(SystemExit):
+        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "10"])
+    with pytest.raises(SystemExit):
+        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "199"])
+    assert (
+        _parse_args(
+            _service_args("1") + ["--heartbeat-timeout-ms", "200"]
+        ).heartbeat_timeout_ms
+        == 200
     )
 
 
