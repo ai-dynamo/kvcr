@@ -5,7 +5,8 @@
 import heapq
 import logging
 import math
-from collections.abc import Collection, Generator
+from collections import Counter
+from collections.abc import Collection, Generator, Iterable
 from dataclasses import dataclass
 
 from .policy import KVCachePolicy
@@ -156,11 +157,13 @@ class _PolicyInvoker:
 class _Entry:
     score: float
     sequence: int
+    pools: tuple[str, ...]
 
 
 class _EvictionQueue:
     def __init__(self) -> None:
-        self._heap: list[tuple[float, int, BlockKey]] = []
+        self._heaps: dict[str, list[tuple[float, int, BlockKey]]] = {}
+        self._pool_sizes: Counter[str] = Counter()
         self._live: dict[BlockKey, _Entry] = {}
         self._next_sequence = 0
 
@@ -171,47 +174,67 @@ class _EvictionQueue:
         entry = self._live.get(key)
         return entry.score if entry is not None else None
 
-    def insert(self, key: BlockKey, score: float) -> bool:
+    def insert(self, key: BlockKey, score: float, pools: Iterable[str] = ("",)) -> bool:
         """Refresh a score, returning whether the key newly became evictable."""
+        pools = tuple(sorted(set(pools)))
         previous = self._live.get(key)
-        if previous is not None and previous.score == score:
+        if previous is not None and previous.score == score and previous.pools == pools:
             return False
-        entry = _Entry(score, self._next_sequence)
+        if previous is not None:
+            self._pool_sizes.subtract(previous.pools)
+        self._pool_sizes.update(pools)
+        entry = _Entry(score, self._next_sequence, pools)
         self._next_sequence += 1
         self._live[key] = entry
-        heapq.heappush(self._heap, (entry.score, entry.sequence, key))
-        if len(self._heap) > 2 * len(self._live):
-            # Accumulated stale entries amortize this O(n) pass. Reusing tuples
-            # limits overhead, but this insert still pays the synchronous cost.
-            # If profiling shows significant pauses, use incremental compaction.
-            # Compact queued entries only; candidates() restores those it holds.
-            self._heap = [
-                item
-                for item in self._heap
-                if (current := self._live.get(item[2])) is not None
-                and current.sequence == item[1]
-            ]
-            heapq.heapify(self._heap)
+        item = (entry.score, entry.sequence, key)
+        for pool in pools:
+            heap = self._heaps.setdefault(pool, [])
+            heapq.heappush(heap, item)
+            if len(heap) > 2 * self._pool_sizes[pool]:
+                # Stale entries amortize this O(n) pass within each pool.
+                # Compact queued entries only; candidates() restores held ones.
+                heap[:] = [
+                    item
+                    for item in heap
+                    if (current := self._live.get(item[2])) is not None
+                    and current.sequence == item[1]
+                ]
+                heapq.heapify(heap)
         return previous is None
 
     def remove(self, key: BlockKey) -> bool:
-        return self._live.pop(key, None) is not None
+        previous = self._live.pop(key, None)
+        if previous is not None:
+            self._pool_sizes.subtract(previous.pools)
+        return previous is not None
 
-    def candidates(self, excluded: set[BlockKey]) -> Generator[BlockKey, None, None]:
-        """Visit each key once in score order; close to restore live entries."""
+    def candidates(
+        self, excluded: set[BlockKey], pools: Collection[str] | None = None
+    ) -> Generator[BlockKey, None, None]:
+        """Visit selected pools in global score order; close to restore entries.
+
+        The caller may shrink pools as deficits are satisfied. A multi-pool key
+        is yielded only once, with the same sequence tie-break as a single pool.
+        """
+        pools = self._heaps if pools is None else pools
         excluded = set(excluded)
-        skipped: list[tuple[float, int, BlockKey]] = []
+        skipped: list[tuple[str, tuple[float, int, BlockKey]]] = []
         try:
-            while self._heap:
-                item = heapq.heappop(self._heap)
+            while heads := [
+                (heap[0], pool) for pool in pools if (heap := self._heaps.get(pool))
+            ]:
+                _, pool = min(heads)
+                item = heapq.heappop(self._heaps[pool])
                 score, sequence, key = item
-                if self._live.get(key) != _Entry(score, sequence):
+                current = self._live.get(key)
+                if current is None or current.sequence != sequence:
                     continue
-                skipped.append(item)
+                skipped.append((pool, item))
                 if key not in excluded:
                     excluded.add(key)
                     yield key
         finally:
-            for score, sequence, key in skipped:
-                if self._live.get(key) == _Entry(score, sequence):
-                    heapq.heappush(self._heap, (score, sequence, key))
+            for pool, item in skipped:
+                current = self._live.get(item[2])
+                if current is not None and current.sequence == item[1]:
+                    heapq.heappush(self._heaps[pool], item)
