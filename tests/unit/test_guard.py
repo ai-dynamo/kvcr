@@ -256,7 +256,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         [
             _frame(first, _recovered_record(g2=[("", 0)], g3=7)),
             _frame(second, _recovered_record(g2=[("", 1)])),
-            _frame(g3_only, _recovered_record(g3=9)),
+            _frame(g3_only, _BlockRecord(g3=_G3Residency(9), position=3)),
         ]
     )
     closed: list[str] = []
@@ -346,11 +346,12 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # gives: the half-written G2 slot is dropped, and the G3 halves are
         # carried whole -- g3_only no longer names any live record, so a
         # rebuild from the core's map could not produce it.
-        retained_g3 = guard._recovery._g3_records[first]
+        retained_g3 = guard._recovery._g3_records[first][0]
         records = cores[0]._block_record_map
         first_residency = records[first].local_dram
         assert first_residency is not None
         first_residency.state = _LocalDramState.FILLING
+        records[first].position = 2
         write_handback = Mock()
         guard._recovery._write_handback = write_handback
         guard._adopt(new_channel(), tier)
@@ -358,9 +359,9 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert guard._recovery.mirror._records is records
         assert guard._recovery.mirror._records[first].g3 is retained_g3
         assert guard._recovery.mirror._records == {
-            first: _recovered_record(g3=7),
+            first: _BlockRecord(g3=_G3Residency(7), position=2),
             second: _recovered_record(g2=[("", 1)]),
-            g3_only: _recovered_record(g3=9),
+            g3_only: _BlockRecord(g3=_G3Residency(9), position=3),
         }
         assert guard._recovery._g3_records == {}
 
@@ -377,7 +378,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 
         assert len(set(agent_names)) == 2
         assert set(guard._recovery._g3_records) == {fresh}
-        assert guard._recovery._g3_records[fresh].slot == 7
+        assert guard._recovery._g3_records[fresh][0].slot == 7
         assert order[3:] == [("adopt", (second, fresh)), "clear", "start"]
         events = [
             message
@@ -523,7 +524,7 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     guard = _guard(owner=owner)
     guard._recovery.attachment = attachment
     mirror = guard._recovery.mirror = _RecoveryMirror(("",))
-    g3_records = guard._recovery._g3_records = {BlockKey(b"g3"): _G3Residency(0)}
+    g3_records = guard._recovery._g3_records = {BlockKey(b"g3"): (_G3Residency(0), -1)}
     guard._pool_lease.current = holder
 
     with pytest.raises(RuntimeError) as first:

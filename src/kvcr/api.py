@@ -154,14 +154,7 @@ class KVCR:
     def align_sequence(
         self, ordered_keys: list[BlockKey], use_current_time: bool = False
     ) -> None:
-        """Record sequence positions and align recency for ready managed keys.
-
-        Use their newest access time, or the current time when requested.
-        Positions use the first occurrence in caller order; missing keys are
-        skipped. Access counts are unchanged. This does not reserve residency.
-        Each call replaces positions for the affected keys; sequence membership
-        is not retained.
-        """
+        """Record sequence positions and align recency for ready managed keys."""
         self._core.align_sequence(ordered_keys, use_current_time)
 
     def deliver(
