@@ -247,6 +247,23 @@ def test_recv_checks_for_data_without_blocking() -> None:
         fake_socket.poll.assert_called_once_with(0)
 
 
+def test_wait_preserves_wake_bytes_and_peer_messages(
+    channel: ZmqPeerControlChannel,
+) -> None:
+    with _pipe() as (reader, writer):
+        os.write(writer, b"wake")
+        started = time.monotonic()
+        channel.wait(2.0, reader)
+        assert time.monotonic() - started < 1.0
+        assert os.read(reader, 4) == b"wake"
+
+        _push_messages(channel.endpoint, 1)
+        started = time.monotonic()
+        channel.wait(2.0, reader)
+        assert time.monotonic() - started < 1.0
+        assert channel.recv() == [msgspec.msgpack.encode({"seq": 0})]
+
+
 def test_an_adopted_listener_serves_conflicts_primary_and_guard() -> None:
     """An adopted endpoint outlives bind conflicts, the primary, and a bad close."""
     # The service owns the endpoint; the worker adopts it, a Guard duplicates it.

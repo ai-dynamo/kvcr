@@ -9,6 +9,7 @@ take it in between.
 """
 
 import logging
+import math
 import os
 import socket
 import struct
@@ -193,6 +194,8 @@ class ZmqPeerControlChannel:
         self._ctx = None
         self._socket = None
         self._outgoing = {}
+        self._poller: zmq.Poller | None = None
+        self._poller_wake_fd: int | None = None
 
     @classmethod
     def from_shared_listener(cls, listener: socket.socket) -> "ZmqPeerControlChannel":
@@ -237,6 +240,8 @@ class ZmqPeerControlChannel:
         self.endpoint = f"tcp://{self._advertise_host}:{int(port)}"
 
     def initialize(self) -> None:
+        self._poller = None
+        self._poller_wake_fd = None
         if self._listener is None:
             self._listener = socket.create_server((self._bind_host, self._bind_port))
         self._ctx = zmq.Context.instance()
@@ -282,6 +287,18 @@ class ZmqPeerControlChannel:
             return False
         return True
 
+    def wait(self, timeout_s: float, wake_fd: int) -> None:
+        """Wait on progress for peer data or a wake byte without consuming either."""
+        socket = self._socket
+        if socket is None:
+            raise RuntimeError("KVCR control channel is not initialized")
+        if self._poller is None or self._poller_wake_fd != wake_fd:
+            self._poller = zmq.Poller()
+            self._poller.register(socket, zmq.POLLIN)
+            self._poller.register(wake_fd, zmq.POLLIN)
+            self._poller_wake_fd = wake_fd
+        self._poller.poll(max(0, math.ceil(timeout_s * 1000)))
+
     def recv(self) -> list[bytes]:
         socket = self._socket
         if socket is None:
@@ -311,5 +328,7 @@ class ZmqPeerControlChannel:
                     sockets.callback(target.close)
             # Dropped before any close runs: a raising close is not retried.
             self._outgoing = {}
+            self._poller = None
+            self._poller_wake_fd = None
             self._socket = None
             self._listener = None
