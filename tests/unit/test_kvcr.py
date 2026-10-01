@@ -310,8 +310,11 @@ def test_startup_timeout_retains_nonquiescent_resources(
     try:
         with pytest.raises(
             interrupt or KVCRStartupError,
-            match=("interrupted startup" if interrupt
-                   else "timed out after 0s .*NIXL agent initialization"),
+            match=(
+                "interrupted startup"
+                if interrupt
+                else "timed out after 0s .*NIXL agent initialization"
+            ),
         ) as exc_info:
             KVCR(
                 KVCRConfig(
