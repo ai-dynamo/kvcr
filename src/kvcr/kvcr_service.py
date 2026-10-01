@@ -656,7 +656,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--heartbeat-timeout-ms",
         type=float,
-        help="opt in to early Guard promotion (minimum 200 ms; default: pidfd-only)",
+        help="opt in to early Guard promotion (minimum 1000 ms; default: pidfd-only)",
     )
     parser.add_argument(
         "--log-level",
@@ -672,7 +672,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         <= args.heartbeat_timeout_ms
         < float("inf")
     ):
-        parser.error("--heartbeat-timeout-ms must be at least 200 and finite")
+        parser.error("--heartbeat-timeout-ms must be at least 1000 and finite")
     return args
 
 

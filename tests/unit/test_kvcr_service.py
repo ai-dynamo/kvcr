@@ -145,6 +145,7 @@ def _running_server(
     guard_count: int = _TEST_GUARD_COUNT,
     pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
     journal_bytes: int = _TEST_JOURNAL_BYTES,
+    heartbeat_timeout_seconds: float | None = None,
 ) -> Iterator[_ServerHarness]:
     socket_path = _test_socket_path()
     pool_dir = tmp_path / "pools"
@@ -156,6 +157,7 @@ def _running_server(
         pool_sizes_bytes=pool_sizes_bytes,
         compatibility_digest=_TEST_DIGEST,
         journal_bytes=journal_bytes,
+        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -356,6 +358,38 @@ def test_service_refuses_startup_without_pidfd_open(tmp_path: Path) -> None:
                 compatibility_digest=_TEST_DIGEST,
             )
     assert not socket_path.exists()
+
+
+def test_held_connection_refreshes_heartbeats_until_release(tmp_path: Path) -> None:
+    timeout = 1.0
+    with _running_server(tmp_path, heartbeat_timeout_seconds=timeout) as harness:
+        guard = harness.server._registry._guards[0]
+        guard._promote = Mock()
+        # The claimant here is the pytest process: a scheduling pause past the
+        # timeout would otherwise SIGKILL the test run through the lease pidfd.
+        guard._fence_missing_primary = Mock(return_value=True)
+        hold = harness.client.claim(
+            0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+        )
+        lease = guard._pool_lease.current
+        try:
+            _wait_until(lambda: guard._last_heartbeat is not None, timeout=2)
+            first_heartbeat = guard._last_heartbeat
+            _wait_until(
+                lambda: (
+                    guard._last_heartbeat is not None
+                    and guard._last_heartbeat >= first_heartbeat + 2 * timeout
+                ),
+                timeout=5,
+            )
+            guard._fence_missing_primary.assert_not_called()
+            guard._promote.assert_not_called()
+            assert guard._phase is _Phase.PRIMARY
+            assert guard._pool_lease.current is lease
+        finally:
+            hold.release()
+        assert guard._phase is _Phase.IDLE
+        assert guard._pool_lease.current is None
 
 
 def test_client_claims_one_grouped_allocation_with_independent_strides(
@@ -1484,23 +1518,13 @@ def test_service_log_level_accepts_cli_and_environment(monkeypatch) -> None:
 
 def test_service_heartbeat_timeout_is_opt_in() -> None:
     assert _parse_args(_service_args("1")).heartbeat_timeout_ms is None
+    with pytest.raises(SystemExit):
+        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "999"])
     assert (
         _parse_args(
             _service_args("1") + ["--heartbeat-timeout-ms", "1000"]
         ).heartbeat_timeout_ms
         == 1000
-    )
-    with pytest.raises(SystemExit):
-        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "0"])
-    with pytest.raises(SystemExit):
-        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "10"])
-    with pytest.raises(SystemExit):
-        _parse_args(_service_args("1") + ["--heartbeat-timeout-ms", "199"])
-    assert (
-        _parse_args(
-            _service_args("1") + ["--heartbeat-timeout-ms", "200"]
-        ).heartbeat_timeout_ms
-        == 200
     )
 
 

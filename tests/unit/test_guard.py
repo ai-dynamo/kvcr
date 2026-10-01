@@ -8,8 +8,8 @@ import logging
 import os
 import queue
 import select
+import signal
 import socket
-import threading
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -144,7 +144,7 @@ def _configurable_guard(**kwargs) -> _Guard:
 
 
 def test_guard_rejects_too_short_heartbeat_timeout() -> None:
-    with pytest.raises(ValueError, match="at least 200 ms"):
+    with pytest.raises(ValueError, match="at least 1 s"):
         _configurable_guard(heartbeat_timeout_seconds=0.01)
 
 
@@ -207,7 +207,15 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
     assert guard._phase is _Phase.PRIMARY
 
 
+def _stub_fence(monkeypatch) -> Mock:
+    """Heartbeat promotion SIGKILLs its primary; tests must not really signal."""
+    fence = Mock()
+    monkeypatch.setattr("kvcr.guard.signal.pidfd_send_signal", fence)
+    return fence
+
+
 def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
+    fence = _stub_fence(monkeypatch)
     guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
     lease = Mock(incarnation="primary")
     guard._phase = _Phase.PRIMARY
@@ -225,9 +233,24 @@ def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
     guard._observe_holder()
     guard._promote.assert_not_called()
     now[0] += 0.251
+    # A heartbeat landing during the poll is seen by the deadline check under it.
+    guard._pool_lease.poll_pidfd = Mock(
+        side_effect=lambda _lease: (guard.heartbeat(lease), None)[1]
+    )
+    guard._observe_holder()
+    guard._promote.assert_not_called()
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    now[0] += 1.1
+    # A primary that cannot be fenced may still be writing: stay put.
+    fence.side_effect = PermissionError("not permitted")
+    guard._observe_holder()
+    guard._promote.assert_not_called()
+    fence.side_effect = None
+
     guard._observe_holder()
 
     guard._promote.assert_called_once_with()
+    assert fence.call_args_list[-1].args == (lease.fileno(), signal.SIGKILL)
     assert guard._pool_lease.current is lease
     assert guard._phase is _Phase.PRIMARY
     guard._pool_lease.poll_pidfd.return_value = select.POLLIN
@@ -237,12 +260,14 @@ def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
 
 
 def test_live_release_during_speculative_promotion_is_honored() -> None:
-    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
+    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
     lease = Mock(incarnation="primary")
     guard._phase = _Phase.PRIMARY
     guard._reserved = _Phase.PROMOTING
     guard._pool_lease.current = lease
-    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    # Promotion closed the pidfd without clearing the lease: polling it here
+    # would be service-fatal.
+    guard._pool_lease.poll_pidfd = Mock(side_effect=ValueError("pidfd is closed"))
     guard._release = Mock()
     guard._submit = Mock(
         side_effect=lambda command: guard._ops[command.operation](*command.args)
@@ -256,7 +281,7 @@ def test_live_release_during_speculative_promotion_is_honored() -> None:
 
 @pytest.mark.parametrize("operation", ["release", "abort"])
 def test_delayed_lease_end_cannot_touch_a_replacement(operation) -> None:
-    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
+    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
     lease = Mock(incarnation="old")
     replacement = Mock(incarnation="replacement")
     guard._phase = _Phase.PRIMARY
@@ -266,78 +291,33 @@ def test_delayed_lease_end_cannot_touch_a_replacement(operation) -> None:
     guard._pool_lease.poll_pidfd = Mock(return_value=None)
     guard._release = Mock()
     guard._close_resources = Mock()
-    submitting, proceed = threading.Event(), threading.Event()
-    submit = guard._submit
+    held: list = []
+    guard._submit = held.append
 
-    def delayed_submit(command):
-        if command.operation == operation:
-            submitting.set()
-            assert proceed.wait(2)
-        return submit(command)
+    guard._end_lease(lease, operation)
 
-    guard._submit = delayed_submit
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
-        result = caller.submit(guard._end_lease, lease, operation)
-        try:
-            assert submitting.wait(2)
-            # Promotion finishes, then death allows a replacement to commit
-            # while the old handler has not yet published its command.
-            guard._reserved = None
-            guard._pool_lease.poll_pidfd.return_value = select.POLLIN
-            guard._observe_holder()
-            guard._reserve_claim()
-            guard._pool_lease.current = replacement
-            guard._phase = _Phase.PRIMARY
-            # The replacement's own release has reserved, but not queued, work.
-            guard._reserved = _Phase.RELEASING
-            proceed.set()
-            _wait_until(lambda: not guard._commands.empty(), timeout=2)
-            guard._started = True
-            guard._thread.start()
-            result.result(timeout=2)
-
-            guard._release.assert_not_called()
-            assert guard._pool_lease.current is replacement
-            assert guard._phase is _Phase.PRIMARY
-            assert guard._reserved is _Phase.RELEASING
-        finally:
-            proceed.set()
-            guard.close()
-
-
-def test_resumption_command_keeps_a_pending_release_reserved() -> None:
-    guard = _configurable_guard()
+    # Promotion finishes, then death allows a replacement to commit while the
+    # old handler has not yet published its command.
+    guard._reserved = None
+    guard._pool_lease.poll_pidfd.return_value = select.POLLIN
+    guard._observe_holder()
+    guard._reserve_claim()
+    guard._pool_lease.current = replacement
+    guard._phase = _Phase.PRIMARY
+    # The replacement's own release has reserved, but not queued, work.
     guard._reserved = _Phase.RELEASING
-    guard._ops["resumed"] = Mock()
-    guard._close_resources = Mock()
+    guard._commands.put(held[0])
     guard._started = True
     guard._thread.start()
     try:
-        guard._submit(_Command("resumed", (Mock(),)))
+        held[0].future.result(timeout=2)
+
+        guard._release.assert_not_called()
+        assert guard._pool_lease.current is replacement
+        assert guard._phase is _Phase.PRIMARY
         assert guard._reserved is _Phase.RELEASING
     finally:
         guard.close()
-
-
-def test_heartbeat_arriving_during_pidfd_poll_prevents_early_promotion(
-    monkeypatch,
-) -> None:
-    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
-    lease = Mock(incarnation="primary")
-    guard._phase = _Phase.PRIMARY
-    guard._pool_lease.current = lease
-    guard._promote = Mock()
-    now = [10.0]
-    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
-    guard.heartbeat(lease)
-    now[0] += 1.1
-    guard._pool_lease.poll_pidfd = Mock(
-        side_effect=lambda _lease: (guard.heartbeat(lease), None)[1]
-    )
-
-    guard._observe_holder()
-
-    guard._promote.assert_not_called()
 
 
 def test_default_guard_waits_for_pidfd_without_heartbeats() -> None:
@@ -353,71 +333,6 @@ def test_default_guard_waits_for_pidfd_without_heartbeats() -> None:
 
     guard._promote.assert_not_called()
     assert guard._last_heartbeat is None
-
-
-def test_resumed_live_primary_invalidates_speculative_guard() -> None:
-    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
-    lease = Mock(incarnation="primary")
-    guard._phase = _Phase.PRIMARY
-    guard._pool_lease.current = lease
-    guard._pool_lease.poll_pidfd = Mock(return_value=None)
-    listener = socket.create_server(("127.0.0.1", 0))
-    guard._pool_lease.listener = listener
-    core = _give_serving_core(guard)
-    guard._recovery._journal = Mock()
-    guard._recovery.mirror = Mock()
-
-    try:
-        guard.heartbeat(lease)
-        command = guard._commands.get_nowait()
-        assert guard._commands.empty()
-        guard._ops[command.operation](*command.args)
-
-        core.close.assert_called_once_with()
-        guard._recovery._journal.invalidate.assert_called_once_with()
-        assert guard._recovery.mirror is None
-        assert guard._core is None
-        assert not guard._serving
-        assert guard._pool_lease.current is lease
-        guard.heartbeat(lease)
-        assert guard._commands.empty()
-        guard._observe_holder()
-        assert not guard._serving
-    finally:
-        guard._control.close()
-        listener.close()
-
-
-def test_resumed_primary_can_still_be_promoted_after_real_death() -> None:
-    guard = _configurable_guard(heartbeat_timeout_seconds=0.5)
-    lease = Mock(incarnation="primary")
-    guard._phase = _Phase.PRIMARY
-    guard._pool_lease.current = lease
-    guard._pool_lease.poll_pidfd = Mock(return_value=None)
-    listener = socket.create_server(("127.0.0.1", 0))
-    guard._pool_lease.listener = listener
-    original_control = ZmqPeerControlChannel.from_shared_listener(
-        socket.socket(fileno=os.dup(listener.fileno()))
-    )
-    guard._control = original_control
-    core = _give_serving_core(guard)
-    core.close.side_effect = original_control.close
-    guard._recovery._journal = Mock()
-    guard._recovery.mirror = Mock()
-    guard._serve = Mock(side_effect=lambda *_args: guard._control.initialize())
-    try:
-        guard.heartbeat(lease)
-        command = guard._commands.get_nowait()
-        guard._ops[command.operation](*command.args)
-        guard._pool_lease.poll_pidfd.return_value = select.POLLIN
-
-        guard._observe_holder()
-
-        assert guard._failure is None
-        guard._serve.assert_called_once()
-    finally:
-        guard._control.close()
-        listener.close()
 
 
 def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> None:
@@ -482,6 +397,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     tmp_path, monkeypatch, caplog
 ) -> None:
     """The Guard's whole life: each stage hands the next exactly what it left."""
+    _stub_fence(monkeypatch)
     caplog.set_level(logging.INFO, logger="kvcr.guard")
     first, second, g3_only, fresh = (
         BlockKey(b"first"),

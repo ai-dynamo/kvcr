@@ -36,7 +36,8 @@ _PROTOCOL_VERSION: ProtocolVersion = 1
 _SO_PEERPIDFD_FALLBACK = 77
 _SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", _SO_PEERPIDFD_FALLBACK)
 _HEARTBEAT_SECONDS = 0.05
-_MIN_HEARTBEAT_TIMEOUT_SECONDS = 4 * _HEARTBEAT_SECONDS
+# A missed deadline SIGKILLs the primary, so keep the floor clear of GC pauses.
+_MIN_HEARTBEAT_TIMEOUT_SECONDS = 20 * _HEARTBEAT_SECONDS
 
 
 class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):

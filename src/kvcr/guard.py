@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import select
+import signal
 import socket
 import threading
 import time
@@ -383,7 +384,7 @@ class _Guard:
         if heartbeat_timeout_seconds is not None and not (
             _MIN_HEARTBEAT_TIMEOUT_SECONDS <= heartbeat_timeout_seconds < float("inf")
         ):
-            raise ValueError("KVCR Guard heartbeat timeout must be at least 200 ms")
+            raise ValueError("KVCR Guard heartbeat timeout must be at least 1 s")
         self._spec = spec
         self._guard_index = guard_index
         # Owned here, not by the registry: one thread owns one pool group, so a
@@ -403,7 +404,6 @@ class _Guard:
             "release": self._stand_down,
             "abort": self._abort,
             "close": self._close,
-            "resumed": self._invalidate_speculative_promotion,
         }
         self._thread = threading.Thread(
             target=self._run, name=f"kvcr-guard-{spec.pool_id}", daemon=True
@@ -419,8 +419,9 @@ class _Guard:
         self._failure_callback = failure_callback or (lambda guard, error: None)
         self._last_heartbeat: float | None = None
         self._heartbeat_timeout = heartbeat_timeout_seconds
-        self._resumption_pending = False
-        self._heartbeat_invalidated = False
+        # Identity of the lease whose fencing failure has been logged: the actor
+        # retries every millisecond, and one warning per lease is enough.
+        self._fence_failed: object | None = None
 
     @property
     def heartbeat_enabled(self) -> bool:
@@ -463,52 +464,16 @@ class _Guard:
         self._end_lease(lease, "release")
 
     def heartbeat(self, lease: "_Lease") -> None:
+        """Record a beat from the current primary, arming the timeout."""
         with self._phase_lock:
             if (
                 self._heartbeat_timeout is None
-                or self._heartbeat_invalidated
                 or self._pool_lease.current is not lease
+                or self._serving
+                or self._reserved is _Phase.PROMOTING
             ):
                 return
-            if not (self._serving or self._reserved is _Phase.PROMOTING):
-                self._last_heartbeat = time.monotonic()
-                return
-            # The primary is alive after all. One command undoes the promotion;
-            # the flag keeps 50 ms heartbeats from flooding the queue until the
-            # actor has run it.
-            if not self._resumption_pending:
-                self._resumption_pending = True
-                self._commands.put(_Command("resumed", (lease,)))
-
-    def _invalidate_speculative_promotion(self, lease: "_Lease") -> None:
-        with self._phase_lock:
-            self._resumption_pending = False
-        if self._pool_lease.current is not lease or not self._serving:
-            return
-        if self._pool_lease.poll_pidfd(lease) is not None:
-            return
-        core, self._core = self._core, None
-        self._serving = False
-        self._resumable = False
-        try:
-            core.close()
-            with socket.socket(
-                fileno=os.dup(self._pool_lease.listener.fileno())
-            ) as listener:
-                self._control = ZmqPeerControlChannel.from_shared_listener(listener)
-        except BaseException as error:
-            # Already not serving: a failed rebuild must not look like one.
-            self._fail(error)
-            raise
-        self._recovery.invalidate_journal()
-        self._recovery.mirror = None
-        with self._phase_lock:
-            self._last_heartbeat = None
-            self._heartbeat_invalidated = True
-        logger.warning(
-            "KVCR Guard %d invalidated after heartbeat resumed from live primary",
-            self._guard_index,
-        )
+            self._last_heartbeat = time.monotonic()
 
     def abort_grant(self, lease: "_Lease") -> None:
         """Roll back a lease its claimant declared it never served.
@@ -525,12 +490,10 @@ class _Guard:
             if self._closing or self._pool_lease.current is not lease:
                 return
             if self._reserved is not None:
-                if self._reserved is _Phase.PROMOTING:
-                    # Only confirmed death makes this release moot.
-                    if self._pool_lease.poll_pidfd(lease) is not None:
-                        return
-                else:
+                if self._reserved is not _Phase.PROMOTING:
                     raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
+                # Queue it: actor dispatch revalidates the lease, and promotion
+                # may already have closed this pidfd, which polling would raise on.
             else:
                 self._reserved = _Phase.RELEASING
         self._submit(_Command(operation, (lease,)))
@@ -665,8 +628,8 @@ class _Guard:
                 with self._phase_lock:
                     current = self._pool_lease.current is command.args[0]
                     if current:
-                        # A speculative promotion may have cleared its reservation
-                        # before this deferred command reached the actor.
+                        # A promotion in flight owns the reservation, so _end_lease
+                        # queued this command without taking one.
                         self._reserved = _Phase.RELEASING
                 if not current:
                     command.future.set_result(None)
@@ -678,13 +641,11 @@ class _Guard:
                 failed = error
                 with self._phase_lock:
                     # The one rollback point: success commits a stable phase itself.
-                    if command.operation != "resumed":
-                        self._reserved = None
+                    self._reserved = None
                 command.future.set_exception(error)
             else:
                 with self._phase_lock:
-                    if command.operation != "resumed":
-                        self._reserved = None
+                    self._reserved = None
                 command.future.set_result(result)
             if command.operation == "close":
                 if failed is not None:
@@ -728,6 +689,8 @@ class _Guard:
                 # second server over a live mapping.
                 raise OSError(f"pidfd poll returned without POLLIN: {flags:#x}")
             if flags is None:
+                if not self._fence_missing_primary(lease):
+                    return
                 self._promote()
                 with self._phase_lock:
                     self._last_heartbeat = None
@@ -745,6 +708,39 @@ class _Guard:
         finally:
             with self._phase_lock:
                 self._reserved = None
+
+    def _fence_missing_primary(self, lease: "_Lease") -> bool:
+        """Kill a primary that stopped heartbeating, so it cannot write again.
+
+        Best-effort, and weaker than the fenced-takeover contract: a successful
+        pidfd_send_signal() means the signal was queued, not that the primary
+        stopped. SIGKILL cannot be caught, but a primary in uninterruptible
+        sleep finishes its kernel operation first, and nothing here orders
+        delivery before promotion. Only confirmed exit via POLLIN fences for
+        certain, which is why this stays opt-in.
+
+        Checking PF_EXITING (0x4 in field 9 of /proc/<pid>/stat) would close
+        most of that gap far sooner than the pidfd reports death, but it needs
+        a shared PID namespace, which separate containers do not have.
+
+        Returns whether the pool is safe to take over.
+        """
+        try:
+            signal.pidfd_send_signal(lease.fileno(), signal.SIGKILL)
+        except ProcessLookupError:
+            return True  # already gone; the poll below will confirm it
+        except (OSError, ValueError) as error:
+            # Unfenced: a live primary could still be writing, so stay put and
+            # let confirmed death drive the takeover instead.
+            if self._fence_failed is not lease:
+                self._fence_failed = lease
+                logger.warning(
+                    "KVCR Guard %d cannot fence its primary, waiting for pidfd: %s",
+                    self._guard_index,
+                    error,
+                )
+            return False
+        return True
 
     def _claim(
         self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
@@ -770,7 +766,6 @@ class _Guard:
                     self._pool_lease.current = liveness
                     # Arm early promotion only after the claimant's first heartbeat.
                     self._last_heartbeat = None
-                    self._heartbeat_invalidated = False
                     self._phase = _Phase.PRIMARY
                     logger.debug(
                         "KVCR_EVENT primary_attached guard=%d pool=%s control=%s:%d",
@@ -989,9 +984,8 @@ class _Guard:
         if core is None:
             raise RecoveryMirrorError("Guard transport was not prepared")
         agent_name = core.nixl_agent_name
-        core._remote_fw_dram._dangling_ops.dead_incarnations = (
-            self._dead_incarnations.copy()
-        )
+        # Shared, not copied: a later confirmed death must reach a serving core.
+        core._remote_fw_dram._dangling_ops.dead_incarnations = self._dead_incarnations
         core.adopt_recovery_records(records)
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
