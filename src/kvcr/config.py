@@ -25,6 +25,8 @@ def _validate_pool_layouts(pool_layouts: PoolBlockLayouts) -> None:
     for pool_name, block_size_bytes in pool_layouts:
         if not isinstance(pool_name, str):
             raise ValueError("pool_layouts pool name must be a string")
+        if ":" in pool_name:
+            raise ValueError("pool_layouts pool names cannot contain a colon")
         if type(block_size_bytes) is not int or block_size_bytes <= 0:
             raise ValueError("pool_layouts block size must be a positive integer")
         names.append(pool_name)

@@ -162,7 +162,7 @@ class KVCR:
         blocks: Mapping[BlockKey, list[MemDescriptor]],
         request_id: str | None = None,
     ) -> OpHandle:
-        """Asynchronously deliver blocks to caller-provided destinations."""
+        """Asynchronously deliver whole blocks or named parts to caller destinations."""
         return self._core.deliver(blocks, request_id)
 
     def deposit(

@@ -492,7 +492,8 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
     assert kvcr._core._block_record_map == {}
 
 
-def test_g3_recovery_rejects_multi_block_local_residency(tmp_path) -> None:
+@pytest.mark.parametrize("slots", [[("", 0), ("", 1)], [(":part", 0)]])
+def test_g3_recovery_rejects_multi_block_local_residency(tmp_path, slots) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     local = ctypes.create_string_buffer(2 * page_size)
     kvcr = _new_g3_kvcr(tmp_path, local, slot_count=2)
@@ -500,7 +501,7 @@ def test_g3_recovery_rejects_multi_block_local_residency(tmp_path) -> None:
     with pytest.raises(RecoveryMirrorError, match="one local DRAM slot"):
         install_recovery_records(
             kvcr._core,
-            {BlockKey(b"multi"): _recovered_record(g2=[("", 0), ("", 1)])},
+            {BlockKey(b"multi"): _recovered_record(g2=slots)},
         )
 
 
@@ -545,8 +546,9 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     now = 2.0
-    with pytest.raises(ValueError, match="multi-block"):
-        kvcr.fetch((first,), expected_layout=["", ""])
+    for layout in (["", ""], [":part"]):
+        with pytest.raises(ValueError, match="G3 does not support"):
+            kvcr.fetch((first,), expected_layout=layout)
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, bool))[fetch][first]
     assert fetch_result.success and fetch_result.descriptors is not None

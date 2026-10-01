@@ -483,6 +483,7 @@ def test_kvcr_rejects_ambiguous_pool_names() -> None:
     for pool_layouts, message in (
         ([("", 8), ("swa", 8)], "empty"),
         ([("swa", 8), ("swa", 8)], "unique"),
+        ([("swa:part", 8)], "colon"),
     ):
         config = KVCRConfig(nixl_agent_name="target", pool_layouts=pool_layouts)
         with pytest.raises(ValueError, match=message):
@@ -502,6 +503,10 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
     with pytest.raises(ValueError, match="expected layout"):
         kvcr.fetch((BlockKey(b"key"),))
     kvcr.fetch((BlockKey(b"key"),), expected_layout=["named"])
+    kvcr.fetch((BlockKey(b"key"),), expected_layout=["named:part", "named:other:part:"])
+    for layout in (["named:"], ["named:part", "named:part"], ["missing:part"]):
+        with pytest.raises(ValueError):
+            kvcr.fetch((BlockKey(b"key"),), expected_layout=layout)
 
 
 def _assert_state_lock_available(core) -> None:

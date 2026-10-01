@@ -48,9 +48,9 @@ class MemDescriptor:
     its spans by endpoint and memory type would add two hierarchy levels merely
     to factor out values typically shared by reference.
 
-    ``info`` currently identifies the descriptor's pool in ``pool_layouts``; an empty
-    string names the single unnamed pool. This generic field may support additional
-    metadata conventions later.
+    ``info`` is a pool name or ``pool:part`` with an opaque part label. Only
+    the pool determines allocation and slot size; the full string identifies
+    a piece within a key. An empty pool name denotes the single unnamed pool.
     """
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]

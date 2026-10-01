@@ -335,10 +335,16 @@ class _KVCRCore:
         if g3 is None and any(record.g3 is not None for record in records.values()):
             raise RecoveryMirrorError("recovered G3 residency has no configured G3")
         if g3 is not None and any(
-            record.local_dram is not None and len(record.local_dram.slots) != 1
+            record.local_dram is not None
+            and (
+                len(record.local_dram.slots) != 1
+                or any(":" in info for info in record.local_dram.layout)
+            )
             for record in records.values()
         ):
-            raise RecoveryMirrorError("G3 recovery requires one local DRAM slot")
+            raise RecoveryMirrorError(
+                "G3 recovery requires one local DRAM slot without a part label"
+            )
         if self._block_record_map:
             raise RecoveryMirrorError("recovered records need a core that holds none")
 
@@ -843,16 +849,25 @@ class _KVCRCore:
             "block descriptors must use configured pools",
         )
         for descriptor in descriptors:
-            block_size = self._block_sizes[descriptor.info]
+            block_size = self._block_sizes[descriptor.info.partition(":")[0]]
             if descriptor.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
         return list(descriptors)
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
-        if not layout or any(name not in self._block_sizes for name in layout):
+        if not layout:
             raise ValueError(invalid_message)
-        if self._g3 is not None and len(layout) != 1:
-            raise ValueError("G3 does not support multi-block layouts")
+        labels = set()
+        for info in layout:
+            pool, separator, label = info.partition(":")
+            if pool not in self._block_sizes or (separator and not label):
+                raise ValueError(invalid_message)
+            if separator:
+                if info in labels:
+                    raise ValueError("block part labels must be unique")
+                labels.add(info)
+        if self._g3 is not None and (len(layout) != 1 or labels):
+            raise ValueError("G3 does not support multi-block layouts or part labels")
 
     def _release_local_dram_sources(
         self,

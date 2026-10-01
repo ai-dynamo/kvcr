@@ -19,6 +19,7 @@ from _kvcr_test_utils import (
     _op_entries,
     _poll_until,
     _RecordingFIFOPolicy,
+    _recovered_record,
     _wait_until,
 )
 
@@ -155,10 +156,13 @@ def test_local_dram_rejects_overlapping_pools() -> None:
         )
 
 
-def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
+@pytest.mark.parametrize("labeled", [False, True])
+def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     full = ctypes.create_string_buffer(16)
     swa = ctypes.create_string_buffer(16)
-    source = ctypes.create_string_buffer(32)
+    payload = b"a" * 16 + b"b" * 8 + b"c" * 8
+    source = ctypes.create_string_buffer(payload, 32)
+    address = ctypes.addressof(source)
     agent = FakeNixlAgent()
     kvcr = _two_pool_kvcr(
         agent,
@@ -168,10 +172,10 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
             pool_layouts=[("full", 16), ("swa", 8)],
         ),
     )
+    layout = ["full", "swa:a", "swa:b"] if labeled else ["full", "swa", "swa"]
     descriptors = [
-        _mem_descriptor(ctypes.addressof(source), 16, info="full"),
-        _mem_descriptor(ctypes.addressof(source) + 16, 8, info="swa"),
-        _mem_descriptor(ctypes.addressof(source) + 24, 8, info="swa"),
+        _mem_descriptor(address + offset, size, info)
+        for offset, size, info in zip((0, 16, 24), (16, 8, 8), layout)
     ]
     first, second = BlockKey(b"first"), BlockKey(b"second")
 
@@ -179,29 +183,52 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
         kvcr.deposit({first: [_mem_descriptor(info="unknown")]})
     operation = kvcr.deposit({first: descriptors})
     _wait_until(lambda: bool(agent.transfers))
-    wrong_layout = kvcr.fetch((first,), expected_layout=["swa"])
-    assert (
-        dict(kvcr.poll_completed())[wrong_layout][first].status is OpEntryStatus.FAILED
-    )
+    wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
+    assert not dict(kvcr.poll_completed())[wrong_layout][first].success
     agent.state = "DONE"
     _poll_until(kvcr, lambda done: operation in dict(done))
-    claim = kvcr.fetch((first,), expected_layout=["full", "swa", "swa"])
+    assert full.raw + swa.raw == payload
+    wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
+    assert not dict(kvcr.poll_completed())[wrong_layout][first].success
+    claim = kvcr.fetch((first,), expected_layout=layout)
     result = dict(_poll_until(kvcr, lambda done: claim in dict(done)))[claim][first]
-    assert [(item.info, item.addr) for item in result.descriptors or ()] == [
-        ("full", ctypes.addressof(full)),
-        ("swa", ctypes.addressof(swa)),
-        ("swa", ctypes.addressof(swa) + 8),
-    ]
-    kvcr.release([result.release_handle])
+    assert [(item.info, item.addr) for item in result.descriptors or ()] == list(
+        zip(
+            layout,
+            (ctypes.addressof(full), ctypes.addressof(swa), ctypes.addressof(swa) + 8),
+        )
+    )
+    wrong = kvcr.deliver({first: [_mem_descriptor(address, 8, "swa:missing")]})
+    assert not dict(kvcr.poll_completed())[wrong][first].success
+
+    agent.state = "PROC"
+    partial = kvcr.deliver(
+        {
+            first: [
+                _mem_descriptor(address + 16 + i * 8, 8, info)
+                for i, info in enumerate(reversed(layout[1:]))
+            ]
+        }
+    )
+    if labeled:
+        _wait_until(lambda: len(agent.transfers) == 2)
+        # Releasing the fetch cannot make any part evictable during a partial copy.
+        assert kvcr._core._block_record_map[first].local_dram.claim_count == 2
+        kvcr.release([result.release_handle])
+        blocked = kvcr.deposit({second: descriptors})
+        assert dict(kvcr.poll_completed())[blocked][second].success is False
+        agent.state = "DONE"
+        assert dict(_poll_until(kvcr, bool))[partial][first].success
+        assert source.raw == b"a" * 16 + b"c" * 8 + b"b" * 8
+    else:
+        assert not dict(kvcr.poll_completed())[partial][first].success
+        kvcr.release([result.release_handle])
+        agent.state = "DONE"
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
 
-    wrong = kvcr.deliver({first: descriptors[1:]})
-    assert dict(kvcr.poll_completed())[wrong][first].status is OpEntryStatus.FAILED
     matching = kvcr.deliver({first: descriptors})
-    assert dict(_poll_until(kvcr, lambda done: matching in dict(done)))[matching][
-        first
-    ].success
-
+    assert dict(_poll_until(kvcr, bool))[matching][first].success
+    assert source.raw == payload
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert kvcr.query((first, second)) == [
@@ -804,7 +831,9 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     local_dram = kvcr._core._local_dram
     assert local_dram is not None
 
-    install_recovery_records(kvcr._core, _g2_recovered(first=2, second=0))
+    records = _g2_recovered(first=2, second=0)
+    records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
+    install_recovery_records(kvcr._core, records)
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(
@@ -863,12 +892,25 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         _g2_recovered(first=0, second=0),
         _g2_recovered(first=0, second=4),
         {
+            BlockKey(key): _recovered_record(g2=[(info, 0)])
+            for key, info in ((b"first", ":first"), (b"second", ":second"))
+        },
+        {BlockKey(b"first"): _recovered_record(g2=[(":same", 0), (":same", 1)])},
+        {BlockKey(b"first"): _recovered_record(g2=[(":", 0)])},
+        {
             BlockKey(b"first"): _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             )
         },
     ],
-    ids=["duplicate-row", "row-out-of-range", "row-never-settled"],
+    ids=[
+        "duplicate-row",
+        "row-out-of-range",
+        "labeled-alias",
+        "duplicate-label",
+        "empty-label",
+        "row-never-settled",
+    ],
 )
 def test_adopt_recovery_slots_rejects_invalid_or_unsettled_rows(
     records: dict[BlockKey, _BlockRecord],

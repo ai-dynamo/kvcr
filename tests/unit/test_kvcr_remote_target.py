@@ -299,6 +299,10 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch((key,), "req", expected_layout=expected_layout)
     _wait_until(lambda: bool(target_control.sent))
+    assert (
+        _decode_control_message(target_control.sent[-1][1])["allow_layout_subset"]
+        is False
+    )
     source_control.incoming.extend(message for _, message in target_control.sent)
     if success:
         _poll_until(source, lambda _: len(source_agent.xfers) == 2)
@@ -652,6 +656,7 @@ def _acked_deliver(control, kvcr, source, key):
     _wait_until(lambda: len(control.sent) == 1)
     sent = _decode_control_message(control.sent[-1][1])
     assert sent["type"] == "start_write"
+    assert sent["allow_layout_subset"] is True
     assert "target_agent_metadata" not in sent
     return op_handle, sent["op_handle"]
 
