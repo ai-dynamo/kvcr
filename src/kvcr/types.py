@@ -20,6 +20,23 @@ PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
 @dataclass(frozen=True)
+class RegDescriptor:
+    """Registered memory containing ``count`` fixed-size transfer elements.
+
+    ``stride=0`` means contiguous elements. The registered extent includes
+    gaps between elements; ``info`` identifies their configured pool.
+    """
+
+    addr: int
+    size: int
+    mem_type: str = "DRAM"
+    device_Id: int = 0
+    info: str = ""
+    stride: int = 0
+    count: int = 1
+
+
+@dataclass(frozen=True)
 class MemDescriptor:
     """Transport-addressable memory span for a pinned KV block.
 

@@ -15,7 +15,7 @@ from typing import Any
 
 from nixl import nixl_agent, nixl_agent_config
 
-from .types import BlockKey, MemDescriptor
+from .types import BlockKey, MemDescriptor, RegDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
@@ -79,7 +79,7 @@ class _KVCRProgress:
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
-        memory_regions: tuple[tuple[int, int], ...] = (),
+        memory_regions: tuple[RegDescriptor, ...] = (),
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -424,12 +424,14 @@ class _KVCRProgress:
     def _register_memory_regions(self) -> None:
         if self._nixl_agent is None or not self._memory_regions:
             return
-        self._memory_registrations.append(
-            self._nixl_agent.register_memory(
-                [(address, size, 0, "") for address, size in self._memory_regions],
-                mem_type="DRAM",
+        for region in self._memory_regions:
+            extent = region.size + (region.count - 1) * (region.stride or region.size)
+            self._memory_registrations.append(
+                self._nixl_agent.register_memory(
+                    [(region.addr, extent, region.device_Id, "")],
+                    mem_type=region.mem_type,
+                )
             )
-        )
 
     def _capture_agent_metadata(self) -> None:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)

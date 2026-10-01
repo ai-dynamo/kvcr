@@ -30,7 +30,6 @@ from kvcr import api as kvcr_api
 from kvcr import progress as kvcr_progress
 from kvcr import recovery_journal as kvcr_recovery
 from kvcr.config import (
-    FrameworkDramInput,
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
@@ -310,8 +309,11 @@ def test_startup_timeout_retains_nonquiescent_resources(
     try:
         with pytest.raises(
             interrupt or KVCRStartupError,
-            match=("interrupted startup" if interrupt
-                   else "timed out after 0s .*NIXL agent initialization"),
+            match=(
+                "interrupted startup"
+                if interrupt
+                else "timed out after 0s .*NIXL agent initialization"
+            ),
         ) as exc_info:
             KVCR(
                 KVCRConfig(
@@ -597,6 +599,8 @@ def test_get_stats_emits_public_state_metric_name(monkeypatch) -> None:
 def test_nixl_lifecycle_stays_on_progress_thread(
     monkeypatch, remote_enabled, expected_backends
 ) -> None:
+    from kvcr.types import RegDescriptor
+
     main_thread = threading.get_ident()
     lifecycle_threads: list[int] = []
     agents: list[Any] = []
@@ -636,7 +640,12 @@ def test_nixl_lifecycle_stays_on_progress_thread(
             ),
         ),
         KVCRBackendConfigs(
-            framework_dram=FrameworkDramInput(128, 256),
+            framework_regions=[
+                RegDescriptor(128, 64, info="full", count=4),
+                RegDescriptor(1024, 64, "VRAM", 1, "full", 128, 2),
+                RegDescriptor(1088, 64, "VRAM", 1, "full", 128, 2),
+                RegDescriptor(1024, 64, "VRAM", 2, "full", 128, 2),
+            ],
             local_dram=LocalDramOptions(
                 [("full", 384, 128), ("swa", 512, 64)], "LOCAL"
             ),
@@ -654,9 +663,46 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     assert len(set(lifecycle_threads)) == 1
     assert lifecycle_threads[0] != main_thread
     assert agent.registrations == [
-        ([(128, 256, 0, ""), (384, 128, 0, ""), (512, 64, 0, "")], "DRAM"),
+        ([(128, 256, 0, "")], "DRAM"),
+        ([(1024, 192, 1, "")], "VRAM"),
+        ([(1088, 192, 1, "")], "VRAM"),
+        ([(1024, 192, 2, "")], "VRAM"),
+        ([(384, 128, 0, "")], "DRAM"),
+        ([(512, 64, 0, "")], "DRAM"),
     ]
-    assert agent.deregistered == [1]
+    assert agent.deregistered == [6, 5, 4, 3, 2, 1]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"addr": -1},
+        {"addr": 1 << 64},
+        {"size": 0},
+        {"stride": 32},
+        {"count": 0},
+        {"count": True},
+        {"stride": 1 << 63, "count": 3},
+        {"mem_type": ""},
+        {"info": 1},
+        {"info": "missing"},
+        {"size": 32},
+    ],
+)
+def test_registration_is_validated_before_startup(fields) -> None:
+    from kvcr.types import RegDescriptor
+
+    region = RegDescriptor(**({"addr": 128, "size": 64, "info": "full"} | fields))
+    agent = FakeNixlAgent()
+    with pytest.raises(ValueError, match="registration"):
+        _new_kvcr(
+            agent,
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            KVCRConfig(nixl_agent_name="target", pool_layouts=[("full", 64)]),
+            framework_regions=[region],
+        )
+    assert agent.registrations == []
 
 
 @pytest.fixture
