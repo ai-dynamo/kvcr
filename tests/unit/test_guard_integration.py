@@ -55,10 +55,13 @@ _DIGEST = "01" * 32
 class _FileBackedNixlAgent(FakeNixlAgent):
     def __init__(self) -> None:
         super().__init__(b"guard-md")
-        self.name = b"target"
         self.block_remote_writes = False
         self.blocked_remote_writes = 0
         self.backends: dict[str, dict[str, str]] = {}
+
+    def create(self, name: str, _config: object) -> "_FileBackedNixlAgent":
+        self.name = name
+        return self
 
     def add_remote_agent(self, metadata: bytes) -> bytes:
         self.remote_agents.append(metadata)
@@ -80,17 +83,24 @@ class _FileBackedNixlAgent(FakeNixlAgent):
         return super().deregister_memory(handle)
 
     def transfer(self, handle):
+        operation, local_descs, local_indices, remote_descs, remote_agent, _ = (
+            self.xfers[handle - 1]
+        )
         if self.xfer_backends[handle - 1] != ["MOCK"]:
             if self.block_remote_writes:
                 self.transfers.append(handle)
                 self.blocked_remote_writes += 1
                 return "PROC"
+            # Unblocked peers in these tests live in the same process.
+            if operation == "WRITE" and remote_agent != self.name:
+                for index in local_indices:
+                    address, size, _ = local_descs[index]
+                    ctypes.memmove(remote_descs[index][0], address, size)
             return super().transfer(handle)
         self.transfers.append(handle)
-        operation, local_descs, local_indices, file_descs, _, _ = self.xfers[handle - 1]
         for index in local_indices:
             address, memory_bytes, _ = local_descs[index]
-            offset, file_bytes, direct_fd = file_descs[index]
+            offset, file_bytes, direct_fd = remote_descs[index]
             byte_count = min(memory_bytes, file_bytes)
             fd = os.open(f"/proc/self/fd/{direct_fd}", os.O_RDWR | os.O_CLOEXEC)
             try:
@@ -194,9 +204,11 @@ def _primary_child(
     slot_bytes = os.sysconf("SC_PAGE_SIZE")
     agent = _FileBackedNixlAgent()
     agent.state = "DONE"
-    kvcr = _make_kvcr(socket_path, g3_path, control_port, mode, agent=agent)
+    source = ctypes.create_string_buffer(slot_bytes)
+    kvcr = _make_kvcr(
+        socket_path, g3_path, control_port, mode, agent=agent, framework=source
+    )
     if mode != "idle":
-        source = ctypes.create_string_buffer(slot_bytes)
         _deposit_two_blocks(kvcr, ctypes.addressof(source), slot_bytes)
     if mode == "stall":
         agent.block_remote_writes = True
@@ -472,7 +484,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     guard_agent = _FileBackedNixlAgent()
     guard_agent.state = "DONE"
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", guard_agent.create)
     service, spawn = live_service
 
     primary = spawn("_group_primary_child", service.socket_path, control_port)
@@ -567,7 +579,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
 
     monkeypatch.setattr(_Guard, "_promote", pause_promotion)
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", guard_agent.create)
 
     service, spawn = live_service
     target = None
@@ -697,7 +709,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     guard_agent = _FileBackedNixlAgent()
     guard_agent.state = "DONE"
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", guard_agent.create)
     service, spawn = live_service
 
     # Generation zero: a primary that stored nothing dies. An empty Guard
@@ -735,12 +747,14 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # pidfd on our own live pid never fires.
     replacement_agent = _FileBackedNixlAgent()
     replacement_agent.state = "DONE"
+    destination = ctypes.create_string_buffer(page_size)
     replacement = _make_kvcr(
         str(service.socket_path),
         str(g3_path),
         control_port,
         "replacement",
         agent=replacement_agent,
+        framework=destination,
     )
     try:
         assert replacement._core._remote_fw_dram._dangling_ops.dead_incarnations == {
@@ -751,7 +765,6 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
             (BlockKey(b"resident-a"), b"A" * page_size),
             (BlockKey(b"resident-b"), b"B" * page_size),
         ):
-            destination = ctypes.create_string_buffer(len(payload))
             operation = replacement.deliver(
                 {key: [_mem_descriptor(ctypes.addressof(destination), len(payload))]}
             )

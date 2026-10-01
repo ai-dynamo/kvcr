@@ -138,15 +138,26 @@ class FakeTelemetryStats:
 
 
 @contextmanager
-def _use_nixl_agent(agent):
+def _use_nixl_agent(agent, *, allow_unregistered=False):
     def create_agent(name, *_):
         agent.name = name
         return agent
 
-    with patch.multiple(
-        kvcr_progress,
-        nixl_agent=create_agent,
-        nixl_agent_config=lambda **kwargs: kwargs,
+    def create_progress(*args, **kwargs):
+        progress = kvcr_progress._KVCRProgress(*args, **kwargs)
+        if allow_unregistered:
+            # Legacy fixtures allocate arbitrary buffers after startup. Explicit
+            # framework_regions keep the real prepared-catalog validation.
+            progress._prepared_indices = agent.unregistered_indices
+        return progress
+
+    with (
+        patch.multiple(
+            kvcr_progress,
+            nixl_agent=create_agent,
+            nixl_agent_config=lambda **kwargs: kwargs,
+        ),
+        patch("kvcr.core._KVCRProgress", create_progress),
     ):
         yield
 
@@ -315,8 +326,55 @@ class FakeNixlAgent:
         self.remote_agents.append(metadata)
         return f"remote-{len(self.remote_agents)}".encode()
 
+    def remove_remote_agent(self, agent_name):
+        pass
+
     def get_xfer_descs(self, descs, mem_type="DRAM"):
         return list(descs)
+
+    def prep_xfer_dlist(self, agent_name, descs, *, mem_type, backends):
+        return agent_name, descs.tolist()
+
+    def unregistered_indices(self, agent_name, descriptors):
+        if any(d.mem_type != descriptors[0].mem_type for d in descriptors):
+            raise ValueError("one NIXL descriptor list cannot mix memory types")
+        rows = [(d.addr, d.size, d.device_Id, d.size, 1) for d in descriptors]
+        return (agent_name, rows), list(range(len(rows)))
+
+    def make_prepped_xfer(
+        self,
+        op,
+        local_handle,
+        local_indices,
+        remote_handle,
+        remote_indices,
+        *,
+        notif_msg=b"",
+        backends=None,
+    ):
+        def selected(handle, indices):
+            result = []
+            for index in indices:
+                for addr, size, device, stride, count in handle[1]:
+                    if 0 <= index < count:
+                        result.append((addr + index * stride, size, device))
+                        break
+                    index -= count
+                else:
+                    raise RuntimeError("NIXL rejected invalid prepared index")
+            return result
+
+        return self.initialize_xfer(
+            op,
+            selected(local_handle, local_indices),
+            selected(remote_handle, remote_indices),
+            remote_handle[0],
+            notif_msg=notif_msg,
+            backends=backends,
+        )
+
+    def release_dlist_handle(self, handle):
+        pass
 
     def initialize_xfer(
         self,
@@ -491,7 +549,7 @@ def _new_kvcr(
         nixl_agent_name=name,
         nixl_listen_port=1,
     )
-    with _use_nixl_agent(agent):
+    with _use_nixl_agent(agent, allow_unregistered=framework_regions is None):
         kvcr = KVCR(
             config,
             KVCRBindings(
@@ -527,9 +585,10 @@ def _new_local_kvcr(
     capacity_needed_callback=None,
     policy=None,
     local_dram_backend="UCX",
+    framework_regions: FrameworkDramInput | None = None,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
-    with _use_nixl_agent(agent):
+    with _use_nixl_agent(agent, allow_unregistered=framework_regions is None):
         kvcr = KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
@@ -546,6 +605,7 @@ def _new_local_kvcr(
                 policy=policy,
             ),
             KVCRBackendConfigs(
+                framework_regions=framework_regions or [],
                 local_dram=LocalDramOptions(
                     [("", ctypes.addressof(local), len(local))],
                     local_dram_backend,

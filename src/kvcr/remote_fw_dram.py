@@ -27,6 +27,7 @@ from .core import (
     DURATION_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
+    _validate_memory_regions,
     logger,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -41,6 +42,7 @@ from .types import (
     PinHandle,
     PinRequestId,
     PinResult,
+    RegDescriptor,
 )
 
 if TYPE_CHECKING:
@@ -261,7 +263,7 @@ class _SourcePinOp(_Op):
 
     started_at: float | None
     deadline: float
-    remote_agent: bytes
+    remote_agent: str
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
@@ -284,7 +286,7 @@ class _SourceWriteOp(_RemoteOp):
     """Progress-owned NIXL write from prepared source descriptors."""
 
     state: _SourceWriteState
-    remote_agent: bytes
+    remote_agent: str
     op_handle: int
     source_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
@@ -515,7 +517,9 @@ class _RemoteFWDram:
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
-        self._remote_agents_by_target: dict[str, tuple[bytes, bytes]] = {}
+        self._remote_agents_by_target: dict[
+            str, tuple[bytes, str, tuple[RegDescriptor, ...]]
+        ] = {}
         # Bumped whenever a name's route is replaced: NIXL hands the same
         # handle back for a reused name, so queued operations from the dead
         # generation must be fenced by number, not by handle.
@@ -950,6 +954,7 @@ class _RemoteFWDram:
         )
         if includes_metadata:
             payload["target_agent_metadata"] = progress.nixl_agent_metadata
+            payload["target_regions"] = progress._memory_regions
         try:
             sent = self._control.send(endpoint, msgspec.msgpack.encode(payload))
         except Exception:
@@ -977,6 +982,8 @@ class _RemoteFWDram:
         try:
             target_agent, _ = self._remote_agent(progress, payload)
             self._ack_target_metadata(progress, payload, target_agent)
+        except _RemoteAgentCleanupError:
+            raise
         except Exception:
             return
 
@@ -1102,6 +1109,8 @@ class _RemoteFWDram:
                 progress, payload, fallback_target=fallback_target
             )
             self._ack_target_metadata(progress, payload, target_agent)
+        except _RemoteAgentCleanupError:
+            raise
         except Exception:
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
@@ -1303,6 +1312,8 @@ class _RemoteFWDram:
     ) -> None:
         try:
             _, remote_agent = self._remote_agent(progress, payload)
+        except _RemoteAgentCleanupError:
+            raise
         except Exception:
             # A promoted Guard adopts the dead primary's control endpoint but
             # not its peer table, so there is no NIXL route home to report on.
@@ -1715,29 +1726,37 @@ class _RemoteFWDram:
         progress: _KVCRProgress,
         payload: Mapping[str, Any],
         fallback_target: str | None = None,
-    ) -> tuple[str, bytes]:
+    ) -> tuple[str, str]:
+        if progress._stop_requested:
+            raise RuntimeError("KVCR progress is stopping")
         kvcr = self._kvcr
         agent = progress.nixl_agent
         target_agent = payload.get("target_agent", fallback_target)
         if not isinstance(target_agent, str) or not target_agent:
             raise TypeError("missing target agent")
         target_metadata = payload.get("target_agent_metadata")
+        regions = (
+            msgspec.convert(
+                payload.get("target_regions", ()), type=tuple[RegDescriptor, ...]
+            )
+            if isinstance(target_metadata, bytes)
+            else None
+        )
+        if regions is not None:
+            _validate_memory_regions(regions)
         cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
-            cached_metadata, remote_agent = cached
+            cached_metadata, remote_agent, cached_regions = cached
             if not isinstance(target_metadata, bytes) or (
-                target_metadata == cached_metadata
+                target_metadata == cached_metadata and regions == cached_regions
             ):
                 reused_at = kvcr._timer()
                 self._record_progress_duration("peer_setup", reused_at, "reused")
                 return target_agent, remote_agent
-            # Same name, new metadata: the process behind the name was replaced,
-            # and the cached route still points at the dead one. A route that
-            # cannot be unloaded propagates: the retained entry retries next
-            # time instead of silently keeping the dead destination.
-            remove = getattr(agent, "remove_remote_agent", None)
-            if remove is not None:
-                remove(remote_agent)
+            # TODO: distinguish peer restarts from additive metadata updates;
+            # load additions without disconnecting the existing peer. Changed
+            # metadata alone does not establish a restart.
+            _unload_remote_agent(progress, remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)
             self._route_generation[target_agent] = (
                 self._route_generation.get(target_agent, 0) + 1
@@ -1747,13 +1766,34 @@ class _RemoteFWDram:
             if not isinstance(target_metadata, bytes):
                 raise TypeError("missing target agent metadata")
             remote_agent = agent.add_remote_agent(target_metadata)
-            if not isinstance(remote_agent, bytes) or not remote_agent:
+            if isinstance(remote_agent, bytes):
+                remote_agent = remote_agent.decode()
+            if not isinstance(remote_agent, str) or not remote_agent:
                 raise RuntimeError("add_remote_agent returned no agent name")
+            owned = (
+                remote_agent == agent.name
+                or remote_agent in progress._prepared
+                or any(
+                    cached[1] == remote_agent
+                    for cached in self._remote_agents_by_target.values()
+                )
+            )
+            if owned:
+                raise RuntimeError("NIXL remote agent is already initialized")
+            try:
+                progress.prepare_memory(remote_agent, regions)
+            except BaseException:
+                _unload_remote_agent(progress, remote_agent)
+                raise
+            self._remote_agents_by_target[target_agent] = (
+                target_metadata,
+                remote_agent,
+                regions,
+            )
         except Exception:
             self._record_progress_duration("peer_setup", started_at, "failed")
             raise
         self._record_progress_duration("peer_setup", started_at, "connected")
-        self._remote_agents_by_target[target_agent] = (target_metadata, remote_agent)
         return target_agent, remote_agent
 
     # Progress notifications, telemetry, and resource cleanup.
@@ -1855,7 +1895,7 @@ class _RemoteFWDram:
     def _send_write_done(
         self,
         progress: _KVCRProgress,
-        remote_agent: bytes,
+        remote_agent: str,
         op_handle: OpHandle,
         success: bool,
         *,
@@ -1882,6 +1922,20 @@ class _RemoteFWDram:
             return
         if result is False:
             logger.warning("KVCR write_done notification failed for op=%d", op_handle)
+
+
+class _RemoteAgentCleanupError(RuntimeError):
+    """Native peer cleanup failed; propagate to the progress-thread handler."""
+
+
+def _unload_remote_agent(progress: _KVCRProgress, remote_agent: str) -> None:
+    try:
+        progress.release_prepared(remote_agent)
+        progress.nixl_agent.remove_remote_agent(remote_agent)
+    except Exception as error:
+        raise _RemoteAgentCleanupError(
+            f"NIXL remote agent {remote_agent!r} cleanup failed"
+        ) from error
 
 
 # Control wire-format helpers.

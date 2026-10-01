@@ -567,7 +567,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         for _, message in source_control.sent
     )
     assert len(source_agent.sent_notifs) == 1
-    assert source_agent.sent_notifs[0][0] == b"remote-1"
+    assert source_agent.sent_notifs[0][0] == "remote-1"
     assert _decode_notif(source_agent.sent_notifs[0][1]) == {
         "type": "write_done",
         "op_handle": op_handle,

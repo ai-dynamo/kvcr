@@ -475,7 +475,7 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
 
     assert source_agent.transfers == ([] if failure == "initialize" else [1])
     agent_name, notif = source_agent.sent_notifs[-1]
-    assert agent_name == b"remote-1"
+    assert agent_name == "remote-1"
     assert _decode_notif(notif) == {
         "type": "write_done",
         "op_handle": 5,
@@ -1029,7 +1029,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     waiting = _SourcePinOp(
         started_at=0.0,
         deadline=10.0,
-        remote_agent=b"peer",
+        remote_agent="peer",
         op_handle=1,
         ordered_keys=(key,),
         dst_descriptors=(destinations,),
@@ -1056,7 +1056,14 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     """Same peer name with new metadata re-adds the NIXL route; identical
     metadata keeps reusing the cached one."""
     agent = FakeNixlAgent()
-    progress = SimpleNamespace(nixl_agent=agent)
+    progress = SimpleNamespace(
+        nixl_agent=agent,
+        prepare_memory=Mock(),
+        release_prepared=Mock(),
+        _prepared={},
+        _stop_requested=False,
+        _failure=None,
+    )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
@@ -1067,8 +1074,20 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
 
     first = _RemoteFWDram._remote_agent(tier, progress, payload)
 
+    assert first == ("worker-a", "remote-1")
     assert _RemoteFWDram._remote_agent(tier, progress, payload) == first
     assert agent.remote_agents == [b"gen-1"]
+    progress.prepare_memory.assert_called_once_with(first[1], ())
+    # Reject malformed replacement geometry before disturbing the cached route.
+    with pytest.raises(ValueError, match="uint64"):
+        _RemoteFWDram._remote_agent(
+            tier, progress, {**payload, "target_regions": [{"addr": 128, "size": 0}]}
+        )
+    assert agent.remote_agents == [b"gen-1"]
+    progress.release_prepared.assert_not_called()
+    # Native bindings may return str directly rather than bytes.
+    add_remote_agent = agent.add_remote_agent
+    agent.add_remote_agent = lambda metadata: add_remote_agent(metadata).decode()
 
     replaced = _RemoteFWDram._remote_agent(
         tier,
@@ -1077,28 +1096,54 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     )
 
     assert agent.remote_agents == [b"gen-1", b"gen-2"]
-    assert replaced[1] != first[1]
+    assert replaced == ("worker-a", "remote-2")
+    progress.release_prepared.assert_called_once_with(first[1])
+    progress.prepare_memory.assert_called_with(replaced[1], ())
     # The bump is what fences queued predecessor operations off the new route.
     assert tier._route_generation == {"worker-a": 1}
+    # Geometry can change without changing the allocation metadata.
+    replaced = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {
+            "target_agent": "worker-a",
+            "target_agent_metadata": b"gen-2",
+            "target_regions": [{"addr": 128, "size": 16, "count": 2}],
+        },
+    )
+    assert tier._route_generation == {"worker-a": 2}
+    assert progress.prepare_memory.call_args.args[1][0].count == 2
     # A payload carrying no metadata still reuses whatever route is cached.
     named_only = {"target_agent": "worker-a"}
     assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
+    assert progress.prepare_memory.call_count == 3
 
 
-def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
-    """NIXL must drop the dead route before the name is reused -- and a route
-    it will not drop stays cached so the unload is retried, not forgotten."""
+@pytest.mark.parametrize(
+    "message_type", ["target_metadata", "start_write", "malformed"]
+)
+def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
+    message_type,
+) -> None:
+    """Cache only prepared routes; let progress handle fatal cleanup errors."""
 
     class RemovingAgent(FakeNixlAgent):
         def __init__(self) -> None:
             super().__init__()
-            self.removed: list[bytes] = []
+            self.removed: list[str] = []
 
-        def remove_remote_agent(self, handle: bytes) -> None:
+        def remove_remote_agent(self, handle: str) -> None:
             self.removed.append(handle)
 
     agent = RemovingAgent()
-    progress = SimpleNamespace(nixl_agent=agent)
+    progress = SimpleNamespace(
+        nixl_agent=agent,
+        prepare_memory=Mock(),
+        release_prepared=Mock(),
+        _prepared={},
+        _stop_requested=False,
+        _failure=None,
+    )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
@@ -1117,30 +1162,73 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
     )
     assert agent.removed == [first]
 
-    class StickyAgent(RemovingAgent):
-        def remove_remote_agent(self, handle: bytes) -> None:
-            raise RuntimeError("route busy")
-
-    sticky = StickyAgent()
-    progress = SimpleNamespace(nixl_agent=sticky)
-    tier._remote_agents_by_target = {}
-    tier._route_generation = {}
-    _, kept = _RemoteFWDram._remote_agent(
-        tier,
-        progress,
-        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    progress.prepare_memory.side_effect = [RuntimeError("prep failed"), None]
+    payload = {"target_agent": "worker-b", "target_agent_metadata": b"gen-3"}
+    with pytest.raises(RuntimeError, match="prep failed"):
+        _RemoteFWDram._remote_agent(tier, progress, payload)
+    assert "worker-b" not in tier._remote_agents_by_target
+    assert agent.removed == [first, "remote-3"]
+    progress.release_prepared.assert_called_with("remote-3")
+    assert not progress._stop_requested
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
+        "worker-b",
+        "remote-4",
     )
-    with pytest.raises(RuntimeError, match="route busy"):
+    assert agent.remote_agents == [b"gen-1", b"gen-2", b"gen-3", b"gen-3"]
+
+    # A repeated native name still belongs to the established peer.
+    agent.add_remote_agent = lambda _: "remote-2"
+    progress.prepare_memory.reset_mock(side_effect=True)
+    progress.release_prepared.reset_mock()
+    with pytest.raises(RuntimeError, match="already initialized"):
         _RemoteFWDram._remote_agent(
             tier,
             progress,
-            {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+            {"target_agent": "worker-c", "target_agent_metadata": b"gen-4"},
         )
-    # No bump: the route was not replaced, so queued operations stay valid.
-    assert tier._route_generation == {}
-    # Retained: matching metadata still reuses the cached route.
+    assert "worker-c" not in tier._remote_agents_by_target
+    progress.prepare_memory.assert_not_called()
+    progress.release_prepared.assert_not_called()
+    assert agent.removed == [first, "remote-3"]
     assert _RemoteFWDram._remote_agent(
-        tier,
+        tier, progress, {"target_agent": "worker-a"}
+    ) == ("worker-a", "remote-2")
+
+    class StickyAgent(RemovingAgent):
+        def remove_remote_agent(self, handle: str) -> None:
+            raise RuntimeError("route busy")
+
+    sticky = StickyAgent()
+    control = FakeBytesControl()
+    source = _new_kvcr(sticky, FakePrimaryPinning(), control, name="source")
+    progress = source._core._progress
+    tier = source._core._remote_fw_dram
+    tier._remote_agent(
         progress,
         {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
-    ) == ("worker-a", kept)
+    )
+    payload = msgspec.msgpack.decode(
+        _start_write_message(1, b"key", target_agent="worker-a")
+    )
+    payload["target_agent_metadata"] = b"gen-2"
+    if message_type == "target_metadata":
+        payload["type"] = message_type
+        handler = tier._handle_target_metadata
+    else:
+        handler = tier._handle_start_write
+        if message_type == "malformed":
+            del payload["keys"]
+    with pytest.raises(RuntimeError, match="cleanup failed") as error:
+        handler(progress, payload)
+    assert str(error.value.__cause__) == "route busy"
+    assert progress._failure is None
+    assert not progress._stop_requested
+    assert tier._route_generation == {}
+
+    control.incoming.append(msgspec.msgpack.encode(payload))
+    _wait_until(lambda: not progress._thread.is_alive())
+    with pytest.raises(RuntimeError, match="cleanup failed") as error:
+        source.close()
+    assert progress._failure is error.value
+    assert str(error.value.__cause__) == "route busy"
+    assert sticky.remote_agents == [b"gen-1"]

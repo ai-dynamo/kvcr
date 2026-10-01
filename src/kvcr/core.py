@@ -62,6 +62,7 @@ _RecordTransfer = Callable[[str, float | None, bool, int, int], None]
 
 def _validate_memory_regions(regions: Sequence[RegDescriptor]) -> None:
     maximum = (1 << 64) - 1
+    counts: dict[str, int] = {}
     for region in regions:
         if not isinstance(region, RegDescriptor):
             raise ValueError("registration requires RegDescriptor entries")
@@ -84,6 +85,9 @@ def _validate_memory_regions(regions: Sequence[RegDescriptor]) -> None:
             raise ValueError("registration memory type must be a non-empty string")
         if not isinstance(region.info, str):
             raise ValueError("registration pool must be a string")
+        counts[region.mem_type] = counts.get(region.mem_type, 0) + region.count
+        if counts[region.mem_type] > 2**31:
+            raise ValueError("registration indices exceed int32 range")
 
 
 def _noop_timer() -> None:
@@ -278,6 +282,7 @@ class _KVCRCore:
         )
         if self._local_dram is not None:
             memory_regions.extend(self._local_dram.memory_regions)
+            _validate_memory_regions(memory_regions)
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
