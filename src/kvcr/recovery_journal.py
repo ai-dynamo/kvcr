@@ -86,6 +86,7 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
         | None
     ) = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    position: Annotated[int, msgspec.Meta(ge=-1)] = -1
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
@@ -93,9 +94,9 @@ _RECOVERY_DECODER = msgspec.msgpack.Decoder(_RecoveryBlock)
 
 
 # TODO: Carry access history. Recovered blocks arrive with last_access unset,
-# so LRU scores every one of them at -float_info.max until first touch and
-# their relative recency is lost. Journaling it faithfully would cost a
-# journal write per cache hit, since last_access changes on every access.
+# so LRU uses position until first access and their relative recency is lost.
+# Journaling recency faithfully would cost a write per cache hit, since
+# last_access changes on every access.
 def _is_recoverable(record: _BlockRecord) -> bool:
     """Whether this record still names bytes a later holder of the pool can use.
 
@@ -113,8 +114,8 @@ def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
     g3 = record.g3.slot if record.g3 is not None else None
     local_dram = record.local_dram
     if local_dram is None or local_dram.state is not _LocalDramState.READY:
-        return _RecoveryBlock(g3=g3)
-    return _RecoveryBlock(g2=local_dram.slots, g3=g3)
+        return _RecoveryBlock(g3=g3, position=record.position)
+    return _RecoveryBlock(g2=local_dram.slots, g3=g3, position=record.position)
 
 
 def _decode_recovery_record(
@@ -132,6 +133,7 @@ def _decode_recovery_record(
             else None
         ),
         g3=_G3Residency(recovered.g3) if recovered.g3 is not None else None,
+        position=recovered.position,
     )
 
 

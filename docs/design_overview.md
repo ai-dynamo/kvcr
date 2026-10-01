@@ -163,6 +163,7 @@ kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | No
 kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion value is (list[MemDescriptor], release_handle)
 kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemDescriptor]]
 kvcr.release(release_handle_list) -> list[Result[None, Error]]      # release fetch/no-evict claims
+kvcr.align_sequence(ordered_keys: list[BlockKey], use_current_time=False) -> None
 
 kvcr.poll_completed() -> list[Completion]                          # drain individual completions
 kvcr.abort(operation_handle, block_key_list=None)                  # cancel this fetch/deliver operation, optionally for selected keys
@@ -186,6 +187,8 @@ The list-shaped API allows a key to span multiple pools. A descriptor's `info` c
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
+
+`align_sequence` lets the framework supply sequence order and align the recency of ready blocks in KVCR-managed storage. It uses the newest access time among those blocks, or the current time when `use_current_time=True`. Missing or non-ready blocks are ignored. Alignment does not increment access counts or reserve residency.
 
 `deposit` also accepts a `no_evict` flag (batch-level, applies to all entries): when set, the KVCR keeps every completed slot non-evictable and returns a release handle per entry. A framework that wants guaranteed local DRAM residency behavior for selected KV blocks can get that behavior through `no_evict`, while the KVCR still handles sharing, routing visibility, transfer setup, and tiering policy. The framework calls `release` with the corresponding handle to clear the no-evict claim.
 
@@ -283,6 +286,7 @@ class KVCachePolicy:
     # Optional lifecycle hooks.
     def on_ingest(self, meta, source) -> None: ...
     def on_remove(self, meta) -> None: ...
+    def on_align_sequence(self, blocks: list[BlockMeta], use_current_time: bool) -> None: ...
 
     # Optional recovery override.
     def decide_recovery(self, meta, failure) -> PlacementDecision:
@@ -299,15 +303,18 @@ PlacementDecision = tuple[PlacementAction, CacheTier | None]
 
 At initialization, an integration selects one built-in policy or supplies an external `KVCachePolicy` instance; otherwise the default policy is LRU, with G3 spill when G3 is configured. Policy calls must complete quickly and never block. A policy declares its configuration dependencies through `required_tiers`; KVCR rejects initialization if any declared tier is not configured. `CacheTier` identifies the relevant framework memory, KVCR-managed storage, peer memory, or object-store tier.
 
-`meta` is a read-only snapshot of the block's identity, size, access history, and current managed residency. `failure` describes the attempted placement, its source, the failure reason, and the number of previous failures.
+`meta` is a read-only snapshot of the block's identity, size, access history, ordering `position`, and current managed residency. `failure` describes the attempted placement, its source, the failure reason, and the number of previous failures.
+
+Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
 Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. If it conflicts with a framework `no_evict` claim, `no_evict` wins until the framework calls `release` with the returned handle; policy may then honor or override `no_retain`.
 
 The policy methods are invoked as follows:
 
 - **Admission — `decide_ingest`:** Called before KVCR creates a managed residency. `required_local` means the admission cannot be dropped, as required for a `no_evict` deposit or a fetch. `KEEP` admits it locally, while `DROP` declines optional admission and completes it as `DROPPED`. `COPY_TO` retains the local residency and also writes to the destination; `MOVE_TO` removes the local residency only after committing the destination. Framework hints and any policy-relevant router hints may inform this decision.
-- **Eviction — `eviction_score` and `decide_eviction`:** When a ready, unclaimed residency enters or re-enters the evictable queue, KVCR calls `eviction_score` and stores the result. When capacity is needed, candidates with lower finite scores are considered first and KVCR calls `decide_eviction`: `KEEP` declines that eviction, `DROP` removes the residency, and `MOVE_TO` removes it after committing the destination. Scored entries are not rescored while they remain in the queue; dynamic reprioritization may be added later if needed.
+- **Eviction — `eviction_score` and `decide_eviction`:** When a ready, unclaimed residency enters or re-enters the evictable queue, KVCR calls `eviction_score` and stores the result. When capacity is needed, candidates with lower finite scores are considered first and KVCR calls `decide_eviction`: `KEEP` declines that eviction, `DROP` removes the residency, and `MOVE_TO` removes it after committing the destination. `align_sequence` refreshes queued scores; broader dynamic reprioritization may be added if needed.
 - **Lifecycle — `on_ingest` and `on_remove`:** These optional hooks notify stateful policies when the first managed residency becomes ready and when the final managed residency disappears. Internal movement between managed tiers does not create another lifecycle event.
+- **Alignment — `on_align_sequence`:** When sequence alignment is requested, KVCR passes the affected blocks' updated metadata in caller order to this optional hook, allowing policies to update their own state before eviction scores are refreshed.
 - **Recovery — `decide_recovery`:** Called when a policy-requested copy or move fails. The default decision logs the failure and drops the source residency.
 
 ---

@@ -143,6 +143,14 @@ class _PolicyInvoker:
         except Exception:
             logger.warning("KVCR on_remove failed", exc_info=True)
 
+    def on_align_sequence(
+        self, blocks: list[BlockMeta], use_current_time: bool
+    ) -> None:
+        try:
+            self._policy.on_align_sequence(blocks, use_current_time)
+        except Exception:
+            logger.warning("KVCR on_align_sequence failed", exc_info=True)
+
 
 @dataclass(frozen=True)
 class _Entry:
@@ -159,7 +167,15 @@ class _EvictionQueue:
     def __len__(self) -> int:
         return len(self._live)
 
-    def insert(self, key: BlockKey, score: float) -> None:
+    def score(self, key: BlockKey) -> float | None:
+        entry = self._live.get(key)
+        return entry.score if entry is not None else None
+
+    def insert(self, key: BlockKey, score: float) -> bool:
+        """Refresh a score, returning whether the key newly became evictable."""
+        previous = self._live.get(key)
+        if previous is not None and previous.score == score:
+            return False
         entry = _Entry(score, self._next_sequence)
         self._next_sequence += 1
         self._live[key] = entry
@@ -176,6 +192,7 @@ class _EvictionQueue:
                 and current.sequence == item[1]
             ]
             heapq.heapify(self._heap)
+        return previous is None
 
     def remove(self, key: BlockKey) -> bool:
         return self._live.pop(key, None) is not None

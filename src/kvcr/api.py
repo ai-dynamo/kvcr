@@ -151,6 +151,12 @@ class KVCR:
         """Return the best currently known status and tier for each key."""
         return self._core.query(keys, request_id)
 
+    def align_sequence(
+        self, ordered_keys: list[BlockKey], use_current_time: bool = False
+    ) -> None:
+        """Record sequence positions and align recency for ready managed keys."""
+        self._core.align_sequence(ordered_keys, use_current_time)
+
     def deliver(
         self,
         blocks: Mapping[BlockKey, list[MemDescriptor]],
