@@ -178,6 +178,21 @@ def test_a_frame_carries_at_most_one_descriptor(
         assert len(closed) == 1
 
 
+def test_complete_descriptor_frame_does_not_send_an_empty_tail(monkeypatch) -> None:
+    """An empty sendall() still syscalls, so a peer that answered and closed
+    between the two calls would raise EPIPE before its reply could be read."""
+    connection = Mock()
+    monkeypatch.setattr(
+        socket,
+        "send_fds",
+        lambda _socket, buffers, _fds: len(buffers[0]),
+    )
+
+    FramedConnection(connection).send_with_fd(_Message("claim"), 42)
+
+    connection.sendall.assert_not_called()
+
+
 def test_a_departed_peer_ends_the_stream(pair: Pair) -> None:
     sender, receiver = pair
     sender.close()

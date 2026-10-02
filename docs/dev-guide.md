@@ -18,9 +18,10 @@ Use a Linux development environment with:
 - [`uv`](https://docs.astral.sh/uv/);
 - a C/C++ runtime compatible with the NIXL wheel selected by the project;
 - enough local memory and disk space for the tests you intend to run; and
-- for service-backed recovery, in the guard service and every claimant: Linux 6.5
-  or newer, and the system libatomic runtime (`libatomic1` on Debian and
-  Ubuntu). Importing `kvcr` needs neither.
+- for service-backed recovery, in the guard service and every claimant: Linux 5.3
+  or newer for `pidfd_open` (before 6.5 the worker supplies its own pidfd, as
+  described under Guard pools below), and the system libatomic runtime
+  (`libatomic1` on Debian and Ubuntu). Importing `kvcr` needs neither.
 
 KVCR declares its Python dependencies in `pyproject.toml`. In particular, it
 pins a compatible NIXL version. Let `uv` resolve that dependency instead of
@@ -298,6 +299,8 @@ layout requires restarting the service, which recreates the groups.
 
 Pool mappings and the `KVCRPoolHold` must not be used by forked children;
 create the shareable framework-control listener after the final fork.
+The service requires `pidfd_open` (Linux 5.3+). On kernels without
+`SO_PEERPIDFD`, the worker passes its own pidfd over the claim socket.
 The service fences each group by the claimant's pidfd until process exit.
 Closing the claim socket, including across exec, does not release a live
 claimant's lease. `KVCRPoolHold.release()` unmaps the group locally, explicitly

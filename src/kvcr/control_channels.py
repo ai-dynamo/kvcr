@@ -81,7 +81,10 @@ class FramedConnection:
         """Send one frame carrying one descriptor on its first byte."""
         frame = self._encode_frame(message)
         sent = socket.send_fds(self._connection, [frame], [file_descriptor])
-        self._connection.sendall(frame[sent:])
+        if sent < len(frame):
+            # sendall() of an empty tail still syscalls, so a peer that already
+            # answered and closed would raise EPIPE before we read its reply.
+            self._connection.sendall(frame[sent:])
 
     @staticmethod
     def _encode_frame(message: object) -> bytes:
