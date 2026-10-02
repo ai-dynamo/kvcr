@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from itertools import chain
 from typing import Annotated, Any
 
 import msgspec
@@ -24,43 +25,48 @@ from .types import BlockKey, MemDescriptor, RegionDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
-# Bound idle waits so backend timers still advance without incoming events.
-_IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
+_RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
 
 
 @dataclass(frozen=True)
 class _TransferRef:
-    """Internal reference into an owning agent's immutable registration catalog."""
+    """An element in an agent's framework or KVCR-owned registered memory."""
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
-    region_id: Annotated[int, msgspec.Meta(ge=0)]
     element_index: Annotated[int, msgspec.Meta(ge=0)]
     info: str = ""
+    framework: bool = True
 
 
 def _resolve_region(
-    ref: _TransferRef, regions: Sequence[RegionDescriptor], agent_name: str
+    ref: _TransferRef, regions: _RegionMaps, agent_name: str
 ) -> RegionDescriptor:
     if not isinstance(ref, _TransferRef):
         raise ValueError("memory transfers require _TransferRef entries")
     if ref.end_point_name != agent_name:
         raise ValueError("memory reference has the wrong owning agent")
-    if type(ref.region_id) is not int or not 0 <= ref.region_id < len(regions):
-        raise ValueError("memory reference region_id is outside the catalog")
-    region = regions[ref.region_id]
+    if type(ref.framework) is not bool:
+        raise ValueError("memory reference framework selector must be a bool")
+    if not isinstance(ref.info, str):
+        raise ValueError("memory reference label must be a string")
+    framework, kvcr = regions
+    if ref.framework:
+        region = framework.get(ref.info)
+        if region is None:
+            region = framework.get(ref.info.partition(":")[0])
+    else:
+        region = kvcr.get(ref.info.partition(":")[0])
+    if region is None:
+        owner = "framework" if ref.framework else "KVCR"
+        raise ValueError(f"no {owner} registration for {ref.info!r}")
     if type(ref.element_index) is not int or not 0 <= ref.element_index < region.count:
         raise ValueError("memory reference element_index is outside its region")
-    if not isinstance(ref.info, str) or region.info not in (
-        ref.info,
-        ref.info.partition(":")[0],
-    ):
-        raise ValueError("memory reference label does not match its region pool")
     return region
 
 
@@ -117,7 +123,7 @@ class _KVCRProgress:
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
-        memory_regions: tuple[RegionDescriptor, ...] = (),
+        memory_regions: _RegionMaps | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -132,18 +138,20 @@ class _KVCRProgress:
         self._next_transfer_id = 0
         self._nixl_listen_port = nixl_listen_port
         self._dram_backends = dram_backends
-        self._memory_regions = memory_regions
+        self._memory_regions = (
+            memory_regions if memory_regions is not None else ({}, {})
+        )
         self._memory_registrations: list[Any] = []
-        self._prepared: dict[str, dict[str, tuple[Any, dict[int, int]]]] = {}
-        self._catalogs: dict[str, tuple[str, tuple[RegionDescriptor, ...]]] = {}
+        self._prepared: dict[
+            str, dict[str, tuple[Any, tuple[dict[str, int], dict[str, int]]]]
+        ] = {}
+        self._catalogs: dict[str, tuple[str, _RegionMaps]] = {}
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._wake_lock = threading.Lock()
         self._wake_read: int | None = None
         self._wake_write: int | None = None
         self._idle_waiter: Callable[[float, int], None] | None = None
-        # Controls without a readiness hook retain their ordinary poll cadence.
-        self._poll_idle = False
         self._completed: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
@@ -308,7 +316,7 @@ class _KVCRProgress:
     def prepare_memory(
         self,
         agent_name: str,
-        regions: Sequence[RegionDescriptor],
+        regions: _RegionMaps,
         *,
         owner_name: str | None = None,
     ) -> None:
@@ -320,17 +328,21 @@ class _KVCRProgress:
             if owner_name is not None
             else (agent_name or self.nixl_agent_name)
         )
-        self._catalogs[agent_name] = (owner, tuple(regions))
-        by_type: dict[str, list[tuple[int, RegionDescriptor]]] = {}
-        for region_id, region in enumerate(regions):
-            by_type.setdefault(region.mem_type, []).append((region_id, region))
+        self._catalogs[agent_name] = (owner, regions)
+        by_type: dict[str, list[tuple[bool, RegionDescriptor]]] = {}
+        framework, kvcr = regions
+        for is_framework, registered in ((True, framework), (False, kvcr)):
+            for region in registered.values():
+                by_type.setdefault(region.mem_type, []).append((is_framework, region))
         prepared = self._prepared.setdefault(agent_name, {})
         try:
             for mem_type, entries in by_type.items():
-                offsets = {}
+                framework_offsets: dict[str, int] = {}
+                kvcr_offsets: dict[str, int] = {}
                 offset = 0
-                for region_id, region in entries:
-                    offsets[region_id] = offset
+                for is_framework, region in entries:
+                    offsets = framework_offsets if is_framework else kvcr_offsets
+                    offsets[region.info] = offset
                     offset += region.count
                 rows = np.array(
                     [
@@ -344,7 +356,7 @@ class _KVCRProgress:
                 )
                 if handle is None:
                     raise RuntimeError("prep_xfer_dlist returned None")
-                prepared[mem_type] = (handle, offsets)
+                prepared[mem_type] = (handle, (framework_offsets, kvcr_offsets))
         except BaseException:
             self.release_prepared(agent_name)
             raise
@@ -375,13 +387,16 @@ class _KVCRProgress:
             raise ValueError(f"no prepared memory for agent {agent_name!r}")
         owner, regions = catalog
         first = _resolve_region(descriptors[0], regions, owner)
-        handle, offsets = self._prepared[agent_name][first.mem_type]
+        handle, (framework_offsets, kvcr_offsets) = self._prepared[agent_name][
+            first.mem_type
+        ]
         indices = []
         for ref in descriptors:
             region = _resolve_region(ref, regions, owner)
             if region.mem_type != first.mem_type:
                 raise ValueError("one NIXL descriptor list cannot mix memory types")
-            indices.append(offsets[ref.region_id] + ref.element_index)
+            offsets = framework_offsets if ref.framework else kvcr_offsets
+            indices.append(offsets[region.info] + ref.element_index)
         return handle, indices
 
     def _release_transfer(self, transfer_id: int, state: _TransferState) -> bool:
@@ -431,11 +446,7 @@ class _KVCRProgress:
     def _wait_for_work(self) -> None:
         wake_fd = self._wake_read
         assert wake_fd is not None
-        timeout = (
-            _IDLE_WAIT_SECONDS
-            if self._in_flight_ops or self._active_transfers or self._poll_idle
-            else _IDLE_WAIT_MAX_SECONDS
-        )
+        timeout = _IDLE_WAIT_SECONDS
         if self._idle_waiter is not None:
             self._idle_waiter(timeout, wake_fd)
         else:
@@ -617,9 +628,11 @@ class _KVCRProgress:
             )
 
     def _register_memory_regions(self) -> None:
-        if self._nixl_agent is None or not self._memory_regions:
+        if self._nixl_agent is None or not any(self._memory_regions):
             return
-        for region in self._memory_regions:
+        for region in chain.from_iterable(
+            regions.values() for regions in self._memory_regions
+        ):
             extent = region.size + (region.count - 1) * (region.stride or region.size)
             self._memory_registrations.append(
                 self._nixl_agent.register_memory(

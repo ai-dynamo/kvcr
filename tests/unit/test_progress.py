@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from kvcr.dangling_ops import _DanglingOps
 from kvcr.progress import _KVCRProgress, _ProgressOp, _TransferRef
 from kvcr.types import MemDescriptor, RegionDescriptor
 
@@ -132,9 +133,9 @@ class _TransferAgent:
 
 
 def _mem(
-    element_index: int, *, region_id: int = 0, owner="transfer-test", info=""
+    element_index: int, *, owner="transfer-test", info="", framework=True
 ) -> _TransferRef:
-    return _TransferRef(owner, region_id, element_index, info)
+    return _TransferRef(owner, element_index, info, framework)
 
 
 def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRProgress:
@@ -147,7 +148,13 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
     )
     progress._nixl_agent = agent
     if prepare:
-        regions = (RegionDescriptor(128, 128, count=4), RegionDescriptor(256, 64))
+        regions = (
+            {
+                "": RegionDescriptor(128, 128, count=4),
+                "small": RegionDescriptor(256, 64, info="small"),
+            },
+            {},
+        )
         for name in ("", agent.name, "remote-agent"):
             progress.prepare_memory(name, regions)
     return progress
@@ -286,7 +293,8 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
     [
         ((), (_mem(0, owner="remote-agent"),), "remote-agent", "non-empty"),
         ((_mem(0),), (_mem(0),), "", "remote-side agent"),
-        ((_mem(0, region_id=3),), (_mem(0),), "remote-agent", "region_id"),
+        ((_mem(0, info="missing"),), (_mem(0),), "remote-agent", None),
+        ((_mem(0, framework=1),), (_mem(0),), "remote-agent", "framework"),
         (
             (MemDescriptor("transfer-test", "DRAM", 128, 128, 0),),
             (_mem(0),),
@@ -313,7 +321,7 @@ def test_progress_rejects_invalid_transfer(
 @pytest.mark.parametrize(
     ("local", "remote"),
     [
-        ((_mem(0),), (_mem(0, region_id=1, owner="remote-agent"),)),
+        ((_mem(0),), (_mem(0, info="small", owner="remote-agent"),)),
         ((_mem(0), _mem(1)), (_mem(2, owner="remote-agent"),)),
     ],
     ids=["size", "count"],
@@ -336,24 +344,32 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
     agent = _TransferAgent()
     progress = _transfer_progress(agent, prepare=False)
     regions = (
-        RegionDescriptor(5000, 16, "VRAM", 3, "pool:k", 32, 8),
-        RegionDescriptor(1000, 16, info="pool:k", stride=64, count=3),
-        RegionDescriptor(2000, 16, info="pool:v", stride=32, count=2),
+        {
+            "gpu": RegionDescriptor(5000, 16, "VRAM", 3, "gpu", 32, 8),
+            "pool": RegionDescriptor(1000, 16, info="pool", stride=64, count=3),
+            "pool:k": RegionDescriptor(2000, 16, info="pool:k", stride=32, count=2),
+        },
+        {"pool": RegionDescriptor(3000, 16, info="pool", count=4)},
     )
     progress.prepare_memory("", regions)
     progress.prepare_memory(
-        "native-peer", tuple(reversed(regions)), owner_name="remote-agent"
+        "native-peer",
+        (dict(reversed(regions[0].items())), regions[1]),
+        owner_name="remote-agent",
     )
     with pytest.raises(RuntimeError, match="already initialized"):
-        progress.prepare_memory("native-peer", ())
+        progress.prepare_memory("native-peer", ({}, {}))
     local = (
-        _mem(1, region_id=1, info="pool:k"),
-        _mem(1, region_id=2, info="pool:v"),
-        _mem(1, region_id=1, info="pool:k"),
+        _mem(1, info="pool:k"),
+        _mem(2, info="pool:v"),
+        _mem(3, info="pool:k", framework=False),
+        _mem(1, info="pool:k"),
     )
-    remote = tuple(
-        _mem(index, region_id=2, owner="remote-agent", info="pool:k")
-        for index in (3, 0, 3)
+    remote = (
+        _mem(1, owner="remote-agent", info="pool:v", framework=False),
+        _mem(0, owner="remote-agent", info="pool:k"),
+        _mem(1, owner="remote-agent", info="pool:v"),
+        _mem(0, owner="remote-agent", info="pool:k"),
     )
     for _ in range(2):
         transfer_id, submitted = progress.submit_transfer(
@@ -364,26 +380,34 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
     with pytest.raises(ValueError, match="cannot mix memory types"):
         progress.submit_transfer(
             "WRITE",
-            (local[0], _mem(0, info="pool:k")),
+            (local[0], _mem(0, info="gpu")),
             remote[:2],
             remote_side_agent="native-peer",
         )
-    with pytest.raises(ValueError, match="label does not match"):
+    with pytest.raises(ValueError):
         progress.submit_transfer(
             "WRITE",
-            (_mem(0, region_id=1, info="pool:v"),),
+            (_mem(0, info="gpu", framework=False),),
             remote[:1],
             remote_side_agent="native-peer",
         )
     assert agent.prep_calls == [
         ("", "VRAM", [[5000, 16, 3, 32, 8]]),
-        ("", "DRAM", [[1000, 16, 0, 64, 3], [2000, 16, 0, 32, 2]]),
-        ("native-peer", "DRAM", [[2000, 16, 0, 32, 2], [1000, 16, 0, 64, 3]]),
+        (
+            "",
+            "DRAM",
+            [[1000, 16, 0, 64, 3], [2000, 16, 0, 32, 2], [3000, 16, 0, 16, 4]],
+        ),
+        (
+            "native-peer",
+            "DRAM",
+            [[2000, 16, 0, 32, 2], [1000, 16, 0, 64, 3], [3000, 16, 0, 16, 4]],
+        ),
         ("native-peer", "VRAM", [[5000, 16, 3, 32, 8]]),
     ]
     assert agent.make_calls == [
-        ("dlist-2", [1, 4, 1], "dlist-4", [3, 0, 3]),
-        ("dlist-2", [1, 4, 1], "dlist-4", [3, 0, 3]),
+        ("dlist-2", [4, 2, 8, 4], "dlist-3", [6, 0, 3, 0]),
+        ("dlist-2", [4, 2, 8, 4], "dlist-3", [6, 0, 3, 0]),
     ]
     assert agent.events.count("make:WRITE:['UCX']:b''") == 2
 
@@ -393,8 +417,8 @@ def test_progress_preparation_failure_is_fatal(release_failures) -> None:
     agent = _TransferAgent()
     progress = _transfer_progress(agent, prepare=False)
     progress._memory_regions = (
-        RegionDescriptor(128, 128),
-        RegionDescriptor(256, 128, "VRAM"),
+        {"": RegionDescriptor(128, 128)},
+        {"gpu": RegionDescriptor(256, 128, "VRAM", info="gpu")},
     )
     agent.register_memory = Mock(side_effect=[7, 8])
     agent.prep_failure = "VRAM"
@@ -681,24 +705,28 @@ def test_submission_and_stop_interrupt_idle_wait() -> None:
     assert not progress._thread.is_alive()
 
 
-@pytest.mark.parametrize(
-    ("state", "timeout"),
-    [("idle", 0.02), ("operation", 0.001), ("transfer", 0.001), ("custom", 0.001)],
-)
-def test_wait_bounds_polling_for_unsignalled_work(state, timeout) -> None:
+def test_idle_wait_does_not_stall_a_healthy_source(monkeypatch) -> None:
     progress = _KVCRProgress(
         lambda _: None, lambda _, items: ({}, False), list, lambda: None
     )
-    progress._idle_waiter = Mock()
-    if state == "operation":
-        progress._in_flight_ops[("pending", 1)] = Mock()
-    elif state == "transfer":
-        progress._active_transfers[1] = object()
-    elif state == "custom":
-        progress._poll_idle = True
+    backend = SimpleNamespace(
+        _kvcr=SimpleNamespace(config=SimpleNamespace(operation_timeout_ms=10)),
+        _progress_outbound=[],
+    )
+    dangling = _DanglingOps(backend)
+    now = [1.0]
+    monkeypatch.setattr("kvcr.dangling_ops.time.monotonic", lambda: now[0])
+
+    def wait(timeout, _wake_fd):
+        now[0] += timeout
+
+    progress._idle_waiter = wait
     progress._wake_read, progress._wake_write = os.pipe2(os.O_NONBLOCK)
     try:
+        dangling.begin_poll()
         progress._wait_for_work()
-        progress._idle_waiter.assert_called_once_with(timeout, progress._wake_read)
+        dangling.begin_poll()
+        assert dangling.check_source_progress()
+        assert not backend._progress_outbound
     finally:
         progress._close_wakeup()

@@ -32,7 +32,7 @@ from .core import (
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
 from .local_dram import _layout_indices, _LocalDramState
-from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _TransferRef
+from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _RegionMaps, _TransferRef
 from .types import (
     BlockKey,
     MemoryRef,
@@ -42,7 +42,6 @@ from .types import (
     PinHandle,
     PinRequestId,
     PinResult,
-    RegionDescriptor,
 )
 
 if TYPE_CHECKING:
@@ -524,9 +523,7 @@ class _RemoteFWDram:
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
-        self._remote_agents_by_target: dict[
-            str, tuple[bytes, str, tuple[RegionDescriptor, ...]]
-        ] = {}
+        self._remote_agents_by_target: dict[str, tuple[bytes, str, _RegionMaps]] = {}
         # Bumped whenever a name's route is replaced: NIXL hands the same
         # handle back for a reused name, so queued operations from the dead
         # generation must be fenced by number, not by handle.
@@ -838,7 +835,6 @@ class _RemoteFWDram:
             initialize_control()
         wait = getattr(self._control, "wait", None)
         _progress._idle_waiter = wait if callable(wait) else None
-        _progress._poll_idle = self._control is not None and not callable(wait)
 
     def poll_progress(
         self, progress: _KVCRProgress, submissions: list[object]
@@ -1782,14 +1778,20 @@ class _RemoteFWDram:
             raise TypeError("missing target agent")
         target_metadata = payload.get("target_agent_metadata")
         regions = (
-            msgspec.convert(
-                payload.get("target_regions", ()), type=tuple[RegionDescriptor, ...]
-            )
+            msgspec.convert(payload.get("target_regions", ({}, {})), type=_RegionMaps)
             if isinstance(target_metadata, bytes)
             else None
         )
         if regions is not None:
-            _validate_memory_regions(regions)
+            if any(
+                name != region.info
+                for catalog in regions
+                for name, region in catalog.items()
+            ):
+                raise ValueError("registration dictionary names must match region info")
+            _validate_memory_regions(
+                chain.from_iterable(catalog.values() for catalog in regions)
+            )
         cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
             cached_metadata, remote_agent, cached_regions = cached

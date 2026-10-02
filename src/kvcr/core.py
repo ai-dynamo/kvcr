@@ -7,8 +7,9 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
+from itertools import chain
 from math import ceil
 from typing import TYPE_CHECKING
 
@@ -61,7 +62,7 @@ _RecordDuration = Callable[[str, float | None, str], None]
 _RecordTransfer = Callable[[str, float | None, bool, int, int], None]
 
 
-def _validate_memory_regions(regions: Sequence[RegionDescriptor]) -> None:
+def _validate_memory_regions(regions: Iterable[RegionDescriptor]) -> None:
     maximum = (1 << 64) - 1
     counts: dict[str, int] = {}
     for region in regions:
@@ -84,7 +85,10 @@ def _validate_memory_regions(regions: Sequence[RegionDescriptor]) -> None:
             raise ValueError("registration extent exceeds uint64 address range")
         if not isinstance(region.mem_type, str) or not region.mem_type:
             raise ValueError("registration memory type must be a non-empty string")
-        if not isinstance(region.info, str) or region.info.endswith(":"):
+        if not isinstance(region.info, str):
+            raise ValueError("registration name must be a pool or pool:part string")
+        _, separator, part = region.info.partition(":")
+        if separator and not part:
             raise ValueError("registration name must be a pool or pool:part string")
         counts[region.mem_type] = counts.get(region.mem_type, 0) + region.count
         if counts[region.mem_type] > 2**31:
@@ -155,13 +159,9 @@ class _KVCRCore:
         _validate_pool_layouts(self.pool_layouts)
         self._block_sizes = dict(self.pool_layouts)
         memory_regions = list(backend_configs.framework_regions)
-        self._framework_region_count = len(memory_regions)
-        self._memory_regions = tuple(memory_regions)
         _validate_memory_regions(memory_regions)
-        self._framework_regions = {
-            region.info: index for index, region in enumerate(memory_regions)
-        }
-        if len(self._framework_regions) != len(memory_regions):
+        framework_regions = {region.info: region for region in memory_regions}
+        if len(framework_regions) != len(memory_regions):
             raise ValueError("framework registration names must be unique")
         if any(
             region.size != self._block_sizes.get(region.info.partition(":")[0])
@@ -288,10 +288,15 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        if self._local_dram is not None:
-            memory_regions.extend(self._local_dram.memory_regions)
-            _validate_memory_regions(memory_regions)
-        self._memory_regions = tuple(memory_regions)
+        kvcr_regions = (
+            {region.info: region for region in self._local_dram.memory_regions}
+            if self._local_dram is not None
+            else {}
+        )
+        self._memory_regions = (framework_regions, kvcr_regions)
+        _validate_memory_regions(
+            chain(framework_regions.values(), kvcr_regions.values())
+        )
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
@@ -320,7 +325,7 @@ class _KVCRCore:
             nixl_agent_name=self.nixl_agent_name,
             nixl_listen_port=self.config.nixl_listen_port,
             dram_backends=list(dram_backends),
-            memory_regions=tuple(memory_regions),
+            memory_regions=self._memory_regions,
         )
 
     def start(self) -> None:
@@ -885,19 +890,12 @@ class _KVCRCore:
             isinstance(ref, MemoryRef) for ref in descriptors
         ):
             raise ValueError("each block requires at least one MemoryRef")
-        normalized = []
-        for ref in descriptors:
-            if not isinstance(ref.info, str):
-                raise ValueError("memory reference label must be a string")
-            region_id = self._framework_regions.get(ref.info)
-            if region_id is None:
-                region_id = self._framework_regions.get(ref.info.partition(":")[0])
-            if region_id is None:
-                raise ValueError(f"no framework registration for {ref.info!r}")
-            normalized.append(
-                _TransferRef(ref.end_point_name, region_id, ref.element_index, ref.info)
-            )
-        return self._validate_descriptors(normalized)
+        return self._validate_descriptors(
+            [
+                _TransferRef(ref.end_point_name, ref.element_index, ref.info)
+                for ref in descriptors
+            ]
+        )
 
     def _validate_descriptors(
         self,

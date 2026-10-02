@@ -911,7 +911,7 @@ def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
 def test_named_reference_validation_and_address_reporting():
     regions = [
         RegionDescriptor(1000, 16, info="pool", stride=64, count=3),
-        RegionDescriptor(2000, 16, "VRAM", 3, "pool:v", 32, 4),
+        RegionDescriptor(2000, 16, "VRAM", 3, "pool:layer:v:", 32, 4),
     ]
     config = KVCRConfig(nixl_agent_name="target", pool_layouts=[("pool", 16)])
     kvcr = _new_kvcr(
@@ -922,11 +922,11 @@ def test_named_reference_validation_and_address_reporting():
         framework_regions=regions,
     )
     core = kvcr._core
-    ref = MemoryRef("target", 2, "pool:v")
+    ref = MemoryRef("target", 2, "pool:layer:v:")
     [internal] = core._normalize_descriptors([ref])
-    assert internal == _TransferRef("target", 1, 2, "pool:v")
+    assert internal == _TransferRef("target", 2, "pool:layer:v:")
     assert core._normalize_descriptors([MemoryRef("target", 1, "pool:k")]) == [
-        _TransferRef("target", 0, 1, "pool:k")
+        _TransferRef("target", 1, "pool:k")
     ]
     span = core._address_descriptor(internal)
     assert (span.addr, span.size, span.mem_type, span.device_Id, span.info) == (
@@ -934,14 +934,14 @@ def test_named_reference_validation_and_address_reporting():
         16,
         "VRAM",
         3,
-        "pool:v",
+        "pool:layer:v:",
     )
     assert core._descriptor_bytes([internal, internal]) == 32
     for bad in (
-        MemoryRef("other", 2, "pool:v"),
-        MemoryRef("target", 4, "pool:v"),
-        MemoryRef("target", -1, "pool:v"),
-        MemoryRef("target", True, "pool:v"),
+        MemoryRef("other", 2, "pool:layer:v:"),
+        MemoryRef("target", 4, "pool:layer:v:"),
+        MemoryRef("target", -1, "pool:layer:v:"),
+        MemoryRef("target", True, "pool:layer:v:"),
         MemoryRef("target", 0, "wrong:v"),
         MemoryRef("target", 0, None),
         MemoryRef("target", 0, "pool:"),

@@ -99,12 +99,9 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         request["keys"] *= 2
         request.update(
             allow_layout_subset=True,
-            target_regions=[RegionDescriptor(4096, 16, "VRAM", 7, count=2)],
+            target_regions=({"": RegionDescriptor(4096, 16, "VRAM", 7, count=2)}, {}),
             dst_descriptors=[
-                [
-                    _TransferRef("target", 0, i, ":" + label)
-                    for i, label in enumerate("ca")
-                ]
+                [_TransferRef("target", i, ":" + label) for i, label in enumerate("ca")]
             ]
             * 2,
         )
@@ -619,7 +616,7 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
         for error in errors:
             assert error.op_handle == source_handle
             assert error.source_blocks == {
-                key: [kvcr._core._address_descriptor(_TransferRef("source", 0, 0))]
+                key: [kvcr._core._address_descriptor(_TransferRef("source", 0))]
             }
             assert error.destination_regions is None
     finally:
@@ -652,7 +649,7 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
         assert (
             errors[0].source_blocks
             == errors[1].source_blocks
-            == {key: [source._core._address_descriptor(_TransferRef("source", 0, 0))]}
+            == {key: [source._core._address_descriptor(_TransferRef("source", 0))]}
         )
         for native_handle in (1, 2):
             done.add(native_handle)
@@ -686,8 +683,10 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
     expected_sources = {
-        key: [source._core._address_descriptor(_TransferRef("source", 1, 0))],
-        framework_hit: [source._core._address_descriptor(_TransferRef("source", 0, 0))],
+        key: [
+            source._core._address_descriptor(_TransferRef("source", 0, framework=False))
+        ],
+        framework_hit: [source._core._address_descriptor(_TransferRef("source", 0))],
     }
     try:
         agent.state = "DONE"
@@ -699,7 +698,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_TransferRef("target", 0, index).__dict__] for index in range(3)
+            [_TransferRef("target", index).__dict__] for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -908,10 +907,13 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     "op_handle": op_handle,
                     "remaining_timeout_ms": 1000,
                     "target_agent_metadata": b"target-md",
-                    "target_regions": [RegionDescriptor(128, 16, count=1024)],
+                    "target_regions": (
+                        {"": RegionDescriptor(128, 16, count=1024)},
+                        {},
+                    ),
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_TransferRef("target", 0, index).__dict__]
+                        [_TransferRef("target", index).__dict__]
                         for index in range(len(op_keys))
                     ],
                 }
@@ -1068,11 +1070,9 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     key = BlockKey(b"shared")
     borrowed = PinHandle("pinned-by-the-other-operation")
     sources = [
-        _TransferRef("target", 0, i, "pool:" + label) for i, label in enumerate("abc")
+        _TransferRef("target", i, "pool:" + label) for i, label in enumerate("abc")
     ]
-    destinations = tuple(
-        _TransferRef("target", 0, 0, "pool:" + label) for label in parts
-    )
+    destinations = tuple(_TransferRef("target", 0, "pool:" + label) for label in parts)
     kvcr._block_record_map[key] = _BlockRecord(
         fw_mem=_FwMemResidency(sources, borrowed)
     )
@@ -1133,12 +1133,18 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     assert first == ("worker-a", "remote-1")
     assert _RemoteFWDram._remote_agent(tier, progress, payload) == first
     assert agent.remote_agents == [b"gen-1"]
-    progress.prepare_memory.assert_called_once_with(first[1], (), owner_name="worker-a")
-    # Reject malformed replacement geometry before disturbing the cached route.
-    with pytest.raises(ValueError, match="uint64"):
-        _RemoteFWDram._remote_agent(
-            tier, progress, {**payload, "target_regions": [{"addr": 128, "size": 0}]}
-        )
+    progress.prepare_memory.assert_called_once_with(
+        first[1], ({}, {}), owner_name="worker-a"
+    )
+    # Reject malformed replacement geometry or names before changing the route.
+    for catalog in (
+        {"": {"addr": 128, "size": 0}},
+        {"wrong-name": {"addr": 128, "size": 16}},
+    ):
+        with pytest.raises(ValueError):
+            _RemoteFWDram._remote_agent(
+                tier, progress, {**payload, "target_regions": (catalog, {})}
+            )
     assert agent.remote_agents == [b"gen-1"]
     progress.release_prepared.assert_not_called()
     # Native bindings may return str directly rather than bytes.
@@ -1154,7 +1160,9 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     assert agent.remote_agents == [b"gen-1", b"gen-2"]
     assert replaced == ("worker-a", "remote-2")
     progress.release_prepared.assert_called_once_with(first[1])
-    progress.prepare_memory.assert_called_with(replaced[1], (), owner_name="worker-a")
+    progress.prepare_memory.assert_called_with(
+        replaced[1], ({}, {}), owner_name="worker-a"
+    )
     # The bump is what fences queued predecessor operations off the new route.
     assert tier._route_generation == {"worker-a": 1}
     # Geometry can change without changing the allocation metadata.
@@ -1164,11 +1172,11 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         {
             "target_agent": "worker-a",
             "target_agent_metadata": b"gen-2",
-            "target_regions": [{"addr": 128, "size": 16, "count": 2}],
+            "target_regions": ({"": {"addr": 128, "size": 16, "count": 2}}, {}),
         },
     )
     assert tier._route_generation == {"worker-a": 2}
-    assert progress.prepare_memory.call_args.args[1][0].count == 2
+    assert progress.prepare_memory.call_args.args[1][0][""].count == 2
     # A payload carrying no metadata still reuses whatever route is cached.
     named_only = {"target_agent": "worker-a"}
     assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced

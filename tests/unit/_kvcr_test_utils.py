@@ -506,13 +506,12 @@ def _start_write_message(
         "op_handle": op_handle,
         "remaining_timeout_ms": remaining_timeout_ms,
         "target_agent_metadata": b"target-md",
-        "target_regions": [RegionDescriptor(128, 16, count=1024)],
+        "target_regions": ({"": RegionDescriptor(128, 16, count=1024)}, {}),
         "keys": [key],
         "dst_descriptors": [
             [
                 {
                     "end_point_name": target_agent or "target",
-                    "region_id": 0,
                     "element_index": 0,
                     "info": "",
                 }

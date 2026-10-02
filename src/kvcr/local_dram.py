@@ -188,10 +188,6 @@ class _LocalDram:
                 raise ValueError("local DRAM pool must hold at least one block")
             self._pools[pool_name] = (address, length, slot_size)
             self._free_slots[pool_name] = deque(range(slot_count))
-        self._region_ids = {
-            name: kvcr._framework_region_count + index
-            for index, name in enumerate(self._pools)
-        }
         ranges = sorted(
             (address, address + length) for address, length, _ in self._pools.values()
         )
@@ -1166,9 +1162,9 @@ class _LocalDram:
     def _descriptor(self, info: str, slot: int) -> _TransferRef:
         return _TransferRef(
             self._kvcr.nixl_agent_name,
-            self._region_ids[info.partition(":")[0]],
             slot,
             info,
+            framework=False,
         )
 
     def _free(self, locations: Collection[tuple[str, int]]) -> None:
