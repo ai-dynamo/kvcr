@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from math import ceil
@@ -41,6 +41,7 @@ from .types import (
     PlacementDecision,
     QueryStatus,
     RecoveryMirrorError,
+    RegionDescriptor,
     ReleaseHandle,
     ReleaseResult,
 )
@@ -60,6 +61,32 @@ _Timer = Callable[[], float | None]
 _Clock = Callable[[], float]
 _RecordDuration = Callable[[str, float | None, str], None]
 _RecordTransfer = Callable[[str, float | None, bool, int, int], None]
+
+
+def _validate_memory_regions(regions: Sequence[RegionDescriptor]) -> None:
+    maximum = (1 << 64) - 1
+    for region in regions:
+        if not isinstance(region, RegionDescriptor):
+            raise ValueError("registration requires RegionDescriptor entries")
+        for name, minimum in (
+            ("addr", 0),
+            ("size", 1),
+            ("device_Id", 0),
+            ("stride", 0),
+            ("count", 1),
+        ):
+            value = getattr(region, name)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError(f"registration {name} must be in uint64 range")
+        if region.stride and region.stride < region.size:
+            raise ValueError("registration stride must be zero or at least size")
+        extent = region.size + (region.count - 1) * (region.stride or region.size)
+        if region.addr + extent > maximum:
+            raise ValueError("registration extent exceeds uint64 address range")
+        if not isinstance(region.mem_type, str) or not region.mem_type:
+            raise ValueError("registration memory type must be a non-empty string")
+        if not isinstance(region.info, str):
+            raise ValueError("registration pool must be a string")
 
 
 def _noop_timer() -> None:
@@ -125,6 +152,13 @@ class _KVCRCore:
         self.pool_layouts = list(config.pool_layouts)
         _validate_pool_layouts(self.pool_layouts)
         self._block_sizes = dict(self.pool_layouts)
+        memory_regions = list(backend_configs.framework_regions)
+        _validate_memory_regions(memory_regions)
+        if any(
+            region.size != self._block_sizes.get(region.info)
+            for region in memory_regions
+        ):
+            raise ValueError("registration elements must match configured pool sizes")
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
@@ -258,10 +292,6 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
-        framework_dram = backend_configs.framework_dram
-        memory_regions: list[tuple[int, int]] = []
-        if framework_dram is not None:
-            memory_regions.append((framework_dram.address, framework_dram.length))
         if self._local_dram is not None:
             memory_regions.extend(self._local_dram.memory_regions)
         dram_backends: set[str] = set()

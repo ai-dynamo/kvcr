@@ -21,6 +21,7 @@ from .types import (
     OpEntryStatus,
     OpHandle,
     PlacementAction,
+    RegionDescriptor,
     ReleaseHandle,
     ReleaseResult,
 )
@@ -199,8 +200,11 @@ class _LocalDram:
         )
 
     @property
-    def memory_regions(self) -> tuple[tuple[int, int], ...]:
-        return tuple((address, length) for address, length, _ in self._pools.values())
+    def memory_regions(self) -> tuple[RegionDescriptor, ...]:
+        return tuple(
+            RegionDescriptor(address, size, info=name, count=length // size)
+            for name, (address, length, size) in self._pools.items()
+        )
 
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]

@@ -33,7 +33,6 @@ from _kvcr_test_utils import (
 from kvcr import KVCR, KVCRBindings, KVCRClient
 from kvcr import progress as kvcr_progress
 from kvcr.config import (
-    FrameworkDramInput,
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
@@ -45,7 +44,7 @@ from kvcr.guard import _Guard
 from kvcr.kvcr_service import _KVCRService
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.recovery_journal import RecoveryJournal, _recovery_frames, read_handback
-from kvcr.types import BlockKey, CacheTier, QueryStatus
+from kvcr.types import BlockKey, CacheTier, QueryStatus, RegionDescriptor
 
 _TIMEOUT_SECONDS = 5
 # A real NIXL agent and its UCX backend dominate a child's startup.
@@ -118,12 +117,30 @@ def _make_kvcr(
     """A claiming KVCR: a fake agent gets a MOCK G3, a real one POSIX plus
     NIXL-registered framework memory every descriptor it hands KVCR points into."""
     page_size = os.sysconf("SC_PAGE_SIZE")
+    layout = pool_layouts or [("", page_size)]
+    object_size = sum(size for _, size in layout)
+    framework_regions = (
+        [
+            RegionDescriptor(
+                descriptor.addr,
+                descriptor.size,
+                info=descriptor.info,
+                stride=object_size,
+                count=len(framework) // object_size,
+            )
+            for descriptor in _real_nixl_descriptors(
+                ctypes.addressof(framework), layout
+            )
+        ]
+        if framework is not None
+        else []
+    )
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent) if agent is not None else nullcontext():
         return KVCR(
             KVCRConfig(
                 nixl_agent_name=agent_name,
-                pool_layouts=pool_layouts or [("", page_size)],
+                pool_layouts=list(dict(layout).items()),
                 nixl_listen_port=0,
             ),
             KVCRBindings(
@@ -135,11 +152,7 @@ def _make_kvcr(
                 ),
             ),
             KVCRBackendConfigs(
-                framework_dram=(
-                    FrameworkDramInput(ctypes.addressof(framework), len(framework))
-                    if framework is not None
-                    else None
-                ),
+                framework_regions=framework_regions,
                 g3=G3Options(
                     paths=(Path(g3_path),),
                     capacity_bytes_per_file=(
@@ -382,9 +395,12 @@ def test_promoted_guard_serves_real_nixl_transfers(
             ),
         ),
         KVCRBackendConfigs(
-            framework_dram=FrameworkDramInput(
-                ctypes.addressof(target_memory), len(target_memory)
-            ),
+            framework_regions=[
+                RegionDescriptor(descriptor.addr, descriptor.size, info=descriptor.info)
+                for descriptor in _real_nixl_descriptors(
+                    ctypes.addressof(target_memory), layout
+                )
+            ],
             remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
         ),
     )
@@ -422,7 +438,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
         control_port,
         "real-replacement",
         framework=framework,
-        pool_layouts=list(dict(layout).items()),
+        pool_layouts=layout,
     )
     try:
         destination = ctypes.addressof(framework) + len(second_payload)
@@ -474,13 +490,15 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
         [("pool0", 0), ("pool1", 0)], _LocalDramState.READY
     )
     assert guard._core._local_dram.memory_regions == (
-        (
+        RegionDescriptor(
             guard._recovery.attachment.address + pools[0].offset_bytes,
-            2 * page_size,
+            page_size + page_size // 2,
+            info="pool0",
         ),
-        (
+        RegionDescriptor(
             guard._recovery.attachment.address + pools[1].offset_bytes,
             page_size,
+            info="pool1",
         ),
     )
     assert [
@@ -575,9 +593,9 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
                 abandon_timeout_ms=10_000,
             ),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-            framework_dram=FrameworkDramInput(
-                ctypes.addressof(target_memory), len(target_memory)
-            ),
+            framework_regions=[
+                RegionDescriptor(ctypes.addressof(target_memory), page_size, count=3)
+            ],
         )
         now = [0.0]
         target._core._clock = lambda: now[0]
@@ -839,7 +857,7 @@ def _real_nixl_primary_child(
         control_port,
         "real-primary",
         framework=framework,
-        pool_layouts=list(dict(layout).items()),
+        pool_layouts=layout,
     )
     if multi_pool == "True":
         payload = b"".join(
