@@ -5,10 +5,12 @@
 import concurrent.futures
 import errno
 import logging
+import mmap
 import os
 import queue
 import select
 import socket
+import threading
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -26,6 +28,7 @@ from kvcr.guard import (
     _Guard,
     _Phase,
     _PoolLease,
+    _RecoveryState,
 )
 from kvcr.guard_protocol import _G3Config, _TierConfig
 from kvcr.local_disk import _G3Residency
@@ -58,6 +61,102 @@ _PAGE_BLOCK_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
 _PAGE_SPEC = msgspec.structs.replace(
     _TEST_SPEC, mapping_bytes=8192 + 2 * _PAGE_BLOCK_SIZE_BYTES
 )
+
+
+def test_odp_population_does_not_gate_prepare_or_outlive_mapping(monkeypatch) -> None:
+    monkeypatch.setenv("UCX_REG_NONBLOCK_MEM_TYPES", "host")
+    entered, finish = threading.Event(), threading.Event()
+    attachment = Mock(address=1234)
+    populate = Mock(
+        side_effect=lambda *_: (
+            (
+                entered.set(),
+                finish.wait(5),
+            )
+            and 0
+        )
+    )
+    monkeypatch.setattr(
+        guard_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kw: SimpleNamespace(madvise=populate),
+    )
+    monkeypatch.setattr(guard_module.KVCRPoolAttachment, "attach", lambda _: attachment)
+    monkeypatch.setattr(guard_module, "RecoveryJournal", Mock())
+    spec = msgspec.structs.replace(_TEST_SPEC, mapping_bytes=128 * 1024 * 1024)
+    recovery = _RecoveryState(spec, _TEST_DIGEST, (32,))
+    recovery.prepare()
+    assert entered.wait(2)
+    warmer = recovery._populate_thread
+    closer = threading.Thread(target=recovery.close)
+    closer.start()
+    assert recovery._populate_stop.wait(2)
+    attachment.close.assert_not_called()
+    finish.set()
+    closer.join(2)
+    assert not closer.is_alive() and not warmer.is_alive()
+    populate.assert_called_once_with(1234, 64 * 1024 * 1024, 23)
+    attachment.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure", ["disabled", "madvise", "start"])
+def test_odp_population_is_optional_and_failure_only_warns(
+    monkeypatch, caplog, failure
+):
+    monkeypatch.setenv(
+        "UCX_REG_NONBLOCK_MEM_TYPES", "" if failure == "disabled" else "host"
+    )
+    attachment = Mock(address=1234)
+    populate = Mock(side_effect=OSError(errno.EINVAL, "unsupported"))
+    monkeypatch.setattr(
+        guard_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kw: SimpleNamespace(madvise=populate),
+    )
+    monkeypatch.setattr(guard_module.KVCRPoolAttachment, "attach", lambda _: attachment)
+    monkeypatch.setattr(guard_module, "RecoveryJournal", Mock())
+    if failure == "start":
+        monkeypatch.setattr(threading.Thread, "start", Mock(side_effect=RuntimeError()))
+    recovery = _RecoveryState(_TEST_SPEC, _TEST_DIGEST, (32,))
+    recovery.prepare()
+    if failure == "madvise":
+        recovery._populate_thread.join(2)
+        assert not recovery._populate_thread.is_alive()
+        assert "Guard background page population failed" in caplog.text
+    else:
+        assert recovery._populate_thread is None
+        populate.assert_not_called()
+        if failure == "start":
+            assert "Guard background page population could not start" in caplog.text
+    recovery.close()
+
+
+def test_odp_population_preserves_cache_contents(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("UCX_REG_NONBLOCK_MEM_TYPES", "host")
+    mapping = mmap.mmap(-1, _TEST_SPEC.mapping_bytes)
+    try:
+        mapping.madvise(23)
+    except OSError as error:
+        mapping.close()
+        if error.errno == errno.EINVAL:
+            pytest.skip("MADV_POPULATE_WRITE requires Linux 5.14+")
+        raise
+    mapping[:4] = b"data"
+    attachment = Mock(
+        close=mapping.close,
+        address=guard_module.ctypes.addressof(
+            guard_module.ctypes.c_char.from_buffer(mapping)
+        ),
+    )
+    monkeypatch.setattr(guard_module.KVCRPoolAttachment, "attach", lambda _: attachment)
+    monkeypatch.setattr(guard_module, "RecoveryJournal", Mock())
+    recovery = _RecoveryState(_TEST_SPEC, _TEST_DIGEST, (32,))
+    recovery.prepare()
+    recovery._populate_thread.join(2)
+    assert not recovery._populate_thread.is_alive()
+    assert mapping[:4] == b"data"
+    assert "Guard background page population failed" not in caplog.text
+    recovery.close()
 
 
 def _tier(

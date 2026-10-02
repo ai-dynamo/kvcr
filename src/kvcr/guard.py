@@ -3,6 +3,7 @@
 """Private journal-backed Guard for one service-owned pool group."""
 
 import concurrent.futures
+import ctypes
 import enum
 import errno
 import logging
@@ -187,11 +188,43 @@ class _RecoveryState:
         self.mirror: _RecoveryMirror | None = None
         # Recovered half a Guard cannot serve; kept for the next primary, which can.
         self._g3_records: dict[BlockKey, tuple[_G3Residency, int]] = {}
+        self._populate_thread: threading.Thread | None = None
+        self._populate_stop = threading.Event()
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
         self.attachment = KVCRPoolAttachment.attach(self._spec)
         self._journal = RecoveryJournal(self.attachment)
+        if "host" in os.environ.get("UCX_REG_NONBLOCK_MEM_TYPES", "").split(","):
+            self._populate_thread = threading.Thread(
+                target=self._populate_mapping, name="kvcr-guard-populate"
+            )
+            try:
+                self._populate_thread.start()
+            except RuntimeError:
+                self._populate_thread = None
+                logger.warning(
+                    "Guard background page population could not start", exc_info=True
+                )
+
+    def _populate_mapping(self) -> None:
+        assert self.attachment is not None
+        try:
+            # CDLL releases the GIL while MADV_POPULATE_WRITE faults pages.
+            populate = ctypes.CDLL(None, use_errno=True).madvise
+            populate.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+            address = self.attachment.address
+            chunk = 64 * 1024 * 1024
+            for offset in range(0, self._spec.mapping_bytes, chunk):
+                if self._populate_stop.is_set():
+                    break
+                if populate(
+                    address + offset, min(chunk, self._spec.mapping_bytes - offset), 23
+                ):
+                    code = ctypes.get_errno()
+                    raise OSError(code, os.strerror(code))
+        except OSError:
+            logger.warning("Guard background page population failed", exc_info=True)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
         """Take up an ordered layout and its prior recovery atomically."""
@@ -324,6 +357,10 @@ class _RecoveryState:
 
     def close(self) -> None:
         """Close the attachment, retaining it if close must be retried."""
+        if self._populate_thread is not None:
+            self._populate_stop.set()
+            self._populate_thread.join()
+            self._populate_thread = None
         if self.attachment is not None:
             self.attachment.close()
             self.attachment = None
@@ -425,7 +462,7 @@ class _Guard:
             raise RuntimeError("Guard preparation was already attempted")
         self._started = True
         # Attaching is not thread-affine; done here so a failure surfaces
-        # directly, with nothing to tear down.
+        # directly; close tears down any prepared mapping and population thread.
         self._recovery.prepare()
         self._thread.start()
 

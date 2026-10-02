@@ -321,6 +321,30 @@ its recovered records; a claimant that cannot inherit the endpoint is refused.
 A clean release returns the Guard to standby and the group to claimable.
 Takeover and handback cost time linear in the number of recovered blocks.
 
+For large host pools, UCX on-demand paging (ODP) can avoid synchronous page
+registration during Guard preparation. Set these variables on the service:
+
+```sh
+export UCX_REG_NONBLOCK_MEM_TYPES=host
+export UCX_REG_NONBLOCK_FALLBACK=n
+export UCX_IB_ODP_PREFETCH=n
+```
+
+This requires host ODP support in the NIC, driver, and UCX backend. Disabling
+fallback prevents silently reverting to blocking registration; verify native
+RDMA transfers using the actual pool mapping and backing filesystem, not just
+the NIC's advertised ODP capability. It does not speed up backing-file
+allocation. Registration shifts page/translation faults to first access.
+With host ODP explicitly enabled, the Guard populates its writable mapping
+once in a background thread using Linux `MADV_POPULATE_WRITE` (5.14+).
+This preserves live cache contents, does not delay readiness, and does not
+guarantee that HCA translations are prefetched. Failed population is logged;
+cold accesses remain valid. Shutdown stops further population and waits for
+the current chunk before unmapping. Worker mappings are unchanged.
+The warm-up targets tmpfs-backed pools; disk-backed mappings are dirtied and
+can trigger writeback of the entire pool. Only the explicit `host` value
+enables this pass (not `all`).
+
 Recovered blocks have no claims or old access timestamps and enter the
 eviction list. Reuse gives them a new timestamp under the configured policy.
 Recovery covers new requests; in-flight operations need caller-level retries.
