@@ -3,7 +3,9 @@
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
 import logging
+import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -19,9 +21,18 @@ from .types import BlockKey, MemDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
+_ACTIVE_WAIT_SECONDS = 0.0001
+# With nothing in flight the loop parks until a submission or a control
+# message arrives; this bounds the park so backend timers still run. Every
+# wake-up is a GIL hand-off in the framework process, so the idle loop must
+# not spin on a fixed cadence.
+_IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
-_STARTUP_TIMEOUT_SECONDS = 30.0
+# NIXL memory registration scales with the framework's pools: registering
+# tens of GB of GPU and pinned host memory with an RDMA NIC can take longer
+# than the default; deployments override it through the environment.
+_STARTUP_TIMEOUT_SECONDS = float(os.environ.get("KVCR_STARTUP_TIMEOUT_S", "30"))
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
@@ -79,7 +90,8 @@ class _KVCRProgress:
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
-        memory_regions: tuple[tuple[int, int], ...] = (),
+        # (address, length, NIXL memory type, device index) per region.
+        memory_regions: tuple[tuple[int, int, str, int], ...] = (),
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -98,6 +110,13 @@ class _KVCRProgress:
         self._memory_registrations: list[Any] = []
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
+        # Submissions from other threads wake a parked loop through this pipe;
+        # a backend with its own event source (the peer control channel)
+        # installs idle_waiter to wait on both at once.
+        self._wake_read, self._wake_write = os.pipe()
+        os.set_blocking(self._wake_read, False)
+        os.set_blocking(self._wake_write, False)
+        self.idle_waiter: Callable[[float, int], None] | None = None
         self._completed: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
@@ -273,6 +292,32 @@ class _KVCRProgress:
     def submit(self, item: object) -> None:
         self.raise_if_failed()
         self._submissions.put(item)
+        self._wake()
+
+    def _wake(self) -> None:
+        try:
+            os.write(self._wake_write, b"\0")
+        except (BlockingIOError, OSError):
+            # A full pipe already guarantees a wake-up; a closed one means
+            # the loop has stopped and drains the queue no more.
+            pass
+
+    def _idle_wait(self) -> None:
+        """Park until a submission, a backend event, or the bounded timeout."""
+        waiter = self.idle_waiter
+        try:
+            if waiter is not None:
+                waiter(_IDLE_WAIT_MAX_SECONDS, self._wake_read)
+            else:
+                select.select([self._wake_read], [], [], _IDLE_WAIT_MAX_SECONDS)
+        except (OSError, ValueError):
+            time.sleep(_IDLE_WAIT_SECONDS)
+        while True:
+            try:
+                if not os.read(self._wake_read, 4096):
+                    break
+            except (BlockingIOError, OSError):
+                break
 
     def take_completed(self) -> list[object]:
         completed: list[object] = []
@@ -325,7 +370,13 @@ class _KVCRProgress:
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration():
-                    time.sleep(_IDLE_WAIT_SECONDS)
+                    # A copy in flight completes within a few milliseconds, so
+                    # poll it on a short cadence; with nothing in flight park
+                    # until a submission or a control message arrives.
+                    if self._in_flight_ops:
+                        time.sleep(_ACTIVE_WAIT_SECONDS)
+                    else:
+                        self._idle_wait()
         except BaseException as error:
             self._failure = error
         finally:
@@ -346,6 +397,11 @@ class _KVCRProgress:
                 if self._failure is None:
                     self._failure = error
             self._ready.set()
+            for fd in (self._wake_read, self._wake_write):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _close_progress_ops(self) -> None:
         self._stop_requested = True
@@ -422,14 +478,27 @@ class _KVCRProgress:
             )
 
     def _register_memory_regions(self) -> None:
+        """Register every framework and pool region, one NIXL call per endpoint.
+
+        A NIXL registration list carries a single memory type, and VRAM entries
+        must name their device, so regions are grouped by (type, device) in
+        first-seen order. A failing group raises after earlier groups
+        registered; cleanup deregisters whatever was recorded.
+        """
         if self._nixl_agent is None or not self._memory_regions:
             return
-        self._memory_registrations.append(
-            self._nixl_agent.register_memory(
-                [(address, size, 0, "") for address, size in self._memory_regions],
-                mem_type="DRAM",
+        grouped: dict[tuple[str, int], list[tuple[int, int, int, str]]] = {}
+        for address, size, mem_type, device_id in self._memory_regions:
+            grouped.setdefault((mem_type, device_id), []).append(
+                (address, size, device_id, "")
             )
-        )
+        for (mem_type, _device_id), descriptors in grouped.items():
+            registration = self._nixl_agent.register_memory(
+                descriptors, mem_type=mem_type
+            )
+            if registration is None:
+                raise RuntimeError(f"NIXL refused to register {mem_type} memory")
+            self._memory_registrations.append(registration)
 
     def _capture_agent_metadata(self) -> None:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)

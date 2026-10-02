@@ -303,7 +303,11 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     if success:
         _poll_until(source, lambda _: len(source_agent.xfers) == 2)
         source_xfer = source_agent.xfers[1]
-        assert len(source_xfer[1]) == len(source_xfer[3]) == 2
+        # Spans contiguous on both sides are coalesced into one descriptor;
+        # the lists stay aligned and cover the block's bytes exactly.
+        assert len(source_xfer[1]) == len(source_xfer[3]) <= 2
+        assert [s for _, s, _ in source_xfer[1]] == [s for _, s, _ in source_xfer[3]]
+        assert sum(s for _, s, _ in source_xfer[1]) == sum(size for _, size in layout)
         notification = source_xfer[5]
         source_agent.state = "DONE"
         _poll_until(source, lambda _: not _has_outstanding_operations(source))

@@ -498,3 +498,36 @@ def test_loop_failure_is_reported_to_main() -> None:
     with pytest.raises(RuntimeError, match="loop failed") as exc_info:
         progress.close()
     assert exc_info.value is expected
+
+
+def test_idle_loop_parks_and_wakes_on_submit() -> None:
+    import time
+
+    polls: list[float] = []
+    stepped = threading.Event()
+
+    class _Op(_ProgressOp):
+        def progress(self, progress, event):
+            stepped.set()
+            return True, True
+
+        def close(self, progress) -> bool:
+            return True
+
+    def poll(progress, items):
+        polls.append(time.monotonic())
+        return {}, False
+
+    progress = _KVCRProgress(lambda _: None, poll, lambda: [], lambda: None)
+    progress.start()
+    try:
+        # Parked: far fewer iterations than a 1 ms cadence would produce.
+        time.sleep(0.2)
+        idle_polls = len(polls)
+        assert idle_polls < 40, idle_polls
+        submitted_at = time.monotonic()
+        progress.submit(_Op(op_id=("test", 1), keys=set()))
+        assert stepped.wait(timeout=1)
+        assert time.monotonic() - submitted_at < 0.01
+    finally:
+        progress.close()
