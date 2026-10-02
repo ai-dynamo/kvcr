@@ -264,7 +264,7 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-All flags except `--log-level` are required.
+All flags except `--log-level` and `--heartbeat-timeout-ms` are required.
 
 | Flag | Meaning |
 | --- | --- |
@@ -273,7 +273,17 @@ All flags except `--log-level` are required.
 | `--guard-count` | Number of Guard-owned pool groups available by index |
 | `--pool-sizes-gb` | Comma-separated usable sizes of the ordered pools in every group |
 | `--compatibility-digest` | Exact digest every claimant must provide |
+| `--heartbeat-timeout-ms` | Opt in to Guard promotion after a missed heartbeat; omitted means pidfd-only detection. Workers send heartbeats every 50 ms; minimum timeout is 1000 ms. |
 | `--log-level` | Service and Guard logging threshold; defaults to `$KVCR_LOG_LEVEL` or `INFO` |
+
+Heartbeat promotion kills the worker it promotes over. On a missed deadline the
+Guard sends SIGKILL through the lease pidfd and then promotes without waiting
+for the exit to be confirmed, so a worker that merely stalled past the timeout
+is terminated, not resumed. That makes the fence best-effort: the signal is
+queued, but a primary in uninterruptible sleep finishes its kernel operation
+first. The 1000 ms minimum timeout reduces false positives from short pauses
+such as GC and page-cache stalls. Pidfd-only detection promotes solely on
+confirmed exit and remains the default.
 
 Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the
 listed usable sizes. The example therefore creates one mapping of 64 GiB plus

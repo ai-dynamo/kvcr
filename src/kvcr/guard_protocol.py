@@ -35,6 +35,9 @@ _PROTOCOL_VERSION: ProtocolVersion = 1
 # SO_PEERPIDFD requires Linux 6.5 or later.
 _SO_PEERPIDFD_FALLBACK = 77
 _SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", _SO_PEERPIDFD_FALLBACK)
+_HEARTBEAT_SECONDS = 0.05
+# A missed deadline SIGKILLs the primary, so keep the floor clear of GC pauses.
+_MIN_HEARTBEAT_TIMEOUT_SECONDS = 20 * _HEARTBEAT_SECONDS
 
 
 class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -112,6 +115,10 @@ class _Release(msgspec.Struct, frozen=True, tag="release"):
     activated: bool = True
 
 
+class _Heartbeat(msgspec.Struct, frozen=True, tag="heartbeat"):
+    version: ProtocolVersion
+
+
 class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     guard_index: int
     spec: KVCRPoolSpec
@@ -119,6 +126,7 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     pools: tuple[_PoolDescriptor, ...]
     version: ProtocolVersion
     dead_incarnations: tuple[str, ...] = ()
+    heartbeat_enabled: bool = False
 
 
 class _Released(msgspec.Struct, frozen=True, tag="released"):
@@ -131,7 +139,7 @@ class _Error(msgspec.Struct, frozen=True, tag="error"):
 
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim)
-_RELEASE_DECODER = msgspec.msgpack.Decoder(_Release)
+_HOLD_DECODER = msgspec.msgpack.Decoder(_Heartbeat | _Release)
 _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
 _RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
 
@@ -224,7 +232,26 @@ class KVCRPoolHold:
     _control_listener_fd: int | None = None
     _incarnation: str | None = None
     _dead_incarnations: tuple[str, ...] = ()
+    _heartbeat_enabled: bool = False
     _release_attempted: bool = field(default=False, init=False, repr=False)
+    _heartbeat_stop: threading.Event = field(
+        default_factory=threading.Event, init=False
+    )
+    _send_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def __post_init__(self) -> None:
+        if self._heartbeat_enabled:
+            threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _heartbeat(self) -> None:
+        while not self._heartbeat_stop.wait(_HEARTBEAT_SECONDS):
+            with self._send_lock:
+                if self._heartbeat_stop.is_set():
+                    return
+                try:
+                    self._connection.send(_Heartbeat(_PROTOCOL_VERSION))
+                except OSError:
+                    return
 
     def hand_listener_to(self, adopt: Callable[[int], None]) -> None:
         """Adopt-then-disown: a failed adoption leaves this hold owning the fd,
@@ -243,6 +270,7 @@ class KVCRPoolHold:
         if self._release_attempted:
             return
         self._attachment.close()
+        self._heartbeat_stop.set()
         if self._control_listener_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self._control_listener_fd)
@@ -250,7 +278,8 @@ class KVCRPoolHold:
         self._release_attempted = True
 
         try:
-            _send_release(self._connection, activated=activated)
+            with self._send_lock:
+                _send_release(self._connection, activated=activated)
             self._connection.close()
         except BaseException as error:
             _close_quietly(self._connection)
@@ -348,6 +377,7 @@ class KVCRClient:
                 _control_listener_fd=listener_fd,
                 _incarnation=request.incarnation,
                 _dead_incarnations=response.dead_incarnations,
+                _heartbeat_enabled=response.heartbeat_enabled,
             )
         except BaseException as error:
             # Release the lease only after local access has stopped, or the
