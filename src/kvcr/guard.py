@@ -469,6 +469,7 @@ class _Guard:
         self.begin_close()
         if self.finish_close(time.monotonic() + 30.0):
             raise TimeoutError("KVCR Guard lifecycle thread did not stop")
+        self.reclaim_pool()
 
     def begin_close(self) -> None:
         """Stop taking work and queue the teardown without waiting: a wedged
@@ -480,7 +481,10 @@ class _Guard:
         if not self._started or not self._thread.is_alive():
             # Inline, and retried on a later call if it raised the first time.
             if not self._closed:
-                self._close_resources()
+                try:
+                    self._close_resources()
+                finally:
+                    self.reclaim_pool()
                 self._closed = True
             return
         if not already:
@@ -969,7 +973,6 @@ class _Guard:
             self._close_control,
             self._recovery.close,
             self._pool_lease.close,
-            self._close_owner,
         ):
             try:
                 give_back()
@@ -983,7 +986,7 @@ class _Guard:
             self._control.close()
             self._control = None
 
-    def _close_owner(self) -> None:
+    def reclaim_pool(self) -> None:
         if self._owner is None:
             return
         if self._recovery.attachment is not None:

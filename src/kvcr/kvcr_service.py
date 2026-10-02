@@ -243,6 +243,13 @@ class _PoolRegistry:
                 kept.add(guard_index)
         # Wedged groups stay visible; drained ones stay listed until the whole
         # drain finished, so a release racing shutdown is absorbed.
+        # Reclaim only after all joins: unlink must not consume their deadline.
+        for guard_index in sorted(set(self._guards) - kept):
+            try:
+                self._guards[guard_index].reclaim_pool()
+            except BaseException as error:  # noqa: BLE001 - raised below
+                failure = failure or error
+                kept.add(guard_index)
         for guard_index in [index for index in self._guards if index not in kept]:
             del self._guards[guard_index]
         if failure is not None:

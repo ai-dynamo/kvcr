@@ -442,6 +442,38 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     registry.close()
     assert registry._guards == {} and third.closed is True
 
+    registry = _new_registry(tmp_path)
+    guard = registry._guards[0]
+    owner = guard._owner
+    with patch.object(owner, "close", side_effect=OSError("reclaim failed")):
+        with pytest.raises(OSError, match="reclaim failed"):
+            registry.close()
+        assert guard._owner is owner and Path(owner.spec.path).exists()
+    registry.close()
+    assert registry._guards == {}
+
+
+def test_shutdown_joins_all_guards_before_reclaiming(tmp_path: Path) -> None:
+    registry = _new_registry(tmp_path, guard_count=2)
+    joined = []
+    for index, guard in registry._guards.items():
+        finish = guard.finish_close
+        owner_close = guard._owner.close
+
+        def finish_close(deadline, index=index, finish=finish):
+            result = finish(deadline)
+            joined.append(index)
+            return result
+
+        def reclaim(owner_close=owner_close):
+            assert joined == [0, 1]
+            owner_close()
+
+        guard.finish_close = finish_close
+        guard._owner.close = reclaim
+    registry.close()
+    assert registry._guards == {}
+
 
 def test_refused_claims_do_not_bind_the_pool(tmp_path: Path) -> None:
     """A hostname, bad G3 terms, or a taken endpoint refuse without binding."""
@@ -1336,6 +1368,14 @@ def test_a_close_in_progress_absorbs_races_and_answers_stragglers(
     gate = threading.Event()
     entered = threading.Event()
     real_close_resources = guard._close_resources
+    real_owner_close = guard._owner.close
+
+    def reclaim_pool() -> None:
+        assert not guard._thread.is_alive()
+        assert guard._recovery.attachment is None
+        real_owner_close()
+
+    guard._owner.close = reclaim_pool
 
     def slow_close() -> None:
         entered.set()
