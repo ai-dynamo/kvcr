@@ -19,7 +19,7 @@ LocalDramRegions = list[tuple[str, int, int]]  # name, address, size in bytes
 PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class RegionDescriptor:
     """Registered memory containing ``count`` fixed-size transfer elements.
 
@@ -27,13 +27,13 @@ class RegionDescriptor:
     gaps between elements; ``info`` identifies their configured pool.
     """
 
-    addr: int
-    size: int
     mem_type: str = "DRAM"
     device_Id: int = 0
-    info: str = ""
+    addr: int
     stride: int = 0
     count: int = 1
+    size: int
+    info: str = ""
 
 
 @dataclass(frozen=True)

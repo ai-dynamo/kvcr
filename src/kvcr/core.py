@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from itertools import islice
 from math import ceil
@@ -63,7 +63,7 @@ _RecordDuration = Callable[[str, float | None, str], None]
 _RecordTransfer = Callable[[str, float | None, bool, int, int], None]
 
 
-def _validate_memory_regions(regions: Sequence[RegionDescriptor]) -> None:
+def _validate_memory_regions(regions: list[RegionDescriptor]) -> None:
     maximum = (1 << 64) - 1
     for region in regions:
         if not isinstance(region, RegionDescriptor):

@@ -469,6 +469,7 @@ class _KVCRProgress:
         if self._nixl_agent is None or not self._memory_regions:
             return
         for region in self._memory_regions:
+            # Assume the entire extent, including stride gaps, is valid to register.
             extent = region.size + (region.count - 1) * (region.stride or region.size)
             self._memory_registrations.append(
                 self._nixl_agent.register_memory(

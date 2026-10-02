@@ -122,11 +122,11 @@ def _make_kvcr(
     framework_regions = (
         [
             RegionDescriptor(
-                descriptor.addr,
-                descriptor.size,
-                info=descriptor.info,
+                addr=descriptor.addr,
                 stride=object_size,
                 count=len(framework) // object_size,
+                size=descriptor.size,
+                info=descriptor.info,
             )
             for descriptor in _real_nixl_descriptors(
                 ctypes.addressof(framework), layout
@@ -396,7 +396,9 @@ def test_promoted_guard_serves_real_nixl_transfers(
         ),
         KVCRBackendConfigs(
             framework_regions=[
-                RegionDescriptor(descriptor.addr, descriptor.size, info=descriptor.info)
+                RegionDescriptor(
+                    addr=descriptor.addr, size=descriptor.size, info=descriptor.info
+                )
                 for descriptor in _real_nixl_descriptors(
                     ctypes.addressof(target_memory), layout
                 )
@@ -491,13 +493,13 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     )
     assert guard._core._local_dram.memory_regions == (
         RegionDescriptor(
-            guard._recovery.attachment.address + pools[0].offset_bytes,
-            page_size + page_size // 2,
+            addr=guard._recovery.attachment.address + pools[0].offset_bytes,
+            size=page_size + page_size // 2,
             info="pool0",
         ),
         RegionDescriptor(
-            guard._recovery.attachment.address + pools[1].offset_bytes,
-            page_size,
+            addr=guard._recovery.attachment.address + pools[1].offset_bytes,
+            size=page_size,
             info="pool1",
         ),
     )
@@ -594,7 +596,9 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
             ),
             remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
             framework_regions=[
-                RegionDescriptor(ctypes.addressof(target_memory), page_size, count=3)
+                RegionDescriptor(
+                    addr=ctypes.addressof(target_memory), count=3, size=page_size
+                )
             ],
         )
         now = [0.0]

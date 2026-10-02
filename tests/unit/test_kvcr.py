@@ -641,10 +641,34 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ),
         KVCRBackendConfigs(
             framework_regions=[
-                RegionDescriptor(128, 64, info="full", count=4),
-                RegionDescriptor(1024, 64, "VRAM", 1, "full", 128, 2),
-                RegionDescriptor(1088, 64, "VRAM", 1, "full", 128, 2),
-                RegionDescriptor(1024, 64, "VRAM", 2, "full", 128, 2),
+                RegionDescriptor(addr=128, count=4, size=64, info="full"),
+                RegionDescriptor(
+                    mem_type="VRAM",
+                    device_Id=1,
+                    addr=1024,
+                    stride=128,
+                    count=2,
+                    size=64,
+                    info="full",
+                ),
+                RegionDescriptor(
+                    mem_type="VRAM",
+                    device_Id=1,
+                    addr=1088,
+                    stride=128,
+                    count=2,
+                    size=64,
+                    info="full",
+                ),
+                RegionDescriptor(
+                    mem_type="VRAM",
+                    device_Id=2,
+                    addr=1024,
+                    stride=128,
+                    count=2,
+                    size=64,
+                    info="full",
+                ),
             ],
             local_dram=LocalDramOptions(
                 [("full", 384, 128), ("swa", 512, 64)], "LOCAL"

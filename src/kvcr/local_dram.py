@@ -202,7 +202,7 @@ class _LocalDram:
     @property
     def memory_regions(self) -> tuple[RegionDescriptor, ...]:
         return tuple(
-            RegionDescriptor(address, size, info=name, count=length // size)
+            RegionDescriptor(addr=address, count=length // size, size=size, info=name)
             for name, (address, length, size) in self._pools.items()
         )
 
