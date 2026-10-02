@@ -95,7 +95,9 @@ def test_odp_population_does_not_gate_prepare_or_outlive_mapping(monkeypatch) ->
     finish.set()
     closer.join(2)
     assert not closer.is_alive() and not warmer.is_alive()
-    populate.assert_called_once_with(1234, 64 * 1024 * 1024, 23)
+    populate.assert_called_once_with(
+        1234, 64 * 1024 * 1024, guard_module._MADV_POPULATE_WRITE
+    )
     attachment.close.assert_called_once_with()
 
 
@@ -135,7 +137,7 @@ def test_odp_population_preserves_cache_contents(monkeypatch, caplog) -> None:
     monkeypatch.setenv("UCX_REG_NONBLOCK_MEM_TYPES", "host")
     mapping = mmap.mmap(-1, _TEST_SPEC.mapping_bytes)
     try:
-        mapping.madvise(23)
+        mapping.madvise(guard_module._MADV_POPULATE_WRITE)
     except OSError as error:
         mapping.close()
         if error.errno == errno.EINVAL:

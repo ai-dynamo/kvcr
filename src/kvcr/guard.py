@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # drains at roughly a fifth of the rate a primary can publish.
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
 _RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
+_MADV_POPULATE_WRITE = 23  # Not exposed by Python's mmap module.
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
 # object, so nothing stale (reused pid, retried release) can touch a newer lease.
@@ -219,7 +220,9 @@ class _RecoveryState:
                 if self._populate_stop.is_set():
                     break
                 if populate(
-                    address + offset, min(chunk, self._spec.mapping_bytes - offset), 23
+                    address + offset,
+                    min(chunk, self._spec.mapping_bytes - offset),
+                    _MADV_POPULATE_WRITE,
                 ):
                     code = ctypes.get_errno()
                     raise OSError(code, os.strerror(code))
