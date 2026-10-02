@@ -19,7 +19,6 @@ import msgspec
 from kvcr import KVCR, KVCRBindings
 from kvcr import progress as kvcr_progress
 from kvcr.config import (
-    FrameworkDramInput,
     G3Options,
     KVCRBackendConfigs,
     KVCRConfig,
@@ -37,6 +36,7 @@ from kvcr.types import (
     OpEntryStatus,
     PinHandle,
     PinRequestId,
+    RegionDescriptor,
 )
 
 _OPEN_KVCRS: list[KVCR] = []
@@ -474,7 +474,7 @@ def _new_kvcr(
     name: str = "target",
     key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
-    framework_dram: FrameworkDramInput | None = None,
+    framework_regions: list[RegionDescriptor] | None = None,
     local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
     inventory_sink=None,
@@ -508,7 +508,7 @@ def _new_kvcr(
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),
             KVCRBackendConfigs(
-                framework_dram=framework_dram,
+                framework_regions=framework_regions or [],
                 local_dram=local_dram,
                 g3=g3,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),

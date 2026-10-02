@@ -19,6 +19,23 @@ LocalDramRegions = list[tuple[str, int, int]]  # name, address, size in bytes
 PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
+@dataclass(frozen=True, kw_only=True)
+class RegionDescriptor:
+    """Registered memory containing ``count`` fixed-size transfer elements.
+
+    ``stride=0`` means contiguous elements. The registered extent includes
+    gaps between elements; ``info`` identifies their configured pool.
+    """
+
+    mem_type: str = "DRAM"
+    device_Id: int = 0
+    addr: int
+    stride: int = 0
+    count: int = 1
+    size: int
+    info: str = ""
+
+
 @dataclass(frozen=True)
 class MemDescriptor:
     """Transport-addressable memory span for a pinned KV block.
