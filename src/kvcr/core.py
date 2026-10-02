@@ -282,10 +282,6 @@ class _KVCRCore:
     def start(self) -> None:
         self._progress.start()
 
-    def prepare(self) -> None:
-        """Register memory while leaving control backends inactive."""
-        self._progress.prepare()
-
     def is_quiescent(self) -> bool:
         """Report whether native progress can still access backend resources."""
         return self._progress.is_quiescent()

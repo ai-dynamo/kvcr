@@ -778,16 +778,12 @@ class _Guard:
             # The old channel is the last reference to the prior primary's listener.
             if self._control is not None:
                 self._control.close()
+            self._control = control
+            self._prepare_core()
         except BaseException as error:
             # The pool has changed hands and nothing here can put it back, so
             # this stopped being something a claimant could be told about.
             control.close()
-            self._record_background_failure(error)
-            raise
-        self._control = control
-        try:
-            self._prepare_core()
-        except BaseException as error:
             self._record_background_failure(error)
             raise
 
@@ -952,7 +948,7 @@ class _Guard:
             ),
         )
         self._core = core
-        core.prepare()
+        core._progress.prepare()
 
     def _hand_back(self) -> None:
         """Stop serving, leaving this pool group's state where the next primary looks.

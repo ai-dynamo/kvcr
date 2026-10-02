@@ -321,6 +321,14 @@ its recovered records; a claimant that cannot inherit the endpoint is refused.
 A clean release returns the Guard to standby and the group to claimable.
 Takeover and handback cost time linear in the number of recovered blocks.
 
+For large host pools, UCX on-demand paging (ODP) avoids synchronous page
+registration during Guard preparation; `Dockerfile.quick-start` enables it. It
+needs host ODP in the NIC, driver and UCX backend, and shifts page faults to
+first access rather than speeding up backing-file allocation. Set
+`UCX_REG_NONBLOCK_FALLBACK=n` to fail loudly instead of silently reverting to
+blocking registration, and confirm with a native RDMA transfer on the real pool
+mapping rather than the NIC's advertised capability.
+
 Recovered blocks have no claims or old access timestamps and enter the
 eviction list. Reuse gives them a new timestamp under the configured policy.
 Recovery covers new requests; in-flight operations need caller-level retries.

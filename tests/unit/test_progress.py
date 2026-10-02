@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _ProgressOp
 from kvcr.types import MemDescriptor
 
@@ -109,36 +108,25 @@ def test_prepare_registers_memory_before_backend_activation(
 ) -> None:
     events: list[str] = []
 
-    class Agent:
-        def register_memory(self, _descs, mem_type="DRAM"):
-            events.append(f"register:{mem_type}")
-            return 1
-
-        def deregister_memory(self, _handle):
-            events.append("deregister")
-
-        def get_agent_metadata(self):
-            events.append("metadata")
-            return b"metadata"
-
-    monkeypatch.setattr(progress_module, "nixl_agent_config", lambda **_: {})
-    monkeypatch.setattr(progress_module, "nixl_agent", lambda *_: Agent())
     progress = _KVCRProgress(
         lambda _: events.append("initialize"),
         lambda _, __: ({}, False),
         list,
         lambda: events.append("close"),
-        nixl_agent_name="guard",
-        nixl_listen_port=0,
-        memory_regions=((1, 4096),),
     )
+    for method, event in (
+        ("_register_memory_regions", "register"),
+        ("_capture_agent_metadata", "metadata"),
+        ("_close_nixl", "deregister"),
+    ):
+        monkeypatch.setattr(progress, method, lambda event=event: events.append(event))
 
     progress.prepare()
-    assert events == ["register:DRAM"]
+    assert events == ["register"]
 
     if activate:
         progress.start()
-        assert events[:3] == ["register:DRAM", "initialize", "metadata"]
+        assert events[:3] == ["register", "initialize", "metadata"]
     progress.close()
     assert "deregister" in events
     if not activate:

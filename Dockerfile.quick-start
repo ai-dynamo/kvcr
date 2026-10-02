@@ -91,6 +91,12 @@ ENV DYN_REQUEST_PLANE=tcp \
     PYTHONHASHSEED=0 \
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1
 
+# On-demand paging keeps Guard preparation off the synchronous registration
+# path. Fallback stays on so hardware without host ODP still registers; set
+# UCX_REG_NONBLOCK_FALLBACK=n to prove ODP is the path actually taken.
+ENV UCX_REG_NONBLOCK_MEM_TYPES=host \
+    UCX_IB_ODP_PREFETCH=n
+
 # Fail the build if an incompatible source revision displaced any part of the
 # serving path. The validated NCCL restore intentionally differs from the
 # torch wheel's declared pin, so a global `pip check` is not a useful canary.
