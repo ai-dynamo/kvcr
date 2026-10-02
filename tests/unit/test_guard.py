@@ -341,8 +341,10 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     try:
         attach.assert_called_once_with(_PAGE_SPEC)
         assert journal.reset_called
-        # Adoption only grants; a core exists once a promotion needs one.
-        assert cores == []
+        # Adoption registers the Guard transport without starting it.
+        assert len(cores) == 1
+        cores[0]._progress.prepare.assert_called_once_with()
+        cores[0].start.assert_not_called()
         with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
             guard._refuse_incompatible(_tier(16))
 
@@ -421,6 +423,25 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 
     # Each generation's core went before its channel; the pool went last.
     assert closed == ["core1", "control1", "core2", "control2", "attachment"]
+
+
+def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
+    core = Mock(_block_record_map={})
+    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=core))
+    guard = _configurable_guard()
+    guard._recovery.attachment = _fake_attachment()
+    guard._recovery._journal = _Journal()
+
+    core._progress.prepare.side_effect = RuntimeError("registration failed")
+    control = Mock()
+    with pytest.raises(RuntimeError, match="registration failed"):
+        guard._adopt(control, _tier(16))
+    control.close.assert_called_once_with()
+    core.close.assert_called_once_with()
+    assert guard._failure is core._progress.prepare.side_effect
+    core._progress.prepare.assert_called_once_with()
+    core.start.assert_not_called()
+    assert guard._serving is False
 
 
 @pytest.mark.parametrize("reader", ["poll", "release", "promote", "cold-promote"])
@@ -703,7 +724,9 @@ def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
 
 
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
-def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(code: int) -> None:
+def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(
+    code: int, monkeypatch
+) -> None:
     """A capacity-refused handback goes cold, one generation only, never fatal."""
     guard = _configurable_guard()
     guard._control = None
@@ -714,12 +737,16 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(code: int) -> No
     _give_serving_core(guard)
     guard._recovery._journal = _Journal()
     guard._recovery._write_handback = Mock(side_effect=OSError(code, "No space left"))
+    prepared = Mock(_block_record_map={})
+    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=prepared))
 
     guard._adopt(Mock(), _tier(16))
 
-    # The pool went cold, not fatal: the Guard stood down and dropped the core.
+    # The pool went cold, not fatal: a fresh standby is ready but not serving.
     assert guard._serving is False
-    assert guard._core is None
+    assert guard._core is prepared
+    prepared._progress.prepare.assert_called_once_with()
+    prepared.start.assert_not_called()
     # The claimant was told cold; the new lease is still mirrored, so this
     # primary's deposits survive its own death.
     assert guard._recovery.mirror is not None

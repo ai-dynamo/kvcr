@@ -357,11 +357,11 @@ def test_promoted_guard_serves_real_nixl_transfers(
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
-    # Promotion builds a real agent under a new name over the same pool.
+    # Promotion activates the prepared agent over the same pool.
     _wait_until(lambda: guard._serving, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
     assert set(guard._core._block_record_map) == {BlockKey(b"resident-b")}
 
-    # A real UCX read through the Guard: the agent did not exist at write time.
+    # A real UCX read through the Guard's separately registered mapping.
     source_endpoint = f"tcp://127.0.0.1:{control_port}"
     target_memory = ctypes.create_string_buffer(len(second_payload))
     target_pinning = FakePrimaryPinning()

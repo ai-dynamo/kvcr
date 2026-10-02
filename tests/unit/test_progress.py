@@ -102,6 +102,64 @@ def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
     return progress
 
 
+@pytest.mark.parametrize("activate", [False, True])
+def test_prepare_registers_memory_before_backend_activation(
+    monkeypatch, activate
+) -> None:
+    events: list[str] = []
+
+    progress = _KVCRProgress(
+        lambda _: events.append("initialize"),
+        lambda _, __: ({}, False),
+        list,
+        lambda: events.append("close"),
+    )
+    for method, event in (
+        ("_register_memory_regions", "register"),
+        ("_capture_agent_metadata", "metadata"),
+        ("_close_nixl", "deregister"),
+    ):
+        monkeypatch.setattr(progress, method, lambda event=event: events.append(event))
+
+    progress.prepare()
+    assert events == ["register"]
+
+    if activate:
+        progress.start()
+    progress.close()
+    assert events == (
+        ["register", "initialize", "metadata", "close", "deregister"]
+        if activate
+        else ["register", "close", "deregister"]
+    )
+
+
+def test_close_drains_queued_submissions(monkeypatch) -> None:
+    entered, resume, stopping = (threading.Event() for _ in range(3))
+    received = []
+
+    def poll(_progress, items):
+        entered.set()
+        assert resume.wait(5)
+        received.extend(items)
+        return {}, False
+
+    progress = _KVCRProgress(lambda _: None, poll, list, lambda: None)
+    progress.start()
+    assert entered.wait(5)
+    progress.submit("queued")
+    monkeypatch.setattr(progress._activate, "set", stopping.set)
+    closer = threading.Thread(target=progress.close)
+    closer.start()
+    try:
+        assert stopping.wait(5)
+    finally:
+        resume.set()
+        closer.join(5)
+    assert not closer.is_alive()
+    assert received == ["queued"]
+
+
 @pytest.mark.parametrize(
     ("transfer_result", "polls_state"),
     [("PROC", True), ("DONE", False)],
@@ -325,6 +383,7 @@ def test_progress_cleanup_continues_after_operation_close_failure(
         lambda: cleaned.append("backend"),
     )
     progress._stop_requested = True
+    progress._activate.set()
 
     def fail_operation_cleanup() -> None:
         raise RuntimeError("operation cleanup failed")
