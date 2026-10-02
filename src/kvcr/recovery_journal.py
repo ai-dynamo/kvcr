@@ -77,7 +77,7 @@ _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 # format: append only, never reorder or remove. G2 cost grows with its location
 # count and pool-name lengths.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
-    # Ordered pool locations, or nothing. Pool names may repeat.
+    # Ordered (full descriptor label, slot) pairs, or nothing. Pools may repeat.
     g2: (
         Annotated[
             list[tuple[str, Annotated[int, msgspec.Meta(ge=0)]]],
@@ -122,10 +122,12 @@ def _decode_recovery_record(
     payload: bytes, pool_names: tuple[str, ...]
 ) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
-    if recovered.g2 is not None and any(
-        name not in pool_names for name, _ in recovered.g2
-    ):
-        raise ValueError("G2 recovery location does not match the pool group")
+    labels: set[str] = set()
+    for label, _ in recovered.g2 or ():
+        pool, separator, part = label.partition(":")
+        if pool not in pool_names or (separator and (not part or label in labels)):
+            raise ValueError("G2 recovery location does not match the pool group")
+        labels.add(label)
     return _BlockRecord(
         local_dram=(
             _LocalDramResidency(recovered.g2, _LocalDramState.READY)

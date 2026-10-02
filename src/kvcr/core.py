@@ -94,7 +94,10 @@ def _validate_memory_regions(regions: list[RegionDescriptor]) -> None:
         if not isinstance(region.mem_type, str) or not region.mem_type:
             raise ValueError("registration memory type must be a non-empty string")
         if not isinstance(region.label, str):
-            raise ValueError("registration name must be a string")
+            raise ValueError("registration name must be a pool or pool:part string")
+        _, separator, part = region.label.partition(":")
+        if separator and not part:
+            raise ValueError("registration name must be a pool or pool:part string")
         counts[region.mem_type] = counts.get(region.mem_type, 0) + region.count
         if counts[region.mem_type] > 2**31:
             raise ValueError("registration indices exceed int32 range")
@@ -169,7 +172,7 @@ class _KVCRCore:
         if len(framework_regions) != len(memory_regions):
             raise ValueError("framework registration names must be unique")
         if any(
-            region.size != self._block_sizes.get(region.label)
+            region.size != self._block_sizes.get(region.label.partition(":")[0])
             for region in memory_regions
         ):
             raise ValueError("registration elements must match configured pool sizes")
@@ -365,10 +368,16 @@ class _KVCRCore:
         if g3 is None and any(record.g3 is not None for record in records.values()):
             raise RecoveryMirrorError("recovered G3 residency has no configured G3")
         if g3 is not None and any(
-            record.local_dram is not None and len(record.local_dram.slots) != 1
+            record.local_dram is not None
+            and (
+                len(record.local_dram.slots) != 1
+                or any(":" in label for label in record.local_dram.layout)
+            )
             for record in records.values()
         ):
-            raise RecoveryMirrorError("G3 recovery requires one local DRAM slot")
+            raise RecoveryMirrorError(
+                "G3 recovery requires one local DRAM slot without a part label"
+            )
         if self._block_record_map:
             raise RecoveryMirrorError("recovered records need a core that holds none")
 
@@ -958,7 +967,7 @@ class _KVCRCore:
         )
 
     def _descriptor_bytes(self, refs: Iterable[_TransferRef]) -> int:
-        return sum(self._block_sizes[ref.label] for ref in refs)
+        return sum(self._block_sizes[ref.label.partition(":")[0]] for ref in refs)
 
     def _normalize_descriptors(
         self, descriptors: list[MemoryRef]
@@ -998,15 +1007,24 @@ class _KVCRCore:
             "block descriptors must use configured pools",
         )
         for ref, region in zip(descriptors, resolved):
-            if region.size != self._block_sizes[ref.label]:
+            if region.size != self._block_sizes[ref.label.partition(":")[0]]:
                 raise ValueError("block descriptor has the wrong byte count")
         return descriptors
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
-        if not layout or any(name not in self._block_sizes for name in layout):
+        if not layout:
             raise ValueError(invalid_message)
-        if self._g3 is not None and len(layout) != 1:
-            raise ValueError("G3 does not support multi-block layouts")
+        labels = set()
+        for label in layout:
+            pool, separator, part = label.partition(":")
+            if pool not in self._block_sizes or (separator and not part):
+                raise ValueError(invalid_message)
+            if separator:
+                if label in labels:
+                    raise ValueError("block part labels must be unique")
+                labels.add(label)
+        if self._g3 is not None and (len(layout) != 1 or labels):
+            raise ValueError("G3 does not support multi-block layouts or part labels")
 
     def _release_local_dram_sources(
         self,

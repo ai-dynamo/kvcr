@@ -63,10 +63,10 @@ _FULLY_LOADED_RECORD = _BlockRecord(
         ),
         (_BlockRecord(), _ONE_POOL, [None, None, -1], _BlockRecord()),
         (
-            replace(_recovered_record(g2=[("", 3)]), position=4),
+            replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
             _ONE_POOL,
-            [[["", 3]], None, 4],
-            replace(_recovered_record(g2=[("", 3)]), position=4),
+            [[[":a", 3], [":part:b:", 2]], None, 4],
+            replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
         ),
         (
             replace(_recovered_record(g3=5), position=6),
@@ -140,6 +140,9 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode([0, None]),
         msgspec.msgpack.encode([[[""]], None]),
         msgspec.msgpack.encode([[["other", 0]], None]),
+        msgspec.msgpack.encode([[["other:part", 0]], None]),
+        msgspec.msgpack.encode([[[":", 0]], None]),
+        msgspec.msgpack.encode([[[":same", 0], [":same", 1]], None]),
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),
         msgspec.msgpack.encode([None, 5, -2]),

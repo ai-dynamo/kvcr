@@ -449,8 +449,8 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
             "pool": RegionDescriptor(
                 addr=1000, size=16, label="pool", stride=64, count=3
             ),
-            "keys": RegionDescriptor(
-                addr=2000, size=16, label="keys", stride=32, count=2
+            "pool:k": RegionDescriptor(
+                addr=2000, size=16, label="pool:k", stride=32, count=2
             ),
         },
         {"pool": RegionDescriptor(addr=3000, size=16, label="pool", count=4)},
@@ -464,16 +464,16 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
     with pytest.raises(RuntimeError, match="already initialized"):
         progress.prepare_memory("native-peer", ({}, {}))
     local = (
-        _mem(1, label="keys"),
-        _mem(2, label="pool"),
-        _mem(3, label="pool", framework=False),
-        _mem(1, label="keys"),
+        _mem(1, label="pool:k"),
+        _mem(2, label="pool:v"),
+        _mem(3, label="pool:k", framework=False),
+        _mem(1, label="pool:k"),
     )
     remote = (
-        _mem(1, owner="remote-agent", label="pool", framework=False),
-        _mem(0, owner="remote-agent", label="keys"),
-        _mem(1, owner="remote-agent", label="pool"),
-        _mem(0, owner="remote-agent", label="keys"),
+        _mem(1, owner="remote-agent", label="pool:v", framework=False),
+        _mem(0, owner="remote-agent", label="pool:k"),
+        _mem(1, owner="remote-agent", label="pool:v"),
+        _mem(0, owner="remote-agent", label="pool:k"),
     )
     for _ in range(2):
         transfer_id, submitted = progress.submit_transfer(

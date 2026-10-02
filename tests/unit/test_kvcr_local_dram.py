@@ -23,6 +23,7 @@ from _kvcr_test_utils import (
     _op_entries,
     _poll_until,
     _RecordingFIFOPolicy,
+    _recovered_record,
     _wait_until,
 )
 
@@ -190,7 +191,8 @@ def test_local_dram_rejects_overlapping_pools() -> None:
         )
 
 
-def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
+@pytest.mark.parametrize("labeled", [False, True])
+def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     full = ctypes.create_string_buffer(16)
     swa = ctypes.create_string_buffer(16)
     payload = b"a" * 16 + b"b" * 8 + b"c" * 8
@@ -205,7 +207,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
             pool_layouts=[("full", 16), ("swa", 8)],
         ),
     )
-    layout = ["full", "swa", "swa"]
+    layout = ["full", "swa:a", "swa:b"] if labeled else ["full", "swa", "swa"]
     descriptors = [
         _mem_descriptor(index, label) for index, label in zip((0, 0, 1), layout)
     ]
@@ -225,14 +227,33 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     claim = kvcr.fetch((first,), expected_layout=layout)
     result = dict(_poll_until(kvcr, lambda done: claim in dict(done)))[claim][first]
     assert result.success and result.release_handle is not None
-    assert result.descriptors == [
-        _mem_descriptor(0, "full"),
-        _mem_descriptor(0, "swa"),
-        _mem_descriptor(1, "swa"),
-    ]
-    wrong = kvcr.deliver({first: descriptors[1:]})
+    assert result.descriptors == descriptors
+    wrong = kvcr.deliver({first: [_mem_descriptor(label="swa:missing")]})
     assert not dict(kvcr.poll_completed())[wrong][first].success
-    kvcr.release([result.release_handle])
+
+    agent.state = "PROC"
+    partial = kvcr.deliver(
+        {
+            first: [
+                _mem_descriptor(i, label)
+                for i, label in enumerate(reversed(layout[1:]))
+            ]
+        }
+    )
+    if labeled:
+        _wait_until(lambda: len(agent.transfers) == 2)
+        # Releasing the fetch cannot make any part evictable during a partial copy.
+        assert kvcr._core._block_record_map[first].local_dram.claim_count == 2
+        kvcr.release([result.release_handle])
+        blocked = kvcr.deposit({second: descriptors})
+        assert dict(kvcr.poll_completed())[blocked][second].success is False
+        agent.state = "DONE"
+        assert dict(_poll_until(kvcr, bool))[partial][first].success
+        assert source.raw == b"a" * 16 + b"c" * 8 + b"b" * 8
+    else:
+        assert not dict(kvcr.poll_completed())[partial][first].success
+        kvcr.release([result.release_handle])
+        agent.state = "DONE"
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
 
     source.raw = b"\x00" * len(source)
@@ -297,8 +318,8 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
     swa0, swa1, grouped = (BlockKey(name) for name in (b"swa0", b"swa1", b"grouped"))
     descriptors = [
         _mem_descriptor(label="full"),
-        _mem_descriptor(0, label="swa"),
-        _mem_descriptor(1, label="swa"),
+        _mem_descriptor(0, label="swa:a"),
+        _mem_descriptor(1, label="swa:b"),
     ]
 
     operation = kvcr.deposit(
@@ -864,6 +885,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     assert local_dram is not None
 
     records = _g2_recovered(first=2, second=0)
+    records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
     install_recovery_records(kvcr._core, records)
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
@@ -918,6 +940,12 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         _g2_recovered(first=0, second=0),
         _g2_recovered(first=0, second=4),
         {
+            BlockKey(key): _recovered_record(g2=[(label, 0)])
+            for key, label in ((b"first", ":first"), (b"second", ":second"))
+        },
+        {BlockKey(b"first"): _recovered_record(g2=[(":same", 0), (":same", 1)])},
+        {BlockKey(b"first"): _recovered_record(g2=[(":", 0)])},
+        {
             BlockKey(b"first"): _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             )
@@ -926,6 +954,9 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
     ids=[
         "duplicate-row",
         "row-out-of-range",
+        "labeled-alias",
+        "duplicate-label",
+        "empty-label",
         "row-never-settled",
     ],
 )

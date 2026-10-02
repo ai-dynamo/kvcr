@@ -61,12 +61,14 @@ def _resolve_region(
     if type(ref.framework) is not bool:
         raise ValueError("memory reference framework selector must be a bool")
     if not isinstance(ref.label, str):
-        raise ValueError("memory reference pool name must be a string")
+        raise ValueError("memory reference label must be a string")
     framework, kvcr = regions
     if ref.framework:
         region = framework.get(ref.label)
+        if region is None:
+            region = framework.get(ref.label.partition(":")[0])
     else:
-        region = kvcr.get(ref.label)
+        region = kvcr.get(ref.label.partition(":")[0])
     if region is None:
         owner = "framework" if ref.framework else "KVCR"
         raise ValueError(f"no {owner} registration for {ref.label!r}")

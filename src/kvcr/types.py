@@ -22,8 +22,8 @@ class RegionDescriptor:
     """Registered memory containing ``count`` fixed-size transfer elements.
 
     ``stride=0`` means contiguous elements. The registered extent includes
-    gaps between elements. ``label`` names the pool; names must be unique
-    among framework registrations.
+    gaps between elements. ``label`` names the buffer as ``pool`` or
+    ``pool:part``; names must be unique among framework registrations.
     """
 
     mem_type: str = "DRAM"
@@ -39,7 +39,8 @@ class RegionDescriptor:
 class MemoryRef:
     """One element in a named registered buffer.
 
-    ``label`` selects the registered pool by exact name.
+    ``label`` selects the registered ``pool:part`` buffer, falling back to the
+    ``pool`` buffer when no exact name is registered, and identifies the key piece.
     """
 
     end_point_name: str
