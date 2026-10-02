@@ -23,13 +23,14 @@ from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
 from .policy_runtime import _PolicyInvoker
-from .progress import _KVCRProgress, _Op, _OpId
+from .progress import _KVCRProgress, _Op, _OpId, _resolve_region, _TransferRef
 from .types import (
     BlockKey,
     BlockMeta,
     CacheTier,
     InventoryEvent,
     MemDescriptor,
+    MemoryRef,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
@@ -38,7 +39,7 @@ from .types import (
     PlacementDecision,
     QueryStatus,
     RecoveryMirrorError,
-    RegDescriptor,
+    RegionDescriptor,
     ReleaseHandle,
     ReleaseResult,
 )
@@ -60,12 +61,12 @@ _RecordDuration = Callable[[str, float | None, str], None]
 _RecordTransfer = Callable[[str, float | None, bool, int, int], None]
 
 
-def _validate_memory_regions(regions: Sequence[RegDescriptor]) -> None:
+def _validate_memory_regions(regions: Sequence[RegionDescriptor]) -> None:
     maximum = (1 << 64) - 1
     counts: dict[str, int] = {}
     for region in regions:
-        if not isinstance(region, RegDescriptor):
-            raise ValueError("registration requires RegDescriptor entries")
+        if not isinstance(region, RegionDescriptor):
+            raise ValueError("registration requires RegionDescriptor entries")
         for name, minimum in (
             ("addr", 0),
             ("size", 1),
@@ -83,8 +84,8 @@ def _validate_memory_regions(regions: Sequence[RegDescriptor]) -> None:
             raise ValueError("registration extent exceeds uint64 address range")
         if not isinstance(region.mem_type, str) or not region.mem_type:
             raise ValueError("registration memory type must be a non-empty string")
-        if not isinstance(region.info, str):
-            raise ValueError("registration pool must be a string")
+        if not isinstance(region.info, str) or region.info.endswith(":"):
+            raise ValueError("registration name must be a pool or pool:part string")
         counts[region.mem_type] = counts.get(region.mem_type, 0) + region.count
         if counts[region.mem_type] > 2**31:
             raise ValueError("registration indices exceed int32 range")
@@ -154,9 +155,16 @@ class _KVCRCore:
         _validate_pool_layouts(self.pool_layouts)
         self._block_sizes = dict(self.pool_layouts)
         memory_regions = list(backend_configs.framework_regions)
+        self._framework_region_count = len(memory_regions)
+        self._memory_regions = tuple(memory_regions)
         _validate_memory_regions(memory_regions)
+        self._framework_regions = {
+            region.info: index for index, region in enumerate(memory_regions)
+        }
+        if len(self._framework_regions) != len(memory_regions):
+            raise ValueError("framework registration names must be unique")
         if any(
-            region.size != self._block_sizes.get(region.info)
+            region.size != self._block_sizes.get(region.info.partition(":")[0])
             for region in memory_regions
         ):
             raise ValueError("registration elements must match configured pool sizes")
@@ -210,7 +218,7 @@ class _KVCRCore:
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
         self._local_dram_sources_by_op: dict[
-            _OpId, dict[BlockKey, list[MemDescriptor]]
+            _OpId, dict[BlockKey, list[_TransferRef]]
         ] = {}
 
         self._completion_queue: list[OpResult] = []
@@ -283,6 +291,7 @@ class _KVCRCore:
         if self._local_dram is not None:
             memory_regions.extend(self._local_dram.memory_regions)
             _validate_memory_regions(memory_regions)
+        self._memory_regions = tuple(memory_regions)
         dram_backends: set[str] = set()
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
@@ -472,7 +481,7 @@ class _KVCRCore:
     # TODO: Add optional completion callbacks to movement APIs.
     def deliver(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[MemoryRef]],
         request_id: str | None = None,
     ) -> OpHandle:
         op_handle = self._next_op_handle
@@ -484,9 +493,9 @@ class _KVCRCore:
             for key, descriptors in blocks.items()
         }
         with self._state_lock:
-            local_blocks: dict[BlockKey, list[MemDescriptor]] = {}
-            g3_blocks: dict[BlockKey, MemDescriptor] = {}
-            remote_blocks: dict[BlockKey, list[MemDescriptor]] = {}
+            local_blocks: dict[BlockKey, list[_TransferRef]] = {}
+            g3_blocks: dict[BlockKey, _TransferRef] = {}
+            remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
             for key, destination in normalized.items():
                 if self._is_local_resident(key):
                     local_blocks[key] = destination
@@ -517,7 +526,7 @@ class _KVCRCore:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[MemoryRef]],
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
@@ -794,7 +803,7 @@ class _KVCRCore:
     def _start_local_fill(
         self,
         source: CacheTier,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         deadline: float,
     ) -> None:
@@ -823,7 +832,7 @@ class _KVCRCore:
         keys: Collection[BlockKey],
         *,
         notify_capacity: bool = True,
-    ) -> Mapping[BlockKey, list[MemDescriptor]]:
+    ) -> Mapping[BlockKey, list[_TransferRef]]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
@@ -835,22 +844,84 @@ class _KVCRCore:
                 self._local_dram_sources_by_op[op_id] = sources
         return sources
 
+    def _region(
+        self, ref: _TransferRef, *, regions=None, agent_name: str | None = None
+    ) -> RegionDescriptor:
+        return _resolve_region(
+            ref,
+            self._memory_regions if regions is None else regions,
+            self.nixl_agent_name if agent_name is None else agent_name,
+        )
+
+    def _address_descriptor(self, ref: _TransferRef) -> MemDescriptor:
+        region = self._region(ref)
+        return MemDescriptor(
+            ref.end_point_name,
+            region.mem_type,
+            region.addr + ref.element_index * (region.stride or region.size),
+            region.size,
+            region.device_Id,
+            ref.info,
+        )
+
+    def _descriptor_bytes(
+        self,
+        refs: Iterable[_TransferRef],
+        *,
+        regions=None,
+        agent_name: str | None = None,
+    ) -> int:
+        return sum(
+            self._region(ref, regions=regions, agent_name=agent_name).size
+            for ref in refs
+        )
+
     def _normalize_descriptors(
-        self, descriptors: list[MemDescriptor]
-    ) -> list[MemDescriptor]:
+        self, descriptors: list[MemoryRef]
+    ) -> list[_TransferRef]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
         if not descriptors or not all(
-            isinstance(descriptor, MemDescriptor) for descriptor in descriptors
+            isinstance(ref, MemoryRef) for ref in descriptors
         ):
-            raise ValueError("each block requires at least one descriptor")
+            raise ValueError("each block requires at least one MemoryRef")
+        normalized = []
+        for ref in descriptors:
+            if not isinstance(ref.info, str):
+                raise ValueError("memory reference label must be a string")
+            region_id = self._framework_regions.get(ref.info)
+            if region_id is None:
+                region_id = self._framework_regions.get(ref.info.partition(":")[0])
+            if region_id is None:
+                raise ValueError(f"no framework registration for {ref.info!r}")
+            normalized.append(
+                _TransferRef(ref.end_point_name, region_id, ref.element_index, ref.info)
+            )
+        return self._validate_descriptors(normalized)
+
+    def _validate_descriptors(
+        self,
+        descriptors: list[_TransferRef],
+        *,
+        regions=None,
+        agent_name: str | None = None,
+    ) -> list[_TransferRef]:
+        if not isinstance(descriptors, list):
+            raise TypeError("block descriptors must be a list")
+        if not descriptors or not all(
+            isinstance(ref, _TransferRef) for ref in descriptors
+        ):
+            raise ValueError("each block requires at least one _TransferRef")
+        resolved = [
+            self._region(ref, regions=regions, agent_name=agent_name)
+            for ref in descriptors
+        ]
         self._validate_block_layout(
-            [descriptor.info for descriptor in descriptors],
+            [ref.info for ref in descriptors],
             "block descriptors must use configured pools",
         )
-        for descriptor in descriptors:
-            block_size = self._block_sizes[descriptor.info.partition(":")[0]]
-            if descriptor.size != block_size:
+        for ref, region in zip(descriptors, resolved):
+            if region.size != self._block_sizes[ref.info.partition(":")[0]]:
                 raise ValueError("block descriptor has the wrong byte count")
         return list(descriptors)
 

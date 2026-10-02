@@ -12,7 +12,7 @@ from .types import (
     InventoryEvent,
     LocalDramRegions,
     PoolBlockLayouts,
-    RegDescriptor,
+    RegionDescriptor,
 )
 
 InventorySink = Callable[[InventoryEvent], None]
@@ -42,9 +42,6 @@ class LocalDramOptions:
     backend: str = "UCX"
 
 
-FrameworkDramInput = list[RegDescriptor]
-
-
 # Early pinning optimization was considered, but its complexity outweighed the benefit.
 @dataclass(frozen=True)
 class RemoteFWDramOptions:
@@ -66,7 +63,7 @@ class G3Options:
 
 @dataclass(frozen=True)
 class KVCRBackendConfigs:
-    framework_regions: FrameworkDramInput = field(default_factory=list)
+    framework_regions: list[RegionDescriptor] = field(default_factory=list)
     local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
     remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)

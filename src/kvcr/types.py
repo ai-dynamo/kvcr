@@ -20,11 +20,12 @@ PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
 @dataclass(frozen=True)
-class RegDescriptor:
+class RegionDescriptor:
     """Registered memory containing ``count`` fixed-size transfer elements.
 
     ``stride=0`` means contiguous elements. The registered extent includes
-    gaps between elements; ``info`` identifies their configured pool.
+    gaps between elements. ``info`` names the buffer as ``pool`` or
+    ``pool:part``; names must be unique among framework registrations.
     """
 
     addr: int
@@ -37,21 +38,21 @@ class RegDescriptor:
 
 
 @dataclass(frozen=True)
-class MemDescriptor:
-    """Transport-addressable memory span for a pinned KV block.
+class MemoryRef:
+    """One element in a framework's named registered buffer.
 
-    Field constraints are enforced by msgspec only when decoding or converting
-    wire data. Direct construction is trusted and unvalidated.
-
-    Endpoint, memory type, and info stay per span to keep descriptor lists flat.
-    In a scenario where one key spans multiple workers and NIXL agents, grouping
-    its spans by endpoint and memory type would add two hierarchy levels merely
-    to factor out values typically shared by reference.
-
-    ``info`` is a pool name or ``pool:part`` with an opaque part label. Only
-    the pool determines allocation and slot size; the full string identifies
-    a piece within a key. An empty pool name denotes the single unnamed pool.
+    ``info`` selects the registered ``pool:part`` buffer, falling back to the
+    ``pool`` buffer when no exact name is registered, and identifies the key piece.
     """
+
+    end_point_name: str
+    element_index: int
+    info: str = ""
+
+
+@dataclass(frozen=True)
+class MemDescriptor:
+    """Address span for TransferError buffer reports and internal FILE I/O."""
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
     mem_type: Annotated[str, msgspec.Meta(min_length=1)]
@@ -61,7 +62,7 @@ class MemDescriptor:
     info: str = ""
 
 
-PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]] | None
+PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemoryRef] | None]] | None
 
 
 class KVCRStartupError(RuntimeError):
@@ -106,7 +107,6 @@ class OpEntryStatus(Enum):
 @dataclass(frozen=True)
 class OpEntryResult:
     status: OpEntryStatus
-    descriptors: list[MemDescriptor] | None = None
     release_handle: ReleaseHandle | None = None
 
     @property

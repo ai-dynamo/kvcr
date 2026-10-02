@@ -158,10 +158,10 @@ kvcr = KVCR(
     config=config,
 )
 
-kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemDescriptor]]; completion includes per-key status and, with no_evict, a release handle
+kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
-kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion value is (list[MemDescriptor], release_handle)
-kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemDescriptor]]
+kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion includes per-key status and a release handle
+kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemoryRef]]
 kvcr.release(release_handle_list) -> list[Result[None, Error]]      # release fetch/no-evict claims
 kvcr.align_sequence(ordered_keys: list[BlockKey], use_current_time=False) -> None
 
@@ -178,7 +178,9 @@ framework.cancel_pin_request(pin_request_id)                                    
 framework.release_pin(pin_handle)                                                 # release an acquired framework-owned source pin
 ```
 
-The list-shaped API allows a key to span multiple pools. A descriptor's `info` can identify its pool and may be extended for other descriptor metadata. `fetch` may receive the expected layout shared by its keys as an ordered list of pool names so KVCR can allocate the destinations. Repeated names represent multiple descriptors from the same pool. A single-pool caller using the empty pool name may omit it.
+Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`info`) must be unique and use `pool` or `pool:part`; buffers sharing a pool prefix share allocation and eviction.
+
+`deposit`, `deliver`, and framework pin results use `MemoryRef(end_point_name, element_index, info)`. The label identifies the piece within a key and selects a registered buffer by exact name, falling back to a pool-only registration. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of labels and returns per-key status and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty name.
 
 ### Operating flow
 

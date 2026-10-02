@@ -12,8 +12,8 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from kvcr.progress import _KVCRProgress, _ProgressOp
-from kvcr.types import MemDescriptor, RegDescriptor
+from kvcr.progress import _KVCRProgress, _ProgressOp, _TransferRef
+from kvcr.types import MemDescriptor, RegionDescriptor
 
 
 class _TransferAgent:
@@ -132,14 +132,9 @@ class _TransferAgent:
 
 
 def _mem(
-    address: int,
-    *,
-    size: int = 128,
-    mem_type: str = "DRAM",
-    device_id: int = 0,
-    info: str = "",
-) -> MemDescriptor:
-    return MemDescriptor("transfer-test", mem_type, address, size, device_id, info)
+    element_index: int, *, region_id: int = 0, owner="transfer-test", info=""
+) -> _TransferRef:
+    return _TransferRef(owner, region_id, element_index, info)
 
 
 def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRProgress:
@@ -152,7 +147,7 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
     )
     progress._nixl_agent = agent
     if prepare:
-        regions = (RegDescriptor(128, 128, count=4), RegDescriptor(256, 64))
+        regions = (RegionDescriptor(128, 128, count=4), RegionDescriptor(256, 64))
         for name in ("", agent.name, "remote-agent"):
             progress.prepare_memory(name, regions)
     return progress
@@ -171,8 +166,8 @@ def test_progress_submits_and_completes_transfer(
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
         remote_side_agent="remote-agent",
         notif_msg=b"done",
         capture_telemetry=True,
@@ -200,8 +195,8 @@ def test_progress_retries_release_while_operation_is_active() -> None:
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "READ",
-        (_mem(128),),
-        (_mem(256),),
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
         remote_side_agent="remote-agent",
     )
 
@@ -221,8 +216,8 @@ def test_progress_reports_rejected_transfer_submission() -> None:
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "READ",
-        (_mem(128),),
-        (_mem(256),),
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
         remote_side_agent="remote-agent",
     )
 
@@ -239,8 +234,8 @@ def test_progress_treats_poll_exception_as_terminal_failure() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
         remote_side_agent="remote-agent",
     )
 
@@ -257,8 +252,8 @@ def test_progress_cancel_retains_transfer_until_release_succeeds() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
         remote_side_agent="remote-agent",
     )
 
@@ -273,8 +268,8 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "READ",
-        (_mem(128),),
-        (_mem(0, mem_type="FILE", device_id=7),),
+        (MemDescriptor(agent.name, "DRAM", 128, 128, 0),),
+        (MemDescriptor(agent.name, "FILE", 0, 128, 7),),
         remote_side_agent=agent.name,
         backend="MOCK",
     )
@@ -289,19 +284,16 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
 @pytest.mark.parametrize(
     ("local", "remote", "remote_agent", "message"),
     [
+        ((), (_mem(0, owner="remote-agent"),), "remote-agent", "non-empty"),
+        ((_mem(0),), (_mem(0),), "", "remote-side agent"),
+        ((_mem(0, region_id=3),), (_mem(0),), "remote-agent", "region_id"),
         (
-            (_mem(128), _mem(256, mem_type="VRAM")),
-            (_mem(384), _mem(512)),
+            (MemDescriptor("transfer-test", "DRAM", 128, 128, 0),),
+            (_mem(0),),
             "remote-agent",
-            "cannot mix memory types",
+            "_TransferRef",
         ),
-        ((), (_mem(256),), "remote-agent", "non-empty"),
-        ((_mem(128),), (_mem(256),), "", "remote-side agent"),
-        ((_mem(129),), (_mem(256),), "remote-agent", "prepared"),
-        ((_mem(640),), (_mem(256),), "remote-agent", "prepared"),
-        ((_mem(128, size=64),), (_mem(256),), "remote-agent", "prepared"),
-        ((_mem(128, device_id=1),), (_mem(256),), "remote-agent", "prepared"),
-        ((_mem(128, mem_type="VRAM"),), (_mem(256),), "remote-agent", "prepared"),
+        ((_mem(0),), (_mem(0),), "remote-agent", "owning agent"),
     ],
 )
 def test_progress_rejects_invalid_transfer(
@@ -321,8 +313,8 @@ def test_progress_rejects_invalid_transfer(
 @pytest.mark.parametrize(
     ("local", "remote"),
     [
-        ((_mem(128),), (_mem(256, size=64),)),
-        ((_mem(128), _mem(256)), (_mem(384),)),
+        ((_mem(0),), (_mem(0, region_id=1, owner="remote-agent"),)),
+        ((_mem(0), _mem(1)), (_mem(2, owner="remote-agent"),)),
     ],
     ids=["size", "count"],
 )
@@ -343,42 +335,55 @@ def test_progress_delegates_descriptor_alignment_to_nixl(local, remote) -> None:
 def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
     agent = _TransferAgent()
     progress = _transfer_progress(agent, prepare=False)
-    progress.prepare_memory(
-        "",
-        (
-            RegDescriptor(1000, 16, info="pool:k", stride=64, count=3),
-            RegDescriptor(2000, 16, info="pool:v", stride=32, count=2),
-        ),
+    regions = (
+        RegionDescriptor(5000, 16, "VRAM", 3, "pool:k", 32, 8),
+        RegionDescriptor(1000, 16, info="pool:k", stride=64, count=3),
+        RegionDescriptor(2000, 16, info="pool:v", stride=32, count=2),
     )
+    progress.prepare_memory("", regions)
     progress.prepare_memory(
-        "remote-agent", (RegDescriptor(5000, 16, "VRAM", 3, stride=32, count=8),)
+        "native-peer", tuple(reversed(regions)), owner_name="remote-agent"
     )
     with pytest.raises(RuntimeError, match="already initialized"):
-        progress.prepare_memory("remote-agent", ())
+        progress.prepare_memory("native-peer", ())
     local = (
-        _mem(1064, size=16, info="another-label"),
-        _mem(2032, size=16),
-        _mem(1064, size=16, info="pool:k"),
+        _mem(1, region_id=1, info="pool:k"),
+        _mem(1, region_id=2, info="pool:v"),
+        _mem(1, region_id=1, info="pool:k"),
     )
     remote = tuple(
-        _mem(address, size=16, mem_type="VRAM", device_id=3)
-        for address in (5096, 5000, 5096)
+        _mem(index, region_id=2, owner="remote-agent", info="pool:k")
+        for index in (3, 0, 3)
     )
-
     for _ in range(2):
         transfer_id, submitted = progress.submit_transfer(
-            "WRITE", local, remote, remote_side_agent="remote-agent", backend="UCX"
+            "WRITE", local, remote, remote_side_agent="native-peer", backend="UCX"
         )
         assert submitted
         progress.poll_transfer(transfer_id)
-
+    with pytest.raises(ValueError, match="cannot mix memory types"):
+        progress.submit_transfer(
+            "WRITE",
+            (local[0], _mem(0, info="pool:k")),
+            remote[:2],
+            remote_side_agent="native-peer",
+        )
+    with pytest.raises(ValueError, match="label does not match"):
+        progress.submit_transfer(
+            "WRITE",
+            (_mem(0, region_id=1, info="pool:v"),),
+            remote[:1],
+            remote_side_agent="native-peer",
+        )
     assert agent.prep_calls == [
+        ("", "VRAM", [[5000, 16, 3, 32, 8]]),
         ("", "DRAM", [[1000, 16, 0, 64, 3], [2000, 16, 0, 32, 2]]),
-        ("remote-agent", "VRAM", [[5000, 16, 3, 32, 8]]),
+        ("native-peer", "DRAM", [[2000, 16, 0, 32, 2], [1000, 16, 0, 64, 3]]),
+        ("native-peer", "VRAM", [[5000, 16, 3, 32, 8]]),
     ]
     assert agent.make_calls == [
-        ("dlist-1", [1, 4, 1], "dlist-2", [3, 0, 3]),
-        ("dlist-1", [1, 4, 1], "dlist-2", [3, 0, 3]),
+        ("dlist-2", [1, 4, 1], "dlist-4", [3, 0, 3]),
+        ("dlist-2", [1, 4, 1], "dlist-4", [3, 0, 3]),
     ]
     assert agent.events.count("make:WRITE:['UCX']:b''") == 2
 
@@ -388,8 +393,8 @@ def test_progress_preparation_failure_is_fatal(release_failures) -> None:
     agent = _TransferAgent()
     progress = _transfer_progress(agent, prepare=False)
     progress._memory_regions = (
-        RegDescriptor(128, 128),
-        RegDescriptor(256, 128, "VRAM"),
+        RegionDescriptor(128, 128),
+        RegionDescriptor(256, 128, "VRAM"),
     )
     agent.register_memory = Mock(side_effect=[7, 8])
     agent.prep_failure = "VRAM"
@@ -483,8 +488,8 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
     progress._memory_registrations.append(7)
     transfer_id, _ = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
         remote_side_agent="remote-agent",
     )
     agent.release_failures = 1

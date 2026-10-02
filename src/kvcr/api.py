@@ -30,7 +30,7 @@ from .types import (
     BlockKey,
     CacheTier,
     KVCRStartupError,
-    MemDescriptor,
+    MemoryRef,
     OpHandle,
     OpResult,
     PinHandle,
@@ -159,7 +159,7 @@ class KVCR:
 
     def deliver(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[MemoryRef]],
         request_id: str | None = None,
     ) -> OpHandle:
         """Asynchronously deliver whole blocks or named parts to caller destinations."""
@@ -167,7 +167,7 @@ class KVCR:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[MemoryRef]],
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:

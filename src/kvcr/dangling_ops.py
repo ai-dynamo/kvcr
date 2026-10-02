@@ -108,7 +108,10 @@ class _DanglingOps:
                 OpHandle(op.op_id[1]),
                 state=state,
                 source_blocks={
-                    key: list(descriptors)
+                    key: [
+                        self._backend._kvcr._address_descriptor(ref)
+                        for ref in descriptors
+                    ]
                     for key, descriptors in zip(op.source_keys, op.src_descriptors)
                 },
             )
@@ -132,7 +135,10 @@ class _DanglingOps:
                 "KVCR remote write memory",
                 op.op_id[1],
                 state=state,
-                destination_regions=list(chain.from_iterable(op.dst_descriptors)),
+                destination_regions=[
+                    self._backend._kvcr._address_descriptor(ref)
+                    for ref in chain.from_iterable(op.dst_descriptors)
+                ],
             )
         )
 

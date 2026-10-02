@@ -14,12 +14,13 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
+import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config
 
-from .types import BlockKey, MemDescriptor, RegDescriptor
+from .types import BlockKey, MemDescriptor, RegionDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
@@ -31,6 +32,36 @@ _STARTUP_TIMEOUT_SECONDS = 30.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
+
+
+@dataclass(frozen=True)
+class _TransferRef:
+    """Internal reference into an owning agent's immutable registration catalog."""
+
+    end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
+    region_id: Annotated[int, msgspec.Meta(ge=0)]
+    element_index: Annotated[int, msgspec.Meta(ge=0)]
+    info: str = ""
+
+
+def _resolve_region(
+    ref: _TransferRef, regions: Sequence[RegionDescriptor], agent_name: str
+) -> RegionDescriptor:
+    if not isinstance(ref, _TransferRef):
+        raise ValueError("memory transfers require _TransferRef entries")
+    if ref.end_point_name != agent_name:
+        raise ValueError("memory reference has the wrong owning agent")
+    if type(ref.region_id) is not int or not 0 <= ref.region_id < len(regions):
+        raise ValueError("memory reference region_id is outside the catalog")
+    region = regions[ref.region_id]
+    if type(ref.element_index) is not int or not 0 <= ref.element_index < region.count:
+        raise ValueError("memory reference element_index is outside its region")
+    if not isinstance(ref.info, str) or region.info not in (
+        ref.info,
+        ref.info.partition(":")[0],
+    ):
+        raise ValueError("memory reference label does not match its region pool")
+    return region
 
 
 @dataclass(slots=True)
@@ -86,7 +117,7 @@ class _KVCRProgress:
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
-        memory_regions: tuple[RegDescriptor, ...] = (),
+        memory_regions: tuple[RegionDescriptor, ...] = (),
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -103,9 +134,8 @@ class _KVCRProgress:
         self._dram_backends = dram_backends
         self._memory_regions = memory_regions
         self._memory_registrations: list[Any] = []
-        self._prepared: dict[
-            str, dict[str, tuple[Any, list[tuple[RegDescriptor, int]]]]
-        ] = {}
+        self._prepared: dict[str, dict[str, tuple[Any, dict[int, int]]]] = {}
+        self._catalogs: dict[str, tuple[str, tuple[RegionDescriptor, ...]]] = {}
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._wake_lock = threading.Lock()
@@ -192,8 +222,8 @@ class _KVCRProgress:
     def submit_transfer(
         self,
         operation: str,
-        local_descriptors: Sequence[MemDescriptor],
-        remote_descriptors: Sequence[MemDescriptor],
+        local_descriptors: Sequence[_TransferRef] | Sequence[MemDescriptor],
+        remote_descriptors: Sequence[_TransferRef] | Sequence[MemDescriptor],
         *,
         remote_side_agent: str,
         backend: str | None = None,
@@ -206,7 +236,11 @@ class _KVCRProgress:
         if not isinstance(remote_side_agent, str) or not remote_side_agent:
             raise ValueError("NIXL remote-side agent must be non-empty")
         agent = self.nixl_agent
-        if "FILE" in (local_descriptors[0].mem_type, remote_descriptors[0].mem_type):
+        if any(
+            isinstance(descriptors[0], MemDescriptor)
+            and descriptors[0].mem_type == "FILE"
+            for descriptors in (local_descriptors, remote_descriptors)
+        ):
             handle = agent.initialize_xfer(
                 operation,
                 self._make_transfer_descriptors(local_descriptors),
@@ -271,25 +305,37 @@ class _KVCRProgress:
             mem_type=mem_type,
         )
 
-    def prepare_memory(self, agent_name: str, regions: Sequence[RegDescriptor]) -> None:
+    def prepare_memory(
+        self,
+        agent_name: str,
+        regions: Sequence[RegionDescriptor],
+        *,
+        owner_name: str | None = None,
+    ) -> None:
         """Initialize physical grids after registration or new metadata install."""
         if agent_name in self._prepared:
             raise RuntimeError("NIXL prepared memory is already initialized")
-        by_type: dict[str, list[RegDescriptor]] = {}
-        for region in regions:
-            by_type.setdefault(region.mem_type, []).append(region)
+        owner = (
+            owner_name
+            if owner_name is not None
+            else (agent_name or self.nixl_agent_name)
+        )
+        self._catalogs[agent_name] = (owner, tuple(regions))
+        by_type: dict[str, list[tuple[int, RegionDescriptor]]] = {}
+        for region_id, region in enumerate(regions):
+            by_type.setdefault(region.mem_type, []).append((region_id, region))
         prepared = self._prepared.setdefault(agent_name, {})
         try:
             for mem_type, entries in by_type.items():
-                spans = []
+                offsets = {}
                 offset = 0
-                for region in entries:
-                    spans.append((region, offset))
+                for region_id, region in entries:
+                    offsets[region_id] = offset
                     offset += region.count
                 rows = np.array(
                     [
                         (r.addr, r.size, r.device_Id, r.stride or r.size, r.count)
-                        for r in entries
+                        for _, r in entries
                     ],
                     dtype=np.uint64,
                 )
@@ -298,12 +344,13 @@ class _KVCRProgress:
                 )
                 if handle is None:
                     raise RuntimeError("prep_xfer_dlist returned None")
-                prepared[mem_type] = (handle, spans)
+                prepared[mem_type] = (handle, offsets)
         except BaseException:
             self.release_prepared(agent_name)
             raise
         if not prepared:
             self._prepared.pop(agent_name, None)
+            self._catalogs.pop(agent_name, None)
 
     def release_prepared(self, agent_name: str) -> None:
         """Release a catalog only after every transfer using it has released."""
@@ -318,35 +365,23 @@ class _KVCRProgress:
                 raise RuntimeError("NIXL prepared memory did not close")
             del prepared[mem_type]
         self._prepared.pop(agent_name, None)
+        self._catalogs.pop(agent_name, None)
 
     def _prepared_indices(
-        self, agent_name: str, descriptors: Sequence[MemDescriptor]
+        self, agent_name: str, descriptors: Sequence[_TransferRef]
     ) -> tuple[Any, list[int]]:
-        mem_type = descriptors[0].mem_type
-        if any(descriptor.mem_type != mem_type for descriptor in descriptors):
-            raise ValueError("one NIXL descriptor list cannot mix memory types")
-        catalog = self._prepared.get(agent_name, {}).get(mem_type)
+        catalog = self._catalogs.get(agent_name)
         if catalog is None:
-            raise ValueError(f"no prepared {mem_type} memory for agent {agent_name!r}")
-        handle, spans = catalog
+            raise ValueError(f"no prepared memory for agent {agent_name!r}")
+        owner, regions = catalog
+        first = _resolve_region(descriptors[0], regions, owner)
+        handle, offsets = self._prepared[agent_name][first.mem_type]
         indices = []
-        for descriptor in descriptors:
-            for region, offset in spans:
-                slot, remainder = divmod(
-                    descriptor.addr - region.addr, region.stride or region.size
-                )
-                if (
-                    descriptor.size == region.size
-                    and descriptor.device_Id == region.device_Id
-                    and remainder == 0
-                    and 0 <= slot < region.count
-                ):
-                    indices.append(offset + slot)
-                    break
-            else:
-                raise ValueError(
-                    f"memory descriptor is outside prepared spans: {descriptor}"
-                )
+        for ref in descriptors:
+            region = _resolve_region(ref, regions, owner)
+            if region.mem_type != first.mem_type:
+                raise ValueError("one NIXL descriptor list cannot mix memory types")
+            indices.append(offsets[ref.region_id] + ref.element_index)
         return handle, indices
 
     def _release_transfer(self, transfer_id: int, state: _TransferState) -> bool:
