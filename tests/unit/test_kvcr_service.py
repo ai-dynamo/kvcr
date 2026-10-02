@@ -436,6 +436,7 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
         registry.close()
     assert registry._guards.keys() == {0}
     assert registry._guards[0]._pool_lease.listener is stubborn
+    assert not first_path.exists()
 
     # With nothing left refusing, the retried close finally takes the pool.
     guard._pool_lease.listener = None
@@ -451,19 +452,23 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
         assert guard._owner is owner and Path(owner.spec.path).exists()
     registry.close()
     assert registry._guards == {}
+    assert not Path(owner.spec.path).exists()
 
 
-def test_shutdown_joins_all_guards_before_reclaiming(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cleanup_failure", [None, "mapping", "lease"])
+def test_shutdown_joins_all_guards_before_reclaiming(tmp_path, cleanup_failure) -> None:
     registry = _new_registry(tmp_path, guard_count=2)
     joined = []
+    paths = [Path(guard._owner.spec.path) for guard in registry._guards.values()]
     for index, guard in registry._guards.items():
         finish = guard.finish_close
         owner_close = guard._owner.close
 
         def finish_close(deadline, index=index, finish=finish):
-            result = finish(deadline)
-            joined.append(index)
-            return result
+            try:
+                return finish(deadline)
+            finally:
+                joined.append(index)
 
         def reclaim(owner_close=owner_close):
             assert joined == [0, 1]
@@ -471,8 +476,29 @@ def test_shutdown_joins_all_guards_before_reclaiming(tmp_path: Path) -> None:
 
         guard.finish_close = finish_close
         guard._owner.close = reclaim
+        if cleanup_failure == "mapping":
+            guard._recovery.attachment.close.side_effect = RuntimeError(
+                "cleanup failed"
+            )
+        elif cleanup_failure == "lease":
+            guard._pool_lease.listener = Mock(
+                close=Mock(side_effect=RuntimeError("cleanup failed"))
+            )
+    if cleanup_failure:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            registry.close()
+        assert registry._guards.keys() == {0, 1}
+        assert all(path.exists() == (cleanup_failure == "mapping") for path in paths)
+        for guard in registry._guards.values():
+            assert not guard._thread.is_alive()
+            if cleanup_failure == "mapping":
+                guard._recovery.attachment.close.side_effect = None
+            else:
+                guard._pool_lease.listener.close.side_effect = None
+        joined.clear()
     registry.close()
     assert registry._guards == {}
+    assert all(not path.exists() for path in paths)
 
 
 def test_refused_claims_do_not_bind_the_pool(tmp_path: Path) -> None:

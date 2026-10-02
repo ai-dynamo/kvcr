@@ -244,7 +244,9 @@ class _PoolRegistry:
         # Wedged groups stay visible; drained ones stay listed until the whole
         # drain finished, so a release racing shutdown is absorbed.
         # Reclaim only after all joins: unlink must not consume their deadline.
-        for guard_index in sorted(set(self._guards) - kept):
+        for guard_index in sorted(self._guards):
+            if self._guards[guard_index]._thread.is_alive():
+                continue
             try:
                 self._guards[guard_index].reclaim_pool()
             except BaseException as error:  # noqa: BLE001 - raised below

@@ -466,10 +466,19 @@ class _Guard:
         self._submit(_Command(operation, (lease,)))
 
     def close(self) -> None:
-        self.begin_close()
-        if self.finish_close(time.monotonic() + 30.0):
-            raise TimeoutError("KVCR Guard lifecycle thread did not stop")
-        self.reclaim_pool()
+        try:
+            self.begin_close()
+            if self.finish_close(time.monotonic() + 30.0):
+                raise TimeoutError("KVCR Guard lifecycle thread did not stop")
+        except BaseException:
+            if not self._thread.is_alive():
+                # First failure wins: reclamation usually fails because the
+                # close did, so its error would mask the cause.
+                with suppress(Exception):
+                    self.reclaim_pool()
+            raise
+        if not self._thread.is_alive():
+            self.reclaim_pool()
 
     def begin_close(self) -> None:
         """Stop taking work and queue the teardown without waiting: a wedged
@@ -481,10 +490,7 @@ class _Guard:
         if not self._started or not self._thread.is_alive():
             # Inline, and retried on a later call if it raised the first time.
             if not self._closed:
-                try:
-                    self._close_resources()
-                finally:
-                    self.reclaim_pool()
+                self._close_resources()
                 self._closed = True
             return
         if not already:
