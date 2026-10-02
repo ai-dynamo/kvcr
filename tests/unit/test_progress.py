@@ -126,11 +126,12 @@ def test_prepare_registers_memory_before_backend_activation(
 
     if activate:
         progress.start()
-        assert events[:3] == ["register", "initialize", "metadata"]
     progress.close()
-    assert "deregister" in events
-    if not activate:
-        assert "initialize" not in events and "metadata" not in events
+    assert events == (
+        ["register", "initialize", "metadata", "close", "deregister"]
+        if activate
+        else ["register", "close", "deregister"]
+    )
 
 
 def test_close_drains_queued_submissions(monkeypatch) -> None:

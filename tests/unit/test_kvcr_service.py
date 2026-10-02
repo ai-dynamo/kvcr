@@ -231,13 +231,17 @@ def _new_registry(tmp_path: Path, guard_count: int = 1) -> _PoolRegistry:
         patch("kvcr.guard.KVCRPoolAttachment.attach", side_effect=_stand_in_pool),
         patch("kvcr.guard.RecoveryJournal", Mock(return_value=journal)),
     ):
-        return _PoolRegistry(
+        registry = _PoolRegistry(
             tmp_path,
             guard_count,
             _TEST_POOL_SIZES_BYTES,
             _TEST_JOURNAL_BYTES,
             _TEST_DIGEST,
         )
+    for guard in registry._guards.values():
+        # Stand-in addresses cannot be registered with the native backend.
+        guard._prepare_core = Mock()
+    return registry
 
 
 def _wait_for_connection_state(
@@ -1316,7 +1320,9 @@ def test_a_pidfd_that_breaks_while_its_process_lives_is_service_fatal(
         poller = Mock()
         poller.poll.return_value = [(liveness.fileno(), select.POLLNVAL)]
         with patch("kvcr.guard.select.poll", return_value=poller):
-            _wait_until(lambda: guard._phase is _Phase.FAILED, timeout=5)
+            _wait_until(
+                lambda: guard._phase is _Phase.FAILED and bool(uncontained), timeout=5
+            )
 
         guard._promote.assert_not_called()
         (error,) = uncontained
