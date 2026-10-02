@@ -55,10 +55,13 @@ _DIGEST = "01" * 32
 class _FileBackedNixlAgent(FakeNixlAgent):
     def __init__(self) -> None:
         super().__init__(b"guard-md")
-        self.name = b"target"
         self.block_remote_writes = False
         self.blocked_remote_writes = 0
         self.backends: dict[str, dict[str, str]] = {}
+
+    def create(self, name: str, _config: object) -> "_FileBackedNixlAgent":
+        self.name = name
+        return self
 
     def add_remote_agent(self, metadata: bytes) -> bytes:
         self.remote_agents.append(metadata)
@@ -80,17 +83,24 @@ class _FileBackedNixlAgent(FakeNixlAgent):
         return super().deregister_memory(handle)
 
     def transfer(self, handle):
+        operation, local_descs, local_indices, remote_descs, remote_agent, _ = (
+            self.xfers[handle - 1]
+        )
         if self.xfer_backends[handle - 1] != ["MOCK"]:
             if self.block_remote_writes:
                 self.transfers.append(handle)
                 self.blocked_remote_writes += 1
                 return "PROC"
+            # Unblocked peers in these tests live in the same process.
+            if operation == "WRITE" and remote_agent != self.name:
+                for index in local_indices:
+                    address, size, _ = local_descs[index]
+                    ctypes.memmove(remote_descs[index][0], address, size)
             return super().transfer(handle)
         self.transfers.append(handle)
-        operation, local_descs, local_indices, file_descs, _, _ = self.xfers[handle - 1]
         for index in local_indices:
             address, memory_bytes, _ = local_descs[index]
-            offset, file_bytes, direct_fd = file_descs[index]
+            offset, file_bytes, direct_fd = remote_descs[index]
             byte_count = min(memory_bytes, file_bytes)
             fd = os.open(f"/proc/self/fd/{direct_fd}", os.O_RDWR | os.O_CLOEXEC)
             try:
@@ -120,18 +130,9 @@ def _make_kvcr(
     layout = pool_layouts or [("", page_size)]
     object_size = sum(size for _, size in layout)
     framework_regions = (
-        [
-            RegionDescriptor(
-                addr=descriptor.addr,
-                stride=object_size,
-                count=len(framework) // object_size,
-                size=descriptor.size,
-                info=descriptor.info,
-            )
-            for descriptor in _real_nixl_descriptors(
-                ctypes.addressof(framework), layout
-            )
-        ]
+        _real_nixl_regions(
+            ctypes.addressof(framework), layout, count=len(framework) // object_size
+        )
         if framework is not None
         else []
     )
@@ -140,7 +141,7 @@ def _make_kvcr(
         return KVCR(
             KVCRConfig(
                 nixl_agent_name=agent_name,
-                pool_layouts=list(dict(layout).items()),
+                pool_layouts=list({name: size for name, size in layout}.items()),
                 nixl_listen_port=0,
             ),
             KVCRBindings(
@@ -179,7 +180,9 @@ def _deposit_two_blocks(kvcr: KVCR, source: int, block_bytes: int) -> None:
         (BlockKey(b"resident-b"), b"B" * block_bytes),
     ):
         ctypes.memmove(source, payload, block_bytes)
-        operation = kvcr.deposit({key: [_mem_descriptor(source, block_bytes)]})
+        operation = kvcr.deposit(
+            {key: [_mem_descriptor(end_point_name=kvcr.config.nixl_agent_name)]}
+        )
         assert dict(_poll_until(kvcr, bool))[operation][key].success, key
     assert kvcr.query((BlockKey(b"resident-a"),)) == [
         (QueryStatus.FETCHABLE, CacheTier.G3)
@@ -194,9 +197,11 @@ def _primary_child(
     slot_bytes = os.sysconf("SC_PAGE_SIZE")
     agent = _FileBackedNixlAgent()
     agent.state = "DONE"
-    kvcr = _make_kvcr(socket_path, g3_path, control_port, mode, agent=agent)
+    source = ctypes.create_string_buffer(slot_bytes)
+    kvcr = _make_kvcr(
+        socket_path, g3_path, control_port, mode, agent=agent, framework=source
+    )
     if mode != "idle":
-        source = ctypes.create_string_buffer(slot_bytes)
         _deposit_two_blocks(kvcr, ctypes.addressof(source), slot_bytes)
     if mode == "stall":
         agent.block_remote_writes = True
@@ -381,7 +386,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
     target = KVCR(
         KVCRConfig(
             nixl_agent_name="real-target",
-            pool_layouts=list(dict(layout).items()),
+            pool_layouts=list({name: size for name, size in layout}.items()),
             nixl_listen_port=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
             abandon_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 2000,
@@ -395,14 +400,9 @@ def test_promoted_guard_serves_real_nixl_transfers(
             ),
         ),
         KVCRBackendConfigs(
-            framework_regions=[
-                RegionDescriptor(
-                    addr=descriptor.addr, size=descriptor.size, info=descriptor.info
-                )
-                for descriptor in _real_nixl_descriptors(
-                    ctypes.addressof(target_memory), layout
-                )
-            ],
+            framework_regions=_real_nixl_regions(
+                ctypes.addressof(target_memory), layout
+            ),
             remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
         ),
     )
@@ -410,11 +410,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
         served_key = BlockKey(b"resident-b")
         target.submit_hint(_router_hint(source_endpoint), request_id="from-guard")
         operation = target.deliver(
-            {
-                served_key: _real_nixl_descriptors(
-                    ctypes.addressof(target_memory), layout
-                )
-            },
+            {served_key: _real_nixl_refs("real-target", layout)},
             request_id="from-guard",
         )
         deadline = time.monotonic() + _REAL_NIXL_TIMEOUT_SECONDS
@@ -450,7 +446,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
         for key, payload in recovered:
             ctypes.memset(destination, 0, len(payload))
             operation = replacement.deliver(
-                {key: _real_nixl_descriptors(destination, layout)}
+                {key: _real_nixl_refs("real-replacement", layout, element_index=1)}
             )
             result = dict(
                 _poll_until(replacement, bool, timeout=_REAL_NIXL_TIMEOUT_SECONDS)
@@ -474,7 +470,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     guard_agent = _FileBackedNixlAgent()
     guard_agent.state = "DONE"
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", guard_agent.create)
     service, spawn = live_service
 
     primary = spawn("_group_primary_child", service.socket_path, control_port)
@@ -505,7 +501,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     )
     assert [
         ctypes.string_at(descriptor.addr, descriptor.size)
-        for descriptor in guard._core._local_dram._descriptors(record.local_dram.slots)
+        for descriptor in guard._core._local_dram.memory_regions
     ] == payloads
 
     replacement = KVCRClient(service.socket_path).claim(
@@ -569,7 +565,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
 
     monkeypatch.setattr(_Guard, "_promote", pause_promotion)
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", guard_agent.create)
 
     service, spawn = live_service
     target = None
@@ -605,10 +601,9 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         target._core._clock = lambda: now[0]
         # The G2 block: a Guard serves what the pool holds and opens no G3.
         key = BlockKey(b"resident-b")
-        stalled_destination = (ctypes.c_char * page_size).from_buffer(target_memory)
         target.submit_hint(_router_hint(source_endpoint), request_id="stalled")
         stalled_operation = target.deliver(
-            {key: [_mem_descriptor(ctypes.addressof(stalled_destination), page_size)]},
+            {key: [_mem_descriptor()]},
             request_id="stalled",
         )
         _await_marker(child, "in-flight")
@@ -659,7 +654,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         destination = (ctypes.c_char * page_size).from_buffer(target_memory, page_size)
         target.submit_hint(_router_hint(source_endpoint), request_id="retry")
         operation = target.deliver(
-            {key: [_mem_descriptor(ctypes.addressof(destination), len(destination))]},
+            {key: [_mem_descriptor(element_index=1)]},
             request_id="retry",
         )
 
@@ -701,7 +696,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     guard_agent = _FileBackedNixlAgent()
     guard_agent.state = "DONE"
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", guard_agent.create)
     service, spawn = live_service
 
     # Generation zero: a primary that stored nothing dies. An empty Guard
@@ -739,12 +734,14 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # pidfd on our own live pid never fires.
     replacement_agent = _FileBackedNixlAgent()
     replacement_agent.state = "DONE"
+    destination = ctypes.create_string_buffer(page_size)
     replacement = _make_kvcr(
         str(service.socket_path),
         str(g3_path),
         control_port,
         "replacement",
         agent=replacement_agent,
+        framework=destination,
     )
     try:
         assert replacement._core._remote_fw_dram._dangling_ops.dead_incarnations == {
@@ -755,9 +752,8 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
             (BlockKey(b"resident-a"), b"A" * page_size),
             (BlockKey(b"resident-b"), b"B" * page_size),
         ):
-            destination = ctypes.create_string_buffer(len(payload))
             operation = replacement.deliver(
-                {key: [_mem_descriptor(ctypes.addressof(destination), len(payload))]}
+                {key: [_mem_descriptor(end_point_name="replacement")]}
             )
             result = dict(_poll_until(replacement, bool))[operation][key]
             assert result.success, key
@@ -833,18 +829,30 @@ def _real_nixl_available() -> bool:
 def _real_nixl_layout(multi_pool: bool) -> list[tuple[str, int]]:
     page = os.sysconf("SC_PAGE_SIZE")
     return (
-        [("full", page + page // 2), ("swa", page // 2), ("swa", page // 2)]
-        if multi_pool
-        else [("", page)]
+        [("full", page + page // 2), ("swa", page // 2)] if multi_pool else [("", page)]
     )
 
 
-def _real_nixl_descriptors(address: int, layout: list[tuple[str, int]]):
-    descriptors = []
+def _real_nixl_regions(address: int, layout: list[tuple[str, int]], count: int = 1):
+    regions = []
+    stride = sum(size for _, size in layout)
     for name, size in layout:
-        descriptors.append(_mem_descriptor(address, size, info=name))
+        regions.append(
+            RegionDescriptor(
+                addr=address, size=size, info=name, stride=stride, count=count
+            )
+        )
         address += size
-    return descriptors
+    return regions
+
+
+def _real_nixl_refs(
+    agent_name: str, layout: list[tuple[str, int]], element_index: int = 0
+):
+    return [
+        _mem_descriptor(element_index, info=name, end_point_name=agent_name)
+        for name, _ in layout
+    ]
 
 
 def _real_nixl_primary_child(
@@ -869,9 +877,7 @@ def _real_nixl_primary_child(
         )
         ctypes.memmove(ctypes.addressof(framework), payload, len(payload))
         key = BlockKey(b"resident-b")
-        operation = kvcr.deposit(
-            {key: _real_nixl_descriptors(ctypes.addressof(framework), layout)}
-        )
+        operation = kvcr.deposit({key: _real_nixl_refs("real-primary", layout)})
         assert dict(_poll_until(kvcr, bool))[operation][key].success
     else:
         _deposit_two_blocks(kvcr, ctypes.addressof(framework), page_size)

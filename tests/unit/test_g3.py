@@ -12,6 +12,7 @@ from _kvcr_test_utils import (
     FakeNixlAgent,
     FakePrimaryPinning,
     FakeTelemetryStats,
+    _buffer_region,
     _ConstantHashAdapter,
     _decode_control_message,
     _has_outstanding_operations,
@@ -47,6 +48,7 @@ from kvcr.types import (
     PlacementAction,
     QueryStatus,
     RecoveryMirrorError,
+    RegionDescriptor,
 )
 
 
@@ -163,6 +165,7 @@ def _new_g3_kvcr(
     remote_options=None,
     inventory_sink=None,
     g3_paths=None,
+    framework_regions=None,
 ):
     page_size = os.sysconf("SC_PAGE_SIZE")
     return _new_kvcr(
@@ -185,11 +188,12 @@ def _new_g3_kvcr(
         inventory_sink=inventory_sink,
         key_adapter=key_adapter,
         remote_options=remote_options,
+        framework_regions=framework_regions,
     )
 
 
-def _deposit(kvcr, key, address, size):
-    handle = kvcr.deposit({key: [_mem_descriptor(address, size)]})
+def _deposit(kvcr, key, index):
+    handle = kvcr.deposit({key: [_mem_descriptor(index)]})
     return dict(_poll_until(kvcr, bool))[handle][key]
 
 
@@ -214,7 +218,6 @@ def test_g3_builtin_policy_eviction_order(
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 3)
     local = ctypes.create_string_buffer(page_size * 2)
-    primary_addr = ctypes.addressof(primary)
     events: list[InventoryEvent] = []
     kvcr = _new_g3_kvcr(
         tmp_path,
@@ -222,18 +225,14 @@ def test_g3_builtin_policy_eviction_order(
         slot_count=2,
         policy=policy,
         inventory_sink=events.append,
+        framework_regions=[_buffer_region(primary, page_size)],
     )
     now = 0.0
     kvcr._core._clock = lambda: now
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
 
     for index, key in enumerate(keys[:2]):
-        assert _deposit(
-            kvcr,
-            key,
-            primary_addr + index * page_size,
-            page_size,
-        ).success
+        assert _deposit(kvcr, key, index).success
 
     now = 1.0
     first_fetch = kvcr.fetch((keys[0],))
@@ -245,12 +244,7 @@ def test_g3_builtin_policy_eviction_order(
     kvcr.release((second_claim, first_claim))
 
     now = 3.0
-    assert _deposit(
-        kvcr,
-        keys[2],
-        primary_addr + 2 * page_size,
-        page_size,
-    ).success
+    assert _deposit(kvcr, keys[2], 2).success
     statuses = kvcr.query(keys)
     assert statuses.pop(moved_index) == (QueryStatus.FETCHABLE, CacheTier.G3)
     assert statuses == [
@@ -310,11 +304,14 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     tmp_path,
 ) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
-    primary = ctypes.create_string_buffer(page_size * 5)
+    primary = ctypes.create_string_buffer(page_size * 10)
     payloads = tuple(bytes((ord("a") + index,)) * page_size for index in range(5))
     primary.raw = b"".join(payloads)
     local = ctypes.create_string_buffer(page_size)
-    destination = ctypes.create_string_buffer(page_size * 4)
+    destination = (ctypes.c_char * (page_size * 4)).from_buffer(primary, page_size * 5)
+    replacement_destination = (ctypes.c_char * page_size).from_buffer(
+        primary, page_size * 9
+    )
     agent = _FakeG3Agent()
     paths = (tmp_path / "g3-0.data", tmp_path / "g3-1.data")
     kvcr = _new_g3_kvcr(
@@ -323,17 +320,14 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         agent=agent,
         g3_paths=paths,
         g3_slot_count=2,
+        framework_regions=[
+            _buffer_region(primary, page_size),
+        ],
     )
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(5))
-    primary_addr = ctypes.addressof(primary)
 
     for index, key in enumerate(keys):
-        assert _deposit(
-            kvcr,
-            key,
-            primary_addr + index * page_size,
-            page_size,
-        ).success
+        assert _deposit(kvcr, key, index).success
 
     assert kvcr.query(keys) == [
         (QueryStatus.FETCHABLE, CacheTier.G3),
@@ -358,12 +352,8 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         (second_fd, page_size),
     ]
 
-    destination_addr = ctypes.addressof(destination)
     deliver = kvcr.deliver(
-        {
-            key: [_mem_descriptor(destination_addr + index * page_size, page_size)]
-            for index, key in enumerate(keys[:4])
-        }
+        {key: [_mem_descriptor(index + 5)] for index, key in enumerate(keys[:4])}
     )
     deliver_result = dict(_poll_until(kvcr, lambda done: deliver in dict(done)))[
         deliver
@@ -385,14 +375,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     ]
     replacement = kvcr._core._block_record_map[keys[4]].g3
     assert replacement is not None and replacement.slot == evicted_slot
-    replacement_destination = ctypes.create_string_buffer(page_size)
-    replacement_deliver = kvcr.deliver(
-        {
-            keys[4]: [
-                _mem_descriptor(ctypes.addressof(replacement_destination), page_size)
-            ]
-        }
-    )
+    replacement_deliver = kvcr.deliver({keys[4]: [_mem_descriptor(9)]})
     replacement_result = dict(
         _poll_until(kvcr, lambda done: replacement_deliver in dict(done))
     )[replacement_deliver][keys[4]]
@@ -407,11 +390,20 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
 ) -> None:
     """Recovery rebuilds free slots and spills observably evict recovered blocks."""
     page_size = os.sysconf("SC_PAGE_SIZE")
-    primary = ctypes.create_string_buffer(page_size * 3)
+    primary = ctypes.create_string_buffer(page_size * 4)
     local = ctypes.create_string_buffer(page_size)
-    destination = ctypes.create_string_buffer(page_size)
+    destination = (ctypes.c_char * page_size).from_buffer(primary, page_size * 3)
     agent = _FakeG3Agent()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy, g3_slot_count=3)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        policy=policy,
+        g3_slot_count=3,
+        framework_regions=[
+            _buffer_region(primary, page_size),
+        ],
+    )
     g3 = kvcr._core._g3
     assert g3 is not None
     first, second = BlockKey(b"first"), BlockKey(b"second")
@@ -450,10 +442,8 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         BlockKey(b"fresh"),
         BlockKey(b"last"),
     )
-    primary_addr = ctypes.addressof(primary)
     for index, key in enumerate((spilled, fresh, last)):
-        address = primary_addr + index * page_size
-        assert _deposit(kvcr, key, address, page_size).success
+        assert _deposit(kvcr, key, index).success
     assert observed == [
         (spilled, 1),
         (first, None),
@@ -465,9 +455,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         (QueryStatus.FETCHABLE, CacheTier.G3),
     ]
 
-    deliver = kvcr.deliver(
-        {second: [_mem_descriptor(ctypes.addressof(destination), page_size)]}
-    )
+    deliver = kvcr.deliver({second: [_mem_descriptor(3)]})
     assert dict(_poll_until(kvcr, bool))[deliver][second].success
     assert destination.raw == b"s" * page_size
 
@@ -506,14 +494,28 @@ def test_g3_recovery_rejects_multi_block_local_residency(tmp_path) -> None:
 
 def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
-    primary = ctypes.create_string_buffer(page_size * 2)
-    primary.raw = b"a" * page_size + b"b" * page_size
+    primary = ctypes.create_string_buffer(page_size * 5)
+    primary.raw = b"a" * page_size + b"\0" * page_size + b"b" * page_size
     local = ctypes.create_string_buffer(page_size)
-    destination = ctypes.create_string_buffer(page_size)
+    destination = (ctypes.c_char * (page_size * 3)).from_buffer(primary, page_size * 2)
     first, second = BlockKey(b"first"), BlockKey(b"second")
     policy = _RecordingG3LRUPolicy()
     agent = _FakeG3Agent()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy, telemetry=True)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        policy=policy,
+        telemetry=True,
+        framework_regions=[
+            RegionDescriptor(
+                addr=ctypes.addressof(primary),
+                size=page_size,
+                stride=2 * page_size,
+                count=3,
+            ),
+        ],
+    )
     now = 0.0
     kvcr._core._clock = lambda: now
 
@@ -521,27 +523,20 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert [mem_type for _, mem_type in agent.registrations] == [
         "FILE",
         "DRAM",
+        "DRAM",
     ]
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
+    assert _deposit(kvcr, first, 0).success
 
-    assert _deposit(
-        kvcr,
-        second,
-        ctypes.addressof(primary) + page_size,
-        page_size,
-    ).success
+    assert _deposit(kvcr, second, 1).success
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
     assert kvcr._core._block_record_map[first].local_dram is None
-    local_deliver = kvcr.deliver(
-        {second: [_mem_descriptor(ctypes.addressof(destination), page_size)]}
-    )
+    destination.raw = b"\0" * len(destination)
+    local_deliver = kvcr.deliver({second: [_mem_descriptor(2)]})
     assert dict(_poll_until(kvcr, bool))[local_deliver][second].success
     now = 1.0
-    deliver = kvcr.deliver(
-        {first: [_mem_descriptor(ctypes.addressof(destination), page_size)]}
-    )
+    deliver = kvcr.deliver({first: [_mem_descriptor(2)]})
     assert dict(_poll_until(kvcr, bool))[deliver][first].success
-    assert destination.raw == b"a" * page_size
+    assert destination.raw == b"\0" * (2 * page_size) + b"a" * page_size
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     now = 2.0
@@ -549,11 +544,8 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
         kvcr.fetch((first,), expected_layout=["", ""])
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, bool))[fetch][first]
-    assert fetch_result.success and fetch_result.descriptors is not None
-    assert (
-        ctypes.string_at(fetch_result.descriptors[0].addr, page_size)
-        == b"a" * page_size
-    )
+    assert fetch_result.success and fetch_result.release_handle is not None
+    assert local.raw == b"a" * page_size
     record = kvcr._core._block_record_map[first]
     assert record.local_dram is not None and record.g3 is not None
     assert [
@@ -612,15 +604,11 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         control=control,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        framework_regions=[_buffer_region(primary, page_size)],
     )
 
     for index, key in enumerate(residents):
-        assert _deposit(
-            kvcr,
-            key,
-            ctypes.addressof(primary) + index * page_size,
-            page_size,
-        ).success
+        assert _deposit(kvcr, key, index).success
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = kvcr.fetch(remotes, request_id="req")
 
@@ -666,15 +654,15 @@ def test_waiting_g3_fetch_source_is_not_evicted(tmp_path) -> None:
         BlockKey(b"third"),
         BlockKey(b"fourth"),
     )
-    kvcr = _new_g3_kvcr(tmp_path, local, slot_count=2)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        slot_count=2,
+        framework_regions=[_buffer_region(primary, page_size)],
+    )
 
     for index, key in enumerate((first, second, third, fourth)):
-        assert _deposit(
-            kvcr,
-            key,
-            ctypes.addressof(primary) + index * page_size,
-            page_size,
-        ).success
+        assert _deposit(kvcr, key, index).success
     assert kvcr.query((first, second)) == [
         (QueryStatus.FETCHABLE, CacheTier.G3),
         (QueryStatus.FETCHABLE, CacheTier.G3),
@@ -726,15 +714,11 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         agent=agent,
         slot_count=2,
         g3_slot_count=4,
+        framework_regions=[_buffer_region(primary, page_size)],
     )
 
     for index, key in enumerate((first, second, third, fourth)):
-        assert _deposit(
-            kvcr,
-            key,
-            ctypes.addressof(primary) + index * page_size,
-            page_size,
-        ).success
+        assert _deposit(kvcr, key, index).success
     fetch = kvcr.fetch((first, second))
     assert (
         len([op for op in kvcr._core._g3._active.values() if op.kind == "store"]) == 1
@@ -766,15 +750,17 @@ def test_failed_g3_spill_recovers_by_dropping_source(tmp_path, caplog) -> None:
     first, second = BlockKey(b"first"), BlockKey(b"second")
     agent = _FakeG3Agent()
     policy = _MoveLocalToG3Policy()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy, telemetry=True)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        policy=policy,
+        telemetry=True,
+        framework_regions=[_buffer_region(primary, page_size)],
+    )
 
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
-    assert _deposit(
-        kvcr,
-        second,
-        ctypes.addressof(primary) + page_size,
-        page_size,
-    ).success
+    assert _deposit(kvcr, first, 0).success
+    assert _deposit(kvcr, second, 1).success
     agent._fail_file_writes = True
 
     fetch = kvcr.fetch((first,))
@@ -804,17 +790,18 @@ def test_full_g3_does_not_hide_a_synchronously_freed_local_slot(tmp_path) -> Non
     primary = ctypes.create_string_buffer(3 * page_size)
     local = ctypes.create_string_buffer(page_size)
     policy = _MoveLocalToG3Policy()
-    kvcr = _new_g3_kvcr(tmp_path, local, policy=policy, g3_slot_count=1)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        policy=policy,
+        g3_slot_count=1,
+        framework_regions=[_buffer_region(primary, page_size)],
+    )
     first, second, third = (BlockKey(bytes((index,))) for index in range(3))
 
     for index, key in enumerate((first, second, third)):
         policy.keep_g3 = index == 2
-        assert _deposit(
-            kvcr,
-            key,
-            ctypes.addressof(primary) + index * page_size,
-            page_size,
-        ).success
+        assert _deposit(kvcr, key, index).success
 
     assert kvcr.query((first, second, third)) == [
         (QueryStatus.FETCHABLE, CacheTier.G3),
@@ -828,12 +815,12 @@ def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:
     primary = ctypes.create_string_buffer(page_size * 2)
     local = ctypes.create_string_buffer(page_size)
     first, second = BlockKey(b"first"), BlockKey(b"second")
-    kvcr = _new_g3_kvcr(tmp_path, local)
-
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
-    deposit = kvcr.deposit(
-        {second: [_mem_descriptor(ctypes.addressof(primary) + page_size, page_size)]}
+    kvcr = _new_g3_kvcr(
+        tmp_path, local, framework_regions=[_buffer_region(primary, page_size)]
     )
+
+    assert _deposit(kvcr, first, 0).success
+    deposit = kvcr.deposit({second: [_mem_descriptor(1)]})
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, lambda done: bool(done)))[fetch][first]
     assert fetch_result.success and fetch_result.release_handle is not None
@@ -892,16 +879,18 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     third, other_key = BlockKey(b"third"), BlockKey(b"other")
     agent = _StuckReadAgent()
     policy = _MoveLocalToG3Policy()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent, policy=policy, slot_count=2)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        policy=policy,
+        slot_count=2,
+        framework_regions=[_buffer_region(primary, page_size)],
+    )
 
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
-    assert _deposit(
-        kvcr,
-        second,
-        ctypes.addressof(primary) + page_size,
-        page_size,
-    ).success
-    assert _deposit(kvcr, third, ctypes.addressof(primary), page_size).success
+    assert _deposit(kvcr, first, 0).success
+    assert _deposit(kvcr, second, 1).success
+    assert _deposit(kvcr, third, 0).success
     _poll_until(kvcr, lambda _: kvcr._core._block_record_map[first].g3 is not None)
     policy.move = False  # later evictions drop instead of spilling
 
@@ -928,9 +917,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     assert retry not in dict(kvcr.poll_completed())
     # An unrelated spill must not fail this retry or be blocked behind it.
     policy.move = True
-    other = kvcr.deposit(
-        {other_key: [_mem_descriptor(ctypes.addressof(primary), page_size)]}
-    )
+    other = kvcr.deposit({other_key: [_mem_descriptor(0)]})
     completed = dict(_poll_until(kvcr, lambda done: other in dict(done)))
     agent.stuck = False
     assert set(completed) == {other}
@@ -938,40 +925,36 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     retry_result = dict(_poll_until(kvcr, lambda done: retry in dict(done)))[retry][
         first
     ]
-    assert retry_result.success and retry_result.descriptors is not None
-    assert (
-        ctypes.string_at(retry_result.descriptors[0].addr, page_size)
-        == b"a" * page_size
-    )
+    assert retry_result.success and retry_result.release_handle is not None
+    assert local.raw == b"a" * len(local)
 
 
-def test_g3_deliver_rejects_a_destination_that_is_not_slot_sized(
+def test_g3_deliver_rejects_an_out_of_bounds_destination(
     tmp_path,
 ) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 2)
     local = ctypes.create_string_buffer(page_size)
-    destination = ctypes.create_string_buffer(page_size)
     first, second = BlockKey(b"first"), BlockKey(b"second")
     agent = _FakeG3Agent()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        framework_regions=[
+            _buffer_region(primary, page_size),
+        ],
+    )
 
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
-    assert _deposit(
-        kvcr,
-        second,
-        ctypes.addressof(primary) + page_size,
-        page_size,
-    ).success
+    assert _deposit(kvcr, first, 0).success
+    assert _deposit(kvcr, second, 1).success
     _poll_until(kvcr, lambda _: kvcr._core._block_record_map[first].g3 is not None)
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     reads = [operation for operation, *_ in agent.xfers if operation == "READ"]
-    with pytest.raises(ValueError, match="wrong byte count"):
-        kvcr.deliver(
-            {first: [_mem_descriptor(ctypes.addressof(destination), page_size // 2)]}
-        )
-    # The undersized destination must never reach NIXL as a whole-slot read.
+    with pytest.raises(ValueError, match="element_index"):
+        kvcr.deliver({first: [_mem_descriptor(2)]})
+    # An out-of-bounds destination must never reach NIXL as a whole-slot read.
     assert [operation for operation, *_ in agent.xfers if operation == "READ"] == reads
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
@@ -996,12 +979,15 @@ def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
     primary = ctypes.create_string_buffer(page_size * 2)
     local = ctypes.create_string_buffer(page_size)
     first, second = BlockKey(b"first"), BlockKey(b"second")
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=_StuckWriteAgent())
-
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
-    kvcr.deposit(
-        {second: [_mem_descriptor(ctypes.addressof(primary) + page_size, page_size)]}
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=_StuckWriteAgent(),
+        framework_regions=[_buffer_region(primary, page_size)],
     )
+
+    assert _deposit(kvcr, first, 0).success
+    kvcr.deposit({second: [_mem_descriptor(1)]})
     local_dram = kvcr._core._local_dram
     _poll_until(kvcr, lambda _: local_dram._capacity_eviction_key == first)
 
@@ -1017,15 +1003,15 @@ def test_waiting_g3_fetch_obeys_original_deadline(tmp_path) -> None:
     local = ctypes.create_string_buffer(page_size)
     first, second = BlockKey(b"first"), BlockKey(b"second")
     agent = _FakeG3Agent()
-    kvcr = _new_g3_kvcr(tmp_path, local, agent=agent)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        framework_regions=[_buffer_region(primary, page_size)],
+    )
 
-    assert _deposit(kvcr, first, ctypes.addressof(primary), page_size).success
-    assert _deposit(
-        kvcr,
-        second,
-        ctypes.addressof(primary) + page_size,
-        page_size,
-    ).success
+    assert _deposit(kvcr, first, 0).success
+    assert _deposit(kvcr, second, 1).success
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
     agent.state = "PROC"

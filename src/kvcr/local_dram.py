@@ -12,11 +12,10 @@ from typing import TYPE_CHECKING, cast
 
 from .config import LocalDramOptions
 from .policy_runtime import _EvictionQueue
-from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
+from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _TransferRef
 from .types import (
     BlockKey,
     CacheTier,
-    MemDescriptor,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
@@ -65,7 +64,7 @@ class _PendingResidencyOp(_Op):
 @dataclass
 class _PendingDeliverOp(_Op):
     deadline: float
-    destinations: Mapping[BlockKey, list[MemDescriptor]]
+    destinations: Mapping[BlockKey, list[_TransferRef]]
     results: dict[BlockKey, OpEntryResult] = field(default_factory=dict)
     active_keys: set[BlockKey] = field(default_factory=set)
 
@@ -74,7 +73,7 @@ class _PendingDeliverOp(_Op):
 class _CapacityWaiter:
     op: _PendingResidencyOp
     key: BlockKey
-    source: list[MemDescriptor] | CacheTier
+    source: list[_TransferRef] | CacheTier
     layout: list[str]
 
 
@@ -83,8 +82,8 @@ class _LocalCopyOp(_ProgressOp):
     deliver_op_id: _OpId | None
     ordered_keys: tuple[BlockKey, ...]
     local_slots: tuple[tuple[tuple[str, int], ...], ...]
-    src_descriptors: tuple[MemDescriptor, ...]
-    dst_descriptors: tuple[MemDescriptor, ...]
+    src_descriptors: tuple[_TransferRef, ...]
+    dst_descriptors: tuple[_TransferRef, ...]
     deadline: float
     backend: str
     clock: _Clock = field(repr=False, compare=False)
@@ -271,7 +270,7 @@ class _LocalDram:
     def deposit(
         self,
         op_handle: OpHandle,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
         *,
         no_evict: bool,
         hints: object | None,
@@ -293,8 +292,8 @@ class _LocalDram:
 
         copy_keys: list[BlockKey] = []
         slots: list[tuple[tuple[str, int], ...]] = []
-        src_descriptors: list[MemDescriptor] = []
-        dst_descriptors: list[MemDescriptor] = []
+        src_descriptors: list[_TransferRef] = []
+        dst_descriptors: list[_TransferRef] = []
         evicted: list[BlockKey] = []
         for key, sources in blocks.items():
             record = self._kvcr._block_record(key)
@@ -304,16 +303,14 @@ class _LocalDram:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 elif residency.state is _LocalDramState.READY:
                     op.results[key] = (
-                        self._new_public_claim(
-                            key, residency, include_descriptors=False
-                        )
+                        self._new_public_claim(key, residency)
                         if no_evict
                         else OpEntryResult(OpEntryStatus.SUCCESS)
                     )
                 elif residency.state is _LocalDramState.DISCARDING:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 continue
-            size_bytes = sum(source.size for source in sources)
+            size_bytes = self._kvcr._descriptor_bytes(sources)
             decision = self._kvcr._policy.decide_ingest(
                 self._kvcr._block_meta(key, record, size_bytes),
                 CacheTier.FW_G2,
@@ -374,7 +371,7 @@ class _LocalDram:
         *,
         hints: object | None,
         layout: list[str],
-    ) -> dict[BlockKey, list[MemDescriptor]]:
+    ) -> dict[BlockKey, list[_TransferRef]]:
         ordered_keys = tuple(dict.fromkeys(keys))
         key_set = set(ordered_keys)
         if not key_set:
@@ -403,9 +400,7 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.READY:
                 self._kvcr._record_access((key,))
-                op.results[key] = self._new_public_claim(
-                    key, residency, include_descriptors=True
-                )
+                op.results[key] = self._new_public_claim(key, residency)
             elif residency.state is _LocalDramState.DISCARDING:
                 # A discarded fill still owns its slot, so this block cannot be
                 # reserved yet. Wait for the slot instead of failing a key a
@@ -450,7 +445,7 @@ class _LocalDram:
     def deliver(
         self,
         op_handle: OpHandle,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
         *,
         deadline: float,
     ) -> None:
@@ -479,8 +474,8 @@ class _LocalDram:
 
     def acquire_sources(
         self, keys: Collection[BlockKey], *, notify_capacity: bool = True
-    ) -> dict[BlockKey, list[MemDescriptor]]:
-        sources: dict[BlockKey, list[MemDescriptor]] = {}
+    ) -> dict[BlockKey, list[_TransferRef]]:
+        sources: dict[BlockKey, list[_TransferRef]] = {}
         for key in keys:
             if key in sources:
                 continue
@@ -586,7 +581,7 @@ class _LocalDram:
         return unhandled
 
     def _finish_copy(self, copy: _LocalCopyOp) -> None:
-        byte_count = sum(descriptor.size for descriptor in copy.src_descriptors)
+        byte_count = self._kvcr._descriptor_bytes(copy.src_descriptors)
         self._kvcr._record_transfer(
             "local_deliver" if copy.deliver_op_id is not None else "local_fill",
             copy.started_at,
@@ -665,11 +660,7 @@ class _LocalDram:
                         if residency_op.op_id[0] == "fetch":
                             self._kvcr._record_access((key,))
                         residency_op.results[key] = (
-                            self._new_public_claim(
-                                key,
-                                residency,
-                                include_descriptors=residency_op.op_id[0] == "fetch",
-                            )
+                            self._new_public_claim(key, residency)
                             if residency_op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
@@ -714,10 +705,10 @@ class _LocalDram:
         deadline: float,
         framework_hints: object | None = None,
         layout: list[str],
-    ) -> tuple[dict[BlockKey, list[MemDescriptor]], set[BlockKey]]:
+    ) -> tuple[dict[BlockKey, list[_TransferRef]], set[BlockKey]]:
         keys = tuple(dict.fromkeys(keys))
         protected = set(keys)
-        destinations: dict[BlockKey, list[MemDescriptor]] = {}
+        destinations: dict[BlockKey, list[_TransferRef]] = {}
         eviction_pending: set[BlockKey] = set()
         evicted: list[BlockKey] = []
         size_bytes = sum(self._pools[name][2] for name in layout)
@@ -756,8 +747,8 @@ class _LocalDram:
     ) -> None:
         copy_keys: list[BlockKey] = []
         local_slots: list[tuple[tuple[str, int], ...]] = []
-        src_descriptors: list[MemDescriptor] = []
-        dst_descriptors: list[MemDescriptor] = []
+        src_descriptors: list[_TransferRef] = []
+        dst_descriptors: list[_TransferRef] = []
         now = self._kvcr._clock()
         for key in keys:
             if key in op.results or key in op.active_keys:
@@ -880,7 +871,7 @@ class _LocalDram:
         self,
         op: _PendingResidencyOp,
         key: BlockKey,
-        source: list[MemDescriptor] | CacheTier,
+        source: list[_TransferRef] | CacheTier,
         layout: list[str],
     ) -> None:
         if key in op.capacity_waiters:
@@ -926,11 +917,7 @@ class _LocalDram:
                         op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
                     elif residency.state is _LocalDramState.READY:
                         op.results[waiter.key] = (
-                            self._new_public_claim(
-                                waiter.key,
-                                residency,
-                                include_descriptors=op.op_id[0] == "fetch",
-                            )
+                            self._new_public_claim(waiter.key, residency)
                             if op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
@@ -991,18 +978,12 @@ class _LocalDram:
         self,
         key: BlockKey,
         residency: _LocalDramResidency,
-        *,
-        include_descriptors: bool,
     ) -> OpEntryResult:
         self._acquire_claim(key, residency)
         handle = ReleaseHandle(self._next_release_handle)
         self._next_release_handle += 1
         self._public_claims[handle] = (key, residency)
-        return OpEntryResult(
-            OpEntryStatus.SUCCESS,
-            self._descriptors(residency.slots) if include_descriptors else None,
-            handle,
-        )
+        return OpEntryResult(OpEntryStatus.SUCCESS, handle)
 
     def _acquire_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         if residency.state is not _LocalDramState.READY:
@@ -1151,18 +1132,15 @@ class _LocalDram:
 
     def _descriptors(
         self, locations: Collection[tuple[str, int]]
-    ) -> list[MemDescriptor]:
+    ) -> list[_TransferRef]:
         return [self._descriptor(pool_name, slot) for pool_name, slot in locations]
 
-    def _descriptor(self, pool_name: str, slot: int) -> MemDescriptor:
-        address, _, slot_size = self._pools[pool_name]
-        return MemDescriptor(
-            end_point_name=self._kvcr.nixl_agent_name,
-            mem_type="DRAM",
-            addr=address + slot * slot_size,
-            size=slot_size,
-            device_Id=0,
-            info=pool_name,
+    def _descriptor(self, pool_name: str, slot: int) -> _TransferRef:
+        return _TransferRef(
+            self._kvcr.nixl_agent_name,
+            slot,
+            pool_name,
+            framework=False,
         )
 
     def _free(self, locations: Collection[tuple[str, int]]) -> None:

@@ -4,12 +4,14 @@
 import logging
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from kvcr import progress as progress_module
-from kvcr.progress import _KVCRProgress, _ProgressOp
-from kvcr.types import MemDescriptor
+from kvcr.progress import _KVCRProgress, _ProgressOp, _TransferRef
+from kvcr.types import MemDescriptor, RegionDescriptor
 
 
 class _TransferAgent:
@@ -23,7 +25,50 @@ class _TransferAgent:
         self.check_exception = False
         self.events: list[str] = []
         self.deregistered: list[int] = []
+        self.prepared: set[str] = set()
+        self.prep_calls: list[tuple[str, str, list[list[int]]]] = []
+        self.make_calls: list[tuple[str, list[int], str, list[int]]] = []
+        self.prep_failure: str | None = None
+        self.dlist_release_failures = 0
         self._next = 0
+
+    def prep_xfer_dlist(self, agent_name, descriptors, *, mem_type, backends):
+        assert isinstance(descriptors, np.ndarray)
+        assert descriptors.dtype == np.uint64
+        assert descriptors.flags.c_contiguous and descriptors.shape[1] == 5
+        if mem_type == self.prep_failure:
+            raise RuntimeError("preparation failed")
+        call = (agent_name, mem_type, descriptors.tolist())
+        self.prep_calls.append(call)
+        handle = f"dlist-{len(self.prep_calls)}"
+        self.prepared.add(handle)
+        return handle
+
+    def make_prepped_xfer(
+        self,
+        operation,
+        local_handle,
+        local_indices,
+        remote_handle,
+        remote_indices,
+        *,
+        notif_msg,
+        backends,
+    ):
+        self.make_calls.append(
+            (local_handle, local_indices, remote_handle, remote_indices)
+        )
+
+        self._next += 1
+        self.events.append(f"make:{operation}:{backends}:{notif_msg!r}")
+        return self._next
+
+    def release_dlist_handle(self, handle):
+        self.events.append(f"release-dlist:{handle}")
+        if self.dlist_release_failures:
+            self.dlist_release_failures -= 1
+            return False
+        self.prepared.remove(handle)
 
     def get_xfer_descs(
         self, descriptors: list[tuple[int, int, int]], mem_type: str
@@ -80,27 +125,35 @@ class _TransferAgent:
         return True
 
     def deregister_memory(self, handle: int) -> None:
+        assert not self.prepared
         self.deregistered.append(handle)
 
 
 def _mem(
-    address: int,
-    *,
-    size: int = 128,
-    mem_type: str = "DRAM",
-    device_id: int = 0,
-) -> MemDescriptor:
-    return MemDescriptor("transfer-test", mem_type, address, size, device_id, "")
+    element_index: int, *, owner="transfer-test", info="", framework=True
+) -> _TransferRef:
+    return _TransferRef(owner, element_index, info, framework)
 
 
-def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
+def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRProgress:
     progress = _KVCRProgress(
         lambda _: None,
         lambda _, __: ({}, False),
         list,
         lambda: None,
+        nixl_agent_name=agent.name,
     )
     progress._nixl_agent = agent
+    if prepare:
+        regions = (
+            {
+                "": RegionDescriptor(addr=128, size=128, count=4),
+                "small": RegionDescriptor(addr=256, size=64, info="small"),
+            },
+            {},
+        )
+        for name in ("", agent.name, "remote-agent"):
+            progress.prepare_memory(name, regions)
     return progress
 
 
@@ -123,31 +176,38 @@ def test_prepare_registers_memory_before_backend_activation(
         ),
     )
     events: list[str] = []
+    agent = _TransferAgent()
+    agent.register_memory = Mock(
+        side_effect=lambda *args, **kwargs: events.append("register") or 1
+    )
 
     progress = _KVCRProgress(
         lambda _: events.append("initialize"),
         lambda _, __: ({}, False),
         list,
         lambda: events.append("close"),
+        nixl_agent_name=agent.name,
+        memory_regions=({}, {"": RegionDescriptor(addr=128, size=128, count=4)}),
     )
-    for method, event in (
-        ("_register_memory_regions", "register"),
-        ("_capture_agent_metadata", "metadata"),
-        ("_close_nixl", "deregister"),
-    ):
-        monkeypatch.setattr(progress, method, lambda event=event: events.append(event))
+    progress._nixl_agent = agent
+    monkeypatch.setattr(
+        progress, "_capture_agent_metadata", lambda: events.append("metadata")
+    )
 
     progress.prepare()
     assert events == ["register"]
+    assert set(progress._prepared) == {"", agent.name}
 
     if activate:
         progress.start()
     progress.close()
     assert events == (
-        ["register", "initialize", "metadata", "close", "deregister"]
+        ["register", "initialize", "metadata", "close"]
         if activate
-        else ["register", "close", "deregister"]
+        else ["register", "close"]
     )
+    assert agent.deregistered == [1]
+    assert progress.is_quiescent()
     # Stages are tracked either way; only DEBUG reads clocks and logs them.
     assert progress._startup_stage == "cleanup"
     stages = [m for m in caplog.messages if "progress_startup_stage " in m]
@@ -193,15 +253,15 @@ def test_progress_submits_and_completes_transfer(
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
-        remote_side_agent=b"remote-agent",
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
+        remote_side_agent="remote-agent",
         notif_msg=b"done",
         capture_telemetry=True,
     )
 
     assert submitted
-    assert "initialize:WRITE:DRAM:DRAM:b'remote-agent':[]:b'done'" in agent.events
+    assert "make:WRITE:[]:b'done'" in agent.events
     result = progress.poll_transfer(transfer_id)
     assert result is not None
     success, telemetry_result = result
@@ -222,9 +282,9 @@ def test_progress_retries_release_while_operation_is_active() -> None:
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "READ",
-        (_mem(128),),
-        (_mem(256),),
-        remote_side_agent=b"remote-agent",
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
+        remote_side_agent="remote-agent",
     )
 
     assert not submitted
@@ -243,9 +303,9 @@ def test_progress_reports_rejected_transfer_submission() -> None:
     progress = _transfer_progress(agent)
     transfer_id, submitted = progress.submit_transfer(
         "READ",
-        (_mem(128),),
-        (_mem(256),),
-        remote_side_agent=b"remote-agent",
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
+        remote_side_agent="remote-agent",
     )
 
     assert not submitted
@@ -261,9 +321,9 @@ def test_progress_treats_poll_exception_as_terminal_failure() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
-        remote_side_agent=b"remote-agent",
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
+        remote_side_agent="remote-agent",
     )
 
     result = progress.poll_transfer(transfer_id)
@@ -279,9 +339,9 @@ def test_progress_cancel_retains_transfer_until_release_succeeds() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
-        remote_side_agent=b"remote-agent",
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
+        remote_side_agent="remote-agent",
     )
 
     assert not progress.cancel_transfer(transfer_id)
@@ -295,8 +355,8 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "READ",
-        (_mem(128),),
-        (_mem(0, mem_type="FILE", device_id=7),),
+        (MemDescriptor(agent.name, "DRAM", 128, 128, 0),),
+        (MemDescriptor(agent.name, "FILE", 0, 128, 7),),
         remote_side_agent=agent.name,
         backend="MOCK",
     )
@@ -311,42 +371,165 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
 @pytest.mark.parametrize(
     ("local", "remote", "remote_agent", "message"),
     [
+        ((), (_mem(0, owner="remote-agent"),), "remote-agent", "non-empty"),
+        ((_mem(0),), (_mem(0),), "", "remote-side agent"),
+        ((_mem(0, info="missing"),), (_mem(0),), "remote-agent", None),
+        ((_mem(0, framework=1),), (_mem(0),), "remote-agent", "framework"),
         (
-            (_mem(128), _mem(256, mem_type="VRAM")),
-            (_mem(384), _mem(512)),
-            b"remote-agent",
-            "cannot mix memory types",
+            (MemDescriptor("transfer-test", "DRAM", 128, 128, 0),),
+            (_mem(0),),
+            "remote-agent",
+            "_TransferRef",
         ),
-        ((), (_mem(256),), b"remote-agent", "non-empty"),
-        ((_mem(128),), (_mem(256),), "", "remote-side agent"),
+        ((_mem(0),), (_mem(0),), "remote-agent", "owning agent"),
     ],
 )
 def test_progress_rejects_invalid_transfer(
     local, remote, remote_agent, message
 ) -> None:
-    progress = _transfer_progress(_TransferAgent())
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
 
     with pytest.raises(ValueError, match=message):
         progress.submit_transfer("WRITE", local, remote, remote_side_agent=remote_agent)
+
+    assert not agent.make_calls
+    assert not agent.events
+    assert not progress._active_transfers
 
 
 @pytest.mark.parametrize(
     ("local", "remote"),
     [
-        ((_mem(128),), (_mem(256, size=64),)),
-        ((_mem(128), _mem(256)), (_mem(384),)),
+        ((_mem(0),), (_mem(0, info="small", owner="remote-agent"),)),
+        ((_mem(0), _mem(1)), (_mem(2, owner="remote-agent"),)),
     ],
     ids=["size", "count"],
 )
 def test_progress_delegates_descriptor_alignment_to_nixl(local, remote) -> None:
-    progress = _transfer_progress(_TransferAgent())
+    agent = _TransferAgent()
+    agent.make_prepped_xfer = Mock(side_effect=RuntimeError("NIXL rejected unaligned"))
+    progress = _transfer_progress(agent)
 
     with pytest.raises(RuntimeError, match="NIXL rejected unaligned"):
         progress.submit_transfer(
-            "WRITE", local, remote, remote_side_agent=b"remote-agent"
+            "WRITE", local, remote, remote_side_agent="remote-agent"
         )
 
+    agent.make_prepped_xfer.assert_called_once()
     assert progress._active_transfers == {}
+
+
+def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent, prepare=False)
+    regions = (
+        {
+            "gpu": RegionDescriptor(
+                addr=5000,
+                size=16,
+                mem_type="VRAM",
+                device_Id=3,
+                info="gpu",
+                stride=32,
+                count=8,
+            ),
+            "pool": RegionDescriptor(
+                addr=1000, size=16, info="pool", stride=64, count=3
+            ),
+            "keys": RegionDescriptor(
+                addr=2000, size=16, info="keys", stride=32, count=2
+            ),
+        },
+        {"pool": RegionDescriptor(addr=3000, size=16, info="pool", count=4)},
+    )
+    progress.prepare_memory("", regions)
+    progress.prepare_memory(
+        "native-peer",
+        (dict(reversed(regions[0].items())), regions[1]),
+        owner_name="remote-agent",
+    )
+    with pytest.raises(RuntimeError, match="already initialized"):
+        progress.prepare_memory("native-peer", ({}, {}))
+    local = (
+        _mem(1, info="keys"),
+        _mem(2, info="pool"),
+        _mem(3, info="pool", framework=False),
+        _mem(1, info="keys"),
+    )
+    remote = (
+        _mem(1, owner="remote-agent", info="pool", framework=False),
+        _mem(0, owner="remote-agent", info="keys"),
+        _mem(1, owner="remote-agent", info="pool"),
+        _mem(0, owner="remote-agent", info="keys"),
+    )
+    for _ in range(2):
+        transfer_id, submitted = progress.submit_transfer(
+            "WRITE", local, remote, remote_side_agent="native-peer", backend="UCX"
+        )
+        assert submitted
+        progress.poll_transfer(transfer_id)
+    with pytest.raises(ValueError, match="cannot mix memory types"):
+        progress.submit_transfer(
+            "WRITE",
+            (local[0], _mem(0, info="gpu")),
+            remote[:2],
+            remote_side_agent="native-peer",
+        )
+    with pytest.raises(ValueError):
+        progress.submit_transfer(
+            "WRITE",
+            (_mem(0, info="gpu", framework=False),),
+            remote[:1],
+            remote_side_agent="native-peer",
+        )
+    assert agent.prep_calls == [
+        ("", "VRAM", [[5000, 16, 3, 32, 8]]),
+        (
+            "",
+            "DRAM",
+            [[1000, 16, 0, 64, 3], [2000, 16, 0, 32, 2], [3000, 16, 0, 16, 4]],
+        ),
+        (
+            "native-peer",
+            "DRAM",
+            [[2000, 16, 0, 32, 2], [1000, 16, 0, 64, 3], [3000, 16, 0, 16, 4]],
+        ),
+        ("native-peer", "VRAM", [[5000, 16, 3, 32, 8]]),
+    ]
+    assert agent.make_calls == [
+        ("dlist-2", [4, 2, 8, 4], "dlist-3", [6, 0, 3, 0]),
+        ("dlist-2", [4, 2, 8, 4], "dlist-3", [6, 0, 3, 0]),
+    ]
+    assert agent.events.count("make:WRITE:['UCX']:b''") == 2
+
+
+@pytest.mark.parametrize("release_failures", [0, 2])
+def test_progress_preparation_failure_is_fatal(release_failures) -> None:
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent, prepare=False)
+    progress._memory_regions = (
+        {"": RegionDescriptor(addr=128, size=128)},
+        {"gpu": RegionDescriptor(addr=256, size=128, mem_type="VRAM", info="gpu")},
+    )
+    agent.register_memory = Mock(side_effect=[7, 8])
+    agent.prep_failure = "VRAM"
+    agent.dlist_release_failures = release_failures
+
+    with pytest.raises(RuntimeError, match="prepar"):
+        progress.start()
+    with pytest.raises(RuntimeError, match="prepar"):
+        progress.close()
+
+    assert bool(agent.prepared) == bool(release_failures)
+    if release_failures:
+        assert agent.deregistered == []
+        assert progress.nixl_agent is agent
+        assert not progress.is_quiescent()
+        progress._close_nixl()
+    assert not agent.prepared
+    assert agent.deregistered == [8, 7]
+    assert progress.is_quiescent()
 
 
 def test_progress_close_retries_operations_until_they_release() -> None:
@@ -376,11 +559,11 @@ def test_progress_close_retries_operations_until_they_release() -> None:
 
 @pytest.mark.parametrize(
     "attribute",
-    ["_active_transfers", "_in_flight_ops", "_memory_registrations"],
+    ["_active_transfers", "_in_flight_ops", "_memory_registrations", "_prepared"],
 )
 def test_progress_quiescence_tracks_native_state(attribute: str) -> None:
     """Quiescence requires every native-state container to be empty."""
-    progress = _transfer_progress(_TransferAgent())
+    progress = _transfer_progress(_TransferAgent(), prepare=False)
     held = getattr(progress, attribute)
     if isinstance(held, dict):
         held[0] = object()
@@ -422,16 +605,21 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
     progress._memory_registrations.append(7)
     transfer_id, _ = progress.submit_transfer(
         "WRITE",
-        (_mem(128),),
-        (_mem(256),),
-        remote_side_agent=b"remote-agent",
+        (_mem(0),),
+        (_mem(1, owner="remote-agent"),),
+        remote_side_agent="remote-agent",
     )
+    agent.release_failures = 1
+    assert progress.poll_transfer(transfer_id) is None
 
     with pytest.raises(RuntimeError, match="active transfers"):
         progress._close_nixl()
+    with pytest.raises(RuntimeError, match="active transfers"):
+        progress.release_prepared("remote-agent")
 
     assert progress.nixl_agent is agent
     assert agent.deregistered == []
+    assert len(agent.prepared) == 3
     assert progress.cancel_transfer(transfer_id)
 
     progress._close_nixl()

@@ -11,8 +11,11 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from itertools import chain
+from typing import Annotated, Any
 
+import msgspec
+import numpy as np
 from nixl import nixl_agent, nixl_agent_config
 
 from .types import BlockKey, MemDescriptor, RegionDescriptor
@@ -25,6 +28,41 @@ _STARTUP_TIMEOUT_SECONDS = 30.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
+_RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
+
+
+@dataclass(frozen=True)
+class _TransferRef:
+    """An element in an agent's framework or KVCR-owned registered memory."""
+
+    end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
+    element_index: Annotated[int, msgspec.Meta(ge=0)]
+    info: str = ""
+    framework: bool = True
+
+
+def _resolve_region(
+    ref: _TransferRef, regions: _RegionMaps, agent_name: str
+) -> RegionDescriptor:
+    if not isinstance(ref, _TransferRef):
+        raise ValueError("memory transfers require _TransferRef entries")
+    if ref.end_point_name != agent_name:
+        raise ValueError("memory reference has the wrong owning agent")
+    if type(ref.framework) is not bool:
+        raise ValueError("memory reference framework selector must be a bool")
+    if not isinstance(ref.info, str):
+        raise ValueError("memory reference pool name must be a string")
+    framework, kvcr = regions
+    if ref.framework:
+        region = framework.get(ref.info)
+    else:
+        region = kvcr.get(ref.info)
+    if region is None:
+        owner = "framework" if ref.framework else "KVCR"
+        raise ValueError(f"no {owner} registration for {ref.info!r}")
+    if type(ref.element_index) is not int or not 0 <= ref.element_index < region.count:
+        raise ValueError("memory reference element_index is outside its region")
+    return region
 
 
 @dataclass(slots=True)
@@ -32,6 +70,7 @@ class _TransferState:
     """Hold one progress-owned NIXL transfer handle."""
 
     handle: Any
+    remote_side_agent: str
     capture_telemetry: bool = False
     outcome: bool | None = None
     telemetry: Any | None = None
@@ -79,7 +118,7 @@ class _KVCRProgress:
         batch_size: int = 64,
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
-        memory_regions: tuple[RegionDescriptor, ...] = (),
+        memory_regions: _RegionMaps | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -94,15 +133,21 @@ class _KVCRProgress:
         self._next_transfer_id = 0
         self._nixl_listen_port = nixl_listen_port
         self._dram_backends = dram_backends
-        self._memory_regions = memory_regions
+        self._memory_regions = (
+            memory_regions if memory_regions is not None else ({}, {})
+        )
         self._memory_registrations: list[Any] = []
+        self._prepared: dict[
+            str, dict[str, tuple[Any, tuple[dict[str, int], dict[str, int]]]]
+        ] = {}
+        self._catalogs: dict[str, tuple[str, _RegionMaps]] = {}
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
         self._ready = threading.Event()
-        self._prepared = threading.Event()
+        self._prepare_ready = threading.Event()
         self._activate = threading.Event()
         self._close_requested = False
         self._thread = threading.Thread(
@@ -179,10 +224,10 @@ class _KVCRProgress:
     def submit_transfer(
         self,
         operation: str,
-        local_descriptors: Sequence[MemDescriptor],
-        remote_descriptors: Sequence[MemDescriptor],
+        local_descriptors: Sequence[_TransferRef] | Sequence[MemDescriptor],
+        remote_descriptors: Sequence[_TransferRef] | Sequence[MemDescriptor],
         *,
-        remote_side_agent: str | bytes,
+        remote_side_agent: str,
         backend: str | None = None,
         notif_msg: bytes = b"",
         capture_telemetry: bool = False,
@@ -190,22 +235,41 @@ class _KVCRProgress:
         """Submit aligned local and remote descriptors to NIXL."""
         if not local_descriptors or not remote_descriptors:
             raise ValueError("NIXL transfer descriptors must be non-empty")
-        if not isinstance(remote_side_agent, (str, bytes)) or not remote_side_agent:
+        if not isinstance(remote_side_agent, str) or not remote_side_agent:
             raise ValueError("NIXL remote-side agent must be non-empty")
         agent = self.nixl_agent
-        handle = agent.initialize_xfer(
-            operation,
-            self._make_transfer_descriptors(local_descriptors),
-            self._make_transfer_descriptors(remote_descriptors),
-            remote_side_agent,
-            notif_msg=notif_msg,
-            backends=[backend] if backend else [],
-        )
+        if any(
+            isinstance(descriptors[0], MemDescriptor)
+            and descriptors[0].mem_type == "FILE"
+            for descriptors in (local_descriptors, remote_descriptors)
+        ):
+            handle = agent.initialize_xfer(
+                operation,
+                self._make_transfer_descriptors(local_descriptors),
+                self._make_transfer_descriptors(remote_descriptors),
+                remote_side_agent,
+                notif_msg=notif_msg,
+                backends=[backend] if backend else [],
+            )
+        else:
+            local, local_indices = self._prepared_indices("", local_descriptors)
+            remote, remote_indices = self._prepared_indices(
+                remote_side_agent, remote_descriptors
+            )
+            handle = agent.make_prepped_xfer(
+                operation,
+                local,
+                local_indices,
+                remote,
+                remote_indices,
+                notif_msg=notif_msg,
+                backends=[backend] if backend else [],
+            )
         if handle is None:
-            raise RuntimeError("initialize_xfer returned None")
+            raise RuntimeError("NIXL transfer creation returned None")
         self._next_transfer_id += 1
         transfer_id = self._next_transfer_id
-        state = _TransferState(handle, capture_telemetry)
+        state = _TransferState(handle, remote_side_agent, capture_telemetry)
         self._active_transfers[transfer_id] = state
         submitted = True
         try:
@@ -243,6 +307,92 @@ class _KVCRProgress:
             mem_type=mem_type,
         )
 
+    def prepare_memory(
+        self,
+        agent_name: str,
+        regions: _RegionMaps,
+        *,
+        owner_name: str | None = None,
+    ) -> None:
+        """Initialize physical grids after registration or new metadata install."""
+        if agent_name in self._prepared:
+            raise RuntimeError("NIXL prepared memory is already initialized")
+        owner = (
+            owner_name
+            if owner_name is not None
+            else (agent_name or self.nixl_agent_name)
+        )
+        self._catalogs[agent_name] = (owner, regions)
+        by_type: dict[str, list[tuple[bool, RegionDescriptor]]] = {}
+        framework, kvcr = regions
+        for is_framework, registered in ((True, framework), (False, kvcr)):
+            for region in registered.values():
+                by_type.setdefault(region.mem_type, []).append((is_framework, region))
+        prepared = self._prepared.setdefault(agent_name, {})
+        try:
+            for mem_type, entries in by_type.items():
+                framework_offsets: dict[str, int] = {}
+                kvcr_offsets: dict[str, int] = {}
+                offset = 0
+                for is_framework, region in entries:
+                    offsets = framework_offsets if is_framework else kvcr_offsets
+                    offsets[region.info] = offset
+                    offset += region.count
+                rows = np.array(
+                    [
+                        (r.addr, r.size, r.device_Id, r.stride or r.size, r.count)
+                        for _, r in entries
+                    ],
+                    dtype=np.uint64,
+                )
+                handle = self.nixl_agent.prep_xfer_dlist(
+                    agent_name, rows, mem_type=mem_type, backends=self._dram_backends
+                )
+                if handle is None:
+                    raise RuntimeError("prep_xfer_dlist returned None")
+                prepared[mem_type] = (handle, (framework_offsets, kvcr_offsets))
+        except BaseException:
+            self.release_prepared(agent_name)
+            raise
+        if not prepared:
+            self._prepared.pop(agent_name, None)
+            self._catalogs.pop(agent_name, None)
+
+    def release_prepared(self, agent_name: str) -> None:
+        """Release a catalog only after every transfer using it has released."""
+        if any(
+            agent_name == "" or state.remote_side_agent == agent_name
+            for state in self._active_transfers.values()
+        ):
+            raise RuntimeError("cannot release prepared memory with active transfers")
+        prepared = self._prepared.get(agent_name, {})
+        for mem_type, (handle, _) in list(prepared.items()):
+            if self.nixl_agent.release_dlist_handle(handle) is False:
+                raise RuntimeError("NIXL prepared memory did not close")
+            del prepared[mem_type]
+        self._prepared.pop(agent_name, None)
+        self._catalogs.pop(agent_name, None)
+
+    def _prepared_indices(
+        self, agent_name: str, descriptors: Sequence[_TransferRef]
+    ) -> tuple[Any, list[int]]:
+        catalog = self._catalogs.get(agent_name)
+        if catalog is None:
+            raise ValueError(f"no prepared memory for agent {agent_name!r}")
+        owner, regions = catalog
+        first = _resolve_region(descriptors[0], regions, owner)
+        handle, (framework_offsets, kvcr_offsets) = self._prepared[agent_name][
+            first.mem_type
+        ]
+        indices = []
+        for ref in descriptors:
+            region = _resolve_region(ref, regions, owner)
+            if region.mem_type != first.mem_type:
+                raise ValueError("one NIXL descriptor list cannot mix memory types")
+            offsets = framework_offsets if ref.framework else kvcr_offsets
+            indices.append(offsets[region.info] + ref.element_index)
+        return handle, indices
+
     def _release_transfer(self, transfer_id: int, state: _TransferState) -> bool:
         release_xfer = getattr(self.nixl_agent, "release_xfer_handle", None)
         if release_xfer is None:
@@ -278,7 +428,7 @@ class _KVCRProgress:
     def prepare(self) -> None:
         """Create the agent and register memory without starting backends."""
         self._thread.start()
-        if not self._prepared.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+        if not self._prepare_ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
             raise RuntimeError(
                 "KVCR progress preparation timed out after "
                 f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
@@ -306,12 +456,15 @@ class _KVCRProgress:
         """Report whether nothing native can still touch backend resources.
 
         A stopped thread is not enough: teardown leaves the loop as soon as a
-        transfer or registration will not release, so all three must be empty.
+        transfer, prepared catalog or registration will not release.
         """
         if self._thread.is_alive():
             return False
         return not (
-            self._active_transfers or self._in_flight_ops or self._memory_registrations
+            self._active_transfers
+            or self._in_flight_ops
+            or self._prepared
+            or self._memory_registrations
         )
 
     def close(self) -> None:
@@ -348,7 +501,7 @@ class _KVCRProgress:
             if not self._activate.is_set():
                 self._log_startup_stage("memory registration")
                 self._register_memory_regions()
-                self._prepared.set()
+                self._prepare_ready.set()
                 self._activate.wait()
                 if self._close_requested:
                     return
@@ -361,7 +514,7 @@ class _KVCRProgress:
                 self._initialize(self)
                 self._log_startup_stage("memory registration")
                 self._register_memory_regions()
-                self._prepared.set()
+                self._prepare_ready.set()
             self._log_startup_stage("agent metadata capture")
             self._capture_agent_metadata()
             self._log_startup_stage("ready")
@@ -372,7 +525,7 @@ class _KVCRProgress:
         except BaseException as error:
             self._failure = error
         finally:
-            self._prepared.set()
+            self._prepare_ready.set()
             self._log_startup_stage("cleanup")
             try:
                 try:
@@ -466,9 +619,11 @@ class _KVCRProgress:
             )
 
     def _register_memory_regions(self) -> None:
-        if self._nixl_agent is None or not self._memory_regions:
+        if self._nixl_agent is None or not any(self._memory_regions):
             return
-        for region in self._memory_regions:
+        for region in chain.from_iterable(
+            regions.values() for regions in self._memory_regions
+        ):
             # Assume the entire extent, including stride gaps, is valid to register.
             extent = region.size + (region.count - 1) * (region.stride or region.size)
             self._memory_registrations.append(
@@ -477,6 +632,8 @@ class _KVCRProgress:
                     mem_type=region.mem_type,
                 )
             )
+        self.prepare_memory("", self._memory_regions)
+        self.prepare_memory(self.nixl_agent_name, self._memory_regions)
 
     def _capture_agent_metadata(self) -> None:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)
@@ -488,6 +645,8 @@ class _KVCRProgress:
             raise RuntimeError("cannot close NIXL with active transfers")
         if self._in_flight_ops:
             raise RuntimeError("cannot close NIXL with unresolved operations")
+        for agent_name in list(self._prepared):
+            self.release_prepared(agent_name)
         failure: BaseException | None = None
         pending_registrations: list[Any] = []
         if self._nixl_agent is not None:

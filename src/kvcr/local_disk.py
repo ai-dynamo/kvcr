@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .config import G3Options
 from .policy_runtime import _EvictionQueue
-from .progress import _KVCRProgress, _OpId, _ProgressOp
+from .progress import _KVCRProgress, _OpId, _ProgressOp, _TransferRef
 from .types import (
     BlockKey,
     BlockMeta,
@@ -305,7 +305,7 @@ class _G3:
     def start_fill(
         self,
         op_handle: OpHandle,
-        blocks: dict[BlockKey, MemDescriptor],
+        blocks: dict[BlockKey, _TransferRef],
         deadline: float,
     ) -> bool:
         return self._start_read("fill", op_handle, blocks, deadline)
@@ -313,7 +313,7 @@ class _G3:
     def start_deliver(
         self,
         op_handle: OpHandle,
-        blocks: dict[BlockKey, MemDescriptor],
+        blocks: dict[BlockKey, _TransferRef],
         deadline: float,
     ) -> bool:
         return self._start_read("deliver", op_handle, blocks, deadline)
@@ -335,7 +335,7 @@ class _G3:
     def _start_store(
         self,
         op_id: _OpId,
-        blocks: dict[BlockKey, MemDescriptor],
+        blocks: dict[BlockKey, _TransferRef],
         deadline: float,
     ) -> bool:
         reservations = self._reserve(tuple(blocks), set(blocks))
@@ -347,7 +347,10 @@ class _G3:
             keys=set(blocks),
             kind="store",
             ordered_keys=tuple(item.key for item in reservations),
-            memory_descriptors=tuple(blocks[item.key] for item in reservations),
+            memory_descriptors=tuple(
+                self._kvcr._address_descriptor(blocks[item.key])
+                for item in reservations
+            ),
             file_descriptors=tuple(
                 self._descriptor(item.slot) for item in reservations
             ),
@@ -364,19 +367,21 @@ class _G3:
         self,
         kind: Literal["fill", "deliver"],
         op_handle: OpHandle,
-        blocks: dict[BlockKey, MemDescriptor],
+        blocks: dict[BlockKey, _TransferRef],
         deadline: float,
     ) -> bool:
+        destinations = {
+            key: self._kvcr._address_descriptor(ref) for key, ref in blocks.items()
+        }
         claims, rejected = self._claim(tuple(blocks))
         # A G3 read moves one whole slot, so every destination must be
         # slot-sized. NIXL requires one memory type per destination descriptor
         # list; mixed destination types would require separate transfers, which
         # this path does not yet split. Fail the whole G3 batch before submit.
-        destinations = tuple(blocks.values())
-        mem_type = destinations[0].mem_type if destinations else ""
+        mem_type = next(iter(destinations.values())).mem_type if destinations else ""
         rejected += tuple(
             key
-            for key, destination in blocks.items()
+            for key, destination in destinations.items()
             if destination.size != self._slot_size or destination.mem_type != mem_type
         )
         if rejected or not claims:
@@ -387,7 +392,7 @@ class _G3:
             keys=set(blocks),
             kind=kind,
             ordered_keys=tuple(item.key for item in claims),
-            memory_descriptors=tuple(blocks[item.key] for item in claims),
+            memory_descriptors=tuple(destinations[item.key] for item in claims),
             file_descriptors=tuple(
                 self._descriptor(item.residency.slot) for item in claims
             ),

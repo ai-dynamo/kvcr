@@ -7,7 +7,6 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -33,14 +32,14 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
-from kvcr.progress import _STOP
+from kvcr.progress import _STOP, _TransferRef
 from kvcr.remote_fw_dram import (
     _FwMemResidency,
     _RemoteFWDram,
     _SourcePinOp,
     _SourceWriteOp,
 )
-from kvcr.types import BlockKey, PinHandle, PinRequestId
+from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
 def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
@@ -57,8 +56,8 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 def test_local_source_starts_without_caller_poll_and_holds_its_slot():
-    memory = ctypes.create_string_buffer(16)
-    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
+    descriptors = [_mem_descriptor(i, end_point_name="source") for i in range(3)]
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
     callbacks = []
     source = _new_kvcr(
@@ -71,6 +70,9 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
             capacity_low_watermark_percent=100,
         ),
         name="source",
+        framework_regions=[
+            RegionDescriptor(addr=ctypes.addressof(memory), size=16, count=3)
+        ],
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         capacity_needed_callback=lambda request: callbacks.append(
             (threading.get_ident(), request)
@@ -79,13 +81,30 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
     key = BlockKey(b"local")
     try:
         agent.state = "DONE"
-        deposit = source.deposit({key: [descriptor]})
+        deposit = source.deposit({key: descriptors})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        assert not source._core._remote_fw_dram._try_local_source_write(
+            source._core._progress,
+            SimpleNamespace(
+                ordered_keys=(key,),
+                dst_descriptors=((descriptors[2], descriptors[0]),),
+            ),
+        )
         callbacks.clear()
         agent.state = "PROC"
         request = msgspec.msgpack.decode(_start_write_message(12, key))
         request["keys"] *= 2
-        request["dst_descriptors"] *= 2
+        request.update(
+            target_regions=(
+                {
+                    "": RegionDescriptor(
+                        addr=4096, size=16, mem_type="VRAM", device_Id=7, count=3
+                    )
+                },
+                {},
+            ),
+            dst_descriptors=[[_TransferRef("target", i) for i in range(3)]] * 2,
+        )
         preparing, resume = threading.Event(), threading.Event()
         initialize_write = _SourceWriteOp.__init__
 
@@ -114,12 +133,19 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
         # The peer request must be served without another caller-side poll.
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count == 1
-        assert len(agent.xfers[-1][1]) == 2
+        assert [
+            ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+        ] == [
+            b"a" * 16,
+            b"b" * 16,
+            b"c" * 16,
+        ] * 2
+        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7), (4128, 16, 7)] * 2
         assert pinning.searches == []
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
         assert list(source.poll_completed()) == []
-        assert callbacks == [(threading.get_ident(), [("", 1)])]
+        assert callbacks == [(threading.get_ident(), [("", 3)])]
 
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == 2)
@@ -133,7 +159,7 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
 
 def test_local_source_falls_back_during_fill_publication_without_blocking_progress():
     memory = ctypes.create_string_buffer(16)
-    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
     source = _new_kvcr(
         agent,
@@ -141,6 +167,7 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
         control,
         name="source",
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
     )
     local = source._core._local_dram
     key = BlockKey(b"local")
@@ -379,21 +406,17 @@ def test_kvcr_close_cleans_pending_pin_operations():
 def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
     source_agent = FakeNixlAgent(metadata=b"source-md")
     control = FakeBytesControl()
-    _new_kvcr(source_agent, FakePrimaryPinning(), control, name="source")
-    control.incoming.append(
-        msgspec.msgpack.encode(
-            {
-                "type": "start_write",
-                "op_handle": 6,
-                "target_agent": "target",
-                "target_agent_metadata": b"target-md",
-                "keys": [BlockKey(b"k0")],
-                "dst_descriptors": [],
-            }
-        )
+    pinning = FakePrimaryPinning()
+    _new_kvcr(source_agent, pinning, control, name="source")
+    request = msgspec.msgpack.decode(
+        _start_write_message(6, BlockKey(b"k0"), target_agent="target")
     )
+    request.pop("remaining_timeout_ms")
+    control.incoming.append(msgspec.msgpack.encode(request))
     _wait_until(lambda: bool(source_agent.sent_notifs))
 
+    assert not pinning.searches
+    assert not source_agent.xfers
     assert _decode_notif(source_agent.sent_notifs[0][1]) == {
         "type": "write_done",
         "op_handle": 6,
@@ -481,7 +504,7 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
 
     assert source_agent.transfers == ([] if failure == "initialize" else [1])
     agent_name, notif = source_agent.sent_notifs[-1]
-    assert agent_name == b"remote-1"
+    assert agent_name == "remote-1"
     assert _decode_notif(notif) == {
         "type": "write_done",
         "op_handle": 5,
@@ -591,7 +614,9 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
         )
         for error in errors:
             assert error.op_handle == source_handle
-            assert error.source_blocks == {key: [_mem_descriptor(addr=0)]}
+            assert error.source_blocks == {
+                key: [kvcr._core._address_descriptor(_TransferRef("source", 0))]
+            }
             assert error.destination_regions is None
     finally:
         agent.state = "DONE"
@@ -623,7 +648,7 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
         assert (
             errors[0].source_blocks
             == errors[1].source_blocks
-            == {key: [_mem_descriptor(addr=0)]}
+            == {key: [source._core._address_descriptor(_TransferRef("source", 0))]}
         )
         for native_handle in (1, 2):
             done.add(native_handle)
@@ -642,7 +667,7 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
 def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     now = 0.0
     memory = ctypes.create_string_buffer(16)
-    descriptor = _mem_descriptor(ctypes.addressof(memory))
+    descriptor = _mem_descriptor(end_point_name="source")
     agent, control, errors = FakeNixlAgent(), FakeBytesControl(), []
     source = _new_kvcr(
         agent,
@@ -651,13 +676,16 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         name="source",
         on_resilience_event=errors.append,
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
     )
     source._core._clock = lambda: now
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
     expected_sources = {
-        key: [replace(descriptor, end_point_name="source")],
-        framework_hit: [_mem_descriptor(addr=0)],
+        key: [
+            source._core._address_descriptor(_TransferRef("source", 0, framework=False))
+        ],
+        framework_hit: [source._core._address_descriptor(_TransferRef("source", 0))],
     }
     try:
         agent.state = "DONE"
@@ -669,7 +697,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_mem_descriptor(128 + 16 * index).__dict__] for index in range(3)
+            [_TransferRef("target", index).__dict__] for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -878,9 +906,13 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     "op_handle": op_handle,
                     "remaining_timeout_ms": 1000,
                     "target_agent_metadata": b"target-md",
+                    "target_regions": (
+                        {"": RegionDescriptor(addr=128, size=16, count=1024)},
+                        {},
+                    ),
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_mem_descriptor(addr=128 + index * 16).__dict__]
+                        [_TransferRef("target", index).__dict__]
                         for index in range(len(op_keys))
                     ],
                 }
@@ -1024,8 +1056,8 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
 
     key = BlockKey(b"shared")
     borrowed = PinHandle("pinned-by-the-other-operation")
-    sources = [_mem_descriptor(info="full"), _mem_descriptor(info="swa")]
-    destinations = tuple(_mem_descriptor(info=item.info) for item in sources)
+    sources = [_TransferRef("target", i, "pool") for i in range(3)]
+    destinations = tuple(_TransferRef("target", 0, "pool") for _ in sources)
     kvcr._block_record_map[key] = _BlockRecord(
         fw_mem=_FwMemResidency(sources, borrowed)
     )
@@ -1035,7 +1067,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     waiting = _SourcePinOp(
         started_at=0.0,
         deadline=10.0,
-        remote_agent=b"peer",
+        remote_agent="peer",
         op_handle=1,
         ordered_keys=(key,),
         dst_descriptors=(destinations,),
@@ -1050,9 +1082,8 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
     submitted = kvcr._progress.submit.call_args.args[0]
     assert submitted.src_descriptors == (tuple(sources),)
     assert submitted.dst_descriptors == (destinations,)
-    assert borrowed in submitted.framework_pins, (
-        "the resumed write reads through this pin but does not hold it"
-    )
+    assert submitted.completed_indices == (0,)
+    assert submitted.framework_pins == {borrowed}
     assert backend._fw_pins_by_op[submitted.op_id] == {borrowed}
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
@@ -1062,7 +1093,14 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     """Same peer name with new metadata re-adds the NIXL route; identical
     metadata keeps reusing the cached one."""
     agent = FakeNixlAgent()
-    progress = SimpleNamespace(nixl_agent=agent)
+    progress = SimpleNamespace(
+        nixl_agent=agent,
+        prepare_memory=Mock(),
+        release_prepared=Mock(),
+        _prepared={},
+        _stop_requested=False,
+        _failure=None,
+    )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
@@ -1073,8 +1111,26 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
 
     first = _RemoteFWDram._remote_agent(tier, progress, payload)
 
+    assert first == ("worker-a", "remote-1")
     assert _RemoteFWDram._remote_agent(tier, progress, payload) == first
     assert agent.remote_agents == [b"gen-1"]
+    progress.prepare_memory.assert_called_once_with(
+        first[1], ({}, {}), owner_name="worker-a"
+    )
+    # Reject malformed replacement geometry or names before changing the route.
+    for catalog in (
+        {"": {"addr": 128, "size": 0}},
+        {"wrong-name": {"addr": 128, "size": 16}},
+    ):
+        with pytest.raises(ValueError):
+            _RemoteFWDram._remote_agent(
+                tier, progress, {**payload, "target_regions": (catalog, {})}
+            )
+    assert agent.remote_agents == [b"gen-1"]
+    progress.release_prepared.assert_not_called()
+    # Native bindings may return str directly rather than bytes.
+    add_remote_agent = agent.add_remote_agent
+    agent.add_remote_agent = lambda metadata: add_remote_agent(metadata).decode()
 
     replaced = _RemoteFWDram._remote_agent(
         tier,
@@ -1083,28 +1139,56 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     )
 
     assert agent.remote_agents == [b"gen-1", b"gen-2"]
-    assert replaced[1] != first[1]
+    assert replaced == ("worker-a", "remote-2")
+    progress.release_prepared.assert_called_once_with(first[1])
+    progress.prepare_memory.assert_called_with(
+        replaced[1], ({}, {}), owner_name="worker-a"
+    )
     # The bump is what fences queued predecessor operations off the new route.
     assert tier._route_generation == {"worker-a": 1}
+    # Geometry can change without changing the allocation metadata.
+    replaced = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        {
+            "target_agent": "worker-a",
+            "target_agent_metadata": b"gen-2",
+            "target_regions": ({"": {"addr": 128, "size": 16, "count": 2}}, {}),
+        },
+    )
+    assert tier._route_generation == {"worker-a": 2}
+    assert progress.prepare_memory.call_args.args[1][0][""].count == 2
     # A payload carrying no metadata still reuses whatever route is cached.
     named_only = {"target_agent": "worker-a"}
     assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
+    assert progress.prepare_memory.call_count == 3
 
 
-def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
-    """NIXL must drop the dead route before the name is reused -- and a route
-    it will not drop stays cached so the unload is retried, not forgotten."""
+@pytest.mark.parametrize(
+    "message_type", ["target_metadata", "start_write", "malformed"]
+)
+def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
+    message_type,
+) -> None:
+    """Cache only prepared routes; let progress handle fatal cleanup errors."""
 
     class RemovingAgent(FakeNixlAgent):
         def __init__(self) -> None:
             super().__init__()
-            self.removed: list[bytes] = []
+            self.removed: list[str] = []
 
-        def remove_remote_agent(self, handle: bytes) -> None:
+        def remove_remote_agent(self, handle: str) -> None:
             self.removed.append(handle)
 
     agent = RemovingAgent()
-    progress = SimpleNamespace(nixl_agent=agent)
+    progress = SimpleNamespace(
+        nixl_agent=agent,
+        prepare_memory=Mock(),
+        release_prepared=Mock(),
+        _prepared={},
+        _stop_requested=False,
+        _failure=None,
+    )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
@@ -1123,30 +1207,73 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
     )
     assert agent.removed == [first]
 
-    class StickyAgent(RemovingAgent):
-        def remove_remote_agent(self, handle: bytes) -> None:
-            raise RuntimeError("route busy")
-
-    sticky = StickyAgent()
-    progress = SimpleNamespace(nixl_agent=sticky)
-    tier._remote_agents_by_target = {}
-    tier._route_generation = {}
-    _, kept = _RemoteFWDram._remote_agent(
-        tier,
-        progress,
-        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+    progress.prepare_memory.side_effect = [RuntimeError("prep failed"), None]
+    payload = {"target_agent": "worker-b", "target_agent_metadata": b"gen-3"}
+    with pytest.raises(RuntimeError, match="prep failed"):
+        _RemoteFWDram._remote_agent(tier, progress, payload)
+    assert "worker-b" not in tier._remote_agents_by_target
+    assert agent.removed == [first, "remote-3"]
+    progress.release_prepared.assert_called_with("remote-3")
+    assert not progress._stop_requested
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
+        "worker-b",
+        "remote-4",
     )
-    with pytest.raises(RuntimeError, match="route busy"):
+    assert agent.remote_agents == [b"gen-1", b"gen-2", b"gen-3", b"gen-3"]
+
+    # A repeated native name still belongs to the established peer.
+    agent.add_remote_agent = lambda _: "remote-2"
+    progress.prepare_memory.reset_mock(side_effect=True)
+    progress.release_prepared.reset_mock()
+    with pytest.raises(RuntimeError, match="already initialized"):
         _RemoteFWDram._remote_agent(
             tier,
             progress,
-            {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
+            {"target_agent": "worker-c", "target_agent_metadata": b"gen-4"},
         )
-    # No bump: the route was not replaced, so queued operations stay valid.
-    assert tier._route_generation == {}
-    # Retained: matching metadata still reuses the cached route.
+    assert "worker-c" not in tier._remote_agents_by_target
+    progress.prepare_memory.assert_not_called()
+    progress.release_prepared.assert_not_called()
+    assert agent.removed == [first, "remote-3"]
     assert _RemoteFWDram._remote_agent(
-        tier,
+        tier, progress, {"target_agent": "worker-a"}
+    ) == ("worker-a", "remote-2")
+
+    class StickyAgent(RemovingAgent):
+        def remove_remote_agent(self, handle: str) -> None:
+            raise RuntimeError("route busy")
+
+    sticky = StickyAgent()
+    control = FakeBytesControl()
+    source = _new_kvcr(sticky, FakePrimaryPinning(), control, name="source")
+    progress = source._core._progress
+    tier = source._core._remote_fw_dram
+    tier._remote_agent(
         progress,
         {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
-    ) == ("worker-a", kept)
+    )
+    payload = msgspec.msgpack.decode(
+        _start_write_message(1, b"key", target_agent="worker-a")
+    )
+    payload["target_agent_metadata"] = b"gen-2"
+    if message_type == "target_metadata":
+        payload["type"] = message_type
+        handler = tier._handle_target_metadata
+    else:
+        handler = tier._handle_start_write
+        if message_type == "malformed":
+            del payload["keys"]
+    with pytest.raises(RuntimeError, match="cleanup failed") as error:
+        handler(progress, payload)
+    assert str(error.value.__cause__) == "route busy"
+    assert progress._failure is None
+    assert not progress._stop_requested
+    assert tier._route_generation == {}
+
+    control.incoming.append(msgspec.msgpack.encode(payload))
+    _wait_until(lambda: not progress._thread.is_alive())
+    with pytest.raises(RuntimeError, match="cleanup failed") as error:
+        source.close()
+    assert progress._failure is error.value
+    assert str(error.value.__cause__) == "route busy"
+    assert sticky.remote_agents == [b"gen-1"]
