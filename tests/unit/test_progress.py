@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
+import select
 import threading
+import time
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,6 +14,7 @@ import numpy as np
 import pytest
 
 from kvcr import progress as progress_module
+from kvcr.dangling_ops import _DanglingOps
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
 from kvcr.types import RegionDescriptor
 
@@ -730,42 +735,100 @@ def test_real_thread_owns_lifecycle_and_transfers_same_object() -> None:
     assert lifecycle_threads[0] != main_thread
 
 
-def test_startup_failure_is_reported_to_main() -> None:
-    expected = RuntimeError("startup failed")
+@pytest.mark.parametrize("stage", ["startup", "loop"])
+def test_failure_is_reported_to_main_and_closes_wake_pipe(stage) -> None:
+    expected = RuntimeError(f"{stage} failed")
+    descriptors = []
 
-    def initialize(_progress: _KVCRProgress) -> None:
-        raise expected
+    def initialize(progress):
+        descriptors.extend((progress._wake_read, progress._wake_write))
+        if stage == "startup":
+            raise expected
 
-    progress = _KVCRProgress(
-        initialize,
-        lambda _, items: ({}, False),
-        lambda: [],
-        lambda: None,
-    )
-
-    with pytest.raises(RuntimeError, match="startup failed") as exc_info:
-        progress.start()
-    assert exc_info.value is expected
-
-
-def test_loop_failure_is_reported_to_main() -> None:
-    expected = RuntimeError("loop failed")
-    stepped = threading.Event()
-
-    def poll(
-        _progress: _KVCRProgress,
-        items: list[object],
-    ) -> tuple[dict[object, object], bool]:
+    def poll(_progress, items):
         if items:
-            stepped.set()
             raise expected
         return {}, False
 
-    progress = _KVCRProgress(lambda _: None, poll, lambda: [], lambda: None)
-    progress.start()
-    progress.submit(object())
-    assert stepped.wait(timeout=1)
-
-    with pytest.raises(RuntimeError, match="loop failed") as exc_info:
+    progress = _KVCRProgress(initialize, poll, list, lambda: None)
+    if stage == "startup":
+        with pytest.raises(RuntimeError, match="startup failed") as exc_info:
+            progress.start()
+        assert exc_info.value is expected
+    else:
+        progress.start()
+        progress.submit(object())
+    with pytest.raises(RuntimeError, match=f"{stage} failed") as exc_info:
         progress.close()
     assert exc_info.value is expected
+    assert progress._wake_read is None and progress._wake_write is None
+    for fd in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_submission_and_stop_interrupt_idle_wait() -> None:
+    """A submission between the queue check and wait must not lose its wake."""
+    waiting = Queue()
+    allow_wait = threading.Event()
+    seen = threading.Event()
+    item = object()
+
+    def poll(_progress, items):
+        if items:
+            assert items == [item]
+            seen.set()
+        return {}, bool(items)
+
+    def wait(_timeout, wake_fd):
+        waiter = select.poll()
+        waiter.register(wake_fd, select.POLLIN)
+        waiting.put(wake_fd)
+        assert allow_wait.wait(timeout=2)
+        # Longer than the assertions below, so periodic polling cannot mask a
+        # missing wake. Still bounded so a broken implementation can shut down.
+        waiter.poll(2_000)
+
+    progress = _KVCRProgress(lambda _: None, poll, list, lambda: None)
+    progress._idle_waiter = wait
+    progress.start()
+    try:
+        waiting.get(timeout=2)
+        progress.submit(item)
+        allow_wait.set()
+        assert seen.wait(timeout=1)
+        waiting.get(timeout=2)
+        started = time.monotonic()
+        progress.close()
+        assert time.monotonic() - started < 1
+    finally:
+        allow_wait.set()
+        progress.close()
+    assert not progress._thread.is_alive()
+
+
+def test_idle_wait_does_not_stall_a_healthy_source(monkeypatch) -> None:
+    progress = _KVCRProgress(
+        lambda _: None, lambda _, items: ({}, False), list, lambda: None
+    )
+    backend = SimpleNamespace(
+        _kvcr=SimpleNamespace(config=SimpleNamespace(operation_timeout_ms=10)),
+        _progress_outbound=[],
+    )
+    dangling = _DanglingOps(backend)
+    now = [1.0]
+    monkeypatch.setattr("kvcr.dangling_ops.time.monotonic", lambda: now[0])
+
+    def wait(timeout, _wake_fd):
+        now[0] += timeout
+
+    progress._idle_waiter = wait
+    progress._wake_read, progress._wake_write = os.pipe2(os.O_NONBLOCK)
+    try:
+        dangling.begin_poll()
+        progress._wait_for_work()
+        dangling.begin_poll()
+        assert dangling.check_source_progress()
+        assert not backend._progress_outbound
+    finally:
+        progress._close_wakeup()

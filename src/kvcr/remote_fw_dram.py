@@ -844,6 +844,8 @@ class _RemoteFWDram:
         initialize_control = getattr(self._control, "initialize", None)
         if initialize_control is not None:
             initialize_control()
+        wait = getattr(self._control, "wait", None)
+        _progress._idle_waiter = wait if callable(wait) else None
 
     def poll_progress(
         self, progress: _KVCRProgress, submissions: list[object]
