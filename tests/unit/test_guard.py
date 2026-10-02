@@ -546,7 +546,7 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     attachment_error = RuntimeError("attachment close failed")
     attachment = Mock(close=Mock(side_effect=[attachment_error, None]))
     holder = Mock(close=Mock(side_effect=RuntimeError("holder close failed")))
-    owner = Mock()
+    owner = Mock(close=Mock(side_effect=OSError("reclaim failed")))
     guard = _guard(owner=owner)
     guard._recovery.attachment = attachment
     mirror = guard._recovery.mirror = _RecoveryMirror(("",))
@@ -568,6 +568,8 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
 
     assert guard._recovery.mirror is None
     assert guard._recovery._g3_records == {}
+    # Reclamation ran and failed too; the cleanup error above still surfaces.
+    owner.close.assert_called_once_with()
 
 
 def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
