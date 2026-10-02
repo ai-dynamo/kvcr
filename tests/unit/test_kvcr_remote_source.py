@@ -293,7 +293,9 @@ def test_write_probe_fences_write_waiting_on_framework_pin(
     assert len(agent.xfers) == (1 if incarnation == "other" else 0)
 
 
-def test_stalled_source_refuses_queued_and_future_writes() -> None:
+@pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
+def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> None:
+    caplog.set_level(log_level, logger="kvcr.core")
     errors = []
 
     def on_resilience_event(error):
@@ -330,6 +332,10 @@ def test_stalled_source_refuses_queued_and_future_writes() -> None:
     assert len(errors) == 1  # A raising callback must not stop native cleanup.
     assert "timeout: 1000 ms" in str(errors[0])
     assert "new source writes disabled until restart" in str(errors[0])
+    refusals = [m for m in caplog.messages if "source_transfer_refused " in m]
+    assert bool(refusals) is (log_level == logging.DEBUG)
+    if refusals:
+        assert "reason=source_stalled" in refusals[0]
 
 
 def test_kvcr_close_cleans_pending_pin_operations():

@@ -341,6 +341,22 @@ backing-file allocation.
 - `UCX_REG_NONBLOCK_FALLBACK=n`: fails instead of silently reverting to blocking
   registration. Use it to confirm ODP is the path actually taken.
 
+Use `--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`; embedded workers must set
+the parent `kvcr` logger) to log `source_transfer_refused` with the operation,
+target, block count and reason, plus progress startup and Guard
+promotion/handback stage markers and recovery snapshot byte counts. Markers
+carry monotonic and thread-CPU nanoseconds and native thread IDs; compare
+timestamps only within a stage's thread. No cache keys or request contents are
+recorded, and nothing here changes initialization or promotion behavior.
+
+`KVCR_DIAGNOSTICS=1` plus the `kvcr` DEBUG logger, both set **before the KVCR
+instance is created**, adds sampled query summaries: opportunistic-query mode,
+hint presence/failure and local/remote status counts. At most four observations
+per request while it stays in a 128-request LRU, so eviction permits resampling
+and total volume is not capped; queries without a request ID share one bucket.
+A zero remote-fetchable count is an advisory observation, **not** a transfer
+failure or proof of reuse. Request IDs are logged in clear.
+
 Recovered blocks have no claims or old access timestamps and enter the
 eviction list. Reuse gives them a new timestamp under the configured policy.
 Recovery covers new requests; in-flight operations need caller-level retries.

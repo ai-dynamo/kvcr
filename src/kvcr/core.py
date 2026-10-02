@@ -4,9 +4,10 @@
 
 import functools
 import logging
+import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from math import ceil
@@ -132,6 +133,15 @@ class _KVCRCore:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")
 
         self.nixl_agent_name = self.config.nixl_agent_name
+        self._query_diagnostics = (
+            OrderedDict()
+            if os.getenv("KVCR_DIAGNOSTICS") == "1"
+            and logger.isEnabledFor(logging.DEBUG)
+            else None
+        )
+        self._query_diagnostics_lock = (
+            threading.Lock() if self._query_diagnostics is not None else None
+        )
         self._request_pin_callback = bindings.request_pin
         self._poll_pin_results_callback = bindings.poll_pin_results
         self._release_pin_callback = bindings.release_pin
@@ -371,6 +381,8 @@ class _KVCRCore:
                 statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
             else:
                 statuses.append((QueryStatus.MISS, None))
+        if self._query_diagnostics is not None:
+            self._log_query_diagnostics(statuses, request_id)
         return statuses
 
     def align_sequence(
@@ -688,6 +700,43 @@ class _KVCRCore:
             run(functools.partial(self._release_local_dram_sources, op_id))
         if first_error is not None:
             raise first_error
+
+    def _log_query_diagnostics(
+        self,
+        statuses: list[tuple[QueryStatus, CacheTier | None]],
+        request_id: str | None,
+    ) -> None:
+        if self._query_diagnostics is not None and logger.isEnabledFor(logging.DEBUG):
+            # query() takes no lock, so only the sampling decision is serialised:
+            # unlocked, concurrent callers read one ordinal and oversample.
+            with self._query_diagnostics_lock:
+                ordinal = self._query_diagnostics.get(request_id, 0) + 1
+                self._query_diagnostics[request_id] = min(ordinal, 4)
+                self._query_diagnostics.move_to_end(request_id)
+                if len(self._query_diagnostics) > 128:
+                    self._query_diagnostics.popitem(last=False)
+            if ordinal <= 4:
+                remote = self._remote_fw_dram
+                hint = remote._request_hints.get(request_id)
+                logger.debug(
+                    "KVCR_EVENT query_decision request_id=%s agent=%s keys=%d "
+                    "query_ordinal=%d sample_cap=4 sample_scope=request_lru128 "
+                    "local_ready=%d local_filling=%d g3_fetchable=%d "
+                    "remote_fetchable=%d misses=%d opportunistic=%s "
+                    "hint_present=%s hint_failed=%s",
+                    request_id,
+                    self.nixl_agent_name,
+                    len(statuses),
+                    ordinal,
+                    statuses.count((QueryStatus.HIT, CacheTier.LOCAL_G2)),
+                    statuses.count((QueryStatus.FETCHING, CacheTier.LOCAL_G2)),
+                    statuses.count((QueryStatus.FETCHABLE, CacheTier.G3)),
+                    statuses.count((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)),
+                    statuses.count((QueryStatus.MISS, None)),
+                    remote._options.opportunistic_query,
+                    hint is not None,
+                    hint.failed if hint is not None else None,
+                )
 
     def _publish_inventory(
         self,

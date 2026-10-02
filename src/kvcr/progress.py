@@ -326,32 +326,45 @@ class _KVCRProgress:
                 raise RuntimeError("KVCR progress thread did not stop")
         self.raise_if_failed()
 
+    def _log_startup_stage(self, stage: str) -> None:
+        self._startup_stage = stage
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KVCR_EVENT progress_startup_stage stage=%s agent=%s tid=%d "
+                "monotonic_ns=%d thread_cpu_ns=%d",
+                stage,
+                self._nixl_agent_name,
+                threading.get_native_id(),
+                time.monotonic_ns(),
+                time.thread_time_ns(),
+            )
+
     def _run(self) -> None:
         try:
-            self._startup_stage = "NIXL agent initialization"
+            self._log_startup_stage("NIXL agent initialization")
             self._initialize_nixl()
             if self._close_requested:
                 return
             if not self._activate.is_set():
-                self._startup_stage = "memory registration"
+                self._log_startup_stage("memory registration")
                 self._register_memory_regions()
                 self._prepared.set()
                 self._activate.wait()
                 if self._close_requested:
                     return
-                self._startup_stage = "backend initialization"
+                self._log_startup_stage("backend initialization")
                 self._initialize(self)
             else:
                 # Preserve the normal ordering for backends that create NIXL
                 # resources before common memory registration.
-                self._startup_stage = "backend initialization"
+                self._log_startup_stage("backend initialization")
                 self._initialize(self)
-                self._startup_stage = "memory registration"
+                self._log_startup_stage("memory registration")
                 self._register_memory_regions()
                 self._prepared.set()
-            self._startup_stage = "agent metadata capture"
+            self._log_startup_stage("agent metadata capture")
             self._capture_agent_metadata()
-            self._startup_stage = "ready"
+            self._log_startup_stage("ready")
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration():
@@ -360,7 +373,7 @@ class _KVCRProgress:
             self._failure = error
         finally:
             self._prepared.set()
-            self._startup_stage = "cleanup"
+            self._log_startup_stage("cleanup")
             try:
                 try:
                     self._close_progress_ops()

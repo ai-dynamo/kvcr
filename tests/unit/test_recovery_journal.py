@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import mmap
 import struct
 from collections.abc import Callable, Iterator
@@ -284,8 +285,11 @@ def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -
     write_recovery_snapshot(pool, terms, frames)
 
 
-def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -> None:
+def test_a_handback_region_lives_and_dies_inside_the_pool_file(
+    tmp_path: Path, caplog
+) -> None:
     """Replayed whole under its own terms, discardable when torn, gone once released."""
+    caplog.set_level(logging.DEBUG, logger="kvcr.recovery_journal")
     with _attached(tmp_path) as pool:
         path = Path(pool._spec.path)
         pools = (
@@ -302,6 +306,11 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
             BlockKey(b"c" * 32): _recovered_record(g3=2),
         }
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
+        written = [r for r in caplog.records if "snapshot_written " in r.message]
+        assert written[-1].args == (
+            pool._spec.pool_id,
+            path.stat().st_size - pool._spec.mapping_bytes,
+        )
         # Inside the pool file, so it has no name of its own to be found under.
         assert set(tmp_path.iterdir()) == {path}
         assert path.stat().st_size > pool._spec.mapping_bytes

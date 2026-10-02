@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import threading
 from types import SimpleNamespace
 
 import pytest
 
+from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _ProgressOp
 from kvcr.types import MemDescriptor
 
@@ -89,6 +91,29 @@ def _mem(
     device_id: int = 0,
 ) -> MemDescriptor:
     return MemDescriptor("transfer-test", mem_type, address, size, device_id, "")
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_startup_stage_logging_is_gated(monkeypatch, caplog, level):
+    caplog.set_level(level, logger="kvcr.progress")
+    progress = _KVCRProgress(
+        lambda _: None, lambda _, __: ({}, False), list, lambda: None
+    )
+
+    def clock():
+        assert level == logging.DEBUG
+        return 123
+
+    monkeypatch.setattr(
+        progress_module,
+        "time",
+        SimpleNamespace(monotonic_ns=clock, thread_time_ns=clock),
+    )
+    progress._log_startup_stage("memory registration")
+    assert progress._startup_stage == "memory registration"
+    assert bool(caplog.messages) is (level == logging.DEBUG)
+    if caplog.messages:
+        assert "monotonic_ns=123 thread_cpu_ns=123" in caplog.messages[0]
 
 
 def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:

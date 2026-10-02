@@ -655,6 +655,19 @@ class _Guard:
                         self._phase = _Phase.FAILED
                 return
 
+    def _log_promotion_stage(self, stage: str) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KVCR_EVENT guard_promotion_stage stage=%s guard=%d pool=%s "
+                "tid=%d monotonic_ns=%d thread_cpu_ns=%d",
+                stage,
+                self._guard_index,
+                self._spec.pool_id,
+                threading.get_native_id(),
+                time.monotonic_ns(),
+                time.thread_time_ns(),
+            )
+
     def _observe_holder(self) -> None:
         """Notice the current primary dying. Polled between commands on the
         actor thread, so a death and every command are totally ordered.
@@ -702,6 +715,7 @@ class _Guard:
                 if lease.incarnation is not None:
                     with self._phase_lock:
                         self._dead_incarnations.add(lease.incarnation)
+                self._log_promotion_stage("death_observed")
                 self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)
@@ -966,6 +980,7 @@ class _Guard:
             raise self._failure
         started = time.monotonic()
         records = self._recovery.take_for_promotion()
+        self._log_promotion_stage("records_recovered")
         self._serve(records, started, time.monotonic())
 
     def _serve(
@@ -990,10 +1005,12 @@ class _Guard:
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
         self._recovery.release_snapshot_region()
+        self._log_promotion_stage("records_adopted")
         start_started = time.monotonic()
         core.start()
         serving = time.monotonic()
         self._serving = True
+        self._log_promotion_stage("serving")
         endpoint = self._pool_lease.bind_address
         control_endpoint = (
             "unbound" if endpoint is None else f"{endpoint[0]}:{endpoint[1]}"
@@ -1030,6 +1047,7 @@ class _Guard:
             ],
             self._configured.remote_fw_dram_backend,
         )
+        self._log_promotion_stage("core_init_start")
         core = _KVCRCore(
             KVCRConfig(
                 nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
@@ -1051,6 +1069,7 @@ class _Guard:
             ),
         )
         self._core = core
+        self._log_promotion_stage("core_init_done")
         core._progress.prepare()
 
     def _hand_back(self) -> None:
@@ -1061,8 +1080,11 @@ class _Guard:
         core = self._core
         if core is None or self._recovery.mirror is None:
             raise RecoveryMirrorError("a serving Guard has no state to hand back")
+        self._log_promotion_stage("handback_start")
         core.close()
+        self._log_promotion_stage("core_closed")
         self._recovery.hand_back(core._block_record_map)
+        self._log_promotion_stage("handback_done")
         self._core = None
         self._serving = False
 
