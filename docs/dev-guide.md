@@ -341,6 +341,18 @@ backing-file allocation.
 - `UCX_REG_NONBLOCK_FALLBACK=n`: fails instead of silently reverting to blocking
   registration. Use it to confirm ODP is the path actually taken.
 
+`--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`) logs source transfer refusals
+with their reason, startup and Guard promotion/handback stage timings, and
+recovery snapshot sizes. With DEBUG set before the KVCR instance is created:
+
+- `KVCR_DIAGNOSTICS=1`: sampled query decisions, up to four per recent request.
+  A zero remote-fetchable count is advisory, not a transfer failure.
+- `KVCR_KEY_HISTORY=1`: SHA-256 key fingerprints for local G2 lifetime events
+  and completed remote transfers.
+
+Both are off by default and uncapped in volume. Fingerprints are unsalted and
+request IDs are logged in clear, so restrict access to these logs.
+
 Recovered blocks have no claims or old access timestamps and enter the
 eviction list. Reuse gives them a new timestamp under the configured policy.
 Recovery covers new requests; in-flight operations need caller-level retries.

@@ -3,9 +3,11 @@
 """KVCR local-DRAM, capacity, and policy tests."""
 
 import ctypes
+import hashlib
 import heapq
 import logging
 from contextlib import closing
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -13,6 +15,7 @@ from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
+    _key_history,
     _mem_descriptor,
     _new_kvcr,
     _new_local_kvcr,
@@ -22,6 +25,7 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr import core as core_module
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
@@ -63,7 +67,10 @@ def _two_pool_kvcr(agent, pools, config=None, capacity_needed_callback=None):
     )
 
 
-def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
+@pytest.mark.parametrize("history", [False, True])
+def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history):
+    monkeypatch.setenv("KVCR_KEY_HISTORY", "1" if history else "0")
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     block_size = 16
     primary = ctypes.create_string_buffer(block_size * 3)
     local = ctypes.create_string_buffer(block_size * 2)
@@ -80,6 +87,13 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
         policy=policy,
     )
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    if not history:
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("disabled history performed diagnostic work")
+
+        monkeypatch.setattr(kvcr._core, "_log_key_history", forbidden)
+        monkeypatch.setattr(core_module, "hashlib", SimpleNamespace(sha256=forbidden))
 
     first = kvcr.deposit(
         {
@@ -134,6 +148,16 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
         InventoryEvent((keys[0],), CacheTier.LOCAL_G2, True),
         InventoryEvent((keys[2],), CacheTier.LOCAL_G2, False),
     ]
+    records = _key_history(caplog)
+    assert bool(records) is history
+    if history:
+        assert [r["sequence"] for r in records] == [
+            str(i) for i in range(1, len(records) + 1)
+        ]
+        removal = next(r for r in records if r["event"] == "remove")
+        assert removal["reason"] == "capacity_eviction"
+        assert removal["key_sha256"] == hashlib.sha256(keys[0]).hexdigest()
+        assert {r["event"] for r in records} >= {"ready", "inventory_accepted"}
 
 
 def test_local_dram_rejects_overlapping_pools() -> None:
@@ -881,3 +905,36 @@ def test_adopt_recovery_slots_rejects_invalid_or_unsettled_rows(
 
     with pytest.raises(ValueError, match="invalid local DRAM recovery slots"):
         local_dram.adopt_recovery_slots(records)
+
+
+def test_recovered_history_bounds_records_and_reports_callback_failure(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    local = ctypes.create_string_buffer(16 * 33)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 33)
+    records = {
+        BlockKey(str(i).encode()): _BlockRecord(
+            local_dram=_LocalDramResidency([("", i)], _LocalDramState.READY)
+        )
+        for i in range(33)
+    }
+    kvcr._core.adopt_recovery_records(records)
+    history = _key_history(caplog)
+    assert [r["batch_offset"] for r in history] == ["0", "32"]
+    hashes = [r["key_sha256"].split(",") for r in history]
+    assert [len(batch) for batch in hashes] == [32, 1]
+    assert {h for batch in hashes for h in batch} == {
+        hashlib.sha256(key).hexdigest() for key in records
+    }
+    key = next(iter(records))
+    assert not kvcr._core._publish_inventory((key,), CacheTier.LOCAL_G2, removed=True)
+    assert _key_history(caplog)[-1]["event"] == "inventory_no_callback"
+
+    def fail(event):
+        raise RuntimeError("callback failed")
+
+    kvcr._core._inventory_sink_callback = fail
+    assert not kvcr._core._publish_inventory((key,), CacheTier.LOCAL_G2, removed=True)
+    assert _key_history(caplog)[-1]["event"] == "inventory_failed"

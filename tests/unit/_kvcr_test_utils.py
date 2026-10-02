@@ -593,3 +593,12 @@ def _recovered_record(
         ),
         g3=None if g3 is None else _G3Residency(g3),
     )
+
+
+def _key_history(caplog) -> list[dict[str, str]]:
+    """KVCR_KEY_HISTORY records as their named fields."""
+    return [
+        dict(field.split("=", 1) for field in record.message.split()[1:])
+        for record in caplog.records
+        if record.message.startswith("KVCR_KEY_HISTORY ")
+    ]

@@ -34,6 +34,7 @@ from .local_dram import _LocalDramState
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
 from .types import (
     BlockKey,
+    CacheTier,
     MemDescriptor,
     OpEntryResult,
     OpEntryStatus,
@@ -781,6 +782,16 @@ class _RemoteFWDram:
         if op.state is not _TargetPullState.QUARANTINED:
             kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
+        if kvcr._key_history_enabled:
+            kvcr._log_key_history(
+                "remote_fetch_completed"
+                if op.local_fill
+                else "remote_deliver_completed",
+                (key for key in op.ordered_keys if key in completed_keys),
+                CacheTier.REMOTE_G2,
+                request_id=op.request_id,
+                op_handle=cast(OpHandle, op.op_id[1]),
+            )
         if not op.success:
             self._fail_request_hint(op.request_id)
         elif (
@@ -1120,6 +1131,24 @@ class _RemoteFWDram:
             or not self._dangling_ops.check_source_progress()
             or (expected is not None and expected != self._dangling_ops.incarnation)
         ):
+            if logger.isEnabledFor(logging.DEBUG):
+                reason = (
+                    "stopping"
+                    if progress._stop_requested
+                    else "source_stalled"
+                    if self._dangling_ops._source_stalled
+                    else "incarnation_mismatch"
+                )
+                logger.debug(
+                    "KVCR_EVENT source_transfer_refused op=%d target=%s "
+                    "blocks=%d reason=%s expected_incarnation=%s incarnation=%s",
+                    op_handle,
+                    target_agent,
+                    len(keys),
+                    reason,
+                    expected,
+                    self._dangling_ops.incarnation,
+                )
             self._send_write_done(progress, remote_agent, op_handle, False)
             return
         self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()

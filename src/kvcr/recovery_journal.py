@@ -608,6 +608,7 @@ def write_recovery_snapshot(
         body += _pack_frame(record_type, key, payload, frame_size)
     if not body:
         pool.release_snapshot_region()
+        logger.debug("KVCR_EVENT snapshot_empty pool=%s bytes=0", pool._spec.pool_id)
         return
 
     digest = hashlib.sha256(terms)
@@ -624,6 +625,11 @@ def write_recovery_snapshot(
             digest.digest(), len(body)
         )
         region.flush()
+    logger.debug(
+        "KVCR_EVENT snapshot_written pool=%s bytes=%d",
+        pool._spec.pool_id,
+        _SNAPSHOT_HEADER.size + len(body),
+    )
 
 
 def read_recovery_snapshot(

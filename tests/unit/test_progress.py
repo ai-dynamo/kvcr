@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import threading
 from types import SimpleNamespace
 
 import pytest
 
+from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _ProgressOp
 from kvcr.types import MemDescriptor
 
@@ -103,9 +105,23 @@ def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
 
 
 @pytest.mark.parametrize("activate", [False, True])
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 def test_prepare_registers_memory_before_backend_activation(
-    monkeypatch, activate
+    monkeypatch, caplog, activate, level
 ) -> None:
+    caplog.set_level(level, logger="kvcr.progress")
+    clock_reads = []
+    monkeypatch.setattr(
+        progress_module,
+        "time",
+        SimpleNamespace(
+            **{
+                **vars(progress_module.time),
+                "monotonic_ns": lambda: clock_reads.append(1) or 123,
+                "thread_time_ns": lambda: clock_reads.append(1) or 123,
+            }
+        ),
+    )
     events: list[str] = []
 
     progress = _KVCRProgress(
@@ -132,6 +148,10 @@ def test_prepare_registers_memory_before_backend_activation(
         if activate
         else ["register", "close", "deregister"]
     )
+    # Stages are tracked either way; only DEBUG reads clocks and logs them.
+    assert progress._startup_stage == "cleanup"
+    stages = [m for m in caplog.messages if "progress_startup_stage " in m]
+    assert bool(stages) is bool(clock_reads) is (level == logging.DEBUG)
 
 
 def test_close_drains_queued_submissions(monkeypatch) -> None:
