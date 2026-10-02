@@ -43,10 +43,19 @@ p.add_argument("--two-node", action="store_true")
 p.add_argument("--etcd-image", default="quay.io/coreos/etcd:v3.5.14")
 p.add_argument("--agent-port", type=int, default=9800)
 p.add_argument("--gpu-type", default="H100", help="node label nvidia.com/gpu.product substring, '' to skip")
+p.add_argument("--overlay", action="append", default=[], metavar="PVC_PATH:IMAGE_PATH",
+               help="copy a file from the PVC over a file in the image before the engine starts "
+                    "(patch one vLLM/Dynamo module without rebuilding); applied in every GPU container")
 p.add_argument("--extra-env", action="append", default=[], metavar="KEY=VALUE",
                help="environment for every container, e.g. PYTHONPATH=/cache/doxu-kvcr/fix51/src "
                     "to test a patched KVCR without rebuilding the image; repeatable")
 args = p.parse_args()
+overlay_cmd = ""
+for item in args.overlay:
+    src, sep, dst = item.partition(":")
+    if not sep or not src.startswith("/") or not dst.startswith("/"):
+        p.error(f"--overlay expects /pvc/path:/image/path, got {item!r}")
+    overlay_cmd += f"cp {src} {dst} && "
 extra_env = []
 for item in args.extra_env:
     key, sep, value = item.partition("=")
@@ -200,7 +209,7 @@ def headless(name: str, role: str, port: int, port_name: str) -> dict:
 
 
 main_cmd = ["sh", "-c",
-            f"mkdir -p {evidence} && ulimit -l unlimited 2>/dev/null; ulimit -s 65536 2>/dev/null; "
+            overlay_cmd + f"mkdir -p {evidence} && ulimit -l unlimited 2>/dev/null; ulimit -s 65536 2>/dev/null; "
             "cd /tmp && exec \"$@\"", "--", *harness]
 
 items: list[dict] = []
@@ -210,7 +219,7 @@ if not args.two_node:
                      gpu_main("main", main_cmd), anti_affinity=False))
 else:
     agent_cmd = ["sh", "-c",
-                 f"ulimit -l unlimited 2>/dev/null; ulimit -s 65536 2>/dev/null; cd {tests} && "
+                 overlay_cmd + f"ulimit -l unlimited 2>/dev/null; ulimit -s 65536 2>/dev/null; cd {tests} && "
                  f"exec python3 -m phase1.node_agent --port {args.agent_port}"]
     items.append(headless(f"{run_id}-b", "b", args.agent_port, "agent"))
     items.append(pod(f"{run_id}-b", "b",
