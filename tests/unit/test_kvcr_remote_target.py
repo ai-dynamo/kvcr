@@ -3,6 +3,7 @@
 """KVCR remote framework-DRAM target-side tests."""
 
 import ctypes
+import hashlib
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,7 @@ from _kvcr_test_utils import (
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _key_history,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
@@ -60,7 +62,9 @@ def test_submit_hint_filters_unlisted_hash():
     assert target.query((BlockKey(b"k"),), "req") == [(QueryStatus.MISS, None)]
 
 
-def test_kvcr_opportunistic_query_accepts_key_outside_hint():
+def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
+    monkeypatch.setenv("KVCR_DIAGNOSTICS", "1")
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     agent = FakeNixlAgent()
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
@@ -79,6 +83,19 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     assert target.query((requested_key,), "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
     ]
+    for _ in range(5):
+        target.query((requested_key,), "req")
+
+    def decisions():
+        return [m for m in caplog.messages if "query_decision " in m]
+
+    assert len(decisions()) == 4  # sampled at most four times per request
+    assert "remote_fetchable=1 misses=0 opportunistic=True" in decisions()[0]
+    for index in range(128):
+        target.query((requested_key,), str(index))
+    caplog.clear()
+    target.query((requested_key,), "req")
+    assert "query_ordinal=1" in decisions()[0]  # evicted, so sampled afresh
     op_handle = target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
 
     assert list(target.poll_completed()) == []
@@ -322,7 +339,9 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
 
 
-def test_remote_staging_commits_available_keys() -> None:
+def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     block_size = 16
     local = ctypes.create_string_buffer(block_size * 3)
     agent = FakeNixlAgent()
@@ -370,6 +389,13 @@ def test_remote_staging_commits_available_keys() -> None:
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
     assert events == [InventoryEvent(available, CacheTier.LOCAL_G2, False)]
+    (fetched,) = [
+        r for r in _key_history(caplog) if r["event"] == "remote_fetch_completed"
+    ]
+    assert fetched["key_sha256"] == ",".join(
+        hashlib.sha256(key).hexdigest() for key in available
+    )
+    assert fetched["request_id"] == "req"  # op is the shared fill, not this fetch
     assert target.release(release_handles) == [
         (handle, True) for handle in release_handles
     ]
@@ -380,8 +406,10 @@ def test_remote_staging_commits_available_keys() -> None:
     [((-1,), True), ((2,), True), ((True,), True), ((0, 0), True), ((0, 1), "false")],
 )
 def test_remote_completion_rejects_invalid_notification(
-    completed_indices, success
+    completed_indices, success, monkeypatch, caplog
 ) -> None:
+    monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     target = _new_kvcr(
@@ -405,6 +433,7 @@ def test_remote_completion_rejects_invalid_notification(
         (op_handle, _op_entries(dict.fromkeys(keys, False)))
     ]
     assert not _has_outstanding_operations(target)
+    assert not [r for r in _key_history(caplog) if r["event"].startswith("remote_")]
 
 
 @pytest.mark.parametrize(
@@ -1126,7 +1155,9 @@ def test_remote_framework_dram_transfers_available_keys(
     eager_ctrl_connect: bool,
     missing_indices: tuple[int, ...],
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
     caplog.set_level(logging.DEBUG, logger="kvcr.core")
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_agent = FakeNixlAgent(metadata=b"source-md")
@@ -1216,6 +1247,13 @@ def test_remote_framework_dram_transfers_available_keys(
         else (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
         for index in range(len(keys))
     ]
+    (delivered,) = [
+        r for r in _key_history(caplog) if r["event"] == "remote_deliver_completed"
+    ]
+    assert delivered["op"] == str(op_handle)
+    assert delivered["key_sha256"] == ",".join(
+        hashlib.sha256(keys[index]).hexdigest() for index in completed_indices
+    )
 
     source_stats = source.get_stats()
     target_stats = target.get_stats()

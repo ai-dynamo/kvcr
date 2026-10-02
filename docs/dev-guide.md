@@ -341,21 +341,17 @@ backing-file allocation.
 - `UCX_REG_NONBLOCK_FALLBACK=n`: fails instead of silently reverting to blocking
   registration. Use it to confirm ODP is the path actually taken.
 
-Use `--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`; embedded workers must set
-the parent `kvcr` logger) to log `source_transfer_refused` with the operation,
-target, block count and reason, plus progress startup and Guard
-promotion/handback stage markers and recovery snapshot byte counts. Markers
-carry monotonic and thread-CPU nanoseconds and native thread IDs; compare
-timestamps only within a stage's thread. No cache keys or request contents are
-recorded, and nothing here changes initialization or promotion behavior.
+`--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`) logs source transfer refusals
+with their reason, startup and Guard promotion/handback stage timings, and
+recovery snapshot sizes. With DEBUG set before the KVCR instance is created:
 
-`KVCR_DIAGNOSTICS=1` plus the `kvcr` DEBUG logger, both set **before the KVCR
-instance is created**, adds sampled query summaries: opportunistic-query mode,
-hint presence/failure and local/remote status counts. At most four observations
-per request while it stays in a 128-request LRU, so eviction permits resampling
-and total volume is not capped; queries without a request ID share one bucket.
-A zero remote-fetchable count is an advisory observation, **not** a transfer
-failure or proof of reuse. Request IDs are logged in clear.
+- `KVCR_DIAGNOSTICS=1`: sampled query decisions, up to four per recent request.
+  A zero remote-fetchable count is advisory, not a transfer failure.
+- `KVCR_KEY_HISTORY=1`: SHA-256 key fingerprints for local G2 lifetime events
+  and completed remote transfers.
+
+Both are off by default and uncapped in volume. Fingerprints are unsalted and
+request IDs are logged in clear, so restrict access to these logs.
 
 Recovered blocks have no claims or old access timestamps and enter the
 eviction list. Reuse gives them a new timestamp under the configured policy.

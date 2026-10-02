@@ -34,6 +34,7 @@ from .local_dram import _LocalDramState
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
 from .types import (
     BlockKey,
+    CacheTier,
     MemDescriptor,
     OpEntryResult,
     OpEntryStatus,
@@ -781,6 +782,16 @@ class _RemoteFWDram:
         if op.state is not _TargetPullState.QUARANTINED:
             kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
+        if kvcr._key_history_enabled:
+            kvcr._log_key_history(
+                "remote_fetch_completed"
+                if op.local_fill
+                else "remote_deliver_completed",
+                (key for key in op.ordered_keys if key in completed_keys),
+                CacheTier.REMOTE_G2,
+                request_id=op.request_id,
+                op_handle=cast(OpHandle, op.op_id[1]),
+            )
         if not op.success:
             self._fail_request_hint(op.request_id)
         elif (

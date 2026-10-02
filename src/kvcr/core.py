@@ -3,6 +3,7 @@
 """KVCR lifecycle and state implementation."""
 
 import functools
+import hashlib
 import logging
 import os
 import threading
@@ -10,6 +11,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
+from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
 
@@ -133,6 +135,10 @@ class _KVCRCore:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")
 
         self.nixl_agent_name = self.config.nixl_agent_name
+        self._key_history_enabled = os.getenv(
+            "KVCR_KEY_HISTORY"
+        ) == "1" and logger.isEnabledFor(logging.DEBUG)
+        self._key_history_sequence = 0
         self._query_diagnostics = (
             OrderedDict()
             if os.getenv("KVCR_DIAGNOSTICS") == "1"
@@ -339,6 +345,9 @@ class _KVCRCore:
         local_dram.rank_recovered(records)
         if g3 is not None:
             g3.rank_recovered(records)
+        if self._key_history_enabled:
+            ready = (k for k, r in records.items() if r.local_dram is not None)
+            self._log_key_history("recovered_ready", ready, CacheTier.LOCAL_G2)
 
     # Public API.
 
@@ -707,8 +716,7 @@ class _KVCRCore:
         request_id: str | None,
     ) -> None:
         if self._query_diagnostics is not None and logger.isEnabledFor(logging.DEBUG):
-            # query() takes no lock, so only the sampling decision is serialised:
-            # unlocked, concurrent callers read one ordinal and oversample.
+            # query() takes no lock; unlocked, callers share an ordinal.
             with self._query_diagnostics_lock:
                 ordinal = self._query_diagnostics.get(request_id, 0) + 1
                 self._query_diagnostics[request_id] = min(ordinal, 4)
@@ -749,14 +757,53 @@ class _KVCRCore:
             return True
         event = InventoryEvent(tuple(keys), tier, removed)
         callback = self._inventory_sink_callback
+        kind = "removed" if removed else "stored"
         if callback is None:
+            if self._key_history_enabled:
+                self._log_key_history("inventory_no_callback", event.keys, tier, kind)
             return False
         try:
             callback(event)
         except Exception:
+            if self._key_history_enabled:
+                self._log_key_history("inventory_failed", event.keys, tier, kind)
             logger.warning("KVCR inventory sink failed", exc_info=True)
             return False
+        if self._key_history_enabled:
+            self._log_key_history("inventory_accepted", event.keys, tier, kind)
         return True
+
+    def _log_key_history(
+        self,
+        event: str,
+        keys: Iterable[BlockKey],
+        tier: CacheTier,
+        reason: str = "-",
+        *,
+        request_id: str | None = None,
+        op_handle: OpHandle | None = None,
+    ) -> None:
+        if not self._key_history_enabled or not logger.isEnabledFor(logging.DEBUG):
+            return
+        iterator = iter(keys)
+        offset = 0
+        while batch := tuple(islice(iterator, 32)):
+            self._key_history_sequence += 1
+            logger.debug(
+                "KVCR_KEY_HISTORY event=%s agent=%s pid=%d sequence=%d "
+                "batch_offset=%d tier=%s reason=%s key_sha256=%s request_id=%s op=%s",
+                event,
+                self.nixl_agent_name,
+                os.getpid(),
+                self._key_history_sequence,
+                offset,
+                tier.value,
+                reason,
+                ",".join(hashlib.sha256(bytes(key)).hexdigest() for key in batch),
+                request_id,
+                op_handle,
+            )
+            offset += len(batch)
 
     def _update_capacity_pressure(self, reclaimable_slots: Mapping[str, int]) -> None:
         callback = self._capacity_needed_callback

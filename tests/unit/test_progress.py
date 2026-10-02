@@ -93,29 +93,6 @@ def _mem(
     return MemDescriptor("transfer-test", mem_type, address, size, device_id, "")
 
 
-@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
-def test_startup_stage_logging_is_gated(monkeypatch, caplog, level):
-    caplog.set_level(level, logger="kvcr.progress")
-    progress = _KVCRProgress(
-        lambda _: None, lambda _, __: ({}, False), list, lambda: None
-    )
-
-    def clock():
-        assert level == logging.DEBUG
-        return 123
-
-    monkeypatch.setattr(
-        progress_module,
-        "time",
-        SimpleNamespace(monotonic_ns=clock, thread_time_ns=clock),
-    )
-    progress._log_startup_stage("memory registration")
-    assert progress._startup_stage == "memory registration"
-    assert bool(caplog.messages) is (level == logging.DEBUG)
-    if caplog.messages:
-        assert "monotonic_ns=123 thread_cpu_ns=123" in caplog.messages[0]
-
-
 def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
     progress = _KVCRProgress(
         lambda _: None,
@@ -128,9 +105,23 @@ def _transfer_progress(agent: _TransferAgent) -> _KVCRProgress:
 
 
 @pytest.mark.parametrize("activate", [False, True])
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 def test_prepare_registers_memory_before_backend_activation(
-    monkeypatch, activate
+    monkeypatch, caplog, activate, level
 ) -> None:
+    caplog.set_level(level, logger="kvcr.progress")
+    clock_reads = []
+    monkeypatch.setattr(
+        progress_module,
+        "time",
+        SimpleNamespace(
+            **{
+                **vars(progress_module.time),
+                "monotonic_ns": lambda: clock_reads.append(1) or 123,
+                "thread_time_ns": lambda: clock_reads.append(1) or 123,
+            }
+        ),
+    )
     events: list[str] = []
 
     progress = _KVCRProgress(
@@ -157,6 +148,10 @@ def test_prepare_registers_memory_before_backend_activation(
         if activate
         else ["register", "close", "deregister"]
     )
+    # Stages are tracked either way; only DEBUG reads clocks and logs them.
+    assert progress._startup_stage == "cleanup"
+    stages = [m for m in caplog.messages if "progress_startup_stage " in m]
+    assert bool(stages) is bool(clock_reads) is (level == logging.DEBUG)
 
 
 def test_close_drains_queued_submissions(monkeypatch) -> None:
