@@ -31,7 +31,7 @@ from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
 from kvcr.types import (
     BlockKey,
-    MemDescriptor,
+    MemoryRef,
     OpEntryResult,
     OpEntryStatus,
     PinHandle,
@@ -194,6 +194,7 @@ class FakePrimaryPinning:
         prefix_length: int | None = None,
         missing_indices: Collection[int] = (),
     ):
+        self.agent_name = "target"
         self.searches: list[tuple[BlockKey, ...]] = []
         self.unpins: list[PinHandle] = []
         self._next_request_id = 0
@@ -217,7 +218,7 @@ class FakePrimaryPinning:
                     "pin",
                     {
                         key: (
-                            [_mem_descriptor(addr=0)]
+                            [_mem_descriptor(end_point_name=self.agent_name)]
                             if (
                                 (prefix_length is None or index < prefix_length)
                                 and index not in self.missing_indices
@@ -270,7 +271,9 @@ class PendingPrimaryPinning(FakePrimaryPinning):
                 (
                     pin_handle,
                     {
-                        key: None if index in missing_indices else [_mem_descriptor()]
+                        key: None
+                        if index in missing_indices
+                        else [_mem_descriptor(end_point_name=self.agent_name)]
                         for index, key in enumerate(keys)
                     },
                 ),
@@ -315,8 +318,49 @@ class FakeNixlAgent:
         self.remote_agents.append(metadata)
         return f"remote-{len(self.remote_agents)}".encode()
 
+    def remove_remote_agent(self, agent_name):
+        pass
+
     def get_xfer_descs(self, descs, mem_type="DRAM"):
         return list(descs)
+
+    def prep_xfer_dlist(self, agent_name, descs, *, mem_type, backends):
+        return agent_name, descs.tolist()
+
+    def make_prepped_xfer(
+        self,
+        op,
+        local_handle,
+        local_indices,
+        remote_handle,
+        remote_indices,
+        *,
+        notif_msg=b"",
+        backends=None,
+    ):
+        def selected(handle, indices):
+            result = []
+            for index in indices:
+                for addr, size, device, stride, count in handle[1]:
+                    if 0 <= index < count:
+                        result.append((addr + index * stride, size, device))
+                        break
+                    index -= count
+                else:
+                    raise RuntimeError("NIXL rejected invalid prepared index")
+            return result
+
+        return self.initialize_xfer(
+            op,
+            selected(local_handle, local_indices),
+            selected(remote_handle, remote_indices),
+            remote_handle[0],
+            notif_msg=notif_msg,
+            backends=backends,
+        )
+
+    def release_dlist_handle(self, handle):
+        pass
 
     def initialize_xfer(
         self,
@@ -398,14 +442,20 @@ class FakeBytesControl:
         return incoming
 
 
-def _mem_descriptor(addr: int = 128, size: int = 16, info: str = "") -> MemDescriptor:
-    return MemDescriptor(
-        end_point_name="primary",
-        mem_type="DRAM",
-        addr=addr,
-        size=size,
-        device_Id=0,
-        info=info,
+def _mem_descriptor(
+    element_index: int = 0,
+    label: str = "",
+    *,
+    end_point_name: str = "target",
+) -> MemoryRef:
+    return MemoryRef(
+        end_point_name=end_point_name, label=label, element_index=element_index
+    )
+
+
+def _buffer_region(buffer, size: int, label: str = "") -> RegionDescriptor:
+    return RegionDescriptor(
+        addr=ctypes.addressof(buffer), size=size, label=label, count=len(buffer) // size
     )
 
 
@@ -458,8 +508,17 @@ def _start_write_message(
         "op_handle": op_handle,
         "remaining_timeout_ms": remaining_timeout_ms,
         "target_agent_metadata": b"target-md",
+        "target_regions": ({"": RegionDescriptor(addr=128, size=16, count=1024)}, {}),
         "keys": [key],
-        "dst_descriptors": [[_mem_descriptor().__dict__]],
+        "dst_descriptors": [
+            [
+                {
+                    "end_point_name": target_agent or "target",
+                    "label": "",
+                    "element_index": 0,
+                }
+            ]
+        ],
     }
     if target_agent is not None:
         payload["target_agent"] = target_agent
@@ -491,6 +550,7 @@ def _new_kvcr(
         nixl_agent_name=name,
         nixl_listen_port=1,
     )
+    pinning.agent_name = name
     with _use_nixl_agent(agent):
         kvcr = KVCR(
             config,
@@ -508,7 +568,14 @@ def _new_kvcr(
                 stats_factory=(FakeTelemetryStats if config.enable_telemetry else None),
             ),
             KVCRBackendConfigs(
-                framework_regions=framework_regions or [],
+                framework_regions=(
+                    framework_regions
+                    if framework_regions is not None
+                    else [
+                        RegionDescriptor(addr=128, size=size, label=pool, count=1024)
+                        for pool, size in config.pool_layouts
+                    ]
+                ),
                 local_dram=local_dram,
                 g3=g3,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
@@ -527,6 +594,7 @@ def _new_local_kvcr(
     capacity_needed_callback=None,
     policy=None,
     local_dram_backend="UCX",
+    framework_regions: list[RegionDescriptor] | None = None,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -546,6 +614,7 @@ def _new_local_kvcr(
                 policy=policy,
             ),
             KVCRBackendConfigs(
+                framework_regions=framework_regions or [],
                 local_dram=LocalDramOptions(
                     [("", ctypes.addressof(local), len(local))],
                     local_dram_backend,

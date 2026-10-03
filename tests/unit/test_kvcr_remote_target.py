@@ -17,6 +17,7 @@ from _kvcr_test_utils import (
     FakePrimaryPinning,
     FakeTelemetryStats,
     _block_op_ids,
+    _buffer_region,
     _ConstantHashAdapter,
     _decode_control_message,
     _decode_notif,
@@ -131,6 +132,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
             [("", ctypes.addressof(source_local), len(source_local))]
         ),
         policy=source_policy,
+        framework_regions=[_buffer_region(source_primary, block_size)],
     )
     source_now = 0.0
     source._core._clock = lambda: source_now
@@ -150,7 +152,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     )
 
     source_deposit = source.deposit(
-        {keys[0]: [_mem_descriptor(ctypes.addressof(source_primary), block_size)]}
+        {keys[0]: [_mem_descriptor(end_point_name="source")]}
     )
     _wait_until(lambda: bool(source_agent.transfers))
     source_agent.state = "DONE"
@@ -184,7 +186,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     source_xfer = source_agent.xfers[1]
     assert source_xfer[1] == [
         (ctypes.addressof(source_local), block_size, 0),
-        (0, block_size, 0),
+        (ctypes.addressof(source_primary), block_size, 0),
     ]
     assert source._core._block_record_map[keys[0]].local_dram.claim_count == 1
 
@@ -206,8 +208,7 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     assert set(completed) == {fetch}
     assert all(result.success for result in completed[fetch].values())
     assert all(
-        result.descriptors is not None and result.release_handle is not None
-        for result in completed[fetch].values()
+        result.release_handle is not None for result in completed[fetch].values()
     )
     assert target.query(keys, "req") == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
@@ -260,10 +261,13 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
             return "PROC"
 
     payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
-    source_primary = [ctypes.create_string_buffer(data, len(data)) for data in payloads]
     pool_data = dict.fromkeys(dict(layout), b"")
     for (name, _), data in zip(layout, payloads, strict=True):
         pool_data[name] += data
+    source_primary = {
+        name: ctypes.create_string_buffer(data, len(data))
+        for name, data in pool_data.items()
+    }
     source_local = {
         name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
     }
@@ -293,6 +297,10 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         config,
         name="source",
         local_dram=dram(source_local),
+        framework_regions=[
+            _buffer_region(source_primary[name], size, name)
+            for name, size in dict(layout).items()
+        ],
     )
     target = _new_kvcr(
         target_agent,
@@ -305,8 +313,12 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     )
     key = BlockKey(b"multi-pool")
     descriptors = [
-        _mem_descriptor(ctypes.addressof(memory), size, info=name)
-        for (name, size), memory in zip(layout, source_primary, strict=True)
+        _mem_descriptor(
+            sum(previous == name for previous, _ in layout[:index]),
+            label=name,
+            end_point_name="source",
+        )
+        for index, (name, _) in enumerate(layout)
     ]
     source_agent.state = "DONE"
     deposit = source.deposit({key: descriptors})
@@ -332,10 +344,6 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     result = dict(_poll_until(target, bool))[fetch][key]
     assert result.success is success
     if success:
-        assert [
-            (descriptor.info, descriptor.size)
-            for descriptor in result.descriptors or ()
-        ] == layout
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
 
 
@@ -378,7 +386,6 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     for key in keys:
         if key in available:
             assert results[key].success
-            assert results[key].descriptors is not None
             assert results[key].release_handle is not None
             release_handles.append(results[key].release_handle)
         else:
@@ -446,6 +453,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     now = 0.0
     block_size = 16
     local = ctypes.create_string_buffer(block_size)
+    primary = ctypes.create_string_buffer(b"a" * block_size, block_size)
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
@@ -463,6 +471,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(primary, block_size)],
     )
     target._core._clock = lambda: now
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
@@ -522,7 +531,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
             _wait_until(lambda: not control.incoming)
             now = 100.0  # Time and a replacement incarnation cannot free the slot.
             assert list(target.poll_completed()) == []
-        blocked = target.deposit({replacement: [_mem_descriptor(size=block_size)]})
+        blocked = target.deposit({replacement: [_mem_descriptor()]})
         assert list(target.poll_completed()) == [
             (blocked, _op_entries({replacement: False}))
         ]
@@ -540,17 +549,17 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     if resolution not in ("queued", "late"):
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert all(error.op_handle == message["op_handle"] for error in errors)
-        assert errors[0].destination_regions == errors[1].destination_regions
+        for error in errors:
+            assert error.destination_regions == [_mem_descriptor()]
+            assert error.destination_owner == "kvcr"
+            assert error.source_blocks is error.source_owners is None
     assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
     assert operation.close(progress)
 
     # The terminal completion makes the single slot reusable.
-    primary = ctypes.create_string_buffer(b"a" * block_size, block_size)
     agent.state = "DONE"
-    deposit = target.deposit(
-        {replacement: [_mem_descriptor(ctypes.addressof(primary), block_size)]}
-    )
+    deposit = target.deposit({replacement: [_mem_descriptor()]})
     assert _poll_until(target, bool) == [(deposit, _op_entries({replacement: True}))]
     assert local.raw == primary.raw
 
@@ -596,7 +605,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         for _, message in source_control.sent
     )
     assert len(source_agent.sent_notifs) == 1
-    assert source_agent.sent_notifs[0][0] == b"remote-1"
+    assert source_agent.sent_notifs[0][0] == "remote-1"
     assert _decode_notif(source_agent.sent_notifs[0][1]) == {
         "type": "write_done",
         "op_handle": op_handle,
@@ -623,14 +632,16 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert list(target.poll_completed()) == [(retry_handle, _op_entries({key: False}))]
     assert target_control.sent == []
 
-    other_destination = [_mem_descriptor(addr=256)]
+    other_destination = [_mem_descriptor(8)]
     mixed_handle = target.deliver(
         {key: [_mem_descriptor()], other_group: other_destination}, request_id="req"
     )
     _wait_until(lambda: bool(target_control.sent))
     message = _decode_control_message(target_control.sent[0][1])
     assert message["keys"] == [other_group]
-    assert message["dst_descriptors"] == msgspec.to_builtins([other_destination])
+    assert message["dst_descriptors"] == msgspec.to_builtins(
+        [target._core._normalize_descriptors(other_destination)]
+    )
     target_agent.notifs["source"] = [_write_done_notification(mixed_handle)]
     assert _poll_until(target, bool) == [
         (mixed_handle, _op_entries({key: False, other_group: True}))
@@ -659,7 +670,7 @@ def _probe_ack(handle, source="tcp://source:1", **fields):
     )
 
 
-def _acked_deliver(control, kvcr, source, key):
+def _acked_deliver(control, kvcr, source, key, destination=None):
     """Drive a deliver whose start_write carries no metadata, and return it."""
     # Each wait below expects exactly the message it triggered, so start clean:
     # a leftover would satisfy the wait before this request is even sent.
@@ -677,7 +688,9 @@ def _acked_deliver(control, kvcr, source, key):
     control.sent = []
 
     kvcr.submit_hint(_router_hint(source), request_id="load")
-    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+    op_handle = kvcr.deliver(
+        {key: [destination or _mem_descriptor()]}, request_id="load"
+    )
     _wait_until(lambda: len(control.sent) == 1)
     sent = _decode_control_message(control.sent[-1][1])
     assert sent["type"] == "start_write"
@@ -809,7 +822,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         control,
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layouts=[("", 16)],
+            pool_layouts=[("framework", 16)],
             operation_timeout_ms=1000,
             abandon_timeout_ms=7000,
         ),
@@ -817,7 +830,8 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     )
     kvcr._core._clock = lambda: now
     key, source = BlockKey(b"k0"), "tcp://source:1"
-    handle, _ = _acked_deliver(control, kvcr, source, key)
+    destination = _mem_descriptor(3, label="framework")
+    handle, _ = _acked_deliver(control, kvcr, source, key, destination)
     control.sent.clear()
     control.send = Mock(wraps=control.send, side_effect=[False, DEFAULT])
     control.recv = Mock(wraps=control.recv)
@@ -843,7 +857,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
 
     # An abandoned operation must not blacklist the endpoint for fresh work.
     kvcr.submit_hint(_router_hint(source), request_id="retry")
-    retry = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+    retry = kvcr.deliver(
+        {key: [_mem_descriptor(label="framework")]}, request_id="retry"
+    )
     _wait_until(
         lambda: any(
             _decode_control_message(raw).get("op_handle") == retry
@@ -872,7 +888,12 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert _poll_until(kvcr, lambda _: len(errors) == 2) == []
     assert not _has_outstanding_operations(kvcr)
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
-    assert errors[0].destination_regions == errors[1].destination_regions
+    assert (
+        errors[0].destination_regions == errors[1].destination_regions == [destination]
+    )
+    for error in errors:
+        assert error.destination_owner == "framework"
+        assert error.source_blocks is error.source_owners is None
     assert [
         message["op_handle"]
         for _, raw in control.sent
@@ -907,7 +928,6 @@ def test_remote_write_cancellation_and_late_completion(
         raise error
 
     now = 0.0
-    descriptor = _mem_descriptor()
     agent, control = FakeNixlAgent(), FakeBytesControl()
     kvcr = _new_kvcr(
         agent,
@@ -1025,8 +1045,10 @@ def test_remote_write_cancellation_and_late_completion(
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
     for error in errors:
         assert error.op_handle == handle
-        assert error.destination_regions == [descriptor]
-        assert error.source_blocks is None
+        assert error.destination_regions == [_mem_descriptor()]
+        assert error.destination_owner == "framework"
+        assert error.source_blocks is error.source_owners is None
+        assert "destination_owner='framework'" in str(error)
     kvcr.close()
 
 
@@ -1211,10 +1233,7 @@ def test_remote_framework_dram_transfers_available_keys(
         target_control.sent = []
 
     op_handle = target.deliver(
-        {
-            key: [_mem_descriptor(addr=8192 + index * 16)]
-            for index, key in enumerate(keys)
-        },
+        {key: [_mem_descriptor(index)] for index, key in enumerate(keys)},
         request_id="req",
     )
     _wait_until(lambda: bool(target_control.sent))
@@ -1223,7 +1242,7 @@ def test_remote_framework_dram_transfers_available_keys(
     assert _poll_until(source, lambda _: bool(source_agent.xfers)) == []
     assert source_agent.xfer_backends == [["REMOTE"]]
     assert source_agent.xfers[0][3] == [
-        (8192 + index * 16, 16, 0) for index in completed_indices
+        (128 + index * 16, 16, 0) for index in completed_indices
     ]
     notification = source_agent.xfers[0][5]
     assert notification is not None

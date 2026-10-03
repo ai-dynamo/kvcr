@@ -5,9 +5,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Annotated, Literal, NewType
-
-import msgspec
+from typing import Literal, NewType
 
 BlockKey = NewType("BlockKey", bytes)
 PinHandle = str
@@ -24,7 +22,8 @@ class RegionDescriptor:
     """Registered memory containing ``count`` fixed-size transfer elements.
 
     ``stride=0`` means contiguous elements. The registered extent includes
-    gaps between elements; ``info`` identifies their configured pool.
+    gaps between elements. ``label`` names the pool; names must be unique
+    among framework registrations.
     """
 
     mem_type: str = "DRAM"
@@ -33,35 +32,22 @@ class RegionDescriptor:
     stride: int = 0
     count: int = 1
     size: int
-    info: str = ""
+    label: str = ""
 
 
-@dataclass(frozen=True)
-class MemDescriptor:
-    """Transport-addressable memory span for a pinned KV block.
+@dataclass(frozen=True, kw_only=True)
+class MemoryRef:
+    """One element in a named registered buffer.
 
-    Field constraints are enforced by msgspec only when decoding or converting
-    wire data. Direct construction is trusted and unvalidated.
-
-    Endpoint, memory type, and info stay per span to keep descriptor lists flat.
-    In a scenario where one key spans multiple workers and NIXL agents, grouping
-    its spans by endpoint and memory type would add two hierarchy levels merely
-    to factor out values typically shared by reference.
-
-    ``info`` currently identifies the descriptor's pool in ``pool_layouts``; an empty
-    string names the single unnamed pool. This generic field may support additional
-    metadata conventions later.
+    ``label`` selects the registered pool by exact name.
     """
 
-    end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
-    mem_type: Annotated[str, msgspec.Meta(min_length=1)]
-    addr: Annotated[int, msgspec.Meta(ge=0)]
-    size: Annotated[int, msgspec.Meta(gt=0)]
-    device_Id: Annotated[int, msgspec.Meta(ge=0)]
-    info: str = ""
+    end_point_name: str
+    label: str = ""
+    element_index: int
 
 
-PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]] | None
+PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemoryRef] | None]] | None
 
 
 class KVCRStartupError(RuntimeError):
@@ -71,9 +57,11 @@ class KVCRStartupError(RuntimeError):
 class TransferError(RuntimeError):
     """Lifecycle report for memory exposed by a failed transfer.
 
-    Source reports identify the original keys and local buffers. Destination
-    reports contain only local regions. ``quiesced`` clears this operation's
-    hazard; it never makes the failed data valid or clears other operations.
+    References identify local buffers. ``source_owners`` identifies each key's
+    owner; ``destination_owner`` applies to all destination regions. Owners are
+    ``framework`` or ``kvcr`` and select the corresponding registration namespace.
+    ``quiesced`` clears this operation's hazard; it never makes the failed data
+    valid or clears other operations.
     Handles are local to this KVCR instance and report side (source/destination).
     """
 
@@ -83,16 +71,21 @@ class TransferError(RuntimeError):
         op_handle: OpHandle,
         *,
         state: Literal["uncertain", "quiesced"] = "uncertain",
-        source_blocks: dict[BlockKey, list[MemDescriptor]] | None = None,
-        destination_regions: list[MemDescriptor] | None = None,
+        source_blocks: dict[BlockKey, list[MemoryRef]] | None = None,
+        source_owners: dict[BlockKey, Literal["framework", "kvcr"]] | None = None,
+        destination_regions: list[MemoryRef] | None = None,
+        destination_owner: Literal["framework", "kvcr"] | None = None,
     ) -> None:
         self.op_handle = op_handle
         self.state = state
         self.source_blocks = source_blocks
+        self.source_owners = source_owners
         self.destination_regions = destination_regions
+        self.destination_owner = destination_owner
         super().__init__(
             f"{message}: state={state}, op={op_handle}, sources={source_blocks!r}, "
-            f"destinations={destination_regions!r}"
+            f"source_owners={source_owners!r}, destinations={destination_regions!r}, "
+            f"destination_owner={destination_owner!r}"
         )
 
 
@@ -106,7 +99,8 @@ class OpEntryStatus(Enum):
 @dataclass(frozen=True)
 class OpEntryResult:
     status: OpEntryStatus
-    descriptors: list[MemDescriptor] | None = None
+    # Fetch locations in KVCR-owned memory, valid until release.
+    descriptors: list[MemoryRef] | None = None
     release_handle: ReleaseHandle | None = None
 
     @property

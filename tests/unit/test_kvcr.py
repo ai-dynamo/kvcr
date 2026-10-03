@@ -42,8 +42,9 @@ from kvcr.guard_protocol import KVCRPoolHold
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.memory import KVCRPoolSpec
+from kvcr.progress import _TransferRef
 from kvcr.remote_fw_dram import _FwMemResidency
-from kvcr.types import BlockKey, KVCRStartupError
+from kvcr.types import BlockKey, KVCRStartupError, MemoryRef, RegionDescriptor
 
 
 def _fake_hold(**fields: Any) -> SimpleNamespace:
@@ -62,7 +63,14 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     local = ctypes.create_string_buffer(block_size)
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _new_local_kvcr(agent, local, 1)
+    kvcr = _new_local_kvcr(
+        agent,
+        local,
+        1,
+        framework_regions=[
+            RegionDescriptor(addr=ctypes.addressof(primary), size=block_size, count=3)
+        ],
+    )
     backend = kvcr._core._local_dram
     assert backend is not None
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
@@ -78,16 +86,12 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
         observed.append((key, None if residency is None else residency.slots))
 
     backend.observe_residency(observe)
-    address = ctypes.addressof(primary)
-
-    first = kvcr.deposit({keys[0]: [_mem_descriptor(address, block_size)]})
+    first = kvcr.deposit({keys[0]: [_mem_descriptor(0)]})
     _poll_until(kvcr, lambda done: first in dict(done))
     assert observed == [(keys[0], [("", 0)])]
 
     agent.state = "ERR"
-    failed = kvcr.deposit(
-        {keys[1]: [_mem_descriptor(address + block_size, block_size)]}
-    )
+    failed = kvcr.deposit({keys[1]: [_mem_descriptor(1)]})
     failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[failed]
     assert not failed_result[keys[1]].success
     assert observed == [
@@ -96,9 +100,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     ]
 
     agent.state = "DONE"
-    third = kvcr.deposit(
-        {keys[2]: [_mem_descriptor(address + 2 * block_size, block_size)]}
-    )
+    third = kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
     _poll_until(kvcr, lambda done: third in dict(done))
     backend.acquire_sources((keys[2],))
     backend.retire_sources((keys[2],))
@@ -502,6 +504,9 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
     with pytest.raises(ValueError, match="expected layout"):
         kvcr.fetch((BlockKey(b"key"),))
     kvcr.fetch((BlockKey(b"key"),), expected_layout=["named"])
+    kvcr.fetch((BlockKey(b"key"),), expected_layout=["named", "named"])
+    with pytest.raises(ValueError):
+        kvcr.fetch((BlockKey(b"key"),), expected_layout=["missing"])
 
 
 def _assert_state_lock_available(core) -> None:
@@ -524,7 +529,12 @@ def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> 
     primary = ctypes.create_string_buffer(16)
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _new_local_kvcr(agent, local, 1)
+    kvcr = _new_local_kvcr(
+        agent,
+        local,
+        1,
+        framework_regions=[RegionDescriptor(addr=ctypes.addressof(primary), size=16)],
+    )
     core = kvcr._core
     owner = core._progress if method == "poll_completed" else core
     boundary = {
@@ -554,7 +564,7 @@ def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> 
         assert errors == [error]
     else:
         key = BlockKey(b"key")
-        blocks = {key: [_mem_descriptor(ctypes.addressof(primary), 16)]}
+        blocks = {key: [_mem_descriptor(0)]}
         handle = getattr(kvcr, method)((key,) if method == "fetch" else blocks)
         result = dict(_poll_until(kvcr, lambda done: handle in dict(done)))[handle]
         assert result[key].success is (method == "deposit")
@@ -603,6 +613,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
 
     main_thread = threading.get_ident()
     lifecycle_threads: list[int] = []
+    preparations: list[tuple[str, str, int]] = []
     agents: list[Any] = []
 
     class LifecycleAgent(FakeNixlAgent):
@@ -621,6 +632,19 @@ def test_nixl_lifecycle_stays_on_progress_thread(
             lifecycle_threads.append(threading.get_ident())
             super().deregister_memory(handle)
 
+        def prep_xfer_dlist(self, agent_name, descs, *, mem_type, backends):
+            lifecycle_threads.append(threading.get_ident())
+            assert len(self.registrations) == 9
+            preparations.append((agent_name, mem_type, len(descs)))
+            return super().prep_xfer_dlist(
+                agent_name, descs, mem_type=mem_type, backends=backends
+            )
+
+        def release_dlist_handle(self, handle):
+            lifecycle_threads.append(threading.get_ident())
+            assert not self.deregistered
+            super().release_dlist_handle(handle)
+
     pinning = FakePrimaryPinning()
     monkeypatch.setattr(kvcr_progress, "nixl_agent", LifecycleAgent)
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
@@ -628,7 +652,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     kvcr = KVCR(
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layouts=[("full", 64), ("swa", 32)],
+            pool_layouts=[("full", 64), ("swa", 32), ("k", 64), ("v", 64), ("k2", 64)],
             nixl_listen_port=1234,
         ),
         KVCRBindings(
@@ -641,37 +665,44 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ),
         KVCRBackendConfigs(
             framework_regions=[
-                RegionDescriptor(addr=128, count=4, size=64, info="full"),
+                RegionDescriptor(addr=128, size=64, label="full", count=4),
                 RegionDescriptor(
-                    mem_type="VRAM",
-                    device_Id=1,
                     addr=1024,
-                    stride=128,
-                    count=2,
                     size=64,
-                    info="full",
-                ),
-                RegionDescriptor(
                     mem_type="VRAM",
                     device_Id=1,
-                    addr=1088,
+                    label="k",
                     stride=128,
                     count=2,
-                    size=64,
-                    info="full",
                 ),
                 RegionDescriptor(
+                    addr=1088,
+                    size=64,
+                    mem_type="VRAM",
+                    device_Id=1,
+                    label="v",
+                    stride=128,
+                    count=2,
+                ),
+                RegionDescriptor(
+                    addr=1024,
+                    size=64,
                     mem_type="VRAM",
                     device_Id=2,
-                    addr=1024,
+                    label="k2",
                     stride=128,
                     count=2,
-                    size=64,
-                    info="full",
                 ),
             ],
             local_dram=LocalDramOptions(
-                [("full", 384, 128), ("swa", 512, 64)], "LOCAL"
+                [
+                    ("full", 384, 128),
+                    ("swa", 512, 64),
+                    ("k", 2048, 64),
+                    ("v", 2112, 64),
+                    ("k2", 2176, 64),
+                ],
+                "LOCAL",
             ),
             remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
         ),
@@ -693,8 +724,18 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ([(1024, 192, 2, "")], "VRAM"),
         ([(384, 128, 0, "")], "DRAM"),
         ([(512, 64, 0, "")], "DRAM"),
+        ([(2048, 64, 0, "")], "DRAM"),
+        ([(2112, 64, 0, "")], "DRAM"),
+        ([(2176, 64, 0, "")], "DRAM"),
     ]
-    assert agent.deregistered == [6, 5, 4, 3, 2, 1]
+    assert agent.deregistered == [9, 8, 7, 6, 5, 4, 3, 2, 1]
+    assert preparations == [
+        ("", "DRAM", 6),
+        ("", "VRAM", 3),
+        ("target", "DRAM", 6),
+        ("target", "VRAM", 3),
+    ]
+    assert not kvcr._core._progress._prepared
 
 
 @pytest.mark.parametrize(
@@ -708,15 +749,15 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         {"count": True},
         {"stride": 1 << 63, "count": 3},
         {"mem_type": ""},
-        {"info": 1},
-        {"info": "missing"},
+        {"label": 1},
+        {"label": "missing"},
         {"size": 32},
     ],
 )
 def test_registration_is_validated_before_startup(fields) -> None:
     from kvcr.types import RegionDescriptor
 
-    region = RegionDescriptor(**({"addr": 128, "size": 64, "info": "full"} | fields))
+    region = RegionDescriptor(**({"addr": 128, "size": 64, "label": "full"} | fields))
     agent = FakeNixlAgent()
     with pytest.raises(ValueError, match="registration"):
         _new_kvcr(
@@ -727,6 +768,30 @@ def test_registration_is_validated_before_startup(fields) -> None:
             framework_regions=[region],
         )
     assert agent.registrations == []
+
+
+@pytest.mark.parametrize("count", [2**30, 2**30 + 1])
+def test_registration_bounds_aggregate_prepared_indices(count) -> None:
+    from kvcr.types import RegionDescriptor
+
+    agent = FakeNixlAgent()
+    with pytest.raises(ValueError, match="int32") if count > 2**30 else nullcontext():
+        kvcr = _new_kvcr(
+            agent,
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            KVCRConfig(
+                nixl_agent_name="target", pool_layouts=[("full0", 1), ("full1", 1)]
+            ),
+            framework_regions=[
+                RegionDescriptor(
+                    addr=index * 2**32, size=1, label=f"full{index}", count=count
+                )
+                for index in range(2)
+            ],
+        )
+        kvcr.close()
+    assert bool(agent.registrations) == (count == 2**30)
 
 
 @pytest.fixture
@@ -876,3 +941,73 @@ def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
     else:
         # Forgotten as well as released, so nothing can give the pool back twice.
         assert kvcr._pool_hold is None
+
+
+def test_named_reference_validation_and_address_reporting():
+    regions = [
+        RegionDescriptor(addr=1000, size=16, label="pool", stride=64, count=3),
+        RegionDescriptor(
+            addr=2000,
+            size=16,
+            mem_type="VRAM",
+            device_Id=3,
+            label="gpu",
+            stride=32,
+            count=4,
+        ),
+    ]
+    config = KVCRConfig(
+        nixl_agent_name="target", pool_layouts=[("pool", 16), ("gpu", 16)]
+    )
+    agent = FakeNixlAgent()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config,
+        framework_regions=regions,
+    )
+    core = kvcr._core
+    ref = MemoryRef(end_point_name="target", label="gpu", element_index=2)
+    [internal] = core._normalize_descriptors([ref])
+    assert internal == _TransferRef("target", 2, "gpu")
+    assert core._normalize_descriptors(
+        [MemoryRef(end_point_name="target", label="pool", element_index=1)]
+    ) == [_TransferRef("target", 1, "pool")]
+    span = core._address_descriptor(internal)
+    assert (span.addr, span.size, span.mem_type, span.device_Id) == (
+        2064,
+        16,
+        "VRAM",
+        3,
+    )
+    assert core._descriptor_bytes([internal, internal]) == 32
+    with pytest.raises(ValueError, match="element_index"):
+        kvcr.deliver(
+            {
+                BlockKey(b"invalid"): [
+                    MemoryRef(end_point_name="target", label="gpu", element_index=4)
+                ]
+            }
+        )
+    assert agent.xfers == agent.transfers == []
+    for bad in (
+        MemoryRef(end_point_name="other", label="gpu", element_index=2),
+        MemoryRef(end_point_name="target", label="gpu", element_index=-1),
+        MemoryRef(end_point_name="target", label="gpu", element_index=True),
+        MemoryRef(end_point_name="target", label="wrong", element_index=0),
+        MemoryRef(end_point_name="target", label=None, element_index=0),
+    ):
+        with pytest.raises(ValueError):
+            core._normalize_descriptors([bad])
+    for bad in (span, internal):
+        with pytest.raises(ValueError, match="MemoryRef"):
+            core._normalize_descriptors([bad])
+    with pytest.raises(ValueError, match="registration names must be unique"):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            config,
+            framework_regions=[regions[0], regions[0]],
+        )

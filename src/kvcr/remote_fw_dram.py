@@ -14,7 +14,7 @@ Source: start_write -> local claim/framework pin -> write -> write_done.
 import logging
 import math
 import time
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -27,15 +27,16 @@ from .core import (
     DURATION_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
+    _validate_memory_regions,
     logger,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
 from .local_dram import _LocalDramState
-from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp
+from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _RegionMaps, _TransferRef
 from .types import (
     BlockKey,
     CacheTier,
-    MemDescriptor,
+    MemoryRef,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
@@ -48,12 +49,12 @@ if TYPE_CHECKING:
     from .core import _KVCRCore
 
 
-_MEM_DESCRIPTOR_LISTS_TYPE = tuple[tuple[MemDescriptor, ...], ...]
+_MEMORY_REF_LISTS_TYPE = tuple[tuple[_TransferRef, ...], ...]
 
 
 @dataclass(slots=True)
 class _FwMemResidency:
-    descriptors: list[MemDescriptor]
+    descriptors: list[_TransferRef]
     pin_handle: PinHandle
 
 
@@ -100,7 +101,7 @@ class _TargetPullOp(_RemoteOp):
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     # Keys sent to the source; keys also includes remembered misses.
     ordered_keys: tuple[BlockKey, ...] = ()
-    dst_descriptors: tuple[tuple[MemDescriptor, ...], ...] = ()
+    dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
@@ -205,12 +206,13 @@ class _TargetPullOp(_RemoteOp):
                     self.op_id[1],
                     self.remote_ctrl_ep,
                     len(completed_keys),
-                    _descriptor_bytes(
-                        descriptors
+                    backend._kvcr._descriptor_bytes(
+                        descriptor
                         for key, descriptors in zip(
                             self.ordered_keys, self.dst_descriptors
                         )
                         if key in completed_keys
+                        for descriptor in descriptors
                     ),
                     result,
                 )
@@ -262,10 +264,10 @@ class _SourcePinOp(_Op):
 
     started_at: float | None
     deadline: float
-    remote_agent: bytes
+    remote_agent: str
     op_handle: int
     ordered_keys: tuple[BlockKey, ...]
-    dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
+    dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
@@ -285,13 +287,13 @@ class _SourceWriteOp(_RemoteOp):
     """Progress-owned NIXL write from prepared source descriptors."""
 
     state: _SourceWriteState
-    remote_agent: bytes
+    remote_agent: str
     op_handle: int
     source_keys: tuple[BlockKey, ...]
-    dst_descriptors: tuple[tuple[MemDescriptor, ...], ...]
+    dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     framework_pins: set[PinHandle] = field(default_factory=set)
-    src_descriptors: tuple[tuple[MemDescriptor, ...], ...] = ()
+    src_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     transfer_id: int | None = None
     success: bool = False
     completed_indices: tuple[int, ...] = ()
@@ -437,7 +439,11 @@ class _SourceWriteOp(_RemoteOp):
                 self.op_id[1],
                 self.route[0],
                 len(self.source_keys) if self.success else 0,
-                _descriptor_bytes(self.src_descriptors) if self.success else 0,
+                backend._kvcr._descriptor_bytes(
+                    chain.from_iterable(self.src_descriptors)
+                )
+                if self.success
+                else 0,
                 result,
             )
         self.state = _SourceWriteState.FINISHED
@@ -516,7 +522,7 @@ class _RemoteFWDram:
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
-        self._remote_agents_by_target: dict[str, tuple[bytes, bytes]] = {}
+        self._remote_agents_by_target: dict[str, tuple[bytes, str, _RegionMaps]] = {}
         # Bumped whenever a name's route is replaced: NIXL hands the same
         # handle back for a reused name, so queued operations from the dead
         # generation must be fenced by number, not by handle.
@@ -578,7 +584,7 @@ class _RemoteFWDram:
 
     def _start_target_pull(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         deadline: float,
         op_handle: OpHandle,
@@ -627,7 +633,7 @@ class _RemoteFWDram:
                 op_handle,
                 current_hint.source,
                 len(keys),
-                _descriptor_bytes(op.dst_descriptors),
+                kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
         kvcr._add_block_dependencies(op, new_operation=True)
         kvcr._progress.submit(op)
@@ -636,7 +642,7 @@ class _RemoteFWDram:
     def deliver(
         self,
         op_handle: OpHandle,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         *,
         deadline: float,
@@ -660,7 +666,7 @@ class _RemoteFWDram:
 
     def fetch(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         deadline: float,
         *,
@@ -961,6 +967,7 @@ class _RemoteFWDram:
         )
         if includes_metadata:
             payload["target_agent_metadata"] = progress.nixl_agent_metadata
+            payload["target_regions"] = progress._memory_regions
         try:
             sent = self._control.send(endpoint, msgspec.msgpack.encode(payload))
         except Exception:
@@ -988,6 +995,8 @@ class _RemoteFWDram:
         try:
             target_agent, _ = self._remote_agent(progress, payload)
             self._ack_target_metadata(progress, payload, target_agent)
+        except _RemoteAgentCleanupError:
+            raise
         except Exception:
             return
 
@@ -1087,11 +1096,8 @@ class _RemoteFWDram:
             ):
                 raise TypeError("invalid remaining_timeout_ms")
             keys = _message_keys(payload)
-            dst_descriptors = tuple(
-                tuple(self._kvcr._normalize_descriptors(list(descriptors)))
-                for descriptors in msgspec.convert(
-                    payload["dst_descriptors"], type=_MEM_DESCRIPTOR_LISTS_TYPE
-                )
+            dst_descriptors = msgspec.convert(
+                payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
             )
         except (KeyError, TypeError, ValueError, msgspec.ValidationError) as error:
             logger.warning("KVCR malformed start_write op=%d: %s", op_handle, error)
@@ -1108,11 +1114,21 @@ class _RemoteFWDram:
         )
         deadline = received_at + remaining_timeout_ms / 1000
         try:
-            fallback_target = dst_descriptors[0][0].end_point_name
+            fallback_target = (
+                dst_descriptors[0][0].end_point_name if dst_descriptors[0] else None
+            )
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
+            for descriptors in dst_descriptors:
+                self._kvcr._validate_descriptors(
+                    list(descriptors),
+                    regions=self._remote_agents_by_target[target_agent][2],
+                    agent_name=target_agent,
+                )
             self._ack_target_metadata(progress, payload, target_agent)
+        except _RemoteAgentCleanupError:
+            raise
         except Exception:
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
@@ -1163,7 +1179,7 @@ class _RemoteFWDram:
                 op_id[1],
                 target_agent,
                 len(keys),
-                _descriptor_bytes(dst_descriptors),
+                self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
         source_pin = _SourcePinOp(
@@ -1187,7 +1203,7 @@ class _RemoteFWDram:
         if kvcr._local_dram is None:
             return False
         layouts = [
-            [descriptor.info for descriptor in destination]
+            [descriptor.label for descriptor in destination]
             for destination in source_pin.dst_descriptors
         ]
         if not kvcr._state_lock.acquire(blocking=False):
@@ -1264,9 +1280,7 @@ class _RemoteFWDram:
             destination = source_pin.dst_descriptors[index]
             if source is None:
                 continue
-            if [descriptor.info for descriptor in source] != [
-                descriptor.info for descriptor in destination
-            ]:
+            if [d.label for d in source] != [d.label for d in destination]:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",
                     source_pin.op_handle,
@@ -1330,8 +1344,12 @@ class _RemoteFWDram:
         payload: Mapping[str, Any],
         op_handle: OpHandle,
     ) -> None:
+        # TODO: reuse this request's peer resolution; if it failed, refuse over
+        # control instead of retrying setup.
         try:
             _, remote_agent = self._remote_agent(progress, payload)
+        except _RemoteAgentCleanupError:
+            raise
         except Exception:
             # A promoted Guard adopts the dead primary's control endpoint but
             # not its peer table, so there is no NIXL route home to report on.
@@ -1609,7 +1627,7 @@ class _RemoteFWDram:
     def _install_framework_pin(
         self,
         keys: Collection[BlockKey],
-        pin_result: tuple[PinHandle, Mapping[BlockKey, list[MemDescriptor] | None]],
+        pin_result: tuple[PinHandle, Mapping[BlockKey, list[MemoryRef] | None]],
     ) -> PinHandle | None:
         try:
             pin_handle, descriptors = pin_result
@@ -1647,7 +1665,7 @@ class _RemoteFWDram:
         self,
         keys: tuple[BlockKey, ...],
     ) -> (
-        tuple[dict[BlockKey, list[MemDescriptor]], set[PinHandle]]
+        tuple[dict[BlockKey, list[_TransferRef]], set[PinHandle]]
         | _PendingFrameworkSources
         | None
     ):
@@ -1680,7 +1698,7 @@ class _RemoteFWDram:
                     framework_pins=held_framework_pins,
                 )
 
-        descriptors: dict[BlockKey, list[MemDescriptor]] = {}
+        descriptors: dict[BlockKey, list[_TransferRef]] = {}
         framework_pins: set[PinHandle] = set()
         for key in keys:
             record = kvcr._block_record_map.get(key)
@@ -1744,29 +1762,45 @@ class _RemoteFWDram:
         progress: _KVCRProgress,
         payload: Mapping[str, Any],
         fallback_target: str | None = None,
-    ) -> tuple[str, bytes]:
+    ) -> tuple[str, str]:
+        if progress._stop_requested:
+            raise RuntimeError("KVCR progress is stopping")
         kvcr = self._kvcr
         agent = progress.nixl_agent
         target_agent = payload.get("target_agent", fallback_target)
         if not isinstance(target_agent, str) or not target_agent:
             raise TypeError("missing target agent")
         target_metadata = payload.get("target_agent_metadata")
+        regions = (
+            msgspec.convert(payload.get("target_regions", ({}, {})), type=_RegionMaps)
+            if isinstance(target_metadata, bytes)
+            else None
+        )
+        if regions is not None:
+            if any(
+                name != region.label
+                for catalog in regions
+                for name, region in catalog.items()
+            ):
+                raise ValueError(
+                    "registration dictionary names must match region label"
+                )
+            _validate_memory_regions([*regions[0].values(), *regions[1].values()])
         cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
-            cached_metadata, remote_agent = cached
+            cached_metadata, remote_agent, cached_regions = cached
             if not isinstance(target_metadata, bytes) or (
-                target_metadata == cached_metadata
+                target_metadata == cached_metadata and regions == cached_regions
             ):
                 reused_at = kvcr._timer()
                 self._record_progress_duration("peer_setup", reused_at, "reused")
                 return target_agent, remote_agent
-            # Same name, new metadata: the process behind the name was replaced,
-            # and the cached route still points at the dead one. A route that
-            # cannot be unloaded propagates: the retained entry retries next
-            # time instead of silently keeping the dead destination.
-            remove = getattr(agent, "remove_remote_agent", None)
-            if remove is not None:
-                remove(remote_agent)
+            # TODO: distinguish peer restarts from additive metadata updates;
+            # load additions without disconnecting the existing peer. Changed
+            # metadata alone does not establish a restart.
+            # Refresh can stay refused indefinitely: operation timeouts do not
+            # release the old peer's native transfers.
+            _unload_remote_agent(progress, remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)
             self._route_generation[target_agent] = (
                 self._route_generation.get(target_agent, 0) + 1
@@ -1776,13 +1810,34 @@ class _RemoteFWDram:
             if not isinstance(target_metadata, bytes):
                 raise TypeError("missing target agent metadata")
             remote_agent = agent.add_remote_agent(target_metadata)
-            if not isinstance(remote_agent, bytes) or not remote_agent:
+            if isinstance(remote_agent, bytes):
+                remote_agent = remote_agent.decode()
+            if not isinstance(remote_agent, str) or not remote_agent:
                 raise RuntimeError("add_remote_agent returned no agent name")
+            owned = (
+                remote_agent == agent.name
+                or remote_agent in progress._prepared
+                or any(
+                    cached[1] == remote_agent
+                    for cached in self._remote_agents_by_target.values()
+                )
+            )
+            if owned:
+                raise RuntimeError("NIXL remote agent is already initialized")
+            try:
+                progress.prepare_memory(remote_agent, regions, owner_name=target_agent)
+            except BaseException:
+                _unload_remote_agent(progress, remote_agent)
+                raise
+            self._remote_agents_by_target[target_agent] = (
+                target_metadata,
+                remote_agent,
+                regions,
+            )
         except Exception:
             self._record_progress_duration("peer_setup", started_at, "failed")
             raise
         self._record_progress_duration("peer_setup", started_at, "connected")
-        self._remote_agents_by_target[target_agent] = (target_metadata, remote_agent)
         return target_agent, remote_agent
 
     # Progress notifications, telemetry, and resource cleanup.
@@ -1884,7 +1939,7 @@ class _RemoteFWDram:
     def _send_write_done(
         self,
         progress: _KVCRProgress,
-        remote_agent: bytes,
+        remote_agent: str,
         op_handle: OpHandle,
         success: bool,
         *,
@@ -1913,13 +1968,28 @@ class _RemoteFWDram:
             logger.warning("KVCR write_done notification failed for op=%d", op_handle)
 
 
+class _RemoteAgentCleanupError(RuntimeError):
+    """Native peer cleanup failed; propagate to the progress-thread handler."""
+
+
+def _unload_remote_agent(progress: _KVCRProgress, remote_agent: str) -> None:
+    if any(
+        state.remote_side_agent == remote_agent
+        for state in progress._active_transfers.values()
+    ):
+        raise RuntimeError(f"NIXL remote agent {remote_agent!r} has active transfers")
+    try:
+        progress.release_prepared(remote_agent)
+        progress.nixl_agent.remove_remote_agent(remote_agent)
+    except Exception as error:
+        raise _RemoteAgentCleanupError(
+            f"NIXL remote agent {remote_agent!r} cleanup failed"
+        ) from error
+
+
 # Control wire-format helpers.
 
 _NOTIF_PREFIX = b"KVCR:"
-
-
-def _descriptor_bytes(groups: Iterable[Iterable[MemDescriptor]]) -> int:
-    return sum(descriptor.size for group in groups for descriptor in group)
 
 
 def _message_keys(payload: Mapping[str, Any]) -> tuple[BlockKey, ...]:
