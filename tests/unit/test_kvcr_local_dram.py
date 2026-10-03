@@ -225,6 +225,11 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     claim = kvcr.fetch((first,), expected_layout=layout)
     result = dict(_poll_until(kvcr, lambda done: claim in dict(done)))[claim][first]
     assert result.success and result.release_handle is not None
+    assert result.descriptors == [
+        _mem_descriptor(0, "full"),
+        _mem_descriptor(0, "swa"),
+        _mem_descriptor(1, "swa"),
+    ]
     wrong = kvcr.deliver({first: descriptors[1:]})
     assert not dict(kvcr.poll_completed())[wrong][first].success
     kvcr.release([result.release_handle])
@@ -639,16 +644,19 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
     deposit_result = completed[deposit][first_key]
     assert deposit_result.success
+    assert deposit_result.descriptors is None
     deposit_claim = deposit_result.release_handle
     assert deposit_claim is not None
 
     assert kvcr.query((first_key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     fetch_result = completed[fetch][first_key]
+    assert fetch_result.descriptors == [_mem_descriptor()]
     fetch_claim = fetch_result.release_handle
     assert fetch_claim is not None
 
     ready_fetch = kvcr.fetch((first_key,))
     ready_fetch_result = dict(kvcr.poll_completed())[ready_fetch][first_key]
+    assert ready_fetch_result.descriptors == [_mem_descriptor()]
     ready_fetch_claim = ready_fetch_result.release_handle
     assert ready_fetch_claim is not None
 

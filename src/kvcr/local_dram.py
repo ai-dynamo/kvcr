@@ -16,6 +16,7 @@ from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _TransferRef
 from .types import (
     BlockKey,
     CacheTier,
+    MemoryRef,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
@@ -303,7 +304,9 @@ class _LocalDram:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 elif residency.state is _LocalDramState.READY:
                     op.results[key] = (
-                        self._new_public_claim(key, residency)
+                        self._new_public_claim(
+                            key, residency, include_descriptors=False
+                        )
                         if no_evict
                         else OpEntryResult(OpEntryStatus.SUCCESS)
                     )
@@ -400,7 +403,9 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.READY:
                 self._kvcr._record_access((key,))
-                op.results[key] = self._new_public_claim(key, residency)
+                op.results[key] = self._new_public_claim(
+                    key, residency, include_descriptors=True
+                )
             elif residency.state is _LocalDramState.DISCARDING:
                 # A discarded fill still owns its slot, so this block cannot be
                 # reserved yet. Wait for the slot instead of failing a key a
@@ -660,7 +665,11 @@ class _LocalDram:
                         if residency_op.op_id[0] == "fetch":
                             self._kvcr._record_access((key,))
                         residency_op.results[key] = (
-                            self._new_public_claim(key, residency)
+                            self._new_public_claim(
+                                key,
+                                residency,
+                                include_descriptors=residency_op.op_id[0] == "fetch",
+                            )
                             if residency_op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
@@ -917,7 +926,11 @@ class _LocalDram:
                         op.results[waiter.key] = OpEntryResult(OpEntryStatus.FAILED)
                     elif residency.state is _LocalDramState.READY:
                         op.results[waiter.key] = (
-                            self._new_public_claim(waiter.key, residency)
+                            self._new_public_claim(
+                                waiter.key,
+                                residency,
+                                include_descriptors=op.op_id[0] == "fetch",
+                            )
                             if op.claim_on_ready
                             else OpEntryResult(OpEntryStatus.SUCCESS)
                         )
@@ -978,12 +991,27 @@ class _LocalDram:
         self,
         key: BlockKey,
         residency: _LocalDramResidency,
+        *,
+        include_descriptors: bool,
     ) -> OpEntryResult:
         self._acquire_claim(key, residency)
         handle = ReleaseHandle(self._next_release_handle)
         self._next_release_handle += 1
         self._public_claims[handle] = (key, residency)
-        return OpEntryResult(OpEntryStatus.SUCCESS, handle)
+        return OpEntryResult(
+            OpEntryStatus.SUCCESS,
+            [
+                MemoryRef(
+                    end_point_name=self._kvcr.nixl_agent_name,
+                    label=pool_name,
+                    element_index=slot,
+                )
+                for pool_name, slot in residency.slots
+            ]
+            if include_descriptors
+            else None,
+            handle,
+        )
 
     def _acquire_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         if residency.state is not _LocalDramState.READY:

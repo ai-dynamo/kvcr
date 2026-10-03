@@ -37,7 +37,7 @@ class RegionDescriptor:
 
 @dataclass(frozen=True, kw_only=True)
 class MemoryRef:
-    """One element in a framework's named registered buffer.
+    """One element in a named registered buffer.
 
     ``label`` selects the registered pool by exact name.
     """
@@ -94,6 +94,8 @@ class OpEntryStatus(Enum):
 @dataclass(frozen=True)
 class OpEntryResult:
     status: OpEntryStatus
+    # Fetch locations in KVCR-owned memory, valid until release.
+    descriptors: list[MemoryRef] | None = None
     release_handle: ReleaseHandle | None = None
 
     @property

@@ -1344,6 +1344,8 @@ class _RemoteFWDram:
         payload: Mapping[str, Any],
         op_handle: OpHandle,
     ) -> None:
+        # TODO: reuse this request's peer resolution; if it failed, refuse over
+        # control instead of retrying setup.
         try:
             _, remote_agent = self._remote_agent(progress, payload)
         except _RemoteAgentCleanupError:
@@ -1796,6 +1798,8 @@ class _RemoteFWDram:
             # TODO: distinguish peer restarts from additive metadata updates;
             # load additions without disconnecting the existing peer. Changed
             # metadata alone does not establish a restart.
+            # Refresh can stay refused indefinitely: operation timeouts do not
+            # release the old peer's native transfers.
             _unload_remote_agent(progress, remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)
             self._route_generation[target_agent] = (

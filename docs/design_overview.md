@@ -160,7 +160,7 @@ kvcr = KVCR(
 
 kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
-kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion includes per-key status and a release handle
+kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion includes per-key status, locations, and a release handle
 kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemoryRef]]
 kvcr.release(release_handle_list) -> list[Result[None, Error]]      # release fetch/no-evict claims
 kvcr.align_sequence(ordered_keys: list[BlockKey], use_current_time=False) -> None
@@ -180,7 +180,7 @@ framework.release_pin(pin_handle)                                               
 
 Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`label`) must be unique and identify configured pools.
 
-`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, registration label, and element index. The label selects a registered buffer by exact pool name. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of pool names and returns per-key status and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label.
+`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, registration label, and element index. The label selects a registered buffer by exact pool name. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of pool names and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label.
 
 ### Operating flow
 

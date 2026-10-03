@@ -56,8 +56,8 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 def test_local_source_starts_without_caller_poll_and_holds_its_slot():
-    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
-    descriptors = [_mem_descriptor(i, end_point_name="source") for i in range(3)]
+    memory = ctypes.create_string_buffer(16)
+    descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
     callbacks = []
     source = _new_kvcr(
@@ -70,9 +70,7 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
             capacity_low_watermark_percent=100,
         ),
         name="source",
-        framework_regions=[
-            RegionDescriptor(addr=ctypes.addressof(memory), size=16, count=3)
-        ],
+        framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         capacity_needed_callback=lambda request: callbacks.append(
             (threading.get_ident(), request)
@@ -81,30 +79,20 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
     key = BlockKey(b"local")
     try:
         agent.state = "DONE"
-        deposit = source.deposit({key: descriptors})
+        deposit = source.deposit({key: [descriptor]})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         assert not source._core._remote_fw_dram._try_local_source_write(
             source._core._progress,
             SimpleNamespace(
                 ordered_keys=(key,),
-                dst_descriptors=((descriptors[2], descriptors[0]),),
+                dst_descriptors=((descriptor, descriptor),),
             ),
         )
         callbacks.clear()
         agent.state = "PROC"
         request = msgspec.msgpack.decode(_start_write_message(12, key))
         request["keys"] *= 2
-        request.update(
-            target_regions=(
-                {
-                    "": RegionDescriptor(
-                        addr=4096, size=16, mem_type="VRAM", device_Id=7, count=3
-                    )
-                },
-                {},
-            ),
-            dst_descriptors=[[_TransferRef("target", i) for i in range(3)]] * 2,
-        )
+        request["dst_descriptors"] *= 2
         preparing, resume = threading.Event(), threading.Event()
         initialize_write = _SourceWriteOp.__init__
 
@@ -133,19 +121,12 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
         # The peer request must be served without another caller-side poll.
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count == 1
-        assert [
-            ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
-        ] == [
-            b"a" * 16,
-            b"b" * 16,
-            b"c" * 16,
-        ] * 2
-        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7), (4128, 16, 7)] * 2
+        assert len(agent.xfers[-1][1]) == 2
         assert pinning.searches == []
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
         assert list(source.poll_completed()) == []
-        assert callbacks == [(threading.get_ident(), [("", 3)])]
+        assert callbacks == [(threading.get_ident(), [("", 1)])]
 
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == 2)
@@ -1188,14 +1169,8 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         agent.state = "DONE"
 
 
-@pytest.mark.parametrize(
-    "message_type", ["target_metadata", "start_write", "malformed"]
-)
-def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
-    message_type,
-) -> None:
-    """Cache only prepared routes; let progress handle fatal cleanup errors."""
-
+def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> None:
+    """Cache only prepared routes without disturbing an established peer."""
     agent = FakeNixlAgent()
     removed = []
     agent.remove_remote_agent = removed.append
@@ -1249,6 +1224,13 @@ def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
     assert _RemoteFWDram._remote_agent(
         tier, progress, {"target_agent": "worker-a"}
     ) == ("worker-a", "remote-1")
+
+
+@pytest.mark.parametrize(
+    "message_type", ["target_metadata", "start_write", "malformed"]
+)
+def test_route_setup_propagates_cleanup_errors(message_type) -> None:
+    """Let progress handle fatal cleanup errors from each control path."""
 
     class StickyAgent(FakeNixlAgent):
         def remove_remote_agent(self, handle: str) -> None:

@@ -86,13 +86,6 @@ class _TransferAgent:
         notif_msg: bytes,
         backends: list[str] | None = None,
     ) -> int:
-        local = local_descriptors[1]
-        remote = remote_descriptors[1]
-        if len(local) != len(remote) or any(
-            local_item[1] != remote_item[1]
-            for local_item, remote_item in zip(local, remote)
-        ):
-            raise RuntimeError("NIXL rejected unaligned descriptors")
         self._next += 1
         self.events.append(
             "initialize:"

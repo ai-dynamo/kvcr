@@ -1000,7 +1000,7 @@ class _KVCRCore:
         for ref, region in zip(descriptors, resolved):
             if region.size != self._block_sizes[ref.label]:
                 raise ValueError("block descriptor has the wrong byte count")
-        return list(descriptors)
+        return descriptors
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
         if not layout or any(name not in self._block_sizes for name in layout):

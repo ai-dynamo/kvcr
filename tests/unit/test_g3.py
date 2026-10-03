@@ -369,6 +369,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         keys[0]
     ]
     assert fetch_result.success
+    assert fetch_result.descriptors == [_mem_descriptor()]
     assert kvcr.query((keys[1], keys[4])) == [
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.G3),
