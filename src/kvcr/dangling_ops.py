@@ -115,8 +115,11 @@ class _DanglingOps:
                             element_index=ref.element_index,
                         )
                         for ref in descriptors
-                        if ref.framework
                     ]
+                    for key, descriptors in zip(op.source_keys, op.src_descriptors)
+                },
+                source_owners={
+                    key: "framework" if descriptors[0].framework else "kvcr"
                     for key, descriptors in zip(op.source_keys, op.src_descriptors)
                 },
             )
@@ -147,8 +150,8 @@ class _DanglingOps:
                         element_index=ref.element_index,
                     )
                     for ref in chain.from_iterable(op.dst_descriptors)
-                    if ref.framework
                 ],
+                destination_owner="kvcr" if op.local_fill else "framework",
             )
         )
 

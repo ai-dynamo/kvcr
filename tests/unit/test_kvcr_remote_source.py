@@ -598,7 +598,9 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
             assert error.source_blocks == {
                 key: [_mem_descriptor(end_point_name="source")]
             }
+            assert error.source_owners == {key: "framework"}
             assert error.destination_regions is None
+            assert error.destination_owner is None
     finally:
         agent.state = "DONE"
         kvcr.close()
@@ -631,12 +633,14 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
             == errors[1].source_blocks
             == {key: [_mem_descriptor(end_point_name="source")]}
         )
+        assert errors[0].source_owners == errors[1].source_owners == {key: "framework"}
         for native_handle in (1, 2):
             done.add(native_handle)
             _poll_until(source, lambda _: len(errors) == 2 + native_handle)
             event = errors[-1]
             assert event.state == "quiesced"
             assert event.source_blocks == errors[0].source_blocks
+            assert event.source_owners == errors[0].source_owners
             pending.remove(event.op_handle)
             assert len(pending) == 2 - native_handle
         assert not _has_outstanding_operations(source)
@@ -663,7 +667,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
     expected_sources = {
-        key: [],
+        key: [descriptor],
         framework_hit: [descriptor],
     }
     try:
@@ -694,6 +698,9 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert source._core._block_record_map[key].local_dram.claim_count == 0
         assert errors[1].source_blocks == expected_sources
+        for error in errors:
+            assert error.source_owners == {key: "kvcr", framework_hit: "framework"}
+            assert error.destination_regions is error.destination_owner is None
         deposit = source.deposit({replacement: [descriptor]})
         assert _poll_until(source, bool) == [
             (deposit, _op_entries({replacement: True}))

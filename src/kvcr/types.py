@@ -57,9 +57,9 @@ class KVCRStartupError(RuntimeError):
 class TransferError(RuntimeError):
     """Lifecycle report for memory exposed by a failed transfer.
 
-    References identify local framework buffers only; KVCR-owned buffers are
-    omitted. Source reports retain every original key, with an empty list for
-    keys using only KVCR memory. Destination reports can likewise be empty.
+    References identify local buffers. ``source_owners`` identifies each key's
+    owner; ``destination_owner`` applies to all destination regions. Owners are
+    ``framework`` or ``kvcr`` and select the corresponding registration namespace.
     ``quiesced`` clears this operation's hazard; it never makes the failed data
     valid or clears other operations.
     Handles are local to this KVCR instance and report side (source/destination).
@@ -72,15 +72,20 @@ class TransferError(RuntimeError):
         *,
         state: Literal["uncertain", "quiesced"] = "uncertain",
         source_blocks: dict[BlockKey, list[MemoryRef]] | None = None,
+        source_owners: dict[BlockKey, Literal["framework", "kvcr"]] | None = None,
         destination_regions: list[MemoryRef] | None = None,
+        destination_owner: Literal["framework", "kvcr"] | None = None,
     ) -> None:
         self.op_handle = op_handle
         self.state = state
         self.source_blocks = source_blocks
+        self.source_owners = source_owners
         self.destination_regions = destination_regions
+        self.destination_owner = destination_owner
         super().__init__(
             f"{message}: state={state}, op={op_handle}, sources={source_blocks!r}, "
-            f"destinations={destination_regions!r}"
+            f"source_owners={source_owners!r}, destinations={destination_regions!r}, "
+            f"destination_owner={destination_owner!r}"
         )
 
 

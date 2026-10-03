@@ -549,7 +549,10 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     if resolution not in ("queued", "late"):
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert all(error.op_handle == message["op_handle"] for error in errors)
-        assert errors[0].destination_regions == errors[1].destination_regions == []
+        for error in errors:
+            assert error.destination_regions == [_mem_descriptor()]
+            assert error.destination_owner == "kvcr"
+            assert error.source_blocks is error.source_owners is None
     assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
     assert operation.close(progress)
@@ -888,6 +891,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert (
         errors[0].destination_regions == errors[1].destination_regions == [destination]
     )
+    for error in errors:
+        assert error.destination_owner == "framework"
+        assert error.source_blocks is error.source_owners is None
     assert [
         message["op_handle"]
         for _, raw in control.sent
@@ -1040,7 +1046,9 @@ def test_remote_write_cancellation_and_late_completion(
     for error in errors:
         assert error.op_handle == handle
         assert error.destination_regions == [_mem_descriptor()]
-        assert error.source_blocks is None
+        assert error.destination_owner == "framework"
+        assert error.source_blocks is error.source_owners is None
+        assert "destination_owner='framework'" in str(error)
     kvcr.close()
 
 
