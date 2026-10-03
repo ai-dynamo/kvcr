@@ -1090,78 +1090,104 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
 
 
 def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> None:
-    """Same peer name with new metadata re-adds the NIXL route; identical
-    metadata keeps reusing the cached one."""
-    agent = FakeNixlAgent()
-    progress = SimpleNamespace(
-        nixl_agent=agent,
-        prepare_memory=Mock(),
-        release_prepared=Mock(),
-        _prepared={},
-        _stop_requested=False,
-        _failure=None,
-    )
-    tier = SimpleNamespace(
-        _kvcr=SimpleNamespace(_timer=time.monotonic),
-        _record_progress_duration=lambda *_args: None,
-        _remote_agents_by_target={},
-        _route_generation={},
-    )
-    payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
+    """Busy routes survive refresh requests and can be replaced after draining."""
+    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    removed = []
+    agent.remove_remote_agent = removed.append
+    source = _new_kvcr(agent, pinning, control, name="source")
+    try:
+        progress = source._core._progress
+        tier = source._core._remote_fw_dram
+        payload = msgspec.msgpack.decode(
+            _start_write_message(1, b"key", target_agent="worker-a")
+        )
+        payload.update(
+            target_agent_metadata=b"gen-1",
+            sender_control_endpoint="tcp://target:1",
+            source_control_endpoint="tcp://source:1",
+        )
+        first = tier._remote_agent(progress, payload)
+        assert first == ("worker-a", "remote-1")
+        assert tier._remote_agent(progress, payload) == first
+        assert agent.remote_agents == [b"gen-1"]
 
-    first = _RemoteFWDram._remote_agent(tier, progress, payload)
+        # Reject malformed replacement geometry or names before changing the route.
+        for catalog in (
+            {"": {"addr": 128, "size": 0}},
+            {"wrong-name": {"addr": 128, "size": 16}},
+        ):
+            with pytest.raises(ValueError):
+                tier._remote_agent(
+                    progress, {**payload, "target_regions": (catalog, {})}
+                )
+        assert agent.remote_agents == [b"gen-1"]
+        assert removed == []
 
-    assert first == ("worker-a", "remote-1")
-    assert _RemoteFWDram._remote_agent(tier, progress, payload) == first
-    assert agent.remote_agents == [b"gen-1"]
-    progress.prepare_memory.assert_called_once_with(
-        first[1], ({}, {}), owner_name="worker-a"
-    )
-    # Reject malformed replacement geometry or names before changing the route.
-    for catalog in (
-        {"": {"addr": 128, "size": 0}},
-        {"wrong-name": {"addr": 128, "size": 16}},
-    ):
-        with pytest.raises(ValueError):
-            _RemoteFWDram._remote_agent(
-                tier, progress, {**payload, "target_regions": (catalog, {})}
+        control.incoming.append(msgspec.msgpack.encode(payload))
+        _poll_until(source, lambda _: len(agent.xfers) == 1)
+        old_catalog = progress._catalogs[first[1]]
+        old_prepared = progress._prepared[first[1]]
+        old_transfers = progress._active_transfers.copy()
+        payload.update(op_handle=2, target_agent_metadata=b"gen-2")
+        control.sent.clear()
+        control.incoming.extend(
+            [
+                msgspec.msgpack.encode({**payload, "type": "target_metadata"}),
+                msgspec.msgpack.encode(payload),
+                _write_probe_message(99),
+            ]
+        )
+        _wait_until(
+            lambda: (
+                progress._failure is not None
+                or any(
+                    _decode_control_message(raw)["type"] == "write_probe_ack"
+                    for _, raw in control.sent
+                )
             )
-    assert agent.remote_agents == [b"gen-1"]
-    progress.release_prepared.assert_not_called()
-    # Native bindings may return str directly rather than bytes.
-    add_remote_agent = agent.add_remote_agent
-    agent.add_remote_agent = lambda metadata: add_remote_agent(metadata).decode()
+        )
+        progress.raise_if_failed()
+        assert [_decode_control_message(raw)["type"] for _, raw in control.sent] == [
+            "write_refused",
+            "write_probe_ack",
+        ]
+        assert _decode_control_message(control.sent[0][1])["op_handle"] == 2
+        assert progress._thread.is_alive()
+        assert progress._active_transfers == old_transfers
+        assert progress._catalogs[first[1]] is old_catalog
+        assert progress._prepared[first[1]] is old_prepared
+        assert tier._remote_agent(progress, {"target_agent": "worker-a"}) == first
+        assert tier._route_generation == {}
+        assert agent.remote_agents == [b"gen-1"]
+        assert removed == agent.released_xfers == []
 
-    replaced = _RemoteFWDram._remote_agent(
-        tier,
-        progress,
-        {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
-    )
+        agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        # Native bindings may return str directly rather than bytes.
+        add_remote_agent = agent.add_remote_agent
+        agent.add_remote_agent = lambda metadata: add_remote_agent(metadata).decode()
+        control.incoming.append(msgspec.msgpack.encode(payload))
+        _poll_until(
+            source,
+            lambda _: len(agent.xfers) == 2 and not _has_outstanding_operations(source),
+        )
+        assert agent.remote_agents == [b"gen-1", b"gen-2"]
+        assert removed == [first[1]]
+        assert first[1] not in progress._catalogs
+        assert agent.xfers[-1][4] == "remote-2"
+        # The bump is what fences queued predecessor operations off the new route.
+        assert tier._route_generation == {"worker-a": 1}
 
-    assert agent.remote_agents == [b"gen-1", b"gen-2"]
-    assert replaced == ("worker-a", "remote-2")
-    progress.release_prepared.assert_called_once_with(first[1])
-    progress.prepare_memory.assert_called_with(
-        replaced[1], ({}, {}), owner_name="worker-a"
-    )
-    # The bump is what fences queued predecessor operations off the new route.
-    assert tier._route_generation == {"worker-a": 1}
-    # Geometry can change without changing the allocation metadata.
-    replaced = _RemoteFWDram._remote_agent(
-        tier,
-        progress,
-        {
-            "target_agent": "worker-a",
-            "target_agent_metadata": b"gen-2",
-            "target_regions": ({"": {"addr": 128, "size": 16, "count": 2}}, {}),
-        },
-    )
-    assert tier._route_generation == {"worker-a": 2}
-    assert progress.prepare_memory.call_args.args[1][0][""].count == 2
-    # A payload carrying no metadata still reuses whatever route is cached.
-    named_only = {"target_agent": "worker-a"}
-    assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
-    assert progress.prepare_memory.call_count == 3
+        # Geometry can change without changing the allocation metadata.
+        payload["target_regions"] = ({"": {"addr": 128, "size": 16, "count": 2}}, {})
+        replaced = tier._remote_agent(progress, payload)
+        assert tier._route_generation == {"worker-a": 2}
+        assert progress._catalogs[replaced[1]][1][0][""].count == 2
+        # A payload carrying no metadata still reuses whatever route is cached.
+        assert tier._remote_agent(progress, {"target_agent": "worker-a"}) == replaced
+        assert agent.remote_agents == [b"gen-1", b"gen-2", b"gen-2"]
+    finally:
+        agent.state = "DONE"
 
 
 @pytest.mark.parametrize(
@@ -1172,22 +1198,16 @@ def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
 ) -> None:
     """Cache only prepared routes; let progress handle fatal cleanup errors."""
 
-    class RemovingAgent(FakeNixlAgent):
-        def __init__(self) -> None:
-            super().__init__()
-            self.removed: list[str] = []
-
-        def remove_remote_agent(self, handle: str) -> None:
-            self.removed.append(handle)
-
-    agent = RemovingAgent()
+    agent = FakeNixlAgent()
+    removed = []
+    agent.remove_remote_agent = removed.append
     progress = SimpleNamespace(
         nixl_agent=agent,
         prepare_memory=Mock(),
         release_prepared=Mock(),
         _prepared={},
+        _active_transfers={},
         _stop_requested=False,
-        _failure=None,
     )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
@@ -1195,34 +1215,27 @@ def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
         _remote_agents_by_target={},
         _route_generation={},
     )
-    _, first = _RemoteFWDram._remote_agent(
+    _RemoteFWDram._remote_agent(
         tier,
         progress,
         {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
     )
-    _RemoteFWDram._remote_agent(
-        tier,
-        progress,
-        {"target_agent": "worker-a", "target_agent_metadata": b"gen-2"},
-    )
-    assert agent.removed == [first]
-
     progress.prepare_memory.side_effect = [RuntimeError("prep failed"), None]
     payload = {"target_agent": "worker-b", "target_agent_metadata": b"gen-3"}
     with pytest.raises(RuntimeError, match="prep failed"):
         _RemoteFWDram._remote_agent(tier, progress, payload)
     assert "worker-b" not in tier._remote_agents_by_target
-    assert agent.removed == [first, "remote-3"]
-    progress.release_prepared.assert_called_with("remote-3")
+    assert removed == ["remote-2"]
+    progress.release_prepared.assert_called_with("remote-2")
     assert not progress._stop_requested
     assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
         "worker-b",
-        "remote-4",
+        "remote-3",
     )
-    assert agent.remote_agents == [b"gen-1", b"gen-2", b"gen-3", b"gen-3"]
+    assert agent.remote_agents == [b"gen-1", b"gen-3", b"gen-3"]
 
     # A repeated native name still belongs to the established peer.
-    agent.add_remote_agent = lambda _: "remote-2"
+    agent.add_remote_agent = lambda _: "remote-1"
     progress.prepare_memory.reset_mock(side_effect=True)
     progress.release_prepared.reset_mock()
     with pytest.raises(RuntimeError, match="already initialized"):
@@ -1234,12 +1247,12 @@ def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
     assert "worker-c" not in tier._remote_agents_by_target
     progress.prepare_memory.assert_not_called()
     progress.release_prepared.assert_not_called()
-    assert agent.removed == [first, "remote-3"]
+    assert removed == ["remote-2"]
     assert _RemoteFWDram._remote_agent(
         tier, progress, {"target_agent": "worker-a"}
-    ) == ("worker-a", "remote-2")
+    ) == ("worker-a", "remote-1")
 
-    class StickyAgent(RemovingAgent):
+    class StickyAgent(FakeNixlAgent):
         def remove_remote_agent(self, handle: str) -> None:
             raise RuntimeError("route busy")
 
@@ -1258,17 +1271,8 @@ def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
     payload["target_agent_metadata"] = b"gen-2"
     if message_type == "target_metadata":
         payload["type"] = message_type
-        handler = tier._handle_target_metadata
-    else:
-        handler = tier._handle_start_write
-        if message_type == "malformed":
-            del payload["keys"]
-    with pytest.raises(RuntimeError, match="cleanup failed") as error:
-        handler(progress, payload)
-    assert str(error.value.__cause__) == "route busy"
-    assert progress._failure is None
-    assert not progress._stop_requested
-    assert tier._route_generation == {}
+    elif message_type == "malformed":
+        del payload["keys"]
 
     control.incoming.append(msgspec.msgpack.encode(payload))
     _wait_until(lambda: not progress._thread.is_alive())
@@ -1277,3 +1281,4 @@ def test_route_setup_cleans_failed_agents_and_propagates_cleanup_errors(
     assert progress._failure is error.value
     assert str(error.value.__cause__) == "route busy"
     assert sticky.remote_agents == [b"gen-1"]
+    assert tier._route_generation == {}

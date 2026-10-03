@@ -929,36 +929,6 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     assert local.raw == b"a" * len(local)
 
 
-def test_g3_deliver_rejects_an_out_of_bounds_destination(
-    tmp_path,
-) -> None:
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    primary = ctypes.create_string_buffer(page_size * 2)
-    local = ctypes.create_string_buffer(page_size)
-    first, second = BlockKey(b"first"), BlockKey(b"second")
-    agent = _FakeG3Agent()
-    kvcr = _new_g3_kvcr(
-        tmp_path,
-        local,
-        agent=agent,
-        framework_regions=[
-            _buffer_region(primary, page_size),
-        ],
-    )
-
-    assert _deposit(kvcr, first, 0).success
-    assert _deposit(kvcr, second, 1).success
-    _poll_until(kvcr, lambda _: kvcr._core._block_record_map[first].g3 is not None)
-    assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
-
-    reads = [operation for operation, *_ in agent.xfers if operation == "READ"]
-    with pytest.raises(ValueError, match="element_index"):
-        kvcr.deliver({first: [_mem_descriptor(2)]})
-    # An out-of-bounds destination must never reach NIXL as a whole-slot read.
-    assert [operation for operation, *_ in agent.xfers if operation == "READ"] == reads
-    assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
-
-
 def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
     tmp_path,
 ) -> None:

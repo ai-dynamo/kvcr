@@ -1096,11 +1096,8 @@ class _RemoteFWDram:
             ):
                 raise TypeError("invalid remaining_timeout_ms")
             keys = _message_keys(payload)
-            dst_descriptors = tuple(
-                tuple(descriptors)
-                for descriptors in msgspec.convert(
-                    payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
-                )
+            dst_descriptors = msgspec.convert(
+                payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
             )
         except (KeyError, TypeError, ValueError, msgspec.ValidationError) as error:
             logger.warning("KVCR malformed start_write op=%d: %s", op_handle, error)
@@ -1123,16 +1120,12 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            dst_descriptors = tuple(
-                tuple(
-                    self._kvcr._validate_descriptors(
-                        list(descriptors),
-                        regions=self._remote_agents_by_target[target_agent][2],
-                        agent_name=target_agent,
-                    )
+            for descriptors in dst_descriptors:
+                self._kvcr._validate_descriptors(
+                    list(descriptors),
+                    regions=self._remote_agents_by_target[target_agent][2],
+                    agent_name=target_agent,
                 )
-                for descriptors in dst_descriptors
-            )
             self._ack_target_metadata(progress, payload, target_agent)
         except _RemoteAgentCleanupError:
             raise
@@ -1186,11 +1179,7 @@ class _RemoteFWDram:
                 op_id[1],
                 target_agent,
                 len(keys),
-                self._kvcr._descriptor_bytes(
-                    chain.from_iterable(dst_descriptors),
-                    regions=self._remote_agents_by_target[target_agent][2],
-                    agent_name=target_agent,
-                ),
+                self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
         source_pin = _SourcePinOp(
@@ -1978,6 +1967,11 @@ class _RemoteAgentCleanupError(RuntimeError):
 
 
 def _unload_remote_agent(progress: _KVCRProgress, remote_agent: str) -> None:
+    if any(
+        state.remote_side_agent == remote_agent
+        for state in progress._active_transfers.values()
+    ):
+        raise RuntimeError(f"NIXL remote agent {remote_agent!r} has active transfers")
     try:
         progress.release_prepared(remote_agent)
         progress.nixl_agent.remove_remote_agent(remote_agent)

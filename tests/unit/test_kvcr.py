@@ -959,8 +959,9 @@ def test_named_reference_validation_and_address_reporting():
     config = KVCRConfig(
         nixl_agent_name="target", pool_layouts=[("pool", 16), ("gpu", 16)]
     )
+    agent = FakeNixlAgent()
     kvcr = _new_kvcr(
-        FakeNixlAgent(),
+        agent,
         FakePrimaryPinning(),
         FakeBytesControl(),
         config,
@@ -982,9 +983,11 @@ def test_named_reference_validation_and_address_reporting():
         "gpu",
     )
     assert core._descriptor_bytes([internal, internal]) == 32
+    with pytest.raises(ValueError, match="element_index"):
+        kvcr.deliver({BlockKey(b"invalid"): [MemoryRef("target", 4, "gpu")]})
+    assert agent.xfers == agent.transfers == []
     for bad in (
         MemoryRef("other", 2, "gpu"),
-        MemoryRef("target", 4, "gpu"),
         MemoryRef("target", -1, "gpu"),
         MemoryRef("target", True, "gpu"),
         MemoryRef("target", 0, "wrong"),

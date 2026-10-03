@@ -953,17 +953,8 @@ class _KVCRCore:
             ref.info,
         )
 
-    def _descriptor_bytes(
-        self,
-        refs: Iterable[_TransferRef],
-        *,
-        regions=None,
-        agent_name: str | None = None,
-    ) -> int:
-        return sum(
-            self._region(ref, regions=regions, agent_name=agent_name).size
-            for ref in refs
-        )
+    def _descriptor_bytes(self, refs: Iterable[_TransferRef]) -> int:
+        return sum(self._block_sizes[ref.info] for ref in refs)
 
     def _normalize_descriptors(
         self, descriptors: list[MemoryRef]

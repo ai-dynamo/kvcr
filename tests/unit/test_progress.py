@@ -148,7 +148,9 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
         regions = (
             {
                 "": RegionDescriptor(addr=128, size=128, count=4),
-                "small": RegionDescriptor(addr=256, size=64, info="small"),
+                "small": RegionDescriptor(
+                    addr=256, size=64, mem_type="VRAM", info="small"
+                ),
             },
             {},
         )
@@ -373,7 +375,24 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
     [
         ((), (_mem(0, owner="remote-agent"),), "remote-agent", "non-empty"),
         ((_mem(0),), (_mem(0),), "", "remote-side agent"),
-        ((_mem(0, info="missing"),), (_mem(0),), "remote-agent", None),
+        (
+            (_mem(0, info="missing"),),
+            (_mem(0, owner="remote-agent"),),
+            "remote-agent",
+            "framework registration",
+        ),
+        (
+            (_mem(0, info="small", framework=False),),
+            (_mem(0, info="small", owner="remote-agent"),),
+            "remote-agent",
+            "KVCR registration",
+        ),
+        (
+            (_mem(0), _mem(0, info="small")),
+            (_mem(0, owner="remote-agent"), _mem(1, owner="remote-agent")),
+            "remote-agent",
+            "cannot mix memory types",
+        ),
         ((_mem(0, framework=1),), (_mem(0),), "remote-agent", "framework"),
         (
             (MemDescriptor("transfer-test", "DRAM", 128, 128, 0),),
@@ -469,20 +488,6 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
         )
         assert submitted
         progress.poll_transfer(transfer_id)
-    with pytest.raises(ValueError, match="cannot mix memory types"):
-        progress.submit_transfer(
-            "WRITE",
-            (local[0], _mem(0, info="gpu")),
-            remote[:2],
-            remote_side_agent="native-peer",
-        )
-    with pytest.raises(ValueError):
-        progress.submit_transfer(
-            "WRITE",
-            (_mem(0, info="gpu", framework=False),),
-            remote[:1],
-            remote_side_agent="native-peer",
-        )
     assert agent.prep_calls == [
         ("", "VRAM", [[5000, 16, 3, 32, 8]]),
         (
@@ -619,7 +624,7 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
 
     assert progress.nixl_agent is agent
     assert agent.deregistered == []
-    assert len(agent.prepared) == 3
+    assert len(agent.prepared) == 6
     assert progress.cancel_transfer(transfer_id)
 
     progress._close_nixl()

@@ -230,6 +230,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     kvcr.release([result.release_handle])
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
 
+    source.raw = b"\x00" * len(source)
     matching = kvcr.deliver({first: descriptors})
     assert dict(_poll_until(kvcr, bool))[matching][first].success
     assert source.raw == payload
