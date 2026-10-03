@@ -8,6 +8,7 @@ from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import lru_cache
 from typing import TYPE_CHECKING, cast
 
 from .config import LocalDramOptions
@@ -34,12 +35,13 @@ logger = logging.getLogger(__name__)
 _Clock = Callable[[], float]
 
 
+@lru_cache(maxsize=512)
 def _layout_indices(
-    layout: list[str], requested: list[str], *, allow_subset: bool = True
-) -> list[int] | None:
+    layout: tuple[str, ...], requested: tuple[str, ...], *, allow_subset: bool = True
+) -> tuple[int, ...] | None:
     """Match full layouts or unambiguous pieces in the requested order."""
     if layout == requested:
-        return list(range(len(layout)))
+        return tuple(range(len(layout)))
     if (
         not allow_subset
         or not requested
@@ -47,7 +49,12 @@ def _layout_indices(
         or any(layout.count(label) != 1 for label in requested)
     ):
         return None
-    return [layout.index(label) for label in requested]
+    return tuple(layout.index(label) for label in requested)
+
+
+@lru_cache(maxsize=64)
+def _layout_slot_counts(layout: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
+    return tuple(Counter(label.partition(":")[0] for label in layout).items())
 
 
 class _LocalDramState(Enum):
@@ -792,8 +799,8 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             else:
                 indices = _layout_indices(
-                    residency.layout,
-                    [descriptor.label for descriptor in op.destinations[key]],
+                    tuple(residency.layout),
+                    tuple(descriptor.label for descriptor in op.destinations[key]),
                 )
                 if indices is None:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -1076,10 +1083,8 @@ class _LocalDram:
     def _allocate_slots(
         self, layout: list[str], protected: set[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
-        required = Counter(label.partition(":")[0] for label in layout)
-        if all(
-            len(self._free_slots[name]) >= count for name, count in required.items()
-        ):
+        required = _layout_slot_counts(tuple(layout))
+        if all(len(self._free_slots[name]) >= count for name, count in required):
             return (
                 [
                     (label, self._free_slots[label.partition(":")[0]].popleft())
@@ -1097,7 +1102,7 @@ class _LocalDram:
         def short() -> set[str]:
             return {
                 name
-                for name, count in required.items()
+                for name, count in required
                 if len(self._free_slots[name]) + freed[name] < count
             }
 
