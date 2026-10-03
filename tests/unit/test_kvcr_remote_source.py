@@ -615,7 +615,7 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
         for error in errors:
             assert error.op_handle == source_handle
             assert error.source_blocks == {
-                key: [kvcr._core._address_descriptor(_TransferRef("source", 0))]
+                key: [_mem_descriptor(end_point_name="source")]
             }
             assert error.destination_regions is None
     finally:
@@ -648,7 +648,7 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
         assert (
             errors[0].source_blocks
             == errors[1].source_blocks
-            == {key: [source._core._address_descriptor(_TransferRef("source", 0))]}
+            == {key: [_mem_descriptor(end_point_name="source")]}
         )
         for native_handle in (1, 2):
             done.add(native_handle)
@@ -682,10 +682,8 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
     key, replacement = BlockKey(b"k0"), BlockKey(b"k1")
     missing, framework_hit = BlockKey(b"missing"), BlockKey(b"framework-hit")
     expected_sources = {
-        key: [
-            source._core._address_descriptor(_TransferRef("source", 0, framework=False))
-        ],
-        framework_hit: [source._core._address_descriptor(_TransferRef("source", 0))],
+        key: [],
+        framework_hit: [descriptor],
     }
     try:
         agent.state = "DONE"

@@ -5,9 +5,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Annotated, Literal, NewType
-
-import msgspec
+from typing import Literal, NewType
 
 BlockKey = NewType("BlockKey", bytes)
 PinHandle = str
@@ -24,7 +22,7 @@ class RegionDescriptor:
     """Registered memory containing ``count`` fixed-size transfer elements.
 
     ``stride=0`` means contiguous elements. The registered extent includes
-    gaps between elements. ``info`` names the pool; names must be unique
+    gaps between elements. ``label`` names the pool; names must be unique
     among framework registrations.
     """
 
@@ -34,31 +32,19 @@ class RegionDescriptor:
     stride: int = 0
     count: int = 1
     size: int
-    info: str = ""
+    label: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class MemoryRef:
     """One element in a framework's named registered buffer.
 
-    ``info`` selects the registered pool by exact name.
+    ``label`` selects the registered pool by exact name.
     """
 
     end_point_name: str
+    label: str = ""
     element_index: int
-    info: str = ""
-
-
-@dataclass(frozen=True)
-class MemDescriptor:
-    """Address span for TransferError buffer reports and internal FILE I/O."""
-
-    end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
-    mem_type: Annotated[str, msgspec.Meta(min_length=1)]
-    addr: Annotated[int, msgspec.Meta(ge=0)]
-    size: Annotated[int, msgspec.Meta(gt=0)]
-    device_Id: Annotated[int, msgspec.Meta(ge=0)]
-    info: str = ""
 
 
 PinResult = tuple[PinHandle, Mapping[BlockKey, list[MemoryRef] | None]] | None
@@ -71,9 +57,11 @@ class KVCRStartupError(RuntimeError):
 class TransferError(RuntimeError):
     """Lifecycle report for memory exposed by a failed transfer.
 
-    Source reports identify the original keys and local buffers. Destination
-    reports contain only local regions. ``quiesced`` clears this operation's
-    hazard; it never makes the failed data valid or clears other operations.
+    References identify local framework buffers only; KVCR-owned buffers are
+    omitted. Source reports retain every original key, with an empty list for
+    keys using only KVCR memory. Destination reports can likewise be empty.
+    ``quiesced`` clears this operation's hazard; it never makes the failed data
+    valid or clears other operations.
     Handles are local to this KVCR instance and report side (source/destination).
     """
 
@@ -83,8 +71,8 @@ class TransferError(RuntimeError):
         op_handle: OpHandle,
         *,
         state: Literal["uncertain", "quiesced"] = "uncertain",
-        source_blocks: dict[BlockKey, list[MemDescriptor]] | None = None,
-        destination_regions: list[MemDescriptor] | None = None,
+        source_blocks: dict[BlockKey, list[MemoryRef]] | None = None,
+        destination_regions: list[MemoryRef] | None = None,
     ) -> None:
         self.op_handle = op_handle
         self.state = state

@@ -18,7 +18,7 @@ import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config
 
-from .types import BlockKey, MemDescriptor, RegionDescriptor
+from .types import BlockKey, RegionDescriptor
 
 logger = logging.getLogger(__name__)
 _IDLE_WAIT_SECONDS = 0.001
@@ -32,12 +32,22 @@ _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
 
 
 @dataclass(frozen=True)
+class _MemDescriptor:
+    """Raw memory addresses or file offsets for FILE transfers."""
+
+    mem_type: str
+    addr: int
+    size: int
+    device_Id: int
+
+
+@dataclass(frozen=True)
 class _TransferRef:
     """An element in an agent's framework or KVCR-owned registered memory."""
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
     element_index: Annotated[int, msgspec.Meta(ge=0)]
-    info: str = ""
+    label: str = ""
     framework: bool = True
 
 
@@ -50,16 +60,16 @@ def _resolve_region(
         raise ValueError("memory reference has the wrong owning agent")
     if type(ref.framework) is not bool:
         raise ValueError("memory reference framework selector must be a bool")
-    if not isinstance(ref.info, str):
+    if not isinstance(ref.label, str):
         raise ValueError("memory reference pool name must be a string")
     framework, kvcr = regions
     if ref.framework:
-        region = framework.get(ref.info)
+        region = framework.get(ref.label)
     else:
-        region = kvcr.get(ref.info)
+        region = kvcr.get(ref.label)
     if region is None:
         owner = "framework" if ref.framework else "KVCR"
-        raise ValueError(f"no {owner} registration for {ref.info!r}")
+        raise ValueError(f"no {owner} registration for {ref.label!r}")
     if type(ref.element_index) is not int or not 0 <= ref.element_index < region.count:
         raise ValueError("memory reference element_index is outside its region")
     return region
@@ -224,8 +234,8 @@ class _KVCRProgress:
     def submit_transfer(
         self,
         operation: str,
-        local_descriptors: Sequence[_TransferRef] | Sequence[MemDescriptor],
-        remote_descriptors: Sequence[_TransferRef] | Sequence[MemDescriptor],
+        local_descriptors: Sequence[_TransferRef] | Sequence[_MemDescriptor],
+        remote_descriptors: Sequence[_TransferRef] | Sequence[_MemDescriptor],
         *,
         remote_side_agent: str,
         backend: str | None = None,
@@ -239,7 +249,7 @@ class _KVCRProgress:
             raise ValueError("NIXL remote-side agent must be non-empty")
         agent = self.nixl_agent
         if any(
-            isinstance(descriptors[0], MemDescriptor)
+            isinstance(descriptors[0], _MemDescriptor)
             and descriptors[0].mem_type == "FILE"
             for descriptors in (local_descriptors, remote_descriptors)
         ):
@@ -295,7 +305,7 @@ class _KVCRProgress:
         state.outcome = False
         return self._release_transfer(transfer_id, state)
 
-    def _make_transfer_descriptors(self, descriptors: Sequence[MemDescriptor]) -> Any:
+    def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type
         if any(descriptor.mem_type != mem_type for descriptor in descriptors):
             raise ValueError("one NIXL descriptor list cannot mix memory types")
@@ -336,7 +346,7 @@ class _KVCRProgress:
                 offset = 0
                 for is_framework, region in entries:
                     offsets = framework_offsets if is_framework else kvcr_offsets
-                    offsets[region.info] = offset
+                    offsets[region.label] = offset
                     offset += region.count
                 rows = np.array(
                     [
@@ -390,7 +400,7 @@ class _KVCRProgress:
             if region.mem_type != first.mem_type:
                 raise ValueError("one NIXL descriptor list cannot mix memory types")
             offsets = framework_offsets if ref.framework else kvcr_offsets
-            indices.append(offsets[region.info] + ref.element_index)
+            indices.append(offsets[region.label] + ref.element_index)
         return handle, indices
 
     def _release_transfer(self, transfer_id: int, state: _TransferState) -> bool:

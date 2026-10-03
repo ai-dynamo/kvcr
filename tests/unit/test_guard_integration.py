@@ -491,12 +491,12 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
         RegionDescriptor(
             addr=guard._recovery.attachment.address + pools[0].offset_bytes,
             size=page_size + page_size // 2,
-            info="pool0",
+            label="pool0",
         ),
         RegionDescriptor(
             addr=guard._recovery.attachment.address + pools[1].offset_bytes,
             size=page_size,
-            info="pool1",
+            label="pool1",
         ),
     )
     assert [
@@ -839,7 +839,7 @@ def _real_nixl_regions(address: int, layout: list[tuple[str, int]], count: int =
     for name, size in layout:
         regions.append(
             RegionDescriptor(
-                addr=address, size=size, info=name, stride=stride, count=count
+                addr=address, size=size, label=name, stride=stride, count=count
             )
         )
         address += size
@@ -850,7 +850,7 @@ def _real_nixl_refs(
     agent_name: str, layout: list[tuple[str, int]], element_index: int = 0
 ):
     return [
-        _mem_descriptor(element_index, info=name, end_point_name=agent_name)
+        _mem_descriptor(element_index, label=name, end_point_name=agent_name)
         for name, _ in layout
     ]
 

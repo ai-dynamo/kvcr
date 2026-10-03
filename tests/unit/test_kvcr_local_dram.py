@@ -70,12 +70,12 @@ def _two_pool_kvcr(agent, pools, source, config=None, capacity_needed_callback=N
             RegionDescriptor(
                 addr=ctypes.addressof(source),
                 size=config.pool_layouts[0][1],
-                info="full",
+                label="full",
             ),
             RegionDescriptor(
                 addr=ctypes.addressof(source) + config.pool_layouts[0][1],
                 size=config.pool_layouts[1][1],
-                info="swa",
+                label="swa",
                 count=(len(source) - config.pool_layouts[0][1])
                 // config.pool_layouts[1][1],
             ),
@@ -207,12 +207,12 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key() -> None:
     )
     layout = ["full", "swa", "swa"]
     descriptors = [
-        _mem_descriptor(index, info) for index, info in zip((0, 0, 1), layout)
+        _mem_descriptor(index, label) for index, label in zip((0, 0, 1), layout)
     ]
     first, second = BlockKey(b"first"), BlockKey(b"second")
 
     with pytest.raises(ValueError, match="framework registration"):
-        kvcr.deposit({first: [_mem_descriptor(info="unknown")]})
+        kvcr.deposit({first: [_mem_descriptor(label="unknown")]})
     operation = kvcr.deposit({first: descriptors})
     _wait_until(lambda: bool(agent.transfers))
     wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
@@ -249,8 +249,8 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     kvcr = _two_pool_kvcr(agent, pools, source)
     full, swa, grouped = (BlockKey(name) for name in (b"full", b"swa", b"grouped"))
     descriptors = [
-        _mem_descriptor(info="full"),
-        _mem_descriptor(0, info="swa"),
+        _mem_descriptor(label="full"),
+        _mem_descriptor(0, label="swa"),
     ]
 
     kvcr.deposit({full: [descriptors[0]], swa: [descriptors[1]]})
@@ -291,9 +291,9 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
     kvcr = _two_pool_kvcr(agent, pools, source)
     swa0, swa1, grouped = (BlockKey(name) for name in (b"swa0", b"swa1", b"grouped"))
     descriptors = [
-        _mem_descriptor(info="full"),
-        _mem_descriptor(0, info="swa"),
-        _mem_descriptor(1, info="swa"),
+        _mem_descriptor(label="full"),
+        _mem_descriptor(0, label="swa"),
+        _mem_descriptor(1, label="swa"),
     ]
 
     operation = kvcr.deposit(
@@ -714,9 +714,9 @@ def test_capacity_pressure_is_pool_local() -> None:
         capacity_needed_callback=capacity_requests.append,
     )
     descriptors = [
-        _mem_descriptor(info="full"),
-        _mem_descriptor(0, info="swa"),
-        _mem_descriptor(1, info="swa"),
+        _mem_descriptor(label="full"),
+        _mem_descriptor(0, label="swa"),
+        _mem_descriptor(1, label="swa"),
     ]
 
     kvcr._core._update_capacity_pressure({"full": 1, "swa": 2})

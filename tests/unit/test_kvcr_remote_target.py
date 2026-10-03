@@ -39,7 +39,6 @@ from kvcr.types import (
     BlockKey,
     CacheTier,
     InventoryEvent,
-    MemDescriptor,
     OpEntryResult,
     OpEntryStatus,
     PlacementAction,
@@ -316,7 +315,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     descriptors = [
         _mem_descriptor(
             sum(previous == name for previous, _ in layout[:index]),
-            info=name,
+            label=name,
             end_point_name="source",
         )
         for index, (name, _) in enumerate(layout)
@@ -550,7 +549,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     if resolution not in ("queued", "late"):
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert all(error.op_handle == message["op_handle"] for error in errors)
-        assert errors[0].destination_regions == errors[1].destination_regions
+        assert errors[0].destination_regions == errors[1].destination_regions == []
     assert not _has_outstanding_operations(target)
     assert key not in target._core._block_record_map
     assert operation.close(progress)
@@ -668,7 +667,7 @@ def _probe_ack(handle, source="tcp://source:1", **fields):
     )
 
 
-def _acked_deliver(control, kvcr, source, key):
+def _acked_deliver(control, kvcr, source, key, destination=None):
     """Drive a deliver whose start_write carries no metadata, and return it."""
     # Each wait below expects exactly the message it triggered, so start clean:
     # a leftover would satisfy the wait before this request is even sent.
@@ -686,7 +685,9 @@ def _acked_deliver(control, kvcr, source, key):
     control.sent = []
 
     kvcr.submit_hint(_router_hint(source), request_id="load")
-    op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+    op_handle = kvcr.deliver(
+        {key: [destination or _mem_descriptor()]}, request_id="load"
+    )
     _wait_until(lambda: len(control.sent) == 1)
     sent = _decode_control_message(control.sent[-1][1])
     assert sent["type"] == "start_write"
@@ -818,7 +819,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         control,
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layouts=[("", 16)],
+            pool_layouts=[("framework", 16)],
             operation_timeout_ms=1000,
             abandon_timeout_ms=7000,
         ),
@@ -826,7 +827,8 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     )
     kvcr._core._clock = lambda: now
     key, source = BlockKey(b"k0"), "tcp://source:1"
-    handle, _ = _acked_deliver(control, kvcr, source, key)
+    destination = _mem_descriptor(3, label="framework")
+    handle, _ = _acked_deliver(control, kvcr, source, key, destination)
     control.sent.clear()
     control.send = Mock(wraps=control.send, side_effect=[False, DEFAULT])
     control.recv = Mock(wraps=control.recv)
@@ -852,7 +854,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
 
     # An abandoned operation must not blacklist the endpoint for fresh work.
     kvcr.submit_hint(_router_hint(source), request_id="retry")
-    retry = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+    retry = kvcr.deliver(
+        {key: [_mem_descriptor(label="framework")]}, request_id="retry"
+    )
     _wait_until(
         lambda: any(
             _decode_control_message(raw).get("op_handle") == retry
@@ -881,7 +885,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert _poll_until(kvcr, lambda _: len(errors) == 2) == []
     assert not _has_outstanding_operations(kvcr)
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
-    assert errors[0].destination_regions == errors[1].destination_regions
+    assert (
+        errors[0].destination_regions == errors[1].destination_regions == [destination]
+    )
     assert [
         message["op_handle"]
         for _, raw in control.sent
@@ -1033,9 +1039,7 @@ def test_remote_write_cancellation_and_late_completion(
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
     for error in errors:
         assert error.op_handle == handle
-        assert error.destination_regions == [
-            MemDescriptor("target", "DRAM", 128, 16, 0)
-        ]
+        assert error.destination_regions == [_mem_descriptor()]
         assert error.source_blocks is None
     kvcr.close()
 

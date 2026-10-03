@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 
 from kvcr import progress as progress_module
-from kvcr.progress import _KVCRProgress, _ProgressOp, _TransferRef
-from kvcr.types import MemDescriptor, RegionDescriptor
+from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
+from kvcr.types import RegionDescriptor
 
 
 class _TransferAgent:
@@ -130,9 +130,9 @@ class _TransferAgent:
 
 
 def _mem(
-    element_index: int, *, owner="transfer-test", info="", framework=True
+    element_index: int, *, owner="transfer-test", label="", framework=True
 ) -> _TransferRef:
-    return _TransferRef(owner, element_index, info, framework)
+    return _TransferRef(owner, element_index, label, framework)
 
 
 def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRProgress:
@@ -149,7 +149,7 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
             {
                 "": RegionDescriptor(addr=128, size=128, count=4),
                 "small": RegionDescriptor(
-                    addr=256, size=64, mem_type="VRAM", info="small"
+                    addr=256, size=64, mem_type="VRAM", label="small"
                 ),
             },
             {},
@@ -357,8 +357,8 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
     progress = _transfer_progress(agent)
     transfer_id, _ = progress.submit_transfer(
         "READ",
-        (MemDescriptor(agent.name, "DRAM", 128, 128, 0),),
-        (MemDescriptor(agent.name, "FILE", 0, 128, 7),),
+        (_MemDescriptor("DRAM", 128, 128, 0),),
+        (_MemDescriptor("FILE", 0, 128, 7),),
         remote_side_agent=agent.name,
         backend="MOCK",
     )
@@ -376,26 +376,26 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
         ((), (_mem(0, owner="remote-agent"),), "remote-agent", "non-empty"),
         ((_mem(0),), (_mem(0),), "", "remote-side agent"),
         (
-            (_mem(0, info="missing"),),
+            (_mem(0, label="missing"),),
             (_mem(0, owner="remote-agent"),),
             "remote-agent",
             "framework registration",
         ),
         (
-            (_mem(0, info="small", framework=False),),
-            (_mem(0, info="small", owner="remote-agent"),),
+            (_mem(0, label="small", framework=False),),
+            (_mem(0, label="small", owner="remote-agent"),),
             "remote-agent",
             "KVCR registration",
         ),
         (
-            (_mem(0), _mem(0, info="small")),
+            (_mem(0), _mem(0, label="small")),
             (_mem(0, owner="remote-agent"), _mem(1, owner="remote-agent")),
             "remote-agent",
             "cannot mix memory types",
         ),
         ((_mem(0, framework=1),), (_mem(0),), "remote-agent", "framework"),
         (
-            (MemDescriptor("transfer-test", "DRAM", 128, 128, 0),),
+            (_MemDescriptor("DRAM", 128, 128, 0),),
             (_mem(0),),
             "remote-agent",
             "_TransferRef",
@@ -420,7 +420,7 @@ def test_progress_rejects_invalid_transfer(
 @pytest.mark.parametrize(
     ("local", "remote"),
     [
-        ((_mem(0),), (_mem(0, info="small", owner="remote-agent"),)),
+        ((_mem(0),), (_mem(0, label="small", owner="remote-agent"),)),
         ((_mem(0), _mem(1)), (_mem(2, owner="remote-agent"),)),
     ],
     ids=["size", "count"],
@@ -449,18 +449,18 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
                 size=16,
                 mem_type="VRAM",
                 device_Id=3,
-                info="gpu",
+                label="gpu",
                 stride=32,
                 count=8,
             ),
             "pool": RegionDescriptor(
-                addr=1000, size=16, info="pool", stride=64, count=3
+                addr=1000, size=16, label="pool", stride=64, count=3
             ),
             "keys": RegionDescriptor(
-                addr=2000, size=16, info="keys", stride=32, count=2
+                addr=2000, size=16, label="keys", stride=32, count=2
             ),
         },
-        {"pool": RegionDescriptor(addr=3000, size=16, info="pool", count=4)},
+        {"pool": RegionDescriptor(addr=3000, size=16, label="pool", count=4)},
     )
     progress.prepare_memory("", regions)
     progress.prepare_memory(
@@ -471,16 +471,16 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
     with pytest.raises(RuntimeError, match="already initialized"):
         progress.prepare_memory("native-peer", ({}, {}))
     local = (
-        _mem(1, info="keys"),
-        _mem(2, info="pool"),
-        _mem(3, info="pool", framework=False),
-        _mem(1, info="keys"),
+        _mem(1, label="keys"),
+        _mem(2, label="pool"),
+        _mem(3, label="pool", framework=False),
+        _mem(1, label="keys"),
     )
     remote = (
-        _mem(1, owner="remote-agent", info="pool", framework=False),
-        _mem(0, owner="remote-agent", info="keys"),
-        _mem(1, owner="remote-agent", info="pool"),
-        _mem(0, owner="remote-agent", info="keys"),
+        _mem(1, owner="remote-agent", label="pool", framework=False),
+        _mem(0, owner="remote-agent", label="keys"),
+        _mem(1, owner="remote-agent", label="pool"),
+        _mem(0, owner="remote-agent", label="keys"),
     )
     for _ in range(2):
         transfer_id, submitted = progress.submit_transfer(
@@ -515,7 +515,7 @@ def test_progress_preparation_failure_is_fatal(release_failures) -> None:
     progress = _transfer_progress(agent, prepare=False)
     progress._memory_regions = (
         {"": RegionDescriptor(addr=128, size=128)},
-        {"gpu": RegionDescriptor(addr=256, size=128, mem_type="VRAM", info="gpu")},
+        {"gpu": RegionDescriptor(addr=256, size=128, mem_type="VRAM", label="gpu")},
     )
     agent.register_memory = Mock(side_effect=[7, 8])
     agent.prep_failure = "VRAM"

@@ -201,7 +201,7 @@ class _LocalDram:
     @property
     def memory_regions(self) -> tuple[RegionDescriptor, ...]:
         return tuple(
-            RegionDescriptor(addr=address, count=length // size, size=size, info=name)
+            RegionDescriptor(addr=address, count=length // size, size=size, label=name)
             for name, (address, length, size) in self._pools.items()
         )
 
@@ -299,7 +299,7 @@ class _LocalDram:
             record = self._kvcr._block_record(key)
             residency = record.local_dram
             if residency is not None:
-                if residency.layout != [descriptor.info for descriptor in sources]:
+                if residency.layout != [descriptor.label for descriptor in sources]:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 elif residency.state is _LocalDramState.READY:
                     op.results[key] = (
@@ -321,13 +321,13 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.DROPPED)
                 continue
             locations, evicted_keys, eviction_pending = self._allocate_slots(
-                [source.info for source in sources], keys, deadline
+                [source.label for source in sources], keys, deadline
             )
             evicted.extend(evicted_keys)
             if locations is None:
                 if eviction_pending:
                     self._enqueue_capacity_waiter(
-                        op, key, sources, [source.info for source in sources]
+                        op, key, sources, [source.label for source in sources]
                     )
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -762,7 +762,7 @@ class _LocalDram:
             elif (
                 residency.state is _LocalDramState.DISCARDING
                 or residency.layout
-                != [descriptor.info for descriptor in op.destinations[key]]
+                != [descriptor.label for descriptor in op.destinations[key]]
                 or now >= op.deadline
             ):
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)

@@ -178,9 +178,9 @@ framework.cancel_pin_request(pin_request_id)                                    
 framework.release_pin(pin_handle)                                                 # release an acquired framework-owned source pin
 ```
 
-Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`info`) must be unique and identify configured pools.
+Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`label`) must be unique and identify configured pools.
 
-`deposit`, `deliver`, and framework pin results use `MemoryRef(end_point_name, element_index, info)`. The pool name selects a registered buffer by exact name. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of pool names and returns per-key status and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty name.
+`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, registration label, and element index. The label selects a registered buffer by exact pool name. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of pool names and returns per-key status and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label.
 
 ### Operating flow
 

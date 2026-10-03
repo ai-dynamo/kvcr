@@ -14,12 +14,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .config import G3Options
 from .policy_runtime import _EvictionQueue
-from .progress import _KVCRProgress, _OpId, _ProgressOp, _TransferRef
+from .progress import _KVCRProgress, _MemDescriptor, _OpId, _ProgressOp, _TransferRef
 from .types import (
     BlockKey,
     BlockMeta,
     CacheTier,
-    MemDescriptor,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
@@ -56,8 +55,8 @@ class _Claim:
 class _G3TransferOp(_ProgressOp):
     kind: Literal["store", "fill", "deliver"]
     ordered_keys: tuple[BlockKey, ...]
-    memory_descriptors: tuple[MemDescriptor, ...]
-    file_descriptors: tuple[MemDescriptor, ...]
+    memory_descriptors: tuple[_MemDescriptor, ...]
+    file_descriptors: tuple[_MemDescriptor, ...]
     backend: str
     deadline: float
     clock: Any = field(repr=False, compare=False)
@@ -614,16 +613,14 @@ class _G3:
         for key in tuple(self._unscored):
             self._make_evictable(key)
 
-    def _descriptor(self, slot: int) -> MemDescriptor:
+    def _descriptor(self, slot: int) -> _MemDescriptor:
         file_index = slot % len(self._direct_fds)
         file_slot = slot // len(self._direct_fds)
-        return MemDescriptor(
-            self._kvcr.nixl_agent_name,
+        return _MemDescriptor(
             "FILE",
             file_slot * self._slot_size,
             self._slot_size,
             self._direct_fds[file_index],
-            "",
         )
 
     def _open_files(self) -> None:

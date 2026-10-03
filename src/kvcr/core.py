@@ -26,13 +26,19 @@ from .local_disk import _G3, _G3Residency
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
 from .policy_runtime import _PolicyInvoker
-from .progress import _KVCRProgress, _Op, _OpId, _resolve_region, _TransferRef
+from .progress import (
+    _KVCRProgress,
+    _MemDescriptor,
+    _Op,
+    _OpId,
+    _resolve_region,
+    _TransferRef,
+)
 from .types import (
     BlockKey,
     BlockMeta,
     CacheTier,
     InventoryEvent,
-    MemDescriptor,
     MemoryRef,
     OpEntryResult,
     OpEntryStatus,
@@ -87,7 +93,7 @@ def _validate_memory_regions(regions: list[RegionDescriptor]) -> None:
             raise ValueError("registration extent exceeds uint64 address range")
         if not isinstance(region.mem_type, str) or not region.mem_type:
             raise ValueError("registration memory type must be a non-empty string")
-        if not isinstance(region.info, str):
+        if not isinstance(region.label, str):
             raise ValueError("registration name must be a string")
         counts[region.mem_type] = counts.get(region.mem_type, 0) + region.count
         if counts[region.mem_type] > 2**31:
@@ -159,11 +165,11 @@ class _KVCRCore:
         self._block_sizes = dict(self.pool_layouts)
         memory_regions = list(backend_configs.framework_regions)
         _validate_memory_regions(memory_regions)
-        framework_regions = {region.info: region for region in memory_regions}
+        framework_regions = {region.label: region for region in memory_regions}
         if len(framework_regions) != len(memory_regions):
             raise ValueError("framework registration names must be unique")
         if any(
-            region.size != self._block_sizes.get(region.info)
+            region.size != self._block_sizes.get(region.label)
             for region in memory_regions
         ):
             raise ValueError("registration elements must match configured pool sizes")
@@ -301,7 +307,7 @@ class _KVCRCore:
             else None
         )
         kvcr_regions = (
-            {region.info: region for region in self._local_dram.memory_regions}
+            {region.label: region for region in self._local_dram.memory_regions}
             if self._local_dram is not None
             else {}
         )
@@ -942,19 +948,17 @@ class _KVCRCore:
             self.nixl_agent_name if agent_name is None else agent_name,
         )
 
-    def _address_descriptor(self, ref: _TransferRef) -> MemDescriptor:
+    def _address_descriptor(self, ref: _TransferRef) -> _MemDescriptor:
         region = self._region(ref)
-        return MemDescriptor(
-            ref.end_point_name,
+        return _MemDescriptor(
             region.mem_type,
             region.addr + ref.element_index * (region.stride or region.size),
             region.size,
             region.device_Id,
-            ref.info,
         )
 
     def _descriptor_bytes(self, refs: Iterable[_TransferRef]) -> int:
-        return sum(self._block_sizes[ref.info] for ref in refs)
+        return sum(self._block_sizes[ref.label] for ref in refs)
 
     def _normalize_descriptors(
         self, descriptors: list[MemoryRef]
@@ -967,7 +971,7 @@ class _KVCRCore:
             raise ValueError("each block requires at least one MemoryRef")
         return self._validate_descriptors(
             [
-                _TransferRef(ref.end_point_name, ref.element_index, ref.info)
+                _TransferRef(ref.end_point_name, ref.element_index, ref.label)
                 for ref in descriptors
             ]
         )
@@ -990,11 +994,11 @@ class _KVCRCore:
             for ref in descriptors
         ]
         self._validate_block_layout(
-            [ref.info for ref in descriptors],
+            [ref.label for ref in descriptors],
             "block descriptors must use configured pools",
         )
         for ref, region in zip(descriptors, resolved):
-            if region.size != self._block_sizes[ref.info]:
+            if region.size != self._block_sizes[ref.label]:
                 raise ValueError("block descriptor has the wrong byte count")
         return list(descriptors)
 

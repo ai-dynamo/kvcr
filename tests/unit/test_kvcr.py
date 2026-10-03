@@ -665,13 +665,13 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ),
         KVCRBackendConfigs(
             framework_regions=[
-                RegionDescriptor(addr=128, size=64, info="full", count=4),
+                RegionDescriptor(addr=128, size=64, label="full", count=4),
                 RegionDescriptor(
                     addr=1024,
                     size=64,
                     mem_type="VRAM",
                     device_Id=1,
-                    info="k",
+                    label="k",
                     stride=128,
                     count=2,
                 ),
@@ -680,7 +680,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
                     size=64,
                     mem_type="VRAM",
                     device_Id=1,
-                    info="v",
+                    label="v",
                     stride=128,
                     count=2,
                 ),
@@ -689,7 +689,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
                     size=64,
                     mem_type="VRAM",
                     device_Id=2,
-                    info="k2",
+                    label="k2",
                     stride=128,
                     count=2,
                 ),
@@ -749,15 +749,15 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         {"count": True},
         {"stride": 1 << 63, "count": 3},
         {"mem_type": ""},
-        {"info": 1},
-        {"info": "missing"},
+        {"label": 1},
+        {"label": "missing"},
         {"size": 32},
     ],
 )
 def test_registration_is_validated_before_startup(fields) -> None:
     from kvcr.types import RegionDescriptor
 
-    region = RegionDescriptor(**({"addr": 128, "size": 64, "info": "full"} | fields))
+    region = RegionDescriptor(**({"addr": 128, "size": 64, "label": "full"} | fields))
     agent = FakeNixlAgent()
     with pytest.raises(ValueError, match="registration"):
         _new_kvcr(
@@ -785,7 +785,7 @@ def test_registration_bounds_aggregate_prepared_indices(count) -> None:
             ),
             framework_regions=[
                 RegionDescriptor(
-                    addr=index * 2**32, size=1, info=f"full{index}", count=count
+                    addr=index * 2**32, size=1, label=f"full{index}", count=count
                 )
                 for index in range(2)
             ],
@@ -945,13 +945,13 @@ def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
 
 def test_named_reference_validation_and_address_reporting():
     regions = [
-        RegionDescriptor(addr=1000, size=16, info="pool", stride=64, count=3),
+        RegionDescriptor(addr=1000, size=16, label="pool", stride=64, count=3),
         RegionDescriptor(
             addr=2000,
             size=16,
             mem_type="VRAM",
             device_Id=3,
-            info="gpu",
+            label="gpu",
             stride=32,
             count=4,
         ),
@@ -968,30 +968,35 @@ def test_named_reference_validation_and_address_reporting():
         framework_regions=regions,
     )
     core = kvcr._core
-    ref = MemoryRef("target", 2, "gpu")
+    ref = MemoryRef(end_point_name="target", label="gpu", element_index=2)
     [internal] = core._normalize_descriptors([ref])
     assert internal == _TransferRef("target", 2, "gpu")
-    assert core._normalize_descriptors([MemoryRef("target", 1, "pool")]) == [
-        _TransferRef("target", 1, "pool")
-    ]
+    assert core._normalize_descriptors(
+        [MemoryRef(end_point_name="target", label="pool", element_index=1)]
+    ) == [_TransferRef("target", 1, "pool")]
     span = core._address_descriptor(internal)
-    assert (span.addr, span.size, span.mem_type, span.device_Id, span.info) == (
+    assert (span.addr, span.size, span.mem_type, span.device_Id) == (
         2064,
         16,
         "VRAM",
         3,
-        "gpu",
     )
     assert core._descriptor_bytes([internal, internal]) == 32
     with pytest.raises(ValueError, match="element_index"):
-        kvcr.deliver({BlockKey(b"invalid"): [MemoryRef("target", 4, "gpu")]})
+        kvcr.deliver(
+            {
+                BlockKey(b"invalid"): [
+                    MemoryRef(end_point_name="target", label="gpu", element_index=4)
+                ]
+            }
+        )
     assert agent.xfers == agent.transfers == []
     for bad in (
-        MemoryRef("other", 2, "gpu"),
-        MemoryRef("target", -1, "gpu"),
-        MemoryRef("target", True, "gpu"),
-        MemoryRef("target", 0, "wrong"),
-        MemoryRef("target", 0, None),
+        MemoryRef(end_point_name="other", label="gpu", element_index=2),
+        MemoryRef(end_point_name="target", label="gpu", element_index=-1),
+        MemoryRef(end_point_name="target", label="gpu", element_index=True),
+        MemoryRef(end_point_name="target", label="wrong", element_index=0),
+        MemoryRef(end_point_name="target", label=None, element_index=0),
     ):
         with pytest.raises(ValueError):
             core._normalize_descriptors([bad])

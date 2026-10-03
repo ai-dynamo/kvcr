@@ -444,16 +444,18 @@ class FakeBytesControl:
 
 def _mem_descriptor(
     element_index: int = 0,
-    info: str = "",
+    label: str = "",
     *,
     end_point_name: str = "target",
 ) -> MemoryRef:
-    return MemoryRef(end_point_name, element_index, info)
+    return MemoryRef(
+        end_point_name=end_point_name, label=label, element_index=element_index
+    )
 
 
-def _buffer_region(buffer, size: int, info: str = "") -> RegionDescriptor:
+def _buffer_region(buffer, size: int, label: str = "") -> RegionDescriptor:
     return RegionDescriptor(
-        addr=ctypes.addressof(buffer), size=size, info=info, count=len(buffer) // size
+        addr=ctypes.addressof(buffer), size=size, label=label, count=len(buffer) // size
     )
 
 
@@ -512,8 +514,8 @@ def _start_write_message(
             [
                 {
                     "end_point_name": target_agent or "target",
+                    "label": "",
                     "element_index": 0,
-                    "info": "",
                 }
             ]
         ],
@@ -570,7 +572,7 @@ def _new_kvcr(
                     framework_regions
                     if framework_regions is not None
                     else [
-                        RegionDescriptor(addr=128, size=size, info=pool, count=1024)
+                        RegionDescriptor(addr=128, size=size, label=pool, count=1024)
                         for pool, size in config.pool_layouts
                     ]
                 ),

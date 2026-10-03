@@ -1203,7 +1203,7 @@ class _RemoteFWDram:
         if kvcr._local_dram is None:
             return False
         layouts = [
-            [descriptor.info for descriptor in destination]
+            [descriptor.label for descriptor in destination]
             for destination in source_pin.dst_descriptors
         ]
         if not kvcr._state_lock.acquire(blocking=False):
@@ -1280,7 +1280,7 @@ class _RemoteFWDram:
             destination = source_pin.dst_descriptors[index]
             if source is None:
                 continue
-            if [d.info for d in source] != [d.info for d in destination]:
+            if [d.label for d in source] != [d.label for d in destination]:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",
                     source_pin.op_handle,
@@ -1776,11 +1776,13 @@ class _RemoteFWDram:
         )
         if regions is not None:
             if any(
-                name != region.info
+                name != region.label
                 for catalog in regions
                 for name, region in catalog.items()
             ):
-                raise ValueError("registration dictionary names must match region info")
+                raise ValueError(
+                    "registration dictionary names must match region label"
+                )
             _validate_memory_regions([*regions[0].values(), *regions[1].values()])
         cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:

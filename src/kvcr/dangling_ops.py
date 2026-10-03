@@ -9,7 +9,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from .core import logger
-from .types import OpHandle, TransferError
+from .types import MemoryRef, OpHandle, TransferError
 
 if TYPE_CHECKING:
     from .progress import _KVCRProgress
@@ -109,8 +109,13 @@ class _DanglingOps:
                 state=state,
                 source_blocks={
                     key: [
-                        self._backend._kvcr._address_descriptor(ref)
+                        MemoryRef(
+                            end_point_name=ref.end_point_name,
+                            label=ref.label,
+                            element_index=ref.element_index,
+                        )
                         for ref in descriptors
+                        if ref.framework
                     ]
                     for key, descriptors in zip(op.source_keys, op.src_descriptors)
                 },
@@ -136,8 +141,13 @@ class _DanglingOps:
                 op.op_id[1],
                 state=state,
                 destination_regions=[
-                    self._backend._kvcr._address_descriptor(ref)
+                    MemoryRef(
+                        end_point_name=ref.end_point_name,
+                        label=ref.label,
+                        element_index=ref.element_index,
+                    )
                     for ref in chain.from_iterable(op.dst_descriptors)
+                    if ref.framework
                 ],
             )
         )
