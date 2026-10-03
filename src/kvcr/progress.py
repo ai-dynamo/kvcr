@@ -3,7 +3,10 @@
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
 import logging
+import math
+import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -155,6 +158,10 @@ class _KVCRProgress:
         self._catalogs: dict[str, tuple[str, _RegionMaps]] = {}
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
+        self._wake_lock = threading.Lock()
+        self._wake_read: int | None = None
+        self._wake_write: int | None = None
+        self._idle_waiter: Callable[[float, int], None] | None = None
         self._completed: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
@@ -450,6 +457,42 @@ class _KVCRProgress:
     def submit(self, item: object) -> None:
         self.raise_if_failed()
         self._submissions.put(item)
+        self._wake()
+
+    def _wake(self) -> None:
+        # Serialize with close: a stale fd could have been reused elsewhere.
+        with self._wake_lock:
+            if self._wake_write is not None:
+                try:
+                    os.write(self._wake_write, b"\0")
+                except BlockingIOError:
+                    pass  # A full pipe already guarantees a wakeup.
+
+    def _wait_for_work(self) -> None:
+        wake_fd = self._wake_read
+        assert wake_fd is not None
+        timeout = _IDLE_WAIT_SECONDS
+        if self._idle_waiter is not None:
+            self._idle_waiter(timeout, wake_fd)
+        else:
+            poller = select.poll()
+            poller.register(wake_fd, select.POLLIN)
+            poller.poll(math.ceil(timeout * 1000))
+        # Queue-before-signal plus a persistent readable byte covers submissions
+        # arriving between the empty-queue check and the wait. Read only once;
+        # a busy producer must not keep us draining signals instead of work.
+        try:
+            os.read(wake_fd, 4096)
+        except BlockingIOError:
+            pass
+
+    def _close_wakeup(self) -> None:
+        with self._wake_lock:
+            descriptors = (self._wake_read, self._wake_write)
+            self._wake_read = self._wake_write = None
+            for descriptor in descriptors:
+                if descriptor is not None:
+                    os.close(descriptor)
 
     def take_completed(self) -> list[object]:
         completed: list[object] = []
@@ -484,6 +527,7 @@ class _KVCRProgress:
             self._close_requested = True
             self._activate.set()
             self._submissions.put(_STOP)
+            self._wake()
             # An interrupt can cut join() short, so the recheck below is
             # what callers rely on, not that join() returned.
             self._thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
@@ -506,6 +550,12 @@ class _KVCRProgress:
 
     def _run(self) -> None:
         try:
+            # Allocate only on the owning thread; constructing an unused core
+            # must not leak descriptors. Startup failures close these too.
+            with self._wake_lock:
+                self._wake_read, self._wake_write = os.pipe2(
+                    os.O_NONBLOCK | os.O_CLOEXEC
+                )
             self._log_startup_stage("NIXL agent initialization")
             self._initialize_nixl()
             if self._close_requested:
@@ -532,8 +582,8 @@ class _KVCRProgress:
             self._log_startup_stage("ready")
             self._ready.set()
             while not self._stop_requested:
-                if not self._run_one_iteration():
-                    time.sleep(_IDLE_WAIT_SECONDS)
+                if not self._run_one_iteration() and not self._stop_requested:
+                    self._wait_for_work()
         except BaseException as error:
             self._failure = error
         finally:
@@ -554,6 +604,7 @@ class _KVCRProgress:
             except BaseException as error:
                 if self._failure is None:
                     self._failure = error
+            self._close_wakeup()
             self._ready.set()
 
     def _close_progress_ops(self) -> None:
