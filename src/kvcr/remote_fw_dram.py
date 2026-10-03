@@ -1209,7 +1209,7 @@ class _RemoteFWDram:
         if kvcr._local_dram is None:
             return False
         layouts = [
-            [descriptor.label for descriptor in destination]
+            tuple(descriptor.label for descriptor in destination)
             for destination in source_pin.dst_descriptors
         ]
         if not kvcr._state_lock.acquire(blocking=False):
@@ -1224,7 +1224,7 @@ class _RemoteFWDram:
                 if residency is None or residency.state is not _LocalDramState.READY:
                     return False
                 indices = _layout_indices(
-                    residency.layout,
+                    tuple(residency.layout),
                     layout,
                     allow_subset=source_pin.allow_layout_subset,
                 )
@@ -1299,8 +1299,8 @@ class _RemoteFWDram:
             if source is None:
                 continue
             indices = _layout_indices(
-                [descriptor.label for descriptor in source],
-                [descriptor.label for descriptor in destination],
+                tuple(descriptor.label for descriptor in source),
+                tuple(descriptor.label for descriptor in destination),
                 allow_subset=source_pin.allow_layout_subset,
             )
             if indices is None:

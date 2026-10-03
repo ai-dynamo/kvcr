@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, NewType
 
+import msgspec
+
 BlockKey = NewType("BlockKey", bytes)
 PinHandle = str
 PinRequestId = NewType("PinRequestId", int)
@@ -17,8 +19,7 @@ LocalDramRegions = list[tuple[str, int, int]]  # name, address, size in bytes
 PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
-@dataclass(frozen=True, kw_only=True)
-class RegionDescriptor:
+class RegionDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     """Registered memory containing ``count`` fixed-size transfer elements.
 
     ``stride=0`` means contiguous elements. The registered extent includes
@@ -35,8 +36,7 @@ class RegionDescriptor:
     label: str = ""
 
 
-@dataclass(frozen=True, kw_only=True)
-class MemoryRef:
+class MemoryRef(msgspec.Struct, frozen=True, kw_only=True):
     """One element in a named registered buffer.
 
     ``label`` identifies the key piece and selects an exact framework registration,

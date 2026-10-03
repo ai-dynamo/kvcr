@@ -41,8 +41,7 @@ class _MemDescriptor:
     device_Id: int
 
 
-@dataclass(frozen=True)
-class _TransferRef:
+class _TransferRef(msgspec.Struct, frozen=True):
     """An element in an agent's framework or KVCR-owned registered memory."""
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
