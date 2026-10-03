@@ -170,8 +170,9 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
 ) -> None:
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
+    block_size = mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024
     hold = _fake_hold(
-        local_dram=LocalDramOptions([("", 1234, 8192)]),
+        local_dram=LocalDramOptions([("", 1234, 2 * block_size)]),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -237,9 +238,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layouts=[
-                    ("", mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024)
-                ],
+                pool_layouts=[("", block_size)],
                 nixl_listen_port=1,
             ),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
