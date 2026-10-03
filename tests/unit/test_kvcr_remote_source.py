@@ -75,7 +75,10 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         ),
         name="source",
         framework_regions=[
-            RegionDescriptor(addr=ctypes.addressof(memory), size=16, count=3)
+            RegionDescriptor(
+                addr=ctypes.addressof(memory), size=16, count=3, label=label
+            )
+            for label in ("", ":*")
         ],
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         capacity_needed_callback=lambda request: callbacks.append(
@@ -102,9 +105,15 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
             allow_layout_subset=True,
             target_regions=(
                 {
-                    "": RegionDescriptor(
-                        addr=4096, size=16, mem_type="VRAM", device_Id=7, count=2
+                    label: RegionDescriptor(
+                        addr=4096,
+                        size=16,
+                        mem_type="VRAM",
+                        device_Id=7,
+                        count=2,
+                        label=label,
                     )
+                    for label in ("", ":*")
                 },
                 {},
             ),

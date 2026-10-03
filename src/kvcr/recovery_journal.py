@@ -125,7 +125,9 @@ def _decode_recovery_record(
     labels: set[str] = set()
     for label, _ in recovered.g2 or ():
         pool, separator, part = label.partition(":")
-        if pool not in pool_names or (separator and (not part or label in labels)):
+        if pool not in pool_names or (
+            separator and (part in ("", "*") or label in labels)
+        ):
             raise ValueError("G2 recovery location does not match the pool group")
         labels.add(label)
     return _BlockRecord(

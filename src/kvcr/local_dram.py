@@ -247,7 +247,7 @@ class _LocalDram:
                 pool = self._pools.get(pool_name)
                 if (
                     pool is None
-                    or (separator and (not part or label in labels))
+                    or (separator and (part in ("", "*") or label in labels))
                     or type(slot) is not int
                     or not 0 <= slot < pool[1] // pool[2]
                     or slot in occupied[pool_name]

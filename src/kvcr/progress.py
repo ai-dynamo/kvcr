@@ -65,8 +65,8 @@ def _resolve_region(
     framework, kvcr = regions
     if ref.framework:
         region = framework.get(ref.label)
-        if region is None:
-            region = framework.get(ref.label.partition(":")[0])
+        if region is None and ":" in ref.label:
+            region = framework.get(ref.label.partition(":")[0] + ":*")
     else:
         region = kvcr.get(ref.label.partition(":")[0])
     if region is None:

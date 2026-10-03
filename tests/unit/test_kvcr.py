@@ -506,7 +506,12 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
         kvcr.fetch((BlockKey(b"key"),))
     kvcr.fetch((BlockKey(b"key"),), expected_layout=["named"])
     kvcr.fetch((BlockKey(b"key"),), expected_layout=["named:part", "named:other:part:"])
-    for layout in (["named:"], ["named:part", "named:part"], ["missing:part"]):
+    for layout in (
+        ["named:"],
+        ["named:*"],
+        ["named:part", "named:part"],
+        ["missing:part"],
+    ):
         with pytest.raises(ValueError):
             kvcr.fetch((BlockKey(b"key"),), expected_layout=layout)
 
@@ -936,7 +941,7 @@ def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
 
 def test_named_reference_validation_and_address_reporting():
     regions = [
-        RegionDescriptor(addr=1000, size=16, label="pool", stride=64, count=3),
+        RegionDescriptor(addr=1000, size=16, label="pool:*", stride=64, count=3),
         RegionDescriptor(
             addr=2000,
             size=16,
@@ -989,6 +994,8 @@ def test_named_reference_validation_and_address_reporting():
         MemoryRef(end_point_name="target", label="wrong:v", element_index=0),
         MemoryRef(end_point_name="target", label=None, element_index=0),
         MemoryRef(end_point_name="target", label="pool:", element_index=0),
+        MemoryRef(end_point_name="target", label="pool:*", element_index=0),
+        MemoryRef(end_point_name="target", label="pool", element_index=0),
     ):
         with pytest.raises(ValueError):
             core._normalize_descriptors([bad])

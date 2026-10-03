@@ -142,6 +142,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode([[["other", 0]], None]),
         msgspec.msgpack.encode([[["other:part", 0]], None]),
         msgspec.msgpack.encode([[[":", 0]], None]),
+        msgspec.msgpack.encode([[[":*", 0]], None]),
         msgspec.msgpack.encode([[[":same", 0], [":same", 1]], None]),
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),

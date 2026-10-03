@@ -51,7 +51,9 @@ from kvcr.types import (
 )
 
 
-def _two_pool_kvcr(agent, pools, source, config=None, capacity_needed_callback=None):
+def _two_pool_kvcr(
+    agent, pools, source, config=None, capacity_needed_callback=None, *, labeled=False
+):
     config = config or KVCRConfig(
         nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]
     )
@@ -76,7 +78,7 @@ def _two_pool_kvcr(agent, pools, source, config=None, capacity_needed_callback=N
             RegionDescriptor(
                 addr=ctypes.addressof(source) + config.pool_layouts[0][1],
                 size=config.pool_layouts[1][1],
-                label="swa",
+                label="swa:*" if labeled else "swa",
                 count=(len(source) - config.pool_layouts[0][1])
                 // config.pool_layouts[1][1],
             ),
@@ -206,6 +208,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
             nixl_agent_name="target",
             pool_layouts=[("full", 16), ("swa", 8)],
         ),
+        labeled=labeled,
     )
     layout = ["full", "swa:a", "swa:b"] if labeled else ["full", "swa", "swa"]
     descriptors = [
@@ -228,7 +231,9 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     result = dict(_poll_until(kvcr, lambda done: claim in dict(done)))[claim][first]
     assert result.success and result.release_handle is not None
     assert result.descriptors == descriptors
-    wrong = kvcr.deliver({first: [_mem_descriptor(label="swa:missing")]})
+    wrong = kvcr.deliver(
+        {first: [_mem_descriptor(label="swa:missing" if labeled else "swa")]}
+    )
     assert not dict(kvcr.poll_completed())[wrong][first].success
 
     agent.state = "PROC"
@@ -314,7 +319,7 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
     source = ctypes.create_string_buffer(24)
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    kvcr = _two_pool_kvcr(agent, pools, source)
+    kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
     swa0, swa1, grouped = (BlockKey(name) for name in (b"swa0", b"swa1", b"grouped"))
     descriptors = [
         _mem_descriptor(label="full"),
@@ -945,6 +950,7 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         },
         {BlockKey(b"first"): _recovered_record(g2=[(":same", 0), (":same", 1)])},
         {BlockKey(b"first"): _recovered_record(g2=[(":", 0)])},
+        {BlockKey(b"first"): _recovered_record(g2=[(":*", 0)])},
         {
             BlockKey(b"first"): _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
@@ -957,6 +963,7 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         "labeled-alias",
         "duplicate-label",
         "empty-label",
+        "wildcard-label",
         "row-never-settled",
     ],
 )

@@ -1017,7 +1017,7 @@ class _KVCRCore:
         labels = set()
         for label in layout:
             pool, separator, part = label.partition(":")
-            if pool not in self._block_sizes or (separator and not part):
+            if pool not in self._block_sizes or (separator and part in ("", "*")):
                 raise ValueError(invalid_message)
             if separator:
                 if label in labels:

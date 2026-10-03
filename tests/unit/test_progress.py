@@ -375,6 +375,12 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
             "framework registration",
         ),
         (
+            (_mem(0, label=":part"),),
+            (_mem(0, owner="remote-agent"),),
+            "remote-agent",
+            "framework registration",
+        ),
+        (
             (_mem(0, label="small", framework=False),),
             (_mem(0, label="small", owner="remote-agent"),),
             "remote-agent",
@@ -446,8 +452,8 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
                 stride=32,
                 count=8,
             ),
-            "pool": RegionDescriptor(
-                addr=1000, size=16, label="pool", stride=64, count=3
+            "pool:*": RegionDescriptor(
+                addr=1000, size=16, label="pool:*", stride=64, count=3
             ),
             "pool:k": RegionDescriptor(
                 addr=2000, size=16, label="pool:k", stride=32, count=2
