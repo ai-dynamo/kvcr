@@ -1256,7 +1256,12 @@ class _RemoteFWDram:
             route=source_pin.route,
             _backend=self,
         )
-        progress.submit(source_write)
+        # Already on progress: retain cleanup ownership before starting the write.
+        progress._in_flight_ops[source_write.op_id] = source_write
+        done, _ = source_write.progress(progress, None)
+        if done:
+            progress._in_flight_ops.pop(source_write.op_id)
+            self._progress_outbound.append(source_write)
         return True
 
     def _submit_prepared_source_write(

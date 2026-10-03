@@ -55,7 +55,8 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     )
 
 
-def test_local_source_starts_without_caller_poll_and_holds_its_slot():
+@pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
+def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -95,7 +96,7 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
             ),
         )
         callbacks.clear()
-        agent.state = "PROC"
+        agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
         request.update(
             allow_layout_subset=True,
@@ -119,7 +120,11 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
             assert resume.wait(timeout=2)
             initialize_write(op, *args, **kwargs)
 
-        with patch.object(_SourceWriteOp, "__init__", pause_write_preparation):
+        with (
+            patch.object(_SourceWriteOp, "__init__", pause_write_preparation),
+            # A resident-source request must not re-enter the submission queue.
+            patch.object(source._core._progress, "submit", side_effect=AssertionError),
+        ):
             control.incoming.append(msgspec.msgpack.encode(request))
             try:
                 assert preparing.wait(timeout=1)
@@ -149,8 +154,9 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
         assert pinning.searches == []
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
-        assert list(source.poll_completed()) == []
-        assert callbacks == [(threading.get_ident(), [("", 3)])]
+        if transfer_state == "PROC":
+            assert list(source.poll_completed()) == []
+            assert callbacks == [(threading.get_ident(), [("", 3)])]
 
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == 2)
