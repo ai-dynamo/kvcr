@@ -141,7 +141,9 @@ def _make_kvcr(
         return KVCR(
             KVCRConfig(
                 nixl_agent_name=agent_name,
-                pool_layouts=list({name: size for name, size in layout}.items()),
+                pool_layouts=list(
+                    {name.partition(":")[0]: size for name, size in layout}.items()
+                ),
                 nixl_listen_port=0,
             ),
             KVCRBindings(
@@ -386,7 +388,9 @@ def test_promoted_guard_serves_real_nixl_transfers(
     target = KVCR(
         KVCRConfig(
             nixl_agent_name="real-target",
-            pool_layouts=list({name: size for name, size in layout}.items()),
+            pool_layouts=list(
+                {name.partition(":")[0]: size for name, size in layout}.items()
+            ),
             nixl_listen_port=0,
             operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
             abandon_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 2000,
@@ -829,7 +833,9 @@ def _real_nixl_available() -> bool:
 def _real_nixl_layout(multi_pool: bool) -> list[tuple[str, int]]:
     page = os.sysconf("SC_PAGE_SIZE")
     return (
-        [("full", page + page // 2), ("swa", page // 2)] if multi_pool else [("", page)]
+        [("full", page + page // 2), ("swa:a", page // 2), ("swa:b", page // 2)]
+        if multi_pool
+        else [("", page)]
     )
 
 

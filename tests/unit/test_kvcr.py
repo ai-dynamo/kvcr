@@ -485,6 +485,7 @@ def test_kvcr_rejects_ambiguous_pool_names() -> None:
     for pool_layouts, message in (
         ([("", 8), ("swa", 8)], "empty"),
         ([("swa", 8), ("swa", 8)], "unique"),
+        ([("swa:part", 8)], "colon"),
     ):
         config = KVCRConfig(nixl_agent_name="target", pool_layouts=pool_layouts)
         with pytest.raises(ValueError, match=message):
@@ -504,9 +505,15 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
     with pytest.raises(ValueError, match="expected layout"):
         kvcr.fetch((BlockKey(b"key"),))
     kvcr.fetch((BlockKey(b"key"),), expected_layout=["named"])
-    kvcr.fetch((BlockKey(b"key"),), expected_layout=["named", "named"])
-    with pytest.raises(ValueError):
-        kvcr.fetch((BlockKey(b"key"),), expected_layout=["missing"])
+    kvcr.fetch((BlockKey(b"key"),), expected_layout=["named:part", "named:other:part:"])
+    for layout in (
+        ["named:"],
+        ["named:*"],
+        ["named:part", "named:part"],
+        ["missing:part"],
+    ):
+        with pytest.raises(ValueError):
+            kvcr.fetch((BlockKey(b"key"),), expected_layout=layout)
 
 
 def _assert_state_lock_available(core) -> None:
@@ -634,7 +641,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
 
         def prep_xfer_dlist(self, agent_name, descs, *, mem_type, backends):
             lifecycle_threads.append(threading.get_ident())
-            assert len(self.registrations) == 9
+            assert len(self.registrations) == 6
             preparations.append((agent_name, mem_type, len(descs)))
             return super().prep_xfer_dlist(
                 agent_name, descs, mem_type=mem_type, backends=backends
@@ -652,7 +659,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
     kvcr = KVCR(
         KVCRConfig(
             nixl_agent_name="target",
-            pool_layouts=[("full", 64), ("swa", 32), ("k", 64), ("v", 64), ("k2", 64)],
+            pool_layouts=[("full", 64), ("swa", 32)],
             nixl_listen_port=1234,
         ),
         KVCRBindings(
@@ -671,7 +678,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
                     size=64,
                     mem_type="VRAM",
                     device_Id=1,
-                    label="k",
+                    label="full:k",
                     stride=128,
                     count=2,
                 ),
@@ -680,7 +687,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
                     size=64,
                     mem_type="VRAM",
                     device_Id=1,
-                    label="v",
+                    label="full:v",
                     stride=128,
                     count=2,
                 ),
@@ -689,20 +696,13 @@ def test_nixl_lifecycle_stays_on_progress_thread(
                     size=64,
                     mem_type="VRAM",
                     device_Id=2,
-                    label="k2",
+                    label="full:k2",
                     stride=128,
                     count=2,
                 ),
             ],
             local_dram=LocalDramOptions(
-                [
-                    ("full", 384, 128),
-                    ("swa", 512, 64),
-                    ("k", 2048, 64),
-                    ("v", 2112, 64),
-                    ("k2", 2176, 64),
-                ],
-                "LOCAL",
+                [("full", 384, 128), ("swa", 512, 64)], "LOCAL"
             ),
             remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
         ),
@@ -724,15 +724,12 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         ([(1024, 192, 2, "")], "VRAM"),
         ([(384, 128, 0, "")], "DRAM"),
         ([(512, 64, 0, "")], "DRAM"),
-        ([(2048, 64, 0, "")], "DRAM"),
-        ([(2112, 64, 0, "")], "DRAM"),
-        ([(2176, 64, 0, "")], "DRAM"),
     ]
-    assert agent.deregistered == [9, 8, 7, 6, 5, 4, 3, 2, 1]
+    assert agent.deregistered == [6, 5, 4, 3, 2, 1]
     assert preparations == [
-        ("", "DRAM", 6),
+        ("", "DRAM", 3),
         ("", "VRAM", 3),
-        ("target", "DRAM", 6),
+        ("target", "DRAM", 3),
         ("target", "VRAM", 3),
     ]
     assert not kvcr._core._progress._prepared
@@ -751,6 +748,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
         {"mem_type": ""},
         {"label": 1},
         {"label": "missing"},
+        {"label": "full:"},
         {"size": 32},
     ],
 )
@@ -780,12 +778,10 @@ def test_registration_bounds_aggregate_prepared_indices(count) -> None:
             agent,
             FakePrimaryPinning(),
             FakeBytesControl(),
-            KVCRConfig(
-                nixl_agent_name="target", pool_layouts=[("full0", 1), ("full1", 1)]
-            ),
+            KVCRConfig(nixl_agent_name="target", pool_layouts=[("full", 1)]),
             framework_regions=[
                 RegionDescriptor(
-                    addr=index * 2**32, size=1, label=f"full{index}", count=count
+                    addr=index * 2**32, size=1, label=f"full:{index}", count=count
                 )
                 for index in range(2)
             ],
@@ -945,20 +941,18 @@ def test_close_gives_the_pool_back_when_the_core_errors_but_quiesces(
 
 def test_named_reference_validation_and_address_reporting():
     regions = [
-        RegionDescriptor(addr=1000, size=16, label="pool", stride=64, count=3),
+        RegionDescriptor(addr=1000, size=16, label="pool:*", stride=64, count=3),
         RegionDescriptor(
             addr=2000,
             size=16,
             mem_type="VRAM",
             device_Id=3,
-            label="gpu",
+            label="pool:layer:v:",
             stride=32,
             count=4,
         ),
     ]
-    config = KVCRConfig(
-        nixl_agent_name="target", pool_layouts=[("pool", 16), ("gpu", 16)]
-    )
+    config = KVCRConfig(nixl_agent_name="target", pool_layouts=[("pool", 16)])
     agent = FakeNixlAgent()
     kvcr = _new_kvcr(
         agent,
@@ -968,12 +962,12 @@ def test_named_reference_validation_and_address_reporting():
         framework_regions=regions,
     )
     core = kvcr._core
-    ref = MemoryRef(end_point_name="target", label="gpu", element_index=2)
+    ref = MemoryRef(end_point_name="target", label="pool:layer:v:", element_index=2)
     [internal] = core._normalize_descriptors([ref])
-    assert internal == _TransferRef("target", 2, "gpu")
+    assert internal == _TransferRef("target", 2, "pool:layer:v:")
     assert core._normalize_descriptors(
-        [MemoryRef(end_point_name="target", label="pool", element_index=1)]
-    ) == [_TransferRef("target", 1, "pool")]
+        [MemoryRef(end_point_name="target", label="pool:k", element_index=1)]
+    ) == [_TransferRef("target", 1, "pool:k")]
     span = core._address_descriptor(internal)
     assert (span.addr, span.size, span.mem_type, span.device_Id) == (
         2064,
@@ -986,17 +980,22 @@ def test_named_reference_validation_and_address_reporting():
         kvcr.deliver(
             {
                 BlockKey(b"invalid"): [
-                    MemoryRef(end_point_name="target", label="gpu", element_index=4)
+                    MemoryRef(
+                        end_point_name="target", label="pool:layer:v:", element_index=4
+                    )
                 ]
             }
         )
     assert agent.xfers == agent.transfers == []
     for bad in (
-        MemoryRef(end_point_name="other", label="gpu", element_index=2),
-        MemoryRef(end_point_name="target", label="gpu", element_index=-1),
-        MemoryRef(end_point_name="target", label="gpu", element_index=True),
-        MemoryRef(end_point_name="target", label="wrong", element_index=0),
+        MemoryRef(end_point_name="other", label="pool:layer:v:", element_index=2),
+        MemoryRef(end_point_name="target", label="pool:layer:v:", element_index=-1),
+        MemoryRef(end_point_name="target", label="pool:layer:v:", element_index=True),
+        MemoryRef(end_point_name="target", label="wrong:v", element_index=0),
         MemoryRef(end_point_name="target", label=None, element_index=0),
+        MemoryRef(end_point_name="target", label="pool:", element_index=0),
+        MemoryRef(end_point_name="target", label="pool:*", element_index=0),
+        MemoryRef(end_point_name="target", label="pool", element_index=0),
     ):
         with pytest.raises(ValueError):
             core._normalize_descriptors([bad])

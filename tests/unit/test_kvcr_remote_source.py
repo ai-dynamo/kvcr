@@ -55,9 +55,13 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     )
 
 
-def test_local_source_starts_without_caller_poll_and_holds_its_slot():
-    memory = ctypes.create_string_buffer(16)
-    descriptor = _mem_descriptor(end_point_name="source")
+@pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
+def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
+    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
+    descriptors = [
+        _mem_descriptor(i, label=label, end_point_name="source")
+        for i, label in enumerate(("", ":b", ":c"))
+    ]
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
     callbacks = []
     source = _new_kvcr(
@@ -70,7 +74,12 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
             capacity_low_watermark_percent=100,
         ),
         name="source",
-        framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
+        framework_regions=[
+            RegionDescriptor(
+                addr=ctypes.addressof(memory), size=16, count=3, label=label
+            )
+            for label in ("", ":*")
+        ],
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         capacity_needed_callback=lambda request: callbacks.append(
             (threading.get_ident(), request)
@@ -79,20 +88,39 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
     key = BlockKey(b"local")
     try:
         agent.state = "DONE"
-        deposit = source.deposit({key: [descriptor]})
+        deposit = source.deposit({key: descriptors})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         assert not source._core._remote_fw_dram._try_local_source_write(
             source._core._progress,
             SimpleNamespace(
                 ordered_keys=(key,),
-                dst_descriptors=((descriptor, descriptor),),
+                dst_descriptors=((descriptors[2], descriptors[0]),),
+                allow_layout_subset=False,
             ),
         )
         callbacks.clear()
-        agent.state = "PROC"
+        agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
-        request["keys"] *= 2
-        request["dst_descriptors"] *= 2
+        request.update(
+            allow_layout_subset=True,
+            target_regions=(
+                {
+                    label: RegionDescriptor(
+                        addr=4096,
+                        size=16,
+                        mem_type="VRAM",
+                        device_Id=7,
+                        count=2,
+                        label=label,
+                    )
+                    for label in ("", ":*")
+                },
+                {},
+            ),
+            dst_descriptors=[
+                [_TransferRef("target", i, label) for i, label in enumerate((":c", ""))]
+            ],
+        )
         preparing, resume = threading.Event(), threading.Event()
         initialize_write = _SourceWriteOp.__init__
 
@@ -101,7 +129,11 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
             assert resume.wait(timeout=2)
             initialize_write(op, *args, **kwargs)
 
-        with patch.object(_SourceWriteOp, "__init__", pause_write_preparation):
+        with (
+            patch.object(_SourceWriteOp, "__init__", pause_write_preparation),
+            # A resident-source request must not re-enter the submission queue.
+            patch.object(source._core._progress, "submit", side_effect=AssertionError),
+        ):
             control.incoming.append(msgspec.msgpack.encode(request))
             try:
                 assert preparing.wait(timeout=1)
@@ -121,12 +153,19 @@ def test_local_source_starts_without_caller_poll_and_holds_its_slot():
         # The peer request must be served without another caller-side poll.
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count == 1
-        assert len(agent.xfers[-1][1]) == 2
+        assert [
+            ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+        ] == [
+            b"c" * 16,
+            b"a" * 16,
+        ]
+        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
         assert pinning.searches == []
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
-        assert list(source.poll_completed()) == []
-        assert callbacks == [(threading.get_ident(), [("", 1)])]
+        if transfer_state == "PROC":
+            assert list(source.poll_completed()) == []
+            assert callbacks == [(threading.get_ident(), [("", 3)])]
 
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == 2)
@@ -384,7 +423,10 @@ def test_kvcr_close_cleans_pending_pin_operations():
     assert not source._core._framework_pin_keys
 
 
-def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
+@pytest.mark.parametrize(
+    "field", ["remaining_timeout_ms", "allow_layout_subset", "keys"]
+)
+def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
     source_agent = FakeNixlAgent(metadata=b"source-md")
     control = FakeBytesControl()
     pinning = FakePrimaryPinning()
@@ -392,7 +434,13 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
     request = msgspec.msgpack.decode(
         _start_write_message(6, BlockKey(b"k0"), target_agent="target")
     )
-    request.pop("remaining_timeout_ms")
+    if field == "remaining_timeout_ms":
+        request.pop(field)
+    elif field == "keys":
+        request[field] *= 2
+        request["dst_descriptors"] *= 2
+    else:
+        request[field] = "yes"
     control.incoming.append(msgspec.msgpack.encode(request))
     _wait_until(lambda: bool(source_agent.sent_notifs))
 
@@ -404,8 +452,7 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
         "success": False,
     }
     assert any(
-        "malformed start_write" in record.getMessage()
-        and "remaining_timeout_ms" in record.getMessage()
+        "malformed start_write" in record.getMessage() and field in record.getMessage()
         for record in kvcr_caplog.records
         if record.levelno == logging.WARNING
     )
@@ -1022,7 +1069,19 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
     ) in stats.records
 
 
-def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
+@pytest.mark.parametrize(
+    ("parts", "allow_subset", "selected"),
+    [
+        ("abc", False, (0, 1, 2)),
+        ("ca", True, (2, 0)),
+        ("x", True, ()),
+        ("ca", False, ()),
+    ],
+    ids=["whole", "partial", "unknown", "strict-fetch"],
+)
+def test_a_resumed_write_holds_a_pin_another_operation_acquired(
+    parts, allow_subset, selected
+) -> None:
     """fw_mem belongs to the block, so two writes can want the same pin."""
     backend = object.__new__(_RemoteFWDram)
     kvcr = object.__new__(_KVCRCore)
@@ -1042,8 +1101,10 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
 
     key = BlockKey(b"shared")
     borrowed = PinHandle("pinned-by-the-other-operation")
-    sources = [_TransferRef("target", i, "pool") for i in range(3)]
-    destinations = tuple(_TransferRef("target", 0, "pool") for _ in sources)
+    sources = [
+        _TransferRef("target", i, "pool:" + label) for i, label in enumerate("abc")
+    ]
+    destinations = tuple(_TransferRef("target", 0, "pool:" + label) for label in parts)
     kvcr._block_record_map[key] = _BlockRecord(
         fw_mem=_FwMemResidency(sources, borrowed)
     )
@@ -1060,17 +1121,21 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired() -> None:
         op_id=("source", 1),
         keys={key},
         framework_pins={stale},
+        allow_layout_subset=allow_subset,
     )
     backend._source_pin_ops[("source", 1)] = waiting
 
     backend._submit_prepared_source_write(("source", 1), waiting)
 
     submitted = kvcr._progress.submit.call_args.args[0]
-    assert submitted.src_descriptors == (tuple(sources),)
-    assert submitted.dst_descriptors == (destinations,)
-    assert submitted.completed_indices == (0,)
-    assert submitted.framework_pins == {borrowed}
-    assert backend._fw_pins_by_op[submitted.op_id] == {borrowed}
+    assert submitted.src_descriptors == (
+        (tuple(sources[i] for i in selected),) if selected else ()
+    )
+    assert submitted.dst_descriptors == ((destinations,) if selected else ())
+    assert submitted.completed_indices == ((0,) if selected else ())
+    expected_pins = {borrowed} if selected else set()
+    assert submitted.framework_pins == expected_pins
+    assert backend._fw_pins_by_op[submitted.op_id] == expected_pins
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
 

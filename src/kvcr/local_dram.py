@@ -34,6 +34,22 @@ logger = logging.getLogger(__name__)
 _Clock = Callable[[], float]
 
 
+def _layout_indices(
+    layout: list[str], requested: list[str], *, allow_subset: bool = True
+) -> list[int] | None:
+    """Match full layouts or unambiguous pieces in the requested order."""
+    if layout == requested:
+        return list(range(len(layout)))
+    if (
+        not allow_subset
+        or not requested
+        or len(set(requested)) != len(requested)
+        or any(layout.count(label) != 1 for label in requested)
+    ):
+        return None
+    return [layout.index(label) for label in requested]
+
+
 class _LocalDramState(Enum):
     FILLING = auto()
     READY = auto()
@@ -42,7 +58,7 @@ class _LocalDramState(Enum):
 
 @dataclass(slots=True)
 class _LocalDramResidency:
-    slots: list[tuple[str, int]]
+    slots: list[tuple[str, int]]  # Full descriptor label and parent-pool slot.
     state: _LocalDramState
     claim_count: int = 0
     retire_on_release: bool = False
@@ -225,15 +241,19 @@ class _LocalDram:
                 continue
             if residency.state is not _LocalDramState.READY or not residency.slots:
                 raise ValueError("invalid local DRAM recovery slots")
-            for pool_name, slot in residency.slots:
+            labels: set[str] = set()
+            for label, slot in residency.slots:
+                pool_name, separator, part = label.partition(":")
                 pool = self._pools.get(pool_name)
                 if (
                     pool is None
+                    or (separator and (part in ("", "*") or label in labels))
                     or type(slot) is not int
                     or not 0 <= slot < pool[1] // pool[2]
                     or slot in occupied[pool_name]
                 ):
                     raise ValueError("invalid local DRAM recovery slots")
+                labels.add(label)
                 occupied[pool_name].add(slot)
         self._free_slots = {
             pool_name: deque(
@@ -720,7 +740,7 @@ class _LocalDram:
         destinations: dict[BlockKey, list[_TransferRef]] = {}
         eviction_pending: set[BlockKey] = set()
         evicted: list[BlockKey] = []
-        size_bytes = sum(self._pools[name][2] for name in layout)
+        size_bytes = sum(self._pools[label.partition(":")[0]][2] for label in layout)
         for key in keys:
             record = self._kvcr._block_record_map.get(key)
             if record is None:
@@ -768,19 +788,23 @@ class _LocalDram:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             elif residency.state is _LocalDramState.FILLING:
                 continue
-            elif (
-                residency.state is _LocalDramState.DISCARDING
-                or residency.layout
-                != [descriptor.label for descriptor in op.destinations[key]]
-                or now >= op.deadline
-            ):
+            elif residency.state is _LocalDramState.DISCARDING or now >= op.deadline:
                 op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
             else:
+                indices = _layout_indices(
+                    residency.layout,
+                    [descriptor.label for descriptor in op.destinations[key]],
+                )
+                if indices is None:
+                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                    continue
                 self._acquire_claim(key, residency)
                 op.active_keys.add(key)
                 copy_keys.append(key)
                 local_slots.append(tuple(residency.slots))
-                src_descriptors.extend(self._descriptors(residency.slots))
+                src_descriptors.extend(
+                    self._descriptors([residency.slots[index] for index in indices])
+                )
                 dst_descriptors.extend(op.destinations[key])
 
         self._update_capacity_pressure()
@@ -1050,14 +1074,17 @@ class _LocalDram:
                 self._make_evictable(key)
 
     def _allocate_slots(
-        self, pool_names: list[str], protected: set[BlockKey], deadline: float
+        self, layout: list[str], protected: set[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
-        required = Counter(pool_names)
+        required = Counter(label.partition(":")[0] for label in layout)
         if all(
             len(self._free_slots[name]) >= count for name, count in required.items()
         ):
             return (
-                [(name, self._free_slots[name].popleft()) for name in pool_names],
+                [
+                    (label, self._free_slots[label.partition(":")[0]].popleft())
+                    for label in layout
+                ],
                 [],
                 False,
             )
@@ -1089,7 +1116,9 @@ class _LocalDram:
                     or residency.claim_count
                 ):
                     raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-                if not any(name in deficient for name, _ in residency.slots):
+                if not any(
+                    label.partition(":")[0] in deficient for label, _ in residency.slots
+                ):
                     continue
                 size_bytes = self._size_bytes(residency.slots)
                 decision, eviction_pending = self._kvcr._decide_eviction(
@@ -1106,7 +1135,7 @@ class _LocalDram:
                 if decision[0] is PlacementAction.KEEP:
                     continue
                 victims.append((key, record, residency, size_bytes))
-                freed.update(name for name, _ in residency.slots)
+                freed.update(label.partition(":")[0] for label, _ in residency.slots)
                 deficient = short()
 
         for key, record, residency, size_bytes in victims:
@@ -1121,7 +1150,10 @@ class _LocalDram:
             self._kvcr._prune_block_record(key)
             self._free(residency.slots)
         return (
-            [(name, self._free_slots[name].popleft()) for name in pool_names],
+            [
+                (label, self._free_slots[label.partition(":")[0]].popleft())
+                for label in layout
+            ],
             [victim[0] for victim in victims],
             False,
         )
@@ -1147,12 +1179,16 @@ class _LocalDram:
             return
         self._unscored.discard(key)
         if self._evictable.insert(key, score):
-            self._evictable_slots.update(name for name, _ in residency.slots)
+            self._evictable_slots.update(
+                label.partition(":")[0] for label, _ in residency.slots
+            )
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)
         if self._evictable.remove(key):
-            self._evictable_slots.subtract(name for name, _ in residency.slots)
+            self._evictable_slots.subtract(
+                label.partition(":")[0] for label, _ in residency.slots
+            )
 
     def _retry_unscored(self) -> None:
         for key in tuple(self._unscored):
@@ -1161,22 +1197,22 @@ class _LocalDram:
     def _descriptors(
         self, locations: Collection[tuple[str, int]]
     ) -> list[_TransferRef]:
-        return [self._descriptor(pool_name, slot) for pool_name, slot in locations]
+        return [self._descriptor(label, slot) for label, slot in locations]
 
-    def _descriptor(self, pool_name: str, slot: int) -> _TransferRef:
+    def _descriptor(self, label: str, slot: int) -> _TransferRef:
         return _TransferRef(
             self._kvcr.nixl_agent_name,
             slot,
-            pool_name,
+            label,
             framework=False,
         )
 
     def _free(self, locations: Collection[tuple[str, int]]) -> None:
-        for pool_name, slot in locations:
-            self._free_slots[pool_name].append(slot)
+        for label, slot in locations:
+            self._free_slots[label.partition(":")[0]].append(slot)
 
     def _size_bytes(self, locations: Collection[tuple[str, int]]) -> int:
-        return sum(self._pools[pool_name][2] for pool_name, _ in locations)
+        return sum(self._pools[label.partition(":")[0]][2] for label, _ in locations)
 
     def _update_capacity_pressure(self) -> None:
         if self._kvcr._capacity_needed_callback is None:
