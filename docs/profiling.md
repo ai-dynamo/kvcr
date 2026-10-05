@@ -10,10 +10,9 @@ remote-memory path. It separates the synchronous `request_pin` callback from the
 asynchronous wait for its result. A shared pin has one lifetime and separate
 associations to each waiting source operation.
 
-It does **not** yet trace NIXL submission/completion, target processing, router
-hints, or caller polling. Complete request/session correlation and performance
-validation remain separate work. Review a decoded pin capture before expanding
-the hooks.
+Source NIXL submission, native completion, release and cancellation are also
+traced; see the [source lifecycle reference](nvtx-events.md). Target processing,
+router hints and caller polling remain separate work in this source checkpoint.
 
 ## Enable tracing
 
@@ -28,8 +27,8 @@ uv sync --extra profiling
 | Value | Behavior |
 | --- | --- |
 | `off` | No NVTX/NumPy import, pin trace objects, or payload construction. |
-| `low` | Pin callback scopes, registration, waiter associations, terminal events. Default when the profiling dependencies are available. |
-| `medium` | Low detail plus individual waiter-detachment events. |
+| `low` | Pin lifecycles and source NIXL writes. Default when the profiling dependencies are available. |
+| `medium` | Low detail plus waiter-detachment and native release-retry events. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for
 tracing with an unavailable backend warns once. An unsupported level warns once

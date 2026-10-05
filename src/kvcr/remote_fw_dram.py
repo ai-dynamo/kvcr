@@ -336,6 +336,8 @@ class _SourceWriteOp(_RemoteOp):
                     if self.state is _SourceWriteState.NOTIFY_FAILURE
                     else _nvtx.Reason.DEADLINE
                 )
+                if failure_reason is _nvtx.Reason.UNKNOWN and trace is not None:
+                    failure_reason = trace.failure_reason
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
