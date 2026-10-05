@@ -275,6 +275,7 @@ class _SourcePinOp(_Op):
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
+    target_incarnation: str | None = None
 
 
 @dataclass
@@ -301,24 +302,40 @@ class _SourceWriteOp(_RemoteOp):
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
+    requested_blocks: int = -1
+    target_incarnation: str | None = None
+    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
+    trace_initialized: bool = False
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
     ) -> tuple[bool, bool]:
         backend = self._backend
+        if not self.trace_initialized:
+            self.trace_initialized = True
+            if backend._nvtx is not None:
+                self.trace = backend._nvtx.source(self, backend._kvcr)
+        trace = self.trace
         observed_work = False
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
         if self.transfer_id is None:
-            if (
-                not backend._dangling_ops.check_source_progress()
-                or status.cancel_requested
-            ):
+            source_responsive = backend._dangling_ops.check_source_progress()
+            if not source_responsive or status.cancel_requested:
                 self.state = _SourceWriteState.NOTIFY_FAILURE
             if (
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
+                failure_reason = (
+                    _nvtx.Reason.CANCELLED
+                    if status.cancel_requested
+                    else _nvtx.Reason.SOURCE_STALLED
+                    if not source_responsive
+                    else _nvtx.Reason.UNKNOWN
+                    if self.state is _SourceWriteState.NOTIFY_FAILURE
+                    else _nvtx.Reason.DEADLINE
+                )
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
@@ -328,6 +345,15 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "failed"
                 )
                 backend._dangling_ops.finish_source(self)
+                if trace is not None:
+                    trace.mark(
+                        "source.write.completed",
+                        once=True,
+                        status=_nvtx.Status.FAILED,
+                        reason=failure_reason,
+                        completed_blocks=0,
+                        completed_bytes=0,
+                    )
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
@@ -340,6 +366,13 @@ class _SourceWriteOp(_RemoteOp):
                 # same handle back for a reused name. The target hears a
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
+                if trace is not None:
+                    trace.mark(
+                        "source.write.refused",
+                        once=True,
+                        status=_nvtx.Status.REJECTED,
+                        reason=_nvtx.Reason.ROUTE_CHANGED,
+                    )
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(
@@ -351,6 +384,19 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "failed"
                 )
                 backend._dangling_ops.finish_source(self)
+                if trace is not None:
+                    trace.mark(
+                        "source.write.completed",
+                        once=True,
+                        status=_nvtx.Status.PARTIAL
+                        if self.requested_blocks
+                        else _nvtx.Status.SUCCESS,
+                        reason=_nvtx.Reason.UNKNOWN
+                        if self.requested_blocks
+                        else _nvtx.Reason.NONE,
+                        completed_blocks=0,
+                        completed_bytes=0,
+                    )
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -367,6 +413,7 @@ class _SourceWriteOp(_RemoteOp):
                         completed_indices=self.completed_indices,
                     ),
                     capture_telemetry=backend._telemetry_enabled,
+                    trace=trace,
                 )
                 self.transfer_id = transfer_id
                 self.state = (
@@ -402,6 +449,15 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 self.state = _SourceWriteState.FINISHED
                 backend._dangling_ops.finish_source(self)
+                if trace is not None:
+                    trace.mark(
+                        "source.write.completed",
+                        once=True,
+                        status=_nvtx.Status.FAILED,
+                        reason=_nvtx.Reason.CREATE_ERROR,
+                        completed_blocks=0,
+                        completed_bytes=0,
+                    )
                 return True, True
 
         transfer_id = self.transfer_id
@@ -411,6 +467,17 @@ class _SourceWriteOp(_RemoteOp):
             status.cancel_requested or backend._kvcr._clock() >= self.deadline
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
+            if trace is not None:
+                trace.mark(
+                    "source.write.cancel_requested",
+                    once=True,
+                    status=_nvtx.Status.CANCELLED
+                    if status.cancel_requested
+                    else _nvtx.Status.TIMEOUT,
+                    reason=_nvtx.Reason.CANCELLED
+                    if status.cancel_requested
+                    else _nvtx.Reason.DEADLINE,
+                )
             observed_work = True
         cancelling = self.state is _SourceWriteState.CANCEL_PENDING
         transfer_result = backend._dangling_ops.poll_source(
@@ -451,6 +518,8 @@ class _SourceWriteOp(_RemoteOp):
             )
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
+        if trace is not None:
+            trace.complete_source(self.success, len(self.source_keys))
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
@@ -459,6 +528,13 @@ class _SourceWriteOp(_RemoteOp):
                 progress.poll_transfer(self.transfer_id, require_completion=True)
                 is None
             ):
+                if self.trace is not None:
+                    self.trace.mark(
+                        "source.write.shutdown_unresolved",
+                        once=True,
+                        status=_nvtx.Status.UNRESOLVED,
+                        reason=_nvtx.Reason.SHUTDOWN,
+                    )
                 return False
             self.transfer_id = None
         self._backend._send_write_done(
@@ -844,6 +920,8 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def initialize_progress(self, _progress: _KVCRProgress) -> None:
+        if self._nvtx is not None:
+            self._nvtx.name_progress_thread()
         initialize_control = getattr(self._control, "initialize", None)
         if initialize_control is not None:
             initialize_control()
@@ -1201,6 +1279,11 @@ class _RemoteFWDram:
             dst_descriptors=dst_descriptors,
             allow_layout_subset=allow_layout_subset,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
+            target_incarnation=(
+                payload.get("sender_incarnation")
+                if isinstance(payload.get("sender_incarnation"), str)
+                else None
+            ),
         )
         if not self._try_local_source_write(progress, source_pin):
             self._progress_outbound.append(source_pin)
@@ -1257,6 +1340,8 @@ class _RemoteFWDram:
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
+            requested_blocks=len(source_pin.ordered_keys),
+            target_incarnation=source_pin.target_incarnation,
             _backend=self,
         )
         # Already on progress: retain cleanup ownership before starting the write.
@@ -1354,6 +1439,8 @@ class _RemoteFWDram:
                 source_pin.dst_descriptors[index] for index in completed_indices
             ),
             route=source_pin.route,
+            requested_blocks=len(source_pin.ordered_keys),
+            target_incarnation=source_pin.target_incarnation,
             _backend=self,
             framework_pins=framework_pins,
             source_keys=completed_keys,
