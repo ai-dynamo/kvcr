@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Remote delivery NVTX events
 
 Install the `profiling` extra. `KVCR_NVTX_LEVEL=off|low|medium` selects
@@ -43,3 +48,37 @@ never by the display prefix. Empty strings and unavailable IDs are distinct via
 `request_known`. Request strings never become registered event names. Session,
 parent-session and framework utilization remain explicitly unknown because the
 current bindings do not provide them.
+
+## Target and caller
+
+`hint.submitted`, `hint.used`, `hint.replaced`, `hint.rejected`, and
+`hint.discarded` describe the request-scoped hint. Each submission has a separate
+trace identity, even if the framework reuses a request string; target events
+identify the consumed hint via `hint_trace_id` in the same tracer instance.
+
+`op.deliver` covers the synchronous public call. `op.dispatched` describes its
+local-G2, G3 and remote block counts. `target.queued` and
+`target.start_write.enqueued` distinguish local progress queueing from successful
+control-channel enqueueing; enqueueing is not acknowledgement by the source.
+`target.write_done.received` is the validated logical result observed by target
+progress. `target.main.consume` is a synchronous main-thread consumption scope.
+`op.completion_queued` waits for **all** branches of a mixed-tier operation;
+`op.completion_returned` records the completion batch returned by `poll_completed`.
+These boundaries expose delay between progress completion and caller polling.
+
+`target.cancel_requested`, `target.quarantined`, `target.quiesced`, and
+`target.shutdown_unresolved` describe uncertainty and eventual proof of safe
+cleanup. A late success after cancellation cannot create a second successful
+caller completion. `op.shutdown_unreturned` records operations whose results
+were not returned before successful shutdown; it is not a DMA-state assertion.
+
+Source and target lifecycle events use the `remote_deliver` category. Incidental
+remote local-fill events retain negative handles and `local_fill=1`; this is not
+full public-fetch fan-out instrumentation. Source request IDs remain unknown;
+the existing target identity/handle links to the target's request mapping.
+
+Additional status codes: 7 rejected, 8 ambiguous, 9 unresolved. Additional reason
+codes: 9 submit rejected, 10 submit ambiguous, 11 creation error, 12 progress
+error, 13 release error, 14 control error, 15 invalid notification, 16 remote
+failure, 17 route changed, 18 source stalled, 19 hint unavailable, 20 hint conflict.
+Unknown remote/framework causes remain unknown rather than guessed.

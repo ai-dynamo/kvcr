@@ -60,6 +60,8 @@ class Reason(IntEnum):
     REMOTE_FAILURE = 16
     ROUTE_CHANGED = 17
     SOURCE_STALLED = 18
+    HINT_UNAVAILABLE = 19
+    HINT_CONFLICT = 20
 
 
 def _warn_once(key: str, message: str) -> None:
@@ -149,6 +151,10 @@ class _PinTracer:
                 ("target_incarnation_lo", "u8"),
                 ("route_generation", "u8"),
                 ("transfer_id", "u8"),
+                ("hint_trace_id", "u8"),
+                ("local_blocks", "i8"),
+                ("remote_blocks", "i8"),
+                ("g3_blocks", "i8"),
                 ("requested_blocks", "i8"),
                 ("requested_bytes", "i8"),
                 ("selected_blocks", "i8"),
@@ -243,6 +249,26 @@ class _PinTracer:
         except Exception:
             return None
 
+    def operation(
+        self, kvcr, handle, blocks, request_id, *, local_fill=False, hint_trace_id=0
+    ):
+        try:
+            refs = tuple(ref for block in blocks.values() for ref in block)
+            return self.lifecycle(
+                target_agent=kvcr.nixl_agent_name,
+                target_incarnation=kvcr._remote_fw_dram._dangling_ops.incarnation,
+                request_id=request_id,
+                op_handle=handle,
+                local_fill=local_fill,
+                hint_trace_id=hint_trace_id,
+                requested_blocks=len(blocks),
+                requested_bytes=kvcr._descriptor_bytes(refs),
+                destination_tier=tier(refs),
+                destination_memory=memory_kind(refs, kvcr._memory_regions),
+            )
+        except Exception:
+            return None
+
 
 def identity(value):
     """Stable 128-bit label identity; no Python hash randomization or truncation."""
@@ -281,6 +307,56 @@ class _LifecycleTrace:
         self._fields = MappingProxyType(fields)
         self._observed = set()
         self.failure_reason = Reason.UNKNOWN
+        self.completion_fields = {}
+
+    def completed(self, entries):
+        try:
+            completed = sum(entry.success for entry in entries.values())
+            all_completed = completed == len(entries)
+            self.completion_fields = dict(
+                status=Status.SUCCESS
+                if all_completed
+                else Status.PARTIAL
+                if completed
+                else Status.FAILED,
+                reason=Reason.NONE if all_completed else self.failure_reason,
+                completed_blocks=completed,
+                completed_bytes=self._fields.get("requested_bytes", -1)
+                if all_completed
+                else -1
+                if completed
+                else 0,
+            )
+            self.mark("op.completion_queued", once=True, **self.completion_fields)
+        except Exception:
+            pass
+
+    def returned(self):
+        self.mark("op.completion_returned", once=True, **self.completion_fields)
+
+    def target_result(self, op, reason):
+        try:
+            complete = len(op.completed_keys)
+            byte_count = op._backend._kvcr._descriptor_bytes(
+                ref
+                for key, refs in zip(op.ordered_keys, op.dst_descriptors)
+                if key in op.completed_keys
+                for ref in refs
+            )
+            self.mark(
+                "target.write_done.received",
+                once=True,
+                status=Status.SUCCESS
+                if op.success and complete == len(op.keys)
+                else Status.PARTIAL
+                if complete
+                else Status.FAILED,
+                reason=reason,
+                completed_blocks=complete,
+                completed_bytes=byte_count,
+            )
+        except Exception:
+            pass
 
     def context(self, request_id):
         try:

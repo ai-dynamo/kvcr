@@ -3,17 +3,14 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NVTX framework-pin tracing
+# NVTX remote-delivery tracing
 
-This first instrumentation checkpoint traces framework pin requests used by the
-remote-memory path. It separates the synchronous `request_pin` callback from the
-asynchronous wait for its result. A shared pin has one lifetime and separate
-associations to each waiting source operation.
-
-It does **not** yet trace NIXL submission/completion, target processing, router
-hints, or caller polling. Complete request/session correlation and performance
-validation remain separate work. Review a decoded pin capture before expanding
-the hooks.
+Tracing covers framework pins, source NIXL writes, target processing, request
+hints, and caller completion for remote delivery. A shared pin has one lifetime
+and separate associations to each waiting source operation. See the
+[lifecycle event reference](nvtx-events.md) for source/target correlation and
+schema 2; the pin schema is described below. Session/parent IDs and framework
+utilization are unavailable through the current bindings.
 
 ## Enable tracing
 
@@ -27,9 +24,9 @@ uv sync --extra profiling
 
 | Value | Behavior |
 | --- | --- |
-| `off` | No NVTX/NumPy import, pin trace objects, or payload construction. |
-| `low` | Pin callback scopes, registration, waiter associations, terminal events. Default when the profiling dependencies are available. |
-| `medium` | Low detail plus individual waiter-detachment events. |
+| `off` | No NVTX/NumPy import, trace objects, or payload construction. |
+| `low` | Pin and transfer lifecycles, hints, target and caller completion. Default when the profiling dependencies are available. |
+| `medium` | Low detail plus waiter-detachment and native release-retry events. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for
 tracing with an unavailable backend warns once. An unsupported level warns once
@@ -80,7 +77,7 @@ ORDER BY e.start;
 
 ## Interpretation
 
-All annotations use the `KVCR` domain and `framework_pin` category. Event names
+Pin annotations use the `KVCR` domain and `framework_pin` category. Event names
 are bounded static strings. IDs and counts are payloads, never registered names.
 
 | Event | Meaning |
