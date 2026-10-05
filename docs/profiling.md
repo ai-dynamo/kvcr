@@ -77,6 +77,39 @@ ORDER BY e.start;
 
 ## Interpretation
 
+For two independent workers, use `examples/nvtx_remote_capture.py`. It runs real
+NIXL/UCX transfers with a synthetic framework binding and verifies the bytes.
+`--memory vram` uses CUDA PyTorch allocations on GPU 0; this requires a compatible
+CUDA-enabled PyTorch environment. It does not validate remote hints in an LLM
+serving framework.
+
+```bash
+KVCR_NVTX_LEVEL=low nsys profile --trace=nvtx,cuda \
+  --sample=none --cpuctxsw=none --output=remote-deliver \
+  python examples/nvtx_remote_capture.py --warmup 1 --iterations 2 \
+    --poll-delay-ms 10
+nsys export --type=sqlite --include-json=true \
+  --output=remote-deliver.sqlite remote-deliver.nsys-rep
+python examples/nvtx_decode.py remote-deliver.sqlite --operations 3
+```
+
+Both spawned workers must appear in the report. The decoder verifies the
+cross-worker identity, pin-to-transfer association, completion ordering, and
+Unicode context. `--scenario partial|failure|timeout` exercises controlled
+framework outcomes. Use the matching decoder scenario. These examples do not
+inject native transfer errors or prove all cancellation/quarantine cases;
+the unit tests cover those controlled native-state transitions.
+
+For overhead measurements, compare `off`, `low`, and `medium` with the same
+block size/count, warmup, iteration count, memory type and poll delay, both with
+and without the profiler. Rotate run order and repeat each configuration.
+The script reports delivery latency and its reciprocal operation rate; startup,
+hint construction, result-byte verification and teardown are outside the timed
+delivery interval. Trace-file size includes startup and other libraries' events.
+These are microbenchmark measurements, not production throughput or an overhead
+acceptance threshold. Off mode disables KVCR annotations; other libraries may
+still emit their own NVTX events.
+
 Pin annotations use the `KVCR` domain and `framework_pin` category. Event names
 are bounded static strings. IDs and counts are payloads, never registered names.
 
