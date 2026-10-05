@@ -429,9 +429,9 @@ class _LifecycleTrace:
             message=name, category=t.lifecycle_category, payload=payload
         )
 
-    def mark(self, name, *, once=False, detail=False, **fields):
+    def mark(self, name, *, once=False, detail=False, retain_cause=False, **fields):
         reason = fields.get("reason", Reason.NONE)
-        if reason not in (
+        if not retain_cause and reason not in (
             Reason.NONE,
             Reason.UNKNOWN,
             Reason.RELEASE_ERROR,

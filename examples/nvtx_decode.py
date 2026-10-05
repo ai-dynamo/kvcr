@@ -78,6 +78,20 @@ def validate(events, scenario, operations):
     gaps = []
     for result in returned:
         assert result["status"] == expected, result
+        if result["request_known"]:
+            contexts = [
+                event
+                for event in named.get("request.context", [])
+                if all(
+                    event[field] == result[field]
+                    for field in ("instance_hi", "instance_lo", "trace_id")
+                )
+            ]
+            assert len(contexts) == 1, "missing or duplicate request context"
+            assert all(
+                contexts[0][field] == result[field]
+                for field in ("request_known", "request_hi", "request_lo")
+            ), "mismatched request context"
         key = operation_key(result)
         assert any(key[:2]) and any(key[2:4]), "missing cross-worker identity"
 

@@ -72,6 +72,31 @@ def test_source_path_connects_pin_to_transfer(recording):
     assert len(payloads(recording, "source.write.completed")) == 1
 
 
+def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypatch):
+    from kvcr.remote_fw_dram import _SourceWriteOp
+
+    source, agent, pinning = test_nvtx.make_source(recording)
+    backend = source._core._remote_fw_dram
+    submit = source._core._progress.submit
+
+    def replace_route(op):
+        if isinstance(op, _SourceWriteOp):
+            backend._route_generation[op.route[0]] = op.route[1] + 1
+        submit(op)
+
+    monkeypatch.setattr(source._core._progress, "submit", replace_route)
+    agent.state = "DONE"
+    pinning.complete(0)
+    test_nvtx._poll_until(
+        source, lambda _: bool(payloads(recording, "source.write.completed"))
+    )
+    assert len(payloads(recording, "source.write.refused")) == 1
+    assert not payloads(recording, "nixl.write.posted")
+    assert int(payloads(recording, "source.write.completed")[0]["reason"]) == int(
+        _nvtx.Reason.ROUTE_CHANGED
+    )
+
+
 def setup_transfer():
     agent = _TransferAgent()
     progress = _transfer_progress(agent)

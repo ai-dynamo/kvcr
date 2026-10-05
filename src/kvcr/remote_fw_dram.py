@@ -275,6 +275,7 @@ class _TargetPullOp(_RemoteOp):
                         once=True,
                         status=_nvtx.Status.UNRESOLVED,
                         reason=_nvtx.Reason.DEADLINE,
+                        retain_cause=True,
                     )
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -401,6 +402,8 @@ class _SourceWriteOp(_RemoteOp):
                     if self.state is _SourceWriteState.NOTIFY_FAILURE
                     else _nvtx.Reason.DEADLINE
                 )
+                if failure_reason is _nvtx.Reason.UNKNOWN and trace is not None:
+                    failure_reason = trace.failure_reason
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )

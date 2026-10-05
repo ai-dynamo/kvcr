@@ -25,13 +25,13 @@ from kvcr.types import BlockKey, OpEntryResult, OpEntryStatus
 recording = test_nvtx.recording
 
 
-def target():
+def target(*, eager=False):
     agent, control = FakeNixlAgent(), FakeBytesControl()
     kvcr = _new_kvcr(
         agent,
         FakePrimaryPinning(),
         control,
-        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=eager),
     )
     return kvcr, agent, control
 
@@ -114,6 +114,29 @@ def test_timeout_quarantine_and_late_quiescence_have_distinct_events(recording):
     assert len(returned) == 1
     assert int(returned[0]["status"]) == int(_nvtx.Status.FAILED)
     assert int(returned[0]["reason"]) == int(_nvtx.Reason.DEADLINE)
+
+
+def test_cancellation_cause_survives_grace_deadline(recording):
+    kvcr, agent, control = target(eager=True)
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    handle, _ = test_kvcr_remote_target._acked_deliver(
+        control, kvcr, "tcp://source:1", BlockKey(b"k")
+    )
+    agent.notifs["source"] = [
+        _write_done_notification(handle, success=False, terminal=False)
+    ]
+    _wait_until(lambda: bool(payloads(recording, "target.cancel_requested")))
+    now = 1000.0
+    result = dict(_poll_until(kvcr, bool))
+    assert not result[handle][BlockKey(b"k")].success
+    assert len(payloads(recording, "target.quarantined")) == 1
+    reason = int(payloads(recording, "op.completion_returned")[0]["reason"])
+    agent.notifs["source"] = [_write_done_notification(handle)]
+    _poll_until(kvcr, lambda _: bool(payloads(recording, "target.quiesced")))
+    assert len(payloads(recording, "op.completion_returned")) == 1
+    kvcr.close()
+    assert reason == int(_nvtx.Reason.CANCELLED)
 
 
 def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
