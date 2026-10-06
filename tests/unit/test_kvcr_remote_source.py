@@ -1253,6 +1253,7 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
         _prepared={},
         _active_transfers={},
         _stop_requested=False,
+        _disconnected_remote_agents=set(),
     )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
@@ -1296,6 +1297,32 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
     assert _RemoteFWDram._remote_agent(
         tier, progress, {"target_agent": "worker-a"}
     ) == ("worker-a", "remote-1")
+
+    # After a typed disconnect, reload only if NIXL dropped native metadata.
+    payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
+    agent.add_remote_agent = Mock(return_value="remote-1")
+    agent.check_remote_metadata = Mock(return_value=True)
+    progress._disconnected_remote_agents.add("remote-1")
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
+        "worker-a",
+        "remote-1",
+    )
+    agent.check_remote_metadata.return_value = False
+    progress._disconnected_remote_agents.add("remote-1")
+    progress.release_prepared.side_effect = RuntimeError("active transfers")
+    with pytest.raises(RuntimeError, match="active transfers"):
+        _RemoteFWDram._remote_agent(tier, progress, payload)
+    assert progress._disconnected_remote_agents == {"remote-1"}
+    assert tier._route_generation == {}
+    progress.release_prepared.side_effect = None
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
+        "worker-a",
+        "remote-1",
+    )
+    assert not progress._disconnected_remote_agents
+    agent.add_remote_agent.assert_called_once_with(b"gen-1")
+    assert removed == ["remote-2"]
+    assert tier._route_generation == {"worker-a": 1}
 
 
 @pytest.mark.parametrize(
