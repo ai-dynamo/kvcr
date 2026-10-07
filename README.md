@@ -69,12 +69,11 @@ the future.
 - TRT-LLM
   - [[RFC] Versioned KV Hints Protocol for TRT-LLM #18153](https://github.com/NVIDIA/TensorRT-LLM/issues/18153)
 
-- vLLM
-  - [[RFC]: First-Class, Orchestrator-Agnostic KV Hint Envelope for Agentic Workloads #53421](https://github.com/vllm-project/vllm/issues/53421)
-  - [[Feature] Add first-class KV hints request envelope for programmatic KV management #53423](https://github.com/vllm-project/vllm/pull/53423)
+- vLLM — supported
+  - Additional features tracked in [RFC #59708](https://github.com/vllm-project/vllm/issues/59708).
 
-- SGLang
-  - [[RFC] First-Class, Versioned KV Hint Envelope for SGLang #36224](https://github.com/sgl-project/sglang/issues/36224)
+- SGLang — supported
+  - Additional features tracked in [RFC #36224](https://github.com/sgl-project/sglang/issues/36224).
 
 - Dynamo KV Router — supported
 
