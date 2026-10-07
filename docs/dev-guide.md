@@ -413,7 +413,7 @@ Select a vLLM revision that includes the merged KVCR secondary-tier adapter
 [`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827)
 on `main`.
 Pair it with a landed Dynamo revision such as
-[`58f1e01`](https://github.com/ai-dynamo/dynamo/commit/58f1e01f76cbcf46a08963ffcab85c774da32a43),
+[`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0),
 which supports the versioned KV hint contract and one KVCR control port per
 local data-parallel rank. The
 [quick start](quick-start.md) records a pinned combination for its container.

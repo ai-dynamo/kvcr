@@ -35,7 +35,7 @@ RUN mkdir -p /overlay \
 # Pin a landed Dynamo revision with the versioned KV hint protocol and
 # per-rank KVCR control ports.
 FROM build-base AS dynamo-builder
-ARG DYNAMO_REF=58f1e01f76cbcf46a08963ffcab85c774da32a43
+ARG DYNAMO_REF=ea23e5130c1bfbadec477b99449d0cee5598caa0
 RUN git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git /src/dynamo \
  && git -C /src/dynamo fetch --depth 1 origin "${DYNAMO_REF}" \
  && git -C /src/dynamo checkout --detach "${DYNAMO_REF}"
