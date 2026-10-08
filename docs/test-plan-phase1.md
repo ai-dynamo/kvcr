@@ -308,3 +308,15 @@ the parser now accepts next to the ISO format (`telemetry.line_timestamp`); and
 `run_phase1.py` grew `--perf-evict-filler`, `--perf-concurrency-levels` and
 `--max-model-len` for the TC-05 DRAM-hit and concurrency arms (run
 `v011-dense8b-perf`, see the evidence report).
+
+Hybrid follow-up the same day (harness `1eb9e6a`): `--hit-block-tokens 576`
+makes the hit/delivery checks geometry-aware (pages must cover the hit blocks
+and equal the source's `source_write` pages and bytes), `--tc02-shared-sections
+140 --tc02-sections 200` give TC-02 a 4-block shared prefix, and the reference
+phase records `cached_tokens` so TC-02's partial arm is marked not applicable
+when the KVCR-disabled engine itself reuses no partial prefix (Qwen3.5 on this
+vLLM: 0 cached for a 2702-token shared prefix, 3456 for an exact repeat). Runs
+`v011-hyb4b-final` + `v011-hyb4b-tc05`: TC-01/02/03/05/06 PASS, TC-04 = finding
+1, same standing as dense. The reference phase now covers only the requested
+cases' prompts; one hybrid run aborted because the bare engine was unstable on
+the 3.9k-token TC-02 prompt (GDN rejects batch-invariant mode).
