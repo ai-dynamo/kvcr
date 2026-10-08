@@ -33,6 +33,7 @@ from .common import (
 )
 from .stack import GUARD, GUARD_PROMOTED
 from .telemetry import (
+    LOCAL_DELIVER,
     LOCAL_FILL,
     REMOTE_DELIVER,
     SOURCE_WRITE,
