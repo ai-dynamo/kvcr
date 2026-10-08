@@ -456,7 +456,7 @@ class _SourceWriteOp(_RemoteOp):
                     trace.mark(
                         "source.write.completed",
                         once=True,
-                        status=_nvtx.Status.PARTIAL
+                        status=_nvtx.Status.FAILED
                         if self.requested_blocks
                         else _nvtx.Status.SUCCESS,
                         reason=_nvtx.Reason.UNKNOWN

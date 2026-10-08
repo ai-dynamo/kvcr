@@ -305,6 +305,21 @@ def test_invalid_result_has_bounded_reason_and_releases_handle(recording):
     assert int(event["reason"]) == int(_nvtx.Reason.INVALID_RESULT)
 
 
+@pytest.mark.parametrize(
+    "requested,completed,expected",
+    [(0, 0, 2), (2, 0, 4), (2, 1, 3), (2, 2, 2)],
+)
+def test_pin_result_status_distinguishes_zero_success(
+    recording, requested, completed, expected
+):
+    trace = _nvtx.create_tracer().begin(requested)
+    trace.finish("success", completed_blocks=completed)
+    event = payloads(recording, "source.pin.completed")[0]
+    assert int(event["status"]) == expected
+    assert int(event["completed_blocks"]) == completed
+    assert int(event["reason"]) == (0 if completed < requested else 1)
+
+
 def test_payload_counting_failure_cannot_interrupt_pin_processing(recording):
     class ValuesUnavailable(dict):
         def values(self):

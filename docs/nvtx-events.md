@@ -82,3 +82,9 @@ codes: 9 submit rejected, 10 submit ambiguous, 11 creation error, 12 progress
 error, 13 release error, 14 control error, 15 invalid notification, 16 remote
 failure, 17 route changed, 18 source stalled, 19 hint unavailable, 20 hint conflict.
 Unknown remote/framework causes remain unknown rather than guessed.
+
+Nonempty source and pin requests with zero completed blocks report FAILED;
+positive incomplete results report PARTIAL. This is a diagnostic convention and
+does not change control notifications or transfer ownership. See the
+[identity producer map](nvtx-context.md) for inference versus framework pin IDs
+and the unavailable session/utilization input seams.

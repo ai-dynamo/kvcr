@@ -12,6 +12,34 @@ from kvcr import _nvtx
 recording = test_nvtx.recording
 
 
+def test_zero_selected_source_is_failed_without_posting(recording):
+    source, agent, pinning = test_nvtx.make_source(recording)
+    pinning.complete(0, missing_indices=(0,))
+    test_nvtx._poll_until(
+        source, lambda _: bool(payloads(recording, "source.write.completed"))
+    )
+    event = payloads(recording, "source.write.completed")[0]
+    assert int(event["status"]) == 4
+    assert int(event["reason"]) == 0
+    assert int(event["requested_blocks"]) == 1
+    assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
+    assert not agent.xfers
+
+
+@pytest.mark.parametrize(
+    "requested,completed,expected",
+    [(0, 0, 2), (2, 0, 4), (2, 1, 3), (2, 2, 2)],
+)
+def test_source_result_status_distinguishes_zero_success(
+    recording, requested, completed, expected
+):
+    trace = _nvtx.create_tracer().lifecycle(requested_blocks=requested)
+    trace.complete_source(True, completed)
+    event = payloads(recording, "source.write.completed")[0]
+    assert int(event["status"]) == expected
+    assert int(event["completed_blocks"]) == completed
+
+
 @pytest.mark.parametrize("value", [None, "", "req-α-😀\x00x", "😀" * 100])
 def test_context_mapping_preserves_identity_and_bounded_utf8(recording, value):
     trace = _nvtx.create_tracer().lifecycle(request_id=value)
