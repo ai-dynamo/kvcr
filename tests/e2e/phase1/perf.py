@@ -347,7 +347,9 @@ def tc05(ctx: Context) -> CaseResult:
         result.measurements["arm_kvcr_dram_hit_window"] = dram_window.totals
         result.measurements["eviction"] = {
             "filler_prompts": len(fillers),
-            "filler_prompt_tokens": sum(r.prompt_tokens or 0 for r in filler_responses),
+            "filler_prompt_tokens": sum(
+                (r.usage or {}).get("prompt_tokens") or 0 for r in filler_responses
+            ),
             "filler_cached_tokens": [r.cached_tokens for r in filler_responses],
             "filler_window": filler_window.totals,
             "pool_after": pool_gauges(ctx, 0),
