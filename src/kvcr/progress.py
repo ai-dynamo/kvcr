@@ -24,7 +24,9 @@ from nixl import nixl_agent, nixl_agent_config
 from .types import BlockKey, RegionDescriptor
 
 logger = logging.getLogger(__name__)
-_IDLE_WAIT_SECONDS = 0.001
+_ACTIVE_WAIT_SECONDS = 0.0001
+_IDLE_WAIT_SECONDS = 0.020
+_OP_CLEANUP_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
@@ -162,6 +164,7 @@ class _KVCRProgress:
         self._wake_read: int | None = None
         self._wake_write: int | None = None
         self._idle_waiter: Callable[[float, int], None] | None = None
+        self._idle_wait_seconds = _IDLE_WAIT_SECONDS
         self._completed: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._completed_backlog: deque[object] = deque()
         self._in_flight_ops: dict[_OpId, _ProgressOp] = {}
@@ -471,7 +474,7 @@ class _KVCRProgress:
     def _wait_for_work(self) -> None:
         wake_fd = self._wake_read
         assert wake_fd is not None
-        timeout = _IDLE_WAIT_SECONDS
+        timeout = self._idle_wait_seconds
         if self._idle_waiter is not None:
             self._idle_waiter(timeout, wake_fd)
         else:
@@ -583,7 +586,10 @@ class _KVCRProgress:
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration() and not self._stop_requested:
-                    self._wait_for_work()
+                    if self._in_flight_ops:
+                        time.sleep(_ACTIVE_WAIT_SECONDS)
+                    else:
+                        self._wait_for_work()
         except BaseException as error:
             self._failure = error
         finally:
@@ -623,7 +629,7 @@ class _KVCRProgress:
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError("KVCR progress operations did not close")
-            time.sleep(_IDLE_WAIT_SECONDS)
+            time.sleep(_OP_CLEANUP_WAIT_SECONDS)
 
     def _run_one_iteration(self) -> bool:
         published = self._publish_completed(self._batch_size)

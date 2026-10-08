@@ -16,6 +16,7 @@ import pytest
 from kvcr import progress as progress_module
 from kvcr.dangling_ops import _DanglingOps
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
+from kvcr.remote_fw_dram import _RemoteFWDram
 from kvcr.types import RegionDescriptor
 
 
@@ -807,19 +808,66 @@ def test_submission_and_stop_interrupt_idle_wait() -> None:
     assert not progress._thread.is_alive()
 
 
-def test_idle_wait_does_not_stall_a_healthy_source(monkeypatch) -> None:
+def test_pending_operations_use_fast_polling_then_return_to_idle(monkeypatch) -> None:
+    waits = []
+
+    class Operation(_ProgressOp):
+        polls = 0
+
+        def progress(self, _progress, _event):
+            self.polls += 1
+            return self.polls == 3, self.polls == 3
+
+        def close(self, _progress):
+            return True
+
+    def wait(timeout, _wake_fd):
+        waits.append(("idle", timeout))
+        if not progress._in_flight_ops:
+            progress._stop_requested = True
+
+    progress = _KVCRProgress(
+        lambda _: None, lambda _, items: ({}, False), list, lambda: None
+    )
+    progress._idle_waiter = wait
+    progress._activate.set()
+    operation = Operation(op_id=("test", 1), keys=set())
+    progress.submit(operation)
+    monkeypatch.setattr(
+        progress_module.time, "sleep", lambda timeout: waits.append(("active", timeout))
+    )
+
+    progress._run()
+    progress.raise_if_failed()
+
+    assert progress.take_completed() == [operation]
+    assert operation.polls == 3
+    assert waits == [("active", 0.0001), ("idle", 0.020)]
+
+
+@pytest.mark.parametrize(
+    ("operation_timeout_ms", "idle_wait"), [(1, 0.0), (10, 0.005), (1000, 0.020)]
+)
+def test_idle_wait_does_not_stall_a_healthy_source(
+    monkeypatch, operation_timeout_ms, idle_wait
+) -> None:
     progress = _KVCRProgress(
         lambda _: None, lambda _, items: ({}, False), list, lambda: None
     )
     backend = SimpleNamespace(
-        _kvcr=SimpleNamespace(config=SimpleNamespace(operation_timeout_ms=10)),
+        _kvcr=SimpleNamespace(
+            config=SimpleNamespace(operation_timeout_ms=operation_timeout_ms)
+        ),
+        _control=None,
         _progress_outbound=[],
     )
+    _RemoteFWDram.initialize_progress(backend, progress)
     dangling = _DanglingOps(backend)
     now = [1.0]
     monkeypatch.setattr("kvcr.dangling_ops.time.monotonic", lambda: now[0])
 
     def wait(timeout, _wake_fd):
+        assert timeout == idle_wait
         now[0] += timeout
 
     progress._idle_waiter = wait
@@ -830,5 +878,8 @@ def test_idle_wait_does_not_stall_a_healthy_source(monkeypatch) -> None:
         dangling.begin_poll()
         assert dangling.check_source_progress()
         assert not backend._progress_outbound
+        now[0] += operation_timeout_ms / 1000 * 1.1
+        assert not dangling.check_source_progress()
+        assert len(backend._progress_outbound) == 1
     finally:
         progress._close_wakeup()
