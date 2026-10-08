@@ -45,24 +45,24 @@ These times are observations from one run, not latency targets.
 
 | Time | Worker / event | Interpretation |
 | --- | --- | --- |
-| 0.122 | Target: `hint.submitted`, trace 7 | Request `capture-α-😀-2` has a new hint lifecycle. |
-| 0.582 | Target: `op.deliver`, trace 8, handle H3 | Synchronous public dispatch begins. |
-| 1.053 | Target: `hint.used`, trace 7, H3 | That submission is used for this operation. |
-| 1.169 | Target: `target.queued`, trace 9, hint 7 | The remote branch is queued; caller trace 8 is separate. |
-| 1.740 | Target: `target.start_write.enqueued` | Control enqueueing, before source processing. |
-| 2.991 | Source: `source.pin.registered`, pin 5 | Framework request accepted; waiter links pin 5 to source operation 3 and H3. |
-| 23.377 | Source: `source.pin.completed` | Four blocks available after the configured pin delay and polling. |
-| 25.032 | Source: `nixl.write.posted`, trace 6 | Native write posted. |
-| 25.156 | Source: `nixl.done_observed` | First observed native DONE. |
-| 25.312 | Source: `nixl.write.released` | Native handle release succeeded. |
-| 25.455 | Source: `source.write.completed` | Logical source success: 4 blocks, 16,384 bytes. |
-| 25.501 | Target: `target.write_done.received` | Progress has the remote result. |
-| 51.654 | Target: `target.main.consume` | Main-thread polling consumes it. |
-| 51.929 | Target: `op.completion_queued`, trace 8 | All operation branches are joined. |
-| 52.084 | Target: `op.completion_returned`, trace 8 | Caller receives the result: receipt-to-return gap 26.583 ms. |
+| 0.127 | Target: `hint.submitted`, trace 7 | Request `capture-α-😀-2` has a new hint lifecycle. |
+| 0.545 | Target: `op.deliver`, trace 8, handle H3 | Synchronous public dispatch begins. |
+| 1.006 | Target: `hint.used`, trace 7, H3 | That submission is used for this operation. |
+| 1.122 | Target: `target.queued`, trace 9, hint 7 | The remote branch is queued; caller trace 8 is separate. |
+| 1.480 | Target: `target.start_write.enqueued` | Control enqueueing, before source processing. |
+| 2.407 | Source: `source.pin.registered`, pin 5 | Framework request accepted; waiter links pin 5 to source operation 3 and H3. |
+| 22.731 | Source: `source.pin.completed` | Four blocks available after the configured pin delay and polling. |
+| 23.842 | Source: `nixl.write.posted`, trace 6 | Native write posted. |
+| 23.960 | Source: `nixl.done_observed` | First observed native DONE. |
+| 24.107 | Source: `nixl.write.released` | Native handle release succeeded. |
+| 24.253 | Source: `source.write.completed` | Logical source success: 4 blocks, 16,384 bytes. |
+| 25.015 | Target: `target.write_done.received` | Progress has the remote result. |
+| 51.468 | Target: `target.main.consume` | Main-thread polling consumes it. |
+| 51.693 | Target: `op.completion_queued`, trace 8 | All operation branches are joined. |
+| 51.840 | Target: `op.completion_returned`, trace 8 | Caller receives the result: receipt-to-return gap 26.825 ms. |
 
-The pin registration-to-completion interval is 20.386 ms. It includes framework
-and polling delay. The later 26.583 ms gap shows delayed caller polling; it is
+The pin registration-to-completion interval is 20.323 ms. It includes framework
+and polling delay. The later 26.825 ms gap shows delayed caller polling; it is
 not extra DMA time. Absolute clocks from separate machines would require clock
 alignment before using a similar cross-worker timing table.
 
