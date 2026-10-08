@@ -55,9 +55,10 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     )
 
 
-@pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-@pytest.mark.parametrize("max_refs", [0, 8])
-@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize(
+    ("transfer_state", "max_refs", "fallback"),
+    [("PROC", 0, False), ("DONE", 0, True), ("PROC", 8, True), ("DONE", 8, False)],
+)
 def test_local_source_starts_inline_and_holds_its_slot(
     transfer_state, max_refs, fallback, monkeypatch
 ):

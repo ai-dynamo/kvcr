@@ -71,7 +71,6 @@ class _LocalDramResidency:
 @dataclass(frozen=True, slots=True)
 class _SourceMetadata:
     residency: _LocalDramResidency
-    owner: str
     refs: tuple[_TransferRef, ...]
     layout: tuple[str, ...]
     indices_by_label: Mapping[str, int | None]
@@ -573,11 +572,7 @@ class _LocalDram:
     ) -> _SourceMetadata | None:
         cached = self._source_cache.get(key)
         if cached is not None:
-            if (
-                cached.residency is residency
-                and cached.owner == self._kvcr.nixl_agent_name
-            ):
-                self._source_cache.move_to_end(key)
+            if cached.residency is residency:
                 return cached
             self._discard_source_metadata(key)
         return None
@@ -587,6 +582,7 @@ class _LocalDram:
     ) -> tuple[_TransferRef, ...]:
         cached = self._cached_source_metadata(key, residency)
         if cached is not None:
+            self._source_cache.move_to_end(key)
             return cached.refs
         refs = tuple(self._descriptor(label, slot) for label, slot in residency.slots)
         if not 0 < len(refs) <= self._source_cache_max_refs:
@@ -595,9 +591,7 @@ class _LocalDram:
         indices: dict[str, int | None] = {}
         for index, label in enumerate(layout):
             indices[label] = None if label in indices else index
-        metadata = _SourceMetadata(
-            residency, self._kvcr.nixl_agent_name, refs, layout, indices
-        )
+        metadata = _SourceMetadata(residency, refs, layout, indices)
         while self._source_cache_ref_count + len(refs) > self._source_cache_max_refs:
             _, evicted = self._source_cache.popitem(last=False)
             self._source_cache_ref_count -= len(evicted.refs)

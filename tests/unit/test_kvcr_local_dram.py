@@ -932,6 +932,8 @@ def test_source_cache_reuses_metadata_with_weighted_lru_budget(source_cache):
         return
     second = _claimed_source_refs(backend, b)
     assert _claimed_source_refs(backend, a) is first
+    # Matching alone does not acquire the source or refresh its recency.
+    assert backend.source_layout_indices(b, [""]) == [0]
     _claimed_source_refs(backend, c)
     # The two-part a costs two refs: c must evict the untouched one-part b.
     assert _claimed_source_refs(backend, a) is first
@@ -941,18 +943,16 @@ def test_source_cache_reuses_metadata_with_weighted_lru_budget(source_cache):
     assert _claimed_source_refs(backend, a) is first
 
 
-def test_source_cache_validates_residency_owner_and_ready_state(source_cache):
+def test_source_cache_validates_residency_and_ready_state(source_cache):
     backend, (key, *_), _ = source_cache
     record = backend._kvcr._block_record_map[key]
     first = _claimed_source_refs(backend, key)
     record.local_dram = _LocalDramResidency(
-        list(record.local_dram.slots), _LocalDramState.READY
+        list(reversed(record.local_dram.slots)), _LocalDramState.READY
     )
     fresh = _claimed_source_refs(backend, key)
-    assert fresh == first and fresh is not first
-    backend._kvcr.nixl_agent_name = "new-owner"
-    fresh = _claimed_source_refs(backend, key)
-    assert {ref.end_point_name for ref in fresh} == {"new-owner"}
+    assert fresh == tuple(reversed(first))
+    assert backend.source_layout_indices(key, [":k"]) == [1]
     record.local_dram.state = _LocalDramState.DISCARDING
     assert backend.acquire_sources((key,)) == {}
     assert backend.source_layout_indices(key, [":k"]) is None
