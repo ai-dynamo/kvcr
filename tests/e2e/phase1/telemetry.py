@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,11 +47,40 @@ LOCAL_DELIVER = "local_deliver"
 TRANSFER = "transfer"
 
 
+VLLM_STAMP = re.compile(r"\b(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\b")
+
+
 def parse_timestamp(stamp: str) -> datetime | None:
     try:
         return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def line_timestamp(line: str) -> datetime | None:
+    """Timestamp of a metrics line in either log format.
+
+    Dynamo's tracing formatter starts the line with an ISO instant
+    (``2026-10-03T21:41:22.673433Z ...``); vLLM's own logger, which Dynamo
+    ea23e51+ lets write the KV Transfer metrics line, prefixes
+    ``(MainProcess pid=N) INFO 10-08 20:54:47 [...]`` with no year or zone.
+    The latter is taken as UTC of the current year (the harness runs with
+    TZ=UTC containers); a run spanning New Year would need the launch date.
+    """
+    stamp = parse_timestamp(line.split()[0])
+    if stamp is not None:
+        return stamp
+    head = line.split("KV Transfer metrics:", 1)[0]
+    found = VLLM_STAMP.search(head)
+    if found is None:
+        return None
+    month, day, hour, minute, second = (int(x) for x in found.groups())
+    now = datetime.now(timezone.utc)
+    year = now.year
+    candidate = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+    if candidate - now > timedelta(days=1):  # log from late last year
+        candidate = candidate.replace(year=year - 1)
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -69,9 +98,9 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
         line = ANSI.sub("", raw).strip()
         if "KV Transfer metrics:" not in line:
             continue
-        stamp = parse_timestamp(line.split()[0])
+        stamp = line_timestamp(line)
         if stamp is None:
-            errors.append(f"line {number}: metric line without ISO timestamp")
+            errors.append(f"line {number}: metric line without a parseable timestamp")
             continue
         payload = line.split("KV Transfer metrics:", 1)[1].strip()
         pairs = METRIC.findall(payload)
@@ -147,6 +176,8 @@ def window(
                 and ("'failed'" in name or "'partial'" in name)
             ):
                 failures.append({"metric": name, "value": value, "line": snapshot.line})
+    if errors:
+        totals["_parse_errors"] = len(errors)
     return Window(totals, count, flushed, failures, list(errors))
 
 
