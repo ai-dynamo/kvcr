@@ -390,14 +390,17 @@ class _LifecycleTrace:
 
     def complete_source(self, success, blocks):
         requested = self._fields.get("requested_blocks", -1)
+        status = Status.FAILED
+        if success:
+            status = (
+                (Status.FAILED if blocks == 0 else Status.PARTIAL)
+                if blocks < requested
+                else Status.SUCCESS
+            )
         self.mark(
             "source.write.completed",
             once=True,
-            status=(Status.FAILED if blocks == 0 else Status.PARTIAL)
-            if blocks < requested
-            else Status.SUCCESS
-            if success
-            else Status.FAILED,
+            status=status,
             reason=Reason.NONE
             if success and blocks >= requested
             else self.failure_reason,
