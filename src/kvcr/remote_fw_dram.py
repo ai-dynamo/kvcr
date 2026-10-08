@@ -31,7 +31,7 @@ from .core import (
     logger,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
-from .local_dram import _layout_indices, _LocalDramState
+from .local_dram import _layout_indices
 from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _RegionMaps, _TransferRef
 from .types import (
     BlockKey,
@@ -1219,12 +1219,8 @@ class _RemoteFWDram:
         selected = []
         try:
             for key, layout in zip(source_pin.ordered_keys, layouts):
-                record = kvcr._block_record_map.get(key)
-                residency = record.local_dram if record is not None else None
-                if residency is None or residency.state is not _LocalDramState.READY:
-                    return False
-                indices = _layout_indices(
-                    residency.layout,
+                indices = kvcr._local_dram.source_layout_indices(
+                    key,
                     layout,
                     allow_subset=source_pin.allow_layout_subset,
                 )
@@ -1298,11 +1294,17 @@ class _RemoteFWDram:
             destination = source_pin.dst_descriptors[index]
             if source is None:
                 continue
-            indices = _layout_indices(
-                [descriptor.label for descriptor in source],
-                [descriptor.label for descriptor in destination],
-                allow_subset=source_pin.allow_layout_subset,
-            )
+            requested = [descriptor.label for descriptor in destination]
+            if key in local_sources:
+                indices = kvcr._local_dram.source_layout_indices(
+                    key, requested, allow_subset=source_pin.allow_layout_subset
+                )
+            else:
+                indices = _layout_indices(
+                    [descriptor.label for descriptor in source],
+                    requested,
+                    allow_subset=source_pin.allow_layout_subset,
+                )
             if indices is None:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",

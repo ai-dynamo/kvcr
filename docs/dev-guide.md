@@ -187,6 +187,10 @@ completion, and release semantics, and the
 [Router–KVCR API](design_overview.md#routerkvcr-api) for request-scoped hints.
 `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
+`LocalDramOptions.source_cache_max_refs` limits cached source metadata to
+`262144` part references by default; `0` disables caching. Each operation still
+acquires its own residency claims.
+
 ### Development loop
 
 Run a focused test while iterating, then the complete standalone validation

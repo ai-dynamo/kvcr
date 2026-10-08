@@ -56,7 +56,11 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
+@pytest.mark.parametrize("max_refs", [0, 8])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_local_source_starts_inline_and_holds_its_slot(
+    transfer_state, max_refs, fallback, monkeypatch
+):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -80,7 +84,10 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
             )
             for label in ("", ":*")
         ],
-        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        local_dram=LocalDramOptions(
+            [("", ctypes.addressof(memory), len(memory))],
+            source_cache_max_refs=max_refs,
+        ),
         capacity_needed_callback=lambda request: callbacks.append(
             (threading.get_ident(), request)
         ),
@@ -170,6 +177,34 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == 2)
         assert residency.claim_count == 1  # Native completion does not release it.
+        first = next(iter(source._core._local_dram_sources_by_op.values()))[key]
+        assert _poll_until(source, lambda _: residency.claim_count == 0) == []
+        assert not source._core._local_dram_sources_by_op
+
+        # The next layer selects different parts from the same full source tuple.
+        if fallback:
+            monkeypatch.setattr(
+                source._core._remote_fw_dram,
+                "_try_local_source_write",
+                lambda *_: False,
+            )
+        request["op_handle"] = 13
+        request["dst_descriptors"] = [
+            [_TransferRef("target", i, label) for i, label in enumerate((":b", ":c"))]
+        ]
+        agent.state = "PROC"
+        control.incoming.append(msgspec.msgpack.encode(request))
+        assert _poll_until(source, lambda _: len(agent.xfers) == 3) == []
+        current = next(iter(source._core._local_dram_sources_by_op.values()))[key]
+        assert current == first
+        assert (current is first) == bool(max_refs)
+        assert residency.claim_count == 1
+        assert [
+            ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+        ] == [b"b" * 16, b"c" * 16]
+        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
+        assert pinning.searches == []
+        agent.state = "DONE"
         assert _poll_until(source, lambda _: residency.claim_count == 0) == []
         assert not source._core._local_dram_sources_by_op
     finally:
@@ -727,7 +762,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_TransferRef("target", index).__dict__] for index in range(3)
+            [_TransferRef("target", index)] for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -945,8 +980,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     ),
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_TransferRef("target", index).__dict__]
-                        for index in range(len(op_keys))
+                        [_TransferRef("target", index)] for index in range(len(op_keys))
                     ],
                 }
             )

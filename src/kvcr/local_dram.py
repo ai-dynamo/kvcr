@@ -3,7 +3,7 @@
 """KVCR-owned local DRAM slots, claims, and transfers."""
 
 import logging
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -66,6 +66,31 @@ class _LocalDramResidency:
     @property
     def layout(self) -> list[str]:
         return [name for name, _ in self.slots]
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceMetadata:
+    residency: _LocalDramResidency
+    owner: str
+    refs: tuple[_TransferRef, ...]
+    layout: tuple[str, ...]
+    indices_by_label: Mapping[str, int | None]
+
+    def layout_indices(
+        self, requested: list[str], *, allow_subset: bool
+    ) -> list[int] | None:
+        # Exact legacy layouts can contain repeated unnamed pool labels.
+        if len(self.layout) == len(requested) and self.layout == tuple(requested):
+            return list(range(len(requested)))
+        if not allow_subset or not requested or len(set(requested)) != len(requested):
+            return None
+        indices = []
+        for label in requested:
+            index = self.indices_by_label.get(label)
+            if index is None:
+                return None
+            indices.append(index)
+        return indices
 
 
 @dataclass
@@ -171,9 +196,17 @@ class _LocalDram:
             raise ValueError("local DRAM pools must match pool_layouts")
         if not region.backend:
             raise ValueError("local DRAM NIXL backend must be non-empty")
+        if (
+            type(region.source_cache_max_refs) is not int
+            or region.source_cache_max_refs < 0
+        ):
+            raise ValueError("source_cache_max_refs must be a non-negative integer")
 
         self._kvcr = kvcr
         self._backend = region.backend
+        self._source_cache_max_refs = region.source_cache_max_refs
+        self._source_cache: OrderedDict[BlockKey, _SourceMetadata] = OrderedDict()
+        self._source_cache_ref_count = 0
         self._pools: dict[str, tuple[int, int, int]] = {}
         self._free_slots: dict[str, deque[int]] = {}
         for (pool_name, address, length), (_, slot_size) in zip(
@@ -499,20 +532,78 @@ class _LocalDram:
 
     def acquire_sources(
         self, keys: Collection[BlockKey], *, notify_capacity: bool = True
-    ) -> dict[BlockKey, list[_TransferRef]]:
-        sources: dict[BlockKey, list[_TransferRef]] = {}
+    ) -> dict[BlockKey, tuple[_TransferRef, ...]]:
+        sources: dict[BlockKey, tuple[_TransferRef, ...]] = {}
         for key in keys:
             if key in sources:
                 continue
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if residency is None or residency.state is not _LocalDramState.READY:
+                self._discard_source_metadata(key)
                 continue
+            refs = self._source_refs(key, residency)
             self._acquire_claim(key, residency)
-            sources[key] = self._descriptors(residency.slots)
+            sources[key] = refs
         if notify_capacity:
             self._update_capacity_pressure()
         return sources
+
+    def source_layout_indices(
+        self, key: BlockKey, requested: list[str], *, allow_subset: bool = True
+    ) -> list[int] | None:
+        """Select current source parts under the same metadata lock as acquisition."""
+        record = self._kvcr._block_record_map.get(key)
+        residency = record.local_dram if record is not None else None
+        if residency is None or residency.state is not _LocalDramState.READY:
+            self._discard_source_metadata(key)
+            return None
+        cached = self._cached_source_metadata(key, residency)
+        if cached is not None:
+            return cached.layout_indices(requested, allow_subset=allow_subset)
+        return _layout_indices(residency.layout, requested, allow_subset=allow_subset)
+
+    def _discard_source_metadata(self, key: BlockKey) -> None:
+        cached = self._source_cache.pop(key, None)
+        if cached is not None:
+            self._source_cache_ref_count -= len(cached.refs)
+
+    def _cached_source_metadata(
+        self, key: BlockKey, residency: _LocalDramResidency
+    ) -> _SourceMetadata | None:
+        cached = self._source_cache.get(key)
+        if cached is not None:
+            if (
+                cached.residency is residency
+                and cached.owner == self._kvcr.nixl_agent_name
+            ):
+                self._source_cache.move_to_end(key)
+                return cached
+            self._discard_source_metadata(key)
+        return None
+
+    def _source_refs(
+        self, key: BlockKey, residency: _LocalDramResidency
+    ) -> tuple[_TransferRef, ...]:
+        cached = self._cached_source_metadata(key, residency)
+        if cached is not None:
+            return cached.refs
+        refs = tuple(self._descriptor(label, slot) for label, slot in residency.slots)
+        if not 0 < len(refs) <= self._source_cache_max_refs:
+            return refs
+        layout = tuple(ref.label for ref in refs)
+        indices: dict[str, int | None] = {}
+        for index, label in enumerate(layout):
+            indices[label] = None if label in indices else index
+        metadata = _SourceMetadata(
+            residency, self._kvcr.nixl_agent_name, refs, layout, indices
+        )
+        while self._source_cache_ref_count + len(refs) > self._source_cache_max_refs:
+            _, evicted = self._source_cache.popitem(last=False)
+            self._source_cache_ref_count -= len(evicted.refs)
+        self._source_cache[key] = metadata
+        self._source_cache_ref_count += len(refs)
+        return refs
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
         for key in keys:

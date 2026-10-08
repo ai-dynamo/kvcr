@@ -40,6 +40,7 @@ def _validate_pool_layouts(pool_layouts: PoolBlockLayouts) -> None:
 class LocalDramOptions:
     pools: LocalDramRegions
     backend: str = "UCX"
+    source_cache_max_refs: int = 262144
 
 
 # Early pinning optimization was considered, but its complexity outweighed the benefit.

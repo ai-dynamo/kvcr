@@ -595,6 +595,7 @@ def _new_local_kvcr(
     policy=None,
     local_dram_backend="UCX",
     framework_regions: list[RegionDescriptor] | None = None,
+    source_cache_max_refs=262144,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -618,6 +619,7 @@ def _new_local_kvcr(
                 local_dram=LocalDramOptions(
                     [("", ctypes.addressof(local), len(local))],
                     local_dram_backend,
+                    source_cache_max_refs=source_cache_max_refs,
                 ),
             ),
         )

@@ -8,7 +8,7 @@ import heapq
 import logging
 from contextlib import closing
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from _kvcr_test_utils import (
@@ -52,7 +52,14 @@ from kvcr.types import (
 
 
 def _two_pool_kvcr(
-    agent, pools, source, config=None, capacity_needed_callback=None, *, labeled=False
+    agent,
+    pools,
+    source,
+    config=None,
+    capacity_needed_callback=None,
+    *,
+    labeled=False,
+    source_cache_max_refs=262144,
 ):
     config = config or KVCRConfig(
         nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]
@@ -66,7 +73,8 @@ def _two_pool_kvcr(
             [
                 (name, ctypes.addressof(pool), len(pool))
                 for (name, _), pool in zip(config.pool_layouts, pools, strict=True)
-            ]
+            ],
+            source_cache_max_refs=source_cache_max_refs,
         ),
         capacity_needed_callback=capacity_needed_callback,
         framework_regions=[
@@ -194,7 +202,10 @@ def test_local_dram_rejects_overlapping_pools() -> None:
 
 
 @pytest.mark.parametrize("labeled", [False, True])
-def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
+@pytest.mark.parametrize("source_cache_max_refs", [0, 8])
+def test_multi_pool_residency_moves_and_evicts_as_one_key(
+    labeled, source_cache_max_refs
+) -> None:
     full = ctypes.create_string_buffer(16)
     swa = ctypes.create_string_buffer(16)
     payload = b"a" * 16 + b"b" * 8 + b"c" * 8
@@ -209,6 +220,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
             pool_layouts=[("full", 16), ("swa", 8)],
         ),
         labeled=labeled,
+        source_cache_max_refs=source_cache_max_refs,
     )
     layout = ["full", "swa:a", "swa:b"] if labeled else ["full", "swa", "swa"]
     descriptors = [
@@ -225,6 +237,20 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     agent.state = "DONE"
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert full.raw + swa.raw == payload
+    backend = kvcr._core._local_dram
+    with patch.object(backend, "_descriptor", side_effect=AssertionError):
+        assert backend.source_layout_indices(first, [layout[0]]) == [0]
+    _claimed_source_refs(backend, first)
+    assert backend.source_layout_indices(first, layout) == [0, 1, 2]
+    assert backend.source_layout_indices(first, list(reversed(layout[1:]))) == (
+        [2, 1] if labeled else None
+    )
+    assert backend.source_layout_indices(first, [layout[1]]) == (
+        [1] if labeled else None
+    )
+    assert backend.source_layout_indices(first, [layout[1], layout[1]]) is None
+    assert backend.source_layout_indices(first, ["swa:missing"]) is None
+    assert backend.source_layout_indices(first, layout[1:], allow_subset=False) is None
     wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
     assert not dict(kvcr.poll_completed())[wrong_layout][first].success
     claim = kvcr.fetch((first,), expected_layout=layout)
@@ -871,6 +897,67 @@ def _g2_recovered(**slots: int) -> dict[BlockKey, _BlockRecord]:
         )
         for name, slot in slots.items()
     }
+
+
+@pytest.fixture
+def source_cache(request):
+    budget = getattr(request, "param", 3)
+    local = ctypes.create_string_buffer(128)
+    kvcr = _new_local_kvcr(FakeNixlAgent(), local, 8, source_cache_max_refs=budget)
+    records = _g2_recovered(a=0, b=2, c=3, d=4)
+    keys = tuple(records)
+    records[keys[0]].local_dram.slots = [(":k", 0), (":v", 1)]
+    records[keys[3]].local_dram.slots = [("", slot) for slot in range(4, 8)]
+    install_recovery_records(kvcr._core, records)
+    yield kvcr._core._local_dram, keys, budget
+
+
+def _claimed_source_refs(backend, key):
+    with backend._kvcr._state_lock:
+        refs = backend.acquire_sources((key,))[key]
+        residency = backend._kvcr._block_record_map[key].local_dram
+        assert residency.claim_count == 1
+        backend.release_sources((key,))
+        assert residency.claim_count == 0
+    return refs
+
+
+@pytest.mark.parametrize("source_cache", [0, 3], indirect=True)
+def test_source_cache_reuses_metadata_with_weighted_lru_budget(source_cache):
+    backend, (a, b, c, oversized), budget = source_cache
+    first = _claimed_source_refs(backend, a)
+    assert isinstance(first, tuple)
+    assert (_claimed_source_refs(backend, a) is first) == bool(budget)
+    if not budget:
+        return
+    second = _claimed_source_refs(backend, b)
+    assert _claimed_source_refs(backend, a) is first
+    _claimed_source_refs(backend, c)
+    # The two-part a costs two refs: c must evict the untouched one-part b.
+    assert _claimed_source_refs(backend, a) is first
+    assert _claimed_source_refs(backend, b) is not second
+    large = _claimed_source_refs(backend, oversized)
+    assert _claimed_source_refs(backend, oversized) is not large
+    assert _claimed_source_refs(backend, a) is first
+
+
+def test_source_cache_validates_residency_owner_and_ready_state(source_cache):
+    backend, (key, *_), _ = source_cache
+    record = backend._kvcr._block_record_map[key]
+    first = _claimed_source_refs(backend, key)
+    record.local_dram = _LocalDramResidency(
+        list(record.local_dram.slots), _LocalDramState.READY
+    )
+    fresh = _claimed_source_refs(backend, key)
+    assert fresh == first and fresh is not first
+    backend._kvcr.nixl_agent_name = "new-owner"
+    fresh = _claimed_source_refs(backend, key)
+    assert {ref.end_point_name for ref in fresh} == {"new-owner"}
+    record.local_dram.state = _LocalDramState.DISCARDING
+    assert backend.acquire_sources((key,)) == {}
+    assert backend.source_layout_indices(key, [":k"]) is None
+    record.local_dram.state = _LocalDramState.READY
+    assert _claimed_source_refs(backend, key) is not fresh
 
 
 def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() -> None:
