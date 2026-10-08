@@ -146,6 +146,9 @@ class Runner:
         )
         self.references: dict[str, TokenSample] = {}
         self.baseline_timings: dict[str, Any] = {}
+        # cached_tokens the KVCR-disabled engine reported per reference request,
+        # in order; tells a case what the engine alone can reuse.
+        self.reference_cached: dict[str, list[int | None]] = {}
         self.wants_perf = bool(PERF_CASE_NAMES & set(args.cases))
         self.result: dict[str, Any] = {
             "plan": "KVCR Test Plan v7, Phase 1 (Guard-mode critical path)",
@@ -259,6 +262,11 @@ class Runner:
                         f"reference request {name} failed: {response.error}"
                     )
                 runs.append(extract_sample(response.body))
+                details = (response.body.get("usage") or {}).get("prompt_tokens_details") or {}
+                cached_value = details.get("cached_tokens")
+                self.reference_cached.setdefault(name, []).append(
+                    cached_value if type(cached_value) is int else None
+                )
             samples[name] = runs
             # The non-streaming runs carry prompt IDs; streamed runs may not.
             canonical = runs[-1]
@@ -304,6 +312,7 @@ class Runner:
             "batch_invariant": self.settings.batch_invariant,
             "unstable": unstable_detail,
             "kvcr_mentions_in_worker_log": kvcr_mentions,
+            "cached_tokens": self.reference_cached,
             "kvcr_lines_in_worker_log": kvcr_lines,
             "prompts": {
                 name: {
@@ -373,6 +382,7 @@ class Runner:
             perf_concurrency_levels=self.args.perf_concurrency_levels,
             hit_block_tokens=self.args.hit_block_tokens,
             baseline_timings=self.baseline_timings,
+            engine_cached=self.reference_cached,
         )
         for name in self.args.cases:
             self.check_deadline()
