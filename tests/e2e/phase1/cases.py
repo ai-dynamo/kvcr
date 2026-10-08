@@ -347,15 +347,16 @@ class Context:
         matching source pin miss for the uncovered key; both are the expected
         signals when the request shares only part of the seeded prefix.
         """
-        target_window = self.wait_window(
-            target,
-            start,
-            lambda w: w.blocks(REMOTE_DELIVER) >= hit_blocks and hit_blocks > 0,
-        )
         source_window = self.wait_window(
             source,
             start,
             lambda w: w.blocks(SOURCE_WRITE) >= hit_blocks and hit_blocks > 0,
+        )
+        written_pages = max(hit_blocks, source_window.blocks(SOURCE_WRITE))
+        target_window = self.wait_window(
+            target,
+            start,
+            lambda w: w.blocks(REMOTE_DELIVER) >= written_pages and hit_blocks > 0,
         )
         delivered = target_window.blocks(REMOTE_DELIVER)
         written = source_window.blocks(SOURCE_WRITE)

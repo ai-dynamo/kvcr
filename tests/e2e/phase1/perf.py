@@ -277,11 +277,15 @@ def tc05(ctx: Context) -> CaseResult:
     for response, name in zip(remote, names):
         if validate_stream(ctx, result, response, name, 1, expect_hit=True):
             hit_blocks += (response.cached_tokens or 0) // ctx.hit_block_tokens
-    target = ctx.wait_window(
-        1, remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= hit_blocks and hit_blocks > 0
-    )
+    # Source first: with hybrid models one hit block maps to several KVCR
+    # pages, so the target must be given time to report as many pages as the
+    # source wrote, not only as many as the hit blocks.
     source = ctx.wait_window(
         0, remote_start, lambda w: w.blocks(SOURCE_WRITE) >= hit_blocks and hit_blocks > 0
+    )
+    written = max(hit_blocks, source.blocks(SOURCE_WRITE))
+    target = ctx.wait_window(
+        1, remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= written and hit_blocks > 0
     )
     result.check(
         "tc05 remote: KVCR transfer delivered the cached blocks (remote_deliver covers hits)",
