@@ -24,7 +24,6 @@ from typing import Any
 from .cases import PROMOTED, Context
 from .client import StreamResponse
 from .common import (
-    BLOCK_SIZE,
     BlockedError,
     CaseResult,
     compare_tokens,
@@ -202,8 +201,8 @@ def validate_stream(
     if expect_hit:
         result.check(
             f"{stage}: cache hit is positive and block-aligned",
-            cached > 0 and cached % BLOCK_SIZE == 0,
-            f"cached_tokens={cached}",
+            cached > 0 and cached % ctx.hit_block_tokens == 0,
+            f"cached_tokens={cached} (block {ctx.hit_block_tokens})",
         )
     else:
         result.check(
@@ -277,7 +276,7 @@ def tc05(ctx: Context) -> CaseResult:
     hit_blocks = 0
     for response, name in zip(remote, names):
         if validate_stream(ctx, result, response, name, 1, expect_hit=True):
-            hit_blocks += (response.cached_tokens or 0) // BLOCK_SIZE
+            hit_blocks += (response.cached_tokens or 0) // ctx.hit_block_tokens
     target = ctx.wait_window(
         1, remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= hit_blocks and hit_blocks > 0
     )
@@ -285,9 +284,11 @@ def tc05(ctx: Context) -> CaseResult:
         0, remote_start, lambda w: w.blocks(SOURCE_WRITE) >= hit_blocks and hit_blocks > 0
     )
     result.check(
-        "tc05 remote: KVCR transfer delivered the cached blocks (remote_deliver == hits)",
-        target.blocks(REMOTE_DELIVER) == hit_blocks and hit_blocks > 0,
-        f"remote_deliver={target.blocks(REMOTE_DELIVER)}, cached blocks={hit_blocks}",
+        "tc05 remote: KVCR transfer delivered the cached blocks (remote_deliver covers hits)",
+        ctx.delivery_covers(target.blocks(REMOTE_DELIVER), hit_blocks)
+        and source.blocks(SOURCE_WRITE) == target.blocks(REMOTE_DELIVER),
+        f"remote_deliver={target.blocks(REMOTE_DELIVER)}, source_write={source.blocks(SOURCE_WRITE)}, "
+        f"cached blocks={hit_blocks}, block tokens={ctx.hit_block_tokens}",
     )
     result.check(
         "tc05 remote: no positive KVCR failed/partial metrics",
@@ -333,7 +334,7 @@ def tc05(ctx: Context) -> CaseResult:
         dram_hits = 0
         for response, name in zip(dram, names):
             if validate_stream(ctx, result, response, name, 0, expect_hit=True):
-                dram_hits += (response.cached_tokens or 0) // BLOCK_SIZE
+                dram_hits += (response.cached_tokens or 0) // ctx.hit_block_tokens
         dram_window = ctx.wait_window(
             0, dram_start, lambda w: w.blocks(LOCAL_DELIVER) >= dram_hits and dram_hits > 0
         )
@@ -368,7 +369,7 @@ def tc05(ctx: Context) -> CaseResult:
         time.sleep(ctx.index_wait)
         s_remote_start = utc_now()
         s_remote = run_arm(ctx, f"tc05-sweep{level}-remote", items, 1, concurrency=level)
-        s_hits = sum((r.cached_tokens or 0) // BLOCK_SIZE for r in s_remote if r.ok)
+        s_hits = sum((r.cached_tokens or 0) // ctx.hit_block_tokens for r in s_remote if r.ok)
         s_target = ctx.wait_window(
             1, s_remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= s_hits and s_hits > 0
         )

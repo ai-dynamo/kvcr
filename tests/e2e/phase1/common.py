@@ -123,7 +123,9 @@ def worker_identity(body: dict[str, Any]) -> tuple[str | None, int | None]:
     )
 
 
-def expected_hit_blocks(prompt_tokens: int, shared_prefix_tokens: int) -> int:
+def expected_hit_blocks(
+    prompt_tokens: int, shared_prefix_tokens: int, block: int = BLOCK_SIZE
+) -> int:
     """Upper bound of complete blocks a prefix-cache hit can cover.
 
     vLLM never reuses the block containing the last prompt token, so a full
@@ -132,7 +134,7 @@ def expected_hit_blocks(prompt_tokens: int, shared_prefix_tokens: int) -> int:
     """
     if prompt_tokens <= 0 or shared_prefix_tokens <= 0:
         return 0
-    return min((prompt_tokens - 1) // BLOCK_SIZE, shared_prefix_tokens // BLOCK_SIZE)
+    return min((prompt_tokens - 1) // block, shared_prefix_tokens // block)
 
 
 @dataclass

@@ -138,7 +138,12 @@ class Runner:
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
         self.tag = args.prompt_tag or uuid.uuid4().hex[:12]
-        self.prompts = Prompts(self.tag, perf_count=args.perf_repeats)
+        self.prompts = Prompts(
+            self.tag,
+            perf_count=args.perf_repeats,
+            tc02_shared=args.tc02_shared_sections,
+            tc02_sections=args.tc02_sections,
+        )
         self.references: dict[str, TokenSample] = {}
         self.baseline_timings: dict[str, Any] = {}
         self.wants_perf = bool(PERF_CASE_NAMES & set(args.cases))
@@ -157,6 +162,8 @@ class Runner:
                 "concurrency": args.perf_concurrency,
                 "evict_filler": args.perf_evict_filler,
                 "concurrency_levels": args.perf_concurrency_levels,
+                "hit_block_tokens": args.hit_block_tokens,
+                "tc02_sections": [args.tc02_shared_sections, args.tc02_sections],
             },
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
@@ -364,6 +371,7 @@ class Runner:
             perf_concurrency=self.args.perf_concurrency,
             perf_evict_filler=self.args.perf_evict_filler,
             perf_concurrency_levels=self.args.perf_concurrency_levels,
+            hit_block_tokens=self.args.hit_block_tokens,
             baseline_timings=self.baseline_timings,
         )
         for name in self.args.cases:
@@ -502,6 +510,26 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "worker 1) and records TTFT/TPOT; tokens are not reference-checked",
     )
     parser.add_argument(
+        "--hit-block-tokens",
+        type=int,
+        default=64,
+        help="tokens per prefix-cache hit block: 64 for dense models, 576 for Qwen3.5 "
+        "hybrid models (vLLM raises the attention block); hit alignment and the "
+        "delivered-pages checks use it",
+    )
+    parser.add_argument(
+        "--tc02-shared-sections",
+        type=int,
+        default=40,
+        help="TC-02 shared prefix P1 length in ~17-token sections (hybrid: 140)",
+    )
+    parser.add_argument(
+        "--tc02-sections",
+        type=int,
+        default=80,
+        help="TC-02 full/partial prompt length in sections (hybrid: 200)",
+    )
+    parser.add_argument(
         "--max-model-len",
         type=int,
         default=32000,
@@ -611,6 +639,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--perf-concurrency-levels expects integers like 4,8")
     if any(not 2 <= level <= 64 for level in args.perf_concurrency_levels):
         parser.error("--perf-concurrency-levels entries must be 2..64")
+    if args.hit_block_tokens < 1 or args.hit_block_tokens % 64:
+        parser.error("--hit-block-tokens must be a positive multiple of 64")
+    if not 2 <= args.tc02_shared_sections < args.tc02_sections <= 1000:
+        parser.error("--tc02-shared-sections must be < --tc02-sections (<= 1000)")
     if not 0 <= args.perf_evict_filler <= 512:
         parser.error("--perf-evict-filler must be 0..512")
     if not 1 <= args.perf_concurrency <= 64:

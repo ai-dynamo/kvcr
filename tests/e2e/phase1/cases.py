@@ -57,6 +57,12 @@ class Prompts:
 
     tag: str
     perf_count: int = 5
+    # TC-02 prompt geometry in sections (~17 tokens each): the shared prefix P1
+    # must hold at least two complete hit blocks and the full prompt at least
+    # one more, so hybrid models whose attention block is 576 tokens need
+    # 140 / 200 instead of the dense 40 / 80.
+    tc02_shared: int = 40
+    tc02_sections: int = 80
 
     @staticmethod
     def section(tag: str, index: int) -> str:
@@ -75,15 +81,17 @@ class Prompts:
 
     @property
     def tc02_p1(self) -> str:
-        return self.prefix(self.tag + "b", 0, 40)
+        return self.prefix(self.tag + "b", 0, self.tc02_shared)
 
     @property
     def tc02_full(self) -> str:
-        return self.tc02_p1 + " " + self.prefix(self.tag + "c", 40, 80) + self.tail
+        rest = self.prefix(self.tag + "c", self.tc02_shared, self.tc02_sections)
+        return self.tc02_p1 + " " + rest + self.tail
 
     @property
     def tc02_partial(self) -> str:
-        return self.tc02_p1 + " " + self.prefix(self.tag + "d", 40, 80) + self.tail
+        rest = self.prefix(self.tag + "d", self.tc02_shared, self.tc02_sections)
+        return self.tc02_p1 + " " + rest + self.tail
 
     @property
     def tc02_absent(self) -> str:
@@ -177,6 +185,7 @@ class Context:
         perf_concurrency: int = 1,
         perf_evict_filler: int = 0,
         perf_concurrency_levels: list[int] | None = None,
+        hit_block_tokens: int = BLOCK_SIZE,
         baseline_timings: dict[str, Any] | None = None,
     ) -> None:
         self.stack = stack
@@ -190,6 +199,11 @@ class Context:
         self.perf_concurrency = perf_concurrency
         self.perf_evict_filler = perf_evict_filler
         self.perf_concurrency_levels = perf_concurrency_levels or []
+        # Tokens per prefix-cache hit block. 64 (vLLM --block-size) for dense
+        # models; hybrid models (Qwen3.5) raise the attention block to 576 so
+        # cached_tokens is a multiple of that, and every KVCR transfer carries
+        # extra SSM state pages, so delivered pages exceed hit blocks.
+        self.hit_block_tokens = hit_block_tokens
         # KVCR-disabled timings recorded during the reference phase, keyed by
         # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
         self.baseline_timings = baseline_timings or {}
@@ -252,17 +266,31 @@ class Context:
         self, result: CaseResult, response: Response, *, max_blocks: int | None = None
     ) -> int:
         cached = self.cached(response)
-        aligned = cached > 0 and cached % BLOCK_SIZE == 0
-        detail = f"cached_tokens={cached}"
+        block = self.hit_block_tokens
+        aligned = cached > 0 and cached % block == 0
+        detail = f"cached_tokens={cached} (block {block})"
         if max_blocks is not None:
-            detail += f", upper bound {max_blocks * BLOCK_SIZE}"
-            aligned = aligned and cached <= max_blocks * BLOCK_SIZE
+            detail += f", upper bound {max_blocks * block}"
+            aligned = aligned and cached <= max_blocks * block
         result.check(
             f"{response.stage}: cache hit is positive and block-aligned",
             aligned,
             detail,
         )
-        return cached // BLOCK_SIZE
+        return cached // block
+
+    def delivery_covers(self, delivered: int | float, hit_blocks: int) -> bool:
+        """Delivered KVCR pages account for the reported hit.
+
+        Dense: one page per 64-token block, so pages == hit blocks. Hybrid: the
+        attention pages plus one state page per SSM group, so pages >= blocks;
+        the exact count is checked against the source's source_write instead.
+        """
+        if hit_blocks <= 0:
+            return False
+        if self.hit_block_tokens == BLOCK_SIZE:
+            return delivered == hit_blocks
+        return delivered >= hit_blocks
 
     # -- telemetry helpers -------------------------------------------------
 
@@ -332,9 +360,10 @@ class Context:
         delivered = target_window.blocks(REMOTE_DELIVER)
         written = source_window.blocks(SOURCE_WRITE)
         result.check(
-            f"{label}: target remote_deliver blocks == cached blocks",
-            delivered == hit_blocks,
-            f"remote_deliver={delivered}, cached blocks={hit_blocks}",
+            f"{label}: target remote_deliver pages cover the cached blocks",
+            self.delivery_covers(delivered, hit_blocks),
+            f"remote_deliver={delivered}, cached blocks={hit_blocks}, "
+            f"block tokens={self.hit_block_tokens}",
         )
         result.check(
             f"{label}: source source_write blocks == target remote_deliver blocks",
@@ -473,14 +502,18 @@ def tc02(ctx: Context) -> CaseResult:
             if left != right:
                 break
             shared += 1
-        bound = expected_hit_blocks(len(part_ids), shared)
+        bound = expected_hit_blocks(len(part_ids), shared, ctx.hit_block_tokens)
         result.measurements["tc02_partial_shared_prefix_tokens"] = shared
+        result.measurements["tc02_prompt_tokens"] = {
+            "full": len(full_ids),
+            "partial": len(part_ids),
+        }
+        seeded_blocks = (len(full_ids) - 1) // ctx.hit_block_tokens
         blocks = ctx.check_hit(result, partial, max_blocks=bound)
         result.check(
             "tc02-partial-w1: hit covers fewer blocks than the seeded prompt",
-            blocks < (len(full_ids) - 1) // BLOCK_SIZE,
-            f"hit blocks={blocks}, "
-            f"seeded prompt blocks={(len(full_ids) - 1) // BLOCK_SIZE}",
+            blocks < seeded_blocks,
+            f"hit blocks={blocks}, seeded prompt blocks={seeded_blocks}",
         )
         ctx.peer_transfer_checks(
             result,
@@ -686,7 +719,7 @@ def tc04(ctx: Context) -> CaseResult:
         )
         result.check(
             f"{stage}: Guard-served blocks delivered to worker 1 (remote_deliver)",
-            window.blocks(REMOTE_DELIVER) == blocks
+            ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
             and window.successes(REMOTE_DELIVER) >= 1,
             f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
             f"hit blocks={blocks}, "
