@@ -285,3 +285,26 @@ Findings for the KVCR, Dynamo and vLLM teams:
 Not covered: disaggregated deployment, more than one TC-05 concurrency level,
 a forced GPU-cache eviction so the local-hit arm exercises KVCR's DRAM read,
 non-Guard reruns (Phase 3).
+
+### KVCR v0.1.1 release verification (2026-10-08, dynamo-aws-dev-02)
+
+Image built with `KVCR_PINNED_SOURCES=1` from the v0.1.1 `Dockerfile.quick-start`
+pins (Dynamo `ea23e51`, vLLM adapter `0856750`, base `nightly-43b4aaea`), pushed as
+`ghcr.io/luckyq/kvcr-phase1:ad5011b…` by `scripts/dlcluster/build_image.sh`.
+v0.1.1 does not include the fix for finding 1 (`ai-dynamo/kvcr` PR #52), so no
+`PYTHONPATH` overlay; the hybrid run keeps the placeholder-skip `events.py`
+overlay re-applied onto the new adapter. Runs `v011-dense8b` (Qwen3-8B,
+batch-invariant, eager) and `v011-hyb4b` (Qwen3.5-4B, hybrid KV manager, CUDA
+graphs): dense TC-01/02/03/05/06 PASS, TC-04 FAIL = finding 1; hybrid TC-01/06
+PASS, TC-02/03/05 fail only on dense block arithmetic and the partial-prompt
+geometry already seen on 10-03, TC-04 = finding 1. No regression against b827065;
+tokens equal the reference in every request. Dense remote hit 160.8 ms vs cold
+84.5 ms (1600-token prompt, 236 MB per hit), hybrid remote hit 78.2 ms vs cold
+96.0 ms; Guard promoted 1.0 s after the kill in both.
+
+Two harness consequences: Dynamo ea23e51 lets vLLM's logger write the
+`KV Transfer metrics` line (`(MainProcess pid=N) INFO MM-DD HH:MM:SS …`), which
+the parser now accepts next to the ISO format (`telemetry.line_timestamp`); and
+`run_phase1.py` grew `--perf-evict-filler`, `--perf-concurrency-levels` and
+`--max-model-len` for the TC-05 DRAM-hit and concurrency arms (run
+`v011-dense8b-perf`, see the evidence report).
