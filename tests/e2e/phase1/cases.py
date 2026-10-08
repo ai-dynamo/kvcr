@@ -524,6 +524,29 @@ def tc02(ctx: Context) -> CaseResult:
             label="tc02 partial deliver",
             allow_partial=True,
         )
+        # Diagnostic (2026-10-08, hybrid): when the partial request's tokens
+        # diverge from the reference, tell numerics apart from a corrupted
+        # delivery by repeating the identical prompt on worker 1 (now a pure
+        # vLLM GPU prefix-cache hit) and on worker 0 (KVCR-local, shares the
+        # seeded prefix). Same tokens everywhere = numerics of this prompt;
+        # only the first answer differing = the delivery path.
+        first = extract_sample(partial.body or {})
+        for stage, worker, key in (
+            ("tc02-partial-again-w1", 1, "tc02_partial"),
+            ("tc02-partial-w0", 0, "tc02_partial"),
+        ):
+            again = ctx.request(stage, p.tc02_partial, worker)
+            result.evidence += [again.request_file, again.response_file]
+            if ctx.require_ok(result, again, worker):
+                ctx.compare(result, again, key)
+                same = compare_tokens(first, extract_sample(again.body or {}))
+                same = [x for x in same if "prompt token IDs" not in x]
+                result.check(
+                    f"{stage}: tokens equal the first partial answer on worker 1",
+                    not same,
+                    "; ".join(same) or f"identical, cached_tokens={ctx.cached(again)}",
+                )
+                result.measurements[f"{stage}_cached_tokens"] = ctx.cached(again)
 
     # present: the remainder (P2) still has to come from worker 0's KVCR pool.
     present = ctx.request("tc02-present-w1", p.tc02_full, 1)
