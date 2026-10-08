@@ -123,6 +123,7 @@ class Runner:
             pool_gb=args.pool_gb,
             compatibility_digest=args.compatibility_digest or "",
             gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
             batch_invariant=args.batch_invariant,
             state_agent=not args.no_state_agent,
             readiness_timeout=args.readiness_timeout,
@@ -154,6 +155,8 @@ class Runner:
                 "repeats": args.perf_repeats,
                 "max_tokens": args.perf_max_tokens,
                 "concurrency": args.perf_concurrency,
+                "evict_filler": args.perf_evict_filler,
+                "concurrency_levels": args.perf_concurrency_levels,
             },
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
@@ -359,6 +362,8 @@ class Runner:
             recovery_timeout=self.args.recovery_timeout,
             perf_max_tokens=self.args.perf_max_tokens,
             perf_concurrency=self.args.perf_concurrency,
+            perf_evict_filler=self.args.perf_evict_filler,
+            perf_concurrency_levels=self.args.perf_concurrency_levels,
             baseline_timings=self.baseline_timings,
         )
         for name in self.args.cases:
@@ -481,6 +486,29 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--perf-concurrency", type=int, default=1, help="parallel perf requests per arm"
     )
     parser.add_argument(
+        "--perf-evict-filler",
+        type=int,
+        default=0,
+        help="TC-05: after the local-hit arm send this many never-seen prompts to "
+        "worker 0 to evict its GPU prefix cache, then re-request the perf prompts "
+        "so the hit must come from the KVCR DRAM pool (local_deliver); 0 = skip. "
+        "Size it above the GPU KV capacity (see --worker-arg=--num-gpu-blocks-override)",
+    )
+    parser.add_argument(
+        "--perf-concurrency-levels",
+        default="",
+        help="TC-05: comma-separated extra concurrency levels, e.g. 4,8; each level "
+        "sends that many fresh prompts in parallel (cold on worker 0, remote hit on "
+        "worker 1) and records TTFT/TPOT; tokens are not reference-checked",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=32000,
+        help="vLLM --max-model-len for every engine (lower it together with "
+        "--worker-arg=--num-gpu-blocks-override=N, vLLM requires N*block_size >= this)",
+    )
+    parser.add_argument(
         "--keep-hybrid-kv-cache-manager",
         action="store_true",
         help="do not pass --disable-hybrid-kv-cache-manager to vLLM (needed for "
@@ -575,6 +603,16 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-tokens must be 1..512 and --pool-gb 1..64")
     if not 1 <= args.perf_repeats <= 32 or not 1 <= args.perf_max_tokens <= 2048:
         parser.error("--perf-repeats must be 1..32 and --perf-max-tokens 1..2048")
+    try:
+        args.perf_concurrency_levels = [
+            int(item) for item in args.perf_concurrency_levels.split(",") if item.strip()
+        ]
+    except ValueError:
+        parser.error("--perf-concurrency-levels expects integers like 4,8")
+    if any(not 2 <= level <= 64 for level in args.perf_concurrency_levels):
+        parser.error("--perf-concurrency-levels entries must be 2..64")
+    if not 0 <= args.perf_evict_filler <= 512:
+        parser.error("--perf-evict-filler must be 0..512")
     if not 1 <= args.perf_concurrency <= 64:
         parser.error("--perf-concurrency must be 1..64")
     if args.http_port == args.reference_http_port:

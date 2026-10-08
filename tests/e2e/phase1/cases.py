@@ -123,6 +123,15 @@ class Prompts:
     def tc06(self, index: int) -> str:
         return self.prefix(f"{self.tag}r{index}", 0, 80) + self.tail
 
+    # Fillers push the perf prompts out of vLLM's GPU prefix cache so the next
+    # local request must read them back from the KVCR DRAM pool.
+    def filler(self, index: int) -> str:
+        return self.prefix(f"{self.tag}x{index}", 0, 80) + self.tail
+
+    # One never-seen prompt per in-flight request of a concurrency level.
+    def sweep(self, level: int, index: int) -> str:
+        return self.prefix(f"{self.tag}k{level}_{index}", 0, 80) + self.tail
+
     def tc06_names(self) -> list[str]:
         return [f"tc06_{i}" for i in range(self.perf_count)]
 
@@ -166,6 +175,8 @@ class Context:
         recovery_timeout: float,
         perf_max_tokens: int = 128,
         perf_concurrency: int = 1,
+        perf_evict_filler: int = 0,
+        perf_concurrency_levels: list[int] | None = None,
         baseline_timings: dict[str, Any] | None = None,
     ) -> None:
         self.stack = stack
@@ -177,6 +188,8 @@ class Context:
         self.recovery_timeout = recovery_timeout
         self.perf_max_tokens = perf_max_tokens
         self.perf_concurrency = perf_concurrency
+        self.perf_evict_filler = perf_evict_filler
+        self.perf_concurrency_levels = perf_concurrency_levels or []
         # KVCR-disabled timings recorded during the reference phase, keyed by
         # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
         self.baseline_timings = baseline_timings or {}

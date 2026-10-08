@@ -128,9 +128,13 @@ def run_arm(
     label: str,
     prompts: list[tuple[str, str]],
     worker_index: int,
+    *,
+    concurrency: int | None = None,
+    max_tokens: int | None = None,
 ) -> list[StreamResponse]:
     """Stream every (name, prompt) to one worker at the configured concurrency."""
     worker_id = ctx.stack.worker_ids[worker_index]
+    parallel = ctx.perf_concurrency if concurrency is None else concurrency
 
     def one(item: tuple[str, str]) -> StreamResponse:
         name, prompt = item
@@ -139,13 +143,13 @@ def run_arm(
             f"{label}-{name}-w{worker_index}",
             prompt,
             worker=worker_id,
-            max_tokens=ctx.perf_max_tokens,
+            max_tokens=ctx.perf_max_tokens if max_tokens is None else max_tokens,
             extra_fields=STREAM_FIELDS,
         )
 
-    if ctx.perf_concurrency <= 1:
+    if parallel <= 1:
         return [one(item) for item in prompts]
-    with ThreadPoolExecutor(max_workers=ctx.perf_concurrency) as pool:
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
         return list(pool.map(one, prompts))
 
 
@@ -301,6 +305,92 @@ def tc05(ctx: Context) -> CaseResult:
         "target_window": target.totals,
     }
 
+    # Arm 5 (optional): local hit from the KVCR DRAM pool. Fill worker 0's GPU
+    # prefix cache with never-seen prompts until the perf prompts are evicted,
+    # then request them again on worker 0: vLLM misses, the KVCR connector must
+    # deliver the blocks from DRAM (local_deliver > 0).
+    if ctx.perf_evict_filler > 0:
+        fillers = [
+            (f"filler_{i}", ctx.prompts.filler(i)) for i in range(ctx.perf_evict_filler)
+        ]
+        evict_start = utc_now()
+        filler_responses = run_arm(
+            ctx, "tc05-evict", fillers, 0, concurrency=max(4, ctx.perf_concurrency), max_tokens=1
+        )
+        result.check(
+            "tc05 dram: every eviction filler request succeeded",
+            all(r.ok for r in filler_responses),
+            f"{sum(r.ok for r in filler_responses)} of {len(filler_responses)} ok, "
+            f"{sum(r.cached_tokens or 0 for r in filler_responses)} cached tokens",
+        )
+        filler_window = ctx.wait_window(
+            0, evict_start, lambda w: w.blocks(LOCAL_FILL) > 0
+        )
+        time.sleep(ctx.index_wait)
+        dram_start = utc_now()
+        dram = run_arm(ctx, "tc05-dram", prompts, 0)
+        dram_hits = 0
+        for response, name in zip(dram, names):
+            if validate_stream(ctx, result, response, name, 0, expect_hit=True):
+                dram_hits += (response.cached_tokens or 0) // BLOCK_SIZE
+        dram_window = ctx.wait_window(
+            0, dram_start, lambda w: w.blocks(LOCAL_DELIVER) >= dram_hits and dram_hits > 0
+        )
+        result.check(
+            "tc05 dram: GPU cache evicted, hits delivered from the KVCR pool (local_deliver > 0)",
+            dram_window.blocks(LOCAL_DELIVER) > 0 and dram_hits > 0,
+            f"local_deliver blocks={dram_window.blocks(LOCAL_DELIVER)}, "
+            f"cached blocks={dram_hits}, tier read bytes={dram_window.get(TIER_READ_BYTES)}",
+        )
+        result.measurements["arm_kvcr_dram_hit"] = arm_summary(dram)
+        result.measurements["arm_kvcr_dram_hit_window"] = dram_window.totals
+        result.measurements["eviction"] = {
+            "filler_prompts": len(fillers),
+            "filler_prompt_tokens": sum(r.prompt_tokens or 0 for r in filler_responses),
+            "filler_cached_tokens": [r.cached_tokens for r in filler_responses],
+            "filler_window": filler_window.totals,
+            "pool_after": pool_gauges(ctx, 0),
+        }
+
+    # Arm 6 (optional): concurrency sweep. Each level sends `level` fresh prompts
+    # at once: cold on worker 0 (store), then the same prompts on worker 1
+    # (peer transfer). No reference tokens exist for these prompts, so only the
+    # hit and the timings are recorded.
+    sweep: dict[str, Any] = {}
+    for level in ctx.perf_concurrency_levels:
+        items = [(f"c{level}_{i}", ctx.prompts.sweep(level, i)) for i in range(level)]
+        s_cold_start = utc_now()
+        s_cold = run_arm(ctx, f"tc05-sweep{level}-cold", items, 0, concurrency=level)
+        ctx.wait_window(0, s_cold_start, lambda w: w.blocks(LOCAL_FILL) > 0)
+        time.sleep(ctx.index_wait)
+        s_remote_start = utc_now()
+        s_remote = run_arm(ctx, f"tc05-sweep{level}-remote", items, 1, concurrency=level)
+        s_hits = sum((r.cached_tokens or 0) // BLOCK_SIZE for r in s_remote if r.ok)
+        s_target = ctx.wait_window(
+            1, s_remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= s_hits and s_hits > 0
+        )
+        s_source = ctx.wait_window(
+            0, s_remote_start, lambda w: w.blocks(SOURCE_WRITE) >= s_hits and s_hits > 0
+        )
+        result.check(
+            f"tc05 sweep c={level}: all requests ok and every remote request hit",
+            all(r.ok for r in s_cold + s_remote)
+            and all((r.cached_tokens or 0) > 0 for r in s_remote),
+            f"cold ok={sum(r.ok for r in s_cold)}/{level}, remote ok="
+            f"{sum(r.ok for r in s_remote)}/{level}, remote cached="
+            f"{[r.cached_tokens for r in s_remote]}",
+        )
+        sweep[str(level)] = {
+            "cold_w0": arm_summary(s_cold),
+            "remote_hit_w1": arm_summary(s_remote),
+            "remote_deliver_blocks": s_target.blocks(REMOTE_DELIVER),
+            "source_write_bytes": s_source.bytes(SOURCE_WRITE),
+            "cached_blocks": s_hits,
+            "peer_failures": s_source.peer_failures + s_target.peer_failures,
+        }
+    if sweep:
+        result.measurements["concurrency_sweep"] = sweep
+
     # Derived: cold-path overhead and reuse gains (medians, seconds).
     cold_s = result.measurements["arm_kvcr_cold"]
     local_s = result.measurements["arm_kvcr_local_hit"]
@@ -316,6 +406,10 @@ def tc05(ctx: Context) -> CaseResult:
         "note": "positive overhead = KVCR slower than the KVCR-disabled engine; "
         "no thresholds are applied in this round",
     }
+    if "arm_kvcr_dram_hit" in result.measurements:
+        result.measurements["derived"]["dram_hit_ttft_gain_vs_cold_seconds"] = delta(
+            cold_s, result.measurements["arm_kvcr_dram_hit"], "ttft_seconds"
+        )
     result.measurements["pool_after"] = {
         "w0": pool_gauges(ctx, 0),
         "w1": pool_gauges(ctx, 1),
