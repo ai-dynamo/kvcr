@@ -40,6 +40,17 @@ def test_source_result_status_distinguishes_zero_success(
     assert int(event["completed_blocks"]) == completed
 
 
+@pytest.mark.parametrize("selected", [0, 1, 2])
+def test_failed_source_result_is_failed_even_with_selected_blocks(recording, selected):
+    trace = _nvtx.create_tracer().lifecycle(
+        requested_blocks=2, selected_bytes=selected * 16
+    )
+    trace.complete_source(False, selected)
+    event = payloads(recording, "source.write.completed")[0]
+    assert int(event["status"]) == 4
+    assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
+
+
 @pytest.mark.parametrize("value", [None, "", "req-α-😀\x00x", "😀" * 100])
 def test_context_mapping_preserves_identity_and_bounded_utf8(recording, value):
     trace = _nvtx.create_tracer().lifecycle(request_id=value)
