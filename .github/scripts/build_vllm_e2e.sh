@@ -88,8 +88,19 @@ print(rows[0][0])
 PY
 }
 
-dynamo_sha=$(resolve_ref "$dynamo_repo" "$dynamo_ref")
-vllm_sha=$(resolve_ref "$vllm_repo" "$vllm_ref")
+# KVCR_PINNED_SOURCES=1 builds the compatibility set the Dockerfile pins
+# (release verification) instead of the moving CI refs above.
+if [[ "${KVCR_PINNED_SOURCES:-0}" == 1 ]]; then
+    dynamo_ref=pinned:Dockerfile.quick-start
+    vllm_ref=pinned:Dockerfile.quick-start
+    dynamo_sha=$(sed -nE 's/^ARG DYNAMO_REF=([0-9a-f]{40})\s*$/\1/p' Dockerfile.quick-start | head -1)
+    vllm_sha=$(sed -nE 's/^ARG KVCR_VLLM_REF=([0-9a-f]{40})\s*$/\1/p' Dockerfile.quick-start | head -1)
+    [[ "$dynamo_sha" =~ ^[0-9a-f]{40}$ && "$vllm_sha" =~ ^[0-9a-f]{40}$ ]] \
+        || die "Dockerfile.quick-start must pin DYNAMO_REF and KVCR_VLLM_REF to full SHAs"
+else
+    dynamo_sha=$(resolve_ref "$dynamo_repo" "$dynamo_ref")
+    vllm_sha=$(resolve_ref "$vllm_repo" "$vllm_ref")
+fi
 base_image=$(python3 - <<'PY'
 from pathlib import Path
 import re

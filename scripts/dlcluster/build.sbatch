@@ -26,7 +26,8 @@ test "$(git -C "$W/repo" rev-parse HEAD)" = "$KVCR_REF"
 cd "$W/repo"
 docker login ghcr.io -u luckyq --password-stdin < "$HOME/.ghcr-token" >/dev/null
 log "logged in to ghcr.io"
-export KVCR_E2E_IMAGE=$KVCR_IMAGE_REPO KVCR_PUSH=1 E2E_BUILD_OUTPUT="$RUNS/build"
+export KVCR_E2E_IMAGE=$KVCR_IMAGE_REPO KVCR_PUSH=1 E2E_BUILD_OUTPUT="$RUNS/build" KVCR_PINNED_SOURCES=${KVCR_PINNED_SOURCES:-1}
+log "pinned sources: $KVCR_PINNED_SOURCES (1 = Dockerfile DYNAMO_REF / KVCR_VLLM_REF)"
 mkdir -p "$E2E_BUILD_OUTPUT"
 log "build+push start"
 bash .github/scripts/build_vllm_e2e.sh
