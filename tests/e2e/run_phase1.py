@@ -228,7 +228,23 @@ class Runner:
         # TC-06 prompts are generated with the perf token budget too, but need no
         # KVCR-disabled timing baseline.
         long_names = perf_names | (set(self.prompts.tc06_names()) if self.wants_perf else set())
-        for name, prompt in self.prompts.all().items():
+        # Only the prompts the requested cases use: a long prompt of a case not
+        # being run must not block the run when the bare engine is unstable on it.
+        case_prompts = {
+            "TC-01": {"tc01"},
+            "TC-02": {"tc02_full", "tc02_partial", "tc02_absent"},
+            "TC-03": {"tc03", "tc03_isolated"},
+            "TC-04": {"tc04", "tc04_fresh", "tc04_second"},
+            "TC-05": set(perf_names),
+            "TC-06": set(self.prompts.tc06_names()) | set(perf_names),
+        }
+        wanted: set[str] = set()
+        for case in self.args.cases:
+            wanted |= case_prompts.get(case, set())
+        selected = {
+            name: prompt for name, prompt in self.prompts.all().items() if name in wanted
+        }
+        for name, prompt in selected.items():
             runs = []
             if name in perf_names:
                 # First contact with this prompt: KVCR-disabled cold TTFT/TPOT.
