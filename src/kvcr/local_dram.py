@@ -1093,15 +1093,16 @@ class _LocalDram:
         self._retry_unscored()
         victims: list[tuple[BlockKey, "_BlockRecord", _LocalDramResidency, int]] = []
         freed: Counter[str] = Counter()
+        deficient = set(required)
 
         def short() -> set[str]:
             return {
                 name
-                for name, count in required.items()
-                if len(self._free_slots[name]) + freed[name] < count
+                for name in deficient
+                if len(self._free_slots[name]) + freed[name] < required[name]
             }
 
-        deficient = short()
+        deficient.intersection_update(short())
         with closing(self._evictable.candidates(protected, deficient)) as candidates:
             while deficient:
                 key = next(candidates, None)

@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import heapq
 import logging
+from collections import deque
 from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -337,10 +338,22 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
     _poll_until(kvcr, lambda done: operation in dict(done))
     pops = Mock(wraps=heapq.heappop)
     monkeypatch.setattr(heapq, "heappop", pops)
+
+    class CountedSlots(deque):
+        length_checks = 0
+
+        def __len__(self):
+            self.length_checks += 1
+            return super().__len__()
+
+    free_slots = kvcr._core._local_dram._free_slots
+    full_slots = free_slots["full"] = CountedSlots(free_slots["full"])
     operation = kvcr.deposit({grouped: descriptors})
     result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
 
     assert result[grouped].success
+    # The initial capacity and deficit checks suffice for the satisfied pool.
+    assert full_slots.length_checks == 2
     # Making room in swa must not scan the older full-only rows.
     assert pops.call_count == 2
     assert kvcr.query(full) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * len(full)
