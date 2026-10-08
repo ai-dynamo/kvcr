@@ -114,8 +114,9 @@ This schema is a source-side pin checkpoint, not a cross-worker identity scheme.
 No request, session, or parent-session identity is inferred from those handles.
 
 Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`,
-`6=cancelled`. Partial reports how many blocks were available, without asserting
-why others were missing.
+`6=cancelled`. For a nonempty request, zero usable blocks is failed; a positive
+subset is partial. An empty request with zero completed blocks remains success.
+Counts describe the observed result without asserting why blocks were missing.
 
 Reason codes: `0=unknown`, `1=none`, `2=callback_error`, `3=duplicate_request`,
 `4=invalid_result`, `5=deadline`, `6=cancelled`, `7=shutdown`, `8=no_waiters`.

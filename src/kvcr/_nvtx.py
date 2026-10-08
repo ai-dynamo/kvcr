@@ -317,7 +317,9 @@ class _LifecycleTrace:
         self.mark(
             "source.write.completed",
             once=True,
-            status=(Status.PARTIAL if blocks < requested else Status.SUCCESS)
+            status=(Status.FAILED if blocks == 0 else Status.PARTIAL)
+            if blocks < requested
+            else Status.SUCCESS
             if success
             else Status.FAILED,
             reason=Reason.NONE
@@ -484,7 +486,7 @@ class _PinTrace:
             "cancelled": Status.CANCELLED,
         }[result]
         if status is Status.SUCCESS and 0 <= completed_blocks < self.requested_blocks:
-            status = Status.PARTIAL
+            status = Status.FAILED if completed_blocks == 0 else Status.PARTIAL
         if reason is None:
             reason = {
                 "success": Reason.NONE,
@@ -494,7 +496,7 @@ class _PinTrace:
             }[result]
         elif isinstance(reason, str):
             reason = Reason[reason.upper()]
-        if status is Status.PARTIAL and reason is Reason.NONE:
+        if status in (Status.PARTIAL, Status.FAILED) and reason is Reason.NONE:
             reason = Reason.UNKNOWN
         self._mark(
             "source.pin.completed",

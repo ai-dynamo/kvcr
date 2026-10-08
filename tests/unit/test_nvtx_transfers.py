@@ -15,7 +15,9 @@ recording = test_nvtx.recording
 def test_zero_selected_source_is_failed_without_posting(recording):
     source, agent, pinning = test_nvtx.make_source(recording)
     pinning.complete(0, missing_indices=(0,))
-    test_nvtx._poll_until(source, lambda _: pinning.unpins == ["pin"])
+    test_nvtx._poll_until(
+        source, lambda _: bool(payloads(recording, "source.write.completed"))
+    )
     event = payloads(recording, "source.write.completed")[0]
     assert int(event["status"]) == 4
     assert int(event["reason"]) == 0

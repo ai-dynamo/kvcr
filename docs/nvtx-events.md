@@ -48,3 +48,9 @@ never by the display prefix. Empty strings and unavailable IDs are distinct via
 `request_known`. Request strings never become registered event names. Session,
 parent-session and framework utilization remain explicitly unknown because the
 current bindings do not provide them.
+
+Nonempty source and pin requests with zero completed blocks report FAILED;
+positive incomplete results report PARTIAL. This is a diagnostic convention and
+does not change control notifications or transfer ownership. See the
+[identity producer map](nvtx-context.md) for inference versus framework pin IDs
+and the unavailable session/utilization input seams.
