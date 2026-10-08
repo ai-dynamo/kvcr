@@ -207,6 +207,9 @@ class Context:
         self.hit_block_tokens = hit_block_tokens
         # Reference-phase cached_tokens per prompt (KVCR disabled), request order.
         self.engine_cached = engine_cached or {}
+        # KVCR-disabled timings recorded during the reference phase, keyed by
+        # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
+        self.baseline_timings = baseline_timings or {}
 
     @property
     def engine_partial_prefix_reuse(self) -> bool | None:
@@ -220,9 +223,6 @@ class Context:
         if not values or values[0] is None:
             return None
         return values[0] > 0
-        # KVCR-disabled timings recorded during the reference phase, keyed by
-        # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
-        self.baseline_timings = baseline_timings or {}
 
     # -- request helpers ---------------------------------------------------
 
