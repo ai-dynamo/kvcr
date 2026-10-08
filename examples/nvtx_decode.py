@@ -74,7 +74,9 @@ def validate(events, scenario, operations):
             assert event["session_known"] == event["parent_session_known"] == 0
     returned = named.get("op.completion_returned", [])
     assert len(returned) == operations, (len(returned), operations)
-    expected = {"success": 2, "partial": 3, "failure": 4, "timeout": 4}[scenario]
+    expected = {"success": 2, "partial": 3, "zero": 4, "failure": 4, "timeout": 4}[
+        scenario
+    ]
     gaps = []
     for result in returned:
         assert result["status"] == expected, result
@@ -102,8 +104,55 @@ def validate(events, scenario, operations):
         target = related("target.queued")
         received = related("target.write_done.received")
         assert len(queued) == len(target) == len(received) == 1
+        # The caller operation and remote branch have separate local traces.
+        # Only the branch's hint_trace_id identifies the consumed submission.
+        branch = target[0]
+        assert all(
+            branch[field] == result[field] for field in ("instance_hi", "instance_lo")
+        ), "hint branch and caller use different tracer instances"
+        hint_id = branch.get("hint_trace_id", 0)
+        assert hint_id, "missing hint trace identity"
+
+        def hint_events(name):
+            return [
+                event
+                for event in named.get(name, [])
+                if (event["instance_hi"], event["instance_lo"], event["trace_id"])
+                == (branch["instance_hi"], branch["instance_lo"], hint_id)
+            ]
+
+        submitted = hint_events("hint.submitted")
+        used = [
+            event
+            for event in hint_events("hint.used")
+            if event["op_handle"] == result["op_handle"]
+        ]
+        assert len(submitted) == len(used) == 1, "missing or duplicate hint association"
+        assert all(
+            event[field] == result[field]
+            for event in (branch, submitted[0], used[0])
+            for field in ("request_known", "request_hi", "request_lo")
+        ), "mismatched hint request identity"
+        assert submitted[0]["start"] <= used[0]["start"] <= branch["start"], (
+            "hint used outside its submission lifetime"
+        )
+        assert not any(
+            event["start"] <= used[0]["start"]
+            for name in ("hint.replaced", "hint.rejected", "hint.discarded")
+            for event in hint_events(name)
+        ), "hint invalidated before use"
         assert received[0]["start"] <= queued[0]["start"] <= result["start"]
         gaps.append((result["start"] - received[0]["start"]) / 1e6)
+        if scenario == "zero":
+            completed = related("source.write.completed")
+            assert len(completed) == 1, "missing zero-result source completion"
+            assert completed[0]["status"] == 4
+            assert (
+                completed[0]["completed_blocks"] == completed[0]["completed_bytes"] == 0
+            )
+            assert not related("nixl.write.posted"), (
+                "zero-result operation posted a transfer"
+            )
         if scenario in ("success", "partial"):
             posted, done, released = (
                 related(name)
@@ -114,8 +163,22 @@ def validate(events, scenario, operations):
                 )
             )
             assert len(posted) == len(done) == len(released) == 1
+            assert all(
+                event[field] == posted[0][field]
+                for event in (done[0], released[0])
+                for field in (
+                    "instance_hi",
+                    "instance_lo",
+                    "trace_id",
+                    "source_op_id",
+                    "transfer_id",
+                )
+            ), "mismatched source lifecycle"
             assert posted[0]["start"] <= done[0]["start"] <= released[0]["start"]
-            assert posted[0]["instance_hi"] != result["instance_hi"]
+            assert (posted[0]["instance_hi"], posted[0]["instance_lo"]) != (
+                result["instance_hi"],
+                result["instance_lo"],
+            ), "source and target share a tracer instance"
             assert posted[0]["thread"] >> 24 != result["thread"] >> 24
             waiters = [
                 e
@@ -148,7 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("sqlite")
     parser.add_argument(
         "--scenario",
-        choices=("success", "partial", "failure", "timeout", "off"),
+        choices=("success", "partial", "zero", "failure", "timeout", "off"),
         default="success",
     )
     parser.add_argument("--operations", type=int, default=1)

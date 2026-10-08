@@ -50,14 +50,30 @@ class PartialFramework(Framework):
         return results
 
 
+class ZeroFramework(Framework):
+    def poll_pin_results(self):
+        results = super().poll_pin_results()
+        for _, result in results:
+            if result is not None:
+                result[1].update(dict.fromkeys(result[1]))
+        return results
+
+
 def worker(role, args, pipe, endpoint=None):
     name = "nvtx-" + role
     keys = tuple(BlockKey(f"block-{i}".encode()) for i in range(args.blocks))
     size = args.blocks * args.block_bytes
     memory = Buffer(size, 73 if role == "source" else 0, args.memory)
-    framework_type = PartialFramework if args.scenario == "partial" else Framework
+    framework_type = {"partial": PartialFramework, "zero": ZeroFramework}.get(
+        args.scenario, Framework
+    )
     framework = framework_type(
-        name, keys, 5 if args.scenario == "timeout" else 0, args.scenario == "failure"
+        name,
+        keys,
+        max(5, args.pin_delay_ms / 1000)
+        if args.scenario == "timeout"
+        else args.pin_delay_ms / 1000,
+        args.scenario == "failure",
     )
     control = control_channel()
     with closing(
@@ -216,7 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--memory", choices=("dram", "vram"), default="dram")
     parser.add_argument(
         "--scenario",
-        choices=("success", "partial", "failure", "timeout"),
+        choices=("success", "partial", "zero", "failure", "timeout"),
         default="success",
     )
     parser.add_argument("--blocks", type=int, default=4)
@@ -224,10 +240,15 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--poll-delay-ms", type=float, default=0)
+    parser.add_argument("--pin-delay-ms", type=float, default=0)
     args = parser.parse_args()
     if (
         min(args.blocks, args.block_bytes, args.iterations) < 1
-        or min(args.warmup, args.poll_delay_ms) < 0
+        or min(args.warmup, args.poll_delay_ms, args.pin_delay_ms) < 0
     ):
         parser.error("counts must be positive; warmup and delay must be nonnegative")
+    if args.scenario == "partial" and args.blocks < 2:
+        parser.error(
+            "partial requires at least two blocks; use zero for all-missing results"
+        )
     run(args)

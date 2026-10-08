@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Target events must retain asynchronous and caller completion boundaries."""
 
+import ctypes
+
 import pytest
 import test_kvcr_remote_target
 import test_nvtx
@@ -19,8 +21,8 @@ from _kvcr_test_utils import (
 from test_nvtx import payloads
 
 from kvcr import _nvtx
-from kvcr.config import RemoteFWDramOptions
-from kvcr.types import BlockKey, OpEntryResult, OpEntryStatus
+from kvcr.config import LocalDramOptions, RemoteFWDramOptions
+from kvcr.types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 recording = test_nvtx.recording
 
@@ -97,6 +99,112 @@ def test_joined_completion_waits_for_all_tiers(recording):
     event = payloads(recording, "op.completion_returned")[0]
     assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
     assert int(event["completed_blocks"]) == 1
+
+
+@pytest.mark.parametrize("first", ["local", "remote"])
+def test_public_mixed_delivery_waits_for_both_branches(recording, first):
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"\0" * 16, 32)
+    local = ctypes.create_string_buffer(16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[
+            RegionDescriptor(addr=ctypes.addressof(primary), size=16, count=2)
+        ],
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    local_key, remote_key = BlockKey(b"local"), BlockKey(b"remote")
+    deposit = kvcr.deposit({local_key: [_mem_descriptor()]})
+    _wait_until(lambda: bool(agent.transfers))
+    agent.state = "DONE"
+    assert deposit in dict(_poll_until(kvcr, bool))
+    recording.events.clear()
+    agent.state = "PROC"
+    request = "mixed-request-α"
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id=request)
+    handle = kvcr.deliver(
+        {local_key: [_mem_descriptor()], remote_key: [_mem_descriptor(1)]},
+        request_id=request,
+    )
+    _wait_until(lambda: bool(control.sent) and len(agent.transfers) == 2)
+    dispatched = payloads(recording, "op.dispatched")[0]
+    assert (
+        int(dispatched["local_blocks"]),
+        int(dispatched["remote_blocks"]),
+        int(dispatched["g3_blocks"]),
+    ) == (1, 1, 0)
+    submitted = payloads(recording, "hint.submitted")[0]
+    used = payloads(recording, "hint.used")[0]
+    queued = payloads(recording, "target.queued")[0]
+    assert (
+        int(submitted["trace_id"])
+        == int(used["trace_id"])
+        == int(queued["hint_trace_id"])
+    )
+    assert int(used["op_handle"]) == handle
+    if first == "local":
+        agent.state = "DONE"
+        _wait_until(lambda: agent.transfers[-1] in agent.released_xfers)
+        assert list(kvcr.poll_completed()) == []
+        assert not payloads(recording, "op.completion_queued")
+        agent.notifs["source"] = [_write_done_notification(handle)]
+    else:
+        agent.notifs["source"] = [_write_done_notification(handle)]
+        _wait_until(lambda: bool(payloads(recording, "target.write_done.received")))
+        assert list(kvcr.poll_completed()) == []
+        assert not payloads(recording, "op.completion_queued")
+        agent.state = "DONE"
+    result = dict(_poll_until(kvcr, bool))
+    assert set(result) == {handle}
+    assert all(entry.success for entry in result[handle].values())
+    assert set(result[handle]) == {local_key, remote_key}
+    assert len(payloads(recording, "op.completion_queued")) == 1
+    returned = payloads(recording, "op.completion_returned")
+    assert len(returned) == 1
+    assert int(returned[0]["completed_blocks"]) == 2
+    assert (
+        int(returned[0]["request_hi"]),
+        int(returned[0]["request_lo"]),
+    ) == _nvtx.identity(request)
+    assert list(kvcr.poll_completed()) == []
+    kvcr.discard_hint(request)
+
+
+def test_replaced_hint_is_used_and_conflicting_hint_is_rejected(recording):
+    kvcr, agent, control = target()
+    request = "reused-request"
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request)
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request)
+    submitted = payloads(recording, "hint.submitted")
+    assert len(submitted) == 2
+    assert int(submitted[0]["trace_id"]) != int(submitted[1]["trace_id"])
+    assert int(payloads(recording, "hint.replaced")[0]["trace_id"]) == int(
+        submitted[0]["trace_id"]
+    )
+    for _ in range(2):
+        handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request)
+        _wait_until(lambda: ("target", handle) in kvcr._core._progress._in_flight_ops)
+        agent.notifs["source"] = [_write_done_notification(handle)]
+        assert handle in dict(_poll_until(kvcr, bool))
+    used = payloads(recording, "hint.used")
+    assert len(used) == 2
+    assert all(
+        int(event["trace_id"]) == int(submitted[1]["trace_id"]) for event in used
+    )
+    assert len({int(event["op_handle"]) for event in used}) == 2
+    control.sent.clear()
+    kvcr.submit_hint(_router_hint("tcp://other:2"), request)
+    rejected = payloads(recording, "hint.rejected")[0]
+    assert int(rejected["trace_id"]) == int(submitted[1]["trace_id"])
+    assert int(rejected["reason"]) == int(_nvtx.Reason.HINT_CONFLICT)
+    failed = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request)
+    assert not dict(kvcr.poll_completed())[failed][BlockKey(b"k")].success
+    assert len(payloads(recording, "hint.used")) == 2
+    assert not control.sent
+    kvcr.discard_hint(request)
 
 
 def test_timeout_quarantine_and_late_quiescence_have_distinct_events(recording):
