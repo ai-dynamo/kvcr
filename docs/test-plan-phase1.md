@@ -314,9 +314,16 @@ makes the hit/delivery checks geometry-aware (pages must cover the hit blocks
 and equal the source's `source_write` pages and bytes), `--tc02-shared-sections
 140 --tc02-sections 200` give TC-02 a 4-block shared prefix, and the reference
 phase records `cached_tokens` so TC-02's partial arm is marked not applicable
-when the KVCR-disabled engine itself reuses no partial prefix (Qwen3.5 on this
-vLLM: 0 cached for a 2702-token shared prefix, 3456 for an exact repeat). Runs
-`v011-hyb4b-final` + `v011-hyb4b-tc05`: TC-01/02/03/05/06 PASS, TC-04 = finding
-1, same standing as dense. The reference phase now covers only the requested
+when the KVCR-disabled engine itself reports no partial hit. For hybrid models
+that happens because vLLM `mamba_cache_mode=align` keeps SSM state only at the
+last aligned boundary of each scheduler step: the P1/P2 junction has a
+checkpoint only if P1 was served as its own request. `--tc02-seed-prefix` does
+that (system-prompt warm-up pattern) and TC-02's partial arm then passes on
+hybrid with a real cross-worker partial hit (`v011-hyb4b-tc02-seed`: 1728
+tokens, 6 pages == 6, 113 MB both sides). Runs `v011-hyb4b-final` +
+`v011-hyb4b-tc05` + `v011-hyb4b-tc02-seed`: TC-01/02/03/05/06 PASS, TC-04 =
+finding 1, same standing as dense. Hybrid runs should pass
+`--hit-block-tokens 576 --tc02-shared-sections 140 --tc02-sections 200
+--tc02-seed-prefix`. The reference phase now covers only the requested
 cases' prompts; one hybrid run aborted because the bare engine was unstable on
 the 3.9k-token TC-02 prompt (GDN rejects batch-invariant mode).
