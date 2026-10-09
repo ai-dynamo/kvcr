@@ -246,9 +246,11 @@ class _PinTracer:
             payload["instance_lo"] = self.instance_lo
             if name not in self._messages:
                 self._messages[name] = self.domain.get_registered_string(name)
-            message = self._messages[name]
+            # nvtx 0.2.16's factory accepts text, not RegisteredString. Its
+            # internal cache resolves the retained handle only on construction;
+            # subsequent emissions reuse the completed attributes object.
             attributes = self.domain.get_event_attributes(
-                message=message if message is not None else name,
+                message=name,
                 category=category,
                 payload=payload,
             )

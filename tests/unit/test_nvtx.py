@@ -173,7 +173,9 @@ def test_default_low_and_fresh_payloads(recording, monkeypatch):
     assert not recording.stack
 
 
-@pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "start", "end"])
+@pytest.mark.parametrize(
+    "failure", ["attributes", "push", "mark", "pop", "start", "end"]
+)
 def test_annotation_failures_preserve_pin_callback_and_release(recording, failure):
     recording.fail = failure
     source, agent, pinning = make_source(recording)

@@ -14,6 +14,28 @@ from kvcr import _nvtx
 recording = test_nvtx.recording
 
 
+def test_registered_handle_is_not_passed_to_string_only_attributes_factory(
+    recording, monkeypatch
+):
+    # Domain.get_event_attributes takes a string and registers it internally;
+    # get_registered_string returns a separate opaque handle type.
+    original = recording.get_event_attributes
+    monkeypatch.setattr(
+        recording, "get_registered_string", lambda name: SimpleNamespace(name=name)
+    )
+
+    def attributes(**kwargs):
+        if not isinstance(kwargs["message"], str):
+            raise TypeError("expected str, not RegisteredString")
+        return original(**kwargs)
+
+    monkeypatch.setattr(recording, "get_event_attributes", attributes)
+    trace = _nvtx.create_tracer().lifecycle(op_handle=41)
+    trace.mark("source.write.completed", completed_blocks=1, status=2)
+    assert len(payloads(recording, "request.context")) == 1
+    assert len(payloads(recording, "source.write.completed")) == 1
+
+
 def test_immutable_context_is_not_repeated_on_transitions(recording):
     trace = _nvtx.create_tracer().lifecycle(
         request_id="req-α",
