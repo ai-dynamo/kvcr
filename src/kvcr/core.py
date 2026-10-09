@@ -15,6 +15,7 @@ from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
 
+from . import _nvtx
 from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -300,6 +301,8 @@ class _KVCRCore:
             backend_configs.remote_fw_dram,
             bindings.key_adapter,
         )
+        self._nvtx = self._remote_fw_dram._nvtx
+        self._nvtx_operations = {}
         self._g3 = (
             _G3(
                 self,
@@ -521,36 +524,64 @@ class _KVCRCore:
             key: self._normalize_descriptors(descriptors)
             for key, descriptors in blocks.items()
         }
-        with self._state_lock:
-            local_blocks: dict[BlockKey, list[_TransferRef]] = {}
-            g3_blocks: dict[BlockKey, _TransferRef] = {}
-            remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
-            for key, destination in normalized.items():
-                if self._is_local_resident(key):
-                    local_blocks[key] = destination
-                elif self._g3 is not None and self._g3.is_ready(key):
-                    g3_blocks[key] = destination[0]
-                else:
-                    remote_blocks[key] = destination
+        trace = (
+            self._nvtx.operation(self, op_handle, normalized, request_id)
+            if self._nvtx is not None
+            else None
+        )
+        if trace is not None:
+            self._nvtx_operations[op_handle] = trace
+        pushed = trace.push("op.deliver") if trace is not None else False
+        try:
+            with self._state_lock:
+                local_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                g3_blocks: dict[BlockKey, _TransferRef] = {}
+                remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                for key, destination in normalized.items():
+                    if self._is_local_resident(key):
+                        local_blocks[key] = destination
+                    elif self._g3 is not None and self._g3.is_ready(key):
+                        g3_blocks[key] = destination[0]
+                    else:
+                        remote_blocks[key] = destination
 
-            if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
-                self._joined_completions[op_handle] = (set(blocks), {})
-            if local_dram is not None and local_blocks:
-                local_dram.deliver(op_handle, local_blocks, deadline=deadline)
-            if g3_blocks and (
-                self._g3 is None
-                or not self._g3.start_deliver(op_handle, g3_blocks, deadline)
-            ):
-                self._complete(
-                    op_handle,
-                    {key: OpEntryResult(OpEntryStatus.FAILED) for key in g3_blocks},
+                if trace is not None:
+                    trace.mark(
+                        "op.dispatched",
+                        local_blocks=len(local_blocks),
+                        remote_blocks=len(remote_blocks),
+                        g3_blocks=len(g3_blocks),
+                    )
+                if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
+                    self._joined_completions[op_handle] = (set(blocks), {})
+                if local_dram is not None and local_blocks:
+                    local_dram.deliver(op_handle, local_blocks, deadline=deadline)
+                if g3_blocks and (
+                    self._g3 is None
+                    or not self._g3.start_deliver(op_handle, g3_blocks, deadline)
+                ):
+                    self._complete(
+                        op_handle,
+                        {key: OpEntryResult(OpEntryStatus.FAILED) for key in g3_blocks},
+                    )
+                if remote_blocks:
+                    self._remote_fw_dram.deliver(
+                        op_handle, remote_blocks, request_id, deadline=deadline
+                    )
+                elif not blocks:
+                    self._complete(op_handle, {})
+        except Exception:
+            self._nvtx_operations.pop(op_handle, None)
+            if trace is not None:
+                trace.mark(
+                    "op.rejected",
+                    status=_nvtx.Status.REJECTED,
+                    reason=_nvtx.Reason.UNKNOWN,
                 )
-            if remote_blocks:
-                self._remote_fw_dram.deliver(
-                    op_handle, remote_blocks, request_id, deadline=deadline
-                )
-            elif not blocks:
-                self._complete(op_handle, {})
+            raise
+        finally:
+            if trace is not None:
+                trace.pop(pushed)
         return op_handle
 
     def deposit(
@@ -657,6 +688,10 @@ class _KVCRCore:
             self._remote_fw_dram.poll_main(progress_items)
         completed = self._completion_queue
         self._completion_queue = []
+        for handle, _ in completed:
+            trace = self._nvtx_operations.pop(handle, None)
+            if trace is not None:
+                trace.returned()
         return completed
 
     def _notify_transfer_errors(self, progress_items: list[object]) -> None:
@@ -732,6 +767,14 @@ class _KVCRCore:
             )
 
         self._closed = True
+        for trace in self._nvtx_operations.values():
+            trace.mark(
+                "op.shutdown_unreturned",
+                once=True,
+                status=_nvtx.Status.UNRESOLVED,
+                reason=_nvtx.Reason.SHUTDOWN,
+            )
+        self._nvtx_operations.clear()
         try:
             self._close_main_resources()
         except BaseException as error:
@@ -1145,6 +1188,9 @@ class _KVCRCore:
                 return
             self._joined_completions.pop(op_handle)
             entries = completed
+        trace = self._nvtx_operations.get(op_handle)
+        if trace is not None:
+            trace.completed(entries)
         self._completion_queue.append((op_handle, entries))
 
     # Timing and telemetry helpers.
