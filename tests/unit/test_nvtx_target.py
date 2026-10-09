@@ -75,6 +75,28 @@ def target(*, eager=False):
     return kvcr, agent, control
 
 
+def test_rejected_progress_submission_closes_unaccepted_target_range(
+    recording, monkeypatch
+):
+    kvcr, _, _ = target()
+    request = "submission-failure"
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id=request)
+
+    def reject(_op):
+        raise RuntimeError("progress submission rejected")
+
+    monkeypatch.setattr(kvcr._core._progress, "submit", reject)
+    with pytest.raises(RuntimeError, match="progress submission rejected"):
+        kvcr.deliver({BlockKey(b"a"): [_mem_descriptor()]}, request_id=request)
+    assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
+    assert len(spans(recording, "target.remote")) == 1
+    assert len(spans(recording, "target.remote", "end")) == 1
+    rejected = payloads(recording, "target.queued.rejected")
+    assert len(rejected) == 1
+    assert int(rejected[0]["status"]) == int(_nvtx.Status.REJECTED)
+    assert not payloads(recording, "target.start_write.enqueued")
+
+
 @pytest.mark.parametrize(
     "indices,expected",
     [

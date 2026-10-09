@@ -840,8 +840,18 @@ class _RemoteFWDram:
                 len(keys),
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
-        kvcr._add_block_dependencies(op, new_operation=True)
-        kvcr._progress.submit(op)
+        try:
+            kvcr._add_block_dependencies(op, new_operation=True)
+            kvcr._progress.submit(op)
+        except Exception:
+            if op.trace is not None:
+                op.trace.mark(
+                    "target.queued.rejected",
+                    status=_nvtx.Status.REJECTED,
+                    reason=_nvtx.Reason.SUBMIT_REJECTED,
+                )
+                op.trace.end("target.remote")
+            raise
         return True
 
     def deliver(

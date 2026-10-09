@@ -73,6 +73,8 @@ identify the consumed hint via `hint_trace_id` in the same tracer instance.
 local-G2, G3 and remote block counts. `target.queued` and
 `target.start_write.enqueued` distinguish local progress queueing from successful
 control-channel enqueueing; enqueueing is not acknowledgement by the source.
+`target.queued.rejected` closes an unaccepted target range when dependency
+setup or progress submission raises, before remote work can begin.
 `target.write_done.received` is the validated logical result observed by target
 progress. `target.main.consume` is a synchronous main-thread consumption scope.
 `op.completion_queued` waits for **all** branches of a mixed-tier operation;
