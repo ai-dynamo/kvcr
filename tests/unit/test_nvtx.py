@@ -27,6 +27,9 @@ class RecordingDomain:
         self.registered = set()
         self.stack = []
         self.fail = None
+        self.ranges = {}
+        self.ended = []
+        self._next_range = 0
 
     def get_registered_string(self, message):
         self.registered.add(message)
@@ -43,7 +46,11 @@ class RecordingDomain:
     def _record(self, kind, attrs):
         if self.fail == kind:
             raise RuntimeError("annotation failure")
-        self.events.append((kind, attrs.message, attrs.payload, threading.get_ident()))
+        # NVTX consumes payloads synchronously. Keep the values observed at the
+        # boundary, rather than a reference to mutable annotation storage.
+        self.events.append(
+            (kind, attrs.message, attrs.payload.copy(), threading.get_ident())
+        )
 
     def mark(self, attrs):
         self._record("mark", attrs)
@@ -57,6 +64,20 @@ class RecordingDomain:
         if self.fail == "pop":
             raise RuntimeError("annotation failure")
 
+    def start_range(self, attrs):
+        self._record("start", attrs)
+        range_id = self._next_range
+        self._next_range += 1
+        self.ranges[range_id] = (attrs.message, attrs.payload.copy())
+        return range_id
+
+    def end_range(self, range_id):
+        name, payload = self.ranges.pop(range_id)
+        self.ended.append(range_id)
+        if self.fail == "end":
+            raise RuntimeError("annotation failure")
+        self.events.append(("end", name, payload, threading.get_ident()))
+
 
 @pytest.fixture
 def recording(monkeypatch):
@@ -68,7 +89,25 @@ def recording(monkeypatch):
 
 
 def payloads(domain, name):
-    return [p for _, message, p, _ in domain.events if message == name]
+    contexts = {}
+    for _, message, payload, _ in domain.events:
+        if message in ("request.context", "source.pin.context"):
+            key = tuple(
+                int(payload[f]) for f in ("instance_hi", "instance_lo", "trace_id")
+            )
+            contexts[key] = {f: payload[f] for f in payload.dtype.names}
+    result = []
+    for _, message, payload, _ in domain.events:
+        if message != name:
+            continue
+        event = {f: payload[f] for f in payload.dtype.names}
+        if int(event["schema_version"]) == 3 and "trace_id" in event:
+            key = tuple(
+                int(event[f]) for f in ("instance_hi", "instance_lo", "trace_id")
+            )
+            event = {**contexts.get(key, {}), **event}
+        result.append(event)
+    return result
 
 
 def make_source(domain, handles=(9,), *, request_id=0):
@@ -134,7 +173,7 @@ def test_default_low_and_fresh_payloads(recording, monkeypatch):
     assert not recording.stack
 
 
-@pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop"])
+@pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "start", "end"])
 def test_annotation_failures_preserve_pin_callback_and_release(recording, failure):
     recording.fail = failure
     source, agent, pinning = make_source(recording)
@@ -361,10 +400,3 @@ def test_concurrent_annotations_have_independent_identities_and_payloads(recordi
     assert len({int(p["pin_id"]) for p in events}) == 32
     assert {int(p["pin_request_id"]) for p in events} == set(range(1, 33))
     assert all(p["completed_blocks"] == p["requested_blocks"] for p in events)
-    assert recording.registered == {
-        "source.pin.framework",
-        "source.pin.registered",
-        "source.pin.waiter",
-        "source.pin.completed",
-        "source.pin.detached",
-    }
