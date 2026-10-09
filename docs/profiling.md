@@ -9,7 +9,7 @@ Tracing covers framework pins, source NIXL writes, target processing, request
 hints, and caller completion for remote delivery. A shared pin has one lifetime
 and separate associations to each waiting source operation. See the
 [lifecycle event reference](nvtx-events.md) for source/target correlation and
-schema 2; the pin schema is described below. A [worked capture walkthrough](nvtx-walkthrough.md) explains the joins and repeatable overhead comparison. Session/parent IDs and framework
+schema 3; the pin schema is described below. A [worked capture walkthrough](nvtx-walkthrough.md) explains the joins and repeatable overhead comparison. Session/parent IDs and framework
 utilization are unavailable through the current bindings.
 
 ## Enable tracing
