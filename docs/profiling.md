@@ -95,7 +95,11 @@ python examples/nvtx_decode.py remote-deliver.sqlite --operations 3
 
 Both spawned workers must appear in the report. The decoder verifies the
 cross-worker identity, pin-to-transfer association, completion ordering, and
-Unicode context. `--scenario partial|failure|timeout` exercises controlled
+context reconstruction. Medium captures also verify the bounded Unicode display
+mapping; low retains the request digest without preparing a display label.
+Schema 3 captures verify independent range endpoints, native release ordering
+and the target range's main-to-progress thread handoff. Older schema 1/2 payloads
+remain readable. `--scenario partial|failure|timeout` exercises controlled
 framework outcomes. Use the matching decoder scenario. These examples do not
 inject native transfer errors or prove all cancellation/quarantine cases;
 the unit tests cover those controlled native-state transitions.

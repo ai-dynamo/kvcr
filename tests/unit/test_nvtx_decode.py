@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The capture checker must reject missing or misassociated request mappings."""
 
+import json
 import runpy
+import sqlite3
 from hashlib import blake2b
 from pathlib import Path
 
@@ -11,6 +13,83 @@ import pytest
 validate = runpy.run_path(str(Path(__file__).parents[2] / "examples/nvtx_decode.py"))[
     "validate"
 ]
+decode = runpy.run_path(str(Path(__file__).parents[2] / "examples/nvtx_decode.py"))[
+    "decode"
+]
+require_range = runpy.run_path(
+    str(Path(__file__).parents[2] / "examples/nvtx_decode.py")
+)["require_range"]
+
+
+@pytest.mark.parametrize("range_id", [None, 0, 7])
+def test_range_validation_requires_a_native_id_and_accepts_zero(range_id):
+    event = dict(
+        instance_hi=1,
+        instance_lo=2,
+        trace_id=3,
+        event_type=60,
+        range_id=range_id,
+        start=10,
+        end=20,
+        thread=1 << 24,
+        end_thread=1 << 24,
+    )
+    if range_id is None:
+        with pytest.raises(AssertionError, match="range ID"):
+            require_range({"target.remote": [event]}, "target.remote", event)
+    else:
+        assert (
+            require_range({"target.remote": [event]}, "target.remote", event)[
+                "range_id"
+            ]
+            == range_id
+        )
+
+
+def compact_sqlite(path, damage=None):
+    # Context intentionally follows the range start. Association overrides are
+    # dynamic: a hint context may be used with several operation handles.
+    prefix = dict(schema_version=3, instance_hi=1, instance_lo=2, trace_id=3)
+    context = dict(prefix, op_handle=0, target_agent_hi=4, request_known=0)
+    rows = [
+        (10, 50, 1, 2, 60, 7, 1, json.dumps(dict(prefix, op_handle=41))),
+        (20, None, 1, None, 34, None, 2, json.dumps(context)),
+        (30, None, 1, None, 34, None, 3, json.dumps(dict(prefix, op_handle=42))),
+    ]
+    if damage == "missing":
+        rows.pop(1)
+    elif damage == "duplicate":
+        rows.append(rows[1])
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE StringIds(id INTEGER,value TEXT)")
+        connection.executemany(
+            "INSERT INTO StringIds VALUES(?,?)",
+            [(1, "target.remote"), (2, "request.context"), (3, "hint.used")],
+        )
+        connection.execute(
+            "CREATE TABLE NVTX_EVENTS(start,end,globalTid,endGlobalTid,eventType,"
+            "rangeId,textId,jsonText)"
+        )
+        connection.executemany("INSERT INTO NVTX_EVENTS VALUES(?,?,?,?,?,?,?,?)", rows)
+
+
+def test_decoder_reconstructs_late_context_and_keeps_dynamic_associations(tmp_path):
+    path = tmp_path / "capture.sqlite"
+    compact_sqlite(path)
+    events = decode(path)
+    assert [event["op_handle"] for event in events] == [41, 0, 42]
+    assert all(event["target_agent_hi"] == 4 for event in events)
+    assert events[0]["end_thread"] == 2
+    assert events[0]["event_type"] == 60
+    assert events[0]["range_id"] == 7
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate"])
+def test_decoder_rejects_unresolvable_compact_context(tmp_path, damage):
+    path = tmp_path / "capture.sqlite"
+    compact_sqlite(path, damage)
+    with pytest.raises(AssertionError, match="context"):
+        decode(path)
 
 
 def capture_events():

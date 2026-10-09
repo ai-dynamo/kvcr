@@ -79,6 +79,15 @@ progress. `target.main.consume` is a synchronous main-thread consumption scope.
 `op.completion_returned` records the completion batch returned by `poll_completed`.
 These boundaries expose delay between progress completion and caller polling.
 
+`op.deliver.lifecycle` is an independent start/end range from dispatch through
+caller-visible completion return. Rejected dispatch and successful shutdown with
+an unreturned result also close it, with their distinct status marks.
+`target.remote` spans target queueing through a validated terminal result or
+confirmed quiescence. It normally starts on the main thread and ends on progress.
+It remains open during timeout/quarantine even if a failed caller result has
+already been returned. These process-local range IDs never replace payload
+`trace_id` or the existing cross-worker agent/incarnation/operation join.
+
 `target.cancel_requested`, `target.quarantined`, `target.quiesced`, and
 `target.shutdown_unresolved` describe uncertainty and eventual proof of safe
 cleanup. A late success after cancellation cannot create a second successful

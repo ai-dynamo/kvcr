@@ -13,6 +13,48 @@ import sqlite3
 from collections import Counter
 from hashlib import blake2b
 
+_IDENTITY = ("instance_hi", "instance_lo", "trace_id")
+_METADATA = ("start", "end", "thread", "end_thread", "name", "event_type", "range_id")
+
+
+def reconstruct_context(events):
+    """Two passes allow a pin context to follow its callback's range start."""
+    contexts = {}
+    for event in events:
+        if event.get("schema_version") == 3 and event["name"] in (
+            "request.context",
+            "source.pin.context",
+        ):
+            key = tuple(event[field] for field in _IDENTITY)
+            assert key not in contexts, "duplicate lifecycle context"
+            contexts[key] = {
+                field: value
+                for field, value in event.items()
+                if field not in _METADATA and field != "_payload_fields"
+            }
+    result = []
+    for event in events:
+        version = event.get("schema_version")
+        assert version in (None, 1, 2, 3), f"unsupported payload schema {version}"
+        if version != 3:
+            result.append(event)
+            continue
+        key = tuple(event[field] for field in _IDENTITY)
+        assert key in contexts, "missing lifecycle context"
+        fields = event.get(
+            "_payload_fields", tuple(field for field in event if field not in _METADATA)
+        )
+        emitted = {field: event[field] for field in fields}
+        result.append(
+            dict(
+                contexts[key],
+                **emitted,
+                **{field: event[field] for field in _METADATA if field in event},
+                _payload_fields=fields,
+            )
+        )
+    return result
+
 
 def scalar(value):
     if isinstance(value, dict):
@@ -24,19 +66,55 @@ def scalar(value):
 
 def decode(path):
     with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(NVTX_EVENTS)")
+        }
+        extra = ",".join(
+            "e." + column if column in columns else "NULL"
+            for column in ("endGlobalTid", "eventType", "rangeId")
+        )
         rows = connection.execute(
-            "SELECT e.start,e.end,e.globalTid,s.value,e.jsonText "
+            f"SELECT e.start,e.end,e.globalTid,s.value,e.jsonText,{extra} "
             "FROM NVTX_EVENTS e JOIN StringIds s ON s.id=e.textId "
             "WHERE e.jsonText IS NOT NULL ORDER BY e.start"
         ).fetchall()
     events = []
-    for start, end, thread, name, raw in rows:
+    for start, end, thread, name, raw, end_thread, event_type, range_id in rows:
         payload = {key: scalar(value) for key, value in json.loads(raw).items()}
         if "schema_version" in payload and "instance_hi" in payload:
             events.append(
-                dict(start=start, end=end, thread=thread, name=name, **payload)
+                dict(
+                    start=start,
+                    end=end,
+                    thread=thread,
+                    end_thread=(end_thread if end_thread is not None else thread)
+                    if end is not None
+                    else None,
+                    name=name,
+                    event_type=event_type,
+                    range_id=range_id,
+                    **payload,
+                )
             )
-    return events
+    return reconstruct_context(events)
+
+
+def require_range(named, name, reference):
+    spans = [
+        event
+        for event in named.get(name, [])
+        if all(event[field] == reference[field] for field in _IDENTITY)
+    ]
+    assert len(spans) == 1, f"missing or duplicate {name} range"
+    span = spans[0]
+    assert span["event_type"] == 60, f"{name} is not a start/end range"
+    assert span["range_id"] is not None, f"missing {name} range ID"
+    assert span["end"] is not None and span["end"] >= span["start"], (
+        f"unclosed {name} range"
+    )
+    assert span["end_thread"] is not None, f"missing {name} end thread"
+    assert span["thread"] >> 24 == span["end_thread"] >> 24, f"{name} crossed processes"
+    return span
 
 
 def operation_key(event):
@@ -56,10 +134,15 @@ def validate(events, scenario, operations):
     if scenario == "off":
         assert not events, "off mode emitted KVCR payloads"
         return dict(events=0)
+    events = reconstruct_context(events)
     named = {}
     for event in events:
         named.setdefault(event["name"], []).append(event)
-        if event["name"] == "request.context" and event["request_known"]:
+        if (
+            event["name"] == "request.context"
+            and event["request_known"]
+            and event.get("request_display_known", 1)
+        ):
             values = event["value_utf8"]
             while values and isinstance(values[0], list):
                 values = values[0]
@@ -142,6 +225,26 @@ def validate(events, scenario, operations):
             for event in hint_events(name)
         ), "hint invalidated before use"
         assert received[0]["start"] <= queued[0]["start"] <= result["start"]
+        compact = result.get("schema_version") == 3
+        if compact:
+            caller_span = require_range(named, "op.deliver.lifecycle", result)
+            target_span = require_range(named, "target.remote", branch)
+            assert (
+                caller_span["start"]
+                <= branch["start"]
+                <= result["start"]
+                <= caller_span["end"]
+            )
+            assert (
+                target_span["start"]
+                <= branch["start"]
+                <= received[0]["start"]
+                <= target_span["end"]
+            )
+            assert caller_span["thread"] == caller_span["end_thread"]
+            assert target_span["thread"] != target_span["end_thread"], (
+                "target ownership never crossed threads"
+            )
         gaps.append((result["start"] - received[0]["start"]) / 1e6)
         if scenario == "zero":
             completed = related("source.write.completed")
@@ -197,12 +300,44 @@ def validate(events, scenario, operations):
             ]
             assert len(pins) == 1
             assert pins[0]["start"] <= posted[0]["start"]
+            if compact:
+                native_span = require_range(named, "nixl.write", posted[0])
+                source_span = require_range(named, "source.write", posted[0])
+                pin_span = require_range(named, "source.pin.wait", pins[0])
+                assert native_span["transfer_id"] == posted[0]["transfer_id"]
+                assert (
+                    native_span["start"]
+                    <= posted[0]["start"]
+                    <= released[0]["start"]
+                    <= native_span["end"]
+                )
+                assert (
+                    source_span["start"]
+                    <= native_span["start"]
+                    <= native_span["end"]
+                    <= source_span["end"]
+                )
+                assert (
+                    pin_span["start"]
+                    <= pins[0]["start"]
+                    <= pin_span["end"]
+                    <= posted[0]["start"]
+                )
     counts = Counter(event["name"] for event in events)
     return dict(
         events=len(events),
         event_counts=dict(counts),
         worker_instances=len({(e["instance_hi"], e["instance_lo"]) for e in events}),
         receipt_to_caller_ms=gaps,
+        range_counts=dict(
+            Counter(event["name"] for event in events if event.get("event_type") == 60)
+        ),
+        cross_thread_ranges=sum(
+            event.get("end_thread") is not None
+            and event["thread"] != event["end_thread"]
+            for event in events
+            if event.get("event_type") == 60
+        ),
     )
 
 
