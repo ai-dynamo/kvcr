@@ -543,6 +543,17 @@ class _SourceWriteOp(_RemoteOp):
             progress, self.remote_agent, self.op_handle, False
         )
         self._backend._dangling_ops.finish_source(self)
+        if self.trace is not None:
+            self.trace.mark(
+                "source.write.completed",
+                once=True,
+                status=_nvtx.Status.FAILED,
+                reason=self.trace.failure_reason
+                if self.trace.failure_reason is not _nvtx.Reason.UNKNOWN
+                else _nvtx.Reason.SHUTDOWN,
+                completed_blocks=0,
+                completed_bytes=0,
+            )
         return True
 
 

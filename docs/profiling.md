@@ -27,8 +27,8 @@ uv sync --extra profiling
 | Value | Behavior |
 | --- | --- |
 | `off` | No NVTX/NumPy import, pin trace objects, or payload construction. |
-| `low` | Pin lifecycles and source NIXL writes. Default when the profiling dependencies are available. |
-| `medium` | Low detail plus waiter-detachment and native release-retry events. |
+| `low` | Essential identities, pin/source lifetimes, transitions and outcomes. Default when the profiling dependencies are available. |
+| `medium` | Low plus descriptor byte/tier/memory diagnostics, bounded request display labels, waiter detachment and native release retries. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for
 tracing with an unavailable backend warns once. An unsupported level warns once
@@ -85,24 +85,34 @@ are bounded static strings. IDs and counts are payloads, never registered names.
 | Event | Meaning |
 | --- | --- |
 | `source.pin.framework` | Same-thread push/pop around the framework's `request_pin` callback, including exceptions. |
+| `source.pin.wait` | Start/end range from before the callback until KVCR observes the result or stops waiting. Shared waiters use one range. |
+| `source.pin.context` | One identity mapping with the accepted framework request ID, or an unknown ID on callback failure. |
 | `source.pin.registered` | A new physical request was accepted into KVCR's pending-pin state. |
 | `source.pin.waiter` | Association between that pin and one source operation/target operation handle. |
 | `source.pin.completed` | KVCR observed a usable/failed result, deadline, cancellation, or shutdown. Exactly one terminal observation per pin trace. |
 | `source.pin.detached` | One source operation stopped waiting; other waiters may remain. Medium detail only. |
 
-Registration-to-completion measures the observed asynchronous wait, including
+The wait range includes the callback and observed asynchronous wait, including
 delay until KVCR polls the framework. It is not the framework's internal execution
 time. A cancellation marker reports KVCR's decision; it does not establish native
 transfer quiescence or permission to reuse a buffer. Late results are still
 discarded/released by the existing lifecycle and do not emit a second completion.
 
-Schema version 1 uses a fresh structured NumPy payload for every event:
+Schema version 3 emits context once. Join compact events to `source.pin.context`
+by `(instance_hi, instance_lo, trace_id)`; its `pin_id` equals the independent
+`trace_id`. Context can follow the callback's range start, so collect context
+before reconstructing events. Waiter association marks keep their own handles
+because one pin can serve several source operations. Attributes and arrays are
+reused per emitting thread, with separate storage for reentrant calls. NVTX
+consumes values synchronously; arrays are not shared between threads or
+reassigned through the attributes' payload setter. Older captures used schema 1
+pin payloads and schema 2 lifecycle payloads.
 
 | Field | Interpretation |
 | --- | --- |
 | `instance_hi`, `instance_lo` | Two uint64 halves of a UUID assigned to this KVCR tracer instance. |
 | `pin_id` | Independent uint64 sequence within that instance; distinguishes framework request-ID reuse. |
-| `pin_request_known`, `pin_request_id` | Signed int64 framework request ID and availability flag. The flag is zero before the callback returns or when its Python integer is outside int64 range; the independent pin identity and lifecycle events are still recorded. Zero is a valid request ID when the flag is set. |
+| `pin_request_known`, `pin_request_id` | Context records the accepted signed int64 request ID and availability flag. The flag is zero if no ID was returned or its integer is outside int64. Zero is a valid request ID when known. |
 | `source_op_id`, `op_handle` | Signed int64 source and target operation handles. Zero denotes unavailable context in direct helper calls. The source path carries these even if the pin callback fails before registration. |
 | `requested_blocks`, `completed_blocks` | Requested count and count of non-missing entries in an accepted result. `-1` means the completed count is unavailable. |
 | `status`, `reason` | Bounded codes below. |

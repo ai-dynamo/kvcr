@@ -10,13 +10,13 @@ Neither profiler presence nor telemetry configuration controls payload work.
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from functools import lru_cache
 from hashlib import blake2b
 from importlib import import_module
 from itertools import count
-from threading import local
+from threading import Lock, RLock, local
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -281,7 +281,12 @@ class _PinTracer:
             slot[2] = False
 
     def begin(self, block_count, *, source_op_id=0, op_handle=0):
-        return _PinTrace(self, next(self._ids), block_count, source_op_id, op_handle)
+        pin_id = next(self._ids)
+        lifetime = _LifecycleTrace(self, pin_id, {})
+        lifetime.start("source.pin.wait", category=self.category)
+        return _PinTrace(
+            self, pin_id, block_count, source_op_id, op_handle, lifetime=lifetime
+        )
 
     def name_progress_thread(self):
         # Python 3.12 does not propagate Thread.name to Linux. Nsight displays
@@ -332,7 +337,7 @@ class _PinTracer:
                     destination_tier=tier(targets),
                     source_memory=memory_kind(refs, kvcr._memory_regions),
                 )
-            return self.lifecycle(
+            trace = self.lifecycle(
                 target_agent=op.route[0] or None,
                 target_incarnation=op.target_incarnation,
                 op_handle=op.op_handle,
@@ -342,6 +347,9 @@ class _PinTracer:
                 selected_blocks=len(op.source_keys),
                 **detail,
             )
+            if trace is not None:
+                trace.start("source.write")
+            return trace
         except Exception:
             return None
 
@@ -384,6 +392,41 @@ class _LifecycleTrace:
         self._observed = set()
         self.failure_reason = Reason.UNKNOWN
         self._context_emitted = False
+        self._ranges = {}
+        self._range_lock = RLock()
+
+    def start(self, name, *, range_key=None, category=None, **fields):
+        """Start an independent range, even when another trace overlaps it."""
+        key = (name, range_key)
+        with self._range_lock:
+            if key in self._ranges:
+                return
+            self._ranges[key] = None
+            try:
+                range_id = self.tracer._emit(
+                    name, self.trace_id, fields, category=category, method="start_range"
+                )
+            except Exception:
+                self._ranges.pop(key, None)
+                return
+            if key in self._ranges:
+                self._ranges[key] = range_id
+            elif range_id is not None:
+                # A reentrant callback ended this range while start was in flight.
+                try:
+                    self.tracer.domain.end_range(range_id)
+                except Exception:
+                    pass
+
+    def end(self, name, *, range_key=None):
+        """Claim the ending once; zero is a valid native range ID."""
+        with self._range_lock:
+            range_id = self._ranges.pop((name, range_key), None)
+        if range_id is not None:
+            try:
+                self.tracer.domain.end_range(range_id)
+            except Exception:
+                pass
 
     def context(self, request_id):
         if self._context_emitted:
@@ -447,6 +490,9 @@ class _LifecycleTrace:
             self.tracer._emit(name, self.trace_id, fields)
         except Exception:
             pass
+        finally:
+            if name == "source.write.completed":
+                self.end("source.write")
 
     def push(self, name, **fields):
         try:
@@ -474,6 +520,8 @@ class _PinTrace:
     finished: bool = False
 
     context_emitted: bool = False
+    lifetime: _LifecycleTrace | None = field(default=None, repr=False)
+    _finish_lock: object = field(default_factory=Lock, repr=False)
 
     def _context(self):
         if self.context_emitted:
@@ -541,9 +589,10 @@ class _PinTrace:
             )
 
     def finish(self, result, *, reason=None, completed_blocks=-1):
-        if self.finished:
-            return
-        self.finished = True
+        with self._finish_lock:
+            if self.finished:
+                return
+            self.finished = True
         self._context()
         status = {
             "success": Status.SUCCESS,
@@ -570,3 +619,5 @@ class _PinTrace:
             reason=reason,
             completed_blocks=completed_blocks,
         )
+        if self.lifetime is not None:
+            self.lifetime.end("source.pin.wait")
