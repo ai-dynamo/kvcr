@@ -52,7 +52,10 @@ def test_failed_source_result_is_failed_even_with_selected_blocks(recording, sel
 
 
 @pytest.mark.parametrize("value", [None, "", "req-α-😀\x00x", "😀" * 100])
-def test_context_mapping_preserves_identity_and_bounded_utf8(recording, value):
+def test_context_mapping_preserves_identity_and_bounded_utf8(
+    recording, monkeypatch, value
+):
+    monkeypatch.setenv("KVCR_NVTX_LEVEL", "medium")
     trace = _nvtx.create_tracer().lifecycle(request_id=value)
     trace.mark("op.deliver")
     context = payloads(recording, "request.context")[0]
@@ -95,7 +98,9 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
     assert not backend._pending_pin_ops
 
 
-def test_source_path_connects_pin_to_transfer(recording):
+@pytest.mark.parametrize("level", ["low", "medium"])
+def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
+    monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
     source, agent, pinning = test_nvtx.make_source(recording)
     agent.state = "DONE"
     pinning.complete(0)
@@ -107,7 +112,10 @@ def test_source_path_connects_pin_to_transfer(recording):
     assert int(submitted[0]["instance_hi"]) == int(pin["instance_hi"])
     assert int(submitted[0]["op_handle"]) == 9
     assert int(submitted[0]["selected_blocks"]) == 1
-    assert int(submitted[0]["selected_bytes"]) > 0
+    if level == "medium":
+        assert int(submitted[0]["selected_bytes"]) > 0
+    else:
+        assert int(submitted[0]["selected_bytes"]) == -1
     assert len(payloads(recording, "source.write.completed")) == 1
 
 

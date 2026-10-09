@@ -341,6 +341,8 @@ class _KVCRProgress:
             handle, remote_side_agent, capture_telemetry, trace=trace
         )
         self._active_transfers[transfer_id] = state
+        if trace is not None:
+            trace.start("nixl.write", range_key=transfer_id, transfer_id=transfer_id)
         submitted = True
         post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE
         try:
@@ -550,6 +552,7 @@ class _KVCRProgress:
                 status=_nvtx.Status.SUCCESS if state.outcome else _nvtx.Status.FAILED,
                 reason=_nvtx.Reason.NONE if state.outcome else _nvtx.Reason.UNKNOWN,
             )
+            state.trace.end("nixl.write", range_key=transfer_id)
         return True
 
     def start(self) -> None:
