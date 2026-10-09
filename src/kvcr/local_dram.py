@@ -35,17 +35,21 @@ _Clock = Callable[[], float]
 
 
 def _layout_indices(
-    layout: list[str], requested: list[str], *, allow_subset: bool = True
+    layout: list[str],
+    requested: list[str],
+    *,
+    allow_subset: bool = True,
+    indices_by_label: dict[str, int | None] | None = None,
 ) -> list[int] | None:
     """Match full layouts or unambiguous pieces in the requested order."""
     if layout == requested:
         return list(range(len(layout)))
-    if (
-        not allow_subset
-        or not requested
-        or len(set(requested)) != len(requested)
-        or any(layout.count(label) != 1 for label in requested)
-    ):
+    if not allow_subset or not requested or len(set(requested)) != len(requested):
+        return None
+    if indices_by_label is not None:
+        indices = [indices_by_label.get(label) for label in requested]
+        return None if None in indices else cast(list[int], indices)
+    if any(layout.count(label) != 1 for label in requested):
         return None
     return [layout.index(label) for label in requested]
 
@@ -62,10 +66,20 @@ class _LocalDramResidency:
     state: _LocalDramState
     claim_count: int = 0
     retire_on_release: bool = False
+    # Slots are fixed for a residency; its derived metadata shares that lifetime.
+    refs: dict[int, _TransferRef] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    indices_by_label: dict[str, int | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _layout: list[str] | None = field(default=None, repr=False, compare=False)
 
     @property
     def layout(self) -> list[str]:
-        return [name for name, _ in self.slots]
+        if self._layout is None:
+            self._layout = [name for name, _ in self.slots]
+        return self._layout
 
 
 @dataclass
@@ -108,6 +122,7 @@ class _LocalCopyOp(_ProgressOp):
     transfer_id: int | None = None
     success: bool = False
     cancellation_requested: bool = False
+    local_dram: "_LocalDram | None" = field(default=None, repr=False, compare=False)
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -139,6 +154,8 @@ class _LocalCopyOp(_ProgressOp):
             except Exception:
                 logger.warning("KVCR local transfer submission failed", exc_info=True)
                 return True, True
+            if submitted and self.local_dram is not None:
+                self.local_dram.prepare_source_indices(self.ordered_keys)
 
         transfer_id = self.transfer_id
         if transfer_id is None:
@@ -507,8 +524,8 @@ class _LocalDram:
 
     def acquire_sources(
         self, keys: Collection[BlockKey], *, notify_capacity: bool = True
-    ) -> dict[BlockKey, list[_TransferRef]]:
-        sources: dict[BlockKey, list[_TransferRef]] = {}
+    ) -> dict[BlockKey, _LocalDramResidency]:
+        sources: dict[BlockKey, _LocalDramResidency] = {}
         for key in keys:
             if key in sources:
                 continue
@@ -517,10 +534,40 @@ class _LocalDram:
             if residency is None or residency.state is not _LocalDramState.READY:
                 continue
             self._acquire_claim(key, residency)
-            sources[key] = self._descriptors(residency.slots)
+            sources[key] = residency
         if notify_capacity:
             self._update_capacity_pressure()
         return sources
+
+    def source_refs(
+        self, residency: _LocalDramResidency, indices: list[int] | None = None
+    ) -> tuple[_TransferRef, ...]:
+        refs = []
+        for index in range(len(residency.slots)) if indices is None else indices:
+            ref = residency.refs.get(index)
+            if ref is None:
+                ref = residency.refs[index] = self._descriptor(*residency.slots[index])
+            refs.append(ref)
+        return tuple(refs)
+
+    def prepare_source_indices(self, keys: Collection[BlockKey]) -> None:
+        # Build after submission so cold batches start transferring before indexing.
+        # This still uses progress-thread time; it is not background work.
+        if not self._kvcr._state_lock.acquire(blocking=False):
+            # Uncached matching remains valid; skip warming rather than wait.
+            return
+        try:
+            for key in keys:
+                record = self._kvcr._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if residency is None or residency.indices_by_label is not None:
+                    continue
+                indices: dict[str, int | None] = {}
+                for index, label in enumerate(residency.layout):
+                    indices[label] = None if label in indices else index
+                residency.indices_by_label = indices
+        finally:
+            self._kvcr._state_lock.release()
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
         for key in keys:
@@ -802,6 +849,7 @@ class _LocalDram:
                 indices = _layout_indices(
                     residency.layout,
                     [descriptor.label for descriptor in op.destinations[key]],
+                    indices_by_label=residency.indices_by_label,
                 )
                 if indices is None:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -810,9 +858,7 @@ class _LocalDram:
                 op.active_keys.add(key)
                 copy_keys.append(key)
                 local_slots.append(tuple(residency.slots))
-                src_descriptors.extend(
-                    self._descriptors([residency.slots[index] for index in indices])
-                )
+                src_descriptors.extend(self.source_refs(residency, indices))
                 dst_descriptors.extend(op.destinations[key])
 
         self._update_capacity_pressure()
@@ -830,6 +876,7 @@ class _LocalDram:
                     backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
+                    local_dram=self,
                 )
             )
             self._next_copy_id += 1

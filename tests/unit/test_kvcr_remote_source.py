@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -87,7 +88,7 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
+def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypatch):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -121,6 +122,9 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         agent.state = "DONE"
         deposit = source.deposit({key: descriptors})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        local = source._core._local_dram
+        make_ref = Mock(wraps=local._descriptor)
+        monkeypatch.setattr(local, "_descriptor", make_ref)
         assert not source._core._remote_fw_dram._try_local_source_write(
             source._core._progress,
             SimpleNamespace(
@@ -192,8 +196,10 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         ]
         assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
         assert pinning.searches == []
+        assert make_ref.call_count == 2
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
+        _wait_until(lambda: residency.indices_by_label == {"": 0, ":b": 1, ":c": 2})
         if transfer_state == "PROC":
             assert list(source.poll_completed()) == []
             assert callbacks == [(threading.get_ident(), [("", 3)])]
@@ -203,6 +209,20 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         assert residency.claim_count == 1  # Native completion does not release it.
         assert _poll_until(source, lambda _: residency.claim_count == 0) == []
         assert not source._core._local_dram_sources_by_op
+
+        # The caller-queued path reuses the same parts without pinning the framework.
+        request["op_handle"] = 13
+        with patch.object(
+            source._core._remote_fw_dram, "_try_local_source_write", return_value=False
+        ):
+            control.incoming.append(msgspec.msgpack.encode(request))
+            _poll_until(
+                source,
+                lambda _: len(agent.released_xfers) == 3 and residency.claim_count == 0,
+            )
+        assert make_ref.call_count == 2
+        assert agent.xfers[-1][1] == agent.xfers[-2][1]
+        assert pinning.searches == []
     finally:
         agent.state = "DONE"
         source.close()
@@ -761,7 +781,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_TransferRef("target", index).__dict__] for index in range(3)
+            [asdict(_TransferRef("target", index))] for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -979,7 +999,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     ),
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_TransferRef("target", index).__dict__]
+                        [asdict(_TransferRef("target", index))]
                         for index in range(len(op_keys))
                     ],
                 }

@@ -403,6 +403,9 @@ class _SourceWriteOp(_RemoteOp):
                 backend._dangling_ops.finish_source(self)
                 return True, True
 
+            if submitted and backend._kvcr._local_dram is not None:
+                backend._kvcr._local_dram.prepare_source_indices(self.source_keys)
+
         transfer_id = self.transfer_id
         if transfer_id is None:
             raise RuntimeError(f"KVCR source operation {self.op_id!r} lost transfer")
@@ -1227,12 +1230,17 @@ class _RemoteFWDram:
                     residency.layout,
                     layout,
                     allow_subset=source_pin.allow_layout_subset,
+                    indices_by_label=residency.indices_by_label,
                 )
                 if indices is None:
                     return False
                 selected.append(indices)
             sources = kvcr._claim_local_dram_sources(
                 source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
+            )
+            source_refs = tuple(
+                kvcr._local_dram.source_refs(sources[key], indices)
+                for key, indices in zip(source_pin.ordered_keys, selected)
             )
             kvcr._add_block_dependencies(source_pin, new_operation=True)
         finally:
@@ -1247,10 +1255,7 @@ class _RemoteFWDram:
             remote_agent=source_pin.remote_agent,
             op_handle=source_pin.op_handle,
             source_keys=source_pin.ordered_keys,
-            src_descriptors=tuple(
-                tuple(sources[key][index] for index in indices)
-                for key, indices in zip(source_pin.ordered_keys, selected)
-            ),
+            src_descriptors=source_refs,
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
@@ -1290,18 +1295,23 @@ class _RemoteFWDram:
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
-        sources = {} if force_failure else {**framework_sources, **local_sources}
         completed_indices = []
         selected_sources = []
-        for index, key in enumerate(source_pin.ordered_keys):
-            source = sources.get(key)
+        for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
+            residency = local_sources.get(key)
+            source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
-            if source is None:
+            if residency is None and source is None:
                 continue
             indices = _layout_indices(
-                [descriptor.label for descriptor in source],
+                residency.layout
+                if residency is not None
+                else [descriptor.label for descriptor in source],
                 [descriptor.label for descriptor in destination],
                 allow_subset=source_pin.allow_layout_subset,
+                indices_by_label=(
+                    residency.indices_by_label if residency is not None else None
+                ),
             )
             if indices is None:
                 logger.warning(
@@ -1311,7 +1321,11 @@ class _RemoteFWDram:
                 )
                 continue
             completed_indices.append(index)
-            selected_sources.append(tuple(source[span] for span in indices))
+            selected_sources.append(
+                kvcr._local_dram.source_refs(residency, indices)
+                if residency is not None
+                else tuple(source[span] for span in indices)
+            )
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
         )

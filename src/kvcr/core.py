@@ -239,7 +239,7 @@ class _KVCRCore:
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
         self._local_dram_sources_by_op: dict[
-            _OpId, dict[BlockKey, list[_TransferRef]]
+            _OpId, dict[BlockKey, _LocalDramResidency]
         ] = {}
 
         self._completion_queue: list[OpResult] = []
@@ -936,7 +936,7 @@ class _KVCRCore:
         keys: Collection[BlockKey],
         *,
         notify_capacity: bool = True,
-    ) -> Mapping[BlockKey, list[_TransferRef]]:
+    ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
