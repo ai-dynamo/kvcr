@@ -1811,6 +1811,16 @@ class _RemoteFWDram:
                 )
             _validate_memory_regions([*regions[0].values(), *regions[1].values()])
         cached = self._remote_agents_by_target.get(target_agent)
+        if cached is not None and cached[1] in progress._disconnected_remote_agents:
+            # A disconnect may drop NIXL's native metadata; reload only if it did.
+            if not agent.check_remote_metadata(cached[1]):
+                progress.release_prepared(cached[1])
+                self._remote_agents_by_target.pop(target_agent)
+                self._route_generation[target_agent] = (
+                    self._route_generation.get(target_agent, 0) + 1
+                )
+            progress._disconnected_remote_agents.discard(cached[1])
+            cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
             cached_metadata, remote_agent, cached_regions = cached
             if not isinstance(target_metadata, bytes) or (

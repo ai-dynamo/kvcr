@@ -16,7 +16,7 @@ from typing import Annotated, Any
 
 import msgspec
 import numpy as np
-from nixl import nixl_agent, nixl_agent_config
+from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
 from .types import BlockKey, RegionDescriptor
 
@@ -142,6 +142,7 @@ class _KVCRProgress:
         self._nixl_agent_name = nixl_agent_name
         self._nixl_agent: Any | None = None
         self._active_transfers: dict[int, _TransferState] = {}
+        self._disconnected_remote_agents: set[str] = set()
         self._next_transfer_id = 0
         self._nixl_listen_port = nixl_listen_port
         self._dram_backends = dram_backends
@@ -205,7 +206,12 @@ class _KVCRProgress:
         if outcome is None or (require_completion and not outcome):
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
-            except Exception:
+            except Exception as error:
+                if isinstance(error, nixlRemoteDisconnectError):
+                    self._disconnected_remote_agents.add(state.remote_side_agent)
+                    # NIXL keeps this as the handle's final status; releasing it
+                    # cancels any request still queued on the failed endpoint.
+                    require_completion = False
                 if state.outcome is not False:
                     logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
@@ -294,7 +300,9 @@ class _KVCRProgress:
             elif post_state not in ("PROC", "PEND"):
                 submitted = False
                 logger.warning("NIXL transfer returned unexpected state %r", post_state)
-        except Exception:
+        except Exception as error:
+            if isinstance(error, nixlRemoteDisconnectError):
+                self._disconnected_remote_agents.add(state.remote_side_agent)
             submitted = False
             logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
         return transfer_id, submitted

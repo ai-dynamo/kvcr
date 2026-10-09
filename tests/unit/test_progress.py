@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from nixl import nixlRemoteDisconnectError
 
 from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
@@ -150,6 +151,40 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
         for name in ("", agent.name, "remote-agent"):
             progress.prepare_memory(name, regions)
     return progress
+
+
+@pytest.mark.parametrize("fail_post", [False, True])
+@pytest.mark.parametrize("error_type", [nixlRemoteDisconnectError, RuntimeError])
+def test_typed_disconnect_marks_peer_and_releases_handle(
+    monkeypatch, fail_post, error_type
+) -> None:
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    # NIXL keeps a failed handle's status, so every later check fails the same way.
+    fail = Mock(side_effect=error_type("failed"))
+    monkeypatch.setattr(agent, "check_xfer_state", fail)
+    if fail_post:
+        monkeypatch.setattr(agent, "transfer", fail)
+    transfer_id, _ = progress.submit_transfer(
+        "WRITE",
+        [_mem(0)],
+        [_mem(1, owner="remote-agent")],
+        remote_side_agent="remote-agent",
+    )
+    assert progress._disconnected_remote_agents == (
+        {"remote-agent"}
+        if fail_post and error_type is nixlRemoteDisconnectError
+        else set()
+    )
+    result = progress.poll_transfer(transfer_id, require_completion=True)
+    if error_type is RuntimeError:
+        # An untyped failure may leave DMA running, so the handle stays.
+        assert result is None and transfer_id in progress._active_transfers
+        assert not progress._disconnected_remote_agents
+    else:
+        assert result == (False, None)
+        assert progress._disconnected_remote_agents == {"remote-agent"}
+        progress.release_prepared("remote-agent")
 
 
 @pytest.mark.parametrize("activate", [False, True])
