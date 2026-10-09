@@ -63,6 +63,11 @@ class Prompts:
     # 140 / 200 instead of the dense 40 / 80.
     tc02_shared: int = 40
     tc02_sections: int = 80
+    # Serve the shared prefix P1 as its own request before the full prompt, so
+    # an engine that only checkpoints SSM state at a request's last aligned
+    # boundary (vLLM mamba_cache_mode=align) holds the state at the P1/P2
+    # junction; otherwise a hybrid model cannot reuse a partial prefix at all.
+    seed_prefix: bool = False
 
     @staticmethod
     def section(tag: str, index: int) -> str:
@@ -148,6 +153,7 @@ class Prompts:
             name: getattr(self, name)
             for name in (
                 "tc01",
+                *(["tc02_p1"] if self.seed_prefix else []),
                 "tc02_full",
                 "tc02_partial",
                 "tc02_absent",
@@ -188,6 +194,7 @@ class Context:
         hit_block_tokens: int = BLOCK_SIZE,
         baseline_timings: dict[str, Any] | None = None,
         engine_cached: dict[str, list[int | None]] | None = None,
+        tc02_seed_prefix: bool = False,
     ) -> None:
         self.stack = stack
         self.client = client
@@ -207,6 +214,7 @@ class Context:
         self.hit_block_tokens = hit_block_tokens
         # Reference-phase cached_tokens per prompt (KVCR disabled), request order.
         self.engine_cached = engine_cached or {}
+        self.tc02_seed_prefix = tc02_seed_prefix
         # KVCR-disabled timings recorded during the reference phase, keyed by
         # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
         self.baseline_timings = baseline_timings or {}
@@ -497,13 +505,29 @@ def tc01(ctx: Context) -> CaseResult:
 def tc02(ctx: Context) -> CaseResult:
     result = CaseResult("TC-02", "Local DRAM full flow", "R2")
     p = ctx.prompts
+    if ctx.tc02_seed_prefix:
+        prefix_req = ctx.request("tc02-seed-prefix-w0", p.tc02_p1, 0)
+        result.evidence += [prefix_req.request_file, prefix_req.response_file]
+        ctx.require_ok(result, prefix_req, 0)
+        ctx.compare(result, prefix_req, "tc02_p1")
+        ctx.check_cold(result, prefix_req)
+        ctx.local_commit_checks(
+            result, 0, prefix_req.started_at, "tc02 prefix store->commit on w0"
+        )
+        time.sleep(ctx.index_wait)
     seed = ctx.request("tc02-seed-full-w0", p.tc02_full, 0)
     result.evidence += [seed.request_file, seed.response_file]
     if not ctx.require_ok(result, seed, 0):
         result.finish()
         return result
     ctx.compare(result, seed, "tc02_full")
-    ctx.check_cold(result, seed)
+    if ctx.tc02_seed_prefix:
+        # P1 was served first (below, before this request), so the full prompt
+        # is itself a partial-prefix hit on worker 0.
+        seed_hit_blocks = ctx.check_hit(result, seed)
+        result.measurements["tc02_seed_full_hit_blocks"] = seed_hit_blocks
+    else:
+        ctx.check_cold(result, seed)
     ctx.local_commit_checks(result, 0, seed.started_at, "tc02 store->commit on w0")
     time.sleep(ctx.index_wait)
 

@@ -143,6 +143,7 @@ class Runner:
             perf_count=args.perf_repeats,
             tc02_shared=args.tc02_shared_sections,
             tc02_sections=args.tc02_sections,
+            seed_prefix=args.tc02_seed_prefix,
         )
         self.references: dict[str, TokenSample] = {}
         self.baseline_timings: dict[str, Any] = {}
@@ -167,6 +168,7 @@ class Runner:
                 "concurrency_levels": args.perf_concurrency_levels,
                 "hit_block_tokens": args.hit_block_tokens,
                 "tc02_sections": [args.tc02_shared_sections, args.tc02_sections],
+                "tc02_seed_prefix": args.tc02_seed_prefix,
             },
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
@@ -232,7 +234,7 @@ class Runner:
         # being run must not block the run when the bare engine is unstable on it.
         case_prompts = {
             "TC-01": {"tc01"},
-            "TC-02": {"tc02_full", "tc02_partial", "tc02_absent"},
+            "TC-02": {"tc02_p1", "tc02_full", "tc02_partial", "tc02_absent"},
             "TC-03": {"tc03", "tc03_isolated"},
             "TC-04": {"tc04", "tc04_fresh", "tc04_second"},
             "TC-05": set(perf_names),
@@ -399,6 +401,7 @@ class Runner:
             hit_block_tokens=self.args.hit_block_tokens,
             baseline_timings=self.baseline_timings,
             engine_cached=self.reference_cached,
+            tc02_seed_prefix=self.args.tc02_seed_prefix,
         )
         for name in self.args.cases:
             self.check_deadline()
@@ -554,6 +557,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=80,
         help="TC-02 full/partial prompt length in sections (hybrid: 200)",
+    )
+    parser.add_argument(
+        "--tc02-seed-prefix",
+        action="store_true",
+        help="TC-02: serve the shared prefix P1 alone on worker 0 before the full "
+        "prompt (hybrid models: vLLM mamba_cache_mode=align keeps SSM state only at "
+        "a request's last aligned boundary, so the P1/P2 junction needs its own request)",
     )
     parser.add_argument(
         "--max-model-len",
