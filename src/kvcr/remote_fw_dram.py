@@ -115,6 +115,14 @@ class _TargetPullOp(_RemoteOp):
     def progress(
         self, progress: _KVCRProgress, event: object | None
     ) -> tuple[bool, bool]:
+        completed, did_work = self._progress(progress, event)
+        if completed and self.trace is not None:
+            self.trace.end("target.remote")
+        return completed, did_work
+
+    def _progress(
+        self, progress: _KVCRProgress, event: object | None
+    ) -> tuple[bool, bool]:
         backend = self._backend
         trace = self.trace
         now = backend._kvcr._clock()
@@ -323,6 +331,8 @@ class _TargetPullOp(_RemoteOp):
                 status=_nvtx.Status.UNRESOLVED,
                 reason=_nvtx.Reason.SHUTDOWN,
             )
+        elif safe and self.trace is not None:
+            self.trace.end("target.remote")
         return safe
 
 
@@ -810,6 +820,7 @@ class _RemoteFWDram:
                 hint_trace_id=current_hint.trace.trace_id
                 if current_hint.trace is not None
                 else 0,
+                range_name="target.remote",
             )
             if self._nvtx is not None
             else None,

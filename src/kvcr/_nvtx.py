@@ -362,11 +362,26 @@ class _PinTracer:
             return None
 
     def operation(
-        self, kvcr, handle, blocks, request_id, *, local_fill=False, hint_trace_id=0
+        self,
+        kvcr,
+        handle,
+        blocks,
+        request_id,
+        *,
+        local_fill=False,
+        hint_trace_id=0,
+        range_name="op.deliver.lifecycle",
     ):
         try:
-            refs = tuple(ref for block in blocks.values() for ref in block)
-            return self.lifecycle(
+            detail = {}
+            if self.level == "medium":
+                refs = tuple(ref for block in blocks.values() for ref in block)
+                detail = dict(
+                    requested_bytes=kvcr._descriptor_bytes(refs),
+                    destination_tier=tier(refs),
+                    destination_memory=memory_kind(refs, kvcr._memory_regions),
+                )
+            trace = self.lifecycle(
                 target_agent=kvcr.nixl_agent_name,
                 target_incarnation=kvcr._remote_fw_dram._dangling_ops.incarnation,
                 request_id=request_id,
@@ -374,10 +389,11 @@ class _PinTracer:
                 local_fill=local_fill,
                 hint_trace_id=hint_trace_id,
                 requested_blocks=len(blocks),
-                requested_bytes=kvcr._descriptor_bytes(refs),
-                destination_tier=tier(refs),
-                destination_memory=memory_kind(refs, kvcr._memory_regions),
+                **detail,
             )
+            if trace is not None:
+                trace.start(range_name)
+            return trace
         except Exception:
             return None
 
@@ -485,11 +501,17 @@ class _LifecycleTrace:
     def target_result(self, op, reason):
         try:
             complete = len(op.completed_keys)
-            byte_count = op._backend._kvcr._descriptor_bytes(
-                ref
-                for key, refs in zip(op.ordered_keys, op.dst_descriptors)
-                if key in op.completed_keys
-                for ref in refs
+            byte_count = (
+                op._backend._kvcr._descriptor_bytes(
+                    ref
+                    for key, refs in zip(op.ordered_keys, op.dst_descriptors)
+                    if key in op.completed_keys
+                    for ref in refs
+                )
+                if self.tracer.level == "medium"
+                else -1
+                if complete
+                else 0
             )
             self.mark(
                 "target.write_done.received",
@@ -549,7 +571,7 @@ class _LifecycleTrace:
             completed_bytes=self._fields.get("selected_bytes", -1) if success else 0,
         )
 
-    def mark(self, name, *, once=False, detail=False, **fields):
+    def mark(self, name, *, once=False, detail=False, retain_cause=False, **fields):
         reason = fields.get("reason", Reason.NONE)
         if not retain_cause and reason not in (
             Reason.NONE,
@@ -571,6 +593,12 @@ class _LifecycleTrace:
         finally:
             if name == "source.write.completed":
                 self.end("source.write")
+            elif name in (
+                "op.completion_returned",
+                "op.rejected",
+                "op.shutdown_unreturned",
+            ):
+                self.end("op.deliver.lifecycle")
 
     def push(self, name, **fields):
         try:

@@ -3,6 +3,7 @@
 """Target events must retain asynchronous and caller completion boundaries."""
 
 import ctypes
+from types import SimpleNamespace
 
 import pytest
 import test_kvcr_remote_target
@@ -19,12 +20,48 @@ from _kvcr_test_utils import (
     _write_done_notification,
 )
 from test_nvtx import payloads
+from test_nvtx_ranges import spans
 
 from kvcr import _nvtx
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 recording = test_nvtx.recording
+
+
+@pytest.mark.parametrize("level", ["low", "medium"])
+def test_target_low_avoids_descriptor_scans_but_preserves_result(
+    recording, monkeypatch, level
+):
+    monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
+    calls = []
+    monkeypatch.setattr(_nvtx, "tier", lambda refs: calls.append("tier") or 1)
+    monkeypatch.setattr(
+        _nvtx, "memory_kind", lambda refs, regions: calls.append("memory") or 1
+    )
+    kvcr = SimpleNamespace(
+        nixl_agent_name="target",
+        _memory_regions=({}, {}),
+        _remote_fw_dram=SimpleNamespace(
+            _dangling_ops=SimpleNamespace(incarnation="inc")
+        ),
+        _descriptor_bytes=lambda refs: calls.append("bytes") or 16,
+    )
+    trace = _nvtx.create_tracer().operation(kvcr, 41, {b"key": (object(),)}, "request")
+    assert trace is not None
+    op = SimpleNamespace(
+        completed_keys={b"key"},
+        keys={b"key"},
+        success=True,
+        ordered_keys=(b"key",),
+        dst_descriptors=((object(),),),
+        _backend=SimpleNamespace(_kvcr=kvcr),
+    )
+    trace.target_result(op, _nvtx.Reason.NONE)
+    assert bool(calls) == (level == "medium")
+    event = payloads(recording, "target.write_done.received")[0]
+    assert int(event["completed_blocks"]) == 1
+    assert int(event["completed_bytes"]) == (16 if level == "medium" else -1)
 
 
 def target(*, eager=False):
@@ -62,6 +99,9 @@ def test_target_receipt_consumption_and_caller_return(recording, indices, expect
     received = payloads(recording, "target.write_done.received")
     assert len(received) == 1
     assert not payloads(recording, "op.completion_returned")
+    assert len(spans(recording, "op.deliver.lifecycle")) == 1
+    assert not spans(recording, "op.deliver.lifecycle", "end")
+    assert len(spans(recording, "target.remote", "end")) == 1
     result = _poll_until(kvcr, bool)
     assert len(result) == 1
     for name in (
@@ -79,6 +119,7 @@ def test_target_receipt_consumption_and_caller_return(recording, indices, expect
     )
     assert int(received[0]["target_incarnation_hi"]) != 0
     assert not kvcr._core._nvtx_operations
+    assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not recording.stack
     kvcr.discard_hint(request)
     assert len(payloads(recording, "hint.discarded")) == 1
@@ -240,8 +281,11 @@ def test_cancellation_cause_survives_grace_deadline(recording):
     assert not result[handle][BlockKey(b"k")].success
     assert len(payloads(recording, "target.quarantined")) == 1
     reason = int(payloads(recording, "op.completion_returned")[0]["reason"])
+    assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
+    assert not spans(recording, "target.remote", "end")
     agent.notifs["source"] = [_write_done_notification(handle)]
     _poll_until(kvcr, lambda _: bool(payloads(recording, "target.quiesced")))
+    assert len(spans(recording, "target.remote", "end")) == 1
     assert len(payloads(recording, "op.completion_returned")) == 1
     kvcr.close()
     assert reason == int(_nvtx.Reason.CANCELLED)
