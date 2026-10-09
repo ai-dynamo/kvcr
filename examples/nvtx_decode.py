@@ -245,6 +245,36 @@ def validate(events, scenario, operations):
             assert target_span["thread"] != target_span["end_thread"], (
                 "target ownership never crossed threads"
             )
+            completed = related("source.write.completed")
+            assert len(completed) == 1, "missing source completion"
+            source_span = require_range(named, "source.write", completed[0])
+            assert source_span["start"] <= completed[0]["start"] <= source_span["end"]
+            assert source_span["thread"] >> 24 != result["thread"] >> 24
+            waiters = [
+                event
+                for event in named.get("source.pin.waiter", [])
+                if all(
+                    event[field] == completed[0][field]
+                    for field in ("instance_hi", "instance_lo", "source_op_id")
+                )
+            ]
+            assert len(waiters) == 1, "missing source pin association"
+            pins = [
+                event
+                for event in named.get("source.pin.completed", [])
+                if all(
+                    event[field] == waiters[0][field]
+                    for field in ("instance_hi", "instance_lo", "pin_id")
+                )
+            ]
+            assert len(pins) == 1, "missing source pin completion"
+            pin_span = require_range(named, "source.pin.wait", pins[0])
+            assert (
+                pin_span["start"]
+                <= pins[0]["start"]
+                <= pin_span["end"]
+                <= source_span["start"]
+            )
         gaps.append((result["start"] - received[0]["start"]) / 1e6)
         if scenario == "zero":
             completed = related("source.write.completed")
@@ -302,8 +332,6 @@ def validate(events, scenario, operations):
             assert pins[0]["start"] <= posted[0]["start"]
             if compact:
                 native_span = require_range(named, "nixl.write", posted[0])
-                source_span = require_range(named, "source.write", posted[0])
-                pin_span = require_range(named, "source.pin.wait", pins[0])
                 assert native_span["transfer_id"] == posted[0]["transfer_id"]
                 assert (
                     native_span["start"]

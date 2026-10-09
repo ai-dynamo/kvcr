@@ -207,6 +207,86 @@ def test_decoder_accepts_associated_unicode_context():
     validate(capture_events(), "failure", 1)
 
 
+def compact_failed_events():
+    events = [e for e in capture_events() if e["name"] != "request.context"]
+    result = next(e for e in events if e["name"] == "op.completion_returned")
+    branch = next(e for e in events if e["name"] == "target.queued")
+    source = dict(
+        result,
+        instance_hi=11,
+        instance_lo=12,
+        trace_id=30,
+        source_op_id=2,
+        request_known=0,
+        completed_blocks=0,
+        completed_bytes=0,
+        thread=2 << 24,
+    )
+    pin = dict(source, trace_id=50, pin_id=50)
+    events.extend(
+        [
+            dict(source, name="source.write.completed", start=35),
+            dict(pin, name="source.pin.waiter", start=31),
+            dict(pin, name="source.pin.completed", start=32),
+        ]
+    )
+    for name, reference, start, end, end_thread in (
+        ("op.deliver.lifecycle", result, 25, 65, result["thread"]),
+        ("target.remote", branch, 28, 45, branch["thread"] + 1),
+        ("source.write", source, 33, 36, source["thread"]),
+        ("source.pin.wait", pin, 29, 33, pin["thread"]),
+    ):
+        events.append(
+            dict(
+                reference,
+                name=name,
+                start=start,
+                end=end,
+                end_thread=end_thread,
+                event_type=60,
+                range_id=0,
+            )
+        )
+    contexts = {}
+    for event in events:
+        event.update(schema_version=3, request_display_known=0)
+        event.setdefault("end", None)
+        event.setdefault("end_thread", None)
+        event.setdefault("event_type", 34)
+        event.setdefault("range_id", None)
+        contexts.setdefault(
+            (event["instance_hi"], event["instance_lo"], event["trace_id"]), event
+        )
+    events.extend(
+        dict(
+            context,
+            name="source.pin.context"
+            if context["trace_id"] == 50
+            else "request.context",
+            start=0,
+            end=None,
+            end_thread=None,
+            event_type=34,
+            range_id=None,
+        )
+        for context in contexts.values()
+    )
+    return events
+
+
+@pytest.mark.parametrize("scenario", ["zero", "failure", "timeout"])
+def test_decoder_accepts_closed_source_ranges_on_failed_results(scenario):
+    validate(compact_failed_events(), scenario, 1)
+
+
+@pytest.mark.parametrize("scenario", ["zero", "failure", "timeout"])
+@pytest.mark.parametrize("name", ["source.write", "source.pin.wait"])
+def test_decoder_rejects_missing_source_ranges_on_failed_results(scenario, name):
+    events = [e for e in compact_failed_events() if e["name"] != name]
+    with pytest.raises(AssertionError, match=name):
+        validate(events, scenario, 1)
+
+
 def successful_events():
     events = capture_events()
     result = next(e for e in events if e["name"] == "op.completion_returned")
