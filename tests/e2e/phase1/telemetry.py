@@ -9,6 +9,7 @@ whose timestamps fall inside [start, end]. Nothing is subtracted between lines.
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from .common import ANSI
+
+# "ConnectorName={...}" segments of a MultiConnector metrics line; the dict
+# body has no nested braces, so a greedy match up to the closing brace works.
+CONNECTOR_DICT = re.compile(r"(\b[A-Za-z]+Connector)=(\{[^}]*\})")
 
 METRIC = re.compile(
     r"(vllm:[^=]+)=([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)(?:, |$)"
@@ -103,15 +108,34 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             errors.append(f"line {number}: metric line without a parseable timestamp")
             continue
         payload = line.split("KV Transfer metrics:", 1)[1].strip()
-        pairs = METRIC.findall(payload)
         values: dict[str, int | float] = {}
-        for name, value in pairs:
-            values[name] = (
-                float(value) if any(c in value for c in ".eE") else int(value)
-            )
-        if not values or len(values) != payload.count("="):
-            errors.append(f"line {number}: incomplete metric parsing")
-            continue
+        if CONNECTOR_DICT.search(payload):
+            # MultiConnector: one Python dict repr per connector,
+            # "OffloadingConnector={...}, NixlConnector={...}". Merge them; the
+            # KVCR tier lives in the OffloadingConnector dict.
+            parsed = 0
+            for found in CONNECTOR_DICT.finditer(payload):
+                try:
+                    block = ast.literal_eval(found.group(2))
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(block, dict):
+                    parsed += 1
+                    for name, value in block.items():
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            values[str(name)] = value
+            if not parsed:
+                errors.append(f"line {number}: unparsable per-connector metrics")
+                continue
+        else:
+            pairs = METRIC.findall(payload)
+            for name, value in pairs:
+                values[name] = (
+                    float(value) if any(c in value for c in ".eE") else int(value)
+                )
+            if not values or len(values) != payload.count("="):
+                errors.append(f"line {number}: incomplete metric parsing")
+                continue
         snapshots.append(Snapshot(stamp, number, values))
     return snapshots, errors
 
