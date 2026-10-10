@@ -113,9 +113,9 @@ def cached_tokens(body: dict[str, Any]) -> int | None:
     return value if type(value) is int else None
 
 
-def worker_identity(body: dict[str, Any]) -> tuple[str | None, int | None]:
+def worker_identity(body: dict[str, Any], role: str = "decode") -> tuple[str | None, int | None]:
     identity = (body.get("nvext") or {}).get("worker_id") or {}
-    worker = identity.get("decode_worker_id")
+    worker = identity.get(f"{role}_worker_id")
     rank = identity.get("decode_dp_rank")
     return (
         str(worker) if type(worker) in (str, int) and str(worker) else None,

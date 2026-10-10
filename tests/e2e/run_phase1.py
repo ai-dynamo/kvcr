@@ -117,6 +117,7 @@ class Runner:
             model=args.model,
             output=self.output,
             mode=args.mode,
+            topology=args.topology,
             gpus=tuple(args.gpus),
             http_port=args.http_port,
             reference_http_port=args.reference_http_port,
@@ -212,6 +213,9 @@ class Runner:
             self.settings.reference_http_port, name="reference-frontend"
         )
         worker = stack.start_worker(0, kvcr=False, tag="-reference")
+        decode_ref = (
+            stack.start_worker(2, kvcr=False, tag="-reference") if stack.disagg else None
+        )
         client = Client(
             f"http://127.0.0.1:{self.settings.reference_http_port}",
             self.args.model,
@@ -220,9 +224,13 @@ class Runner:
             request_timeout=self.args.request_timeout,
         )
         stack.wait_model(client)
+        if stack.disagg:
+            stack.discover_worker(client, 2)
         stack.discover_worker(client, 0)
         launch = json.loads((stack.evidence / f"{worker.name}.launch.json").read_text())
-        bypass = "--kv-transfer-config" not in launch["command"]
+        bypass = not any(
+            "OffloadingConnector" in part or '"kvcr"' in part for part in launch["command"]
+        )
         samples: dict[str, list[TokenSample]] = {}
         unstable = []
         unstable_detail: dict[str, Any] = {}
@@ -350,7 +358,9 @@ class Runner:
             self.result["reference"]["kvcr_disabled_timings"] = self.baseline_timings
             save_json(evidence / "baseline-timings.json", self.baseline_timings)
         self.save()
-        stack.stop(worker, stack.frontend)  # type: ignore[arg-type]
+        stack.stop(*[c for c in (worker, decode_ref, stack.frontend) if c is not None])  # type: ignore[arg-type]
+        if stack.disagg:
+            stack.worker_ids.pop(2, None)
         stack.reset_discovery()
         if not bypass or kvcr_mentions:
             raise ValidationError("reference engine was not verified KVCR-free")
@@ -373,6 +383,10 @@ class Runner:
             if stack.uses_state_agent():
                 stack.start_state_agent()
         stack.start_frontend(self.settings.http_port)
+        if stack.disagg:
+            stack.start_worker(2)
+            stack.wait_model(client)
+            stack.discover_worker(client, 2)
         for index in (0, 1):
             stack.start_worker(index)
             stack.wait_model(client)
@@ -382,6 +396,7 @@ class Runner:
             for index, wid in stack.worker_ids.items()
         }
         self.result["compatibility_digest"] = self.settings.compatibility_digest
+        self.result["topology"] = self.settings.topology
         self.save()
         return client
 
@@ -499,7 +514,9 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--mode", choices=MODES, default=GUARD)
     parser.add_argument(
-        "--gpus", default="0,1", help="Two CUDA device indices, e.g. 0,1"
+        "--gpus",
+        default="0,1",
+        help="CUDA device indices: two for --topology agg (0,1), three for disagg (0,1,2)",
     )
     parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04,TC-05,TC-06")
     parser.add_argument("--http-port", type=int, default=8000)
@@ -564,6 +581,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="TC-02: serve the shared prefix P1 alone on worker 0 before the full "
         "prompt (hybrid models: vLLM mamba_cache_mode=align keeps SSM state only at "
         "a request's last aligned boundary, so the P1/P2 junction needs its own request)",
+    )
+    parser.add_argument(
+        "--topology",
+        choices=("agg", "disagg"),
+        default="agg",
+        help="agg: two decode workers (default). disagg: 2P+1D, workers 0/1 are "
+        "prefill workers (KVCR source/target) and worker 2 the shared decode worker; "
+        "needs three GPUs",
     )
     parser.add_argument(
         "--max-model-len",
@@ -638,9 +663,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     gpus = [part.strip() for part in args.gpus.split(",")]
-    if len(gpus) != 2 or not all(part.isdecimal() for part in gpus):
-        parser.error("--gpus needs two CUDA device indices (same index = one shared GPU)")
+    wanted_gpus = 3 if args.topology == "disagg" else 2
+    if len(gpus) != wanted_gpus or not all(part.isdecimal() for part in gpus):
+        parser.error(
+            f"--gpus needs {wanted_gpus} CUDA device indices for --topology {args.topology}"
+        )
     args.gpus = [int(part) for part in gpus]
+    if args.topology == "disagg" and (args.remote_worker or args.external_services is None):
+        parser.error("--topology disagg is single-node and needs --external-services (sidecars)")
     # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
     if (args.gpus[0] == args.gpus[1] and not args.remote_worker
             and args.gpu_memory_utilization > 0.45):

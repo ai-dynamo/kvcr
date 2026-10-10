@@ -133,7 +133,7 @@ def run_arm(
     max_tokens: int | None = None,
 ) -> list[StreamResponse]:
     """Stream every (name, prompt) to one worker at the configured concurrency."""
-    worker_id = ctx.stack.worker_ids[worker_index]
+    pin = ctx.stack.pin(worker_index)
     parallel = ctx.perf_concurrency if concurrency is None else concurrency
 
     def one(item: tuple[str, str]) -> StreamResponse:
@@ -142,9 +142,9 @@ def run_arm(
         return ctx.client.stream_completion(
             f"{label}-{name}-w{worker_index}",
             prompt,
-            worker=worker_id,
             max_tokens=ctx.perf_max_tokens if max_tokens is None else max_tokens,
             extra_fields=STREAM_FIELDS,
+            **pin,
         )
 
     if parallel <= 1:
@@ -174,8 +174,8 @@ def validate_stream(
     expected_worker = ctx.stack.worker_ids[worker_index]
     result.check(
         f"{stage}: served by worker {worker_index}",
-        response.worker in (None, expected_worker),
-        f"decode_worker_id={response.worker}",
+        ctx.stack.served(response) in (None, expected_worker),
+        f"{ctx.stack.served_role}_worker_id={ctx.stack.served(response)}",
     )
     reference = ctx.references[reference_key]
     observed = response.sample()

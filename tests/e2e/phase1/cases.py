@@ -237,7 +237,8 @@ class Context:
     def request(self, stage: str, prompt: str, worker_index: int) -> Response:
         self.stack.check_children()
         worker_id = self.stack.worker_ids[worker_index]
-        return self.client.completion(stage, prompt, worker=worker_id)
+        del worker_id
+        return self.client.completion(stage, prompt, **self.stack.pin(worker_index))
 
     def require_ok(
         self, result: CaseResult, response: Response, worker_index: int
@@ -249,11 +250,11 @@ class Context:
         )
         if not ok:
             return False
-        worker, _ = worker_identity(response.body or {})
+        worker = self.stack.identity(response.body or {})
         return result.check(
             f"{response.stage}: served by worker {worker_index}",
             worker == self.stack.worker_ids[worker_index],
-            f"decode_worker_id={worker}",
+            f"{self.stack.served_role}_worker_id={worker}",
         )
 
     def compare(

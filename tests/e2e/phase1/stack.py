@@ -86,12 +86,18 @@ class Settings:
     model: str
     output: Path
     mode: str = GUARD
-    gpus: tuple[int, int] = (0, 1)
+    # "agg": two decode workers, worker 0 KVCR source, worker 1 target.
+    # "disagg": 2P+1D on three GPUs: workers 0/1 are prefill workers (KVCR
+    # source/target, the P->D hop uses NixlConnector), worker 2 is the single
+    # decode worker. Requests pin the prefill worker; the decode is shared.
+    topology: str = "agg"
+    gpus: tuple[int, ...] = (0, 1)
     http_port: int = 8000
     reference_http_port: int = 8001
-    control_ports: tuple[int, int] = (17771, 17772)
-    event_ports: tuple[int, int] = (20081, 20082)
-    system_ports: tuple[int, int] = (9091, 9092)
+    control_ports: tuple[int, ...] = (17771, 17772, 17773)
+    event_ports: tuple[int, ...] = (20081, 20082, 20083)
+    system_ports: tuple[int, ...] = (9091, 9092, 9093)
+    nixl_side_channel_ports: tuple[int, ...] = (5601, 5602, 5603)
     pool_gb: int = 2
     g2_slots: int = 256
     cpu_bytes_to_use: int = 2_000_000_000
@@ -522,6 +528,58 @@ class Stack:
             "kv_connector_extra_config": extra,
         }
 
+    # -- topology helpers --------------------------------------------------
+
+    @property
+    def disagg(self) -> bool:
+        return self.settings.topology == "disagg"
+
+    @property
+    def decode_index(self) -> int | None:
+        return 2 if self.disagg else None
+
+    @property
+    def served_role(self) -> str:
+        """Which worker id identifies the KVCR-relevant worker of a response."""
+        return "prefill" if self.disagg else "decode"
+
+    def identity(self, body: dict[str, Any]) -> str | None:
+        return worker_identity(body, self.served_role)[0]
+
+    def served(self, stream: Any) -> str | None:
+        return stream.prefill_worker if self.disagg else stream.worker
+
+    def pin(self, index: int) -> dict[str, str | None]:
+        """Request kwargs that route a request through worker[index]."""
+        if not self.disagg:
+            return {"worker": self.worker_ids.get(index)}
+        return {
+            "prefill": self.worker_ids.get(index),
+            "worker": self.worker_ids.get(2),
+        }
+
+    def disaggregation_mode(self, index: int) -> str | None:
+        if not self.disagg:
+            return None
+        return "decode" if index == 2 else "prefill"
+
+    def kv_transfer_config(self, index: int, *, kvcr: bool) -> dict[str, Any] | None:
+        mode = self.disaggregation_mode(index)
+        if mode is None:
+            return self.transfer_config(index) if kvcr else None
+        if mode == "decode":
+            return {"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}
+        nixl = {"kv_connector": "NixlConnector", "kv_role": "kv_producer"}
+        if not kvcr:
+            return nixl
+        return {
+            "kv_connector": "MultiConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "connectors": [self.transfer_config(index), nixl]
+            },
+        }
+
     def events_config(self, index: int) -> dict[str, Any]:
         return {
             "publisher": "zmq",
@@ -556,13 +614,14 @@ class Stack:
             str(self.settings.gpu_memory_utilization),
             *self.settings.extra_worker_args,
         ]
-        if kvcr:
-            command += [
-                "--kv-transfer-config",
-                json.dumps(self.transfer_config(index)),
-                "--kv-events-config",
-                json.dumps(self.events_config(index)),
-            ]
+        mode = self.disaggregation_mode(index)
+        if mode is not None:
+            command += ["--disaggregation-mode", mode]
+        transfer = self.kv_transfer_config(index, kvcr=kvcr)
+        if transfer is not None:
+            command += ["--kv-transfer-config", json.dumps(transfer)]
+        if kvcr or (mode is not None):
+            command += ["--kv-events-config", json.dumps(self.events_config(index))]
         return command
 
     def service_socket(self, index: int) -> Path:
@@ -708,6 +767,13 @@ class Stack:
         env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpus[index])
         env["VLLM_LOGGING_LEVEL"] = "DEBUG"
         env["DYN_SYSTEM_PORT"] = str(self.settings.system_ports[index])
+        if self.disagg:
+            # Three NIXL side channels on one host; Dynamo only sets the host
+            # when it recognises a top-level NixlConnector.
+            env.setdefault("VLLM_NIXL_SIDE_CHANNEL_HOST", "127.0.0.1")
+            env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(
+                self.settings.nixl_side_channel_ports[index]
+            )
         name = f"worker-{index}{tag}"
         save_json(
             self.evidence / f"{name}.kv-transfer-config.json",
@@ -808,15 +874,19 @@ class Stack:
                 wid for wid in self.discovery_instance_ids() if wid not in known
             ]
             pinned = candidates[0] if attempt % 2 and len(candidates) == 1 else None
+            role = "decode" if (not self.disagg or index == 2) else "prefill"
+            pin: dict[str, str | None] = {"worker": pinned}
+            if self.disagg and index != 2:
+                pin = {"prefill": pinned, "worker": self.worker_ids.get(2)}
             probe = client.completion(
                 f"probe-w{index}-{attempt:02d}",
                 f"identity probe {uuid.uuid4().hex}",
-                worker=pinned,
                 max_tokens=1,
                 extra_fields=["worker_id"],
+                **pin,
             )
             if probe.ok and probe.body is not None:
-                worker, _ = worker_identity(probe.body)
+                worker, _ = worker_identity(probe.body, role)
                 if worker is not None and worker not in known:
                     self.worker_ids[index] = worker
                     return worker

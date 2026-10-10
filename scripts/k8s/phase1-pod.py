@@ -40,6 +40,8 @@ p.add_argument("--pool-gb", type=int, default=2)
 p.add_argument("--no-batch-invariant", action="store_true")
 p.add_argument("--harness-arg", action="append", default=[])
 p.add_argument("--two-node", action="store_true")
+p.add_argument("--topology", choices=("agg", "disagg"), default="agg",
+               help="disagg = 2P+1D on three GPUs in one pod (workers 0/1 prefill with KVCR sidecars, worker 2 decode)")
 p.add_argument("--etcd-image", default="quay.io/coreos/etcd:v3.5.14")
 p.add_argument("--agent-port", type=int, default=9800)
 p.add_argument("--gpu-type", default="H100", help="node label nvidia.com/gpu.product substring, '' to skip")
@@ -73,7 +75,9 @@ labels = {"app": "kvcr-phase1", "owner": "doxu", "run": run_id, "tests-sha": arg
 node_selector = (
     {"nvidia.com/gpu.product": f"NVIDIA-{args.gpu_type}-80GB-HBM3"} if args.gpu_type else {}
 )
-gpus_per_pod = 1 if args.two_node else 2
+if args.two_node and args.topology == "disagg":
+    p.error("--topology disagg is single-node only")
+gpus_per_pod = 1 if args.two_node else (3 if args.topology == "disagg" else 2)
 
 harness = [
     "python3", f"{tests}/run_phase1.py",
@@ -81,7 +85,8 @@ harness = [
     "--mode", "guard",
     "--cases", args.cases,
     "--timeout", str(args.timeout),
-    "--gpus", "0,0" if args.two_node else "0,1",
+    "--gpus", "0,0" if args.two_node else ("0,1,2" if args.topology == "disagg" else "0,1"),
+    "--topology", args.topology,
     "--model", args.model,
     "--pool-gb", str(args.pool_gb),
     "--external-services", "/run/kvcr",
