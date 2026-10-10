@@ -171,7 +171,7 @@ class KVCR:
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
-        """Asynchronously copy blocks into KVCR-managed storage."""
+        """Asynchronously copy blocks or add labelled parts to KVCR-managed storage."""
         return self._core.deposit(blocks, no_evict, hints)
 
     def fetch(

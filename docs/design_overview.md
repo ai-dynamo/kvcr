@@ -188,6 +188,8 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
+Successive deposits may add distinct labels to the same key; existing labels are not overwritten. Each call completes for its requested parts, while previously committed parts remain available if a later addition fails. Key-level inventory does not imply that every layer is present.
+
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
 `align_sequence` lets the framework supply sequence order and align the recency of ready blocks in KVCR-managed storage. It uses the newest access time among those blocks, or the current time when `use_current_time=True`. Missing or non-ready blocks are ignored. Alignment does not increment access counts or reserve residency.
