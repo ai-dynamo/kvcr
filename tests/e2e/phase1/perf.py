@@ -489,7 +489,7 @@ def tc06(ctx: Context) -> CaseResult:
         response = ctx.client.stream_completion(
             f"tc06-guard-attempt{len(attempts) + 1}-w1",
             prompt0,
-            worker=ctx.stack.worker_ids[1],
+            **ctx.stack.pin(1),
             max_tokens=ctx.perf_max_tokens,
             extra_fields=STREAM_FIELDS,
         )
