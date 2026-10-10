@@ -3,6 +3,7 @@
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -16,7 +17,12 @@ from typing import Annotated, Any
 
 import msgspec
 import numpy as np
-from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
+from nixl import (
+    nixl_agent,
+    nixl_agent_config,
+    nixlBackendError,
+    nixlRemoteDisconnectError,
+)
 
 from .types import BlockKey, RegionDescriptor
 
@@ -25,10 +31,33 @@ _IDLE_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
+_NIXL_AGENT_STAGE = "NIXL agent initialization"
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
 _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
+
+
+def _visible_network_interfaces() -> int | None:
+    try:
+        return len(os.listdir("/sys/class/net"))
+    except OSError:
+        return None
+
+
+def _network_interface_hint(effect: str) -> str:
+    """Name the usual remedy when creating the NIXL agent is slow or fails.
+
+    UCX enumerates every network interface that carries an IPv4 address while
+    it creates the agent, so a host that exposes many of them is slow to start
+    and fails beyond UCX's limit of 128 transports/devices.
+    """
+    count = _visible_network_interfaces()
+    seen = "" if count is None else f" ({count} visible here)"
+    return (
+        f"If this host exposes many network interfaces{seen}, {effect}; "
+        "restrict UCX to the interfaces KVCR needs with UCX_NET_DEVICES."
+    )
 
 
 @dataclass(frozen=True)
@@ -439,21 +468,24 @@ class _KVCRProgress:
         if not self._thread.is_alive():
             self._thread.start()
         if not self._ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
-            raise RuntimeError(
-                "KVCR progress initialization timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
-            )
+            raise self._startup_timeout_error("initialization")
         self.raise_if_failed()
 
     def prepare(self) -> None:
         """Create the agent and register memory without starting backends."""
         self._thread.start()
         if not self._prepare_ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
-            raise RuntimeError(
-                "KVCR progress preparation timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
-            )
+            raise self._startup_timeout_error("preparation")
         self.raise_if_failed()
+
+    def _startup_timeout_error(self, phase: str) -> RuntimeError:
+        message = (
+            f"KVCR progress {phase} timed out after "
+            f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+        )
+        if self._startup_stage == _NIXL_AGENT_STAGE:
+            message += ". " + _network_interface_hint("UCX agent creation is slow")
+        return RuntimeError(message)
 
     def submit(self, item: object) -> None:
         self.raise_if_failed()
@@ -514,7 +546,7 @@ class _KVCRProgress:
 
     def _run(self) -> None:
         try:
-            self._log_startup_stage("NIXL agent initialization")
+            self._log_startup_stage(_NIXL_AGENT_STAGE)
             self._initialize_nixl()
             if self._close_requested:
                 return
@@ -627,16 +659,31 @@ class _KVCRProgress:
         if self._nixl_agent is None and self._nixl_agent_name is not None:
             if self._nixl_listen_port is None:
                 raise RuntimeError("KVCR NIXL listen port is not configured")
-            self._nixl_agent = nixl_agent(
-                self._nixl_agent_name,
-                nixl_agent_config(
-                    num_threads=4,
-                    capture_telemetry=True,
-                    enable_listen_thread=True,
-                    listen_port=self._nixl_listen_port,
-                    backends=self._dram_backends,
-                ),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KVCR_EVENT progress_nixl_agent_create agent=%s net_devices=%s",
+                    self._nixl_agent_name,
+                    _visible_network_interfaces(),
+                )
+            try:
+                self._nixl_agent = nixl_agent(
+                    self._nixl_agent_name,
+                    nixl_agent_config(
+                        num_threads=4,
+                        capture_telemetry=True,
+                        enable_listen_thread=True,
+                        listen_port=self._nixl_listen_port,
+                        backends=self._dram_backends,
+                    ),
+                )
+            except nixlBackendError:
+                logger.error(
+                    "NIXL agent creation failed. %s",
+                    _network_interface_hint(
+                        "UCX can exceed its limit of 128 transports/devices"
+                    ),
+                )
+                raise
 
     def _register_memory_regions(self) -> None:
         if self._nixl_agent is None or not any(self._memory_regions):
