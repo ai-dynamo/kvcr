@@ -259,11 +259,13 @@ def test_invalidation_stops_every_role_until_an_owner_reset(
 
 
 @contextmanager
-def _attached(tmp_path: Path) -> Iterator[KVCRPoolAttachment]:
+def _attached(
+    tmp_path: Path, pool_size_bytes: int = 8192 + 4096
+) -> Iterator[KVCRPoolAttachment]:
     """An owned pool, mapped, the way a Guard or a claimant holds one."""
     owner = _KVCRPoolOwner.allocate(
         pool_id="pool_0",
-        pool_size_bytes=8192 + 4096,
+        pool_size_bytes=pool_size_bytes,
         journal_bytes=8192,
         pool_dir=tmp_path,
     )
@@ -285,12 +287,17 @@ def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -
     write_recovery_snapshot(pool, terms, frames)
 
 
+@pytest.mark.parametrize(
+    "pool_size_bytes",
+    [8192 + 4096, 4 * mmap.ALLOCATIONGRANULARITY, 4 * mmap.ALLOCATIONGRANULARITY + 1],
+    ids=["small-pool", "page-aligned-pool", "unaligned-pool"],
+)
 def test_a_handback_region_lives_and_dies_inside_the_pool_file(
-    tmp_path: Path, caplog
+    tmp_path: Path, caplog, pool_size_bytes: int
 ) -> None:
     """Replayed whole under its own terms, discardable when torn, gone once released."""
     caplog.set_level(logging.DEBUG, logger="kvcr.recovery_journal")
-    with _attached(tmp_path) as pool:
+    with _attached(tmp_path, pool_size_bytes) as pool:
         path = Path(pool._spec.path)
         pools = (
             _PoolDescriptor("pool0", 2048, 1024, pool._spec.journal_bytes),
@@ -307,10 +314,10 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
         }
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
         written = [r for r in caplog.records if "snapshot_written " in r.message]
-        assert written[-1].args == (
-            pool._spec.pool_id,
-            path.stat().st_size - pool._spec.mapping_bytes,
-        )
+        with pool.mapped_snapshot() as snapshot:
+            assert snapshot is not None
+            # The snapshot's byte count excludes alignment padding after the pool.
+            assert written[-1].args == (pool._spec.pool_id, len(snapshot))
         # Inside the pool file, so it has no name of its own to be found under.
         assert set(tmp_path.iterdir()) == {path}
         assert path.stat().st_size > pool._spec.mapping_bytes
