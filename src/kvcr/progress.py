@@ -41,7 +41,7 @@ class _MemDescriptor:
     device_Id: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _TransferRef:
     """An element in an agent's framework or KVCR-owned registered memory."""
 

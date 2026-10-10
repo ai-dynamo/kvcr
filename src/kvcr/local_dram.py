@@ -35,17 +35,21 @@ _Clock = Callable[[], float]
 
 
 def _layout_indices(
-    layout: list[str], requested: list[str], *, allow_subset: bool = True
+    layout: list[str],
+    requested: list[str],
+    *,
+    allow_subset: bool = True,
+    indices_by_label: dict[str, int | None] | None = None,
 ) -> list[int] | None:
     """Match full layouts or unambiguous pieces in the requested order."""
     if layout == requested:
         return list(range(len(layout)))
-    if (
-        not allow_subset
-        or not requested
-        or len(set(requested)) != len(requested)
-        or any(layout.count(label) != 1 for label in requested)
-    ):
+    if not allow_subset or not requested or len(set(requested)) != len(requested):
+        return None
+    if indices_by_label is not None:
+        indices = [indices_by_label.get(label) for label in requested]
+        return None if None in indices else cast(list[int], indices)
+    if any(layout.count(label) != 1 for label in requested):
         return None
     return [layout.index(label) for label in requested]
 
@@ -62,10 +66,28 @@ class _LocalDramResidency:
     state: _LocalDramState
     claim_count: int = 0
     retire_on_release: bool = False
+    # Slots are fixed for a residency; its derived metadata shares that lifetime.
+    refs: dict[int, _TransferRef] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    indices_by_label: dict[str, int | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _layout: list[str] | None = field(default=None, repr=False, compare=False)
 
     @property
     def layout(self) -> list[str]:
-        return [name for name, _ in self.slots]
+        if self._layout is None:
+            self._layout = [name for name, _ in self.slots]
+        return self._layout
+
+    def prepare_label_index(self) -> None:
+        # Build on fill completion or takeover, not on transfer submission.
+        if self.indices_by_label is None:
+            indices: dict[str, int | None] = {}
+            for index, label in enumerate(self.layout):
+                indices[label] = None if label in indices else index
+            self.indices_by_label = indices
 
 
 @dataclass
@@ -263,6 +285,7 @@ class _LocalDram:
                     raise ValueError("invalid local DRAM recovery slots")
                 labels.add(label)
                 occupied[pool_name].add(slot)
+            residency.prepare_label_index()
         self._free_slots = {
             pool_name: deque(
                 slot
@@ -507,8 +530,8 @@ class _LocalDram:
 
     def acquire_sources(
         self, keys: Collection[BlockKey], *, notify_capacity: bool = True
-    ) -> dict[BlockKey, list[_TransferRef]]:
-        sources: dict[BlockKey, list[_TransferRef]] = {}
+    ) -> dict[BlockKey, _LocalDramResidency]:
+        sources: dict[BlockKey, _LocalDramResidency] = {}
         for key in keys:
             if key in sources:
                 continue
@@ -517,10 +540,21 @@ class _LocalDram:
             if residency is None or residency.state is not _LocalDramState.READY:
                 continue
             self._acquire_claim(key, residency)
-            sources[key] = self._descriptors(residency.slots)
+            sources[key] = residency
         if notify_capacity:
             self._update_capacity_pressure()
         return sources
+
+    def source_refs(
+        self, residency: _LocalDramResidency, indices: list[int]
+    ) -> tuple[_TransferRef, ...]:
+        refs = []
+        for index in indices:
+            ref = residency.refs.get(index)
+            if ref is None:
+                ref = residency.refs[index] = self._descriptor(*residency.slots[index])
+            refs.append(ref)
+        return tuple(refs)
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
         for key in keys:
@@ -666,6 +700,7 @@ class _LocalDram:
             if key_success:
                 record.last_access = now
                 residency.state = _LocalDramState.READY
+                residency.prepare_label_index()
                 self._residency_observer(key, record)
                 meta = self._kvcr._block_meta(
                     key, record, self._size_bytes(residency.slots)
@@ -802,6 +837,7 @@ class _LocalDram:
                 indices = _layout_indices(
                     residency.layout,
                     [descriptor.label for descriptor in op.destinations[key]],
+                    indices_by_label=residency.indices_by_label,
                 )
                 if indices is None:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
@@ -810,9 +846,7 @@ class _LocalDram:
                 op.active_keys.add(key)
                 copy_keys.append(key)
                 local_slots.append(tuple(residency.slots))
-                src_descriptors.extend(
-                    self._descriptors([residency.slots[index] for index in indices])
-                )
+                src_descriptors.extend(self.source_refs(residency, indices))
                 dst_descriptors.extend(op.destinations[key])
 
         self._update_capacity_pressure()

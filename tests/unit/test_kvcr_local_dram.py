@@ -30,7 +30,12 @@ from _kvcr_test_utils import (
 from kvcr import core as core_module
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
-from kvcr.local_dram import _LocalCopyOp, _LocalDramResidency, _LocalDramState
+from kvcr.local_dram import (
+    _layout_indices,
+    _LocalCopyOp,
+    _LocalDramResidency,
+    _LocalDramState,
+)
 from kvcr.policy import FIFOPolicy, LRUPolicy
 from kvcr.policy_runtime import _EvictionQueue, _PolicyInvoker
 from kvcr.recovery_journal import (
@@ -203,7 +208,7 @@ def test_local_dram_rejects_overlapping_pools() -> None:
 
 
 @pytest.mark.parametrize("labeled", [False, True])
-def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
+def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) -> None:
     full = ctypes.create_string_buffer(16)
     swa = ctypes.create_string_buffer(16)
     payload = b"a" * 16 + b"b" * 8 + b"c" * 8
@@ -245,6 +250,15 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     )
     assert not dict(kvcr.poll_completed())[wrong][first].success
 
+    local_dram = kvcr._core._local_dram
+    residency = kvcr._core._block_record_map[first].local_dram
+    # Ready blocks already have their label index, but references stay incremental.
+    assert residency.indices_by_label == (
+        {"full": 0, "swa:a": 1, "swa:b": 2} if labeled else {"full": 0, "swa": None}
+    )
+    assert not residency.refs
+    make_ref = Mock(wraps=local_dram._descriptor)
+    monkeypatch.setattr(local_dram, "_descriptor", make_ref)
     agent.state = "PROC"
     partial = kvcr.deliver(
         {
@@ -256,6 +270,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     )
     if labeled:
         _wait_until(lambda: len(agent.transfers) == 2)
+        assert make_ref.call_count == 2  # Only the requested parts are constructed.
         # Releasing the fetch cannot make any part evictable during a partial copy.
         assert kvcr._core._block_record_map[first].local_dram.claim_count == 2
         kvcr.release([result.release_handle])
@@ -274,12 +289,38 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     matching = kvcr.deliver({first: descriptors})
     assert dict(_poll_until(kvcr, bool))[matching][first].success
     assert source.raw == payload
+    assert make_ref.call_count == 3  # The full copy reuses those earlier parts.
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert kvcr.query((first, second)) == [
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
+
+
+@pytest.mark.parametrize(
+    "requested,allow_subset,expected",
+    [
+        (["", "swa:a", "swa", "swa"], False, [0, 1, 2, 3]),
+        (["swa:a", ""], True, [1, 0]),
+        (["swa"], True, None),
+        (["missing"], True, None),
+        (["", ""], True, None),
+        ([], True, None),
+        (["swa:a"], False, None),
+    ],
+)
+def test_layout_matching_with_and_without_index(requested, allow_subset, expected):
+    for index in (None, {"": 0, "swa:a": 1, "swa": None}):
+        assert (
+            _layout_indices(
+                ["", "swa:a", "swa", "swa"],
+                requested,
+                allow_subset=allow_subset,
+                indices_by_label=index,
+            )
+            == expected
+        )
 
 
 def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
@@ -909,6 +950,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     records = _g2_recovered(first=2, second=0)
     records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
     install_recovery_records(kvcr._core, records)
+    assert records[BlockKey(b"first")].local_dram.indices_by_label == {":first": 0}
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(
