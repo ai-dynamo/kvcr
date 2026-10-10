@@ -327,3 +327,17 @@ finding 1, same standing as dense. Hybrid runs should pass
 --tc02-seed-prefix`. The reference phase now covers only the requested
 cases' prompts; one hybrid run aborted because the bare engine was unstable on
 the 3.9k-token TC-02 prompt (GDN rejects batch-invariant mode).
+
+### 2P+1D disaggregated (2026-10-10)
+
+`--topology disagg` (three GPUs; `--two-node` puts P1 on the second node) runs
+workers 0/1 as prefill workers with a MultiConnector of the KVCR
+OffloadingConnector and NixlConnector kv_producer, worker 2 as the decode
+worker (NixlConnector kv_consumer). Requests pin the prefill worker
+(`x-dynamo-prefill-instance-id`), identity comes from `prefill_worker_id`.
+Dynamo reads `secondary_tiers`/`dynamo_state_agent` only from the top-level
+extra config, so the harness mirrors them there (finding A in the report).
+Runs `v011-dense8b-2p1d` and `p1-2p1d-2node`: TC-01/02/03/05 PASS, TC-04 = #51
+first-request miss, TC-06 PASS single node and 3/5 Guard-served hits across
+nodes; 0 token mismatches. Run at `--gpu-memory-utilization 0.35` because the
+dead prefill's KV region stays mapped by the decode worker (finding B).
