@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import heapq
 import logging
+from collections import deque
 from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -387,12 +388,24 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
     _poll_until(kvcr, lambda done: operation in dict(done))
     pops = Mock(wraps=heapq.heappop)
     monkeypatch.setattr(heapq, "heappop", pops)
+
+    class CountedSlots(deque):
+        length_checks = 0
+
+        def __len__(self):
+            self.length_checks += 1
+            return super().__len__()
+
+    free_slots = kvcr._core._local_dram._free_slots
+    full_slots = free_slots["full"] = CountedSlots(free_slots["full"])
     operation = kvcr.deposit({grouped: descriptors})
     result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
 
     assert result[grouped].success
-    # The older full-only rows must be scanned once while making room in swa.
-    assert pops.call_count <= len(full) + 2
+    # The initial capacity and deficit checks suffice for the satisfied pool.
+    assert full_slots.length_checks == 2
+    # Making room in swa must not scan the older full-only rows.
+    assert pops.call_count == 2
     assert kvcr.query(full) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * len(full)
     assert kvcr.query((swa0, swa1, grouped)) == [
         (QueryStatus.MISS, None),
@@ -414,23 +427,27 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
 
 def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     queue = _EvictionQueue()
-    first, churned, excluded = (
-        BlockKey(name) for name in (b"first", b"churned", b"excluded")
+    first, churned, excluded, unrelated = (
+        BlockKey(name) for name in (b"first", b"churned", b"excluded", b"unrelated")
     )
-    queue.insert(first, 0)
-    queue.insert(churned, 1)
-    queue.insert(excluded, 1)
+    queue.insert(first, 0, ("full", "swa", "swa"))
+    queue.insert(churned, 1, ("swa",))
+    queue.insert(excluded, 1, ("swa",))
+    queue.insert(unrelated, 0.5, ("full",))
 
-    with closing(queue.candidates({excluded})) as candidates:
+    deficient = {"full", "swa"}
+    with closing(queue.candidates({excluded}, deficient)) as candidates:
         assert next(candidates) == first
+        deficient.remove("full")  # No more victims from a satisfied pool.
         for _ in range(100):
             queue.remove(churned)
-            queue.insert(churned, 1)
-        assert len(queue._heap) <= 2 * len(queue)
+            queue.insert(churned, 1, ("swa",))
+        assert len(queue._heaps["swa"]) <= 6
         assert list(candidates) == [churned]
 
-    assert len(queue._heap) == 3
-    assert list(queue.candidates(set())) == [first, excluded, churned]
+    assert sum(map(len, queue._heaps.values())) == 5
+    assert list(queue.candidates(set())) == [first, unrelated, excluded, churned]
+    assert list(queue.candidates(set(), {"full"})) == [first, unrelated]
 
 
 def test_lru_float_score_uses_small_tail_first_bias() -> None:

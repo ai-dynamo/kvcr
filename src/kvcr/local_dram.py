@@ -1135,16 +1135,17 @@ class _LocalDram:
         self._retry_unscored()
         victims: list[tuple[BlockKey, "_BlockRecord", _LocalDramResidency, int]] = []
         freed: Counter[str] = Counter()
+        deficient = set(required)
 
         def short() -> set[str]:
             return {
                 name
-                for name, count in required.items()
-                if len(self._free_slots[name]) + freed[name] < count
+                for name in deficient
+                if len(self._free_slots[name]) + freed[name] < required[name]
             }
 
-        deficient = short()
-        with closing(self._evictable.candidates(protected)) as candidates:
+        deficient.intersection_update(short())
+        with closing(self._evictable.candidates(protected, deficient)) as candidates:
             while deficient:
                 key = next(candidates, None)
                 if key is None:
@@ -1158,17 +1159,13 @@ class _LocalDram:
                     or residency.claim_count
                 ):
                     raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-                if not any(
-                    label.partition(":")[0] in deficient for label, _ in residency.slots
-                ):
-                    continue
                 size_bytes = self._size_bytes(residency.slots)
                 decision, eviction_pending = self._kvcr._decide_eviction(
                     self._kvcr._block_meta(key, record, size_bytes),
                     CacheTier.LOCAL_G2,
                     deadline,
                 )
-                deficient = short()
+                deficient.intersection_update(short())
                 if not deficient:
                     break
                 if eviction_pending:
@@ -1178,7 +1175,7 @@ class _LocalDram:
                     continue
                 victims.append((key, record, residency, size_bytes))
                 freed.update(label.partition(":")[0] for label, _ in residency.slots)
-                deficient = short()
+                deficient.intersection_update(short())
 
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
@@ -1220,7 +1217,9 @@ class _LocalDram:
             self._unscored.add(key)
             return
         self._unscored.discard(key)
-        if self._evictable.insert(key, score):
+        if self._evictable.insert(
+            key, score, (label.partition(":")[0] for label, _ in residency.slots)
+        ):
             self._evictable_slots.update(
                 label.partition(":")[0] for label, _ in residency.slots
             )
