@@ -361,6 +361,7 @@ class _RecoveryMirror:
             if record.g3 is not None:
                 record.g3.claim_count = 0
             record.fw_mem = None
+            record.fw_pin_handle = None
             record.in_flight_ops = None
             record.access_count = 0
             record.last_access = None

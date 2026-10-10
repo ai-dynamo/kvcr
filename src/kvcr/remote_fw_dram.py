@@ -52,12 +52,6 @@ if TYPE_CHECKING:
 _MEMORY_REF_LISTS_TYPE = tuple[tuple[_TransferRef, ...], ...]
 
 
-@dataclass(slots=True)
-class _FwMemResidency:
-    descriptors: list[_TransferRef]
-    pin_handle: PinHandle
-
-
 @dataclass(frozen=True)
 class _RequestHint:
     source: str | None
@@ -1286,7 +1280,7 @@ class _RemoteFWDram:
             source_pin.op_id, source_pin.ordered_keys
         )
         framework_sources = {
-            key: record.fw_mem.descriptors
+            key: record.fw_mem
             for key in source_pin.ordered_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
@@ -1331,7 +1325,7 @@ class _RemoteFWDram:
             source_pin.op_id, local_sources.keys() - set(completed_keys)
         )
         relevant_pins = {
-            record.fw_mem.pin_handle
+            record.fw_pin_handle
             for key in completed_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
@@ -1479,7 +1473,7 @@ class _RemoteFWDram:
         for key in op.keys:
             record = kvcr._block_record_map.get(key)
             if record is not None and record.fw_mem is not None:
-                relevant_pins.add(record.fw_mem.pin_handle)
+                relevant_pins.add(record.fw_pin_handle)
         unused_pins = op.framework_pins - relevant_pins
         op.framework_pins = relevant_pins
         self._release_framework_pins(unused_pins)
@@ -1694,7 +1688,8 @@ class _RemoteFWDram:
                 record = block_record(key)
                 if record.fw_mem is not None:
                     continue
-                record.fw_mem = _FwMemResidency(descriptor, pin_handle)
+                record.fw_mem = descriptor
+                record.fw_pin_handle = pin_handle
                 pin_keys.add(key)
             return pin_handle
         except Exception as error:
@@ -1724,18 +1719,17 @@ class _RemoteFWDram:
         keys_to_pin: list[BlockKey] = []
         for key in keys:
             record = kvcr._block_record_map.get(key)
-            residency = record.fw_mem if record is not None else None
-            if residency is None:
+            if record is None or record.fw_mem is None:
                 keys_to_pin.append(key)
 
         if not keys_to_pin:
             kvcr._record_duration("source_acquire", started_at, "reused")
         else:
             held_framework_pins = {
-                residency.pin_handle
+                record.fw_pin_handle
                 for key in keys
                 if (record := kvcr._block_record_map.get(key)) is not None
-                and (residency := record.fw_mem) is not None
+                and record.fw_mem is not None
             }
             pending_pins, covered_keys = self._find_pending_pins(keys_to_pin)
             uncovered_keys = [key for key in keys_to_pin if key not in covered_keys]
@@ -1752,11 +1746,10 @@ class _RemoteFWDram:
         framework_pins: set[PinHandle] = set()
         for key in keys:
             record = kvcr._block_record_map.get(key)
-            residency = record.fw_mem if record is not None else None
-            if residency is None:
+            if record is None or record.fw_mem is None:
                 continue
-            descriptors[key] = residency.descriptors
-            framework_pins.add(residency.pin_handle)
+            descriptors[key] = record.fw_mem
+            framework_pins.add(record.fw_pin_handle)
         if not descriptors:
             return None
         return descriptors, framework_pins
@@ -1780,9 +1773,10 @@ class _RemoteFWDram:
                 if (
                     record is not None
                     and record.fw_mem is not None
-                    and record.fw_mem.pin_handle == pin_handle
+                    and record.fw_pin_handle == pin_handle
                 ):
                     record.fw_mem = None
+                    record.fw_pin_handle = None
                     kvcr._prune_block_record(key)
             if self._try_release_pin(pin_handle, warn=first_attempt):
                 kvcr._framework_pin_keys.pop(pin_handle, None)

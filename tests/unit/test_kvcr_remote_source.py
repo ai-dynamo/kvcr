@@ -35,7 +35,6 @@ from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.progress import _STOP, _TransferRef
 from kvcr.remote_fw_dram import (
-    _FwMemResidency,
     _RemoteFWDram,
     _SourcePinOp,
     _SourceWriteOp,
@@ -826,6 +825,7 @@ def test_kvcr_pin_release_failure_is_logged_and_retried(kvcr_caplog, failure):
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
     control.incoming.append(_start_write_message(14, BlockKey(b"k0")))
     assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
+    record = kvcr._core._block_record_map[BlockKey(b"k0")]
     source_agent.state = "DONE"
     assert (
         _poll_until(
@@ -838,6 +838,7 @@ def test_kvcr_pin_release_failure_is_logged_and_retried(kvcr_caplog, failure):
     assert pinning.unpins == ["pin"]
     assert "pin" in kvcr._core._framework_pin_keys
     assert not kvcr._core._block_record_map
+    assert record.fw_mem is record.fw_pin_handle is None
     warnings = [record.getMessage() for record in kvcr_caplog.records]
     assert any("release_pin failed" in message for message in warnings)
 
@@ -1159,9 +1160,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         _TransferRef("target", i, "pool:" + label) for i, label in enumerate("abc")
     ]
     destinations = tuple(_TransferRef("target", 0, "pool:" + label) for label in parts)
-    kvcr._block_record_map[key] = _BlockRecord(
-        fw_mem=_FwMemResidency(sources, borrowed)
-    )
+    kvcr._block_record_map[key] = _BlockRecord(fw_mem=sources, fw_pin_handle=borrowed)
 
     # This operation acquired a pin of its own for a key it no longer needs.
     stale = PinHandle("acquired-here")

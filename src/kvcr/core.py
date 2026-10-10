@@ -55,7 +55,6 @@ from .types import (
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
-    from .remote_fw_dram import _FwMemResidency
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +124,9 @@ def _noop_record_transfer(
 class _BlockRecord:
     # Locally pinned framework-owned G2 memory. This is never remote
     # KVCR residency and exists only while KVCR controls the pin.
-    fw_mem: "_FwMemResidency | None" = None
+    # References and their pin handle are installed and cleared together.
+    fw_mem: list[_TransferRef] | None = None
+    fw_pin_handle: PinHandle | None = None
     local_dram: _LocalDramResidency | None = None
     g3: _G3Residency | None = None
     in_flight_ops: set[_OpId] | None = None

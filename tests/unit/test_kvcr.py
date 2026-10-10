@@ -43,7 +43,6 @@ from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.memory import KVCRPoolSpec
 from kvcr.progress import _TransferRef
-from kvcr.remote_fw_dram import _FwMemResidency
 from kvcr.types import BlockKey, KVCRStartupError, MemoryRef, RegionDescriptor
 
 
@@ -904,7 +903,6 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
         _BlockRecord(),
         _LocalDramResidency([("", 0)], _LocalDramState.READY),
         _G3Residency(0),
-        _FwMemResidency([_mem_descriptor()], object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__
 
