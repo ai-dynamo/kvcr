@@ -841,9 +841,16 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def initialize_progress(self, _progress: _KVCRProgress) -> None:
+        # Leave room before the source-stall deadline; waits round to milliseconds.
+        _progress._idle_wait_seconds = min(
+            _progress._idle_wait_seconds,
+            self._kvcr.config.operation_timeout_ms // 2 / 1000,
+        )
         initialize_control = getattr(self._control, "initialize", None)
         if initialize_control is not None:
             initialize_control()
+        wait = getattr(self._control, "wait", None)
+        _progress._idle_waiter = wait if callable(wait) else None
 
     def poll_progress(
         self, progress: _KVCRProgress, submissions: list[object]
