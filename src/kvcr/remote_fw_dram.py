@@ -1475,6 +1475,11 @@ class _RemoteFWDram:
         self._resume_source_pin(op_id, op)
 
     def _expire_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
+        logger.debug(
+            "KVCR_EVENT framework_pin_timeout op=%s pending_pins=%d",
+            op_id,
+            len(op.pending_pin_ids),
+        )
         self._cancel_pending_pin_for_op(op_id, op, result="timeout")
         self._submit_prepared_source_write(op_id, op, force_failure=True)
 
@@ -1681,7 +1686,17 @@ class _RemoteFWDram:
                 record.fw_mem = _FwMemResidency(descriptor, pin_handle)
                 pin_keys.add(key)
             return pin_handle
-        except Exception:
+        except Exception as error:
+            if logger.isEnabledFor(logging.DEBUG):
+                # Only expose known validation reasons, not callback data or keys.
+                reason = error.args[0] if error.args else None
+                if type(reason) is not str or reason not in (
+                    "invalid framework pin result",
+                    "request_pin returned incomplete descriptors",
+                    "request_pin returned no descriptors",
+                ):
+                    reason = "descriptor normalization or installation failed"
+                logger.debug("KVCR_EVENT framework_pin_rejected reason=%s", reason)
             self._discard_pin_result(pin_result, keys)
             return None
 
