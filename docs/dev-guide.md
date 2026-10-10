@@ -677,6 +677,24 @@ missing suffix, and preserve output correctness. Diagnose reductions at each
 stage: router-planned blocks, source-resident blocks, pinned blocks, submitted
 blocks, completed blocks, and destination-published blocks.
 
+### Startup is slow or fails on a host with many network interfaces
+
+The symptoms are `KVCR progress initialization timed out after 30s (stage: NIXL
+agent initialization)`, or `NIXL_ERR_BACKEND` together with the UCX log line
+`exceeded transports/devices limit (up to 128 are supported)`. UCX considers
+every network interface that carries an IPv4 address when the NIXL agent is
+created. Creation time grows roughly with the square of that number, ranks that
+start together on one node largely wait on each other, and UCX stops at 128
+transports/devices. The interfaces that count are the ones visible to the
+process that creates the KVCR instance, for example all host interfaces when
+the container uses `--network host`.
+
+Set `UCX_NET_DEVICES=<interface>[,<interface>...]` in the environment of that
+process, naming the interface or interfaces that carry traffic to your peers.
+The
+[quick start troubleshooting](quick-start.md#startup-is-slow-or-fails-on-a-host-with-many-network-interfaces)
+shows how to count interfaces and where this does not help.
+
 ### Operations time out or fail slowly
 
 Use telemetry to separate:
