@@ -123,6 +123,8 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
         deposit = source.deposit({key: descriptors})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         local = source._core._local_dram
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
         make_ref = Mock(wraps=local._descriptor)
         monkeypatch.setattr(local, "_descriptor", make_ref)
         assert not source._core._remote_fw_dram._try_local_source_write(
@@ -186,7 +188,6 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
             _wait_until(lambda: len(agent.xfers) == 2)
 
         # The peer request must be served without another caller-side poll.
-        residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count == 1
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
@@ -199,7 +200,6 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
         assert make_ref.call_count == 2
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
-        _wait_until(lambda: residency.indices_by_label == {"": 0, ":b": 1, ":c": 2})
         if transfer_state == "PROC":
             assert list(source.poll_completed()) == []
             assert callbacks == [(threading.get_ident(), [("", 3)])]

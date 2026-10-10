@@ -81,6 +81,14 @@ class _LocalDramResidency:
             self._layout = [name for name, _ in self.slots]
         return self._layout
 
+    def prepare_label_index(self) -> None:
+        # Build on fill completion or takeover, not on transfer submission.
+        if self.indices_by_label is None:
+            indices: dict[str, int | None] = {}
+            for index, label in enumerate(self.layout):
+                indices[label] = None if label in indices else index
+            self.indices_by_label = indices
+
 
 @dataclass
 class _PendingResidencyOp(_Op):
@@ -122,7 +130,6 @@ class _LocalCopyOp(_ProgressOp):
     transfer_id: int | None = None
     success: bool = False
     cancellation_requested: bool = False
-    local_dram: "_LocalDram | None" = field(default=None, repr=False, compare=False)
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -154,8 +161,6 @@ class _LocalCopyOp(_ProgressOp):
             except Exception:
                 logger.warning("KVCR local transfer submission failed", exc_info=True)
                 return True, True
-            if submitted and self.local_dram is not None:
-                self.local_dram.prepare_source_indices(self.ordered_keys)
 
         transfer_id = self.transfer_id
         if transfer_id is None:
@@ -280,6 +285,7 @@ class _LocalDram:
                     raise ValueError("invalid local DRAM recovery slots")
                 labels.add(label)
                 occupied[pool_name].add(slot)
+            residency.prepare_label_index()
         self._free_slots = {
             pool_name: deque(
                 slot
@@ -540,34 +546,15 @@ class _LocalDram:
         return sources
 
     def source_refs(
-        self, residency: _LocalDramResidency, indices: list[int] | None = None
+        self, residency: _LocalDramResidency, indices: list[int]
     ) -> tuple[_TransferRef, ...]:
         refs = []
-        for index in range(len(residency.slots)) if indices is None else indices:
+        for index in indices:
             ref = residency.refs.get(index)
             if ref is None:
                 ref = residency.refs[index] = self._descriptor(*residency.slots[index])
             refs.append(ref)
         return tuple(refs)
-
-    def prepare_source_indices(self, keys: Collection[BlockKey]) -> None:
-        # Build after submission so cold batches start transferring before indexing.
-        # This still uses progress-thread time; it is not background work.
-        if not self._kvcr._state_lock.acquire(blocking=False):
-            # Uncached matching remains valid; skip warming rather than wait.
-            return
-        try:
-            for key in keys:
-                record = self._kvcr._block_record_map.get(key)
-                residency = record.local_dram if record is not None else None
-                if residency is None or residency.indices_by_label is not None:
-                    continue
-                indices: dict[str, int | None] = {}
-                for index, label in enumerate(residency.layout):
-                    indices[label] = None if label in indices else index
-                residency.indices_by_label = indices
-        finally:
-            self._kvcr._state_lock.release()
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
         for key in keys:
@@ -713,6 +700,7 @@ class _LocalDram:
             if key_success:
                 record.last_access = now
                 residency.state = _LocalDramState.READY
+                residency.prepare_label_index()
                 self._residency_observer(key, record)
                 meta = self._kvcr._block_meta(
                     key, record, self._size_bytes(residency.slots)
@@ -876,7 +864,6 @@ class _LocalDram:
                     backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
-                    local_dram=self,
                 )
             )
             self._next_copy_id += 1

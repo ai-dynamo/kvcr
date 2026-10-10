@@ -403,9 +403,6 @@ class _SourceWriteOp(_RemoteOp):
                 backend._dangling_ops.finish_source(self)
                 return True, True
 
-            if submitted and backend._kvcr._local_dram is not None:
-                backend._kvcr._local_dram.prepare_source_indices(self.source_keys)
-
         transfer_id = self.transfer_id
         if transfer_id is None:
             raise RuntimeError(f"KVCR source operation {self.op_id!r} lost transfer")

@@ -6,7 +6,6 @@ import ctypes
 import hashlib
 import heapq
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -252,25 +251,14 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     assert not dict(kvcr.poll_completed())[wrong][first].success
 
     local_dram = kvcr._core._local_dram
+    residency = kvcr._core._block_record_map[first].local_dram
+    # Ready blocks already have their label index, but references stay incremental.
+    assert residency.indices_by_label == (
+        {"full": 0, "swa:a": 1, "swa:b": 2} if labeled else {"full": 0, "swa": None}
+    )
+    assert not residency.refs
     make_ref = Mock(wraps=local_dram._descriptor)
     monkeypatch.setattr(local_dram, "_descriptor", make_ref)
-    residency = kvcr._core._block_record_map[first].local_dram
-    # Busy metadata must not stall progress; the delivery below uses uncached matching.
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        with kvcr._core._state_lock:
-            warming = executor.submit(local_dram.prepare_source_indices, (first,))
-            warming.result(timeout=1)
-            assert residency.indices_by_label is None
-    prepare_index = Mock(wraps=local_dram.prepare_source_indices)
-    monkeypatch.setattr(local_dram, "prepare_source_indices", prepare_index)
-    native_transfer = agent.transfer
-    indices_at_submission = []
-
-    def submit(handle):
-        indices_at_submission.append(residency.indices_by_label)
-        return native_transfer(handle)
-
-    monkeypatch.setattr(agent, "transfer", submit)
     agent.state = "PROC"
     partial = kvcr.deliver(
         {
@@ -302,14 +290,6 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     assert dict(_poll_until(kvcr, bool))[matching][first].success
     assert source.raw == payload
     assert make_ref.call_count == 3  # The full copy reuses those earlier parts.
-    # The first transfer must start before optional full-layout indexing.
-    assert indices_at_submission[0] is None
-    assert prepare_index.call_count == len(indices_at_submission)
-    # Post-submit warming may skip a busy lock; prepare explicitly to check its result.
-    local_dram.prepare_source_indices((first,))
-    assert residency.indices_by_label == (
-        {"full": 0, "swa:a": 1, "swa:b": 2} if labeled else {"full": 0, "swa": None}
-    )
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert kvcr.query((first, second)) == [
@@ -970,6 +950,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     records = _g2_recovered(first=2, second=0)
     records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
     install_recovery_records(kvcr._core, records)
+    assert records[BlockKey(b"first")].local_dram.indices_by_label == {":first": 0}
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(
