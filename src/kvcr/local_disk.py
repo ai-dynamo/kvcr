@@ -8,7 +8,7 @@ import os
 from collections import deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -19,12 +19,14 @@ from .types import (
     BlockKey,
     BlockMeta,
     CacheTier,
+    MemoryRef,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
     PlacementAction,
     PlacementDecision,
     PlacementFailure,
+    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -63,6 +65,10 @@ class _G3TransferOp(_ProgressOp):
     started_at: float | None = field(repr=False, compare=False)
     reservations: tuple[_Reservation, ...] = ()
     claims: tuple[_Claim, ...] = ()
+    memory_refs: tuple[_TransferRef, ...] = ()
+    lifecycle_handle: OpHandle | None = None
+    abandon_deadline: float | None = None
+    uncertain: bool = False
     transfer_id: int | None = None
     cancellation_requested: bool = False
     success: bool = False
@@ -99,21 +105,52 @@ class _G3TransferOp(_ProgressOp):
             observed_work = True
         result = progress.poll_transfer(
             transfer_id,
-            cancellation_requested=self.cancellation_requested,
+            require_completion=True,
         )
         if result is None:
+            if (
+                self.cancellation_requested
+                and not self.uncertain
+                and self.abandon_deadline is not None
+                and self.clock() >= self.abandon_deadline
+            ):
+                self.uncertain = True
+                self._report_memory(progress, "uncertain")
+                progress._completed_backlog.append(replace(self))
+                observed_work = True
             return False, observed_work
         self.transfer_id = None
-        self.success, _ = result
+        self.success = result[0] and not self.cancellation_requested
+        if self.uncertain:
+            self._report_memory(progress, "quiesced")
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
-        if self.transfer_id is not None:
-            if not progress.cancel_transfer(self.transfer_id):
-                return False
-            self.transfer_id = None
+        self.cancellation_requested = True
         self.success = False
-        return True
+        return self.transfer_id is None
+
+    def _report_memory(
+        self, progress: _KVCRProgress, state: Literal["uncertain", "quiesced"]
+    ) -> None:
+        if self.lifecycle_handle is None:
+            raise RuntimeError("G3 delivery lost its memory lifecycle handle")
+        progress._completed_backlog.append(
+            TransferError(
+                "KVCR G3 delivery memory",
+                self.lifecycle_handle,
+                state=state,
+                destination_regions=[
+                    MemoryRef(
+                        end_point_name=ref.end_point_name,
+                        label=ref.label,
+                        element_index=ref.element_index,
+                    )
+                    for ref in self.memory_refs
+                ],
+                destination_owner="framework",
+            )
+        )
 
 
 class _G3:
@@ -221,6 +258,8 @@ class _G3:
             raise RuntimeError("failed to register G3 files")
 
     def close_progress(self) -> None:
+        if any(op.transfer_id is not None for op in self._active.values()):
+            raise RuntimeError("cannot deregister G3 files with active transfers")
         try:
             registration = self._file_registration
             if registration is not None:
@@ -324,6 +363,18 @@ class _G3:
             if not isinstance(item, _G3TransferOp):
                 unhandled.append(item)
                 continue
+            if item.uncertain and item.transfer_id is not None:
+                if item.op_id not in self._active:
+                    raise RuntimeError(f"unknown uncertain G3 operation {item.op_id!r}")
+                self._record_transfer(item)
+                self._kvcr._complete(
+                    item.op_id[1],
+                    {
+                        key: OpEntryResult(OpEntryStatus.FAILED)
+                        for key in item.ordered_keys
+                    },
+                )
+                continue
             if self._active.pop(item.op_id, None) is not item:
                 raise RuntimeError(f"unknown completed G3 operation {item.op_id!r}")
             try:
@@ -387,6 +438,16 @@ class _G3:
         if rejected or not claims:
             self._release_claims(claims)
             return False
+        lifecycle_handle = None
+        abandon_deadline = None
+        if kind == "deliver":
+            lifecycle_handle = self._kvcr._next_fill_handle
+            self._kvcr._next_fill_handle -= 1
+            config = self._kvcr.config
+            abandon_deadline = (
+                deadline
+                + (config.abandon_timeout_ms - config.operation_timeout_ms) / 1000
+            )
         op = _G3TransferOp(
             op_id=(f"g3_{kind}", op_handle),
             keys=set(blocks),
@@ -401,6 +462,11 @@ class _G3:
             clock=self._kvcr._clock,
             started_at=self._kvcr._timer(),
             claims=claims,
+            memory_refs=(
+                tuple(blocks[item.key] for item in claims) if kind == "deliver" else ()
+            ),
+            lifecycle_handle=lifecycle_handle,
+            abandon_deadline=abandon_deadline,
         )
         self._submit(op)
         return True
@@ -451,12 +517,15 @@ class _G3:
                 self._release_claims(op.claims)
             return
 
-        self._record_transfer(op)
+        if not op.uncertain:
+            self._record_transfer(op)
         try:
             if op.success:
                 self._kvcr._record_access(op.ordered_keys)
         finally:
             self._release_claims(op.claims)
+        if op.uncertain:
+            return
         self._kvcr._complete(
             op.op_id[1],
             {

@@ -166,6 +166,7 @@ def _new_g3_kvcr(
     inventory_sink=None,
     g3_paths=None,
     framework_regions=None,
+    on_resilience_event=None,
 ):
     page_size = os.sysconf("SC_PAGE_SIZE")
     return _new_kvcr(
@@ -189,6 +190,7 @@ def _new_g3_kvcr(
         key_adapter=key_adapter,
         remote_options=remote_options,
         framework_regions=framework_regions,
+        on_resilience_event=on_resilience_event,
     )
 
 
@@ -869,11 +871,6 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
         def check_xfer_state(self, handle):
             return "PROC" if self._is_stuck_read(handle) else "DONE"
 
-        def release_xfer_handle(self, handle):
-            if self._is_stuck_read(handle):
-                return False
-            return super().release_xfer_handle(handle)
-
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 2)
     primary.raw = b"a" * page_size + b"b" * page_size
@@ -906,12 +903,15 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
             agent.xfers[handle - 1][0] == "READ" for handle in agent.transfers
         ),
     )
+    native_handle = agent.transfers[-1]
     now[0] = 100.0
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert not result[fetch][first].success
 
     record = kvcr._core._block_record_map[first]
     assert record.local_dram.state is _LocalDramState.DISCARDING
+    assert native_handle not in agent.released_xfers
+    assert any(op.kind == "fill" for op in kvcr._core._g3._active.values())
     assert record.g3 is not None
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
@@ -932,42 +932,92 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     assert local.raw == b"a" * len(local)
 
 
-def test_closing_an_unfinished_spill_releases_its_capacity_reservation(
+def test_closing_a_pending_spill_retains_its_memory_and_file_registration(
     tmp_path,
 ) -> None:
-    class _StuckWriteAgent(_FakeG3Agent):
-        def _is_file_write(self, handle):
-            return self.xfers[handle - 1][0] == "WRITE" and (
-                self._xfer_backends.get(handle) == ("MOCK",)
-            )
-
-        def transfer(self, handle):
-            result = super().transfer(handle)
-            return "PROC" if self._is_file_write(handle) else result
-
-        def check_xfer_state(self, handle):
-            return "PROC" if self._is_file_write(handle) else "DONE"
-
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 2)
     local = ctypes.create_string_buffer(page_size)
     first, second = BlockKey(b"first"), BlockKey(b"second")
+    agent = _FakeG3Agent()
     kvcr = _new_g3_kvcr(
         tmp_path,
         local,
-        agent=_StuckWriteAgent(),
+        agent=agent,
         framework_regions=[_buffer_region(primary, page_size)],
     )
 
     assert _deposit(kvcr, first, 0).success
+    agent.state = "PEND"
     kvcr.deposit({second: [_mem_descriptor(1)]})
     local_dram = kvcr._core._local_dram
     _poll_until(kvcr, lambda _: local_dram._capacity_eviction_key == first)
+    g3 = kvcr._core._g3
+    op = next(iter(g3._active.values()))
+    _poll_until(kvcr, lambda _: op.transfer_id is not None)
+    assert not op.close(kvcr._core._progress)
+    assert local_dram._capacity_eviction_key == first
+    assert first in kvcr._core._local_dram_sources_by_op[op.op_id]
+    assert op.reservations
+    registration = g3._file_registration
+    with pytest.raises(RuntimeError, match="active transfers"):
+        g3.close_progress()
+    assert g3._file_registration == registration
+    assert registration not in agent.deregistered
+    agent.state = "DONE"
 
     _OPEN_KVCRS.remove(kvcr)
     kvcr.close()
-    # Nothing will finish the spill now, so nothing may stay queued behind it.
     assert local_dram._capacity_eviction_key is None
+    assert registration in agent.deregistered
+
+
+def test_timed_out_g3_delivery_retains_memory_until_native_completion(
+    tmp_path,
+):
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    primary = ctypes.create_string_buffer(page_size * 3)
+    local = ctypes.create_string_buffer(page_size)
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+    errors = []
+    agent = _FakeG3Agent()
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        framework_regions=[_buffer_region(primary, page_size)],
+        on_resilience_event=errors.append,
+    )
+    assert _deposit(kvcr, first, 0).success
+    assert _deposit(kvcr, second, 1).success
+    now = [0.0]
+    kvcr._core._clock = lambda: now[0]
+    agent.state = "PEND"
+    deliver = kvcr.deliver({first: [_mem_descriptor(2)]})
+    g3 = kvcr._core._g3
+    op = g3._active[("g3_deliver", deliver)]
+    _poll_until(kvcr, lambda _: op.transfer_id is not None)
+    native_handle = agent.transfers[-1]
+    now[0] = 2.0
+    assert _poll_until(kvcr, lambda _: op.cancellation_requested) == []
+    assert errors == []
+    now[0] = 5.0
+    result = dict(_poll_until(kvcr, lambda done: deliver in dict(done)))
+    assert not result[deliver][first].success
+    assert native_handle not in agent.released_xfers
+    assert g3._active[op.op_id] is op
+    assert op.claims[0].residency.claim_count == 1
+    assert [error.state for error in errors] == ["uncertain"]
+    assert errors[0].op_handle < 0
+    assert errors[0].destination_owner == "framework"
+    assert errors[0].destination_regions[0].element_index == 2
+    assert kvcr.poll_completed() == []
+    agent.state = "DONE"
+    assert _poll_until(kvcr, lambda _: op.op_id not in g3._active) == []
+    assert agent.released_xfers.count(native_handle) == 1
+    assert op.claims[0].residency.claim_count == 0
+    assert [error.state for error in errors] == ["uncertain", "quiesced"]
+    assert errors[0].op_handle == errors[1].op_handle
 
 
 def test_waiting_g3_fetch_obeys_original_deadline(tmp_path) -> None:

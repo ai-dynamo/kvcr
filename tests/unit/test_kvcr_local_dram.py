@@ -600,6 +600,7 @@ def test_align_sequence_updates_policy_and_journal(
     kvcr._core._clock = lambda: 6.0
     kvcr.align_sequence(ordered_keys, use_current_time=True)
     assert journal.publish.call_count == 2
+    agent.state = "DONE"
 
 
 def test_local_deposit_applies_optional_admission() -> None:
@@ -829,62 +830,92 @@ def test_capacity_pressure_is_pool_local() -> None:
 
 
 @pytest.mark.parametrize(
-    ("failure", "terminal_state", "success"),
+    ("kind", "failure", "abandon"),
     [
-        ("submission", None, False),
-        ("timeout", None, False),
-        ("timeout", "DONE", True),
+        ("deposit", "submission", False),
+        ("deposit", "timeout", False),
+        ("deposit", "timeout", True),
+        ("deliver", "timeout", True),
     ],
 )
-def test_local_deposit_waits_for_safe_release(
-    failure: str, terminal_state: str | None, success: bool, caplog
+def test_local_copy_timeout_retains_memory_until_completion(
+    kind: str, failure: str, abandon: bool, caplog
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
 
-    class DelayedReleaseAgent(FakeNixlAgent):
-        def __init__(self):
-            super().__init__()
-            self.allow_release = False
-            self.release_attempts = 0
-
+    class PendingAgent(FakeNixlAgent):
         def transfer(self, handle):
             result = super().transfer(handle)
             return "ERR" if failure == "submission" else result
 
-        def release_xfer_handle(self, handle):
-            self.release_attempts += 1
-            if not self.allow_release:
-                return False
-            super().release_xfer_handle(handle)
-
     now = 0.0
     block_size = 16
-    primary = ctypes.create_string_buffer(block_size)
+    primary = ctypes.create_string_buffer(block_size * 2)
     local = ctypes.create_string_buffer(block_size)
-    agent = DelayedReleaseAgent()
+    agent = PendingAgent()
+    errors = []
     kvcr = _new_local_kvcr(
-        agent, local, 1, framework_regions=[_buffer_region(primary, len(local) // 1)]
+        agent,
+        local,
+        1,
+        framework_regions=[_buffer_region(primary, block_size)],
+        on_resilience_event=errors.append,
     )
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
 
-    op_handle = kvcr.deposit({key: [_mem_descriptor()]})
-    _wait_until(lambda: bool(agent.transfers))
+    if kind == "deliver":
+        agent.state = "DONE"
+        deposit = kvcr.deposit({key: [_mem_descriptor()]})
+        assert dict(_poll_until(kvcr, bool))[deposit][key].success
+    agent.state = "PEND"
+    released = list(agent.released_xfers)
+    op_handle = getattr(kvcr, kind)({key: [_mem_descriptor()]})
+    _wait_until(lambda: len(agent.transfers) > len(released))
     if failure == "timeout":
         now = 2.0
-    _wait_until(lambda: agent.release_attempts > 0)
+    progress = kvcr._core._progress
+    copy = next(iter(progress._in_flight_ops.values()))
+    _wait_until(lambda: copy.cancellation_requested)
 
     assert list(kvcr.poll_completed()) == []
-    assert kvcr._core._block_record_map[key].local_dram is not None
+    residency = kvcr._core._block_record_map[key].local_dram
+    assert residency is not None
+    assert agent.released_xfers == released
+    if abandon:
+        now = 5.0
+        assert _poll_until(kvcr, bool) == [(op_handle, _op_entries({key: False}))]
+        assert [error.state for error in errors] == ["uncertain"]
+        if kind == "deposit":
+            assert errors[0].source_blocks == {key: [_mem_descriptor()]}
+            assert errors[0].source_owners == {key: "framework"}
+        else:
+            assert errors[0].destination_regions == [_mem_descriptor()]
+            assert errors[0].destination_owner == "framework"
+        assert residency.claim_count == (kind == "deliver")
+        assert agent.released_xfers == released
+        blocked = kvcr.deposit({BlockKey(b"other"): [_mem_descriptor(1)]})
+        assert dict(kvcr.poll_completed())[blocked][BlockKey(b"other")].success is False
 
-    if terminal_state is not None:
-        agent.state = terminal_state
-    agent.allow_release = True
-    assert _poll_until(kvcr, lambda results: bool(results)) == [
-        (op_handle, _op_entries({key: success}))
-    ]
-    assert agent.released_xfers == [1]
-    assert (key in kvcr._core._block_record_map) is success
+    assert not copy.close(progress)
+    assert copy.transfer_id in progress._active_transfers
+    assert agent.released_xfers == released
+
+    agent.state = "DONE"
+    assert _poll_until(
+        kvcr,
+        lambda _: (
+            residency.claim_count == 0
+            if kind == "deliver"
+            else key not in kvcr._core._block_record_map
+        ),
+    ) == ([] if abandon else [(op_handle, _op_entries({key: False}))])
+    assert [error.state for error in errors] == (
+        ["uncertain", "quiesced"] if abandon else []
+    )
+    if abandon:
+        assert errors[0].op_handle == errors[1].op_handle
+    assert (key in kvcr._core._block_record_map) is (kind == "deliver")
 
     for event, expected in [
         ("submit_failed", "submission"),

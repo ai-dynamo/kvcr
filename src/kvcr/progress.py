@@ -216,7 +216,7 @@ class _KVCRProgress:
                     logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
-            # its completion signal. Remote writes retain it until actual DONE.
+            # its completion signal. Retain it until native access has stopped.
             if require_completion and xfer_state != "DONE":
                 if xfer_state not in ("PROC", "PEND"):
                     state.outcome = False

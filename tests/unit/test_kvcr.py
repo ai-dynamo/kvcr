@@ -10,7 +10,7 @@ from contextlib import nullcontext, suppress
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from _kvcr_test_utils import (
@@ -90,16 +90,18 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     _poll_until(kvcr, lambda done: first in dict(done))
     assert observed == [(keys[0], [("", 0)])]
 
-    agent.state = "ERR"
-    failed = kvcr.deposit({keys[1]: [_mem_descriptor(1)]})
-    failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[failed]
+    # Native completion after an error permits cleanup, not a successful fill.
+    with patch.object(agent, "check_xfer_state", side_effect=["ERR", "DONE"]):
+        failed = kvcr.deposit({keys[1]: [_mem_descriptor(1)]})
+        failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[
+            failed
+        ]
     assert not failed_result[keys[1]].success
     assert observed == [
         (keys[0], [("", 0)]),
         (keys[0], None),
     ]
 
-    agent.state = "DONE"
     third = kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
     _poll_until(kvcr, lambda done: third in dict(done))
     backend.acquire_sources((keys[2],))
