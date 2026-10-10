@@ -845,8 +845,10 @@ def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
 
+@pytest.mark.parametrize("queued_deposit", [False, True])
 def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     tmp_path,
+    queued_deposit,
 ) -> None:
     class _StuckReadAgent(_FakeG3Agent):
         """Keep a G3 read in flight so its fill is abandoned, not resolved."""
@@ -880,6 +882,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     local = ctypes.create_string_buffer(page_size * 2)
     first, second = BlockKey(b"first"), BlockKey(b"second")
     third, other_key = BlockKey(b"third"), BlockKey(b"other")
+    fourth = BlockKey(b"fourth")
     agent = _StuckReadAgent()
     policy = _MoveLocalToG3Policy()
     kvcr = _new_g3_kvcr(
@@ -888,25 +891,39 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
         agent=agent,
         policy=policy,
         slot_count=2,
+        g3_slot_count=4,
         framework_regions=[_buffer_region(primary, page_size)],
     )
 
     assert _deposit(kvcr, first, 0).success
     assert _deposit(kvcr, second, 1).success
     assert _deposit(kvcr, third, 0).success
+    assert _deposit(kvcr, fourth, 0).success
     _poll_until(kvcr, lambda _: kvcr._core._block_record_map[first].g3 is not None)
-    policy.move = False  # later evictions drop instead of spilling
+    policy.move = queued_deposit
 
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
     fetch = kvcr.fetch((first,))
+    if queued_deposit:
+        # Public claims hold both spill victims until the waiters are queued.
+        hold = kvcr.fetch((third,))
+        claim = dict(kvcr.poll_completed())[hold][third].release_handle
+        now[0] = 0.5
+        other = kvcr.fetch((second,))
+        deposit = kvcr.deposit({first: [_mem_descriptor(0)]})
+        _poll_until(kvcr, lambda _: kvcr._core._block_record_map[third].g3 is not None)
+        kvcr.release((claim,))
+        hold = kvcr.fetch((fourth,))
+        claim = dict(kvcr.poll_completed())[hold][fourth].release_handle
+        _poll_until(kvcr, lambda _: kvcr._core._block_record_map[fourth].g3 is not None)
     _poll_until(
         kvcr,
         lambda _: any(
             agent.xfers[handle - 1][0] == "READ" for handle in agent.transfers
         ),
     )
-    now[0] = 100.0
+    now[0] = 1.1
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert not result[fetch][first].success
 
@@ -918,6 +935,20 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     # The abandoned fill still owns the slot, so the retry waits for it.
     retry = kvcr.fetch((first,))
     assert retry not in dict(kvcr.poll_completed())
+    if queued_deposit:
+        # Finishing the second spill must not fail the queued deposit early.
+        kvcr.release((claim,))
+        completed = kvcr.poll_completed()
+        agent.stuck = False
+        assert completed == []
+        completed = dict(
+            _poll_until(kvcr, lambda done: {other, deposit, retry} <= dict(done).keys())
+        )
+        assert completed[deposit][first].success
+        assert completed[other][second].success
+        assert completed[retry][first].release_handle is not None
+        assert local.raw == primary.raw
+        return
     # An unrelated spill must not fail this retry or be blocked behind it.
     policy.move = True
     other = kvcr.deposit({other_key: [_mem_descriptor(0)]})
