@@ -55,7 +55,6 @@ from .types import (
 
 if TYPE_CHECKING:
     from .api import KVCRBindings
-    from .remote_fw_dram import _FwMemResidency
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +124,9 @@ def _noop_record_transfer(
 class _BlockRecord:
     # Locally pinned framework-owned G2 memory. This is never remote
     # KVCR residency and exists only while KVCR controls the pin.
-    fw_mem: "_FwMemResidency | None" = None
+    # References and their pin handle are installed and cleared together.
+    fw_mem: list[_TransferRef] | None = None
+    fw_pin_handle: PinHandle | None = None
     local_dram: _LocalDramResidency | None = None
     g3: _G3Residency | None = None
     in_flight_ops: set[_OpId] | None = None
@@ -974,16 +975,16 @@ class _KVCRCore:
     ) -> list[_TransferRef]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
-        if not descriptors or not all(
-            isinstance(ref, MemoryRef) for ref in descriptors
-        ):
+        if not descriptors:
             raise ValueError("each block requires at least one MemoryRef")
-        return self._validate_descriptors(
-            [
+        normalized = []
+        for ref in descriptors:
+            if not isinstance(ref, MemoryRef):
+                raise ValueError("each block requires at least one MemoryRef")
+            normalized.append(
                 _TransferRef(ref.end_point_name, ref.element_index, ref.label)
-                for ref in descriptors
-            ]
-        )
+            )
+        return self._validate_descriptors(normalized)
 
     def _validate_descriptors(
         self,
@@ -994,21 +995,21 @@ class _KVCRCore:
     ) -> list[_TransferRef]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
-        if not descriptors or not all(
-            isinstance(ref, _TransferRef) for ref in descriptors
-        ):
+        if not descriptors:
             raise ValueError("each block requires at least one _TransferRef")
-        resolved = [
-            self._region(ref, regions=regions, agent_name=agent_name)
-            for ref in descriptors
-        ]
+        layout = []
+        for ref in descriptors:
+            region = self._region(ref, regions=regions, agent_name=agent_name)
+            block_size = self._block_sizes.get(ref.label.partition(":")[0])
+            if block_size is None:
+                raise ValueError("block descriptors must use configured pools")
+            if region.size != block_size:
+                raise ValueError("block descriptor has the wrong byte count")
+            layout.append(ref.label)
         self._validate_block_layout(
-            [ref.label for ref in descriptors],
+            layout,
             "block descriptors must use configured pools",
         )
-        for ref, region in zip(descriptors, resolved):
-            if region.size != self._block_sizes[ref.label.partition(":")[0]]:
-                raise ValueError("block descriptor has the wrong byte count")
         return descriptors
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:

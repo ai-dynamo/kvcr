@@ -8,6 +8,7 @@ from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import lru_cache
 from typing import TYPE_CHECKING, cast
 
 from .config import LocalDramOptions
@@ -52,6 +53,11 @@ def _layout_indices(
     if any(layout.count(label) != 1 for label in requested):
         return None
     return [layout.index(label) for label in requested]
+
+
+@lru_cache(maxsize=64)
+def _layout_slot_counts(layout: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
+    return tuple(Counter(label.partition(":")[0] for label in layout).items())
 
 
 class _LocalDramState(Enum):
@@ -1118,10 +1124,8 @@ class _LocalDram:
     def _allocate_slots(
         self, layout: list[str], protected: set[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
-        required = Counter(label.partition(":")[0] for label in layout)
-        if all(
-            len(self._free_slots[name]) >= count for name, count in required.items()
-        ):
+        required = _layout_slot_counts(tuple(layout))
+        if all(len(self._free_slots[name]) >= count for name, count in required):
             return (
                 [
                     (label, self._free_slots[label.partition(":")[0]].popleft())
@@ -1139,7 +1143,7 @@ class _LocalDram:
         def short() -> set[str]:
             return {
                 name
-                for name, count in required.items()
+                for name, count in required
                 if len(self._free_slots[name]) + freed[name] < count
             }
 

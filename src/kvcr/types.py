@@ -35,7 +35,7 @@ class RegionDescriptor:
     label: str = ""
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class MemoryRef:
     """One element in a named registered buffer.
 

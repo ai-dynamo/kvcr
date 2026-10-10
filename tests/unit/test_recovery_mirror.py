@@ -20,7 +20,7 @@ from kvcr.recovery_journal import (
     _recovery_frames,
     _RecoveryMirror,
 )
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, PinHandle
 
 _ONE_POOL = ("",)
 _TWO_POOLS = ("full", "swa")
@@ -32,7 +32,8 @@ def _payload(record: _BlockRecord) -> bytes:
 
 # Live-only fields are stripped; settled slots and position survive.
 _FULLY_LOADED_RECORD = _BlockRecord(
-    fw_mem=object(),
+    fw_mem=[_TransferRef("old-agent", 0)],
+    fw_pin_handle=PinHandle("pin"),
     local_dram=_LocalDramResidency(
         [("", 3)],
         _LocalDramState.READY,
@@ -196,6 +197,8 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     discarding_spill = BlockKey(b"discarding-spill")
     served = {
         ready: _BlockRecord(
+            fw_mem=[_TransferRef("old-agent", 0, "full")],
+            fw_pin_handle=PinHandle("pin"),
             local_dram=_LocalDramResidency(
                 [("full", 0), ("swa", 10)],
                 _LocalDramState.READY,
