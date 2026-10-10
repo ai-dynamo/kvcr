@@ -516,7 +516,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gpus",
         default="0,1",
-        help="CUDA device indices: two for --topology agg (0,1), three for disagg (0,1,2)",
+        help="CUDA device indices: two for --topology agg (0,1), three for disagg (0,1,2; "
+        "two-node disagg: 0,0,1 = P0 on GPU0 of node a, P1 on GPU0 of node b, D0 on GPU1 of node a)",
     )
     parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04,TC-05,TC-06")
     parser.add_argument("--http-port", type=int, default=8000)
@@ -669,8 +670,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             f"--gpus needs {wanted_gpus} CUDA device indices for --topology {args.topology}"
         )
     args.gpus = [int(part) for part in gpus]
-    if args.topology == "disagg" and (args.remote_worker or args.external_services is None):
-        parser.error("--topology disagg is single-node and needs --external-services (sidecars)")
+    if args.topology == "disagg" and args.external_services is None:
+        parser.error("--topology disagg needs --external-services (kvcr_service sidecars)")
     # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
     if (args.gpus[0] == args.gpus[1] and not args.remote_worker
             and args.gpu_memory_utilization > 0.45):

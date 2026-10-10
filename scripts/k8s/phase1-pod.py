@@ -75,9 +75,11 @@ labels = {"app": "kvcr-phase1", "owner": "doxu", "run": run_id, "tests-sha": arg
 node_selector = (
     {"nvidia.com/gpu.product": f"NVIDIA-{args.gpu_type}-80GB-HBM3"} if args.gpu_type else {}
 )
-if args.two_node and args.topology == "disagg":
-    p.error("--topology disagg is single-node only")
-gpus_per_pod = 1 if args.two_node else (3 if args.topology == "disagg" else 2)
+disagg = args.topology == "disagg"
+# single node: 2 (agg) or 3 (disagg) GPUs; two nodes: pod a holds P0 (+ D0 when disagg), pod b holds P1
+gpus_pod_a = (2 if disagg else 1) if args.two_node else (3 if disagg else 2)
+gpus_pod_b = 1
+gpus_per_pod = gpus_pod_a
 
 harness = [
     "python3", f"{tests}/run_phase1.py",
@@ -85,7 +87,7 @@ harness = [
     "--mode", "guard",
     "--cases", args.cases,
     "--timeout", str(args.timeout),
-    "--gpus", "0,0" if args.two_node else ("0,1,2" if args.topology == "disagg" else "0,1"),
+    "--gpus", ("0,0,1" if disagg else "0,0") if args.two_node else ("0,1,2" if disagg else "0,1"),
     "--topology", args.topology,
     "--model", args.model,
     "--pool-gb", str(args.pool_gb),
@@ -159,7 +161,8 @@ def etcd_sidecar() -> dict:
     }
 
 
-def gpu_main(name: str, command: list, probe: dict | None = None) -> dict:
+def gpu_main(name: str, command: list, probe: dict | None = None, gpus: int | None = None) -> dict:
+    gpus = gpus_per_pod if gpus is None else gpus
     return {
         "name": name,
         "image": args.image,
@@ -173,8 +176,8 @@ def gpu_main(name: str, command: list, probe: dict | None = None) -> dict:
             *extra_env,
         ],
         "resources": {
-            "requests": {"cpu": "12", "memory": "48Gi", "nvidia.com/gpu": str(gpus_per_pod)},
-            "limits": {"cpu": "24", "memory": "120Gi", "nvidia.com/gpu": str(gpus_per_pod)},
+            "requests": {"cpu": "12", "memory": "48Gi", "nvidia.com/gpu": str(gpus)},
+            "limits": {"cpu": "24", "memory": "120Gi", "nvidia.com/gpu": str(gpus)},
         },
         **({"readinessProbe": probe} if probe else {}),
         "volumeMounts": common_mounts,
@@ -230,7 +233,8 @@ else:
     items.append(pod(f"{run_id}-b", "b",
                      [sidecar(1, f"{stack_dir}/kvcr-service-1.log")],
                      gpu_main("node-agent", agent_cmd,
-                              probe={"httpGet": {"path": "/info", "port": args.agent_port}, "periodSeconds": 2}),
+                              probe={"httpGet": {"path": "/info", "port": args.agent_port}, "periodSeconds": 2},
+                              gpus=gpus_pod_b),
                      anti_affinity=True))
     items.append(headless(f"{run_id}-a", "a", 2379, "etcd"))
     items.append(pod(f"{run_id}-a", "a",

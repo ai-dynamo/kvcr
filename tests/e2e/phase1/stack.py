@@ -770,7 +770,7 @@ class Stack:
         if self.disagg:
             # Three NIXL side channels on one host; Dynamo only sets the host
             # when it recognises a top-level NixlConnector.
-            env.setdefault("VLLM_NIXL_SIDE_CHANNEL_HOST", "127.0.0.1")
+            env.setdefault("VLLM_NIXL_SIDE_CHANNEL_HOST", self.worker_host(index))
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(
                 self.settings.nixl_side_channel_ports[index]
             )
