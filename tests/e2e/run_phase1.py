@@ -387,10 +387,18 @@ class Runner:
                 stack.start_state_agent()
         stack.start_frontend(self.settings.http_port)
         if stack.disagg:
+            # The frontend lists the model only once a prefill worker is
+            # registered, so bring up prefill 0 and the decode worker together
+            # and identify the decode worker first.
+            stack.start_worker(0)
             stack.start_worker(2)
             stack.wait_model(client)
             stack.discover_worker(client, 2)
-        for index in (0, 1):
+            stack.discover_worker(client, 0)
+            remaining = (1,)
+        else:
+            remaining = (0, 1)
+        for index in remaining:
             stack.start_worker(index)
             stack.wait_model(client)
             stack.discover_worker(client, index)

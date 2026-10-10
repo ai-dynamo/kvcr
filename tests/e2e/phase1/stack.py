@@ -714,7 +714,7 @@ class Stack:
             "2",
         ]
         env = self.base_env()
-        env["DYN_SYSTEM_PORT"] = str(self.settings.system_ports[1] + 1)
+        env["DYN_SYSTEM_PORT"] = str(max(self.settings.system_ports) + 1)
         agent = self._spawn("kv-state-agent", command, env)
         self.state_agent = agent
         self.wait_log(agent, STATE_AGENT_READY, 120)
@@ -827,6 +827,7 @@ class Stack:
                     m.get("id") == self.settings.model for m in data.get("data", [])
                 ):
                     return data
+                last = f"model not listed yet: {[m.get('id') for m in data.get('data', [])]}"
             time.sleep(2)
         raise ValidationError(f"model readiness timed out: {last}")
 
