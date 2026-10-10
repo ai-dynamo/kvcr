@@ -595,6 +595,7 @@ def _new_local_kvcr(
     policy=None,
     local_dram_backend="UCX",
     framework_regions: list[RegionDescriptor] | None = None,
+    on_resilience_event=None,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -612,6 +613,7 @@ def _new_local_kvcr(
                 inventory_sink=inventory_sink,
                 capacity_needed_callback=capacity_needed_callback,
                 policy=policy,
+                on_resilience_event=on_resilience_event,
             ),
             KVCRBackendConfigs(
                 framework_regions=framework_regions or [],

@@ -6,9 +6,10 @@ import logging
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import TYPE_CHECKING, cast
+from itertools import islice
+from typing import TYPE_CHECKING, Literal, cast
 
 from .config import LocalDramOptions
 from .policy_runtime import _EvictionQueue
@@ -24,6 +25,7 @@ from .types import (
     RegionDescriptor,
     ReleaseHandle,
     ReleaseResult,
+    TransferError,
 )
 
 if TYPE_CHECKING:
@@ -124,12 +126,14 @@ class _LocalCopyOp(_ProgressOp):
     src_descriptors: tuple[_TransferRef, ...]
     dst_descriptors: tuple[_TransferRef, ...]
     deadline: float
+    abandon_deadline: float
     backend: str
     clock: _Clock = field(repr=False, compare=False)
     started_at: float | None = field(repr=False, compare=False)
     transfer_id: int | None = None
     success: bool = False
     cancellation_requested: bool = False
+    uncertain: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -171,20 +175,69 @@ class _LocalCopyOp(_ProgressOp):
             observed_work = True
         result = progress.poll_transfer(
             transfer_id,
-            cancellation_requested=self.cancellation_requested,
+            require_completion=True,
         )
         if result is None:
+            if (
+                self.cancellation_requested
+                and not self.uncertain
+                and self.clock() >= self.abandon_deadline
+            ):
+                self.uncertain = True
+                self._report_memory(progress, "uncertain")
+                # Report failure without returning the native handle or pool memory.
+                progress._completed_backlog.append(replace(self))
             return False, observed_work
         self.transfer_id = None
-        self.success, _ = result
+        self.success = result[0] and not self.cancellation_requested
+        if self.uncertain:
+            self._report_memory(progress, "quiesced")
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
-        if self.transfer_id is not None:
-            if not progress.cancel_transfer(self.transfer_id):
-                return False
-            self.transfer_id = None
-        return True
+        self.cancellation_requested = True
+        self.success = False
+        return self.transfer_id is None
+
+    def _report_memory(
+        self, progress: _KVCRProgress, state: Literal["uncertain", "quiesced"]
+    ) -> None:
+        sources = iter(self.src_descriptors)
+        source_blocks = (
+            {
+                key: [
+                    MemoryRef(
+                        end_point_name=ref.end_point_name,
+                        label=ref.label,
+                        element_index=ref.element_index,
+                    )
+                    for ref in islice(sources, len(slots))
+                ]
+                for key, slots in zip(self.ordered_keys, self.local_slots)
+            }
+            if self.deliver_op_id is None
+            else None
+        )
+        progress._completed_backlog.append(
+            TransferError(
+                "KVCR local copy memory",
+                self.op_id[1],
+                state=state,
+                source_blocks=source_blocks,
+                source_owners=dict.fromkeys(source_blocks, "framework")
+                if source_blocks is not None
+                else None,
+                destination_regions=[
+                    MemoryRef(
+                        end_point_name=ref.end_point_name,
+                        label=ref.label,
+                        element_index=ref.element_index,
+                    )
+                    for ref in self.dst_descriptors
+                ],
+                destination_owner="kvcr" if self.deliver_op_id is None else "framework",
+            )
+        )
 
 
 class _LocalDram:
@@ -237,7 +290,9 @@ class _LocalDram:
         self._public_claims: dict[
             ReleaseHandle, tuple[BlockKey, _LocalDramResidency]
         ] = {}
-        self._next_copy_id = 1
+        self._abandon_grace = (
+            kvcr.config.abandon_timeout_ms - kvcr.config.operation_timeout_ms
+        ) / 1000
         self._next_release_handle = 1
         # A no-op until something attaches: the tiers publish residency
         # changes unconditionally, and only recovery cares to hear them.
@@ -400,7 +455,7 @@ class _LocalDram:
         if copy_keys:
             self._kvcr._progress.submit(
                 _LocalCopyOp(
-                    op_id=("local_copy", self._next_copy_id),
+                    op_id=("local_copy", self._kvcr._next_fill_handle),
                     keys=set(copy_keys),
                     deliver_op_id=None,
                     ordered_keys=tuple(copy_keys),
@@ -408,12 +463,13 @@ class _LocalDram:
                     src_descriptors=tuple(src_descriptors),
                     dst_descriptors=tuple(dst_descriptors),
                     deadline=deadline,
+                    abandon_deadline=deadline + self._abandon_grace,
                     backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
                 )
             )
-            self._next_copy_id += 1
+            self._kvcr._next_fill_handle -= 1
 
     def fetch(
         self,
@@ -648,6 +704,15 @@ class _LocalDram:
         return unhandled
 
     def _finish_copy(self, copy: _LocalCopyOp) -> None:
+        if copy.transfer_id is not None:
+            if copy.deliver_op_id is None:
+                self.discard_fill(copy.keys)
+            else:
+                op = self._pending_deliver_ops[copy.deliver_op_id]
+                for key in copy.ordered_keys:
+                    op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
+                self._finish_deliver_if_ready(op)
+            return
         byte_count = self._kvcr._descriptor_bytes(copy.src_descriptors)
         self._kvcr._record_transfer(
             "local_deliver" if copy.deliver_op_id is not None else "local_fill",
@@ -853,7 +918,7 @@ class _LocalDram:
         if copy_keys:
             self._kvcr._progress.submit(
                 _LocalCopyOp(
-                    op_id=("local_copy", self._next_copy_id),
+                    op_id=("local_copy", self._kvcr._next_fill_handle),
                     keys=set(copy_keys),
                     deliver_op_id=op.op_id,
                     ordered_keys=tuple(copy_keys),
@@ -861,18 +926,19 @@ class _LocalDram:
                     src_descriptors=tuple(src_descriptors),
                     dst_descriptors=tuple(dst_descriptors),
                     deadline=op.deadline,
+                    abandon_deadline=op.deadline + self._abandon_grace,
                     backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
                 )
             )
-            self._next_copy_id += 1
+            self._kvcr._next_fill_handle -= 1
         self._finish_deliver_if_ready(op)
 
     def _finish_delivery_copy(self, copy: _LocalCopyOp) -> None:
         if copy.deliver_op_id is None:
             raise RuntimeError("local delivery has no owning operation")
-        op = self._pending_deliver_ops[copy.deliver_op_id]
+        op = self._pending_deliver_ops.get(copy.deliver_op_id)
         for key, slots in zip(copy.ordered_keys, copy.local_slots):
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
@@ -885,12 +951,14 @@ class _LocalDram:
             if copy.success:
                 self._kvcr._record_access((key,))
             self._release_claim(key, residency)
-            op.active_keys.discard(key)
-            op.results[key] = OpEntryResult(
-                OpEntryStatus.SUCCESS if copy.success else OpEntryStatus.FAILED
-            )
+            if op is not None:
+                op.active_keys.discard(key)
+                op.results[key] = OpEntryResult(
+                    OpEntryStatus.SUCCESS if copy.success else OpEntryStatus.FAILED
+                )
         self._update_capacity_pressure()
-        self._finish_deliver_if_ready(op)
+        if op is not None:
+            self._finish_deliver_if_ready(op)
 
     def _finish_residency_if_ready(self, op: _PendingResidencyOp) -> None:
         if len(op.results) != len(op.keys):
@@ -1035,7 +1103,7 @@ class _LocalDram:
                 else:
                     self._kvcr._progress.submit(
                         _LocalCopyOp(
-                            op_id=("local_copy", self._next_copy_id),
+                            op_id=("local_copy", self._kvcr._next_fill_handle),
                             keys={waiter.key},
                             deliver_op_id=None,
                             ordered_keys=(waiter.key,),
@@ -1043,12 +1111,13 @@ class _LocalDram:
                             src_descriptors=tuple(waiter.source),
                             dst_descriptors=tuple(self._descriptors(locations)),
                             deadline=op.deadline,
+                            abandon_deadline=op.deadline + self._abandon_grace,
                             backend=self._backend,
                             clock=self._kvcr._clock,
                             started_at=self._kvcr._timer(),
                         )
                     )
-                    self._next_copy_id += 1
+                    self._kvcr._next_fill_handle -= 1
         finally:
             self._resuming_capacity_waiters = False
             self._update_capacity_pressure()
