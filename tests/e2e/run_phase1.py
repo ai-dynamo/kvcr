@@ -265,7 +265,7 @@ class Runner:
                     streamed = client.stream_completion(
                         f"ref-{name}-{kind}",
                         prompt,
-                        worker=stack.worker_ids[0],
+                        **stack.pin(0),
                         max_tokens=self.args.perf_max_tokens,
                         extra_fields=STREAM_FIELDS,
                     )
@@ -280,7 +280,7 @@ class Runner:
                 response = client.completion(
                     f"ref-{name}-{repeat}",
                     prompt,
-                    worker=stack.worker_ids[0],
+                    **stack.pin(0),
                     max_tokens=self.args.perf_max_tokens if name in long_names else None,
                 )
                 if not response.ok or response.body is None:
