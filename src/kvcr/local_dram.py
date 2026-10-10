@@ -133,7 +133,7 @@ class _LocalCopyOp(_ProgressOp):
                 self.cancellation_requested = not submitted
                 if not submitted:
                     logger.debug(
-                        "KVCR_EVENT local_copy_submit_rejected op=%s", self.op_id
+                        "KVCR_EVENT local_copy_submit_failed op=%s", self.op_id
                     )
                 observed_work = True
             except Exception:

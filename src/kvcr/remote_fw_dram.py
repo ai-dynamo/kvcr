@@ -1690,7 +1690,7 @@ class _RemoteFWDram:
             if logger.isEnabledFor(logging.DEBUG):
                 # Only expose known validation reasons, not callback data or keys.
                 reason = error.args[0] if error.args else None
-                if reason not in (
+                if type(reason) is not str or reason not in (
                     "invalid framework pin result",
                     "request_pin returned incomplete descriptors",
                     "request_pin returned no descriptors",

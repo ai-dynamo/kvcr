@@ -846,7 +846,7 @@ def test_local_deposit_waits_for_safe_release(
     assert (key in kvcr._core._block_record_map) is success
 
     for event, expected in [
-        ("submit_rejected", "submission"),
+        ("submit_failed", "submission"),
         ("deadline_expired", "timeout"),
     ]:
         assert caplog.text.count(f"local_copy_{event}") == (failure == expected)

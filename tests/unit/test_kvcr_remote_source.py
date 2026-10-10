@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import msgspec
 import pytest
@@ -43,6 +43,7 @@ from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
+@pytest.mark.parametrize("custom_argument", [False, True])
 @pytest.mark.parametrize(
     "result,reason",
     [
@@ -52,16 +53,24 @@ from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
         (("pin", {b"key": []}), "descriptor normalization or installation failed"),
     ],
 )
-def test_framework_pin_rejection_diagnostic(result, reason, level, caplog):
+def test_framework_pin_rejection_diagnostic(
+    result, reason, level, custom_argument, caplog
+):
     caplog.set_level(level, logger="kvcr.core")
     remote = Mock()
-    remote._kvcr._normalize_descriptors.side_effect = ValueError(
-        "private callback data"
-    )
+    argument = "private callback data"
+    if custom_argument:
+        argument = MagicMock()
+        argument.__eq__.return_value = True
+        argument.__str__.return_value = "private callback data"
+    remote._kvcr._normalize_descriptors.side_effect = ValueError(argument)
     assert _RemoteFWDram._install_framework_pin(remote, [b"key"], result) is None
     remote._discard_pin_result.assert_called_once_with(result, [b"key"])
     assert (reason in caplog.text) == (level == logging.DEBUG)
     assert "private callback data" not in caplog.text
+    if custom_argument:
+        argument.__eq__.assert_not_called()
+        argument.__str__.assert_not_called()
 
 
 def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
