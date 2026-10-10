@@ -1687,11 +1687,11 @@ class _RemoteFWDram:
             if not any(descriptor is not None for descriptor in normalized.values()):
                 raise ValueError("request_pin returned no descriptors")
             pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
-            for key in keys:
-                descriptor = normalized[key]
+            block_record = self._kvcr._block_record
+            for key, descriptor in normalized.items():
                 if descriptor is None:
                     continue
-                record = self._kvcr._block_record(key)
+                record = block_record(key)
                 if record.fw_mem is not None:
                     continue
                 record.fw_mem = _FwMemResidency(descriptor, pin_handle)
