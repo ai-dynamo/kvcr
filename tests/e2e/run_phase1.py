@@ -130,6 +130,7 @@ class Runner:
             readiness_timeout=args.readiness_timeout,
             request_timeout=args.request_timeout,
             extra_worker_args=list(args.worker_arg),
+            frontend_env=dict(item.split("=", 1) for item in args.frontend_env if "=" in item),
             disable_hybrid_kv_cache_manager=not args.keep_hybrid_kv_cache_manager,
             enforce_eager=not args.no_enforce_eager,
             external_services=args.external_services,
@@ -601,6 +602,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="agg: two decode workers (default). disagg: 2P+1D, workers 0/1 are "
         "prefill workers (KVCR source/target) and worker 2 the shared decode worker; "
         "needs three GPUs",
+    )
+    parser.add_argument(
+        "--frontend-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment for the Dynamo frontend process only, e.g. "
+        "DYN_LOG=info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug",
     )
     parser.add_argument(
         "--max-model-len",

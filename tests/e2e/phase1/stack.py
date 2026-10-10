@@ -126,6 +126,8 @@ class Settings:
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
+    # Extra environment for the Dynamo frontend only (e.g. DYN_LOG for router debugging).
+    frontend_env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.compatibility_digest:
@@ -697,7 +699,9 @@ class Stack:
             "--http-port",
             str(port),
         ]
-        self.frontend = self._spawn(name, command, self.base_env())
+        env = self.base_env()
+        env.update(self.settings.frontend_env)
+        self.frontend = self._spawn(name, command, env)
         return self.frontend
 
     def start_state_agent(self) -> Managed:
