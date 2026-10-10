@@ -32,6 +32,7 @@ from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import (
     _layout_indices,
+    _layout_slot_counts,
     _LocalCopyOp,
     _LocalDramResidency,
     _LocalDramState,
@@ -225,6 +226,9 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
         labeled=labeled,
     )
     layout = ["full", "swa:a", "swa:b"] if labeled else ["full", "swa", "swa"]
+    slot_counts = _layout_slot_counts(tuple(layout))
+    assert slot_counts == (("full", 1), ("swa", 2))
+    assert _layout_slot_counts(tuple(layout)) is slot_counts
     descriptors = [
         _mem_descriptor(index, label) for index, label in zip((0, 0, 1), layout)
     ]
