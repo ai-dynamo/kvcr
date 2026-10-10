@@ -359,8 +359,11 @@ class Runner:
             save_json(evidence / "baseline-timings.json", self.baseline_timings)
         self.save()
         stack.stop(*[c for c in (worker, decode_ref, stack.frontend) if c is not None])  # type: ignore[arg-type]
-        if stack.disagg:
-            stack.worker_ids.pop(2, None)
+        # Forget the reference handles: the cases phase may start the decode
+        # worker before worker 0 and must not see the stopped reference worker.
+        for index in (0, 2):
+            stack.workers.pop(index, None)
+            stack.worker_ids.pop(index, None)
         stack.reset_discovery()
         if not bypass or kvcr_mentions:
             raise ValidationError("reference engine was not verified KVCR-free")

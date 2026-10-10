@@ -877,7 +877,13 @@ class Stack:
             role = "decode" if (not self.disagg or index == 2) else "prefill"
             pin: dict[str, str | None] = {"worker": pinned}
             if self.disagg and index != 2:
-                pin = {"prefill": pinned, "worker": self.worker_ids.get(2)}
+                # The prefill router rejects a request that pins only the decode
+                # worker, so pin both or neither.
+                pin = (
+                    {"prefill": pinned, "worker": self.worker_ids.get(2)}
+                    if pinned is not None
+                    else {}
+                )
             probe = client.completion(
                 f"probe-w{index}-{attempt:02d}",
                 f"identity probe {uuid.uuid4().hex}",
