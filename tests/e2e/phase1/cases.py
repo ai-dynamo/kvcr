@@ -68,6 +68,11 @@ class Prompts:
     # boundary (vLLM mamba_cache_mode=align) holds the state at the P1/P2
     # junction; otherwise a hybrid model cannot reuse a partial prefix at all.
     seed_prefix: bool = False
+    # Extra sections Q shared by the full and partial prompts AFTER P1 but
+    # never served on their own: the shared prefix then runs past P1's last
+    # SSM checkpoint, to measure whether KVCR pulls attention pages beyond
+    # the block the engine can actually reuse.
+    tc02_extra_shared: int = 0
 
     @staticmethod
     def section(tag: str, index: int) -> str:
@@ -89,14 +94,24 @@ class Prompts:
         return self.prefix(self.tag + "b", 0, self.tc02_shared)
 
     @property
+    def tc02_q(self) -> str:
+        """Shared continuation after P1 (empty unless tc02_extra_shared > 0)."""
+        if not self.tc02_extra_shared:
+            return ""
+        end = self.tc02_shared + self.tc02_extra_shared
+        return " " + self.prefix(self.tag + "q", self.tc02_shared, end)
+
+    @property
     def tc02_full(self) -> str:
-        rest = self.prefix(self.tag + "c", self.tc02_shared, self.tc02_sections)
-        return self.tc02_p1 + " " + rest + self.tail
+        start = self.tc02_shared + self.tc02_extra_shared
+        rest = self.prefix(self.tag + "c", start, start + self.tc02_sections - self.tc02_shared)
+        return self.tc02_p1 + self.tc02_q + " " + rest + self.tail
 
     @property
     def tc02_partial(self) -> str:
-        rest = self.prefix(self.tag + "d", self.tc02_shared, self.tc02_sections)
-        return self.tc02_p1 + " " + rest + self.tail
+        start = self.tc02_shared + self.tc02_extra_shared
+        rest = self.prefix(self.tag + "d", start, start + self.tc02_sections - self.tc02_shared)
+        return self.tc02_p1 + self.tc02_q + " " + rest + self.tail
 
     @property
     def tc02_absent(self) -> str:

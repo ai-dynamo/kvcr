@@ -146,6 +146,7 @@ class Runner:
             tc02_shared=args.tc02_shared_sections,
             tc02_sections=args.tc02_sections,
             seed_prefix=args.tc02_seed_prefix,
+            tc02_extra_shared=args.tc02_extra_shared_sections,
         )
         self.references: dict[str, TokenSample] = {}
         self.baseline_timings: dict[str, Any] = {}
@@ -587,6 +588,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=80,
         help="TC-02 full/partial prompt length in sections (hybrid: 200)",
+    )
+    parser.add_argument(
+        "--tc02-extra-shared-sections",
+        type=int,
+        default=0,
+        help="TC-02: sections shared by full and partial prompts after P1 (never served "
+        "alone); with --tc02-seed-prefix the shared prefix then exceeds the last SSM checkpoint",
     )
     parser.add_argument(
         "--tc02-seed-prefix",
