@@ -30,7 +30,7 @@ from _kvcr_test_utils import (
 from kvcr import core as core_module
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.local_dram import _LocalCopyOp, _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy, LRUPolicy
 from kvcr.policy_runtime import _EvictionQueue, _PolicyInvoker
 from kvcr.recovery_journal import (
@@ -49,6 +49,15 @@ from kvcr.types import (
     QueryStatus,
     RegionDescriptor,
 )
+
+
+def test_expired_copy_logs_without_submitting(caplog):
+    caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+    copy = SimpleNamespace(transfer_id=None, clock=lambda: 1, deadline=1, op_id=7)
+    progress = Mock()
+    assert _LocalCopyOp.progress(copy, progress, None) == (True, True)
+    progress.submit_transfer.assert_not_called()
+    assert "local_copy_expired_before_submit op=7" in caplog.text
 
 
 def _two_pool_kvcr(
@@ -787,8 +796,10 @@ def test_capacity_pressure_is_pool_local() -> None:
     ],
 )
 def test_local_deposit_waits_for_safe_release(
-    failure: str, terminal_state: str | None, success: bool
+    failure: str, terminal_state: str | None, success: bool, caplog
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+
     class DelayedReleaseAgent(FakeNixlAgent):
         def __init__(self):
             super().__init__()
@@ -833,6 +844,12 @@ def test_local_deposit_waits_for_safe_release(
     ]
     assert agent.released_xfers == [1]
     assert (key in kvcr._core._block_record_map) is success
+
+    for event, expected in [
+        ("submit_rejected", "submission"),
+        ("deadline_expired", "timeout"),
+    ]:
+        assert caplog.text.count(f"local_copy_{event}") == (failure == expected)
 
 
 def test_local_initialize_failure_completes_without_failing_progress() -> None:

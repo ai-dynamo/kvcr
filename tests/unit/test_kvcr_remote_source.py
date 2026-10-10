@@ -42,6 +42,28 @@ from kvcr.remote_fw_dram import (
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
+@pytest.mark.parametrize(
+    "result,reason",
+    [
+        ((None, {}), "invalid framework pin result"),
+        (("pin", {}), "request_pin returned incomplete descriptors"),
+        (("pin", {b"key": None}), "request_pin returned no descriptors"),
+        (("pin", {b"key": []}), "descriptor normalization or installation failed"),
+    ],
+)
+def test_framework_pin_rejection_diagnostic(result, reason, level, caplog):
+    caplog.set_level(level, logger="kvcr.core")
+    remote = Mock()
+    remote._kvcr._normalize_descriptors.side_effect = ValueError(
+        "private callback data"
+    )
+    assert _RemoteFWDram._install_framework_pin(remote, [b"key"], result) is None
+    remote._discard_pin_result.assert_called_once_with(result, [b"key"])
+    assert (reason in caplog.text) == (level == logging.DEBUG)
+    assert "private callback data" not in caplog.text
+
+
 def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     return msgspec.msgpack.encode(
         {
@@ -245,8 +267,10 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
 def test_kvcr_start_write_respects_framework_pin_deadline(
     pin_before_deadline: bool,
+    caplog,
 ) -> None:
     """Source writes must not start after their framework-pin deadline."""
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     now = 0.0
     deadline_captured = threading.Event()
 
@@ -289,6 +313,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
     assert source_agent.xfers == []
     assert pinning.searches == ([(key,)] if pin_before_deadline else [])
     assert pinning.cancelled == ([PinRequestId(0)] if pin_before_deadline else [])
+    assert caplog.text.count("framework_pin_timeout") == pin_before_deadline
     assert _decode_notif(source_agent.sent_notifs[0][1]) == {
         "type": "write_done",
         "op_handle": 9,

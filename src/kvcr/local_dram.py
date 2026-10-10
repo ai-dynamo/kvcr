@@ -117,6 +117,9 @@ class _LocalCopyOp(_ProgressOp):
         observed_work = False
         if self.transfer_id is None:
             if self.clock() >= self.deadline:
+                logger.debug(
+                    "KVCR_EVENT local_copy_expired_before_submit op=%s", self.op_id
+                )
                 return True, True
             try:
                 transfer_id, submitted = progress.submit_transfer(
@@ -128,6 +131,10 @@ class _LocalCopyOp(_ProgressOp):
                 )
                 self.transfer_id = transfer_id
                 self.cancellation_requested = not submitted
+                if not submitted:
+                    logger.debug(
+                        "KVCR_EVENT local_copy_submit_rejected op=%s", self.op_id
+                    )
                 observed_work = True
             except Exception:
                 logger.warning("KVCR local transfer submission failed", exc_info=True)
@@ -137,6 +144,7 @@ class _LocalCopyOp(_ProgressOp):
         if transfer_id is None:
             raise RuntimeError(f"KVCR local copy {self.op_id!r} lost transfer")
         if not self.cancellation_requested and self.clock() >= self.deadline:
+            logger.debug("KVCR_EVENT local_copy_deadline_expired op=%s", self.op_id)
             self.cancellation_requested = True
             observed_work = True
         result = progress.poll_transfer(
