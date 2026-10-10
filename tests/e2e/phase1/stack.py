@@ -574,12 +574,21 @@ class Stack:
         nixl = {"kv_connector": "NixlConnector", "kv_role": "kv_producer"}
         if not kvcr:
             return nixl
+        kvcr_cfg = self.transfer_config(index)
+        extra: dict[str, Any] = {"connectors": [kvcr_cfg, nixl]}
+        # Dynamo (ea23e51) reads the KVCR tier list, the state-agent settings
+        # and the self-describing-events flag from the TOP-LEVEL
+        # kv_connector_extra_config to advertise router-hint capability and
+        # attach the KV state agent; nested inside MultiConnector they are
+        # invisible, so no hints reach a prefill worker. Mirror them at the top
+        # level (vLLM's MultiConnector ignores keys other than "connectors").
+        for key in ("secondary_tiers", "dynamo_state_agent", "self_describing_kv_events"):
+            if key in kvcr_cfg["kv_connector_extra_config"]:
+                extra[key] = kvcr_cfg["kv_connector_extra_config"][key]
         return {
             "kv_connector": "MultiConnector",
             "kv_role": "kv_both",
-            "kv_connector_extra_config": {
-                "connectors": [self.transfer_config(index), nixl]
-            },
+            "kv_connector_extra_config": extra,
         }
 
     def events_config(self, index: int) -> dict[str, Any]:
