@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
-from nixl import nixlRemoteDisconnectError
+from nixl import nixlBackendError, nixlRemoteDisconnectError
 
 from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
@@ -781,6 +782,133 @@ def test_startup_failure_is_reported_to_main() -> None:
     with pytest.raises(RuntimeError, match="startup failed") as exc_info:
         progress.start()
     assert exc_info.value is expected
+
+
+def _agent_creating_progress(monkeypatch, create_agent, interfaces=220):
+    monkeypatch.setattr(progress_module, "nixl_agent", create_agent)
+    monkeypatch.setattr(progress_module, "nixl_agent_config", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        progress_module, "_visible_network_interfaces", lambda: interfaces
+    )
+    return _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        nixl_agent_name="interface-hint",
+        nixl_listen_port=1,
+    )
+
+
+def test_nixl_backend_failure_logs_interface_hint(monkeypatch, caplog) -> None:
+    expected = nixlBackendError("NIXL_ERR_BACKEND")
+
+    def create_agent(*_args, **_kwargs):
+        raise expected
+
+    progress = _agent_creating_progress(monkeypatch, create_agent)
+
+    with caplog.at_level(logging.ERROR, logger="kvcr.progress"):
+        with pytest.raises(nixlBackendError) as exc_info:
+            progress.start()
+
+    assert exc_info.value is expected
+    assert "(220 visible here)" in caplog.text
+    assert "128 transports/devices" in caplog.text
+    assert "UCX_NET_DEVICES" in caplog.text
+
+
+def test_other_agent_creation_failures_get_no_interface_hint(
+    monkeypatch, caplog
+) -> None:
+    def create_agent(*_args, **_kwargs):
+        raise RuntimeError("listen port in use")
+
+    progress = _agent_creating_progress(monkeypatch, create_agent)
+
+    with caplog.at_level(logging.ERROR, logger="kvcr.progress"):
+        with pytest.raises(RuntimeError, match="listen port in use"):
+            progress.start()
+
+    assert "UCX_NET_DEVICES" not in caplog.text
+
+
+def test_startup_timeout_names_interface_remedy_only_while_creating_agent(
+    monkeypatch,
+) -> None:
+    progress = _agent_creating_progress(monkeypatch, Mock(), interfaces=58)
+
+    progress._startup_stage = "NIXL agent initialization"
+    message = str(progress._startup_timeout_error("initialization"))
+    assert message.startswith(
+        "KVCR progress initialization timed out after 30s "
+        "(stage: NIXL agent initialization). "
+    )
+    assert "(58 visible here)" in message
+    assert "UCX_NET_DEVICES" in message
+    assert str(progress._startup_timeout_error("preparation")).startswith(
+        "KVCR progress preparation timed out after 30s"
+    )
+
+    progress._startup_stage = "memory registration"
+    assert str(progress._startup_timeout_error("initialization")) == (
+        "KVCR progress initialization timed out after 30s (stage: memory registration)"
+    )
+
+
+def test_slow_agent_creation_times_out_with_interface_remedy(monkeypatch) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def create_agent(*_args, **_kwargs):
+        entered.set()
+        release.wait(5)
+        return Mock()
+
+    monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0.2)
+    progress = _agent_creating_progress(monkeypatch, create_agent)
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=r"timed out after 0\.2s \(stage: NIXL agent initialization\)\. .*"
+            r"\(220 visible here\).*UCX_NET_DEVICES",
+        ):
+            progress.start()
+        assert entered.is_set()
+    finally:
+        release.set()
+        progress.close()
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_agent_creation_logs_interface_count_only_at_debug(
+    monkeypatch, caplog, level
+) -> None:
+    caplog.set_level(level, logger="kvcr.progress")
+    progress = _agent_creating_progress(monkeypatch, lambda *_a, **_k: Mock(), 7)
+
+    progress.start()
+    progress.close()
+
+    events = [m for m in caplog.messages if "progress_nixl_agent_create" in m]
+    assert bool(events) is (level == logging.DEBUG)
+    if events:
+        assert "agent=interface-hint net_devices=7" in events[0]
+
+
+def test_interface_count_is_omitted_when_sysfs_is_unavailable(monkeypatch) -> None:
+    real_listdir = os.listdir
+
+    def listdir(path):
+        if path == "/sys/class/net":
+            raise OSError("no sysfs")
+        return real_listdir(path)
+
+    monkeypatch.setattr(progress_module.os, "listdir", listdir)
+
+    assert progress_module._visible_network_interfaces() is None
+    assert "visible here" not in progress_module._network_interface_hint("it is slow")
 
 
 def test_loop_failure_is_reported_to_main() -> None:
