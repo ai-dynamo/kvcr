@@ -124,6 +124,9 @@ class KVCRConfig:
     abandon_timeout_ms: int = 5000
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
+    # None retains the standard progress startup budget. Large registrations
+    # may need a longer bounded wait; this does not change transfer deadlines.
+    startup_timeout_ms: int | None = None
 
 
 @dataclass(frozen=True)

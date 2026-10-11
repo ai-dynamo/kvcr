@@ -55,6 +55,43 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
     return hold
 
 
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "30000", float("inf")])
+def test_invalid_startup_budget_is_rejected_before_agent_creation(monkeypatch, budget):
+    def unexpected_agent(*args, **kwargs):
+        pytest.fail("invalid startup budget reached native initialization")
+
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", unexpected_agent)
+    with pytest.raises(ValueError, match="startup_timeout_ms"):
+        KVCR(
+            KVCRConfig("startup-test", [("", 16)], startup_timeout_ms=budget),
+            KVCRBindings(Mock(), Mock(), Mock()),
+            KVCRBackendConfigs(),
+        )
+
+
+def test_configured_startup_budget_reaches_progress_without_changing_operations(
+    monkeypatch,
+):
+    monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda *a, **kw: FakeNixlAgent())
+    monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kw: kw)
+    config = KVCRConfig(
+        "startup-test", [("", 16)], nixl_listen_port=1, startup_timeout_ms=1000
+    )
+    runner = KVCR(
+        config,
+        KVCRBindings(Mock(), Mock(), Mock(), framework_control=FakeBytesControl()),
+        KVCRBackendConfigs(),
+    )
+    try:
+        assert runner._core._progress._ready.is_set()
+        assert config.operation_timeout_ms == 1000
+        assert config.abandon_timeout_ms == 5000
+    finally:
+        runner.close()
+    assert runner._core.is_quiescent()
+
+
 def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     """Observers see only stable transitions: bytes READY in a slot, then gone."""
     block_size = 16

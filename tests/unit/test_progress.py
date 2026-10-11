@@ -209,6 +209,73 @@ def test_prepare_registers_memory_before_backend_activation(
     assert bool(stages) is bool(clock_reads) is (level == logging.DEBUG)
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_instance_startup_budget_covers_registration_and_activation(
+    monkeypatch, prepared
+) -> None:
+    """An instance override also applies before guarded backend activation."""
+    monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
+    events = []
+    agent = _TransferAgent()
+    agent.register_memory = Mock(
+        side_effect=lambda *a, **kw: events.append("register") or 1
+    )
+    progress = _KVCRProgress(
+        lambda _: events.append("initialize"),
+        lambda _, __: ({}, False),
+        list,
+        lambda: events.append("close"),
+        nixl_agent_name=agent.name,
+        memory_regions=({}, {"": RegionDescriptor(addr=128, size=128, count=4)}),
+        startup_timeout_seconds=1,
+    )
+    progress._nixl_agent = agent
+    monkeypatch.setattr(
+        progress, "_capture_agent_metadata", lambda: events.append("metadata")
+    )
+    try:
+        if prepared:
+            progress.prepare()
+            assert events == ["register"]
+        progress.start()
+    finally:
+        progress.close()
+    assert events == (
+        ["register", "initialize", "metadata", "close"]
+        if prepared
+        else ["initialize", "register", "metadata", "close"]
+    )
+    assert agent.deregistered == [1]
+    assert progress.is_quiescent()
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_instance_startup_budget_remains_bounded(monkeypatch, prepared) -> None:
+    """A longer default must not hide a blocked instance's shorter deadline."""
+    entered, release = threading.Event(), threading.Event()
+
+    def initialize_agent():
+        entered.set()
+        assert release.wait(5)
+
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        startup_timeout_seconds=0.001,
+    )
+    monkeypatch.setattr(progress, "_initialize_nixl", initialize_agent)
+    try:
+        with pytest.raises(RuntimeError, match="timed out after 0.001s"):
+            (progress.prepare if prepared else progress.start)()
+        assert entered.wait(1)
+    finally:
+        release.set()
+        progress.close()
+    assert progress.is_quiescent()
+
+
 def test_close_drains_queued_submissions(monkeypatch) -> None:
     entered, resume, stopping = (threading.Event() for _ in range(3))
     received = []

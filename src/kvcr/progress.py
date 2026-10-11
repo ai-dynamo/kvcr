@@ -131,6 +131,7 @@ class _KVCRProgress:
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
+        startup_timeout_seconds: float | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -170,6 +171,7 @@ class _KVCRProgress:
         self._failure: BaseException | None = None
         self._stop_requested = False
         self._startup_stage = "thread startup"
+        self._startup_timeout_seconds = startup_timeout_seconds
 
     @property
     def nixl_agent(self) -> Any:
@@ -430,20 +432,26 @@ class _KVCRProgress:
         self._activate.set()
         if not self._thread.is_alive():
             self._thread.start()
-        if not self._ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+        timeout = self._startup_timeout_seconds
+        if timeout is None:
+            timeout = _STARTUP_TIMEOUT_SECONDS
+        if not self._ready.wait(timeout=timeout):
             raise RuntimeError(
                 "KVCR progress initialization timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+                f"{timeout:g}s (stage: {self._startup_stage})"
             )
         self.raise_if_failed()
 
     def prepare(self) -> None:
         """Create the agent and register memory without starting backends."""
         self._thread.start()
-        if not self._prepare_ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+        timeout = self._startup_timeout_seconds
+        if timeout is None:
+            timeout = _STARTUP_TIMEOUT_SECONDS
+        if not self._prepare_ready.wait(timeout=timeout):
             raise RuntimeError(
                 "KVCR progress preparation timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+                f"{timeout:g}s (stage: {self._startup_stage})"
             )
         self.raise_if_failed()
 

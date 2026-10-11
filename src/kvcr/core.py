@@ -178,6 +178,11 @@ class _KVCRCore:
             raise ValueError("registration elements must match configured pool sizes")
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
+        startup_timeout_ms = self.config.startup_timeout_ms
+        if startup_timeout_ms is not None and (
+            type(startup_timeout_ms) is not int or startup_timeout_ms <= 0
+        ):
+            raise ValueError("startup_timeout_ms must be a positive integer or None")
         if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
             raise ValueError(
                 "abandon_timeout_ms must be at least twice operation_timeout_ms"
@@ -345,6 +350,9 @@ class _KVCRCore:
             nixl_listen_port=self.config.nixl_listen_port,
             dram_backends=list(dram_backends),
             memory_regions=self._memory_regions,
+            startup_timeout_seconds=(
+                startup_timeout_ms / 1000 if startup_timeout_ms is not None else None
+            ),
         )
 
     def start(self) -> None:
