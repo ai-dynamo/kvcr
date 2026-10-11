@@ -607,6 +607,8 @@ def tc02(ctx: Context) -> CaseResult:
                 label="tc02 partial deliver",
                 allow_partial=True,
             )
+
+    if ctx.require_ok(result, partial, 1):
         # Diagnostic (2026-10-08, hybrid): when the partial request's tokens
         # diverge from the reference, tell numerics apart from a corrupted
         # delivery by repeating the identical prompt on worker 1 (now a pure
