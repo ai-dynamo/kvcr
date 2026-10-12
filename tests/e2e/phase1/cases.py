@@ -156,6 +156,10 @@ class Prompts:
     def filler(self, index: int) -> str:
         return self.prefix(f"{self.tag}x{index}", 0, 80) + self.tail
 
+    def short_filler(self, index: int) -> str:
+        """~45 tokens: allocates one GPU block, never a full block to offload."""
+        return self.prefix(f"{self.tag}y{index}", 0, 2) + self.tail
+
     # One never-seen prompt per in-flight request of a concurrency level.
     def sweep(self, level: int, index: int) -> str:
         return self.prefix(f"{self.tag}k{level}_{index}", 0, 80) + self.tail
@@ -210,6 +214,7 @@ class Context:
         baseline_timings: dict[str, Any] | None = None,
         engine_cached: dict[str, list[int | None]] | None = None,
         tc02_seed_prefix: bool = False,
+        tc02_evict_target: int = 0,
     ) -> None:
         self.stack = stack
         self.client = client
@@ -230,6 +235,7 @@ class Context:
         # Reference-phase cached_tokens per prompt (KVCR disabled), request order.
         self.engine_cached = engine_cached or {}
         self.tc02_seed_prefix = tc02_seed_prefix
+        self.tc02_evict_target = tc02_evict_target
         # KVCR-disabled timings recorded during the reference phase, keyed by
         # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
         self.baseline_timings = baseline_timings or {}
@@ -632,6 +638,57 @@ def tc02(ctx: Context) -> CaseResult:
                     "; ".join(same) or f"identical, cached_tokens={ctx.cached(again)}",
                 )
                 result.measurements[f"{stage}_cached_tokens"] = ctx.cached(again)
+
+    # Diagnostic (2026-10-11): after the delivery, evict worker 1's GPU prefix
+    # cache with many sub-block prompts (one GPU block each, never a full block,
+    # so nothing is offloaded to the host tier) and request the partial prompt
+    # again on worker 1. Tells where the delivered prefix now lives: a hit with
+    # remote_deliver=0 and host-tier load bytes = served from worker 1's own
+    # vLLM DRAM tier; a hit with remote_deliver>0 = pulled from worker 0 again;
+    # cached_tokens=0 = gone.
+    if ctx.tc02_evict_target > 0 and ctx.require_ok(result, partial, 1):
+        evict_start = utc_now()
+        fillers = [(f"short_{i}", p.short_filler(i)) for i in range(ctx.tc02_evict_target)]
+        pin = ctx.stack.pin(1)
+
+        def one(item: tuple[str, str]) -> Response:
+            name, prompt = item
+            return ctx.client.completion(f"tc02-evict-{name}", prompt, max_tokens=1, **pin)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            evict_responses = list(pool.map(one, fillers))
+        result.check(
+            "tc02 evict: every short filler request succeeded on worker 1",
+            all(r.ok for r in evict_responses),
+            f"{sum(r.ok for r in evict_responses)} of {len(evict_responses)} ok",
+        )
+        evict_window = ctx.settle(1, evict_start)
+        time.sleep(ctx.index_wait)
+        again2 = ctx.request("tc02-partial-after-evict-w1", p.tc02_partial, 1)
+        result.evidence += [again2.request_file, again2.response_file]
+        if ctx.require_ok(result, again2, 1):
+            ctx.compare(result, again2, "tc02_partial")
+            window2 = ctx.settle(1, again2.started_at)
+            cached2 = ctx.cached(again2)
+            served_from = (
+                "gone (cold)" if cached2 == 0
+                else "worker 0 via KVCR again" if window2.blocks(REMOTE_DELIVER) > 0
+                else "worker 1 local (host tier or GPU)"
+            )
+            result.check(
+                "tc02 after-evict: delivered prefix location recorded (informational)",
+                True,
+                f"cached_tokens={cached2}, remote_deliver={window2.blocks(REMOTE_DELIVER)}, "
+                f"local_deliver={window2.blocks(LOCAL_DELIVER)}, "
+                f"host load bytes={window2.get('vllm:kv_offload_load_bytes')}, -> {served_from}",
+            )
+            result.measurements["tc02_after_evict"] = {
+                "cached_tokens": cached2,
+                "served_from": served_from,
+                "filler_requests": len(fillers),
+                "filler_window": evict_window.totals,
+                "request_window": window2.totals,
+            }
 
     # present: the remainder (P2) still has to come from worker 0's KVCR pool.
     present = ctx.request("tc02-present-w1", p.tc02_full, 1)

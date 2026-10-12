@@ -430,6 +430,7 @@ class Runner:
             baseline_timings=self.baseline_timings,
             engine_cached=self.reference_cached,
             tc02_seed_prefix=self.args.tc02_seed_prefix,
+            tc02_evict_target=self.args.tc02_evict_target,
         )
         for name in self.args.cases:
             self.check_deadline()
@@ -595,6 +596,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="TC-02: sections shared by full and partial prompts after P1 (never served "
         "alone); with --tc02-seed-prefix the shared prefix then exceeds the last SSM checkpoint",
+    )
+    parser.add_argument(
+        "--tc02-evict-target",
+        type=int,
+        default=0,
+        help="TC-02: after the partial delivery, send this many sub-block prompts to "
+        "worker 1 to evict its GPU prefix cache, then re-request the partial prompt and "
+        "record where the delivered prefix is served from (0 = skip)",
     )
     parser.add_argument(
         "--tc02-seed-prefix",

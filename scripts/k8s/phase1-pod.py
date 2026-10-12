@@ -40,6 +40,7 @@ p.add_argument("--pool-gb", type=int, default=2)
 p.add_argument("--no-batch-invariant", action="store_true")
 p.add_argument("--harness-arg", action="append", default=[])
 p.add_argument("--two-node", action="store_true")
+p.add_argument("--hf-home", default="/cache/doxu-kvcr/hf", help="HF_HOME inside the containers (shared hub: /cache)")
 p.add_argument("--topology", choices=("agg", "disagg"), default="agg",
                help="disagg = 2P+1D on three GPUs in one pod (workers 0/1 prefill with KVCR sidecars, worker 2 decode)")
 p.add_argument("--etcd-image", default="quay.io/coreos/etcd:v3.5.14")
@@ -171,7 +172,7 @@ def gpu_main(name: str, command: list, probe: dict | None = None, gpus: int | No
         "workingDir": "/tmp",
         "securityContext": {"runAsUser": 0},
         "env": [
-            {"name": "HF_HOME", "value": "/cache/doxu-kvcr/hf"},
+            {"name": "HF_HOME", "value": args.hf_home},
             {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
             *extra_env,
         ],
