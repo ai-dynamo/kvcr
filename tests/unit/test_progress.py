@@ -158,6 +158,7 @@ def test_prepare_registers_memory_before_backend_activation(
     monkeypatch, caplog, activate, level
 ) -> None:
     caplog.set_level(level, logger="kvcr.progress")
+    monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
     clock_reads = []
     monkeypatch.setattr(
         progress_module,
@@ -183,6 +184,7 @@ def test_prepare_registers_memory_before_backend_activation(
         lambda: events.append("close"),
         nixl_agent_name=agent.name,
         memory_regions=({}, {"": RegionDescriptor(addr=128, size=128, count=4)}),
+        startup_timeout_seconds=1,
     )
     progress._nixl_agent = agent
     monkeypatch.setattr(
@@ -207,46 +209,6 @@ def test_prepare_registers_memory_before_backend_activation(
     assert progress._startup_stage == "cleanup"
     stages = [m for m in caplog.messages if "progress_startup_stage " in m]
     assert bool(stages) is bool(clock_reads) is (level == logging.DEBUG)
-
-
-@pytest.mark.parametrize("prepared", [False, True])
-def test_instance_startup_budget_covers_registration_and_activation(
-    monkeypatch, prepared
-) -> None:
-    """An instance override also applies before guarded backend activation."""
-    monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
-    events = []
-    agent = _TransferAgent()
-    agent.register_memory = Mock(
-        side_effect=lambda *a, **kw: events.append("register") or 1
-    )
-    progress = _KVCRProgress(
-        lambda _: events.append("initialize"),
-        lambda _, __: ({}, False),
-        list,
-        lambda: events.append("close"),
-        nixl_agent_name=agent.name,
-        memory_regions=({}, {"": RegionDescriptor(addr=128, size=128, count=4)}),
-        startup_timeout_seconds=1,
-    )
-    progress._nixl_agent = agent
-    monkeypatch.setattr(
-        progress, "_capture_agent_metadata", lambda: events.append("metadata")
-    )
-    try:
-        if prepared:
-            progress.prepare()
-            assert events == ["register"]
-        progress.start()
-    finally:
-        progress.close()
-    assert events == (
-        ["register", "initialize", "metadata", "close"]
-        if prepared
-        else ["initialize", "register", "metadata", "close"]
-    )
-    assert agent.deregistered == [1]
-    assert progress.is_quiescent()
 
 
 @pytest.mark.parametrize("prepared", [False, True])
