@@ -358,3 +358,23 @@ def test_target_annotations_cannot_break_empty_or_missing_hint_delivery(
     assert not results[missing][BlockKey(b"k")].success
     assert not kvcr._core._nvtx_operations
     assert not recording.stack
+
+
+def test_target_context_reuse_clears_hint_and_block_counts(recording):
+    tracer = _nvtx.create_tracer()
+    first = tracer.lifecycle(
+        hint_trace_id=123, local_blocks=1, remote_blocks=2, g3_blocks=3
+    )
+    second = tracer.lifecycle()
+    contexts = payloads(recording, "request.context")
+    assert [int(p["trace_id"]) for p in contexts] == [
+        first.trace_id,
+        second.trace_id,
+    ]
+    assert [
+        tuple(
+            int(p[name])
+            for name in ("hint_trace_id", "local_blocks", "remote_blocks", "g3_blocks")
+        )
+        for p in contexts
+    ] == [(123, 1, 2, 3), (0, -1, -1, -1)]
