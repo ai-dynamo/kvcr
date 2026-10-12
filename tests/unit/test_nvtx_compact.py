@@ -168,3 +168,131 @@ def test_concurrent_emission_owns_separate_payload_storage(recording):
         (first.trace_id, 11),
         (second.trace_id, 22),
     }
+
+
+@pytest.mark.parametrize("name", ["request.context", "source.pin.context"])
+def test_reused_context_clears_optional_values_without_rebinding(recording, name):
+    tracer = _nvtx.create_tracer()
+    tracer._emit(
+        name,
+        11,
+        dict(
+            requested_blocks=16,
+            requested_bytes=65536,
+            completed_blocks=8,
+            completed_bytes=32768,
+            request_hi=12,
+            request_known=1,
+            pin_id=21,
+            pin_request_known=1,
+            pin_request_id=22,
+            request_display_known=1,
+            length=256,
+            truncated=1,
+            value_utf8=99,
+            status=_nvtx.Status.FAILED,
+            reason=_nvtx.Reason.CALLBACK_ERROR,
+        ),
+        context=True,
+    )
+    # Rebinding would fail; the existing attributes and storage must be reused.
+    recording.fail = "attributes"
+    tracer._emit(name, 12, {}, context=True)
+    first, second = [e[2] for e in recording.events if e[1] == name]
+    assert int(first["requested_bytes"]) == 65536
+    assert first["value_utf8"].tobytes() == b"c" * 256
+    assert int(second["schema_version"]) == 3
+    assert int(second["instance_hi"]) == tracer.instance_hi
+    assert int(second["instance_lo"]) == tracer.instance_lo
+    assert int(second["trace_id"]) == 12
+    for field in (
+        "requested_blocks",
+        "requested_bytes",
+        "selected_blocks",
+        "selected_bytes",
+        "completed_blocks",
+        "completed_bytes",
+    ):
+        assert int(second[field]) == -1
+    for field in (
+        "request_hi",
+        "request_known",
+        "pin_id",
+        "pin_request_known",
+        "pin_request_id",
+        "request_display_known",
+        "length",
+        "truncated",
+    ):
+        assert int(second[field]) == 0
+    assert second["value_utf8"].tobytes() == bytes(256)
+    assert int(second["status"]) == _nvtx.Status.PENDING
+    assert int(second["reason"]) == _nvtx.Reason.NONE
+
+
+def test_context_recovers_after_partial_assignment_failure(recording):
+    tracer = _nvtx.create_tracer()
+    with pytest.raises((TypeError, ValueError)):
+        tracer._emit(
+            "request.context",
+            11,
+            dict(request_known=1, value_utf8=99, requested_blocks="not-an-integer"),
+            context=True,
+        )
+    recording.fail = "attributes"
+    tracer._emit("request.context", 12, {}, context=True)
+    [(_, _, payload, _)] = recording.events
+    assert int(payload["trace_id"]) == 12
+    assert int(payload["request_known"]) == 0
+    assert int(payload["requested_blocks"]) == -1
+    assert payload["value_utf8"].tobytes() == bytes(256)
+
+
+def test_reentrant_context_retains_outer_snapshot(recording):
+    tracer = _nvtx.create_tracer()
+    original = recording.mark
+    entering = False
+
+    def reenter(attrs):
+        nonlocal entering
+        if not entering:
+            entering = True
+            tracer._emit("request.context", 22, {}, context=True)
+            entering = False
+        original(attrs)
+
+    recording.mark = reenter
+    tracer._emit("request.context", 11, dict(requested_blocks=16), context=True)
+    snapshots = [e[2] for e in recording.events]
+    assert [(int(p["trace_id"]), int(p["requested_blocks"])) for p in snapshots] == [
+        (22, -1),
+        (11, 16),
+    ]
+
+
+def test_concurrent_contexts_have_independent_defaults(recording):
+    tracer = _nvtx.create_tracer()
+    barrier = threading.Barrier(2)
+    original = recording.mark
+
+    def overlap(attrs):
+        barrier.wait(timeout=5)
+        original(attrs)
+
+    recording.mark = overlap
+    threads = [
+        threading.Thread(
+            target=tracer._emit,
+            args=("request.context", identity, fields),
+            kwargs={"context": True},
+        )
+        for identity, fields in ((11, dict(requested_blocks=16)), (22, {}))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert {
+        (int(e[2]["trace_id"]), int(e[2]["requested_blocks"])) for e in recording.events
+    } == {(11, 16), (22, -1)}

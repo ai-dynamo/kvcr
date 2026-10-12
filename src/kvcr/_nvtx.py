@@ -185,6 +185,14 @@ class _PinTracer:
                 ("value_utf8", "u1", (256,)),
             ]
         )
+        self._context_defaults = numpy.zeros((), dtype=self.context_dtype)
+        self._context_defaults["schema_version"] = 3
+        self._context_defaults["instance_hi"] = self.instance_hi
+        self._context_defaults["instance_lo"] = self.instance_lo
+        for name in self.context_dtype.names:
+            if name.endswith("_blocks") or name.endswith("_bytes"):
+                self._context_defaults[name] = -1
+        self._context_defaults.setflags(write=False)
         self._field_types = {
             name: self.context_dtype.fields[name][0]
             for name in self.context_dtype.names
@@ -259,21 +267,11 @@ class _PinTracer:
         slot[2] = True
         try:
             payload = slot[0]
-            payload["trace_id"] = trace_id
             if context:
                 # A prior lifecycle's omitted fields and display must not leak.
-                for field in self.context_dtype.names:
-                    if field not in (
-                        "schema_version",
-                        "instance_hi",
-                        "instance_lo",
-                        "trace_id",
-                    ):
-                        payload[field] = (
-                            -1
-                            if field.endswith("_blocks") or field.endswith("_bytes")
-                            else 0
-                        )
+                # Copy defaults into the array already bound to the attributes.
+                payload[...] = self._context_defaults
+            payload["trace_id"] = trace_id
             payload["status"] = fields.get("status", Status.PENDING)
             payload["reason"] = fields.get("reason", Reason.NONE)
             for field, value in fields.items():
