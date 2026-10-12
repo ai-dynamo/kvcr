@@ -61,9 +61,9 @@ def test_invalid_startup_budget_is_rejected_before_agent_creation(monkeypatch, b
         pytest.fail("invalid startup budget reached native initialization")
 
     monkeypatch.setattr(kvcr_progress, "nixl_agent", unexpected_agent)
-    with pytest.raises(ValueError, match="startup_timeout_ms"):
+    with pytest.raises(ValueError, match="startup_timeout_seconds"):
         KVCR(
-            KVCRConfig("startup-test", [("", 16)], startup_timeout_ms=budget),
+            KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=budget),
             KVCRBindings(Mock(), Mock(), Mock()),
             KVCRBackendConfigs(),
         )
@@ -76,7 +76,7 @@ def test_configured_startup_budget_reaches_progress_without_changing_operations(
     monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda *a, **kw: FakeNixlAgent())
     monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kw: kw)
     config = KVCRConfig(
-        "startup-test", [("", 16)], nixl_listen_port=1, startup_timeout_ms=1000
+        "startup-test", [("", 16)], nixl_listen_port=1, startup_timeout_seconds=1
     )
     runner = KVCR(
         config,
@@ -85,6 +85,7 @@ def test_configured_startup_budget_reaches_progress_without_changing_operations(
     )
     try:
         assert runner._core._progress._ready.is_set()
+        assert runner._core._progress._startup_timeout_seconds == 1
         assert config.operation_timeout_ms == 1000
         assert config.abandon_timeout_ms == 5000
     finally:
