@@ -125,6 +125,7 @@ class Runner:
             compatibility_digest=args.compatibility_digest or "",
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
+            cpu_bytes_to_use=args.cpu_bytes_to_use,
             batch_invariant=args.batch_invariant,
             state_agent=not args.no_state_agent,
             readiness_timeout=args.readiness_timeout,
@@ -627,6 +628,12 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="KEY=VALUE",
         help="environment for the Dynamo frontend process only, e.g. "
         "DYN_LOG=info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug",
+    )
+    parser.add_argument(
+        "--cpu-bytes-to-use",
+        type=int,
+        default=2_000_000_000,
+        help="vLLM host primary tier bytes per worker (OffloadingConnector cpu_bytes_to_use)",
     )
     parser.add_argument(
         "--max-model-len",

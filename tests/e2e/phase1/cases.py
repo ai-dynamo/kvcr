@@ -157,8 +157,9 @@ class Prompts:
         return self.prefix(f"{self.tag}x{index}", 0, 80) + self.tail
 
     def short_filler(self, index: int) -> str:
-        """~45 tokens: allocates one GPU block, never a full block to offload."""
-        return self.prefix(f"{self.tag}y{index}", 0, 2) + self.tail
+        """~80 tokens: exactly one full 64-token block (cached, hence evicting)
+        plus a tail. Sub-block prompts are freed, not cached, and evict nothing."""
+        return self.prefix(f"{self.tag}y{index}", 0, 4) + self.tail
 
     # One never-seen prompt per in-flight request of a concurrency level.
     def sweep(self, level: int, index: int) -> str:
