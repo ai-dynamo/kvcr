@@ -159,6 +159,7 @@ def _new_g3_kvcr(
     policy=None,
     slot_count=1,
     g3_slot_count=2,
+    g3_capacity_bytes_per_file=None,
     control=None,
     telemetry=False,
     key_adapter=None,
@@ -181,7 +182,11 @@ def _new_g3_kvcr(
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
             paths=((tmp_path / "g3.data",) if g3_paths is None else tuple(g3_paths)),
-            capacity_bytes_per_file=page_size * g3_slot_count,
+            capacity_bytes_per_file=(
+                page_size * g3_slot_count
+                if g3_capacity_bytes_per_file is None
+                else g3_capacity_bytes_per_file
+            ),
             backend="MOCK",
             backend_options={"threads": "2"},
         ),
@@ -302,8 +307,10 @@ def test_g3_rejects_hard_linked_paths_and_releases_the_first_lock(
     assert _new_g3_kvcr(tmp_path, local, g3_paths=(path,))._core._g3 is not None
 
 
+@pytest.mark.parametrize("tail_bytes", [0, 1, os.sysconf("SC_PAGE_SIZE") - 1])
 def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     tmp_path,
+    tail_bytes,
 ) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 10)
@@ -322,6 +329,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         agent=agent,
         g3_paths=paths,
         g3_slot_count=2,
+        g3_capacity_bytes_per_file=2 * page_size + tail_bytes,
         framework_regions=[
             _buffer_region(primary, page_size),
         ],
@@ -340,6 +348,17 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     ]
     g3 = kvcr._core._g3
     assert g3 is not None
+    assert all(path.stat().st_size == 2 * page_size for path in paths)
+    file_registrations = [
+        descriptor
+        for descriptors, mem_type in agent.registrations
+        if mem_type == "FILE"
+        for descriptor in descriptors
+    ]
+    assert [descriptor[1] for descriptor in file_registrations] == [
+        2 * page_size,
+        2 * page_size,
+    ]
     first_fd, second_fd = g3._direct_fds
     locations = []
     for key in keys[:4]:
@@ -384,6 +403,49 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     )[replacement_deliver][keys[4]]
     assert replacement_result.success
     assert replacement_destination.raw == payloads[4]
+
+    # Reopening uses the same rounded size, even when the budget had a tail.
+    kvcr.close()
+    reopened = _new_g3_kvcr(
+        tmp_path,
+        local,
+        g3_paths=paths,
+        g3_capacity_bytes_per_file=2 * page_size + tail_bytes,
+    )
+    assert reopened._core._g3 is not None
+
+
+@pytest.mark.parametrize("capacity", [-1, 0, os.sysconf("SC_PAGE_SIZE") - 1])
+def test_g3_rejects_capacity_smaller_than_one_slot(tmp_path, capacity) -> None:
+    local = ctypes.create_string_buffer(os.sysconf("SC_PAGE_SIZE"))
+    with pytest.raises(ValueError, match="at least one complete slot"):
+        _new_g3_kvcr(tmp_path, local, g3_capacity_bytes_per_file=capacity)
+    assert not (tmp_path / "g3.data").exists()
+
+
+def test_g3_recovery_does_not_combine_unused_tails_across_files(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        g3_paths=(tmp_path / "first.data", tmp_path / "second.data"),
+        g3_capacity_bytes_per_file=3 * page_size - 1,
+    )
+    g3 = kvcr._core._g3
+    assert g3 is not None
+    g3.adopt_recovery_slots(
+        {
+            BlockKey(b"recovered"): _BlockRecord(g3=_G3Residency(3)),
+        }
+    )
+    assert tuple(g3._free_slots) == (0, 1, 2)
+    with pytest.raises(ValueError, match="invalid G3 recovery slots"):
+        g3.adopt_recovery_slots(
+            {
+                BlockKey(b"phantom"): _BlockRecord(g3=_G3Residency(4)),
+            }
+        )
 
 
 @pytest.mark.parametrize("policy", [G3FIFOPolicy(), G3LRUPolicy()], ids=["fifo", "lru"])
