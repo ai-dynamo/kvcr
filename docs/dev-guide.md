@@ -178,6 +178,11 @@ runner = KVCR(
 The callback names above represent services implemented by the framework
 adapter; they are not provided by KVCR itself.
 
+`KVCRConfig.startup_timeout_seconds` accepts a positive integer to allow longer
+initialization waits. Omitting it or setting it to `None` uses 30 seconds.
+The timeout applies separately to the local preparation and startup waits;
+transfer deadlines are unchanged.
+
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 

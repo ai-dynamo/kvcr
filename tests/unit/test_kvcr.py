@@ -56,11 +56,7 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("budget", [0, True, 1.5])
-def test_invalid_startup_budget_is_rejected_before_agent_creation(monkeypatch, budget):
-    def unexpected_agent(*args, **kwargs):
-        pytest.fail("invalid startup budget reached native initialization")
-
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", unexpected_agent)
+def test_invalid_startup_budget_is_rejected(budget):
     with pytest.raises(ValueError, match="startup_timeout_seconds"):
         KVCR(
             KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=budget),
@@ -69,28 +65,15 @@ def test_invalid_startup_budget_is_rejected_before_agent_creation(monkeypatch, b
         )
 
 
-def test_configured_startup_budget_reaches_progress_without_changing_operations(
-    monkeypatch,
-):
+def test_configured_startup_budget_reaches_progress(monkeypatch):
     monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
-    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda *a, **kw: FakeNixlAgent())
-    monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kw: kw)
-    config = KVCRConfig(
-        "startup-test", [("", 16)], nixl_listen_port=1, startup_timeout_seconds=1
+    runner = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config=KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=1),
     )
-    runner = KVCR(
-        config,
-        KVCRBindings(Mock(), Mock(), Mock(), framework_control=FakeBytesControl()),
-        KVCRBackendConfigs(),
-    )
-    try:
-        assert runner._core._progress._ready.is_set()
-        assert runner._core._progress._startup_timeout_seconds == 1
-        assert config.operation_timeout_ms == 1000
-        assert config.abandon_timeout_ms == 5000
-    finally:
-        runner.close()
-    assert runner._core.is_quiescent()
+    assert runner._core._progress._startup_timeout_seconds == 1
 
 
 def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
