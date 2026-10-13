@@ -567,6 +567,11 @@ The secondary tier can optionally own local G2 capacity through
 `secondary_g2_slots`, attach to a service-owned pool through
 `kvcr_service_socket_path` together with `compatibility_digest`, or configure
 file-backed storage through `g3`.
+`g3.capacity_bytes_per_file` is a per-file budget: KVCR rounds it down to
+complete slots of the configured block size. Each file must fit at least one
+slot, and the block size must be page aligned. Rounding never exceeds the
+requested capacity, and each file's unused tail is excluded from slot counts
+and recovery. Existing nonempty files must match the resulting rounded size.
 The vLLM adapter uses one unnamed pool per Guard, so start the guard service with
 one pool size, for example `--pool-sizes-gb 48`.
 Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes

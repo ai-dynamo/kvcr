@@ -241,16 +241,31 @@ def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
             _POOL_LAYOUTS,
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
         )
-    with pytest.raises(ValueError, match="complete slots"):
+    with pytest.raises(ValueError, match="at least one complete slot"):
         _TierConfig(
             [("pool", mmap.PAGESIZE)],
-            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE + 1}),
+            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE - 1}),
         )
     with pytest.raises(ValueError, match="page-aligned"):
         _TierConfig(
             [("pool", mmap.PAGESIZE // 2)],
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
         )
+
+
+@pytest.mark.parametrize("tail_bytes", [0, 1, mmap.PAGESIZE - 1])
+def test_g3_tier_config_accepts_capacity_with_unused_tail(tail_bytes) -> None:
+    tier = _TierConfig(
+        [("pool", mmap.PAGESIZE)],
+        _G3Config(
+            paths=("/g3/a", "/g3/b"),
+            capacity_bytes_per_file=2 * mmap.PAGESIZE + tail_bytes,
+            backend="FILE",
+            backend_options={},
+        ),
+    )
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(tier), type=_TierConfig)
+    assert decoded == tier
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
