@@ -19,6 +19,7 @@ from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.recovery_journal import (
     _JOURNAL_HEADER_BYTES,
     _RECORD_BLOCK,
+    _RECORD_G2_APPEND,
     _SNAPSHOT_HEADER,
     RecoveryJournal,
     RecoveryJournalError,
@@ -121,16 +122,79 @@ def test_ring_round_trips_wraps_and_drains_streaming(
 
 class _Source:
     def __init__(self) -> None:
-        self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
+        self._observer: Callable[..., None] | None = None
+        self.flush: Callable[[], None] = lambda: None
 
     def observe_residency(
-        self, observer: Callable[[BlockKey, _BlockRecord], None]
+        self,
+        observer: Callable[..., None],
+        *,
+        flush: Callable[[], None] | None = None,
     ) -> None:
         self._observer = observer
+        if flush is not None:
+            self.flush = flush
 
-    def emit(self, key: BlockKey, record: _BlockRecord) -> None:
+    def emit(self, key: BlockKey, record: _BlockRecord, added_slots=None) -> None:
         assert self._observer is not None
-        self._observer(key, record)
+        self._observer(key, record, added_slots)
+
+
+def test_publisher_coalesces_only_new_slots_until_the_poll_flushes(
+    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
+) -> None:
+    journal, _ = journal_and_mapping
+    local_dram, g3 = _Source(), _Source()
+    _attach_journal(local_dram, journal, g3)
+    key = BlockKey(b"layered")
+    record = _recovered_record(g2=[("pool0:a", 2)], g3=7)
+    record.position = 5
+    local_dram.emit(key, record, [("pool0:a", 2)])
+    record.local_dram.append_slots([("pool0:b", 3)])
+    local_dram.emit(key, record, [("pool0:b", 3)])
+    local_dram.emit(key, record, [])
+    assert journal.read_next() is None
+
+    local_dram.flush()
+
+    frame = journal.read_next()
+    assert frame[:2] == (_RECORD_G2_APPEND, key)
+    assert _decode_recovery_record(frame[2], ("pool0",)) == record
+    assert journal.read_next() is None
+
+    # Later polls carry only the newly committed pieces, not the growing record.
+    record.local_dram.append_slots([("pool0:c", 4)])
+    local_dram.emit(key, record, [("pool0:c", 4)])
+    local_dram.flush()
+    frame = journal.read_next()
+    assert frame[0] == _RECORD_G2_APPEND
+    assert _decode_recovery_record(frame[2], ("pool0",)).local_dram.slots == [
+        ("pool0:c", 4)
+    ]
+    local_dram.emit(key, record, [])
+    local_dram.flush()
+    assert journal.read_next() is None
+
+    # A synchronous metadata update subsumes the pending additions.
+    record.local_dram.append_slots([("pool0:d", 5)])
+    local_dram.emit(key, record, [("pool0:d", 5)])
+    record.position = 8
+    g3.emit(key, record)
+    local_dram.flush()
+    frame = journal.read_next()
+    assert frame[0] == _RECORD_BLOCK
+    assert _decode_recovery_record(frame[2], ("pool0",)) == record
+    assert journal.read_next() is None
+
+    # Retirement publishes before slot reuse and cannot be undone by the flush.
+    record.local_dram.append_slots([("pool0:e", 6)])
+    local_dram.emit(key, record, [("pool0:e", 6)])
+    local_dram.emit(key, _BlockRecord())
+    local_dram.flush()
+    frame = journal.read_next()
+    assert frame[0] == _RECORD_BLOCK
+    assert _decode_recovery_record(frame[2], ("pool0",)) == _BlockRecord()
+    assert journal.read_next() is None
 
 
 def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
@@ -166,7 +230,19 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     caplog.clear()
     with patch.object(journal, "publish", wraps=journal.publish) as publish:
         local_dram.emit(key, _recovered_record(g2=[("pool0", 0)]))
-        local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
+        with (
+            patch(
+                "kvcr.recovery_journal._project_recovery_record",
+                side_effect=AssertionError("disabled publication projected a record"),
+            ),
+            patch(
+                "kvcr.recovery_journal._RECOVERY_ENCODER",
+                encode=Mock(side_effect=AssertionError("disabled publication encoded")),
+            ),
+        ):
+            local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
+            local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]), [("pool0", 2)])
+            local_dram.flush()
     assert publish.call_count == 1
     assert len(caplog.messages) == 1
 
@@ -244,6 +320,14 @@ def test_invalidation_stops_every_role_until_an_owner_reset(
     mapping[_JOURNAL_HEADER_BYTES + 12] = 1
     with pytest.raises(RecoveryJournalError, match="padding"):
         journal.read_next()
+    assert journal.is_invalid()
+
+    # A reader without append support refuses the new type instead of replacing G2.
+    journal.reset()
+    assert journal.publish(_RECORD_G2_APPEND, b"key", b"payload")
+    with patch("kvcr.recovery_journal._RECORD_TYPES", frozenset({_RECORD_BLOCK})):
+        with pytest.raises(RecoveryJournalError, match="unknown type"):
+            journal.read_next()
     assert journal.is_invalid()
 
     # An owner's own declaration kills the ring exactly the same way, and a

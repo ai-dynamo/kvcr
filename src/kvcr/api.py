@@ -78,7 +78,7 @@ class KVCRBindings(msgspec.Struct, frozen=True):
 
 
 class KVCR:
-    """Framework-facing KV Cache Runner."""
+    """Framework-facing KV Cache Runner; serialize public calls on each instance."""
 
     # TODO: Accept hot-start metadata and a side-process heartbeat/handoff binding.
     def __init__(
@@ -171,7 +171,7 @@ class KVCR:
         no_evict: bool = False,
         hints: object | None = None,
     ) -> OpHandle:
-        """Asynchronously copy blocks into KVCR-managed storage."""
+        """Asynchronously copy blocks or named parts into KVCR-managed storage."""
         return self._core.deposit(blocks, no_evict, hints)
 
     def fetch(
@@ -181,7 +181,7 @@ class KVCR:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        """Asynchronously fetch blocks into KVCR-managed storage."""
+        """Fetch blocks into KVCR storage; local requests may select named pieces."""
         return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(

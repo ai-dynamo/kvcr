@@ -180,13 +180,15 @@ framework.release_pin(pin_handle)                                               
 
 Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`label`) must be unique and use `pool`, `pool:part`, or `pool:*` for a buffer shared across parts; buffers sharing a pool prefix share allocation and eviction.
 
-`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, concrete label, and element index. The label identifies the piece within a key and selects a framework buffer by exact name; a `pool:part` reference without an exact registration requires `pool:*`. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of labels and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label.
+`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, concrete label, and element index. The label identifies the piece within a key and selects a framework buffer by exact name; a `pool:part` reference without an exact registration requires `pool:*`. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of labels and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label. Deposits of the same key and named piece must contain identical immutable bytes; duplicate deposits are not ordered, and already committed pieces are reused.
 
 ### Operating flow
 
 **Using KVCR-owned DRAM**
 
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
+
+Immutable pieces of a key may be deposited and delivered independently, allowing transfers to overlap. Availability may describe a partial key; each delivery completes for its requested pieces.
 
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 

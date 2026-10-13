@@ -50,6 +50,18 @@ def _make_block_key(block_hash: bytes, group_idx: int) -> BlockKey:
     return BlockKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
 
 
+class _CopyingWriteAgent(FakeNixlAgent):
+    def transfer(self, handle):
+        self.transfers.append(handle)
+        _, sources, _, destinations, _, _ = self.xfers[handle - 1]
+        for (src, src_size, _), (dst, dst_size, _) in zip(
+            sources, destinations, strict=True
+        ):
+            ctypes.memmove(dst, src, min(src_size, dst_size))
+        return "PROC"
+
+
+
 def test_submit_hint_filters_unlisted_hash():
     target = _new_kvcr(
         FakeNixlAgent(),
@@ -239,7 +251,8 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
 @pytest.mark.parametrize(
     ("layout", "expected_layout", "success"),
     [
-        ([("full", 16), ("swa", 8)], ["swa", "full"], False),
+        ([("full", 16), ("swa", 8)], ["swa", "full"], True),
+        ([("full", 16), ("swa", 8)], ["full", "swa:missing"], False),
         ([("full", 16), ("swa", 8)], ["full", "swa"], True),
         ([("", 16), ("", 16)], ["", ""], True),
     ],
@@ -250,16 +263,6 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     success: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class CopyingWriteAgent(FakeNixlAgent):
-        def transfer(self, handle):
-            self.transfers.append(handle)
-            _, sources, _, destinations, _, _ = self.xfers[handle - 1]
-            for (src, src_size, _), (dst, dst_size, _) in zip(
-                sources, destinations, strict=True
-            ):
-                ctypes.memmove(dst, src, min(src_size, dst_size))
-            return "PROC"
-
     payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
     pool_data = dict.fromkeys(dict(layout), b"")
     for (name, _), data in zip(layout, payloads, strict=True):
@@ -274,7 +277,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     target_local = {
         name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
     }
-    source_agent = CopyingWriteAgent(metadata=b"source-md")
+    source_agent = _CopyingWriteAgent(metadata=b"source-md")
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_control = FakeBytesControl("tcp://source:1")
     target_control = FakeBytesControl("tcp://target:1")
@@ -302,6 +305,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
             for name, size in dict(layout).items()
         ],
     )
+    source._core._clock = lambda: 0.0  # A layout mismatch must not wait for timeout.
     target = _new_kvcr(
         target_agent,
         FakePrimaryPinning(),

@@ -666,6 +666,8 @@ class _KVCRCore:
                 if self._local_dram is not None:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
+                if self._local_dram is not None:
+                    self._local_dram._flush_residency_updates()
         completed = self._completion_queue
         self._completion_queue = []
         return completed

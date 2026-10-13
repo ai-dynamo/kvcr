@@ -97,7 +97,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
     observed: list[tuple[BlockKey, int | None]] = []
 
-    def observe(key: BlockKey, record: _BlockRecord) -> None:
+    def observe(key: BlockKey, record: _BlockRecord, added_slots=None) -> None:
         residency = record.local_dram
         if residency is None:
             assert 0 not in backend._free_slots

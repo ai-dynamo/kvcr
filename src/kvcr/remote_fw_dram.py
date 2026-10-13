@@ -1225,11 +1225,8 @@ class _RemoteFWDram:
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
                     return False
-                indices = _layout_indices(
-                    residency.layout,
-                    layout,
-                    allow_subset=source_pin.allow_layout_subset,
-                    indices_by_label=residency.indices_by_label,
+                indices = residency.ready_indices(
+                    layout, allow_subset=source_pin.allow_layout_subset
                 )
                 if indices is None:
                     return False
@@ -1302,15 +1299,17 @@ class _RemoteFWDram:
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
                 continue
-            indices = _layout_indices(
-                residency.layout
+            labels = [descriptor.label for descriptor in destination]
+            indices = (
+                residency.ready_indices(
+                    labels, allow_subset=source_pin.allow_layout_subset
+                )
                 if residency is not None
-                else [descriptor.label for descriptor in source],
-                [descriptor.label for descriptor in destination],
-                allow_subset=source_pin.allow_layout_subset,
-                indices_by_label=(
-                    residency.indices_by_label if residency is not None else None
-                ),
+                else _layout_indices(
+                    [descriptor.label for descriptor in source],
+                    labels,
+                    allow_subset=source_pin.allow_layout_subset,
+                )
             )
             if indices is None:
                 logger.warning(

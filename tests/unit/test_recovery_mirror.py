@@ -13,6 +13,7 @@ from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _TransferRef
 from kvcr.recovery_journal import (
     _RECORD_BLOCK,
+    _RECORD_G2_APPEND,
     _RECOVERY_ENCODER,
     RecoveryMirrorError,
     _decode_recovery_record,
@@ -92,6 +93,19 @@ _FULLY_LOADED_RECORD = _BlockRecord(
             [None, None, -1],
             _BlockRecord(),
         ),
+        (
+            _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":pending", 0), (":ready", 1)],
+                    _LocalDramState.READY,
+                    pending_labels={":pending"},
+                    pending_deposits=1,
+                )
+            ),
+            _ONE_POOL,
+            [[[":ready", 1]], None, -1],
+            _recovered_record(g2=[(":ready", 1)]),
+        ),
     ],
 )
 def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
@@ -158,6 +172,62 @@ def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:
         mirror.apply(_RECORD_BLOCK, b"block", payload)
 
 
+def test_mirror_appends_in_place_and_preserves_positional_pool_duplicates() -> None:
+    mirror = _RecoveryMirror(_ONE_POOL)
+    key = BlockKey(b"layered")
+    first = replace(_recovered_record(g2=[(":b", 3)], g3=7), position=5)
+    mirror.apply(_RECORD_G2_APPEND, key, _payload(first))
+    record = mirror._records[key]
+    residency = record.local_dram
+    slots = residency.slots
+    added = replace(
+        _recovered_record(g2=[(":a", 2), ("", 4), ("", 5)], g3=7), position=5
+    )
+
+    mirror.apply(_RECORD_G2_APPEND, key, _payload(added))
+
+    assert mirror._records[key] is record
+    assert record.local_dram is residency
+    assert residency.slots is slots
+    assert record == replace(
+        _recovered_record(g2=[(":b", 3), (":a", 2), ("", 4), ("", 5)], g3=7),
+        position=5,
+    )
+    assert residency.indices_by_label == {":b": 0, ":a": 1, "": None}
+    assert residency.ready_indices(["", ":b", "", ":a"], allow_subset=False) == [
+        2,
+        0,
+        3,
+        1,
+    ]
+    assert residency.ready_indices(["", ""]) is None
+
+    # A G3-only snapshot drops old G2 pieces; a later append starts G2 afresh.
+    mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g3=7)))
+    mirror.apply(_RECORD_G2_APPEND, key, _payload(added))
+    assert mirror._records[key] == added
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        msgspec.msgpack.encode([None, 7, 8]),
+        msgspec.msgpack.encode([[[":new", 1], [":same", 2]], 7, 8]),
+    ],
+)
+def test_mirror_rejects_invalid_appends_before_mutating(payload: bytes) -> None:
+    mirror = _RecoveryMirror(_ONE_POOL)
+    key = BlockKey(b"layered")
+    original = replace(_recovered_record(g2=[(":same", 0)], g3=3), position=4)
+    mirror.apply(_RECORD_BLOCK, key, _payload(original))
+
+    with pytest.raises(RecoveryMirrorError, match="malformed"):
+        mirror.apply(_RECORD_G2_APPEND, key, payload)
+
+    assert mirror._records == {key: original}
+
+
 def test_mirror_replaces_blocks_whole_and_hands_them_over_uncopied() -> None:
     """Frames replace blocks whole in _records (mirrored table); take transfers it."""
     mirror = _RecoveryMirror(_ONE_POOL)
@@ -194,6 +264,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     filling, forgotten = BlockKey(b"filling"), BlockKey(b"forgotten")
     filling_spill = BlockKey(b"filling-spill")
     discarding_spill = BlockKey(b"discarding-spill")
+    partially_ready = BlockKey(b"partially-ready")
     served = {
         ready: _BlockRecord(
             local_dram=_LocalDramResidency(
@@ -227,10 +298,21 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
             ),
             g3=_G3Residency(5),
         ),
+        partially_ready: _BlockRecord(
+            local_dram=_LocalDramResidency(
+                [("full:a", 2), ("full:b", 3)],
+                _LocalDramState.READY,
+                pending_labels={"full:a"},
+                pending_deposits=1,
+            ),
+        ),
     }
     # A kept mirror must match exactly what the handback frames carry.
     residency = served[ready].local_dram
     residency.refs[0] = _TransferRef("old-agent", 0, "full", framework=False)
+    partial = served[partially_ready].local_dram
+    partial.prepare_label_index()
+    partial.refs[1] = _TransferRef("old-agent", 3, "full:b", framework=False)
     framed = {
         BlockKey(key): _decode_recovery_record(payload, _TWO_POOLS)
         for _, key, payload in _recovery_frames(served)
@@ -241,10 +323,16 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records is served
     assert mirror._records[ready].local_dram is residency
     assert not residency.refs  # A new agent must regenerate its own references.
+    assert not partial.pending_labels
+    assert partial.pending_deposits == 0
+    assert not partial.refs
+    partial.prepare_label_index()
+    assert partial.indices_by_label == {"full:b": 0}
     assert mirror._records == framed
     assert mirror._records == {
         ready: replace(_recovered_record(g2=[("full", 0), ("swa", 10)]), position=7),
         spilled: _recovered_record(g3=3),
         filling_spill: _recovered_record(g3=4),
         discarding_spill: _recovered_record(g3=5),
+        partially_ready: _recovered_record(g2=[("full:b", 3)]),
     }

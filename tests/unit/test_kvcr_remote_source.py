@@ -32,7 +32,9 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _STOP, _TransferRef
+from kvcr.recovery_journal import install_recovery_records
 from kvcr.remote_fw_dram import (
     _FwMemResidency,
     _RemoteFWDram,
@@ -87,7 +89,10 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypatch):
+@pytest.mark.parametrize("recovered", [False, True])
+def test_local_source_starts_inline_and_holds_its_slot(
+    transfer_state, recovered, monkeypatch
+):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -119,11 +124,26 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
     key = BlockKey(b"local")
     try:
         agent.state = "DONE"
-        deposit = source.deposit({key: descriptors})
-        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        if recovered:
+            install_recovery_records(
+                source._core,
+                {
+                    key: _BlockRecord(
+                        local_dram=_LocalDramResidency(
+                            [(":c", 2), (":b", 1), ("", 0)], _LocalDramState.READY
+                        )
+                    )
+                },
+            )
+        else:
+            deposit = source.deposit({key: descriptors})
+            assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        prior_transfers = len(agent.xfers)
         local = source._core._local_dram
         residency = source._core._block_record_map[key].local_dram
-        assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
+        assert residency.indices_by_label == (
+            {":c": 0, ":b": 1, "": 2} if recovered else {"": 0, ":b": 1, ":c": 2}
+        )
         make_ref = Mock(wraps=local._descriptor)
         monkeypatch.setattr(local, "_descriptor", make_ref)
         assert not source._core._remote_fw_dram._try_local_source_write(
@@ -137,8 +157,9 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
         callbacks.clear()
         agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
+        requested_labels = ("", ":b", ":c") if recovered else (":c", "")
         request.update(
-            allow_layout_subset=True,
+            allow_layout_subset=not recovered,
             target_regions=(
                 {
                     label: RegionDescriptor(
@@ -146,7 +167,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                         size=16,
                         mem_type="VRAM",
                         device_Id=7,
-                        count=2,
+                        count=len(requested_labels),
                         label=label,
                     )
                     for label in ("", ":*")
@@ -154,7 +175,10 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                 {},
             ),
             dst_descriptors=[
-                [_TransferRef("target", i, label) for i, label in enumerate((":c", ""))]
+                [
+                    _TransferRef("target", i, label)
+                    for i, label in enumerate(requested_labels)
+                ]
             ],
         )
         preparing, resume = threading.Event(), threading.Event()
@@ -184,19 +208,21 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                     source._core._state_lock.release()
             finally:
                 resume.set()
-            _wait_until(lambda: len(agent.xfers) == 2)
+            _wait_until(lambda: len(agent.xfers) == prior_transfers + 1)
 
         # The peer request must be served without another caller-side poll.
         assert residency.claim_count == 1
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
         ] == [
-            b"c" * 16,
-            b"a" * 16,
+            label.removeprefix(":").encode() * 16 if label else b"a" * 16
+            for label in requested_labels
         ]
-        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
+        assert agent.xfers[-1][3] == [
+            (4096 + i * 16, 16, 7) for i in range(len(requested_labels))
+        ]
         assert pinning.searches == []
-        assert make_ref.call_count == 2
+        assert make_ref.call_count == len(requested_labels)
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
         if transfer_state == "PROC":
@@ -204,7 +230,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
             assert callbacks == [(threading.get_ident(), [("", 3)])]
 
         agent.state = "DONE"
-        _wait_until(lambda: len(agent.released_xfers) == 2)
+        _wait_until(lambda: len(agent.released_xfers) == prior_transfers + 1)
         assert residency.claim_count == 1  # Native completion does not release it.
         assert _poll_until(source, lambda _: residency.claim_count == 0) == []
         assert not source._core._local_dram_sources_by_op
@@ -217,9 +243,12 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
             control.incoming.append(msgspec.msgpack.encode(request))
             _poll_until(
                 source,
-                lambda _: len(agent.released_xfers) == 3 and residency.claim_count == 0,
+                lambda _: (
+                    len(agent.released_xfers) == prior_transfers + 2
+                    and residency.claim_count == 0
+                ),
             )
-        assert make_ref.call_count == 2
+        assert make_ref.call_count == len(requested_labels)
         assert agent.xfers[-1][1] == agent.xfers[-2][1]
         assert pinning.searches == []
     finally:
