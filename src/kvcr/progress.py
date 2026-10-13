@@ -196,7 +196,6 @@ class _KVCRProgress:
         self,
         transfer_id: int,
         *,
-        cancellation_requested: bool = False,
         require_completion: bool = False,
     ) -> tuple[bool, Any | None] | None:
         """Advance a transfer and return its result after releasing its handle."""
@@ -219,16 +218,17 @@ class _KVCRProgress:
                 xfer_state = "ERR"
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
             # its completion signal. Retain it until native access has stopped.
+            # TODO: Enable timeout cancellation for NIXL backends that guarantee
+            # cancellation stops native access before releasing the handle.
             if require_completion and xfer_state != "DONE":
                 if xfer_state not in ("PROC", "PEND"):
                     state.outcome = False
                 return None
             pending = xfer_state in ("PROC", "PEND")
-            if pending and not cancellation_requested:
+            if pending:
                 return None
             outcome = xfer_state == "DONE" and state.outcome is not False
-            if not pending:
-                state.outcome = outcome
+            state.outcome = outcome
         if outcome and state.capture_telemetry:
             get_telemetry = getattr(agent, "get_xfer_telemetry", None)
             if get_telemetry is not None:
@@ -308,14 +308,6 @@ class _KVCRProgress:
             submitted = False
             logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
         return transfer_id, submitted
-
-    def cancel_transfer(self, transfer_id: int) -> bool:
-        """Cancel if necessary and forget only after NIXL releases the handle."""
-        state = self._active_transfers.get(transfer_id)
-        if state is None:
-            return True
-        state.outcome = False
-        return self._release_transfer(transfer_id, state)
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type

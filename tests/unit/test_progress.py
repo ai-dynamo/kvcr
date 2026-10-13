@@ -335,7 +335,7 @@ def test_progress_submits_and_completes_transfer(
 
 def test_progress_retries_release_while_operation_is_active() -> None:
     agent = _TransferAgent()
-    agent.state = "PROC"
+    agent.state = "ERR"
     agent.submit_exception = True
     agent.release_failures = 2
     progress = _transfer_progress(agent)
@@ -347,9 +347,9 @@ def test_progress_retries_release_while_operation_is_active() -> None:
     )
 
     assert not submitted
-    assert progress.poll_transfer(transfer_id, cancellation_requested=True) is None
-    assert progress.poll_transfer(transfer_id, cancellation_requested=True) is None
-    result = progress.poll_transfer(transfer_id, cancellation_requested=True)
+    assert progress.poll_transfer(transfer_id) is None
+    assert progress.poll_transfer(transfer_id) is None
+    result = progress.poll_transfer(transfer_id)
     assert result is not None
     success, _ = result
     assert not success
@@ -390,23 +390,6 @@ def test_progress_treats_poll_exception_as_terminal_failure() -> None:
     success, _ = result
     assert not success
     assert agent.events[-1] == "release-transfer:1"
-
-
-def test_progress_cancel_retains_transfer_until_release_succeeds() -> None:
-    agent = _TransferAgent()
-    agent.release_failures = 1
-    progress = _transfer_progress(agent)
-    transfer_id, _ = progress.submit_transfer(
-        "WRITE",
-        (_mem(0),),
-        (_mem(1, owner="remote-agent"),),
-        remote_side_agent="remote-agent",
-    )
-
-    assert not progress.cancel_transfer(transfer_id)
-    assert transfer_id in progress._active_transfers
-    assert progress.cancel_transfer(transfer_id)
-    assert transfer_id not in progress._active_transfers
 
 
 def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
@@ -688,7 +671,7 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
     assert progress.nixl_agent is agent
     assert agent.deregistered == []
     assert len(agent.prepared) == 6
-    assert progress.cancel_transfer(transfer_id)
+    assert progress.poll_transfer(transfer_id) == (True, None)
 
     progress._close_nixl()
     assert agent.deregistered == [7]

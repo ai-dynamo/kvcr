@@ -173,6 +173,8 @@ class _LocalCopyOp(_ProgressOp):
             logger.debug("KVCR_EVENT local_copy_deadline_expired op=%s", self.op_id)
             self.failure_latched = True
             observed_work = True
+        # shortcut: cached generic errors retain memory until exit; reclaim only
+        # after backend-specific error handling proves native access has stopped.
         result = progress.poll_transfer(
             transfer_id,
             require_completion=True,

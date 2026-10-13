@@ -111,8 +111,9 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     _poll_until(kvcr, lambda done: first in dict(done))
     assert observed == [(keys[0], [("", 0)])]
 
-    # Native completion after an error permits cleanup, not a successful fill.
-    with patch.object(agent, "check_xfer_state", side_effect=["ERR", "DONE"]):
+    with patch.object(
+        agent, "make_prepped_xfer", side_effect=RuntimeError("transfer creation failed")
+    ):
         failed = kvcr.deposit({keys[1]: [_mem_descriptor(1)]})
         failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[
             failed

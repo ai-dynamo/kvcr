@@ -6,7 +6,7 @@ import ctypes
 import hashlib
 import heapq
 import logging
-from contextlib import closing
+from contextlib import closing, suppress
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,6 +28,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import core as core_module
+from kvcr import progress as progress_module
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import (
@@ -835,24 +836,35 @@ def test_capacity_pressure_is_pool_local() -> None:
         ("deposit", "submission", False),
         ("deposit", "timeout", False),
         ("deposit", "timeout", True),
+        ("deposit", "sticky_error", True),
         ("deliver", "timeout", True),
     ],
 )
 def test_local_copy_timeout_retains_memory_until_completion(
-    kind: str, failure: str, abandon: bool, caplog
+    kind: str, failure: str, abandon: bool, caplog, request
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
 
     class PendingAgent(FakeNixlAgent):
+        error_polls = 0
+
         def transfer(self, handle):
             result = super().transfer(handle)
             return "ERR" if failure == "submission" else result
+
+        def check_xfer_state(self, handle):
+            if failure == "sticky_error" and self.state != "DONE":
+                self.error_polls += 1
+                raise RuntimeError("cached native error")
+            return super().check_xfer_state(handle)
 
     now = 0.0
     block_size = 16
     primary = ctypes.create_string_buffer(block_size * 2)
     local = ctypes.create_string_buffer(block_size)
     agent = PendingAgent()
+    # Fake-only teardown: real cached NIXL errors cannot transition to DONE.
+    request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
     errors = []
     kvcr = _new_local_kvcr(
         agent,
@@ -872,7 +884,7 @@ def test_local_copy_timeout_retains_memory_until_completion(
     released = list(agent.released_xfers)
     op_handle = getattr(kvcr, kind)({key: [_mem_descriptor()]})
     _wait_until(lambda: len(agent.transfers) > len(released))
-    if failure == "timeout":
+    if failure in ("timeout", "sticky_error"):
         now = 2.0
     progress = kvcr._core._progress
     copy = next(iter(progress._in_flight_ops.values()))
@@ -897,9 +909,16 @@ def test_local_copy_timeout_retains_memory_until_completion(
         blocked = kvcr.deposit({BlockKey(b"other"): [_mem_descriptor(1)]})
         assert dict(kvcr.poll_completed())[blocked][BlockKey(b"other")].success is False
 
-    assert not copy.close(progress)
-    assert copy.transfer_id in progress._active_transfers
-    assert agent.released_xfers == released
+    if failure == "sticky_error":
+        checked = agent.error_polls
+        now = 50.0
+        _wait_until(lambda: agent.error_polls >= checked + 2)
+        assert kvcr.poll_completed() == []
+        assert [error.state for error in errors] == ["uncertain"]
+        assert copy.transfer_id in progress._active_transfers
+        assert agent.released_xfers == released
+        assert key in kvcr._core._block_record_map
+        return
 
     agent.state = "DONE"
     assert _poll_until(
@@ -922,6 +941,50 @@ def test_local_copy_timeout_retains_memory_until_completion(
         ("deadline_expired", "timeout"),
     ]:
         assert caplog.text.count(f"local_copy_{event}") == (failure == expected)
+
+
+def test_close_retains_pending_local_copy_resources(monkeypatch) -> None:
+    monkeypatch.setattr(progress_module, "_OP_CLEANUP_TIMEOUT_SECONDS", 0.01)
+    primary = ctypes.create_string_buffer(16)
+    local = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "PEND"
+    kvcr = _new_local_kvcr(
+        agent, local, 1, framework_regions=[_buffer_region(primary, 16)]
+    )
+    kvcr._core._clock = lambda: 0.0
+    key = BlockKey(b"k0")
+    progress = kvcr._core._progress
+    try:
+        kvcr.deposit({key: [_mem_descriptor()]})
+        _wait_until(lambda: bool(agent.transfers))
+        copy = next(iter(progress._in_flight_ops.values()))
+        _wait_until(lambda: copy.transfer_id is not None)
+        transfer_id = copy.transfer_id
+        registrations = progress._memory_registrations.copy()
+        prepared = {
+            owner: entries.copy() for owner, entries in progress._prepared.items()
+        }
+        residency = kvcr._core._block_record_map[key].local_dram
+
+        with pytest.raises(RuntimeError, match="active transfers"):
+            kvcr.close()
+        assert not progress._thread.is_alive()
+        assert not kvcr._core.is_quiescent() and not kvcr._core._closed
+        assert transfer_id in progress._active_transfers
+        assert not agent.released_xfers and not agent.deregistered
+        assert progress._memory_registrations == registrations
+        assert progress._prepared == prepared
+        assert kvcr._core._block_record_map[key].local_dram is residency
+    finally:
+        # Fake-only cleanup: the stopped thread cannot observe late completion.
+        agent.state = "DONE"
+        with suppress(RuntimeError):
+            progress.close()
+        progress._close_progress_ops()
+        progress._close_nixl()
+        with suppress(RuntimeError):
+            kvcr.close()  # Re-raises the saved failure after completing teardown.
 
 
 def test_local_initialize_failure_completes_without_failing_progress() -> None:
