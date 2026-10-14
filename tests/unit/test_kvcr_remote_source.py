@@ -413,6 +413,109 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
         source.close()
 
 
+@pytest.mark.parametrize("ready_source", [None, "local", "framework", "mismatch"])
+def test_partial_local_source_waits_even_when_another_key_is_ready(
+    ready_source, caplog
+):
+    now = 0.0
+    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 64)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    pinning = FakePrimaryPinning(
+        prefix_length=None if ready_source in ("framework", "mismatch") else 0
+    )
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        framework_regions=[
+            _buffer_region(memory, 16, ":*"),
+            _buffer_region(memory, 16),
+        ],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    source._core._clock = lambda: now
+    key = BlockKey(b"partial")
+    ready = BlockKey(b"ready")
+    agent.state = "DONE"
+    deposited = {key: [_mem_descriptor(label=":a", end_point_name="source")]}
+    if ready_source == "local":
+        deposited[ready] = [_mem_descriptor(1, ":b", end_point_name="source")]
+    deposit = source.deposit(deposited, expected_layout=[":a", ":b"])
+    assert _poll_until(source, bool) == [
+        (deposit, _op_entries({key: True for key in deposited}))
+    ]
+    if ready_source == "local":
+        agent.state = "PROC"
+    residency = source._core._block_record_map[key].local_dram
+    request = msgspec.msgpack.decode(_start_write_message(12, key))
+    request.update(
+        target_regions=(
+            {
+                ":*": RegionDescriptor(addr=4096, size=16, label=":*"),
+                "": RegionDescriptor(addr=8192, size=16),
+            },
+            {},
+        ),
+        dst_descriptors=[[_TransferRef("target", 0, ":b")]],
+    )
+    if ready_source is not None:
+        request["keys"].append(ready)
+        request["dst_descriptors"].append(
+            [_TransferRef("target", 0, "" if ready_source == "framework" else ":b")]
+        )
+    control.incoming.append(msgspec.msgpack.encode(request))
+    remote = source._core._remote_fw_dram
+    if ready_source in ("local", "framework"):
+        _poll_until(
+            source,
+            lambda _: (
+                len(agent.transfers) == 2
+                and (ready_source == "local" or len(agent.released_xfers) == 2)
+            ),
+        )
+        assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [1]
+        assert agent.xfers[-1][3] == [
+            (4096 if ready_source == "local" else 8192, 16, 0)
+        ]
+        assert _decode_notif(agent.xfers[-1][5]).get("terminal", True) is False
+        assert pinning.unpins == (["pin"] if ready_source == "framework" else [])
+    elif ready_source == "mismatch":
+        _poll_until(source, lambda _: pinning.unpins == ["pin"])
+    _poll_until(source, lambda _: bool(remote._source_pin_ops))
+    assert residency.claim_count == 1
+    assert not agent.sent_notifs
+    assert pinning.searches == (
+        [(ready,)] if ready_source in ("framework", "mismatch") else []
+    )
+    # Waiting for a future deposit must not block idle control servicing.
+    control.incoming.append(_write_probe_message(99))
+    _wait_until(
+        lambda: any(
+            _decode_control_message(raw).get("type") == "write_probe_ack"
+            for _, raw in control.sent
+        )
+    )
+    assert len(agent.xfers) == (2 if ready_source in ("local", "framework") else 1)
+    now = 1.0
+    if ready_source == "local":
+        _poll_until(source, lambda _: bool(agent.sent_notifs))
+        assert _decode_notif(agent.sent_notifs[-1][1])["terminal"] is False
+        assert residency.claim_count == 1
+        assert source._core._block_record_map[ready].local_dram.claim_count == 1
+        assert agent.released_xfers == [1]
+        assert len(agent.xfers) == 2
+        agent.state = "DONE"
+    _poll_until(
+        source, lambda _: bool(agent.sent_notifs) and residency.claim_count == 0
+    )
+    assert _decode_notif(agent.sent_notifs[-1][1])["success"] is False
+    assert len(agent.xfers) == (2 if ready_source in ("local", "framework") else 1)
+    assert not remote._source_pin_ops
+    assert not source._core._local_dram_sources_by_op
+    assert caplog.text.count("layout mismatch") == (ready_source == "mismatch")
+
+
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
 def test_kvcr_start_write_respects_framework_pin_deadline(
     pin_before_deadline: bool,
