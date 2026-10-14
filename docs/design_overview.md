@@ -180,7 +180,7 @@ framework.release_pin(pin_handle)                                               
 
 Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`label`) must be unique and use `pool`, `pool:part`, or `pool:*` for a buffer shared across parts; buffers sharing a pool prefix share allocation and eviction.
 
-`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, concrete label, and element index. The label identifies the piece within a key and selects a framework buffer by exact name; a `pool:part` reference without an exact registration requires `pool:*`. A key may span multiple pools. `fetch` requests every piece in `expected_layout` and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label. Deposits of the same key and named piece must contain identical immutable bytes; duplicate deposits are not ordered, and already committed pieces are reused.
+`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, concrete label, and element index. The label identifies the piece within a key and selects a framework buffer by exact name; a `pool:part` reference without an exact registration requires `pool:*`. A key may span multiple pools. `fetch` selects the non-`!` pieces in `expected_layout` and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. Excluding repeated pools requires named pieces. A single-pool caller may use the empty label. Deposits of the same key and named piece must contain identical immutable bytes; duplicate deposits are not ordered, and already committed pieces are reused.
 
 ### Operating flow
 
@@ -188,7 +188,7 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
-Both `deposit` and `fetch` use `expected_layout` to declare the full ordered key layout. KVCR reserves capacity for every declared piece before copying. Without `expected_layout`, the first deposit defines the whole key from its supplied pieces, and fetch expects one unnamed piece. Later calls cannot change the declaration.
+Both `deposit` and `fetch` use `expected_layout` to declare the full ordered key layout. At creation, a leading `!` excludes a piece from local storage; KVCR reserves capacity for all other pieces before copying. Without `expected_layout`, the first deposit defines the whole key from its supplied pieces, and fetch expects one unnamed piece. Later deposits cannot change the declaration. A fetch may exclude additional pieces without changing the existing reservation. Concrete `MemoryRef` labels carry no marker. Peers share the full piece identities but may have different local exclusions.
 
 Declared immutable pieces may be deposited and delivered independently, allowing transfers to overlap. Each delivery completes for its requested pieces; reserved but unwritten pieces are not readable. Incomplete reservations remain non-evictable while the owner is alive, until every locally reserved piece is ready. A key is journaled only when all its declared pieces are committed. Recovery drops incomplete keys and reclaims their reserved slots.
 
@@ -253,7 +253,7 @@ The router maintains an eventually-consistent global prefix inventory for cache-
 
 Framework-owned memory is reported through the framework's existing router event path. If needed, `tier_enter`/`tier_exit` reporting or `inventory_snapshot()` can be added to the KVCR API later.
 
-KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once. A DRAM addition is published when every declared piece is committed; it advertises the complete key. Removal withdraws that advertisement.
+KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once. A DRAM addition is published when all locally included pieces are committed; it advertises the source’s complete local share, not necessarily the entire key. Removal withdraws that advertisement.
 
 ### Request-scoped hints
 
