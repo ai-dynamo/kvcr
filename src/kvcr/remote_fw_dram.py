@@ -1127,7 +1127,7 @@ class _RemoteFWDram:
             )
             for descriptors in dst_descriptors:
                 self._kvcr._validate_descriptors(
-                    list(descriptors),
+                    descriptors,
                     regions=self._remote_agents_by_target[target_agent][2],
                     agent_name=target_agent,
                 )

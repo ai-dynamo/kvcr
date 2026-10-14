@@ -988,37 +988,39 @@ class _KVCRCore:
         normalized = []
         for ref in descriptors:
             if not isinstance(ref, MemoryRef):
-                raise ValueError("each block requires at least one MemoryRef")
+                raise ValueError(
+                    "block descriptors must contain only MemoryRef entries"
+                )
             normalized.append(
                 _TransferRef(ref.end_point_name, ref.element_index, ref.label)
             )
-        return self._validate_descriptors(normalized)
+        self._validate_descriptors(normalized)
+        return normalized
 
     def _validate_descriptors(
         self,
-        descriptors: list[_TransferRef],
+        descriptors: list[_TransferRef] | tuple[_TransferRef, ...],
         *,
         regions=None,
         agent_name: str | None = None,
-    ) -> list[_TransferRef]:
-        if not isinstance(descriptors, list):
-            raise TypeError("block descriptors must be a list")
+    ) -> None:
         if not descriptors:
             raise ValueError("each block requires at least one _TransferRef")
-        layout = []
+        labels = set()
         for ref in descriptors:
             region = self._region(ref, regions=regions, agent_name=agent_name)
-            block_size = self._block_sizes.get(ref.label.partition(":")[0])
-            if block_size is None:
+            pool, separator, part = ref.label.partition(":")
+            block_size = self._block_sizes.get(pool)
+            if block_size is None or (separator and part in ("", "*")):
                 raise ValueError("block descriptors must use configured pools")
             if region.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
-            layout.append(ref.label)
-        self._validate_block_layout(
-            layout,
-            "block descriptors must use configured pools",
-        )
-        return descriptors
+            if separator:
+                if ref.label in labels:
+                    raise ValueError("block part labels must be unique")
+                labels.add(ref.label)
+        if self._g3 is not None and (len(descriptors) != 1 or labels):
+            raise ValueError("G3 does not support multi-block layouts or part labels")
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
         if not layout:

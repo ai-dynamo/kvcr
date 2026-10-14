@@ -544,6 +544,8 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     now = 2.0
+    with pytest.raises(ValueError, match="G3 does not support"):
+        kvcr.deposit({first: [_mem_descriptor(0), _mem_descriptor(1)]})
     for layout in (["", ""], [":part"]):
         with pytest.raises(ValueError, match="G3 does not support"):
             kvcr.fetch((first,), expected_layout=layout)

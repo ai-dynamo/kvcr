@@ -989,6 +989,13 @@ def test_named_reference_validation_and_address_reporting():
     ref = MemoryRef(end_point_name="target", label="pool:layer:v:", element_index=2)
     [internal] = core._normalize_descriptors([ref])
     assert internal == _TransferRef("target", 2, "pool:layer:v:")
+    with pytest.raises(TypeError, match="must be a list"):
+        core._normalize_descriptors((ref,))
+    with pytest.raises(ValueError, match="part labels must be unique"):
+        core._normalize_descriptors([ref, ref])
+    with patch.object(core, "_g3", object()):
+        with pytest.raises(ValueError, match="G3 does not support"):
+            core._normalize_descriptors([ref])
     assert core._normalize_descriptors(
         [MemoryRef(end_point_name="target", label="pool:k", element_index=1)]
     ) == [_TransferRef("target", 1, "pool:k")]
@@ -1024,7 +1031,7 @@ def test_named_reference_validation_and_address_reporting():
         with pytest.raises(ValueError):
             core._normalize_descriptors([bad])
     for bad in (span, internal):
-        with pytest.raises(ValueError, match="MemoryRef"):
+        with pytest.raises(ValueError, match="must contain only MemoryRef entries"):
             core._normalize_descriptors([bad])
     with pytest.raises(ValueError, match="registration names must be unique"):
         _new_kvcr(
