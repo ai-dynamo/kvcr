@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Supply a compatible Dynamo vLLM nightly or PR image. The CI workflow resolves
+# this reference to a digest before building, so the recorded base is immutable.
+ARG DYNAMO_IMAGE
+FROM ${DYNAMO_IMAGE}
+
+USER root
+ARG DYNAMO_IMAGE
+ARG KVCR_COMMIT
+LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/kvcr" \
+      org.opencontainers.image.revision="${KVCR_COMMIT}" \
+      org.opencontainers.image.base.name="${DYNAMO_IMAGE}"
+
+# Recovery uses libatomic even though it is not a Python package dependency.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
+COPY src /opt/kvcr-src/src
+RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
+ && python3 -c "import kvcr; from importlib.metadata import version; print('kvcr==' + version('kvcr'))"
