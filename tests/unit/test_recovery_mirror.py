@@ -13,7 +13,7 @@ from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _TransferRef
 from kvcr.recovery_journal import (
     _RECORD_BLOCK,
-    _RECORD_G2_APPEND,
+    _RECORD_G2_READY,
     _RECOVERY_ENCODER,
     RecoveryMirrorError,
     _decode_recovery_record,
@@ -31,7 +31,7 @@ def _payload(record: _BlockRecord) -> bytes:
     return _RECOVERY_ENCODER.encode(_project_recovery_record(record))
 
 
-# Live-only fields are stripped; settled slots and position survive.
+# Live-only fields are stripped; reservations, readiness, and position survive.
 _FULLY_LOADED_RECORD = _BlockRecord(
     fw_mem=object(),
     local_dram=_LocalDramResidency(
@@ -54,26 +54,32 @@ _FULLY_LOADED_RECORD = _BlockRecord(
         (
             _FULLY_LOADED_RECORD,
             _ONE_POOL,
-            [[["", 3]], 5, 3],
+            [[["", 3]], 5, 3, None, []],
             replace(_recovered_record(g2=[("", 3)], g3=5), position=3),
         ),
         (
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
             _TWO_POOLS,
-            [[["full", 7], ["full", 2], ["swa", 9]], 5, -1],
+            [
+                [["full", 7], ["full", 2], ["swa", 9]],
+                5,
+                -1,
+                None,
+                [],
+            ],
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
         ),
-        (_BlockRecord(), _ONE_POOL, [None, None, -1], _BlockRecord()),
+        (_BlockRecord(), _ONE_POOL, [None, None, -1, None, []], _BlockRecord()),
         (
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
             _ONE_POOL,
-            [[[":a", 3], [":part:b:", 2]], None, 4],
+            [[[":a", 3], [":part:b:", 2]], None, 4, None, []],
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
         ),
         (
             replace(_recovered_record(g3=5), position=6),
             _ONE_POOL,
-            [None, 5, 6],
+            [None, 5, 6, None, []],
             replace(_recovered_record(g3=5), position=6),
         ),
         # A G2 slot still FILLING or DISCARDING never settled, so it must not wire.
@@ -82,7 +88,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             ),
             _ONE_POOL,
-            [None, None, -1],
+            [None, None, -1, None, []],
             _BlockRecord(),
         ),
         (
@@ -90,7 +96,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.DISCARDING)
             ),
             _ONE_POOL,
-            [None, None, -1],
+            [None, None, -1, None, []],
             _BlockRecord(),
         ),
         (
@@ -103,8 +109,20 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 )
             ),
             _ONE_POOL,
-            [[[":ready", 1]], None, -1],
-            _recovered_record(g2=[(":ready", 1)]),
+            [
+                [[":pending", 0], [":ready", 1]],
+                None,
+                -1,
+                None,
+                [":pending"],
+            ],
+            _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":pending", 0), (":ready", 1)],
+                    _LocalDramState.READY,
+                    pending_labels={":pending"},
+                )
+            ),
         ),
     ],
 )
@@ -114,7 +132,7 @@ def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
     wire: list[object],
     recovered: _BlockRecord,
 ) -> None:
-    """Settled slots and position survive; decode rebuilds other live state."""
+    """Reservations and readiness survive; decode rebuilds other live state."""
     encoded = _payload(record)
 
     # The outer record stays positional; G2 locations carry their pool names.
@@ -129,6 +147,8 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         g2: list[tuple[str, int]] | None = None
         g3: int | None = None
         position: int = -1
+        key_layout: tuple[str, ...] | None = None
+        pending_labels: tuple[str, ...] = ()
         appended: int = 0
 
     legacy = msgspec.msgpack.encode([[["", 3]], 5])
@@ -143,7 +163,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     assert upgraded.g3 == 5
     assert upgraded.position == 6
     assert upgraded.appended == 0
-    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, 42))
+    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, ("",), (), 42))
     assert _decode_recovery_record(future, _ONE_POOL) == positioned
 
 
@@ -162,70 +182,57 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),
         msgspec.msgpack.encode([None, 5, -2]),
+        msgspec.msgpack.encode([[[":a", 0]], None, -1, [":b"], []]),
+        msgspec.msgpack.encode([[[":a", 0]], None, -1, [":a"], [":unknown"]]),
+        msgspec.msgpack.encode([[[":a", 0]], None, -1, [":a"], [":a"]]),
     ],
 )
 def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:
     """A frame that does not decode to valid wire state is refused, not applied."""
-    mirror = _RecoveryMirror(_ONE_POOL)
+    mirror = _RecoveryMirror((*_ONE_POOL, "full"))
 
     with pytest.raises(RecoveryMirrorError, match="malformed"):
         mirror.apply(_RECORD_BLOCK, b"block", payload)
 
 
-def test_mirror_appends_in_place_and_preserves_positional_pool_duplicates() -> None:
+def test_mirror_completes_reserved_pieces_in_place() -> None:
     mirror = _RecoveryMirror(_ONE_POOL)
     key = BlockKey(b"layered")
-    first = replace(_recovered_record(g2=[(":b", 3)], g3=7), position=5)
-    mirror.apply(_RECORD_G2_APPEND, key, _payload(first))
+    first = _BlockRecord(
+        local_dram=_LocalDramResidency(
+            [(":a", 2), (":b", 3), (":c", 4)],
+            _LocalDramState.READY,
+            pending_labels={":a", ":c"},
+        ),
+        position=5,
+    )
+    mirror.apply(_RECORD_BLOCK, key, _payload(first))
     record = mirror._records[key]
     residency = record.local_dram
     slots = residency.slots
-    added = replace(
-        _recovered_record(g2=[(":a", 2), ("", 4), ("", 5)], g3=7), position=5
-    )
+    # Reject the whole delta before changing any readiness.
+    for invalid in (b"", [], [-1], [3], [0, 1], [0, 0], ["0"]):
+        with pytest.raises(RecoveryMirrorError, match="malformed"):
+            mirror.apply(_RECORD_G2_READY, key, msgspec.msgpack.encode(invalid))
+        assert record == first
 
-    mirror.apply(_RECORD_G2_APPEND, key, _payload(added))
+    mirror.apply(_RECORD_G2_READY, key, msgspec.msgpack.encode([0]))
 
     assert mirror._records[key] is record
     assert record.local_dram is residency
     assert residency.slots is slots
-    assert record == replace(
-        _recovered_record(g2=[(":b", 3), (":a", 2), ("", 4), ("", 5)], g3=7),
-        position=5,
-    )
-    assert residency.indices_by_label == {":b": 0, ":a": 1, "": None}
-    assert residency.ready_indices(["", ":b", "", ":a"], allow_subset=False) == [
-        2,
-        0,
-        3,
-        1,
-    ]
-    assert residency.ready_indices(["", ""]) is None
+    assert residency.pending_labels == {":c"}
+    assert residency.ready_indices([":b", ":a"]) == [1, 0]
+    assert residency.ready_indices([":c"]) is None
+    mirror.apply(_RECORD_G2_READY, key, msgspec.msgpack.encode([2]))
+    assert not residency.pending_labels
+    assert residency.key_layout == (":a", ":b", ":c")
 
-    # A G3-only snapshot drops old G2 pieces; a later append starts G2 afresh.
-    mirror.apply(_RECORD_BLOCK, key, _payload(_recovered_record(g3=7)))
-    mirror.apply(_RECORD_G2_APPEND, key, _payload(added))
-    assert mirror._records[key] == added
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"",
-        msgspec.msgpack.encode([None, 7, 8]),
-        msgspec.msgpack.encode([[[":new", 1], [":same", 2]], 7, 8]),
-    ],
-)
-def test_mirror_rejects_invalid_appends_before_mutating(payload: bytes) -> None:
-    mirror = _RecoveryMirror(_ONE_POOL)
-    key = BlockKey(b"layered")
-    original = replace(_recovered_record(g2=[(":same", 0)], g3=3), position=4)
-    mirror.apply(_RECORD_BLOCK, key, _payload(original))
-
+    # Retirement removes the reservation; a late completion cannot recreate it.
+    mirror.apply(_RECORD_BLOCK, key, _payload(_BlockRecord()))
     with pytest.raises(RecoveryMirrorError, match="malformed"):
-        mirror.apply(_RECORD_G2_APPEND, key, payload)
-
-    assert mirror._records == {key: original}
+        mirror.apply(_RECORD_G2_READY, key, msgspec.msgpack.encode([0]))
+    assert not mirror._records
 
 
 def test_mirror_replaces_blocks_whole_and_hands_them_over_uncopied() -> None:
@@ -304,6 +311,8 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
                 _LocalDramState.READY,
                 pending_labels={"full:a"},
                 pending_deposits=1,
+                remote_indices=(0,),
+                remote_cancelled=True,
             ),
         ),
     }
@@ -323,16 +332,26 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records is served
     assert mirror._records[ready].local_dram is residency
     assert not residency.refs  # A new agent must regenerate its own references.
-    assert not partial.pending_labels
+    assert partial.pending_labels == {"full:a"}
     assert partial.pending_deposits == 0
+    assert partial.remote_indices is None
+    assert not partial.remote_cancelled
     assert not partial.refs
     partial.prepare_label_index()
-    assert partial.indices_by_label == {"full:b": 0}
+    assert partial.indices_by_label == {"full:a": 0, "full:b": 1}
+    assert partial.ready_indices(["full:a"]) is None
+    assert partial.ready_indices(["full:b"]) == [1]
     assert mirror._records == framed
     assert mirror._records == {
         ready: replace(_recovered_record(g2=[("full", 0), ("swa", 10)]), position=7),
         spilled: _recovered_record(g3=3),
         filling_spill: _recovered_record(g3=4),
         discarding_spill: _recovered_record(g3=5),
-        partially_ready: _recovered_record(g2=[("full:b", 3)]),
+        partially_ready: _BlockRecord(
+            local_dram=_LocalDramResidency(
+                [("full:a", 2), ("full:b", 3)],
+                _LocalDramState.READY,
+                pending_labels={"full:a"},
+            ),
+        ),
     }

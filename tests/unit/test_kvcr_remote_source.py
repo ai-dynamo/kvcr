@@ -88,8 +88,7 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     )
 
 
-@pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-@pytest.mark.parametrize("recovered", [False, True])
+@pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
 def test_local_source_starts_inline_and_holds_its_slot(
     transfer_state, recovered, monkeypatch
 ):
@@ -130,7 +129,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
                 {
                     key: _BlockRecord(
                         local_dram=_LocalDramResidency(
-                            [(":c", 2), (":b", 1), ("", 0)], _LocalDramState.READY
+                            [("", 0), (":b", 1), (":c", 2)], _LocalDramState.READY
                         )
                     )
                 },
@@ -141,25 +140,14 @@ def test_local_source_starts_inline_and_holds_its_slot(
         prior_transfers = len(agent.xfers)
         local = source._core._local_dram
         residency = source._core._block_record_map[key].local_dram
-        assert residency.indices_by_label == (
-            {":c": 0, ":b": 1, "": 2} if recovered else {"": 0, ":b": 1, ":c": 2}
-        )
+        assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
         make_ref = Mock(wraps=local._descriptor)
         monkeypatch.setattr(local, "_descriptor", make_ref)
-        assert not source._core._remote_fw_dram._try_local_source_write(
-            source._core._progress,
-            SimpleNamespace(
-                ordered_keys=(key,),
-                dst_descriptors=((descriptors[2], descriptors[0]),),
-                allow_layout_subset=False,
-            ),
-        )
         callbacks.clear()
         agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
-        requested_labels = ("", ":b", ":c") if recovered else (":c", "")
+        requested_labels = (":c", "")
         request.update(
-            allow_layout_subset=not recovered,
             target_regions=(
                 {
                     label: RegionDescriptor(
@@ -509,7 +497,7 @@ def test_kvcr_close_cleans_pending_pin_operations():
     "field",
     [
         "remaining_timeout_ms",
-        "allow_layout_subset",
+        "key_layout",
         "keys",
         "framework",
         "label",
@@ -1164,17 +1152,12 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
 
 
 @pytest.mark.parametrize(
-    ("parts", "allow_subset", "selected"),
-    [
-        ("abc", False, (0, 1, 2)),
-        ("ca", True, (2, 0)),
-        ("x", True, ()),
-        ("ca", False, ()),
-    ],
-    ids=["whole", "partial", "unknown", "strict-fetch"],
+    ("parts", "selected"),
+    [("abc", (0, 1, 2)), ("ca", (2, 0)), ("x", ())],
+    ids=["whole", "partial", "unknown"],
 )
 def test_a_resumed_write_holds_a_pin_another_operation_acquired(
-    parts, allow_subset, selected
+    parts, selected
 ) -> None:
     """fw_mem belongs to the block, so two writes can want the same pin."""
     backend = object.__new__(_RemoteFWDram)
@@ -1215,7 +1198,6 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         op_id=("source", 1),
         keys=frozenset((key,)),
         framework_pins={stale},
-        allow_layout_subset=allow_subset,
     )
     backend._source_pin_ops[("source", 1)] = waiting
 

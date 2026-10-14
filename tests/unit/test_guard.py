@@ -35,7 +35,7 @@ from kvcr.local_dram import _LocalDramState
 from kvcr.memory import KVCRPoolSpec
 from kvcr.recovery_journal import (
     _RECORD_BLOCK,
-    _RECORD_G2_APPEND,
+    _RECORD_G2_READY,
     _RECOVERY_ENCODER,
     RecoveryJournalError,
     RecoveryMirrorError,
@@ -606,7 +606,7 @@ def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("reader", "malformed_append"),
+    ("reader", "malformed_ready"),
     [
         ("poll", False),
         ("poll", True),
@@ -619,7 +619,7 @@ def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
 )
 def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     reader: str,
-    malformed_append: bool,
+    malformed_ready: bool,
 ) -> None:
     """Which reader finds the invalid journal is a race; none may take the service."""
     guard = _configurable_guard()
@@ -630,8 +630,8 @@ def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     guard._control = None
     journal = Mock()
     error = RecoveryJournalError("recovery journal is invalid")
-    if malformed_append:
-        frame = (_RECORD_G2_APPEND, b"broken", b"invalid")
+    if malformed_ready:
+        frame = (_RECORD_G2_READY, b"broken", b"invalid")
         journal.read_next.return_value = frame
         journal.drain.return_value = iter([frame])
     else:

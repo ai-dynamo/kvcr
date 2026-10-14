@@ -170,9 +170,13 @@ class KVCR:
         blocks: Mapping[BlockKey, list[MemoryRef]],
         no_evict: bool = False,
         hints: object | None = None,
+        *,
+        expected_layout: list[str] | None = None,
     ) -> OpHandle:
-        """Asynchronously copy blocks or named parts into KVCR-managed storage."""
-        return self._core.deposit(blocks, no_evict, hints)
+        """Deposit pieces with a fixed expected layout."""
+        return self._core.deposit(
+            blocks, no_evict, hints, expected_layout=expected_layout
+        )
 
     def fetch(
         self,
@@ -181,7 +185,7 @@ class KVCR:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        """Fetch blocks into KVCR storage; local requests may select named pieces."""
+        """Fetch every piece of the full ordered expected layout."""
         return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(

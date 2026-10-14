@@ -97,7 +97,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
     observed: list[tuple[BlockKey, int | None]] = []
 
-    def observe(key: BlockKey, record: _BlockRecord, added_slots=None) -> None:
+    def observe(key: BlockKey, record: _BlockRecord, ready_indices=None) -> None:
         residency = record.local_dram
         if residency is None:
             assert 0 not in backend._free_slots
@@ -535,9 +535,18 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
         ["named:*"],
         ["named:part", "named:part"],
         ["missing:part"],
+        [],
+        ["named:part", "!missing:part"],
+        ["!named:part"],
+        ["named:part", "!named:part"],
+        ["named", "!named"],
+        ["!named", "named"],
+        ["named:part", "!missing:*"],
     ):
         with pytest.raises(ValueError):
             kvcr.fetch((BlockKey(b"key"),), expected_layout=layout)
+        with pytest.raises(ValueError):
+            kvcr.deposit({}, expected_layout=layout)
 
 
 def _assert_state_lock_available(core) -> None:

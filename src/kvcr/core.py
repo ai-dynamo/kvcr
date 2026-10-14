@@ -25,7 +25,12 @@ from .config import (
 )
 from .hint_parser import _KVFetchHint
 from .local_disk import _G3, _G3Residency
-from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
+from .local_dram import (
+    _layout_indices,
+    _LocalDram,
+    _LocalDramResidency,
+    _LocalDramState,
+)
 from .policy import G3LRUPolicy, LRUPolicy
 from .policy_runtime import _PolicyInvoker
 from .progress import (
@@ -568,7 +573,10 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[MemoryRef]],
         no_evict: bool = False,
         hints: object | None = None,
+        *,
+        expected_layout: list[str] | None = None,
     ) -> OpHandle:
+        declaration = self._validate_expected_layout(expected_layout)
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         if self._local_dram is not None:
@@ -576,6 +584,23 @@ class _KVCRCore:
                 key: self._normalize_descriptors(descriptors)
                 for key, descriptors in blocks.items()
             }
+            if declaration is not None:
+                local_layout = list(declaration)
+                indices = {}
+                for index, label in enumerate(local_layout):
+                    indices[label] = None if label in indices else index
+                if any(
+                    _layout_indices(
+                        local_layout,
+                        [ref.label for ref in refs],
+                        indices_by_label=indices,
+                    )
+                    is None
+                    for refs in blocks.values()
+                ):
+                    raise ValueError(
+                        "deposit pieces must belong to the local key layout"
+                    )
         with self._state_lock:
             if self._local_dram is None:
                 self._complete(
@@ -588,6 +613,7 @@ class _KVCRCore:
                     blocks,
                     no_evict=no_evict,
                     hints=hints,
+                    key_layout=declaration,
                 )
         return op_handle
 
@@ -598,10 +624,10 @@ class _KVCRCore:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        expected_layout = [""] if expected_layout is None else list(expected_layout)
-        self._validate_block_layout(
-            expected_layout, "expected layout must use configured pools"
+        declaration = self._validate_expected_layout(
+            [""] if expected_layout is None else expected_layout
         )
+        requested = list(declaration)
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -616,7 +642,12 @@ class _KVCRCore:
 
             sources = {}
             for key in ordered_keys:
-                if self._is_local_resident(key):
+                record = self._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if (
+                    residency is not None
+                    and residency.fetch_slots(requested) is not None
+                ):
                     continue
                 if self._g3 is not None and self._g3.is_ready(key):
                     sources[key] = CacheTier.G3
@@ -632,7 +663,8 @@ class _KVCRCore:
                 request_id,
                 deadline,
                 hints=hints,
-                layout=expected_layout,
+                layout=requested,
+                key_layout=declaration,
             )
             for source in (CacheTier.G3, CacheTier.REMOTE_G2):
                 self._start_local_fill(
@@ -949,12 +981,14 @@ class _KVCRCore:
         keys: Collection[BlockKey],
         *,
         notify_capacity: bool = True,
+        allow_filling: bool = False,
     ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
                 tuple(key for key in keys if key not in sources),
                 notify_capacity=notify_capacity,
+                allow_filling=allow_filling,
             )
             if claimed:
                 sources.update(claimed)
@@ -1015,7 +1049,11 @@ class _KVCRCore:
             region = self._region(ref, regions=regions, agent_name=agent_name)
             pool, separator, part = ref.label.partition(":")
             block_size = self._block_sizes.get(pool)
-            if block_size is None or (separator and part in ("", "*")):
+            if (
+                ref.label.startswith("!")
+                or block_size is None
+                or (separator and part in ("", "*"))
+            ):
                 raise ValueError("block descriptors must use configured pools")
             if region.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
@@ -1032,7 +1070,11 @@ class _KVCRCore:
         labels = set()
         for label in layout:
             pool, separator, part = label.partition(":")
-            if pool not in self._block_sizes or (separator and part in ("", "*")):
+            if (
+                label.startswith("!")
+                or pool not in self._block_sizes
+                or (separator and part in ("", "*"))
+            ):
                 raise ValueError(invalid_message)
             if separator:
                 if label in labels:
@@ -1040,6 +1082,18 @@ class _KVCRCore:
                 labels.add(label)
         if self._g3 is not None and (len(layout) != 1 or labels):
             raise ValueError("G3 does not support multi-block layouts or part labels")
+
+    def _validate_expected_layout(
+        self, layout: list[str] | None
+    ) -> tuple[str, ...] | None:
+        if layout is None:
+            return None
+        if any(not isinstance(label, str) for label in layout):
+            raise ValueError("expected layout labels must be strings")
+        self._validate_block_layout(
+            layout, "expected layout must include configured local pools"
+        )
+        return tuple(layout)
 
     def _release_local_dram_sources(
         self,
