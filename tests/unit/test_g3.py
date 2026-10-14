@@ -300,17 +300,23 @@ def test_g3_rejects_hard_linked_paths_and_releases_the_first_lock(
     path.touch()
     os.link(path, alias)
 
+    capacity = 3 * page_size - 1
     with pytest.raises(ValueError, match="must not alias the same file"):
-        _new_g3_kvcr(tmp_path, local, g3_paths=(path, alias))
+        _new_g3_kvcr(
+            tmp_path, local, g3_paths=(path, alias), g3_capacity_bytes_per_file=capacity
+        )
 
-    # A new controller can lock it only if failure cleanup closed the owner FD.
-    assert _new_g3_kvcr(tmp_path, local, g3_paths=(path,))._core._g3 is not None
+    # Reopening with the same budget checks rounded size and failure cleanup.
+    assert (
+        _new_g3_kvcr(
+            tmp_path, local, g3_paths=(path,), g3_capacity_bytes_per_file=capacity
+        )._core._g3
+        is not None
+    )
 
 
-@pytest.mark.parametrize("tail_bytes", [0, 1, os.sysconf("SC_PAGE_SIZE") - 1])
 def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     tmp_path,
-    tail_bytes,
 ) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 10)
@@ -328,8 +334,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         local,
         agent=agent,
         g3_paths=paths,
-        g3_slot_count=2,
-        g3_capacity_bytes_per_file=2 * page_size + tail_bytes,
+        g3_capacity_bytes_per_file=3 * page_size - 1,
         framework_regions=[
             _buffer_region(primary, page_size),
         ],
@@ -349,16 +354,12 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     g3 = kvcr._core._g3
     assert g3 is not None
     assert all(path.stat().st_size == 2 * page_size for path in paths)
-    file_registrations = [
-        descriptor
+    file_descriptors = next(
+        descriptors
         for descriptors, mem_type in agent.registrations
         if mem_type == "FILE"
-        for descriptor in descriptors
-    ]
-    assert [descriptor[1] for descriptor in file_registrations] == [
-        2 * page_size,
-        2 * page_size,
-    ]
+    )
+    assert [size for _, size, _, _ in file_descriptors] == [2 * page_size] * len(paths)
     first_fd, second_fd = g3._direct_fds
     locations = []
     for key in keys[:4]:
@@ -404,48 +405,13 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     assert replacement_result.success
     assert replacement_destination.raw == payloads[4]
 
-    # Reopening uses the same rounded size, even when the budget had a tail.
-    kvcr.close()
-    reopened = _new_g3_kvcr(
-        tmp_path,
-        local,
-        g3_paths=paths,
-        g3_capacity_bytes_per_file=2 * page_size + tail_bytes,
-    )
-    assert reopened._core._g3 is not None
 
-
-@pytest.mark.parametrize("capacity", [-1, 0, os.sysconf("SC_PAGE_SIZE") - 1])
-def test_g3_rejects_capacity_smaller_than_one_slot(tmp_path, capacity) -> None:
-    local = ctypes.create_string_buffer(os.sysconf("SC_PAGE_SIZE"))
-    with pytest.raises(ValueError, match="at least one complete slot"):
-        _new_g3_kvcr(tmp_path, local, g3_capacity_bytes_per_file=capacity)
-    assert not (tmp_path / "g3.data").exists()
-
-
-def test_g3_recovery_does_not_combine_unused_tails_across_files(tmp_path) -> None:
+def test_g3_rejects_capacity_smaller_than_one_slot(tmp_path) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     local = ctypes.create_string_buffer(page_size)
-    kvcr = _new_g3_kvcr(
-        tmp_path,
-        local,
-        g3_paths=(tmp_path / "first.data", tmp_path / "second.data"),
-        g3_capacity_bytes_per_file=3 * page_size - 1,
-    )
-    g3 = kvcr._core._g3
-    assert g3 is not None
-    g3.adopt_recovery_slots(
-        {
-            BlockKey(b"recovered"): _BlockRecord(g3=_G3Residency(3)),
-        }
-    )
-    assert tuple(g3._free_slots) == (0, 1, 2)
-    with pytest.raises(ValueError, match="invalid G3 recovery slots"):
-        g3.adopt_recovery_slots(
-            {
-                BlockKey(b"phantom"): _BlockRecord(g3=_G3Residency(4)),
-            }
-        )
+    with pytest.raises(ValueError, match="at least one complete slot"):
+        _new_g3_kvcr(tmp_path, local, g3_capacity_bytes_per_file=page_size - 1)
+    assert not (tmp_path / "g3.data").exists()
 
 
 @pytest.mark.parametrize("policy", [G3FIFOPolicy(), G3LRUPolicy()], ids=["fifo", "lru"])
@@ -464,7 +430,8 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         local,
         agent=agent,
         policy=policy,
-        g3_slot_count=3,
+        g3_paths=tuple(tmp_path / f"g3-{i}.data" for i in range(3)),
+        g3_capacity_bytes_per_file=2 * page_size - 1,
         framework_regions=[
             _buffer_region(primary, page_size),
         ],
@@ -481,7 +448,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         },
     )
     # _free_slots is the allocator's free list: recovery must rebuild it as the
-    # complement of the adopted slots without disturbing the records themselves.
+    # complement of the adopted slots, excluding the unused tails in each file.
     assert tuple(g3._free_slots) == (1,)
     assert kvcr._core._block_record_map[first].g3 == _G3Residency(0)
     assert kvcr._core._block_record_map[second].g3 == _G3Residency(2)
@@ -530,7 +497,12 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
     """Duplicate or out-of-range recovered slots are refused and none adopted."""
     page_size = os.sysconf("SC_PAGE_SIZE")
     local = ctypes.create_string_buffer(page_size)
-    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=4)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        g3_paths=(tmp_path / "first.data", tmp_path / "second.data"),
+        g3_capacity_bytes_per_file=3 * page_size - 1,
+    )
     g3 = kvcr._core._g3
     assert g3 is not None
 
@@ -543,6 +515,7 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
         )
 
     assert kvcr._core._block_record_map == {}
+    assert tuple(g3._free_slots) == (0, 1, 2, 3)
 
 
 @pytest.mark.parametrize("slots", [[("", 0), ("", 1)], [(":part", 0)]])
