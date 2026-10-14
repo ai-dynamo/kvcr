@@ -54,6 +54,7 @@ from .types import (
 
 if TYPE_CHECKING:
     from .core import _KVCRCore
+    from .local_dram import _LocalDramResidency
 
 
 _MEMORY_REF_LISTS_TYPE = tuple[tuple[_TransferRef, ...], ...]
@@ -154,6 +155,22 @@ class _TargetPullOp(_RemoteOp):
             self.state = _TargetPullState.WAITING_WRITE_DONE
             return False, True
 
+        if not self.uncertain and isinstance(event, Mapping):
+            for completion in event.get("completed_waves", ()):
+                if self.state is not _TargetPullState.WAITING_WRITE_DONE and not (
+                    completion.get("confirmed", False)
+                ):
+                    continue
+                try:
+                    indices = _notification_completed_indices(
+                        completion, len(self.ordered_keys)
+                    )
+                except TypeError:
+                    cancelled = True
+                    break
+                self.completed_keys.update(self.ordered_keys[i] for i in indices)
+            self.success = bool(self.completed_keys)
+
         if (
             self.state
             in (
@@ -188,9 +205,10 @@ class _TargetPullOp(_RemoteOp):
             except TypeError:
                 success = False
                 completed_keys = set()
-            all_completed = success and completed_keys == self.keys
-            self.success = success
-            self.completed_keys = completed_keys
+            self.completed_keys.update(completed_keys)
+            completed_keys = self.completed_keys
+            all_completed = completed_keys == self.keys
+            self.success = success or bool(completed_keys)
             self.state = _TargetPullState.FINISHED
             if completed_keys:
                 backend._record_progress_counter(
@@ -282,6 +300,7 @@ class _SourcePinOp(_Op):
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
+    write_in_flight: bool = False
 
 
 @dataclass
@@ -308,6 +327,7 @@ class _SourceWriteOp(_RemoteOp):
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
+    terminal: bool = True
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -326,9 +346,7 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
-                backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, False
-                )
+                self.notify_failure(progress)
                 self.success = False
                 self.state = _SourceWriteState.FINISHED
                 backend._record_progress_duration(
@@ -350,7 +368,11 @@ class _SourceWriteOp(_RemoteOp):
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, True
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    True,
+                    confirmed_indices=status.completed_indices,
                 )
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
@@ -372,6 +394,8 @@ class _SourceWriteOp(_RemoteOp):
                         self.op_handle,
                         True,
                         completed_indices=self.completed_indices,
+                        terminal=self.terminal,
+                        confirmed_indices=status.completed_indices,
                     ),
                     capture_telemetry=backend._telemetry_enabled,
                 )
@@ -401,9 +425,7 @@ class _SourceWriteOp(_RemoteOp):
                     "transfer_submit", submit_started_at, "failed"
                 )
                 self.success = False
-                backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, False
-                )
+                self.notify_failure(progress)
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
@@ -438,7 +460,7 @@ class _SourceWriteOp(_RemoteOp):
                 ("source_write",),
             )
         else:
-            backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
+            self.notify_failure(progress)
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
         if logger.isEnabledFor(logging.DEBUG):
@@ -468,11 +490,22 @@ class _SourceWriteOp(_RemoteOp):
             ):
                 return False
             self.transfer_id = None
-        self._backend._send_write_done(
-            progress, self.remote_agent, self.op_handle, False
-        )
+        self.notify_failure(progress)
         self._backend._dangling_ops.finish_source(self)
         return True
+
+    def notify_failure(self, progress: _KVCRProgress, *, terminal: bool = True) -> None:
+        status = self._backend._dangling_ops.source_writes[
+            (self.route[0], self.op_handle)
+        ]
+        self._backend._send_write_done(
+            progress,
+            self.remote_agent,
+            self.op_handle,
+            False,
+            terminal=terminal,
+            confirmed_indices=status.completed_indices,
+        )
 
 
 @dataclass(frozen=True)
@@ -540,7 +573,7 @@ class _RemoteFWDram:
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
-        self._refused_writes: dict[_OpId, dict[str, bool]] = {}
+        self._refused_writes: dict[_OpId, dict[str, Any]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
@@ -717,9 +750,16 @@ class _RemoteFWDram:
                         self._kvcr._remove_block_dependencies(item)
                         if item.success:
                             self._kvcr._record_access(
-                                self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
+                                self._kvcr._local_dram_sources_by_op.get(
+                                    item.op_id, {}
+                                ).keys()
+                                & item.keys
                             )
-                        self._kvcr._release_local_dram_sources(item.op_id)
+                        self._kvcr._release_local_dram_sources(item.op_id, item.keys)
+                        if pending := self._source_pin_ops.get(item.op_id):
+                            pending.write_in_flight = False
+                            if not item.success:
+                                self._remove_source_pin(item.op_id, pending)
                     if pins is not None:
                         self._release_framework_pins(pins)
                 else:
@@ -755,6 +795,8 @@ class _RemoteFWDram:
             self._process_pending_pin_results()
             now = self._kvcr._clock()
             for op_id, op in list(self._source_pin_ops.items()):
+                if op.write_in_flight:
+                    continue
                 if now >= op.deadline:
                     logger.warning("KVCR operation %r expired", op_id)
                     self._expire_source_pin(op_id, op)
@@ -883,7 +925,15 @@ class _RemoteFWDram:
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
             if not events.get(op_id, {}).get("terminal"):
-                events[op_id] = refusal
+                event = events.setdefault(op_id, {})
+                if refusal.get("confirmed_indices"):
+                    event.setdefault("completed_waves", []).append(
+                        {
+                            "completed_indices": refusal["confirmed_indices"],
+                            "confirmed": True,
+                        }
+                    )
+                event.update(refusal, terminal=True)
         self._refused_writes.clear()
         observed_work |= bool(events)
         return events, observed_work
@@ -909,7 +959,13 @@ class _RemoteFWDram:
         for (target, handle), status in self._dangling_ops.source_writes.items():
             cached = self._remote_agents_by_target.get(target)
             if not status.submitted and cached is not None:
-                self._send_write_done(self._kvcr._progress, cached[1], handle, False)
+                self._send_write_done(
+                    self._kvcr._progress,
+                    cached[1],
+                    handle,
+                    False,
+                    confirmed_indices=status.completed_indices,
+                )
         close_control = getattr(self._control, "close", None)
         if close_control is not None:
             close_control()
@@ -1158,7 +1214,13 @@ class _RemoteFWDram:
         write_id = (target_agent, OpHandle(op_handle))
         if status := self._dangling_ops.source_writes.get(write_id):
             if status.cancel_requested and not status.submitted:
-                self._send_write_done(progress, remote_agent, op_handle, False)
+                self._send_write_done(
+                    progress,
+                    remote_agent,
+                    op_handle,
+                    False,
+                    confirmed_indices=status.completed_indices,
+                )
             return
         expected = payload.get("source_incarnation")
         if (
@@ -1285,6 +1347,7 @@ class _RemoteFWDram:
         op_id: _OpId,
         source_pin: _SourcePinOp,
         *,
+        local_sources: Mapping[BlockKey, "_LocalDramResidency"] | None = None,
         force_failure: bool = False,
     ) -> None:
         kvcr = self._kvcr
@@ -1296,9 +1359,10 @@ class _RemoteFWDram:
             # the same handle back for a reused name, so submitting would
             # write the dead generation's destinations through the new route.
             force_failure = True
-        local_sources = kvcr._claim_local_dram_sources(
-            source_pin.op_id, source_pin.keys
-        )
+        if local_sources is None:
+            local_sources = kvcr._claim_local_dram_sources(
+                source_pin.op_id, source_pin.keys, allow_filling=True
+            )
         framework_sources = {
             key: record.fw_mem.descriptors
             for key in source_pin.keys
@@ -1308,7 +1372,7 @@ class _RemoteFWDram:
         }
         completed_indices = []
         selected_sources = []
-        waiting = False
+        pending_keys = set()
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
                 continue
@@ -1338,7 +1402,7 @@ class _RemoteFWDram:
                     and residency.state is not _LocalDramState.DISCARDING
                     and residency.can_wait_for_pieces(labels)
                 ):
-                    waiting = True
+                    pending_keys.add(key)
                     continue
             else:
                 indices = _layout_indices(layout, labels)
@@ -1348,10 +1412,6 @@ class _RemoteFWDram:
                     source_pin.op_handle,
                     key,
                 )
-                source_pin.keys -= {key}
-                record = kvcr._block_record_map[key]
-                record.discard_in_flight_op(op_id)
-                kvcr._prune_block_record(key)
                 continue
             completed_indices.append(index)
             selected_sources.append(
@@ -1359,15 +1419,28 @@ class _RemoteFWDram:
                 if residency is not None
                 else tuple(source[span] for span in indices)
             )
+        if pending_keys and not completed_indices:
+            if pending_keys != source_pin.keys or source_pin.framework_pins:
+                kvcr._release_local_dram_sources(
+                    source_pin.op_id, local_sources.keys() - pending_keys
+                )
+                kvcr._remove_block_dependencies(source_pin)
+                source_pin.keys = frozenset(pending_keys)
+                kvcr._add_block_dependencies(source_pin, new_operation=True)
+                unused_pins = source_pin.framework_pins
+                source_pin.framework_pins = set()
+                self._release_framework_pins(unused_pins)
+            return
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
         )
 
-        retained_keys = source_pin.keys if waiting else set(completed_keys)
-        kvcr._release_local_dram_sources(op_id, local_sources.keys() - retained_keys)
+        kvcr._release_local_dram_sources(
+            source_pin.op_id, local_sources.keys() - set(completed_keys) - pending_keys
+        )
         relevant_pins = {
             record.fw_mem.pin_handle
-            for key in retained_keys
+            for key in completed_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
@@ -1377,13 +1450,16 @@ class _RemoteFWDram:
         # release from unpinning it mid-read.
         framework_pins = set(relevant_pins)
         unused_pins = source_pin.framework_pins - framework_pins
-        if waiting:
-            source_pin.framework_pins = framework_pins
-            self._release_framework_pins(unused_pins)
-            return
         source_pin.framework_pins.clear()
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
+        write_keys = frozenset(completed_keys or source_pin.keys)
+        if pending_keys:
+            # Keep missing pieces pending; serialize writes under the same wire handle.
+            source_pin.keys = frozenset(pending_keys)
+            source_pin.write_in_flight = True
+            self._source_pin_ops[op_id] = source_pin
+            kvcr._add_block_dependencies(source_pin, new_operation=True)
 
         source_write = _SourceWriteOp(
             state=(
@@ -1391,7 +1467,7 @@ class _RemoteFWDram:
                 if not force_failure
                 else _SourceWriteState.NOTIFY_FAILURE
             ),
-            keys=frozenset(completed_keys or source_pin.keys),
+            keys=write_keys,
             started_at=source_pin.started_at,
             deadline=source_pin.deadline,
             op_id=source_pin.op_id,
@@ -1406,6 +1482,7 @@ class _RemoteFWDram:
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
+            terminal=not pending_keys,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1540,7 +1617,7 @@ class _RemoteFWDram:
         self._resume_source_pin(op.op_id, op)
 
     def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
-        if self._source_pin_ops.get(op_id) is not op:
+        if self._source_pin_ops.get(op_id) is not op or op.write_in_flight:
             return
         kvcr = self._kvcr
         if kvcr._clock() >= op.deadline:
@@ -1550,12 +1627,13 @@ class _RemoteFWDram:
         local_sources = kvcr._claim_local_dram_sources(
             op.op_id, op.keys, allow_filling=True
         )
-        unresolved_keys = tuple(
-            key
-            for key in op.ordered_keys
-            if key in op.keys and key not in local_sources
-        )
-        if unresolved_keys and not op.framework_acquire_attempted:
+        if not op.framework_acquire_attempted and (
+            unresolved_keys := tuple(
+                key
+                for key in op.ordered_keys
+                if key in op.keys and key not in local_sources
+            )
+        ):
             if any(
                 not kvcr._framework_pin_keys[pin].isdisjoint(unresolved_keys)
                 for pin in self._releasing_framework_pins
@@ -1572,7 +1650,7 @@ class _RemoteFWDram:
                 _, framework_pins = framework_sources
                 op.framework_pins.update(framework_pins)
 
-        self._submit_prepared_source_write(op_id, op)
+        self._submit_prepared_source_write(op_id, op, local_sources=local_sources)
 
     def _remove_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         self._cancel_pending_pin_for_op(op_id, op)
@@ -1966,11 +2044,34 @@ class _RemoteFWDram:
                     op_id = ("target", op_handle)
                     previous = events.get(op_id, {})
                     terminal = payload.get("terminal", True) is True
+                    # Preserve completed waves when a later wave fails in this poll.
+                    completions = previous.get("completed_waves", [])
+                    if payload.get("confirmed_indices"):
+                        completions.append(
+                            {
+                                "completed_indices": payload["confirmed_indices"],
+                                "confirmed": True,
+                            }
+                        )
+                    if (
+                        not terminal
+                        and payload.get("success") is True
+                        and not previous.get("cancelled", False)
+                    ):
+                        completions.append(
+                            {"completed_indices": payload.get("completed_indices")}
+                        )
                     cancelled = previous.get("cancelled", False) or not payload.get(
                         "success", False
                     )
+                    if previous.get("terminal", False) and not terminal:
+                        payload = previous.copy()
                     terminal |= previous.get("terminal", False)
-                    payload.update(terminal=terminal, cancelled=cancelled)
+                    payload.update(
+                        terminal=terminal,
+                        cancelled=cancelled,
+                        completed_waves=completions,
+                    )
                     events[op_id] = payload
         except Exception:
             logger.warning("KVCR notification receive failed", exc_info=True)
@@ -2047,6 +2148,7 @@ class _RemoteFWDram:
         success: bool,
         *,
         terminal: bool = True,
+        confirmed_indices: tuple[int, ...] = (),
     ) -> None:
         agent = progress.nixl_agent
         send_notif = getattr(agent, "send_notif", None)
@@ -2058,7 +2160,13 @@ class _RemoteFWDram:
             return
         try:
             result = send_notif(
-                remote_agent, _write_done_notif(op_handle, success, terminal=terminal)
+                remote_agent,
+                _write_done_notif(
+                    op_handle,
+                    success,
+                    terminal=terminal,
+                    confirmed_indices=confirmed_indices,
+                ),
             )
         except Exception:
             logger.warning(
@@ -2113,6 +2221,7 @@ def _write_done_notif(
     completed_indices: tuple[int, ...] = (),
     *,
     terminal: bool = True,
+    confirmed_indices: tuple[int, ...] = (),
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": "write_done",
@@ -2123,6 +2232,9 @@ def _write_done_notif(
         payload["completed_indices"] = completed_indices
     if not terminal:
         payload["terminal"] = False
+    if confirmed_indices:
+        # Standalone failure notifications can overtake earlier native completions.
+        payload["confirmed_indices"] = confirmed_indices
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)
 
 

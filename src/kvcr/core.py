@@ -1020,9 +1020,11 @@ class _KVCRCore:
         allow_filling: bool = False,
     ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
-        if self._local_dram is not None:
+        if self._local_dram is not None and (
+            unclaimed := tuple(key for key in keys if key not in sources)
+        ):
             claimed = self._local_dram.acquire_sources(
-                tuple(key for key in keys if key not in sources),
+                unclaimed,
                 notify_capacity=notify_capacity,
                 allow_filling=allow_filling,
             )
