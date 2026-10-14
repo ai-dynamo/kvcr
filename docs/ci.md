@@ -1,23 +1,42 @@
 # CI integration image
 
-The **Docker Build** GitHub Actions workflow builds a thin KVCR layer on a
-prebuilt Dynamo vLLM image using `Dockerfile.ci`. Use **Run workflow** in the
+The **Docker Build** GitHub Actions workflow installs Dynamo nightly wheels and
+KVCR on a prebuilt vLLM image using `Dockerfile.ci`. Use **Run workflow** in the
 Actions tab and supply:
 
-- `base_image`: a compatible Dynamo vLLM nightly or PR image, including its
-  registry and tag or digest. This selects the Dynamo and vLLM revisions used
-  by the test; they are inherited from the base rather than built from source.
+- `base_image`: defaults to `vllm/vllm-openai:nightly`. Supply a compatible
+  vLLM nightly or PR image tag or digest to select a specific backend build.
+- `dynamo_version`: defaults to `nightly`, resolving the latest prerelease
+  `ai-dynamo` wheel from NVIDIA's package index. Supply an exact version such
+  as `1.6.0.dev20261014` to reproduce a specific nightly. Its dependency selects
+  the matching `ai-dynamo-runtime` wheel.
 - `kvcr_ref`: optionally, the KVCR ref to check out, such as
   `refs/pull/23/merge`. If omitted, the workflow builds its selected revision.
 
 The workflow keeps the CI recipe from its selected revision and checks out the
 requested KVCR source separately, so older PR refs do not need to contain
 `Dockerfile.ci`. It sets up Docker Buildx, pulls the base for
-`linux/amd64`, resolves its digest, and installs KVCR from that checkout. It
+`linux/amd64`, resolves its digest, installs Dynamo's wheels, and installs KVCR
+from that checkout. No Dynamo source compilation or vLLM source overlay is
+required. Dynamo is installed without the `[vllm]` extra to keep the selected
+backend, and constraints preserve the base's vLLM, torch, NumPy, and protobuf
+versions. Only Dynamo's version resolution enables prereleases; installing the
+resolved version does not enable prereleases for unrelated dependencies. It
 loads the resulting image into the local Docker daemon with the tag
 `kvcr-vllm-e2e:<checked-out KVCR commit SHA>`. The image labels record the KVCR
 SHA and resolved base image. A `kvcr-build-metadata` artifact records the same
-inputs, including the originally requested base reference, for seven days.
+inputs, the installed package versions, and Dynamo's pip installation report
+(including downloaded wheel URLs and hashes) for seven days. These reports are
+also stored in the image under `/opt/kvcr-*.json`.
+The build preserves the base's installed NCCL version, rejects dependency
+conflicts introduced by installation, and checks the Dynamo
+router-hint imports and vLLM KVCR adapter against the newly installed package.
+An older adapter can fail this check even when installing KVCR itself succeeds.
+The inherited vLLM API-server entrypoint is cleared so tests can launch Dynamo.
+
+Dynamo's [nightly wheel installation instructions](https://docs.nvidia.com/dynamo/latest/reference/nightly-releases)
+describe the NVIDIA prerelease index. Floating nightly inputs can change between
+builds; use the recorded base digest and installed Dynamo version for reproduction.
 
 The build runs locally on `ubuntu-latest`. The runner needs enough disk for the
 base image, build layers, and loaded result. Private base images require registry
@@ -34,11 +53,13 @@ its local image disappears with the runner.
 To build the same layer locally:
 
 ```bash
-export DYNAMO_IMAGE='<compatible-dynamo-vllm-image>'
+export VLLM_IMAGE=vllm/vllm-openai:nightly
+export DYNAMO_VERSION=nightly
 export KVCR_COMMIT=$(git rev-parse HEAD)
 docker buildx build --load --platform linux/amd64 \
   --file Dockerfile.ci \
-  --build-arg DYNAMO_IMAGE="$DYNAMO_IMAGE" \
+  --build-arg VLLM_IMAGE="$VLLM_IMAGE" \
+  --build-arg DYNAMO_VERSION="$DYNAMO_VERSION" \
   --build-arg KVCR_COMMIT="$KVCR_COMMIT" \
   --tag "kvcr-vllm-e2e:$KVCR_COMMIT" \
   .

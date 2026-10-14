@@ -7,9 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: Dynamo vLLM image reference (nightly or PR image)
+        description: vLLM image reference (nightly or PR image)
         required: true
         type: string
+        default: vllm/vllm-openai:nightly
+      dynamo_version:
+        description: Dynamo wheel version, or nightly for the latest prerelease
+        required: true
+        type: string
+        default: nightly
       kvcr_ref:
         description: KVCR ref to test (optional; e.g. refs/pull/23/merge)
         required: false
@@ -45,6 +51,7 @@ jobs:
         id: source
         env:
           BASE_IMAGE: ${{ inputs.base_image }}
+          DYNAMO_VERSION: ${{ inputs.dynamo_version }}
         run: |
           set -euo pipefail
           kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
@@ -58,8 +65,10 @@ jobs:
             --arg requested_base_image "$BASE_IMAGE" \
             --arg resolved_base_image "$base_image" \
             --arg image_tag "$image_tag" \
+            --arg dynamo_version "$DYNAMO_VERSION" \
             '{kvcr_sha: $kvcr_sha, requested_base_image: $requested_base_image,
-              resolved_base_image: $resolved_base_image, image_tag: $image_tag}' \
+              resolved_base_image: $resolved_base_image, image_tag: $image_tag,
+              requested_dynamo_version: $dynamo_version}' \
             > "$RUNNER_TEMP/kvcr-build-metadata.json"
 
       # Keep the local build separate from setup so it can later be routed
@@ -74,17 +83,26 @@ jobs:
           load: true
           tags: ${{ steps.source.outputs.image_tag }}
           build-args: |
-            DYNAMO_IMAGE=${{ steps.source.outputs.base_image }}
+            VLLM_IMAGE=${{ steps.source.outputs.base_image }}
+            DYNAMO_VERSION=${{ inputs.dynamo_version }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
 
       - name: Verify local image
         env:
           IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
-        run: docker image inspect "$IMAGE_TAG"
+        run: |
+          docker image inspect "$IMAGE_TAG"
+          docker run --rm --entrypoint cat "$IMAGE_TAG" \
+            /opt/kvcr-build-metadata.json > "$RUNNER_TEMP/kvcr-installed-packages.json"
+          docker run --rm --entrypoint cat "$IMAGE_TAG" \
+            /opt/kvcr-dynamo-install-report.json > "$RUNNER_TEMP/kvcr-dynamo-install-report.json"
 
       - name: Save build metadata
         uses: actions/upload-artifact@v4
         with:
           name: kvcr-build-metadata
-          path: ${{ runner.temp }}/kvcr-build-metadata.json
+          path: |
+            ${{ runner.temp }}/kvcr-build-metadata.json
+            ${{ runner.temp }}/kvcr-installed-packages.json
+            ${{ runner.temp }}/kvcr-dynamo-install-report.json
           retention-days: 7
