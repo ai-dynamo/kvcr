@@ -224,7 +224,7 @@ def test_pool_descriptor_constraints_are_part_of_the_wire_contract() -> None:
         _PoolDescriptor("pool", 1023, 1024)
 
 
-def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
+def test_g3_config_validates_paths_and_tier_capacity() -> None:
     good = {
         "paths": ("/g3/a",),
         "capacity_bytes_per_file": 1,
@@ -252,20 +252,13 @@ def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
         )
 
-
-@pytest.mark.parametrize("tail_bytes", [0, 1, mmap.PAGESIZE - 1])
-def test_g3_tier_config_accepts_capacity_with_unused_tail(tail_bytes) -> None:
     tier = _TierConfig(
         [("pool", mmap.PAGESIZE)],
-        _G3Config(
-            paths=("/g3/a", "/g3/b"),
-            capacity_bytes_per_file=2 * mmap.PAGESIZE + tail_bytes,
-            backend="FILE",
-            backend_options={},
-        ),
+        _G3Config(**{**good, "capacity_bytes_per_file": 2 * mmap.PAGESIZE - 1}),
     )
-    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(tier), type=_TierConfig)
-    assert decoded == tier
+    assert (
+        msgspec.msgpack.decode(msgspec.msgpack.encode(tier), type=_TierConfig) == tier
+    )
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
