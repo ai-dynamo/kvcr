@@ -178,6 +178,13 @@ class _KVCRCore:
             raise ValueError("registration elements must match configured pool sizes")
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
+        startup_timeout_seconds = self.config.startup_timeout_seconds
+        if startup_timeout_seconds is not None and (
+            type(startup_timeout_seconds) is not int or startup_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "startup_timeout_seconds must be a positive integer or None"
+            )
         if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
             raise ValueError(
                 "abandon_timeout_ms must be at least twice operation_timeout_ms"
@@ -239,7 +246,7 @@ class _KVCRCore:
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
         self._local_dram_sources_by_op: dict[
-            _OpId, dict[BlockKey, list[_TransferRef]]
+            _OpId, dict[BlockKey, _LocalDramResidency]
         ] = {}
 
         self._completion_queue: list[OpResult] = []
@@ -345,6 +352,7 @@ class _KVCRCore:
             nixl_listen_port=self.config.nixl_listen_port,
             dram_backends=list(dram_backends),
             memory_regions=self._memory_regions,
+            startup_timeout_seconds=startup_timeout_seconds,
         )
 
     def start(self) -> None:
@@ -650,11 +658,12 @@ class _KVCRCore:
         progress_items = self._pending_progress_items
         self._pending_progress_items = []
         with self._state_lock:
-            if self._g3 is not None:
-                progress_items = self._g3.poll_main(progress_items)
-            if self._local_dram is not None:
-                progress_items = self._local_dram.poll_main(progress_items)
-            self._remote_fw_dram.poll_main(progress_items)
+            if not self._closed:
+                if self._g3 is not None:
+                    progress_items = self._g3.poll_main(progress_items)
+                if self._local_dram is not None:
+                    progress_items = self._local_dram.poll_main(progress_items)
+                self._remote_fw_dram.poll_main(progress_items)
         completed = self._completion_queue
         self._completion_queue = []
         return completed
@@ -936,7 +945,7 @@ class _KVCRCore:
         keys: Collection[BlockKey],
         *,
         notify_capacity: bool = True,
-    ) -> Mapping[BlockKey, list[_TransferRef]]:
+    ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
@@ -974,16 +983,16 @@ class _KVCRCore:
     ) -> list[_TransferRef]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
-        if not descriptors or not all(
-            isinstance(ref, MemoryRef) for ref in descriptors
-        ):
+        if not descriptors:
             raise ValueError("each block requires at least one MemoryRef")
-        return self._validate_descriptors(
-            [
+        normalized = []
+        for ref in descriptors:
+            if not isinstance(ref, MemoryRef):
+                raise ValueError("each block requires at least one MemoryRef")
+            normalized.append(
                 _TransferRef(ref.end_point_name, ref.element_index, ref.label)
-                for ref in descriptors
-            ]
-        )
+            )
+        return self._validate_descriptors(normalized)
 
     def _validate_descriptors(
         self,
@@ -994,21 +1003,21 @@ class _KVCRCore:
     ) -> list[_TransferRef]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
-        if not descriptors or not all(
-            isinstance(ref, _TransferRef) for ref in descriptors
-        ):
+        if not descriptors:
             raise ValueError("each block requires at least one _TransferRef")
-        resolved = [
-            self._region(ref, regions=regions, agent_name=agent_name)
-            for ref in descriptors
-        ]
+        layout = []
+        for ref in descriptors:
+            region = self._region(ref, regions=regions, agent_name=agent_name)
+            block_size = self._block_sizes.get(ref.label.partition(":")[0])
+            if block_size is None:
+                raise ValueError("block descriptors must use configured pools")
+            if region.size != block_size:
+                raise ValueError("block descriptor has the wrong byte count")
+            layout.append(ref.label)
         self._validate_block_layout(
-            [ref.label for ref in descriptors],
+            layout,
             "block descriptors must use configured pools",
         )
-        for ref, region in zip(descriptors, resolved):
-            if region.size != self._block_sizes[ref.label.partition(":")[0]]:
-                raise ValueError("block descriptor has the wrong byte count")
         return descriptors
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:

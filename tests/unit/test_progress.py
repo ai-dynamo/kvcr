@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from nixl import nixlRemoteDisconnectError
 
 from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
@@ -152,12 +153,47 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
     return progress
 
 
+@pytest.mark.parametrize("fail_post", [False, True])
+@pytest.mark.parametrize("error_type", [nixlRemoteDisconnectError, RuntimeError])
+def test_typed_disconnect_marks_peer_and_releases_handle(
+    monkeypatch, fail_post, error_type
+) -> None:
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    # NIXL keeps a failed handle's status, so every later check fails the same way.
+    fail = Mock(side_effect=error_type("failed"))
+    monkeypatch.setattr(agent, "check_xfer_state", fail)
+    if fail_post:
+        monkeypatch.setattr(agent, "transfer", fail)
+    transfer_id, _ = progress.submit_transfer(
+        "WRITE",
+        [_mem(0)],
+        [_mem(1, owner="remote-agent")],
+        remote_side_agent="remote-agent",
+    )
+    assert progress._disconnected_remote_agents == (
+        {"remote-agent"}
+        if fail_post and error_type is nixlRemoteDisconnectError
+        else set()
+    )
+    result = progress.poll_transfer(transfer_id, require_completion=True)
+    if error_type is RuntimeError:
+        # An untyped failure may leave DMA running, so the handle stays.
+        assert result is None and transfer_id in progress._active_transfers
+        assert not progress._disconnected_remote_agents
+    else:
+        assert result == (False, None)
+        assert progress._disconnected_remote_agents == {"remote-agent"}
+        progress.release_prepared("remote-agent")
+
+
 @pytest.mark.parametrize("activate", [False, True])
 @pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 def test_prepare_registers_memory_before_backend_activation(
     monkeypatch, caplog, activate, level
 ) -> None:
     caplog.set_level(level, logger="kvcr.progress")
+    monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
     clock_reads = []
     monkeypatch.setattr(
         progress_module,
@@ -183,6 +219,7 @@ def test_prepare_registers_memory_before_backend_activation(
         lambda: events.append("close"),
         nixl_agent_name=agent.name,
         memory_regions=({}, {"": RegionDescriptor(addr=128, size=128, count=4)}),
+        startup_timeout_seconds=1,
     )
     progress._nixl_agent = agent
     monkeypatch.setattr(
@@ -207,6 +244,33 @@ def test_prepare_registers_memory_before_backend_activation(
     assert progress._startup_stage == "cleanup"
     stages = [m for m in caplog.messages if "progress_startup_stage " in m]
     assert bool(stages) is bool(clock_reads) is (level == logging.DEBUG)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_instance_startup_budget_remains_bounded(monkeypatch, prepared) -> None:
+    """A longer default must not hide a blocked instance's shorter deadline."""
+    entered, release = threading.Event(), threading.Event()
+
+    def initialize_agent():
+        entered.set()
+        assert release.wait(5)
+
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        startup_timeout_seconds=0.001,
+    )
+    monkeypatch.setattr(progress, "_initialize_nixl", initialize_agent)
+    try:
+        with pytest.raises(RuntimeError, match="timed out after 0.001s"):
+            (progress.prepare if prepared else progress.start)()
+        assert entered.wait(1)
+    finally:
+        release.set()
+        progress.close()
+    assert progress.is_quiescent()
 
 
 def test_close_drains_queued_submissions(monkeypatch) -> None:
@@ -271,7 +335,7 @@ def test_progress_submits_and_completes_transfer(
 
 def test_progress_retries_release_while_operation_is_active() -> None:
     agent = _TransferAgent()
-    agent.state = "PROC"
+    agent.state = "ERR"
     agent.submit_exception = True
     agent.release_failures = 2
     progress = _transfer_progress(agent)
@@ -283,9 +347,9 @@ def test_progress_retries_release_while_operation_is_active() -> None:
     )
 
     assert not submitted
-    assert progress.poll_transfer(transfer_id, cancellation_requested=True) is None
-    assert progress.poll_transfer(transfer_id, cancellation_requested=True) is None
-    result = progress.poll_transfer(transfer_id, cancellation_requested=True)
+    assert progress.poll_transfer(transfer_id) is None
+    assert progress.poll_transfer(transfer_id) is None
+    result = progress.poll_transfer(transfer_id)
     assert result is not None
     success, _ = result
     assert not success
@@ -326,23 +390,6 @@ def test_progress_treats_poll_exception_as_terminal_failure() -> None:
     success, _ = result
     assert not success
     assert agent.events[-1] == "release-transfer:1"
-
-
-def test_progress_cancel_retains_transfer_until_release_succeeds() -> None:
-    agent = _TransferAgent()
-    agent.release_failures = 1
-    progress = _transfer_progress(agent)
-    transfer_id, _ = progress.submit_transfer(
-        "WRITE",
-        (_mem(0),),
-        (_mem(1, owner="remote-agent"),),
-        remote_side_agent="remote-agent",
-    )
-
-    assert not progress.cancel_transfer(transfer_id)
-    assert transfer_id in progress._active_transfers
-    assert progress.cancel_transfer(transfer_id)
-    assert transfer_id not in progress._active_transfers
 
 
 def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
@@ -624,7 +671,7 @@ def test_progress_does_not_deregister_memory_with_an_active_transfer() -> None:
     assert progress.nixl_agent is agent
     assert agent.deregistered == []
     assert len(agent.prepared) == 6
-    assert progress.cancel_transfer(transfer_id)
+    assert progress.poll_transfer(transfer_id) == (True, None)
 
     progress._close_nixl()
     assert agent.deregistered == [7]

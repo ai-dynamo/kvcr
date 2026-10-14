@@ -124,6 +124,7 @@ class KVCRConfig:
     abandon_timeout_ms: int = 5000
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
+    startup_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)

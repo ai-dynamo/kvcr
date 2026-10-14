@@ -40,7 +40,8 @@ def _atomics() -> tuple[Any, Any]:
     Late because libatomic is a system library, not a declared dependency:
     importing kvcr must not require what only recovery uses.
     """
-    library = ctypes.CDLL(ctypes.util.find_library("atomic") or "libatomic.so.1")
+    # Keep the GIL across these tiny atomics to avoid a handoff for every frame.
+    library = ctypes.PyDLL(ctypes.util.find_library("atomic") or "libatomic.so.1")
     load, store = library["__atomic_load_8"], library["__atomic_store_8"]
     load.argtypes, load.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64
     store.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
@@ -356,6 +357,8 @@ class _RecoveryMirror:
                 else:
                     local_dram.claim_count = 0
                     local_dram.retire_on_release = False
+                    # References name the previous agent, unlike the slot layout.
+                    local_dram.refs.clear()
             if record.g3 is not None:
                 record.g3.claim_count = 0
             record.fw_mem = None
