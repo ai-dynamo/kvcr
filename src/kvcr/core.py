@@ -401,7 +401,7 @@ class _KVCRCore:
         for key, record in records.items():
             if record.local_dram is not None or g3 is None:
                 source = CacheTier.LOCAL_G2
-                slot_size = local_dram._size_bytes(record.local_dram.slots)
+                slot_size = local_dram._size_bytes(record.local_dram)
             else:
                 source, slot_size = CacheTier.G3, g3._slot_size
             self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
@@ -501,7 +501,7 @@ class _KVCRCore:
                     tier = local_dram if record.local_dram is not None else g3
                     tier._residency_observer(key, record)
                 size_bytes = (
-                    local_dram._size_bytes(record.local_dram.slots)
+                    local_dram._size_bytes(record.local_dram)
                     if record.local_dram is not None
                     else g3._slot_size
                 )

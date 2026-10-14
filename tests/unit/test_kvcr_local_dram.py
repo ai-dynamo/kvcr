@@ -235,6 +235,11 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
         kvcr.deposit({first: [_mem_descriptor(label="unknown")]})
     operation = kvcr.deposit({first: descriptors})
     _wait_until(lambda: bool(agent.transfers))
+    local_dram = kvcr._core._local_dram
+    residency = kvcr._core._block_record_map[first].local_dram
+    assert local_dram._size_bytes(residency) == 32
+    pool_counts = residency.pool_counts
+    assert pool_counts == {"full": 1, "swa": 2}
     wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
     assert not dict(kvcr.poll_completed())[wrong_layout][first].success
     agent.state = "DONE"
@@ -251,8 +256,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     )
     assert not dict(kvcr.poll_completed())[wrong][first].success
 
-    local_dram = kvcr._core._local_dram
-    residency = kvcr._core._block_record_map[first].local_dram
+    assert residency.pool_counts is pool_counts
     # Ready blocks already have their label index, but references stay incremental.
     assert residency.indices_by_label == (
         {"full": 0, "swa:a": 1, "swa:b": 2} if labeled else {"full": 0, "swa": None}
@@ -1043,8 +1047,11 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
 
     records = _g2_recovered(first=2, second=0)
     records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
+    residency = records[BlockKey(b"first")].local_dram
+    residency._cached_size = 8  # Cached with a different pool size.
     install_recovery_records(kvcr._core, records)
-    assert records[BlockKey(b"first")].local_dram.indices_by_label == {":first": 0}
+    assert residency.indices_by_label == {":first": 0}
+    assert local_dram._size_bytes(residency) == 16
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(
