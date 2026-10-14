@@ -440,6 +440,9 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
         inventory_sink=events.append,
     )
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    assert (
+        target.query(keys, "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)] * 3
+    )
     fetch = target.fetch(keys, request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
@@ -1207,7 +1210,14 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
 def test_kvcr_deliver_fails_closed_when_hint_source_missing():
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl()
-    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
+    local, framework = ctypes.create_string_buffer(16), ctypes.create_string_buffer(16)
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(framework, 16)],
+    )
     key = _make_block_key(b"orphan", 0)
 
     op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
@@ -1215,35 +1225,94 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
     assert list(kvcr.poll_completed()) == [(op_handle, _op_entries({key: False}))]
     assert control.sent == []
 
+    # A rejected remote attempt must not hide a later local deposit.
+    agent.state = "DONE"
+    deposit = kvcr.deposit({key: [_mem_descriptor()]})
+    assert dict(_poll_until(kvcr, bool))[deposit][key].success
+    assert kvcr.query([key], "req") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    delivery = kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    assert dict(_poll_until(kvcr, bool))[delivery][key].success
 
-def test_kvcr_request_scoped_sources_do_not_overwrite():
+
+@pytest.mark.parametrize("select_with_query", [False, True])
+def test_kvcr_request_scoped_sources_survive_local_deposits(select_with_query):
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl()
+    local = ctypes.create_string_buffer(32)
+    framework = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     kvcr = _new_kvcr(
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+        key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(framework, 16, ":*")],
     )
     key = _make_block_key(b"shared-block", 0)
-
     kvcr.submit_hint(_router_hint("tcp://source-A:1"), request_id="req-a")
     kvcr.submit_hint(_router_hint("tcp://source-B:1"), request_id="req-b")
-    op_a = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req-a")
-    op_b = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req-b")
 
-    _wait_until(lambda: len(control.sent) == 2)
-    assert [endpoint for endpoint, _ in control.sent] == [
-        "tcp://source-A:1",
-        "tcp://source-B:1",
-    ]
-    assert {("target", op_a), ("target", op_b)} <= _block_op_ids(kvcr)
-    agent.notifs["source"] = [
-        _write_done_notification(op_a),
-        _write_done_notification(op_b),
-    ]
-    _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
+    def deliver_remote():
+        previous = len(control.sent)
+        handles = [
+            kvcr.deliver({key: [_mem_descriptor(1, ":b")]}, request)
+            for request in ("req-a", "req-b")
+        ]
+        _wait_until(lambda: len(control.sent) == previous + 2)
+        assert [endpoint for endpoint, _ in control.sent[-2:]] == [
+            "tcp://source-A:1",
+            "tcp://source-B:1",
+        ]
+        assert {("target", handle) for handle in handles} <= _block_op_ids(kvcr)
+        agent.notifs["source"] = [
+            _write_done_notification(handle) for handle in handles
+        ]
+        assert dict(_poll_until(kvcr, lambda done: len(done) == 2)) == {
+            handle: _op_entries({key: True}) for handle in handles
+        }
+
+    if select_with_query:
+        for request in ("req-a", "req-b"):
+            assert kvcr.query((key,), request) == [
+                (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+            ]
+    else:
+        deliver_remote()
+
+    agent.state = "DONE"
+    deposit = kvcr.deposit(
+        {key: [_mem_descriptor(0, ":a")]}, expected_layout=[":a", ":b"]
+    )
+    assert kvcr.query((key,), "req-a") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    assert dict(_poll_until(kvcr, bool))[deposit][key].success
+    assert kvcr.query((key,), "req-a") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    assert kvcr.query((key,), "other") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    deliver_remote()
+
+    # A failed remote route must not silently switch to the partial local key.
+    kvcr.submit_hint(_router_hint("tcp://different:1"), request_id="req-a")
+    assert kvcr.query((key,), "req-a") == [(QueryStatus.MISS, None)]
+    failed = kvcr.deliver({key: [_mem_descriptor(0, ":a")]}, "req-a")
+    assert dict(_poll_until(kvcr, bool))[failed][key].status is OpEntryStatus.FAILED
+    kvcr.discard_hint("req-a")
+    assert kvcr.query((key,), "req-a") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    assert kvcr.query((key,), "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    delivered = kvcr.deliver({key: [_mem_descriptor(0, ":a")]}, "req-a")
+    assert dict(_poll_until(kvcr, bool))[delivered][key].success
+
+    # Only successful staging switches an existing remote selection to local.
+    rejected = kvcr.fetch([key], "req-b", expected_layout=[":a"])
+    assert not dict(kvcr.poll_completed())[rejected][key].success
+    assert kvcr.query([key], "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    deposit = kvcr.deposit({key: [_mem_descriptor(1, ":b")]})
+    assert dict(_poll_until(kvcr, bool))[deposit][key].success
+    assert kvcr.query([key], "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    staged = kvcr.fetch([key], "req-b", expected_layout=[":a", ":b"])
+    claim = dict(kvcr.poll_completed())[staged][key].release_handle
+    assert claim is not None
+    assert kvcr.query([key], "req-b") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    assert kvcr.release([claim]) == [(claim, True)]
 
 
 @pytest.mark.parametrize(
