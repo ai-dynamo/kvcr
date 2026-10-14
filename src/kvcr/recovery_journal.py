@@ -88,6 +88,7 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     ) = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
+    key_layout: tuple[str, ...] | None = None
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
@@ -122,7 +123,16 @@ def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
         or local_dram.pending_labels
     ):
         return _RecoveryBlock(g3=g3, position=record.position)
-    return _RecoveryBlock(g2=local_dram.slots, g3=g3, position=record.position)
+    return _RecoveryBlock(
+        g2=local_dram.slots,
+        g3=g3,
+        position=record.position,
+        key_layout=(
+            None
+            if local_dram.key_layout == tuple(label for label, _ in local_dram.slots)
+            else local_dram.key_layout
+        ),
+    )
 
 
 def _decode_recovery_record(
@@ -137,9 +147,30 @@ def _decode_recovery_record(
         ):
             raise ValueError("G2 recovery location does not match the pool group")
         labels.add(label)
+    key_layout = recovered.key_layout
+    if key_layout is not None:
+        declared = set()
+        excluded = {marked[1:] for marked in key_layout if marked.startswith("!")}
+        for marked in key_layout:
+            label = marked.removeprefix("!")
+            _, separator, part = label.partition(":")
+            if (
+                label.startswith("!")
+                or (marked.startswith("!") and not label)
+                or (separator and part in ("", "*"))
+                or (label in declared and (separator or label in excluded))
+            ):
+                raise ValueError("invalid recovery key layout")
+            declared.add(label)
+        if [label for label in key_layout if not label.startswith("!")] != [
+            label for label, _ in recovered.g2 or ()
+        ]:
+            raise ValueError("recovery reservation does not match key layout")
     return _BlockRecord(
         local_dram=(
-            _LocalDramResidency(recovered.g2, _LocalDramState.READY)
+            _LocalDramResidency(
+                recovered.g2, _LocalDramState.READY, key_layout=key_layout
+            )
             if recovered.g2 is not None
             else None
         ),

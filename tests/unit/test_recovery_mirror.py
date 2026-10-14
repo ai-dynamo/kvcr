@@ -53,7 +53,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
         (
             _FULLY_LOADED_RECORD,
             _ONE_POOL,
-            [[["", 3]], 5, 3],
+            [[["", 3]], 5, 3, None],
             replace(_recovered_record(g2=[("", 3)], g3=5), position=3),
         ),
         (
@@ -63,20 +63,39 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 [["full", 7], ["full", 2], ["swa", 9]],
                 5,
                 -1,
+                None,
             ],
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
         ),
-        (_BlockRecord(), _ONE_POOL, [None, None, -1], _BlockRecord()),
+        (
+            _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":ready", 1)],
+                    _LocalDramState.READY,
+                    key_layout=(":ready", "!other:piece"),
+                )
+            ),
+            _ONE_POOL,
+            [[[":ready", 1]], None, -1, [":ready", "!other:piece"]],
+            _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":ready", 1)],
+                    _LocalDramState.READY,
+                    key_layout=(":ready", "!other:piece"),
+                )
+            ),
+        ),
+        (_BlockRecord(), _ONE_POOL, [None, None, -1, None], _BlockRecord()),
         (
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
             _ONE_POOL,
-            [[[":a", 3], [":part:b:", 2]], None, 4],
+            [[[":a", 3], [":part:b:", 2]], None, 4, None],
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
         ),
         (
             replace(_recovered_record(g3=5), position=6),
             _ONE_POOL,
-            [None, 5, 6],
+            [None, 5, 6, None],
             replace(_recovered_record(g3=5), position=6),
         ),
         # A G2 slot still FILLING or DISCARDING never settled, so it must not wire.
@@ -85,7 +104,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             ),
             _ONE_POOL,
-            [None, None, -1],
+            [None, None, -1, None],
             _BlockRecord(),
         ),
         (
@@ -93,7 +112,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.DISCARDING)
             ),
             _ONE_POOL,
-            [None, None, -1],
+            [None, None, -1, None],
             _BlockRecord(),
         ),
         (
@@ -101,12 +120,13 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 local_dram=_LocalDramResidency(
                     [(":pending", 0), (":ready", 1)],
                     _LocalDramState.READY,
+                    key_layout=(":pending", ":ready", "!other:piece"),
                     pending_labels={":pending"},
                     pending_deposits=1,
                 )
             ),
             _ONE_POOL,
-            [None, None, -1],
+            [None, None, -1, None],
             _BlockRecord(),
         ),
     ],
@@ -132,6 +152,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         g2: list[tuple[str, int]] | None = None
         g3: int | None = None
         position: int = -1
+        key_layout: tuple[str, ...] | None = None
         appended: int = 0
 
     legacy = msgspec.msgpack.encode([[["", 3]], 5])
@@ -146,7 +167,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     assert upgraded.g3 == 5
     assert upgraded.position == 6
     assert upgraded.appended == 0
-    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, 42))
+    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, ("",), 42))
     assert _decode_recovery_record(future, _ONE_POOL) == positioned
 
 
@@ -165,11 +186,15 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),
         msgspec.msgpack.encode([None, 5, -2]),
+        msgspec.msgpack.encode([[[":a", 0]], None, -1, [":b"]]),
+        msgspec.msgpack.encode([[[":a", 0]], None, -1, ["!:a"]]),
+        msgspec.msgpack.encode([[["full", 0]], None, -1, ["!full", "full"]]),
+        msgspec.msgpack.encode([[["full", 0]], None, -1, ["full", "!full"]]),
     ],
 )
 def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:
     """A frame that does not decode to valid wire state is refused, not applied."""
-    mirror = _RecoveryMirror(_ONE_POOL)
+    mirror = _RecoveryMirror((*_ONE_POOL, "full"))
 
     with pytest.raises(RecoveryMirrorError, match="malformed"):
         mirror.apply(_RECORD_BLOCK, b"block", payload)
