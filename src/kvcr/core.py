@@ -1049,11 +1049,7 @@ class _KVCRCore:
             region = self._region(ref, regions=regions, agent_name=agent_name)
             pool, separator, part = ref.label.partition(":")
             block_size = self._block_sizes.get(pool)
-            if (
-                ref.label.startswith("!")
-                or block_size is None
-                or (separator and part in ("", "*"))
-            ):
+            if block_size is None or (separator and part in ("", "*")):
                 raise ValueError("block descriptors must use configured pools")
             if region.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
@@ -1070,11 +1066,7 @@ class _KVCRCore:
         labels = set()
         for label in layout:
             pool, separator, part = label.partition(":")
-            if (
-                label.startswith("!")
-                or pool not in self._block_sizes
-                or (separator and part in ("", "*"))
-            ):
+            if pool not in self._block_sizes or (separator and part in ("", "*")):
                 raise ValueError(invalid_message)
             if separator:
                 if label in labels:

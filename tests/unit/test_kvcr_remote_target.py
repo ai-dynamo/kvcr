@@ -248,18 +248,21 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
 
 
 @pytest.mark.parametrize(
-    ("layout", "expected_layout", "success"),
+    ("layout", "expected_layout", "success", "partial"),
     [
-        ([("full", 16), ("swa", 8)], ["swa", "full"], False),
-        ([("full", 16), ("swa", 8)], ["full", "swa:missing"], False),
-        ([("full", 16), ("swa", 8)], ["full", "swa"], True),
-        ([("", 16), ("", 16)], ["", ""], True),
+        ([("full", 16), ("swa", 8)], ["swa", "full"], False, False),
+        ([("full", 16), ("swa", 8)], ["full", "swa:missing"], False, False),
+        ([("full", 16), ("swa", 8)], ["full", "swa"], True, False),
+        ([("", 16), ("", 16)], ["", ""], True, False),
+        ([("full", 16), ("swa", 8)], ["full", "swa"], True, True),
+        ([("full", 16), ("swa", 8), ("swa", 8)], ["full", "swa", "swa"], True, True),
     ],
 )
 def test_remote_fetch_preserves_block_layout_and_bytes(
     layout: list[tuple[str, int]],
     expected_layout: list[str],
     success: bool,
+    partial: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
@@ -277,7 +280,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         name: ctypes.create_string_buffer(len(data)) for name, data in pool_data.items()
     }
     source_agent = _CopyingWriteAgent(metadata=b"source-md")
-    target_agent = FakeNixlAgent(metadata=b"target-md")
+    target_agent = _CopyingWriteAgent(metadata=b"target-md")
     source_control = FakeBytesControl("tcp://source:1")
     target_control = FakeBytesControl("tcp://target:1")
     config = KVCRConfig(
@@ -313,6 +316,10 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=dram(target_local),
+        framework_regions=[
+            _buffer_region(source_primary[name], size, name)
+            for name, size in dict(layout).items()
+        ],
     )
     key = BlockKey(b"multi-pool")
     descriptors = [
@@ -328,6 +335,14 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     assert dict(_poll_until(source, bool))[deposit][key].success
     source_agent.state = "PROC"
 
+    if partial:
+        target_agent.state = "DONE"
+        deposit = target.deposit(
+            {key: [_mem_descriptor(0, label=layout[0][0])]},
+            expected_layout=expected_layout,
+        )
+        assert dict(_poll_until(target, bool))[deposit][key].success
+
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch(
         (key,),
@@ -342,7 +357,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     if success:
         _poll_until(source, lambda _: len(source_agent.xfers) == 2)
         source_xfer = source_agent.xfers[1]
-        assert len(source_xfer[1]) == len(source_xfer[3]) == 2
+        assert len(source_xfer[1]) == len(source_xfer[3]) == len(layout) - partial
         notification = source_xfer[5]
         source_agent.state = "DONE"
         _poll_until(source, lambda _: not _has_outstanding_operations(source))

@@ -54,8 +54,13 @@ def _layout_indices(
     """Match full layouts or unambiguous pieces in the requested order."""
     if layout == requested:
         return list(range(len(layout)))
-    if not requested or len(set(requested)) != len(requested):
+    if not requested:
         return None
+    labels = set(requested)
+    if len(labels) != len(requested):
+        # Repeated pools are positional: require every occurrence in layout order.
+        indices = [index for index, label in enumerate(layout) if label in labels]
+        return indices if [layout[index] for index in indices] == requested else None
     if indices_by_label is not None:
         indices = [indices_by_label.get(label) for label in requested]
         return None if None in indices else cast(list[int], indices)
@@ -434,7 +439,7 @@ class _LocalDram:
         }
 
     def rank_recovered(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
-        """Make recovered rows evictable, once the policy can score them.
+        """Make complete recovered rows evictable once the policy can score them.
 
         Separate from adopt_recovery_slots because a score is asked of the policy,
         and the policy only knows a block once it has been admitted. Without this a
@@ -1475,6 +1480,7 @@ class _LocalDram:
             residency is None
             or residency.state is not _LocalDramState.READY
             or residency.claim_count
+            or residency.pending_labels
         ):
             return
         score = self._kvcr._policy.eviction_score(

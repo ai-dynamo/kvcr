@@ -114,9 +114,9 @@ Framework-owned memory and KVCR-owned memory use different residency types. Fram
 
 Residency state and operation state are deliberately disjoint. A `BlockRecord` does not embed or own operation lifecycle state; it only keeps references to related operation IDs when needed. The progress thread's polymorphic `in_flight_ops` collection owns the operations it advances and their progress-side lifecycle; each operation type defines how completion affects its resources. This lets block lookup remain stable while operations are created, coalesced, completed, cancelled, or removed independently.
 
-Ready, unclaimed KVCR-owned residencies are tracked by a policy-scored eviction queue, while available pool slots are tracked separately for allocation. Auxiliary structures may support completion polling, pins that cover multiple keys, and reuse of established peer connections.
+Complete, unclaimed KVCR-owned residencies are tracked by a policy-scored eviction queue, while available pool slots are tracked separately for allocation. Auxiliary structures may support completion polling, pins that cover multiple keys, and reuse of established peer connections.
 
-Claims are attached to concrete residencies. They prevent KVCR-owned memory from being evicted while in use and keep framework-owned memory pinned until all dependent operations finish. Concurrent operations may share existing residencies, pins, or in-flight work; cancellation of one caller must not invalidate resources still needed by another. When an operation needs a KVCR residency that is currently evictable, the KVCR removes it from the evictable queue and acquires a claim before using it, making it non-evictable. After the last claim is released, a ready residency that is still retained returns to the evictable queue; otherwise its KVCR-owned memory is freed.
+Claims are attached to concrete residencies. They prevent KVCR-owned memory from being evicted while in use and keep framework-owned memory pinned until all dependent operations finish. Concurrent operations may share existing residencies, pins, or in-flight work; cancellation of one caller must not invalidate resources still needed by another. When an operation needs a KVCR residency that is currently evictable, the KVCR removes it from the evictable queue and acquires a claim before using it, making it non-evictable. After the last claim is released, complete retained residencies return to the evictable queue, incomplete retained residencies remain protected, and discarded or wholly uncommitted residencies are freed.
 
 ### Asynchronous Execution
 
@@ -190,7 +190,7 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 Both `deposit` and `fetch` use `expected_layout` to declare the full ordered key layout. KVCR reserves capacity for every declared piece before copying. Without `expected_layout`, the first deposit defines the whole key from its supplied pieces, and fetch expects one unnamed piece. Later calls cannot change the declaration.
 
-Declared immutable pieces may be deposited and delivered independently, allowing transfers to overlap. Each delivery completes for its requested pieces; reserved but unwritten pieces are not readable.
+Declared immutable pieces may be deposited and delivered independently, allowing transfers to overlap. Each delivery completes for its requested pieces; reserved but unwritten pieces are not readable. Incomplete reservations remain non-evictable, including after recovery, until every locally reserved piece is ready. Abandoned incomplete keys therefore continue to consume capacity.
 
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
@@ -203,7 +203,7 @@ The tradeoff is backpressure: when policy cannot free enough capacity—for exam
 **Block availability query**
 
 When the framework asks the KVCR whether a block is available, the KVCR responds with one of:
-- `HIT(tier)` — locally available at the reported tier at the time of the query
+- `HIT(tier)` — at least one piece is locally readable at the reported tier; other declared pieces may still be pending
 - `FETCHING(destination_tier)` — a fetch into the reported tier is in progress
 - `FETCHABLE(source_tier)` — not started, but the KVCR knows a source tier
 - `MISS(None)` — not found in any tier the KVCR currently knows about

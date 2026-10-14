@@ -536,12 +536,6 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
         ["named:part", "named:part"],
         ["missing:part"],
         [],
-        ["named:part", "!missing:part"],
-        ["!named:part"],
-        ["named:part", "!named:part"],
-        ["named", "!named"],
-        ["!named", "named"],
-        ["named:part", "!missing:*"],
     ):
         with pytest.raises(ValueError):
             kvcr.fetch((BlockKey(b"key"),), expected_layout=layout)

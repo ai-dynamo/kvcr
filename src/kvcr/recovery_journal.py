@@ -89,7 +89,6 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     ) = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
-    key_layout: tuple[str, ...] | None = None
     pending_labels: tuple[str, ...] = ()
 
 
@@ -144,11 +143,6 @@ def _decode_recovery_record(
         ):
             raise ValueError("G2 recovery location does not match the pool group")
         labels.add(label)
-    key_layout = recovered.key_layout
-    if key_layout is not None and key_layout != tuple(
-        label for label, _ in recovered.g2 or ()
-    ):
-        raise ValueError("recovery reservation does not match key layout")
     pending = set(recovered.pending_labels)
     if not pending <= labels or pending and pending == labels:
         raise ValueError("recovery readiness does not match committed locations")
@@ -157,7 +151,6 @@ def _decode_recovery_record(
             _LocalDramResidency(
                 recovered.g2,
                 _LocalDramState.READY,
-                key_layout=key_layout,
                 pending_labels=pending,
             )
             if recovered.g2 is not None
