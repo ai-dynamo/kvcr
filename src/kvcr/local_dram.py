@@ -1176,6 +1176,12 @@ class _LocalDram:
             or self._pending_residency_ops.get(op.op_id) is not op
         ):
             return
+        if op.op_id[0] == "fetch":
+            remote_keys = self._kvcr._remote_delivery_keys.get(op.request_id)
+            if remote_keys:
+                remote_keys.difference_update(
+                    key for key, result in op.results.items() if result.success
+                )
         op.capacity_waiters.clear()
         self._pending_residency_ops.pop(op.op_id)
         claimed, op.claimed_keys = op.claimed_keys, set()

@@ -248,6 +248,8 @@ class _KVCRCore:
         # Serialize caller metadata transactions with progress-side source claims.
         self._state_lock = threading.RLock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
+        # Preserve remote selections until a successful fetch or discard_hint().
+        self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
@@ -435,6 +437,7 @@ class _KVCRCore:
         )
 
     def discard_hint(self, request_id: str) -> None:
+        self._remote_delivery_keys.pop(request_id, None)
         self._remote_fw_dram.discard_hint(request_id)
 
     # TODO(kvcr-g3): Prefer REMOTE_G2 over G3 in query/fetch/deliver once one
@@ -447,11 +450,33 @@ class _KVCRCore:
         """Return the best available local or remote path for each key.
 
         Exact hint membership is used unless opportunistic querying is enabled.
+        Remote selections survive deposits until successful fetch or discard_hint.
         """
         statuses = []
+        remote_keys = self._remote_delivery_keys.get(request_id, ())
         for key in keys:
             record = self._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
+            if key in remote_keys:
+                fetching_locally = (
+                    residency is not None
+                    and residency.state is _LocalDramState.FILLING
+                    and any(
+                        op_id[0] == "fetch"
+                        and (op := self._local_dram._pending_residency_ops.get(op_id))
+                        is not None
+                        and op.request_id == request_id
+                        and key not in op.results
+                        for op_id in record.active_op_ids
+                    )
+                )
+                if not fetching_locally:
+                    statuses.append(
+                        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+                        if self._remote_fw_dram.query(key, request_id)
+                        else (QueryStatus.MISS, None)
+                    )
+                    continue
             if residency is not None and residency.state is _LocalDramState.READY:
                 statuses.append((QueryStatus.HIT, CacheTier.LOCAL_G2))
             elif residency is not None and residency.state is _LocalDramState.FILLING:
@@ -461,6 +486,11 @@ class _KVCRCore:
             # Remote hints are request-scoped and advisory, not block residency.
             elif request_id is not None and self._remote_fw_dram.query(key, request_id):
                 statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
+                if not remote_keys:
+                    remote_keys = self._remote_delivery_keys.setdefault(
+                        request_id, set()
+                    )
+                remote_keys.add(key)
             else:
                 statuses.append((QueryStatus.MISS, None))
         if self._query_diagnostics is not None:
@@ -544,8 +574,11 @@ class _KVCRCore:
             local_blocks: dict[BlockKey, list[_TransferRef]] = {}
             g3_blocks: dict[BlockKey, _TransferRef] = {}
             remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
+            remote_keys = self._remote_delivery_keys.get(request_id, ())
             for key, destination in normalized.items():
-                if self._is_local_resident(key):
+                if key in remote_keys:
+                    remote_blocks[key] = destination
+                elif self._is_local_resident(key):
                     local_blocks[key] = destination
                 elif self._g3 is not None and self._g3.is_ready(key):
                     g3_blocks[key] = destination[0]
@@ -788,6 +821,7 @@ class _KVCRCore:
             raise progress_error
 
     def _close_main_resources(self) -> None:
+        self._remote_delivery_keys.clear()
         # Every stage runs even if an earlier one failed: skipping the rest
         # would leak files and pins for a failure that says nothing about them.
         first_error: BaseException | None = None
