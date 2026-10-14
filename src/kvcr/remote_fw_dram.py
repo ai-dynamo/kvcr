@@ -66,6 +66,7 @@ class _RequestHint:
     submitted_at: float | None
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
+    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
 
 class _TargetPullState(Enum):
@@ -109,11 +110,21 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
     ) -> tuple[bool, bool]:
+        completed, did_work = self._progress(progress, event)
+        if completed and self.trace is not None:
+            self.trace.end("target.remote")
+        return completed, did_work
+
+    def _progress(
+        self, progress: _KVCRProgress, event: object | None
+    ) -> tuple[bool, bool]:
         backend = self._backend
+        trace = self.trace
         now = backend._kvcr._clock()
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
@@ -122,6 +133,13 @@ class _TargetPullOp(_RemoteOp):
                 self.remote_ctrl_ep
             )
             if now >= self.deadline:
+                if trace is not None:
+                    trace.mark(
+                        "target.start_write.rejected",
+                        once=True,
+                        status=_nvtx.Status.TIMEOUT,
+                        reason=_nvtx.Reason.DEADLINE,
+                    )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -140,11 +158,20 @@ class _TargetPullOp(_RemoteOp):
                 },
             )
             if not sent:
+                if trace is not None:
+                    trace.mark(
+                        "target.start_write.rejected",
+                        once=True,
+                        status=_nvtx.Status.REJECTED,
+                        reason=_nvtx.Reason.CONTROL_ERROR,
+                    )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
             self.state = _TargetPullState.WAITING_WRITE_DONE
+            if trace is not None:
+                trace.mark("target.start_write.enqueued", once=True)
             return False, True
 
         if (
@@ -158,6 +185,10 @@ class _TargetPullOp(_RemoteOp):
             and event.get("terminal", True) is True
         ):
             if self.uncertain:
+                if trace is not None:
+                    trace.mark(
+                        "target.quiesced", once=True, status=_nvtx.Status.SUCCESS
+                    )
                 backend._dangling_ops.report_target(self, "quiesced")
                 self.state = _TargetPullState.FINISHED
                 return True, True
@@ -167,6 +198,16 @@ class _TargetPullOp(_RemoteOp):
                 and not cancelled
                 and self.state is _TargetPullState.WAITING_WRITE_DONE
                 and (not self.local_fill or now < self.deadline)
+            )
+            reason = (
+                _nvtx.Reason.NONE
+                if success
+                else _nvtx.Reason.CANCELLED
+                if cancelled
+                else trace.failure_reason
+                if trace is not None
+                and trace.failure_reason is not _nvtx.Reason.UNKNOWN
+                else _nvtx.Reason.REMOTE_FAILURE
             )
             try:
                 if success:
@@ -181,9 +222,15 @@ class _TargetPullOp(_RemoteOp):
             except TypeError:
                 success = False
                 completed_keys = set()
+                reason = _nvtx.Reason.INVALID_NOTIFICATION
             all_completed = success and completed_keys == self.keys
             self.success = success
             self.completed_keys = completed_keys
+            if trace is not None:
+                trace.target_result(
+                    self,
+                    reason if not success or all_completed else _nvtx.Reason.UNKNOWN,
+                )
             self.state = _TargetPullState.FINISHED
             if completed_keys:
                 backend._record_progress_counter(
@@ -230,10 +277,29 @@ class _TargetPullOp(_RemoteOp):
         ):
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 self.state = _TargetPullState.QUARANTINED
+                if trace is not None:
+                    trace.mark(
+                        "target.quarantined",
+                        once=True,
+                        status=_nvtx.Status.UNRESOLVED,
+                        reason=_nvtx.Reason.DEADLINE,
+                        retain_cause=True,
+                    )
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
             self.state = _TargetPullState.WAITING_TERMINAL
+            if trace is not None:
+                trace.mark(
+                    "target.cancel_requested",
+                    once=True,
+                    status=_nvtx.Status.CANCELLED
+                    if cancelled
+                    else _nvtx.Status.TIMEOUT,
+                    reason=_nvtx.Reason.CANCELLED
+                    if cancelled
+                    else _nvtx.Reason.DEADLINE,
+                )
             config = backend._kvcr.config
             self.deadline += (
                 config.abandon_timeout_ms - config.operation_timeout_ms
@@ -257,7 +323,17 @@ class _TargetPullOp(_RemoteOp):
 
     def close(self, progress: _KVCRProgress) -> bool:
         # Shutdown must not release destinations still awaiting a remote write.
-        return self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
+        safe = self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
+        if not safe and self.trace is not None:
+            self.trace.mark(
+                "target.shutdown_unresolved",
+                once=True,
+                status=_nvtx.Status.UNRESOLVED,
+                reason=_nvtx.Reason.SHUTDOWN,
+            )
+        elif safe and self.trace is not None:
+            self.trace.end("target.remote")
+        return safe
 
 
 @dataclass
@@ -644,7 +720,24 @@ class _RemoteFWDram:
             previous = self._request_hints.get(request_id)
             if previous is not None and previous.source != src:
                 self._request_hints[request_id] = replace(previous, failed=True)
+                if previous.trace is not None:
+                    previous.trace.mark(
+                        "hint.rejected",
+                        status=_nvtx.Status.REJECTED,
+                        reason=_nvtx.Reason.HINT_CONFLICT,
+                    )
                 return
+            trace = (
+                self._nvtx.lifecycle(
+                    request_id=request_id, requested_blocks=len(block_hashes)
+                )
+                if self._nvtx is not None
+                else None
+            )
+            if previous is not None and previous.trace is not None:
+                previous.trace.mark("hint.replaced", once=True)
+            if trace is not None:
+                trace.mark("hint.submitted")
             self._request_hints[request_id] = _RequestHint(
                 source=src,
                 block_hashes=block_hashes,
@@ -653,6 +746,7 @@ class _RemoteFWDram:
                     if previous is not None and previous.submitted_at is not None
                     else kvcr._timer()
                 ),
+                trace=trace,
             )
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
@@ -717,7 +811,24 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             request_id=request_id,
+            trace=self._nvtx.operation(
+                kvcr,
+                op_handle,
+                blocks,
+                request_id,
+                local_fill=local_fill,
+                hint_trace_id=current_hint.trace.trace_id
+                if current_hint.trace is not None
+                else 0,
+                range_name="target.remote",
+            )
+            if self._nvtx is not None
+            else None,
         )
+        if current_hint.trace is not None:
+            current_hint.trace.mark("hint.used", op_handle=op_handle)
+        if op.trace is not None:
+            op.trace.mark("target.queued")
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "
@@ -729,8 +840,18 @@ class _RemoteFWDram:
                 len(keys),
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
-        kvcr._add_block_dependencies(op, new_operation=True)
-        kvcr._progress.submit(op)
+        try:
+            kvcr._add_block_dependencies(op, new_operation=True)
+            kvcr._progress.submit(op)
+        except Exception:
+            if op.trace is not None:
+                op.trace.mark(
+                    "target.queued.rejected",
+                    status=_nvtx.Status.REJECTED,
+                    reason=_nvtx.Reason.SUBMIT_REJECTED,
+                )
+                op.trace.end("target.remote")
+            raise
         return True
 
     def deliver(
@@ -753,6 +874,14 @@ class _RemoteFWDram:
             local_fill=False,
         ):
             return
+        trace = kvcr._nvtx_operations.get(op_handle)
+        if trace is not None:
+            trace.mark(
+                "target.hint_unavailable",
+                once=True,
+                status=_nvtx.Status.REJECTED,
+                reason=_nvtx.Reason.HINT_UNAVAILABLE,
+            )
         kvcr._complete(
             op_handle,
             {key: OpEntryResult(OpEntryStatus.FAILED) for key in blocks},
@@ -836,7 +965,9 @@ class _RemoteFWDram:
                     self._resume_source_pin(op_id, op)
 
     def discard_hint(self, request_id: str) -> None:
-        self._request_hints.pop(request_id, None)
+        hint = self._request_hints.pop(request_id, None)
+        if hint is not None and hint.trace is not None:
+            hint.trace.mark("hint.discarded", once=True)
 
     def _fail_request_hint(self, request_id: str | None) -> None:
         if request_id is None:
@@ -849,6 +980,11 @@ class _RemoteFWDram:
         if self._closed:
             return
         self._closed = True
+        for hint in self._request_hints.values():
+            if hint.trace is not None:
+                hint.trace.mark(
+                    "hint.discarded", once=True, reason=_nvtx.Reason.SHUTDOWN
+                )
         self._request_hints.clear()
         for op_id, op in list(self._source_pin_ops.items()):
             self._remove_source_pin(op_id, op)
@@ -878,7 +1014,19 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def _finish_target_pull(self, op: _TargetPullOp) -> None:
+        trace = op.trace
+        pushed = trace.push("target.main.consume") if trace is not None else False
+        try:
+            self._consume_target_pull(op)
+        finally:
+            if trace is not None:
+                trace.pop(pushed)
+
+    def _consume_target_pull(self, op: _TargetPullOp) -> None:
         kvcr = self._kvcr
+        caller_trace = kvcr._nvtx_operations.get(op.op_id[1])
+        if caller_trace is not None and op.trace is not None:
+            caller_trace.failure_reason = op.trace.failure_reason
         if op.state is not _TargetPullState.QUARANTINED:
             kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
