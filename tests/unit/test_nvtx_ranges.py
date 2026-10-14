@@ -108,3 +108,87 @@ def test_terminal_source_paths_close_their_ranges(recording, failure):
         source.close()
     assert len(spans(recording, "source.write")) == 1
     assert len(spans(recording, "source.write", "end")) == 1
+
+
+@pytest.mark.parametrize(
+    "restart,fail_start", [(False, False), (True, False), (True, True)]
+)
+def test_end_can_claim_inflight_start_without_blocking(recording, restart, fail_start):
+    """A slow native start must not block completion or overwrite a later start."""
+    tracer = _nvtx.create_tracer()
+    trace = tracer.lifecycle()
+    entered, release, ended = (threading.Event() for _ in range(3))
+    original = recording.start_range
+    calls = 0
+
+    def delayed_start(attrs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release native start")
+            if fail_start:
+                raise RuntimeError("native start failed")
+        return original(attrs)
+
+    def finish_and_restart():
+        trace.end("nixl.write")
+        if restart:
+            trace.start("nixl.write", transfer_id=22)
+        ended.set()
+
+    recording.start_range = delayed_start
+    starting = threading.Thread(target=trace.start, args=("nixl.write",))
+    finishing = threading.Thread(target=finish_and_restart)
+    starting.start()
+    try:
+        assert entered.wait(5)
+        finishing.start()
+        completed_while_start_blocked = ended.wait(1)
+    finally:
+        release.set()
+        starting.join(timeout=5)
+        if finishing.ident is not None:
+            finishing.join(timeout=5)
+    assert not starting.is_alive() and not finishing.is_alive()
+    assert completed_while_start_blocked, "end waited for the native start call"
+    if restart:
+        # The replacement starts first and receives native ID zero. A late
+        # return or failure from the old start must not remove this new range.
+        assert list(recording.ranges) == [0]
+        assert int(recording.ranges[0][1]["transfer_id"]) == 22
+        trace.end("nixl.write")
+    assert not recording.ranges
+    assert len(recording.ended) == (1 + int(restart) - int(fail_start))
+
+
+def test_duplicate_start_during_native_call_has_one_range(recording):
+    trace = _nvtx.create_tracer().lifecycle()
+    original = recording.start_range
+
+    def reenter(attrs):
+        trace.start("nixl.write")
+        return original(attrs)
+
+    recording.start_range = reenter
+    trace.start("nixl.write")
+    trace.end("nixl.write")
+    trace.end("nixl.write")
+    assert len(spans(recording, "nixl.write")) == 1
+    assert recording.ended == [0]
+
+
+def test_reentrant_end_closes_native_start_once(recording):
+    trace = _nvtx.create_tracer().lifecycle()
+    original = recording.start_range
+
+    def reenter(attrs):
+        trace.end("nixl.write")
+        return original(attrs)
+
+    recording.start_range = reenter
+    trace.start("nixl.write")
+    trace.end("nixl.write")
+    assert recording.ended == [0]
+    assert not recording.ranges
