@@ -47,7 +47,7 @@ Pass the public repository and exact revision explicitly:
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-export KVCR_VLLM_REF=000c7df9ffd3e470980fd4cd6b8ec1b0585500ff
+export KVCR_VLLM_REF=08567505b09324f891797f4a13c1bd73fc75a827
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \

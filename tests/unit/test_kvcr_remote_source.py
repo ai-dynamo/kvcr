@@ -7,8 +7,9 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import msgspec
 import pytest
@@ -42,6 +43,37 @@ from kvcr.remote_fw_dram import (
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
+@pytest.mark.parametrize("custom_argument", [False, True])
+@pytest.mark.parametrize(
+    "result,reason",
+    [
+        ((None, {}), "invalid framework pin result"),
+        (("pin", {}), "request_pin returned incomplete descriptors"),
+        (("pin", {b"key": None}), "request_pin returned no descriptors"),
+        (("pin", {b"key": []}), "descriptor normalization or installation failed"),
+    ],
+)
+def test_framework_pin_rejection_diagnostic(
+    result, reason, level, custom_argument, caplog
+):
+    caplog.set_level(level, logger="kvcr.core")
+    remote = Mock()
+    argument = "private callback data"
+    if custom_argument:
+        argument = MagicMock()
+        argument.__eq__.return_value = True
+        argument.__str__.return_value = "private callback data"
+    remote._kvcr._normalize_descriptors.side_effect = ValueError(argument)
+    assert _RemoteFWDram._install_framework_pin(remote, [b"key"], result) is None
+    remote._discard_pin_result.assert_called_once_with(result, [b"key"])
+    assert (reason in caplog.text) == (level == logging.DEBUG)
+    assert "private callback data" not in caplog.text
+    if custom_argument:
+        argument.__eq__.assert_not_called()
+        argument.__str__.assert_not_called()
+
+
 def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     return msgspec.msgpack.encode(
         {
@@ -56,7 +88,7 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
+def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypatch):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -90,6 +122,11 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         agent.state = "DONE"
         deposit = source.deposit({key: descriptors})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        local = source._core._local_dram
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
+        make_ref = Mock(wraps=local._descriptor)
+        monkeypatch.setattr(local, "_descriptor", make_ref)
         assert not source._core._remote_fw_dram._try_local_source_write(
             source._core._progress,
             SimpleNamespace(
@@ -151,7 +188,6 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
             _wait_until(lambda: len(agent.xfers) == 2)
 
         # The peer request must be served without another caller-side poll.
-        residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count == 1
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
@@ -161,6 +197,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         ]
         assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
         assert pinning.searches == []
+        assert make_ref.call_count == 2
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
         if transfer_state == "PROC":
@@ -172,6 +209,20 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state):
         assert residency.claim_count == 1  # Native completion does not release it.
         assert _poll_until(source, lambda _: residency.claim_count == 0) == []
         assert not source._core._local_dram_sources_by_op
+
+        # The caller-queued path reuses the same parts without pinning the framework.
+        request["op_handle"] = 13
+        with patch.object(
+            source._core._remote_fw_dram, "_try_local_source_write", return_value=False
+        ):
+            control.incoming.append(msgspec.msgpack.encode(request))
+            _poll_until(
+                source,
+                lambda _: len(agent.released_xfers) == 3 and residency.claim_count == 0,
+            )
+        assert make_ref.call_count == 2
+        assert agent.xfers[-1][1] == agent.xfers[-2][1]
+        assert pinning.searches == []
     finally:
         agent.state = "DONE"
         source.close()
@@ -245,8 +296,10 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
 def test_kvcr_start_write_respects_framework_pin_deadline(
     pin_before_deadline: bool,
+    caplog,
 ) -> None:
     """Source writes must not start after their framework-pin deadline."""
+    caplog.set_level(logging.DEBUG, logger="kvcr.core")
     now = 0.0
     deadline_captured = threading.Event()
 
@@ -289,6 +342,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
     assert source_agent.xfers == []
     assert pinning.searches == ([(key,)] if pin_before_deadline else [])
     assert pinning.cancelled == ([PinRequestId(0)] if pin_before_deadline else [])
+    assert caplog.text.count("framework_pin_timeout") == pin_before_deadline
     assert _decode_notif(source_agent.sent_notifs[0][1]) == {
         "type": "write_done",
         "op_handle": 9,
@@ -727,7 +781,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [_TransferRef("target", index).__dict__] for index in range(3)
+            [asdict(_TransferRef("target", index))] for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -945,7 +999,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     ),
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [_TransferRef("target", index).__dict__]
+                        [asdict(_TransferRef("target", index))]
                         for index in range(len(op_keys))
                     ],
                 }
@@ -1253,6 +1307,7 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
         _prepared={},
         _active_transfers={},
         _stop_requested=False,
+        _disconnected_remote_agents=set(),
     )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
@@ -1296,6 +1351,32 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
     assert _RemoteFWDram._remote_agent(
         tier, progress, {"target_agent": "worker-a"}
     ) == ("worker-a", "remote-1")
+
+    # After a typed disconnect, reload only if NIXL dropped native metadata.
+    payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
+    agent.add_remote_agent = Mock(return_value="remote-1")
+    agent.check_remote_metadata = Mock(return_value=True)
+    progress._disconnected_remote_agents.add("remote-1")
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
+        "worker-a",
+        "remote-1",
+    )
+    agent.check_remote_metadata.return_value = False
+    progress._disconnected_remote_agents.add("remote-1")
+    progress.release_prepared.side_effect = RuntimeError("active transfers")
+    with pytest.raises(RuntimeError, match="active transfers"):
+        _RemoteFWDram._remote_agent(tier, progress, payload)
+    assert progress._disconnected_remote_agents == {"remote-1"}
+    assert tier._route_generation == {}
+    progress.release_prepared.side_effect = None
+    assert _RemoteFWDram._remote_agent(tier, progress, payload) == (
+        "worker-a",
+        "remote-1",
+    )
+    assert not progress._disconnected_remote_agents
+    agent.add_remote_agent.assert_called_once_with(b"gen-1")
+    assert removed == ["remote-2"]
+    assert tier._route_generation == {"worker-a": 1}
 
 
 @pytest.mark.parametrize(

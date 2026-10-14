@@ -1474,12 +1474,17 @@ class _RemoteFWDram:
                     residency.layout,
                     layout,
                     allow_subset=source_pin.allow_layout_subset,
+                    indices_by_label=residency.indices_by_label,
                 )
                 if indices is None:
                     return False
                 selected.append(indices)
             sources = kvcr._claim_local_dram_sources(
                 source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
+            )
+            source_refs = tuple(
+                kvcr._local_dram.source_refs(sources[key], indices)
+                for key, indices in zip(source_pin.ordered_keys, selected)
             )
             kvcr._add_block_dependencies(source_pin, new_operation=True)
         finally:
@@ -1494,10 +1499,7 @@ class _RemoteFWDram:
             remote_agent=source_pin.remote_agent,
             op_handle=source_pin.op_handle,
             source_keys=source_pin.ordered_keys,
-            src_descriptors=tuple(
-                tuple(sources[key][index] for index in indices)
-                for key, indices in zip(source_pin.ordered_keys, selected)
-            ),
+            src_descriptors=source_refs,
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
@@ -1539,18 +1541,23 @@ class _RemoteFWDram:
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
-        sources = {} if force_failure else {**framework_sources, **local_sources}
         completed_indices = []
         selected_sources = []
-        for index, key in enumerate(source_pin.ordered_keys):
-            source = sources.get(key)
+        for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
+            residency = local_sources.get(key)
+            source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
-            if source is None:
+            if residency is None and source is None:
                 continue
             indices = _layout_indices(
-                [descriptor.label for descriptor in source],
+                residency.layout
+                if residency is not None
+                else [descriptor.label for descriptor in source],
                 [descriptor.label for descriptor in destination],
                 allow_subset=source_pin.allow_layout_subset,
+                indices_by_label=(
+                    residency.indices_by_label if residency is not None else None
+                ),
             )
             if indices is None:
                 logger.warning(
@@ -1560,7 +1567,11 @@ class _RemoteFWDram:
                 )
                 continue
             completed_indices.append(index)
-            selected_sources.append(tuple(source[span] for span in indices))
+            selected_sources.append(
+                kvcr._local_dram.source_refs(residency, indices)
+                if residency is not None
+                else tuple(source[span] for span in indices)
+            )
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
         )
@@ -1741,6 +1752,11 @@ class _RemoteFWDram:
         self._resume_source_pin(op_id, op)
 
     def _expire_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
+        logger.debug(
+            "KVCR_EVENT framework_pin_timeout op=%s pending_pins=%d",
+            op_id,
+            len(op.pending_pin_ids),
+        )
         self._cancel_pending_pin_for_op(op_id, op, result="timeout")
         self._submit_prepared_source_write(op_id, op, force_failure=True)
 
@@ -1981,17 +1997,27 @@ class _RemoteFWDram:
             if not any(descriptor is not None for descriptor in normalized.values()):
                 raise ValueError("request_pin returned no descriptors")
             pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
-            for key in keys:
-                descriptor = normalized[key]
+            block_record = self._kvcr._block_record
+            for key, descriptor in normalized.items():
                 if descriptor is None:
                     continue
-                record = self._kvcr._block_record(key)
+                record = block_record(key)
                 if record.fw_mem is not None:
                     continue
                 record.fw_mem = _FwMemResidency(descriptor, pin_handle)
                 pin_keys.add(key)
             return pin_handle
-        except Exception:
+        except Exception as error:
+            if logger.isEnabledFor(logging.DEBUG):
+                # Only expose known validation reasons, not callback data or keys.
+                reason = error.args[0] if error.args else None
+                if type(reason) is not str or reason not in (
+                    "invalid framework pin result",
+                    "request_pin returned incomplete descriptors",
+                    "request_pin returned no descriptors",
+                ):
+                    reason = "descriptor normalization or installation failed"
+                logger.debug("KVCR_EVENT framework_pin_rejected reason=%s", reason)
             self._discard_pin_result(pin_result, keys)
             return None
 
@@ -2123,6 +2149,16 @@ class _RemoteFWDram:
                 )
             _validate_memory_regions([*regions[0].values(), *regions[1].values()])
         cached = self._remote_agents_by_target.get(target_agent)
+        if cached is not None and cached[1] in progress._disconnected_remote_agents:
+            # A disconnect may drop NIXL's native metadata; reload only if it did.
+            if not agent.check_remote_metadata(cached[1]):
+                progress.release_prepared(cached[1])
+                self._remote_agents_by_target.pop(target_agent)
+                self._route_generation[target_agent] = (
+                    self._route_generation.get(target_agent, 0) + 1
+                )
+            progress._disconnected_remote_agents.discard(cached[1])
+            cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
             cached_metadata, remote_agent, cached_regions = cached
             if not isinstance(target_metadata, bytes) or (

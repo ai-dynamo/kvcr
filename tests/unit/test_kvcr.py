@@ -10,7 +10,7 @@ from contextlib import nullcontext, suppress
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from _kvcr_test_utils import (
@@ -55,6 +55,27 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
     return hold
 
 
+@pytest.mark.parametrize("budget", [0, True, 1.5])
+def test_invalid_startup_budget_is_rejected(budget):
+    with pytest.raises(ValueError, match="startup_timeout_seconds"):
+        KVCR(
+            KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=budget),
+            KVCRBindings(Mock(), Mock(), Mock()),
+            KVCRBackendConfigs(),
+        )
+
+
+def test_configured_startup_budget_reaches_progress(monkeypatch):
+    monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
+    runner = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config=KVCRConfig("startup-test", [("", 16)], startup_timeout_seconds=1),
+    )
+    assert runner._core._progress._startup_timeout_seconds == 1
+
+
 def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     """Observers see only stable transitions: bytes READY in a slot, then gone."""
     block_size = 16
@@ -90,16 +111,19 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     _poll_until(kvcr, lambda done: first in dict(done))
     assert observed == [(keys[0], [("", 0)])]
 
-    agent.state = "ERR"
-    failed = kvcr.deposit({keys[1]: [_mem_descriptor(1)]})
-    failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[failed]
+    with patch.object(
+        agent, "make_prepped_xfer", side_effect=RuntimeError("transfer creation failed")
+    ):
+        failed = kvcr.deposit({keys[1]: [_mem_descriptor(1)]})
+        failed_result = dict(_poll_until(kvcr, lambda done: failed in dict(done)))[
+            failed
+        ]
     assert not failed_result[keys[1]].success
     assert observed == [
         (keys[0], [("", 0)]),
         (keys[0], None),
     ]
 
-    agent.state = "DONE"
     third = kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
     _poll_until(kvcr, lambda done: third in dict(done))
     backend.acquire_sources((keys[2],))

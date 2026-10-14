@@ -6,7 +6,7 @@ import ctypes
 import hashlib
 import heapq
 import logging
-from contextlib import closing
+from contextlib import closing, suppress
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,9 +28,15 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import core as core_module
+from kvcr import progress as progress_module
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.local_dram import (
+    _layout_indices,
+    _LocalCopyOp,
+    _LocalDramResidency,
+    _LocalDramState,
+)
 from kvcr.policy import FIFOPolicy, LRUPolicy
 from kvcr.policy_runtime import _EvictionQueue, _PolicyInvoker
 from kvcr.recovery_journal import (
@@ -49,6 +55,15 @@ from kvcr.types import (
     QueryStatus,
     RegionDescriptor,
 )
+
+
+def test_expired_copy_logs_without_submitting(caplog):
+    caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+    copy = SimpleNamespace(transfer_id=None, clock=lambda: 1, deadline=1, op_id=7)
+    progress = Mock()
+    assert _LocalCopyOp.progress(copy, progress, None) == (True, True)
+    progress.submit_transfer.assert_not_called()
+    assert "local_copy_expired_before_submit op=7" in caplog.text
 
 
 def _two_pool_kvcr(
@@ -194,7 +209,7 @@ def test_local_dram_rejects_overlapping_pools() -> None:
 
 
 @pytest.mark.parametrize("labeled", [False, True])
-def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
+def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) -> None:
     full = ctypes.create_string_buffer(16)
     swa = ctypes.create_string_buffer(16)
     payload = b"a" * 16 + b"b" * 8 + b"c" * 8
@@ -236,6 +251,15 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     )
     assert not dict(kvcr.poll_completed())[wrong][first].success
 
+    local_dram = kvcr._core._local_dram
+    residency = kvcr._core._block_record_map[first].local_dram
+    # Ready blocks already have their label index, but references stay incremental.
+    assert residency.indices_by_label == (
+        {"full": 0, "swa:a": 1, "swa:b": 2} if labeled else {"full": 0, "swa": None}
+    )
+    assert not residency.refs
+    make_ref = Mock(wraps=local_dram._descriptor)
+    monkeypatch.setattr(local_dram, "_descriptor", make_ref)
     agent.state = "PROC"
     partial = kvcr.deliver(
         {
@@ -247,6 +271,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     )
     if labeled:
         _wait_until(lambda: len(agent.transfers) == 2)
+        assert make_ref.call_count == 2  # Only the requested parts are constructed.
         # Releasing the fetch cannot make any part evictable during a partial copy.
         assert kvcr._core._block_record_map[first].local_dram.claim_count == 2
         kvcr.release([result.release_handle])
@@ -265,12 +290,38 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled) -> None:
     matching = kvcr.deliver({first: descriptors})
     assert dict(_poll_until(kvcr, bool))[matching][first].success
     assert source.raw == payload
+    assert make_ref.call_count == 3  # The full copy reuses those earlier parts.
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert kvcr.query((first, second)) == [
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
+
+
+@pytest.mark.parametrize(
+    "requested,allow_subset,expected",
+    [
+        (["", "swa:a", "swa", "swa"], False, [0, 1, 2, 3]),
+        (["swa:a", ""], True, [1, 0]),
+        (["swa"], True, None),
+        (["missing"], True, None),
+        (["", ""], True, None),
+        ([], True, None),
+        (["swa:a"], False, None),
+    ],
+)
+def test_layout_matching_with_and_without_index(requested, allow_subset, expected):
+    for index in (None, {"": 0, "swa:a": 1, "swa": None}):
+        assert (
+            _layout_indices(
+                ["", "swa:a", "swa", "swa"],
+                requested,
+                allow_subset=allow_subset,
+                indices_by_label=index,
+            )
+            == expected
+        )
 
 
 def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
@@ -550,6 +601,7 @@ def test_align_sequence_updates_policy_and_journal(
     kvcr._core._clock = lambda: 6.0
     kvcr.align_sequence(ordered_keys, use_current_time=True)
     assert journal.publish.call_count == 2
+    agent.state = "DONE"
 
 
 def test_local_deposit_applies_optional_admission() -> None:
@@ -779,60 +831,160 @@ def test_capacity_pressure_is_pool_local() -> None:
 
 
 @pytest.mark.parametrize(
-    ("failure", "terminal_state", "success"),
+    ("kind", "failure", "abandon"),
     [
-        ("submission", None, False),
-        ("timeout", None, False),
-        ("timeout", "DONE", True),
+        ("deposit", "submission", False),
+        ("deposit", "timeout", False),
+        ("deposit", "timeout", True),
+        ("deposit", "sticky_error", True),
+        ("deliver", "timeout", True),
     ],
 )
-def test_local_deposit_waits_for_safe_release(
-    failure: str, terminal_state: str | None, success: bool
+def test_local_copy_timeout_retains_memory_until_completion(
+    kind: str, failure: str, abandon: bool, caplog, request
 ) -> None:
-    class DelayedReleaseAgent(FakeNixlAgent):
-        def __init__(self):
-            super().__init__()
-            self.allow_release = False
-            self.release_attempts = 0
+    caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+
+    class PendingAgent(FakeNixlAgent):
+        error_polls = 0
 
         def transfer(self, handle):
             result = super().transfer(handle)
             return "ERR" if failure == "submission" else result
 
-        def release_xfer_handle(self, handle):
-            self.release_attempts += 1
-            if not self.allow_release:
-                return False
-            super().release_xfer_handle(handle)
+        def check_xfer_state(self, handle):
+            if failure == "sticky_error" and self.state != "DONE":
+                self.error_polls += 1
+                raise RuntimeError("cached native error")
+            return super().check_xfer_state(handle)
 
     now = 0.0
     block_size = 16
-    primary = ctypes.create_string_buffer(block_size)
+    primary = ctypes.create_string_buffer(block_size * 2)
     local = ctypes.create_string_buffer(block_size)
-    agent = DelayedReleaseAgent()
+    agent = PendingAgent()
+    # Fake-only teardown: real cached NIXL errors cannot transition to DONE.
+    request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
+    errors = []
     kvcr = _new_local_kvcr(
-        agent, local, 1, framework_regions=[_buffer_region(primary, len(local) // 1)]
+        agent,
+        local,
+        1,
+        framework_regions=[_buffer_region(primary, block_size)],
+        on_resilience_event=errors.append,
     )
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
 
-    op_handle = kvcr.deposit({key: [_mem_descriptor()]})
-    _wait_until(lambda: bool(agent.transfers))
-    if failure == "timeout":
+    if kind == "deliver":
+        agent.state = "DONE"
+        deposit = kvcr.deposit({key: [_mem_descriptor()]})
+        assert dict(_poll_until(kvcr, bool))[deposit][key].success
+    agent.state = "PEND"
+    released = list(agent.released_xfers)
+    op_handle = getattr(kvcr, kind)({key: [_mem_descriptor()]})
+    _wait_until(lambda: len(agent.transfers) > len(released))
+    if failure in ("timeout", "sticky_error"):
         now = 2.0
-    _wait_until(lambda: agent.release_attempts > 0)
+    progress = kvcr._core._progress
+    copy = next(iter(progress._in_flight_ops.values()))
+    _wait_until(lambda: copy.failure_latched)
 
     assert list(kvcr.poll_completed()) == []
-    assert kvcr._core._block_record_map[key].local_dram is not None
+    residency = kvcr._core._block_record_map[key].local_dram
+    assert residency is not None
+    assert agent.released_xfers == released
+    if abandon:
+        now = 5.0
+        assert _poll_until(kvcr, bool) == [(op_handle, _op_entries({key: False}))]
+        assert [error.state for error in errors] == ["uncertain"]
+        if kind == "deposit":
+            assert errors[0].source_blocks == {key: [_mem_descriptor()]}
+            assert errors[0].source_owners == {key: "framework"}
+        else:
+            assert errors[0].destination_regions == [_mem_descriptor()]
+            assert errors[0].destination_owner == "framework"
+        assert residency.claim_count == (kind == "deliver")
+        assert agent.released_xfers == released
+        blocked = kvcr.deposit({BlockKey(b"other"): [_mem_descriptor(1)]})
+        assert dict(kvcr.poll_completed())[blocked][BlockKey(b"other")].success is False
 
-    if terminal_state is not None:
-        agent.state = terminal_state
-    agent.allow_release = True
-    assert _poll_until(kvcr, lambda results: bool(results)) == [
-        (op_handle, _op_entries({key: success}))
-    ]
-    assert agent.released_xfers == [1]
-    assert (key in kvcr._core._block_record_map) is success
+    if failure == "sticky_error":
+        checked = agent.error_polls
+        now = 50.0
+        _wait_until(lambda: agent.error_polls >= checked + 2)
+        assert kvcr.poll_completed() == []
+        assert [error.state for error in errors] == ["uncertain"]
+        assert copy.transfer_id in progress._active_transfers
+        assert agent.released_xfers == released
+        assert key in kvcr._core._block_record_map
+        return
+
+    agent.state = "DONE"
+    assert _poll_until(
+        kvcr,
+        lambda _: (
+            residency.claim_count == 0
+            if kind == "deliver"
+            else key not in kvcr._core._block_record_map
+        ),
+    ) == ([] if abandon else [(op_handle, _op_entries({key: False}))])
+    assert [error.state for error in errors] == (
+        ["uncertain", "quiesced"] if abandon else []
+    )
+    if abandon:
+        assert errors[0].op_handle == errors[1].op_handle
+    assert (key in kvcr._core._block_record_map) is (kind == "deliver")
+
+    for event, expected in [
+        ("submit_failed", "submission"),
+        ("deadline_expired", "timeout"),
+    ]:
+        assert caplog.text.count(f"local_copy_{event}") == (failure == expected)
+
+
+def test_close_retains_pending_local_copy_resources(monkeypatch) -> None:
+    monkeypatch.setattr(progress_module, "_OP_CLEANUP_TIMEOUT_SECONDS", 0.01)
+    primary = ctypes.create_string_buffer(16)
+    local = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "PEND"
+    kvcr = _new_local_kvcr(
+        agent, local, 1, framework_regions=[_buffer_region(primary, 16)]
+    )
+    kvcr._core._clock = lambda: 0.0
+    key = BlockKey(b"k0")
+    progress = kvcr._core._progress
+    try:
+        kvcr.deposit({key: [_mem_descriptor()]})
+        _wait_until(lambda: bool(agent.transfers))
+        copy = next(iter(progress._in_flight_ops.values()))
+        _wait_until(lambda: copy.transfer_id is not None)
+        transfer_id = copy.transfer_id
+        registrations = progress._memory_registrations.copy()
+        prepared = {
+            owner: entries.copy() for owner, entries in progress._prepared.items()
+        }
+        residency = kvcr._core._block_record_map[key].local_dram
+
+        with pytest.raises(RuntimeError, match="active transfers"):
+            kvcr.close()
+        assert not progress._thread.is_alive()
+        assert not kvcr._core.is_quiescent() and not kvcr._core._closed
+        assert transfer_id in progress._active_transfers
+        assert not agent.released_xfers and not agent.deregistered
+        assert progress._memory_registrations == registrations
+        assert progress._prepared == prepared
+        assert kvcr._core._block_record_map[key].local_dram is residency
+    finally:
+        # Fake-only cleanup: the stopped thread cannot observe late completion.
+        agent.state = "DONE"
+        with suppress(RuntimeError):
+            progress.close()
+        progress._close_progress_ops()
+        progress._close_nixl()
+        with suppress(RuntimeError):
+            kvcr.close()  # Re-raises the saved failure after completing teardown.
 
 
 def test_local_initialize_failure_completes_without_failing_progress() -> None:
@@ -892,6 +1044,7 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     records = _g2_recovered(first=2, second=0)
     records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
     install_recovery_records(kvcr._core, records)
+    assert records[BlockKey(b"first")].local_dram.indices_by_label == {":first": 0}
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(

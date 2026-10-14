@@ -16,7 +16,7 @@ from typing import Annotated, Any
 
 import msgspec
 import numpy as np
-from nixl import nixl_agent, nixl_agent_config
+from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
 from . import _nvtx
 from .types import BlockKey, RegionDescriptor
@@ -42,7 +42,7 @@ class _MemDescriptor:
     device_Id: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _TransferRef:
     """An element in an agent's framework or KVCR-owned registered memory."""
 
@@ -133,6 +133,7 @@ class _KVCRProgress:
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
+        startup_timeout_seconds: float | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -144,6 +145,7 @@ class _KVCRProgress:
         self._nixl_agent_name = nixl_agent_name
         self._nixl_agent: Any | None = None
         self._active_transfers: dict[int, _TransferState] = {}
+        self._disconnected_remote_agents: set[str] = set()
         self._next_transfer_id = 0
         self._nixl_listen_port = nixl_listen_port
         self._dram_backends = dram_backends
@@ -172,6 +174,7 @@ class _KVCRProgress:
         self._failure: BaseException | None = None
         self._stop_requested = False
         self._startup_stage = "thread startup"
+        self._startup_timeout_seconds = startup_timeout_seconds
 
     @property
     def nixl_agent(self) -> Any:
@@ -195,7 +198,6 @@ class _KVCRProgress:
         self,
         transfer_id: int,
         *,
-        cancellation_requested: bool = False,
         require_completion: bool = False,
     ) -> tuple[bool, Any | None] | None:
         """Advance a transfer and return its result after releasing its handle."""
@@ -207,7 +209,12 @@ class _KVCRProgress:
         if outcome is None or (require_completion and not outcome):
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
-            except Exception:
+            except Exception as error:
+                if isinstance(error, nixlRemoteDisconnectError):
+                    self._disconnected_remote_agents.add(state.remote_side_agent)
+                    # NIXL keeps this as the handle's final status; releasing it
+                    # cancels any request still queued on the failed endpoint.
+                    require_completion = False
                 if state.outcome is not False:
                     logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
@@ -228,17 +235,18 @@ class _KVCRProgress:
                         reason=_nvtx.Reason.PROGRESS_ERROR,
                     )
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
-            # its completion signal. Remote writes retain it until actual DONE.
+            # its completion signal. Retain it until native access has stopped.
+            # TODO: Enable timeout cancellation for NIXL backends that guarantee
+            # cancellation stops native access before releasing the handle.
             if require_completion and xfer_state != "DONE":
                 if xfer_state not in ("PROC", "PEND"):
                     state.outcome = False
                 return None
             pending = xfer_state in ("PROC", "PEND")
-            if pending and not cancellation_requested:
+            if pending:
                 return None
             outcome = xfer_state == "DONE" and state.outcome is not False
-            if not pending:
-                state.outcome = outcome
+            state.outcome = outcome
         if outcome and state.capture_telemetry:
             get_telemetry = getattr(agent, "get_xfer_telemetry", None)
             if get_telemetry is not None:
@@ -363,7 +371,9 @@ class _KVCRProgress:
                     _nvtx.Reason.SUBMIT_AMBIGUOUS,
                 )
                 logger.warning("NIXL transfer returned unexpected state %r", post_state)
-        except Exception:
+        except Exception as error:
+            if isinstance(error, nixlRemoteDisconnectError):
+                self._disconnected_remote_agents.add(state.remote_side_agent)
             submitted = False
             post_status, post_reason = (
                 _nvtx.Status.AMBIGUOUS,
@@ -386,22 +396,6 @@ class _KVCRProgress:
                     status=_nvtx.Status.SUCCESS,
                 )
         return transfer_id, submitted
-
-    def cancel_transfer(self, transfer_id: int) -> bool:
-        """Cancel if necessary and forget only after NIXL releases the handle."""
-        state = self._active_transfers.get(transfer_id)
-        if state is None:
-            return True
-        state.outcome = False
-        if state.trace is not None:
-            state.trace.mark(
-                "nixl.write.cancel_requested",
-                once=True,
-                transfer_id=transfer_id,
-                status=_nvtx.Status.CANCELLED,
-                reason=_nvtx.Reason.CANCELLED,
-            )
-        return self._release_transfer(transfer_id, state)
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type
@@ -559,20 +553,26 @@ class _KVCRProgress:
         self._activate.set()
         if not self._thread.is_alive():
             self._thread.start()
-        if not self._ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+        timeout = self._startup_timeout_seconds
+        if timeout is None:
+            timeout = _STARTUP_TIMEOUT_SECONDS
+        if not self._ready.wait(timeout=timeout):
             raise RuntimeError(
                 "KVCR progress initialization timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+                f"{timeout:g}s (stage: {self._startup_stage})"
             )
         self.raise_if_failed()
 
     def prepare(self) -> None:
         """Create the agent and register memory without starting backends."""
         self._thread.start()
-        if not self._prepare_ready.wait(timeout=_STARTUP_TIMEOUT_SECONDS):
+        timeout = self._startup_timeout_seconds
+        if timeout is None:
+            timeout = _STARTUP_TIMEOUT_SECONDS
+        if not self._prepare_ready.wait(timeout=timeout):
             raise RuntimeError(
                 "KVCR progress preparation timed out after "
-                f"{_STARTUP_TIMEOUT_SECONDS:g}s (stage: {self._startup_stage})"
+                f"{timeout:g}s (stage: {self._startup_stage})"
             )
         self.raise_if_failed()
 
