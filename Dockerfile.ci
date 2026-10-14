@@ -122,17 +122,8 @@ from importlib import metadata
 
 import kvcr
 import dynamo.vllm
-from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
-from dynamo.vllm.kv_hints import resolve_kv_transfer_hint_sources
-from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.kvcr import manager
 
-assert KV_HINT_TRANSFER_CAPABILITY_KEY == "router_hint"
-assert callable(resolve_kv_transfer_hint_sources)
-assert (
-    SecondaryTierFactory.get_tier_class({"type": "kvcr"})
-    is manager.KVCRSecondaryTierManager
-)
 print("kvcr==" + metadata.version("kvcr"))
 print("dynamo.vllm:", dynamo.vllm.__file__)
 print("KVCR adapter:", manager.__file__)

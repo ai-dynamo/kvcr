@@ -29,8 +29,8 @@ inputs, the installed package versions, and Dynamo's pip installation report
 (including downloaded wheel URLs and hashes) for seven days. These reports are
 also stored in the image under `/opt/kvcr-*.json`.
 The build preserves the base's installed NCCL version, rejects dependency
-conflicts introduced by installation, and checks the Dynamo
-router-hint imports and vLLM KVCR adapter against the newly installed package.
+conflicts introduced by installation, and checks that Dynamo and the vLLM KVCR
+adapter import against the newly installed package.
 An older adapter can fail this check even when installing KVCR itself succeeds.
 The inherited vLLM API-server entrypoint is cleared so tests can launch Dynamo.
 
