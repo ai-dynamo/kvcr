@@ -10,61 +10,24 @@ Neither profiler presence nor telemetry configuration controls payload work.
 
 import logging
 import os
-from dataclasses import dataclass, field
-from enum import IntEnum
 from functools import lru_cache
 from hashlib import blake2b
 from importlib import import_module
-from itertools import count
-from threading import Lock, RLock, local
+from threading import Lock
 from types import MappingProxyType
-from uuid import uuid4
+
+from ._nvtx_payload import Reason, Status, _PayloadEmitter
+from ._nvtx_pin import _PinTrace
 
 _LOGGER = logging.getLogger(__name__)
 _WARNED: set[str] = set()
-_NAMES = (
-    "source.pin.framework",
-    "source.pin.registered",
-    "source.pin.waiter",
-    "source.pin.completed",
-    "source.pin.detached",
+_NON_FAILURE_REASONS = (
+    Reason.NONE,
+    Reason.UNKNOWN,
+    Reason.RELEASE_ERROR,
+    Reason.SHUTDOWN,
 )
-
-
-class Status(IntEnum):
-    PENDING = 1
-    SUCCESS = 2
-    PARTIAL = 3
-    FAILED = 4
-    TIMEOUT = 5
-    CANCELLED = 6
-    REJECTED = 7
-    AMBIGUOUS = 8
-    UNRESOLVED = 9
-
-
-class Reason(IntEnum):
-    UNKNOWN = 0
-    NONE = 1
-    CALLBACK_ERROR = 2
-    DUPLICATE_REQUEST = 3
-    INVALID_RESULT = 4
-    DEADLINE = 5
-    CANCELLED = 6
-    SHUTDOWN = 7
-    NO_WAITERS = 8
-    SUBMIT_REJECTED = 9
-    SUBMIT_AMBIGUOUS = 10
-    CREATE_ERROR = 11
-    PROGRESS_ERROR = 12
-    RELEASE_ERROR = 13
-    CONTROL_ERROR = 14
-    INVALID_NOTIFICATION = 15
-    REMOTE_FAILURE = 16
-    ROUTE_CHANGED = 17
-    SOURCE_STALLED = 18
-    HINT_UNAVAILABLE = 19
-    HINT_CONFLICT = 20
+_MEMORY_KINDS = {"DRAM": 1, "VRAM": 2, "FILE": 3}
 
 
 def _warn_once(key: str, message: str) -> None:
@@ -108,190 +71,30 @@ def create_tracer():
         return None
 
 
-class _PinTracer:
+class _PinTracer(_PayloadEmitter):
     def __init__(self, domain, numpy, level):
-        self.domain, self.numpy, self.level = domain, numpy, level
-        instance = uuid4().int
-        self.instance_hi, self.instance_lo = instance >> 64, instance & (2**64 - 1)
-        self._ids = count(1)
-        self.category = domain.get_category_id("framework_pin")
-        self.lifecycle_category = domain.get_category_id("remote_deliver")
-        self._messages = {name: domain.get_registered_string(name) for name in _NAMES}
+        super().__init__(domain, numpy, level)
         self._identity = lru_cache(maxsize=128)(identity)
-        self._thread = local()
-        self.dtype = numpy.dtype(
-            [
-                ("schema_version", "u2"),
-                ("instance_hi", "u8"),
-                ("instance_lo", "u8"),
-                ("pin_id", "u8"),
-                ("pin_request_known", "u1"),
-                ("pin_request_id", "i8"),
-                ("source_op_id", "i8"),
-                ("op_handle", "i8"),
-                ("requested_blocks", "u8"),
-                ("completed_blocks", "i8"),
-                ("status", "u1"),
-                ("reason", "u1"),
-                ("fw_dram_utilization_known", "u1"),
-            ]
-        )
-        self.event_dtype = numpy.dtype(
-            [
-                ("schema_version", "u2"),
-                ("instance_hi", "u8"),
-                ("instance_lo", "u8"),
-                ("trace_id", "u8"),
-                ("request_hi", "u8"),
-                ("request_lo", "u8"),
-                ("request_known", "u1"),
-                ("session_known", "u1"),
-                ("parent_session_known", "u1"),
-                ("op_handle", "i8"),
-                ("source_op_id", "i8"),
-                ("target_agent_hi", "u8"),
-                ("target_agent_lo", "u8"),
-                ("target_incarnation_hi", "u8"),
-                ("target_incarnation_lo", "u8"),
-                ("route_generation", "u8"),
-                ("transfer_id", "u8"),
-                ("hint_trace_id", "u8"),
-                ("local_blocks", "i8"),
-                ("remote_blocks", "i8"),
-                ("g3_blocks", "i8"),
-                ("requested_blocks", "i8"),
-                ("requested_bytes", "i8"),
-                ("selected_blocks", "i8"),
-                ("completed_blocks", "i8"),
-                ("selected_bytes", "i8"),
-                ("completed_bytes", "i8"),
-                ("status", "u1"),
-                ("reason", "u1"),
-                ("local_fill", "u1"),
-                ("source_tier", "u1"),
-                ("destination_tier", "u1"),
-                ("source_memory", "u1"),
-                ("destination_memory", "u1"),
-                ("native_error_known", "u1"),
-                ("native_error", "i8"),
-            ]
-        )
-        # Nsight 2025.3 exports NumPy Unicode payloads as empty strings. A
-        # bounded byte array and explicit length also preserve embedded NULs.
-        self.context_dtype = numpy.dtype(
-            self.event_dtype.descr
-            + [
-                ("pin_id", "u8"),
-                ("pin_request_known", "u1"),
-                ("pin_request_id", "i8"),
-                ("fw_dram_utilization_known", "u1"),
-                ("request_display_known", "u1"),
-                ("length", "u2"),
-                ("truncated", "u1"),
-                ("value_utf8", "u1", (256,)),
-            ]
-        )
-        self._context_defaults = numpy.zeros((), dtype=self.context_dtype)
-        self._context_defaults["schema_version"] = 3
-        self._context_defaults["instance_hi"] = self.instance_hi
-        self._context_defaults["instance_lo"] = self.instance_lo
-        for name in self.context_dtype.names:
-            if name.endswith("_blocks") or name.endswith("_bytes"):
-                self._context_defaults[name] = -1
-        self._context_defaults.setflags(write=False)
-        self._field_types = {
-            name: self.context_dtype.fields[name][0]
-            for name in self.context_dtype.names
-        }
-        self._prefix_names = frozenset(
-            (
-                "schema_version",
-                "instance_hi",
-                "instance_lo",
-                "trace_id",
-                "status",
-                "reason",
-            )
-        )
-        self._prefix = [
-            (name, self._field_types[name])
-            for name in (
-                "schema_version",
-                "instance_hi",
-                "instance_lo",
-                "trace_id",
-                "status",
-                "reason",
-            )
-        ]
-
-    def _emit(
-        self, name, trace_id, fields, *, category=None, method="mark", context=False
-    ):
-        """Reuse storage without sharing an in-flight call's payload.
-
-        Never reassign EventAttributes.payload: its setter traverses structured
-        dtype metadata. Update the array already owned by the attributes instead.
-        Callers isolate failures from KVCR results and resource ownership.
-        """
-        category = self.lifecycle_category if category is None else category
-        extra = (
-            ()
-            if context
-            else tuple(key for key in fields if key not in self._prefix_names)
-        )
-        key = (name, category, context, extra)
-        buffers = getattr(self._thread, "buffers", None)
-        if buffers is None:
-            self._thread.buffers = buffers = {}
-        slots = buffers.setdefault(key, [])
-        slot = next((slot for slot in slots if not slot[2]), None)
-        if slot is None:
-            dtype = (
-                self.context_dtype
-                if context
-                else self.numpy.dtype(
-                    self._prefix + [(key, self._field_types[key]) for key in extra]
-                )
-            )
-            payload = self.numpy.zeros((), dtype=dtype)
-            payload["schema_version"] = 3
-            payload["instance_hi"] = self.instance_hi
-            payload["instance_lo"] = self.instance_lo
-            if name not in self._messages:
-                self._messages[name] = self.domain.get_registered_string(name)
-            # nvtx 0.2.16's factory accepts text, not RegisteredString. Its
-            # internal cache resolves the retained handle only on construction;
-            # subsequent emissions reuse the completed attributes object.
-            attributes = self.domain.get_event_attributes(
-                message=name,
-                category=category,
-                payload=payload,
-            )
-            slot = [payload, attributes, False]
-            slots.append(slot)
-        slot[2] = True
-        try:
-            payload = slot[0]
-            if context:
-                # A prior lifecycle's omitted fields and display must not leak.
-                # Copy defaults into the array already bound to the attributes.
-                payload[...] = self._context_defaults
-            payload["trace_id"] = trace_id
-            payload["status"] = fields.get("status", Status.PENDING)
-            payload["reason"] = fields.get("reason", Reason.NONE)
-            for field, value in fields.items():
-                payload[field] = value
-            return getattr(self.domain, method)(slot[1])
-        finally:
-            slot[2] = False
 
     def begin(self, block_count, *, source_op_id=0, op_handle=0):
         pin_id = next(self._ids)
-        lifetime = _LifecycleTrace(self, pin_id, {})
-        lifetime.start("source.pin.wait", category=self.category)
+        try:
+            wait_range_id = self._emit(
+                "source.pin.wait",
+                pin_id,
+                {},
+                category=self.category,
+                method=self.domain.start_range,
+            )
+        except Exception:
+            wait_range_id = None
         return _PinTrace(
-            self, pin_id, block_count, source_op_id, op_handle, lifetime=lifetime
+            self,
+            pin_id,
+            block_count,
+            source_op_id,
+            op_handle,
+            _wait_range_id=wait_range_id,
         )
 
     def name_progress_thread(self):
@@ -419,9 +222,7 @@ def memory_kind(refs, regions):
             region = table.get(
                 ref.label.partition(":")[0] + (":*" if ref.framework else "")
             )
-        kinds.add(
-            {"DRAM": 1, "VRAM": 2, "FILE": 3}.get(getattr(region, "mem_type", None), 0)
-        )
+        kinds.add(_MEMORY_KINDS.get(getattr(region, "mem_type", None), 0))
     return next(iter(kinds)) if len(kinds) == 1 else 0
 
 
@@ -436,38 +237,50 @@ class _LifecycleTrace:
         self.completion_fields = {}
         self._context_emitted = False
         self._ranges = {}
-        self._range_lock = RLock()
+        # Native calls run outside this lock; recursive acquisition is unnecessary.
+        self._range_lock = Lock()
 
     def start(self, name, *, range_key=None, category=None, **fields):
         """Start an independent range, even when another trace overlaps it."""
         key = (name, range_key)
+        # Identity keeps an in-flight start separate from a later restart.
+        entry = [None]
         with self._range_lock:
             if key in self._ranges:
                 return
-            self._ranges[key] = None
-            try:
-                range_id = self.tracer._emit(
-                    name, self.trace_id, fields, category=category, method="start_range"
-                )
-            except Exception:
-                self._ranges.pop(key, None)
+            self._ranges[key] = entry
+        try:
+            range_id = self.tracer._emit(
+                name,
+                self.trace_id,
+                fields,
+                category=category,
+                method=self.tracer.domain.start_range,
+            )
+        except Exception:
+            with self._range_lock:
+                if self._ranges.get(key) is entry:
+                    self._ranges.pop(key, None)
+            return
+        with self._range_lock:
+            if self._ranges.get(key) is entry:
+                entry[0] = range_id
                 return
-            if key in self._ranges:
-                self._ranges[key] = range_id
-            elif range_id is not None:
-                # A reentrant callback ended this range while start was in flight.
-                try:
-                    self.tracer.domain.end_range(range_id)
-                except Exception:
-                    pass
+        if range_id is not None:
+            # An overlapping or reentrant end already claimed this start.
+            try:
+                self.tracer.domain.end_range(range_id)
+            except Exception:
+                pass
 
     def end(self, name, *, range_key=None):
         """Claim the ending once; zero is a valid native range ID."""
+        key = (name, range_key)
         with self._range_lock:
-            range_id = self._ranges.pop((name, range_key), None)
-        if range_id is not None:
+            entry = self._ranges.pop(key, None)
+        if entry is not None and entry[0] is not None:
             try:
-                self.tracer.domain.end_range(range_id)
+                self.tracer.domain.end_range(entry[0])
             except Exception:
                 pass
 
@@ -535,9 +348,8 @@ class _LifecycleTrace:
             values = dict(self._fields)
             if t.level == "medium" and request_id is not None:
                 encoded = request_id.encode("utf-8")
-                display = t.numpy.zeros(256, dtype="u1")
-                display[: min(len(encoded), 256)] = t.numpy.frombuffer(
-                    encoded[:256], dtype="u1"
+                display = t.numpy.frombuffer(
+                    encoded[:256].ljust(256, b"\0"), dtype="u1"
                 )
                 values.update(
                     request_display_known=1,
@@ -545,7 +357,13 @@ class _LifecycleTrace:
                     truncated=len(encoded) > 256,
                     value_utf8=display,
                 )
-            t._emit("request.context", self.trace_id, values, context=True)
+            t._emit(
+                "request.context",
+                self.trace_id,
+                values,
+                method=t.domain.mark,
+                context=True,
+            )
         except Exception:
             pass
 
@@ -571,12 +389,7 @@ class _LifecycleTrace:
 
     def mark(self, name, *, once=False, detail=False, retain_cause=False, **fields):
         reason = fields.get("reason", Reason.NONE)
-        if not retain_cause and reason not in (
-            Reason.NONE,
-            Reason.UNKNOWN,
-            Reason.RELEASE_ERROR,
-            Reason.SHUTDOWN,
-        ):
+        if not retain_cause and reason not in _NON_FAILURE_REASONS:
             self.failure_reason = reason
         if detail and self.tracer.level != "medium":
             return
@@ -585,7 +398,9 @@ class _LifecycleTrace:
                 return
             self._observed.add(name)
         try:
-            self.tracer._emit(name, self.trace_id, fields)
+            self.tracer._emit(
+                name, self.trace_id, fields, method=self.tracer.domain.mark
+            )
         except Exception:
             pass
         finally:
@@ -600,70 +415,8 @@ class _LifecycleTrace:
 
     def push(self, name, **fields):
         try:
-            self.tracer._emit(name, self.trace_id, fields, method="push_range")
-            return True
-        except Exception:
-            return False
-
-    def pop(self, pushed):
-        if pushed:
-            try:
-                self.tracer.domain.pop_range()
-            except Exception:
-                pass
-
-
-@dataclass
-class _PinTrace:
-    tracer: _PinTracer
-    pin_id: int
-    requested_blocks: int
-    source_op_id: int
-    op_handle: int
-    request_id: int | None = None
-    finished: bool = False
-
-    context_emitted: bool = False
-    lifetime: _LifecycleTrace | None = field(default=None, repr=False)
-    _finish_lock: object = field(default_factory=Lock, repr=False)
-
-    def _context(self):
-        if self.context_emitted:
-            return
-        self.context_emitted = True
-        known = self.request_id is not None and -(2**63) <= self.request_id < 2**63
-        try:
             self.tracer._emit(
-                "source.pin.context",
-                self.pin_id,
-                dict(
-                    pin_id=self.pin_id,
-                    pin_request_known=known,
-                    pin_request_id=self.request_id if known else 0,
-                    source_op_id=self.source_op_id,
-                    op_handle=self.op_handle,
-                    requested_blocks=self.requested_blocks,
-                ),
-                category=self.tracer.category,
-                context=True,
-            )
-        except Exception:
-            pass
-
-    def _mark(self, name, **fields):
-        try:
-            self.tracer._emit(name, self.pin_id, fields, category=self.tracer.category)
-        except Exception:
-            pass  # Annotation errors never alter KVCR results or resources.
-
-    def push(self):
-        try:
-            self.tracer._emit(
-                "source.pin.framework",
-                self.pin_id,
-                {},
-                category=self.tracer.category,
-                method="push_range",
+                name, self.trace_id, fields, method=self.tracer.domain.push_range
             )
             return True
         except Exception:
@@ -675,53 +428,3 @@ class _PinTrace:
                 self.tracer.domain.pop_range()
             except Exception:
                 pass
-
-    def registered(self, request_id):
-        self.request_id = request_id
-        self._context()
-        self._mark("source.pin.registered")
-
-    def waiter(self, source_op_id, op_handle):
-        self._mark("source.pin.waiter", source_op_id=source_op_id, op_handle=op_handle)
-
-    def detached(self, source_op_id, op_handle):
-        if self.tracer.level == "medium":
-            self._mark(
-                "source.pin.detached",
-                source_op_id=source_op_id,
-                op_handle=op_handle,
-            )
-
-    def finish(self, result, *, reason=None, completed_blocks=-1):
-        with self._finish_lock:
-            if self.finished:
-                return
-            self.finished = True
-        self._context()
-        status = {
-            "success": Status.SUCCESS,
-            "failed": Status.FAILED,
-            "timeout": Status.TIMEOUT,
-            "cancelled": Status.CANCELLED,
-        }[result]
-        if status is Status.SUCCESS and 0 <= completed_blocks < self.requested_blocks:
-            status = Status.FAILED if completed_blocks == 0 else Status.PARTIAL
-        if reason is None:
-            reason = {
-                "success": Reason.NONE,
-                "failed": Reason.UNKNOWN,
-                "timeout": Reason.DEADLINE,
-                "cancelled": Reason.CANCELLED,
-            }[result]
-        elif isinstance(reason, str):
-            reason = Reason[reason.upper()]
-        if status in (Status.PARTIAL, Status.FAILED) and reason is Reason.NONE:
-            reason = Reason.UNKNOWN
-        self._mark(
-            "source.pin.completed",
-            status=status,
-            reason=reason,
-            completed_blocks=completed_blocks,
-        )
-        if self.lifetime is not None:
-            self.lifetime.end("source.pin.wait")

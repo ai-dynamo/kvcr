@@ -194,10 +194,11 @@ def test_reused_context_clears_optional_values_without_rebinding(recording, name
             reason=_nvtx.Reason.CALLBACK_ERROR,
         ),
         context=True,
+        method=tracer.domain.mark,
     )
     # Rebinding would fail; the existing attributes and storage must be reused.
     recording.fail = "attributes"
-    tracer._emit(name, 12, {}, context=True)
+    tracer._emit(name, 12, {}, context=True, method=tracer.domain.mark)
     first, second = [e[2] for e in recording.events if e[1] == name]
     assert int(first["requested_bytes"]) == 65536
     assert first["value_utf8"].tobytes() == b"c" * 256
@@ -238,9 +239,10 @@ def test_context_recovers_after_partial_assignment_failure(recording):
             11,
             dict(request_known=1, value_utf8=99, requested_blocks="not-an-integer"),
             context=True,
+            method=tracer.domain.mark,
         )
     recording.fail = "attributes"
-    tracer._emit("request.context", 12, {}, context=True)
+    tracer._emit("request.context", 12, {}, context=True, method=tracer.domain.mark)
     [(_, _, payload, _)] = recording.events
     assert int(payload["trace_id"]) == 12
     assert int(payload["request_known"]) == 0
@@ -257,12 +259,20 @@ def test_reentrant_context_retains_outer_snapshot(recording):
         nonlocal entering
         if not entering:
             entering = True
-            tracer._emit("request.context", 22, {}, context=True)
+            tracer._emit(
+                "request.context", 22, {}, context=True, method=tracer.domain.mark
+            )
             entering = False
         original(attrs)
 
     recording.mark = reenter
-    tracer._emit("request.context", 11, dict(requested_blocks=16), context=True)
+    tracer._emit(
+        "request.context",
+        11,
+        dict(requested_blocks=16),
+        context=True,
+        method=tracer.domain.mark,
+    )
     snapshots = [e[2] for e in recording.events]
     assert [(int(p["trace_id"]), int(p["requested_blocks"])) for p in snapshots] == [
         (22, -1),
@@ -284,7 +294,7 @@ def test_concurrent_contexts_have_independent_defaults(recording):
         threading.Thread(
             target=tracer._emit,
             args=("request.context", identity, fields),
-            kwargs={"context": True},
+            kwargs={"context": True, "method": tracer.domain.mark},
         )
         for identity, fields in ((11, dict(requested_blocks=16)), (22, {}))
     ]
