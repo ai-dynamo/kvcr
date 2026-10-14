@@ -634,7 +634,10 @@ class _RemoteFWDram:
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             request_id=request_id,
             key_layout=(
-                kvcr._block_record_map[keys[0]].local_dram.key_layout
+                tuple(
+                    label.removeprefix("!")
+                    for label in kvcr._block_record_map[keys[0]].local_dram.key_layout
+                )
                 if local_fill
                 else ()
             ),
@@ -1320,7 +1323,9 @@ class _RemoteFWDram:
                 if residency is not None
                 else [descriptor.label for descriptor in source]
             )
-            if source_pin.key_layout and source_pin.key_layout != tuple(layout):
+            if source_pin.key_layout and source_pin.key_layout != tuple(
+                label.removeprefix("!") for label in layout
+            ):
                 indices = None
             elif residency is not None:
                 indices = (
