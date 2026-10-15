@@ -53,31 +53,43 @@ def test_parse_hints_returns_every_valid_action_in_order():
     assert [r.action_type for r in rejected] == ["kv.future_action", "kv.fetch"]
 
 
-@pytest.mark.parametrize("as_mapping", [False, True])
-def test_parse_hints_accepts_struct_and_mapping(as_mapping):
+def test_parse_hints_accepts_struct():
     hint = _router_hint("tcp://source:1234", (123, 456, 123))
-    hint = msgspec.to_builtins(hint) if as_mapping else hint
     hints, rejected = parse_hints(hint, _types())
     assert len(hints) == 1 and rejected == []
     assert hints[0].source_endpoint == "tcp://source:1234"
     assert hints[0].block_hashes == frozenset({123, 456})
 
 
-def test_parse_hints_non_mapping_action_and_payload():
+def test_parse_hints_rejects_invalid_actions_and_payloads():
     hint = _HintEnvelope(
         "0.1",
         7,
-        [None, _HintAction("a", "kv.fetch", "1.0", "bad")],
+        [
+            None,
+            msgspec.to_builtins(_fetch_hint("dict", "tcp://dict:1", (2,))),
+            _HintAction("a", "kv.fetch", "1.0", "bad"),
+            _fetch_hint("ok", "tcp://source:1", (1,)),
+        ],
     )
     hints, rejected = parse_hints(hint, _types())
-    assert hints == []
+    assert hints == [_KVFetchHint("ok", "tcp://source:1", frozenset({1}))]
     assert [(r.action_id, r.action_type, r.reason, r.message_id) for r in rejected] == [
+        (None, "unknown", "invalid_hint", None),
         (None, "unknown", "invalid_hint", None),
         ("a", "kv.fetch", "invalid_payload", None),
     ]
 
 
-@pytest.mark.parametrize("hint", [None, {}, _HintEnvelope("0.1", "m", "bad")])
+@pytest.mark.parametrize(
+    "hint",
+    [
+        None,
+        {},
+        msgspec.to_builtins(_router_hint("tcp://source:1")),
+        _HintEnvelope("0.1", "m", "bad"),
+    ],
+)
 def test_parse_hints_rejects_invalid_envelope(hint):
     with pytest.raises(ValueError, match="invalid router hint"):
         parse_hints(hint, _types())

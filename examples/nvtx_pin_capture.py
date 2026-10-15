@@ -14,10 +14,25 @@ import socket
 import time
 from contextlib import ExitStack
 
+import msgspec
+
 from kvcr import KVCR, KVCRBindings
 from kvcr.config import KVCRBackendConfigs, KVCRConfig, RemoteFWDramOptions
 from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.types import BlockKey, MemoryRef, PinRequestId, RegionDescriptor
+
+
+class _HintAction(msgspec.Struct, frozen=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict[str, object]
+
+
+class _HintEnvelope(msgspec.Struct, frozen=True):
+    protocol_version: str
+    message_id: str
+    actions: list[_HintAction]
 
 
 def control_channel():
@@ -125,21 +140,21 @@ def run(blocks, delay_ms, scenario):
             workers.append(worker)
         source, target = workers
         target.submit_hint(
-            {
-                "protocol_version": "0.1",
-                "message_id": "nvtx-pin-example",
-                "actions": [
-                    {
-                        "action_id": "a1",
-                        "action_type": "kv.fetch",
-                        "action_version": "1.0",
-                        "payload": {
+            _HintEnvelope(
+                protocol_version="0.1",
+                message_id="nvtx-pin-example",
+                actions=[
+                    _HintAction(
+                        action_id="a1",
+                        action_type="kv.fetch",
+                        action_version="1.0",
+                        payload={
                             "source_control_endpoint": channels[0].endpoint,
                             "block_hashes": list(range(blocks)),
                         },
-                    }
+                    )
                 ],
-            },
+            ),
             request_id="nvtx-pin-example",
         )
         operation = target.deliver(

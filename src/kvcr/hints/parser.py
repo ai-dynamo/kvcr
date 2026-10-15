@@ -52,10 +52,6 @@ def _warn_version_mismatch(
     logger.warning(message, supported, received)
 
 
-def _hint_field(value: Mapping[str, object] | msgspec.Struct, name: str) -> object:
-    return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
-
-
 class _Hint(Protocol):
     """A parsed envelope hint: a frozen struct per action type.
 
@@ -121,14 +117,14 @@ def reject_hint(
     )
 
 
-def hint_message_id(hint: Mapping[str, object] | msgspec.Struct) -> str | None:
+def hint_message_id(hint: msgspec.Struct) -> str | None:
     """The envelope's ``message_id`` when it is a string, else ``None``."""
-    message_id = _hint_field(hint, "message_id")
+    message_id = getattr(hint, "message_id", None)
     return message_id if isinstance(message_id, str) else None
 
 
 def parse_hints(
-    hint: Mapping[str, object] | msgspec.Struct,
+    hint: msgspec.Struct,
     types: Mapping[str, HintType],
 ) -> tuple[list[_Hint], list[HintResult]]:
     """Parse every hint of a KV hint envelope with ``types`` (by action type).
@@ -137,17 +133,17 @@ def parse_hints(
     each hint that could not be used. Raises ``ValueError`` only when the
     envelope itself is malformed.
     """
-    if not isinstance(hint, (Mapping, msgspec.Struct)):
+    if not isinstance(hint, msgspec.Struct):
         raise ValueError("invalid router hint")
 
     _warn_version_mismatch(
         supported=_KV_HINT_PROTOCOL_VERSION,
-        received=_hint_field(hint, "protocol_version"),
+        received=getattr(hint, "protocol_version", None),
         issue="protocol-version-mismatch",
         message="KV hint protocol_version mismatch; supported=%r received=%r",
     )
 
-    raw_actions = _hint_field(hint, "actions")
+    raw_actions = getattr(hint, "actions", None)
     if not isinstance(raw_actions, list):
         raise ValueError("invalid router hint")
 
@@ -156,15 +152,15 @@ def parse_hints(
     hints: list[_Hint] = []
     rejected: list[HintResult] = []
     for raw in raw_actions:
-        if not isinstance(raw, (Mapping, msgspec.Struct)):
+        if not isinstance(raw, msgspec.Struct):
             rejected.append(reject_hint(None, "unknown", "invalid_hint", message_id))
             continue
 
-        action_id = _hint_field(raw, "action_id")
+        action_id = getattr(raw, "action_id", None)
         if not isinstance(action_id, str):
             rejected.append(reject_hint(None, "unknown", "invalid_hint", message_id))
             continue
-        action_type = _hint_field(raw, "action_type")
+        action_type = getattr(raw, "action_type", None)
         if not isinstance(action_type, str):
             rejected.append(
                 reject_hint(action_id, "unknown", "invalid_hint", message_id)
@@ -185,7 +181,7 @@ def parse_hints(
 
         _warn_version_mismatch(
             supported=hint_type.version,
-            received=_hint_field(raw, "action_version"),
+            received=getattr(raw, "action_version", None),
             issue=f"{action_type}-version-mismatch",
             message=(
                 f"{action_type.replace('%', '%%')} action_version mismatch; "
@@ -193,7 +189,7 @@ def parse_hints(
             ),
         )
 
-        payload = _hint_field(raw, "payload")
+        payload = getattr(raw, "payload", None)
         if not isinstance(payload, Mapping):
             rejected.append(
                 reject_hint(action_id, action_type, "invalid_payload", message_id)
