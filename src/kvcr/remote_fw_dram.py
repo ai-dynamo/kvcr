@@ -274,6 +274,7 @@ class _SourcePinOp(_Op):
     deadline: float
     remote_agent: str
     op_handle: int
+    # Preserve request positions even when keys drops rejected dependencies.
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
@@ -1291,18 +1292,21 @@ class _RemoteFWDram:
             # write the dead generation's destinations through the new route.
             force_failure = True
         local_sources = kvcr._claim_local_dram_sources(
-            source_pin.op_id, source_pin.ordered_keys
+            source_pin.op_id, source_pin.keys
         )
         framework_sources = {
             key: record.fw_mem.descriptors
-            for key in source_pin.ordered_keys
+            for key in source_pin.keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
         completed_indices = []
         selected_sources = []
+        waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
+            if key not in source_pin.keys:
+                continue
             residency = local_sources.get(key)
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
@@ -1327,7 +1331,8 @@ class _RemoteFWDram:
                     and residency.state is not _LocalDramState.DISCARDING
                     and residency.can_wait_for_pieces(labels)
                 ):
-                    return  # Keep claims until all requested pieces are readable.
+                    waiting = True
+                    continue
             else:
                 indices = _layout_indices(layout, labels)
             if indices is None:
@@ -1336,6 +1341,10 @@ class _RemoteFWDram:
                     source_pin.op_handle,
                     key,
                 )
+                source_pin.keys -= {key}
+                record = kvcr._block_record_map[key]
+                record.discard_in_flight_op(op_id)
+                kvcr._prune_block_record(key)
                 continue
             completed_indices.append(index)
             selected_sources.append(
@@ -1347,12 +1356,11 @@ class _RemoteFWDram:
             source_pin.ordered_keys[index] for index in completed_indices
         )
 
-        kvcr._release_local_dram_sources(
-            source_pin.op_id, local_sources.keys() - set(completed_keys)
-        )
+        retained_keys = source_pin.keys if waiting else set(completed_keys)
+        kvcr._release_local_dram_sources(op_id, local_sources.keys() - retained_keys)
         relevant_pins = {
             record.fw_mem.pin_handle
-            for key in completed_keys
+            for key in retained_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
@@ -1362,6 +1370,10 @@ class _RemoteFWDram:
         # release from unpinning it mid-read.
         framework_pins = set(relevant_pins)
         unused_pins = source_pin.framework_pins - framework_pins
+        if waiting:
+            source_pin.framework_pins = framework_pins
+            self._release_framework_pins(unused_pins)
+            return
         source_pin.framework_pins.clear()
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
@@ -1372,7 +1384,7 @@ class _RemoteFWDram:
                 if not force_failure
                 else _SourceWriteState.NOTIFY_FAILURE
             ),
-            keys=frozenset(completed_keys or source_pin.ordered_keys),
+            keys=frozenset(completed_keys or source_pin.keys),
             started_at=source_pin.started_at,
             deadline=source_pin.deadline,
             op_id=source_pin.op_id,
@@ -1529,10 +1541,12 @@ class _RemoteFWDram:
             return
 
         local_sources = kvcr._claim_local_dram_sources(
-            op.op_id, op.ordered_keys, allow_filling=True
+            op.op_id, op.keys, allow_filling=True
         )
         unresolved_keys = tuple(
-            key for key in op.ordered_keys if key not in local_sources
+            key
+            for key in op.ordered_keys
+            if key in op.keys and key not in local_sources
         )
         if unresolved_keys and not op.framework_acquire_attempted:
             if any(
