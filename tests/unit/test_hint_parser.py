@@ -10,17 +10,14 @@ from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 from kvcr.hint_parser import _LOGGED_HINT_ISSUES, _KVFetchHint
 
 
-@pytest.mark.parametrize("as_mapping", [False, True])
-def test_kv_fetch_hint_parses_first_fetch_action(as_mapping) -> None:
+def test_kv_fetch_hint_parses_first_fetch_action() -> None:
     hint = _router_hint("tcp://source:1234", (123, 456, 123))
     hint.actions.insert(0, _HintAction("ignored", "kv.future_action", "9.0", {}))
     hint.actions.extend(_router_hint("tcp://other:1234", (789,)).actions)
 
-    hint = msgspec.to_builtins(hint) if as_mapping else hint
-    payload = hint["actions"][1]["payload"] if as_mapping else hint.actions[1].payload
     parsed = _KVFetchHint.from_hint(hint)
-    payload["source_control_endpoint"] = "tcp://changed:1"
-    payload["block_hashes"].clear()
+    hint.actions[1].payload["source_control_endpoint"] = "tcp://changed:1"
+    hint.actions[1].payload["block_hashes"].clear()
     assert parsed == _KVFetchHint(
         source_endpoint="tcp://source:1234",
         block_hashes=frozenset({123, 456}),
@@ -53,6 +50,7 @@ def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
     [
         None,
         {},
+        msgspec.to_builtins(_router_hint("tcp://source:1")),
         _HintEnvelope("0.1", "test", "bad"),
         _HintEnvelope(
             "0.1", "test", [None, _HintAction("a", "kv.fetch", "1.0", "bad")]
