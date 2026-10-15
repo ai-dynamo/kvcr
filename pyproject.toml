@@ -27,6 +27,9 @@ dependencies = [
 # cursor operations. It is loaded on first use, so importing kvcr without it
 # works; running a KVCR-Service or claiming one of its pools does not.
 
+[project.optional-dependencies]
+profiling = ["nvtx>=0.2.16,<0.3", "numpy>=1.26,<3"]
+
 [dependency-groups]
 dev = [
   "pytest>=8,<9",
