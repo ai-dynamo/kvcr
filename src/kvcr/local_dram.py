@@ -979,11 +979,9 @@ class _LocalDram:
                     writer.results[key] = (
                         self._new_public_claim(key, residency)
                         if key_success and writer.claim_on_ready
-                        else OpEntryResult(
-                            OpEntryStatus.SUCCESS
-                            if key_success
-                            else OpEntryStatus.FAILED
-                        )
+                        else _SUCCESS_RESULT
+                        if key_success
+                        else _FAILED_RESULT
                     )
                     affected_residency_ops[writer.op_id] = writer
             else:

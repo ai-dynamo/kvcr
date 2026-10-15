@@ -245,22 +245,31 @@ def test_local_source_starts_inline_and_holds_its_slot(
         source.close()
 
 
-@pytest.mark.parametrize("first_piece_ready", [False, True])
+@pytest.mark.parametrize(
+    "first_piece_ready,mixed", [(False, False), (True, False), (True, True)]
+)
 @pytest.mark.parametrize("timeout", [False, True])
-def test_local_source_waits_for_declared_pieces(first_piece_ready, timeout) -> None:
+def test_local_source_waits_for_declared_pieces(
+    first_piece_ready, timeout, mixed, caplog, request
+) -> None:
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     local = ctypes.create_string_buffer(32)
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
     source = _new_kvcr(
         agent,
         pinning,
         control,
         name="source",
-        framework_regions=[_buffer_region(primary, 16, ":*")],
+        framework_regions=[
+            _buffer_region(primary, 16),
+            _buffer_region(primary, 16, ":*"),
+        ],
         local_dram=LocalDramOptions([("", ctypes.addressof(local), 32)]),
     )
     now = 0.0
     source._core._clock = lambda: now
+    backend = source._core._remote_fw_dram
     key = BlockKey(b"partial")
     layout = [":a", ":b"]
     first = source.deposit(
@@ -273,19 +282,33 @@ def test_local_source_waits_for_declared_pieces(first_piece_ready, timeout) -> N
         assert dict(_poll_until(source, bool))[first][key].success
         agent.state = "PROC"
 
-    request = msgspec.msgpack.decode(_start_write_message(12, key))
-    request.update(
+    message = msgspec.msgpack.decode(_start_write_message(12, key))
+    rejected = (BlockKey(b"wrong-before"), BlockKey(b"wrong-after")) if mixed else ()
+    keys = [rejected[0], key, rejected[1]] if mixed else [key]
+    message.update(
+        keys=keys,
         key_layout=layout,
         target_regions=({":*": _buffer_region(primary, 16, ":*")}, {}),
         dst_descriptors=[
             [_TransferRef("target", i, label) for i, label in enumerate(layout)]
+            for _ in keys
         ],
     )
-    control.incoming.append(msgspec.msgpack.encode(request))
-    _poll_until(source, lambda _: bool(source._core._remote_fw_dram._source_pin_ops))
+    control.incoming.append(msgspec.msgpack.encode(message))
+    _poll_until(source, lambda _: bool(backend._source_pin_ops))
     assert len(agent.xfers) == 1
     residency = source._core._block_record_map[key].local_dram
     producer_claims = int(not first_piece_ready)
+    if mixed:
+        _poll_until(
+            source,
+            lambda _: pinning.searches and not backend._pending_pin_ops,
+        )
+        assert pinning.unpins == ["pin"]
+        for rejected_key in rejected:
+            assert rejected_key not in source._core._block_record_map
+        for _ in range(3):
+            assert source.poll_completed() == []
     assert residency.claim_count == producer_claims + 1
 
     if timeout:
@@ -312,11 +335,17 @@ def test_local_source_waits_for_declared_pieces(first_piece_ready, timeout) -> N
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
         ] == [b"a" * 16, b"b" * 16]
         notification = agent.xfers[-1][5]
+        assert _decode_notif(notification)["completed_indices"] == [1 if mixed else 0]
     assert _decode_notif(notification)["success"] is not timeout
-    assert not source._core._remote_fw_dram._source_pin_ops
+    assert not backend._source_pin_ops
     assert not source._core._local_dram_sources_by_op
     assert residency.claim_count == 0
-    assert pinning.searches == []
+    assert pinning.searches == ([rejected] if mixed else [])
+    assert [
+        record.args[1]
+        for record in caplog.records
+        if "start_write layout mismatch" in record.message
+    ] == list(rejected)
 
 
 def test_local_source_falls_back_during_fill_publication_without_blocking_progress():
