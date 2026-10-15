@@ -1171,7 +1171,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         ordered_keys=(key,),
         dst_descriptors=(destinations,),
         op_id=("source", 1),
-        keys={key},
+        keys=frozenset((key,)),
         framework_pins={stale},
         allow_layout_subset=allow_subset,
     )

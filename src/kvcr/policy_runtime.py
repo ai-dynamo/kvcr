@@ -7,8 +7,6 @@ import logging
 import math
 from collections.abc import Collection, Generator
 
-import msgspec
-
 from .policy import KVCachePolicy
 from .types import (
     BlockKey,
@@ -153,15 +151,10 @@ class _PolicyInvoker:
             logger.warning("KVCR on_align_sequence failed", exc_info=True)
 
 
-class _Entry(msgspec.Struct, frozen=True):
-    score: float
-    sequence: int
-
-
 class _EvictionQueue:
     def __init__(self) -> None:
         self._heap: list[tuple[float, int, BlockKey]] = []
-        self._live: dict[BlockKey, _Entry] = {}
+        self._live: dict[BlockKey, tuple[float, int, BlockKey]] = {}
         self._next_sequence = 0
 
     def __len__(self) -> int:
@@ -169,27 +162,24 @@ class _EvictionQueue:
 
     def score(self, key: BlockKey) -> float | None:
         entry = self._live.get(key)
-        return entry.score if entry is not None else None
+        return entry[0] if entry is not None else None
 
     def insert(self, key: BlockKey, score: float) -> bool:
         """Refresh a score, returning whether the key newly became evictable."""
         previous = self._live.get(key)
-        if previous is not None and previous.score == score:
+        if previous is not None and previous[0] == score:
             return False
-        entry = _Entry(score, self._next_sequence)
+        entry = (score, self._next_sequence, key)
         self._next_sequence += 1
         self._live[key] = entry
-        heapq.heappush(self._heap, (entry.score, entry.sequence, key))
+        heapq.heappush(self._heap, entry)
         if len(self._heap) > 2 * len(self._live):
             # Accumulated stale entries amortize this O(n) pass. Reusing tuples
             # limits overhead, but this insert still pays the synchronous cost.
             # If profiling shows significant pauses, use incremental compaction.
             # Compact queued entries only; candidates() restores those it holds.
             self._heap = [
-                item
-                for item in self._heap
-                if (current := self._live.get(item[2])) is not None
-                and current.sequence == item[1]
+                item for item in self._heap if self._live.get(item[2]) is item
             ]
             heapq.heapify(self._heap)
         return previous is None
@@ -197,23 +187,24 @@ class _EvictionQueue:
     def remove(self, key: BlockKey) -> bool:
         return self._live.pop(key, None) is not None
 
-    def candidates(self, excluded: set[BlockKey]) -> Generator[BlockKey, None, None]:
+    def candidates(
+        self, excluded: frozenset[BlockKey]
+    ) -> Generator[BlockKey, None, None]:
         """Visit each key once in score order; close to restore live entries."""
-        excluded = set(excluded)
+        # Reuse the immutable exclusion set to avoid copying it for each allocation.
+        seen: set[BlockKey] = set()
         skipped: list[tuple[float, int, BlockKey]] = []
         try:
             while self._heap:
                 item = heapq.heappop(self._heap)
-                _, sequence, key = item
-                current = self._live.get(key)
-                if current is None or current.sequence != sequence:
+                key = item[2]
+                if self._live.get(key) is not item:
                     continue
                 skipped.append(item)
-                if key not in excluded:
-                    excluded.add(key)
+                if key not in excluded and key not in seen:
+                    seen.add(key)
                     yield key
         finally:
             for item in skipped:
-                current = self._live.get(item[2])
-                if current is not None and current.sequence == item[1]:
+                if self._live.get(item[2]) is item:
                     heapq.heappush(self._heap, item)

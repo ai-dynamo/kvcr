@@ -140,11 +140,16 @@ def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history
     assert policy.ingested == []
 
     agent.state = "DONE"
-    completed = _poll_until(kvcr, lambda results: len(results) == 2)
-    assert dict(completed) == {
+    completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
+    assert completed == {
         first: _op_entries({keys[0]: True, keys[1]: True}),
         filling_duplicate: _op_entries({keys[0]: True}),
     }
+    assert (
+        completed[first][keys[0]]
+        is completed[first][keys[1]]
+        is completed[filling_duplicate][keys[0]]
+    )
     assert local.raw == b"a" * block_size + b"b" * block_size
     assert events == [InventoryEvent(keys[:2], CacheTier.LOCAL_G2, False)]
     assert [(meta.block_key, source) for meta, source in policy.ingested] == [
@@ -425,17 +430,22 @@ def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     queue.insert(first, 0)
     queue.insert(churned, 1)
     queue.insert(excluded, 1)
+    assert all(queue._live[item[2]] is item for item in queue._heap)
 
-    with closing(queue.candidates({excluded})) as candidates:
+    protected = frozenset((excluded,))
+    with closing(queue.candidates(protected)) as candidates:
         assert next(candidates) == first
         for _ in range(100):
             queue.remove(churned)
             queue.insert(churned, 1)
         assert len(queue._heap) <= 2 * len(queue)
-        assert list(candidates) == [churned]
+        assert next(candidates) == churned
+        assert not queue.insert(churned, 2)
+        assert list(candidates) == []
 
+    assert queue.score(churned) == 2
     assert len(queue._heap) == 3
-    assert list(queue.candidates(set())) == [first, excluded, churned]
+    assert list(queue.candidates(frozenset())) == [first, excluded, churned]
 
 
 def test_lru_float_score_uses_small_tail_first_bias() -> None:

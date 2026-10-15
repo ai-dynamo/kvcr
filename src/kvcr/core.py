@@ -29,6 +29,7 @@ from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
 from .policy_runtime import _PolicyInvoker
 from .progress import (
+    _FAILED_RESULT,
     _KVCRProgress,
     _MemDescriptor,
     _Op,
@@ -43,7 +44,6 @@ from .types import (
     InventoryEvent,
     MemoryRef,
     OpEntryResult,
-    OpEntryStatus,
     OpHandle,
     OpResult,
     PinHandle,
@@ -553,7 +553,7 @@ class _KVCRCore:
             ):
                 self._complete(
                     op_handle,
-                    {key: OpEntryResult(OpEntryStatus.FAILED) for key in g3_blocks},
+                    dict.fromkeys(g3_blocks, _FAILED_RESULT),
                 )
             if remote_blocks:
                 self._remote_fw_dram.deliver(
@@ -580,7 +580,7 @@ class _KVCRCore:
             if self._local_dram is None:
                 self._complete(
                     op_handle,
-                    {key: OpEntryResult(OpEntryStatus.FAILED) for key in blocks},
+                    dict.fromkeys(blocks, _FAILED_RESULT),
                 )
             else:
                 self._local_dram.deposit(
@@ -610,7 +610,7 @@ class _KVCRCore:
             if local_dram is None:
                 self._complete(
                     op_handle,
-                    {key: OpEntryResult(OpEntryStatus.FAILED) for key in ordered_keys},
+                    dict.fromkeys(ordered_keys, _FAILED_RESULT),
                 )
                 return op_handle
 

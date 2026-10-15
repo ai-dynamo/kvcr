@@ -18,9 +18,12 @@ import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
-from .types import BlockKey, RegionDescriptor
+from .types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 logger = logging.getLogger(__name__)
+_SUCCESS_RESULT = OpEntryResult(OpEntryStatus.SUCCESS)
+_FAILED_RESULT = OpEntryResult(OpEntryStatus.FAILED)
+_DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
@@ -92,7 +95,7 @@ class _Op:
     """Identity and block dependencies shared by all KVCR operations."""
 
     op_id: _OpId
-    keys: set[BlockKey]
+    keys: frozenset[BlockKey]
 
 
 class _ProgressOp(_Op, ABC):

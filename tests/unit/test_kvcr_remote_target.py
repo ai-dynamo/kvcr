@@ -442,8 +442,6 @@ def test_remote_completion_rejects_invalid_notification(
     ]
     completed = _poll_until(target, bool)
     assert completed == [(op_handle, _op_entries(dict.fromkeys(keys, False)))]
-    entries = completed[0][1]
-    assert entries[keys[0]] is entries[keys[1]]
     assert not _has_outstanding_operations(target)
     assert not [r for r in _key_history(caplog) if r["event"].startswith("remote_")]
 
@@ -1274,8 +1272,6 @@ def test_remote_framework_dram_transfers_available_keys(
             ),
         )
     ]
-    entries = completed[0][1]
-    assert entries[keys[completed_indices[0]]] is entries[keys[completed_indices[1]]]
     assert target.query(keys, "req") == [
         (QueryStatus.MISS, None)
         if index in missing_indices
