@@ -15,6 +15,8 @@ from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
 
+import msgspec
+
 from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -419,7 +421,7 @@ class _KVCRCore:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object],
+        hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
         hint = _KVFetchHint.from_hint(hints)

@@ -11,7 +11,7 @@ import mmap
 import struct
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -498,7 +498,7 @@ def claimed_core(
     return _KVCRCore(
         config,
         bindings,
-        replace(backend_configs, local_dram=claimed.hold.local_dram),
+        msgspec.structs.replace(backend_configs, local_dram=claimed.hold.local_dram),
     )
 
 

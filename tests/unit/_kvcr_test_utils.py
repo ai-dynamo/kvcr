@@ -8,7 +8,6 @@ import socket
 import time
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,27 +44,31 @@ _OPEN_KVCRS: list[KVCR] = []
 _HANDED_OUT: set[int] = set()
 
 
+class _HintAction(msgspec.Struct, frozen=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: object
+
+
+class _HintEnvelope(msgspec.Struct, frozen=True):
+    protocol_version: str
+    message_id: str
+    actions: list[_HintAction]
+
+
 def _router_hint(
     source: str | None,
     block_hashes: Collection[int] = (123,),
-) -> dict[str, object]:
+) -> _HintEnvelope:
     payload: dict[str, object] = {
         "block_hashes": list(block_hashes),
     }
     if source is not None:
         payload["source_control_endpoint"] = source
-    return {
-        "protocol_version": "0.1",
-        "message_id": "test-message",
-        "actions": [
-            {
-                "action_id": "a1",
-                "action_type": "kv.fetch",
-                "action_version": "1.0",
-                "payload": payload,
-            }
-        ],
-    }
+    return _HintEnvelope(
+        "0.1", "test-message", [_HintAction("a1", "kv.fetch", "1.0", payload)]
+    )
 
 
 def _ephemeral_floor() -> int:
@@ -541,7 +544,7 @@ def _new_kvcr(
     policy=None,
     on_resilience_event=None,
 ) -> KVCR:
-    config = replace(
+    config = msgspec.structs.replace(
         config
         or KVCRConfig(
             nixl_agent_name=name,

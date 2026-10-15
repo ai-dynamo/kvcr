@@ -3,7 +3,6 @@
 """Runtime and policy value types for KVCR."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, NewType
 
@@ -19,8 +18,7 @@ LocalDramRegions = list[tuple[str, int, int]]  # name, address, size in bytes
 PoolBlockLayouts = list[tuple[str, int]]  # name, block size in bytes
 
 
-@dataclass(frozen=True, kw_only=True)
-class RegionDescriptor:
+class RegionDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     """Registered memory containing ``count`` fixed-size transfer elements.
 
     ``stride=0`` means contiguous elements. The registered extent includes
@@ -99,8 +97,7 @@ class OpEntryStatus(Enum):
     FAILED = "FAILED"
 
 
-@dataclass(frozen=True)
-class OpEntryResult:
+class OpEntryResult(msgspec.Struct, frozen=True):
     status: OpEntryStatus
     # Fetch locations in KVCR-owned memory, valid until release.
     descriptors: list[MemoryRef] | None = None
@@ -131,8 +128,7 @@ class CacheTier(Enum):
     # G4 = "G4"
 
 
-@dataclass(frozen=True)
-class InventoryEvent:
+class InventoryEvent(msgspec.Struct, frozen=True):
     keys: tuple[BlockKey, ...]
     tier: CacheTier
     removed: bool
@@ -157,8 +153,7 @@ class PlacementAction(Enum):
 PlacementDecision = tuple[PlacementAction, CacheTier | None]
 
 
-@dataclass(frozen=True)
-class PlacementFailure:
+class PlacementFailure(msgspec.Struct, frozen=True):
     attempted: PlacementDecision
     source: CacheTier
     reason: str
