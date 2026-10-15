@@ -225,6 +225,8 @@ def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> 
     assert len(agent.transfers) == 2
     assert kvcr.query([key]) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert events == []
+    kvcr.align_sequence([key])
+    journal.publish.assert_not_called()
     assert kvcr.release([claim]) == [(claim, True)]
     # The earlier writer protects the key even after the public claim is released.
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
@@ -248,11 +250,13 @@ def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> 
     states[agent.transfers[2]] = "DONE"
     assert dict(_poll_until(kvcr, bool))[third][key].success
     assert events == [InventoryEvent((key,), CacheTier.LOCAL_G2, False)]
+    assert journal.publish.call_count == 1
     mirror = _RecoveryMirror(("full", "swa"))
     for call in journal.publish.call_args_list:
         mirror.apply(*call.args)
     recovered = mirror.take_records()[key].local_dram
-    assert recovered.committed_slots() == list(zip(layout[:3], range(3)))
+    assert recovered.slots == list(zip(layout, range(3)))
+    assert not recovered.pending_labels
     published = journal.publish.call_count
     states[agent.transfers[0]] = "ERR"
     assert not dict(_poll_until(kvcr, bool))[first][key].success
@@ -326,7 +330,7 @@ def test_failed_labelled_deposit_keeps_previous_parts(monkeypatch, timeout) -> N
     assert pools[1].raw == b"a" * 8 + b"b" * 8
 
 
-@pytest.mark.parametrize("case", ["later", "pending", "retry", "recovered"])
+@pytest.mark.parametrize("case", ["pending", "retry"])
 def test_local_reads_wait_for_later_piece_and_release_claims(monkeypatch, case):
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
     source = ctypes.create_string_buffer(b"_" * 8 + b"a" * 8 + b"b" * 8)
@@ -337,17 +341,8 @@ def test_local_reads_wait_for_later_piece_and_release_claims(monkeypatch, case):
     kvcr._core._clock = lambda: now
     key = BlockKey(b"partial")
     pieces = [_mem_descriptor(0, "swa:a"), _mem_descriptor(1, "swa:b")]
-    if case == "recovered":
-        pools[1][:8] = b"a" * 8
-        residency = _LocalDramResidency(
-            [("swa:a", 0), ("swa:b", 1)],
-            _LocalDramState.READY,
-            pending_labels={"swa:b"},
-        )
-        install_recovery_records(kvcr._core, {key: _BlockRecord(local_dram=residency)})
-    else:
-        first = kvcr.deposit({key: pieces[:1]}, expected_layout=["swa:a", "swa:b"])
-        assert dict(_poll_until(kvcr, bool))[first][key].success
+    first = kvcr.deposit({key: pieces[:1]}, expected_layout=["swa:a", "swa:b"])
+    assert dict(_poll_until(kvcr, bool))[first][key].success
     initial_transfers = len(agent.transfers)
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
     assert kvcr.query([key]) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
@@ -1387,6 +1382,15 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         {BlockKey(b"first"): _recovered_record(g2=[(":*", 0)])},
         {
             BlockKey(b"first"): _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":a", 0), (":b", 1)],
+                    _LocalDramState.READY,
+                    pending_labels={":b"},
+                )
+            )
+        },
+        {
+            BlockKey(b"first"): _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             )
         },
@@ -1398,6 +1402,7 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         "duplicate-label",
         "empty-label",
         "wildcard-label",
+        "partial-key",
         "row-never-settled",
     ],
 )

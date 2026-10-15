@@ -372,75 +372,6 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
 
 
-@pytest.mark.parametrize("first_piece_ready", [False, True])
-def test_remote_fetch_waits_for_declared_pieces(first_piece_ready) -> None:
-    block_size = 16
-    primary = ctypes.create_string_buffer(b"a" * block_size + b"b" * block_size, 32)
-    source_local = ctypes.create_string_buffer(32)
-    target_local = ctypes.create_string_buffer(32)
-    source_agent = _CopyingWriteAgent(metadata=b"source-md")
-    target_agent = FakeNixlAgent(metadata=b"target-md")
-    source_pinning = FakePrimaryPinning()
-    source_control = FakeBytesControl("tcp://source:1")
-    target_control = FakeBytesControl("tcp://target:1")
-    config = KVCRConfig(nixl_agent_name="unused", pool_layouts=[("p", block_size)])
-    source = _new_kvcr(
-        source_agent,
-        source_pinning,
-        source_control,
-        config,
-        name="source",
-        framework_regions=[_buffer_region(primary, block_size, "p:*")],
-        local_dram=LocalDramOptions([("p", ctypes.addressof(source_local), 32)]),
-    )
-    target = _new_kvcr(
-        target_agent,
-        FakePrimaryPinning(),
-        target_control,
-        config,
-        key_adapter=_ConstantHashAdapter(),
-        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-        local_dram=LocalDramOptions([("p", ctypes.addressof(target_local), 32)]),
-    )
-    key = BlockKey(b"partial")
-    first = source.deposit(
-        {key: [_mem_descriptor(0, label="p:a", end_point_name="source")]},
-        expected_layout=["p:a", "p:b"],
-    )
-    _wait_until(lambda: len(source_agent.xfers) == 1)
-    if first_piece_ready:
-        source_agent.state = "DONE"
-        assert dict(_poll_until(source, bool))[first][key].success
-        source_agent.state = "PROC"
-
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = target.fetch((key,), "req", expected_layout=["p:a", "p:b"])
-    _wait_until(lambda: bool(target_control.sent))
-    source_control.incoming.extend(message for _, message in target_control.sent)
-    _poll_until(source, lambda _: bool(source._core._remote_fw_dram._source_pin_ops))
-    assert len(source_agent.xfers) == 1
-    assert source_pinning.searches == []
-    assert list(target.poll_completed()) == []
-
-    second = source.deposit(
-        {key: [_mem_descriptor(1, label="p:b", end_point_name="source")]}
-    )
-    _wait_until(lambda: len(source_agent.xfers) == 2)
-    source_agent.state = "DONE"
-    completed = dict(
-        _poll_until(source, lambda _: not _has_outstanding_operations(source))
-    )
-    assert completed[second][key].success
-    assert len(source_agent.xfers) == 3
-    assert len(source_agent.xfers[-1][1]) == 2
-    target_agent.notifs["source"] = [source_agent.xfers[-1][5]]
-    result = dict(_poll_until(target, bool))[fetch][key]
-    assert result.success
-    assert [ref.label for ref in result.descriptors] == ["p:a", "p:b"]
-    assert target_local.raw == primary.raw
-    target.release([result.release_handle])
-
-
 @pytest.mark.parametrize("queued_success", [False, True])
 def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) -> None:
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
@@ -478,9 +409,10 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
     assert target._core._block_record_map[key].local_dram is residency
     assert (residency.remote_indices is not None) is not queued_success
     assert "p:b" in residency.pending_labels
+    primary[:16] = b"\0" * 16
     cached = target.deliver({key: [_mem_descriptor(0, label="p:a")]})
     result = dict(_poll_until(target, bool))[cached][key]
-    assert result.success and local.raw[:16] == b"a" * 16
+    assert result.success and primary.raw[:16] == b"a" * 16
     assert events == []
     if not queued_success:
         agent.notifs["source"] = [

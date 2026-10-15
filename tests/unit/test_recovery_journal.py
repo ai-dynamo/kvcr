@@ -19,7 +19,6 @@ from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.recovery_journal import (
     _JOURNAL_HEADER_BYTES,
     _RECORD_BLOCK,
-    _RECORD_G2_READY,
     _SNAPSHOT_HEADER,
     RecoveryJournal,
     RecoveryJournalError,
@@ -122,88 +121,16 @@ def test_ring_round_trips_wraps_and_drains_streaming(
 
 class _Source:
     def __init__(self) -> None:
-        self._observer: Callable[..., None] | None = None
-        self.flush: Callable[[], None] = lambda: None
+        self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
 
     def observe_residency(
-        self,
-        observer: Callable[..., None],
-        *,
-        flush: Callable[[], None] | None = None,
+        self, observer: Callable[[BlockKey, _BlockRecord], None]
     ) -> None:
         self._observer = observer
-        if flush is not None:
-            self.flush = flush
 
-    def emit(self, key: BlockKey, record: _BlockRecord, ready_indices=None) -> None:
+    def emit(self, key: BlockKey, record: _BlockRecord) -> None:
         assert self._observer is not None
-        self._observer(key, record, ready_indices)
-
-
-@pytest.mark.parametrize("repeated_pool", [False, True])
-def test_publisher_coalesces_readiness_until_the_poll_flushes(
-    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
-    repeated_pool: bool,
-) -> None:
-    journal, _ = journal_and_mapping
-    local_dram, g3 = _Source(), _Source()
-    _attach_journal(local_dram, journal, g3)
-    key = BlockKey(b"layered")
-    slots = [(f"pool0:{label}", slot) for label, slot in zip("abcde", range(2, 7))]
-    if repeated_pool:
-        slots.extend([("pool0", 0), ("pool0", 1)])
-    record = _recovered_record(g2=slots, g3=7)
-    record.local_dram.pending_labels = {f"pool0:{label}" for label in "bcde"}
-    if repeated_pool:
-        record.local_dram.pending_labels.add("pool0")
-    record.position = 5
-    local_dram.emit(key, record, [0])
-    record.local_dram.pending_labels.remove("pool0:b")
-    local_dram.emit(key, record, [1])
-    local_dram.emit(key, record, [])
-    assert journal.read_next() is None
-
-    local_dram.flush()
-
-    frame = journal.read_next()
-    assert frame[:2] == (_RECORD_BLOCK, key)
-    assert _decode_recovery_record(frame[2], ("pool0",)) == record
-    assert journal.read_next() is None
-
-    # Later polls carry only the newly committed pieces, not the full reservation.
-    record.local_dram.pending_labels.remove("pool0:c")
-    local_dram.emit(key, record, [2])
-    local_dram.flush()
-    frame = journal.read_next()
-    assert frame[0] == (_RECORD_BLOCK if repeated_pool else _RECORD_G2_READY)
-    if repeated_pool:
-        assert _decode_recovery_record(frame[2], ("pool0",)) == record
-    else:
-        assert msgspec.msgpack.decode(frame[2]) == [2]
-    local_dram.emit(key, record, [])
-    local_dram.flush()
-    assert journal.read_next() is None
-
-    # A synchronous metadata update subsumes the pending additions.
-    record.local_dram.pending_labels.remove("pool0:d")
-    local_dram.emit(key, record, [3])
-    record.position = 8
-    g3.emit(key, record)
-    local_dram.flush()
-    frame = journal.read_next()
-    assert frame[0] == _RECORD_BLOCK
-    assert _decode_recovery_record(frame[2], ("pool0",)) == record
-    assert journal.read_next() is None
-
-    # Retirement publishes before slot reuse and cannot be undone by the flush.
-    record.local_dram.pending_labels.remove("pool0:e")
-    local_dram.emit(key, record, [4])
-    local_dram.emit(key, _BlockRecord())
-    local_dram.flush()
-    frame = journal.read_next()
-    assert frame[0] == _RECORD_BLOCK
-    assert _decode_recovery_record(frame[2], ("pool0",)) == _BlockRecord()
-    assert journal.read_next() is None
+        self._observer(key, record)
 
 
 def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
@@ -250,8 +177,6 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
             ),
         ):
             local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
-            local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]), [("pool0", 2)])
-            local_dram.flush()
     assert publish.call_count == 1
     assert len(caplog.messages) == 1
 

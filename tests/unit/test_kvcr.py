@@ -97,7 +97,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
     observed: list[tuple[BlockKey, int | None]] = []
 
-    def observe(key: BlockKey, record: _BlockRecord, ready_indices=None) -> None:
+    def observe(key: BlockKey, record: _BlockRecord) -> None:
         residency = record.local_dram
         if residency is None:
             assert 0 not in backend._free_slots
@@ -574,7 +574,7 @@ def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> 
     boundary = {
         "deliver": "_normalize_descriptors",
         "deposit": "_normalize_descriptors",
-        "fetch": "_validate_block_layout",
+        "fetch": "_validate_expected_layout",
         "poll_completed": "take_completed",
     }[method]
     original = getattr(owner, boundary)

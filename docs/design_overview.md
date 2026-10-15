@@ -104,7 +104,7 @@ A KVCR-owned DRAM pool may be allocated by the framework and passed to KVCR, or 
 
 `compatibility_manifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible.
 
-If the engine or GPU fails, KVCR-Guard verifies that the owning process has died before activating its backup KVCR; a timeout alone is not sufficient. A replacement in-process KVCR can attach to the preserved pool, recover the committed state and layout declarations, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
+If the engine or GPU fails, KVCR-Guard verifies that the owning process has died before activating its backup KVCR; a timeout alone is not sufficient. A replacement in-process KVCR can attach to the preserved pool, recover complete keys and their layout declarations, resynchronize inventory if needed, and assume ownership through a fenced handoff. Incomplete keys, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
 
 ### State Model
 
@@ -190,7 +190,7 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 Both `deposit` and `fetch` use `expected_layout` to declare the full ordered key layout. KVCR reserves capacity for every declared piece before copying. Without `expected_layout`, the first deposit defines the whole key from its supplied pieces, and fetch expects one unnamed piece. Later calls cannot change the declaration.
 
-Declared immutable pieces may be deposited and delivered independently, allowing transfers to overlap. Each delivery completes for its requested pieces; reserved but unwritten pieces are not readable. Incomplete reservations remain non-evictable, including after recovery, until every locally reserved piece is ready. Abandoned incomplete keys therefore continue to consume capacity.
+Declared immutable pieces may be deposited and delivered independently, allowing transfers to overlap. Each delivery completes for its requested pieces; reserved but unwritten pieces are not readable. Incomplete reservations remain non-evictable while the owner is alive, until every locally reserved piece is ready. A key is journaled only when all its declared pieces are committed. Recovery drops incomplete keys and reclaims their reserved slots.
 
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 

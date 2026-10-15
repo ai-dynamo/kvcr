@@ -505,8 +505,12 @@ class _KVCRCore:
                 record.last_access = timestamp
                 if record.position != position:
                     record.position = position
-                    tier = local_dram if record.local_dram is not None else g3
-                    tier._residency_observer(key, record)
+                    residency = record.local_dram
+                    if record.g3 is not None or (
+                        residency is not None and not residency.pending_labels
+                    ):
+                        tier = local_dram if residency is not None else g3
+                        tier._residency_observer(key, record)
                 size_bytes = (
                     local_dram._size_bytes(record.local_dram)
                     if record.local_dram is not None
@@ -646,7 +650,7 @@ class _KVCRCore:
                 residency = record.local_dram if record is not None else None
                 if (
                     residency is not None
-                    and residency.fetch_slots(requested) is not None
+                    and residency.ready_indices(requested) is not None
                 ):
                     continue
                 if self._g3 is not None and self._g3.is_ready(key):
@@ -698,8 +702,6 @@ class _KVCRCore:
                 if self._local_dram is not None:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
-                if self._local_dram is not None:
-                    self._local_dram._flush_residency_updates()
         completed = self._completion_queue
         self._completion_queue = []
         return completed
@@ -1060,7 +1062,14 @@ class _KVCRCore:
         if self._g3 is not None and (len(descriptors) != 1 or labels):
             raise ValueError("G3 does not support multi-block layouts or part labels")
 
-    def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
+    def _validate_expected_layout(
+        self, layout: list[str] | None
+    ) -> tuple[str, ...] | None:
+        if layout is None:
+            return None
+        if any(not isinstance(label, str) for label in layout):
+            raise ValueError("expected layout labels must be strings")
+        invalid_message = "expected layout must include configured local pools"
         if not layout:
             raise ValueError(invalid_message)
         labels = set()
@@ -1075,16 +1084,6 @@ class _KVCRCore:
         if self._g3 is not None and (len(layout) != 1 or labels):
             raise ValueError("G3 does not support multi-block layouts or part labels")
 
-    def _validate_expected_layout(
-        self, layout: list[str] | None
-    ) -> tuple[str, ...] | None:
-        if layout is None:
-            return None
-        if any(not isinstance(label, str) for label in layout):
-            raise ValueError("expected layout labels must be strings")
-        self._validate_block_layout(
-            layout, "expected layout must include configured local pools"
-        )
         return tuple(layout)
 
     def _release_local_dram_sources(

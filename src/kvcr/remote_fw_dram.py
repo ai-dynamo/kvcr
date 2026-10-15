@@ -282,9 +282,6 @@ class _SourcePinOp(_Op):
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
 
-    def matches_key_layout(self, layout: Collection[str]) -> bool:
-        return self.key_layout == tuple(layout)
-
 
 @dataclass
 class _PendingFrameworkSources:
@@ -1234,8 +1231,9 @@ class _RemoteFWDram:
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
                     return False
-                if source_pin.key_layout and not source_pin.matches_key_layout(
-                    residency.key_layout
+                if (
+                    source_pin.key_layout
+                    and source_pin.key_layout != residency.key_layout
                 ):
                     return False
                 indices = residency.ready_indices(layout)
@@ -1316,7 +1314,7 @@ class _RemoteFWDram:
                 if residency is not None
                 else [descriptor.label for descriptor in source]
             )
-            if source_pin.key_layout and not source_pin.matches_key_layout(layout):
+            if source_pin.key_layout and source_pin.key_layout != tuple(layout):
                 indices = None
             elif residency is not None:
                 indices = (

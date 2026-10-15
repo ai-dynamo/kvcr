@@ -71,8 +71,7 @@ _FRAME_HEADER = struct.Struct("<HHH")
 
 # A reader must never infer a record's kind from whether it happens to decode.
 _RECORD_BLOCK = 1
-_RECORD_G2_READY = 2
-_RECORD_TYPES = frozenset({_RECORD_BLOCK, _RECORD_G2_READY})
+_RECORD_TYPES = frozenset({_RECORD_BLOCK})
 
 
 # Arrays avoid repeating field names in the bounded ring. Field order is the
@@ -89,14 +88,10 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     ) = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
-    pending_labels: tuple[str, ...] = ()
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
 _RECOVERY_DECODER = msgspec.msgpack.Decoder(_RecoveryBlock)
-_READY_DECODER = msgspec.msgpack.Decoder(
-    Annotated[list[Annotated[int, msgspec.Meta(ge=0)]], msgspec.Meta(min_length=1)]
-)
 
 
 # TODO: Carry access history. Recovered blocks arrive with last_access unset,
@@ -112,23 +107,22 @@ def _is_recoverable(record: _BlockRecord) -> bool:
     """
     local_dram = record.local_dram
     return record.g3 is not None or (
-        local_dram is not None and local_dram.state is _LocalDramState.READY
+        local_dram is not None
+        and local_dram.state is _LocalDramState.READY
+        and not local_dram.pending_labels
     )
 
 
 def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
     g3 = record.g3.slot if record.g3 is not None else None
     local_dram = record.local_dram
-    if local_dram is None or local_dram.state is not _LocalDramState.READY:
+    if (
+        local_dram is None
+        or local_dram.state is not _LocalDramState.READY
+        or local_dram.pending_labels
+    ):
         return _RecoveryBlock(g3=g3, position=record.position)
-    return _RecoveryBlock(
-        g2=local_dram.slots,
-        g3=g3,
-        position=record.position,
-        pending_labels=tuple(
-            label for label, _ in local_dram.slots if label in local_dram.pending_labels
-        ),
-    )
+    return _RecoveryBlock(g2=local_dram.slots, g3=g3, position=record.position)
 
 
 def _decode_recovery_record(
@@ -143,16 +137,9 @@ def _decode_recovery_record(
         ):
             raise ValueError("G2 recovery location does not match the pool group")
         labels.add(label)
-    pending = set(recovered.pending_labels)
-    if not pending <= labels or pending and pending == labels:
-        raise ValueError("recovery readiness does not match committed locations")
     return _BlockRecord(
         local_dram=(
-            _LocalDramResidency(
-                recovered.g2,
-                _LocalDramState.READY,
-                pending_labels=pending,
-            )
+            _LocalDramResidency(recovered.g2, _LocalDramState.READY)
             if recovered.g2 is not None
             else None
         ),
@@ -349,26 +336,10 @@ class _RecoveryMirror:
     def apply(self, record_type: int, key: bytes, payload: bytes) -> None:
         block_key = BlockKey(key)
         try:
-            if record_type == _RECORD_G2_READY:
-                indices = _READY_DECODER.decode(payload)
-                existing = self._records.get(block_key)
-                residency = existing.local_dram if existing is not None else None
-                if residency is None:
-                    raise ValueError("G2 completion has no reservation")
-                residency.prepare_label_index()
-                labels = {residency.slots[index][0] for index in indices}
-                if (
-                    len(residency.indices_by_label) != len(residency.slots)
-                    or len(labels) != len(indices)
-                    or not labels <= residency.pending_labels
-                ):
-                    raise ValueError("G2 completion does not match reservation")
-                residency.pending_labels.difference_update(labels)
-                return
             if record_type != _RECORD_BLOCK:
                 raise ValueError(f"unknown recovery record type: {record_type}")
             record = _decode_recovery_record(payload, self._pool_names)
-        except (IndexError, TypeError, ValueError, msgspec.DecodeError) as error:
+        except (TypeError, ValueError, msgspec.DecodeError) as error:
             raise RecoveryMirrorError("recovery record is malformed") from error
         if record.local_dram is None and record.g3 is None:
             self._records.pop(block_key, None)
@@ -379,13 +350,16 @@ class _RecoveryMirror:
         """Take a closed core's records as this mirror's state, canonicalized in place.
 
         In place because rebuilding costs a second copy of the set per million
-        blocks. Reservations survive with their readiness; writer ownership does not.
+        blocks. Only complete residencies survive; writer ownership does not.
         """
         stale = []
         for key, record in records.items():
             local_dram = record.local_dram
             if local_dram is not None:
-                if local_dram.state is not _LocalDramState.READY:
+                if (
+                    local_dram.state is not _LocalDramState.READY
+                    or local_dram.pending_labels
+                ):
                     record.local_dram = None
                 else:
                     local_dram.pending_deposits = 0
@@ -424,14 +398,14 @@ def _attach_journal(
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
     enabled = True
-    pending: dict[BlockKey, tuple[_BlockRecord, list[int]]] = {}
 
-    def publish_frame(record_type: int, key: bytes, payload: bytes) -> None:
+    def publish(key: BlockKey, record: _BlockRecord) -> None:
         nonlocal enabled
         if not enabled:
             return
+        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
         try:
-            if not journal.publish(record_type, key, payload):
+            if not journal.publish(_RECORD_BLOCK, bytes(key), payload):
                 logger.warning(
                     "KVCR recovery publication disabled after a rejected frame"
                 )
@@ -441,47 +415,10 @@ def _attach_journal(
             enabled = False
             with suppress(Exception):
                 journal.invalidate()
-        if not enabled:
-            pending.clear()
-
-    def publish(
-        key: BlockKey,
-        record: _BlockRecord,
-        ready_indices: list[int] | None = None,
-    ) -> None:
-        if not enabled:
-            return
-        # A full replacement also includes or retires any staged additions.
-        pending.pop(key, None)
-        record_type = _RECORD_BLOCK if ready_indices is None else _RECORD_G2_READY
-        payload = _RECOVERY_ENCODER.encode(
-            _project_recovery_record(record) if ready_indices is None else ready_indices
-        )
-        publish_frame(record_type, bytes(key), payload)
-
-    def observe(
-        key: BlockKey,
-        record: _BlockRecord,
-        ready_indices: list[int] | None = None,
-    ) -> None:
-        if ready_indices is None:
-            publish(key, record)
-        elif enabled and ready_indices:
-            pending.setdefault(key, (record, []))[1].extend(ready_indices)
-
-    def flush() -> None:
-        while pending:
-            key, (record, indices) = pending.popitem()
-            residency = record.local_dram
-            residency.prepare_label_index()
-            # Positional duplicates need a snapshot; named completions use deltas.
-            first = len(indices) == len(residency.slots) - len(residency.pending_labels)
-            snapshot = first or len(residency.indices_by_label) < len(residency.slots)
-            publish(key, record, None if snapshot else indices)
 
     if g3 is not None:
         g3.observe_residency(publish)
-    local_dram.observe_residency(observe, flush=flush)
+    local_dram.observe_residency(publish)
 
 
 def install_recovery_records(

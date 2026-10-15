@@ -144,15 +144,6 @@ class _LocalDramResidency:
             is not None
         )
 
-    def committed_slots(self) -> list[tuple[str, int]]:
-        if not self.pending_labels:
-            return self.slots
-        return [slot for slot in self.slots if slot[0] not in self.pending_labels]
-
-    def fetch_slots(self, requested: list[str]) -> list[tuple[str, int]] | None:
-        indices = self.ready_indices(requested)
-        return None if indices is None else [self.slots[index] for index in indices]
-
 
 @dataclass
 class _PendingResidencyOp(_Op):
@@ -367,10 +358,9 @@ class _LocalDram:
         self._next_release_handle = 1
         # A no-op until something attaches: the tiers publish residency
         # changes unconditionally, and only recovery cares to hear them.
-        self._residency_observer: Callable[..., None] = (
-            lambda key, record, added_slots=None: None
+        self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
+            lambda key, record: None
         )
-        self._flush_residency_updates: Callable[[], None] = lambda: None
 
     @property
     def memory_regions(self) -> tuple[RegionDescriptor, ...]:
@@ -380,14 +370,9 @@ class _LocalDram:
         )
 
     def observe_residency(
-        self,
-        observer: Callable[..., None],
-        *,
-        flush: Callable[[], None] | None = None,
+        self, observer: Callable[[BlockKey, "_BlockRecord"], None]
     ) -> None:
         self._residency_observer = observer
-        if flush is not None:
-            self._flush_residency_updates = flush
 
     def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Take the rows already-recovered records name, before the core starts.
@@ -401,7 +386,11 @@ class _LocalDram:
             residency = record.local_dram
             if residency is None:
                 continue
-            if residency.state is not _LocalDramState.READY or not residency.slots:
+            if (
+                residency.state is not _LocalDramState.READY
+                or not residency.slots
+                or residency.pending_labels
+            ):
                 raise ValueError("invalid local DRAM recovery slots")
             labels: set[str] = set()
             for label, slot in residency.slots:
@@ -420,11 +409,7 @@ class _LocalDram:
             declaration = self._kvcr._validate_expected_layout(
                 list(residency.key_layout)
             )
-            if (
-                list(declaration) != residency.layout
-                or not residency.pending_labels.issubset(residency.layout)
-                or not residency.committed_slots()
-            ):
+            if list(declaration) != residency.layout:
                 raise ValueError("invalid local DRAM recovery layout")
             # Byte counts depend on the receiving core's pool geometry.
             residency._cached_size = None
@@ -571,9 +556,7 @@ class _LocalDram:
                 )
                 if not selected_indices:
                     op.results[key] = (
-                        self._new_public_claim(
-                            key, residency, include_descriptors=False
-                        )
+                        self._new_public_claim(key, residency)
                         if op.claim_on_ready
                         else _SUCCESS_RESULT
                     )
@@ -697,9 +680,7 @@ class _LocalDram:
         ):
             ready = [residency.slots[index] for index in indices]
             self._kvcr._record_access((key,))
-            op.results[key] = self._new_public_claim(
-                key, residency, include_descriptors=True, slots=ready
-            )
+            op.results[key] = self._new_public_claim(key, residency, slots=ready)
         else:
             if key not in op.claimed_keys:
                 self._acquire_claim(key, residency)
@@ -959,7 +940,6 @@ class _LocalDram:
             if record is None or residency is None:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             was_ready = residency.state is _LocalDramState.READY
-            was_complete = not residency.pending_labels
             key_success = (
                 success
                 and residency.state is not _LocalDramState.DISCARDING
@@ -976,19 +956,14 @@ class _LocalDram:
                 residency.remote_indices = None
                 residency.remote_cancelled = False
             if key_success:
-                added = [
-                    index
-                    for index in indices
-                    if residency.slots[index][0] in residency.pending_labels
-                ]
-                if added:
-                    residency.pending_labels.difference_update(
-                        residency.slots[index][0] for index in added
-                    )
+                pending_count = len(residency.pending_labels)
+                residency.pending_labels.difference_update(
+                    residency.slots[index][0] for index in indices
+                )
+                if len(residency.pending_labels) < pending_count:
                     residency.state = _LocalDramState.READY
                     residency.prepare_label_index()
                     record.last_access = now
-                    self._residency_observer(key, record, added)
                     if not was_ready:
                         self._kvcr._on_ingest(
                             self._kvcr._block_meta(
@@ -996,10 +971,20 @@ class _LocalDram:
                             ),
                             source,
                         )
-                    if not was_complete and not residency.pending_labels:
+                    if not residency.pending_labels:
+                        self._residency_observer(key, record)
                         committed.append(key)
             if writer is not None:
-                if self._finish_deposit_write(key, residency, writer, key_success):
+                if key not in writer.results:
+                    writer.results[key] = (
+                        self._new_public_claim(key, residency)
+                        if key_success and writer.claim_on_ready
+                        else OpEntryResult(
+                            OpEntryStatus.SUCCESS
+                            if key_success
+                            else OpEntryStatus.FAILED
+                        )
+                    )
                     affected_residency_ops[writer.op_id] = writer
             else:
                 for op_id in record.active_op_ids:
@@ -1014,7 +999,6 @@ class _LocalDram:
                 failed.append(key)
 
             # Releasing the final claim may retire this residency and wake a waiter.
-            residency = record.local_dram
             for op_id in record.active_op_ids:
                 residency_op = self._pending_residency_ops.get(op_id)
                 if (
@@ -1059,24 +1043,6 @@ class _LocalDram:
         for key in failed:
             self._kvcr._prune_block_record(key)
         self._resume_capacity_waiters()
-
-    def _finish_deposit_write(
-        self,
-        key: BlockKey,
-        residency: _LocalDramResidency,
-        writer: _PendingResidencyOp,
-        key_success: bool,
-    ) -> bool:
-        if key not in writer.results:
-            writer.results[key] = (
-                self._new_public_claim(key, residency, include_descriptors=False)
-                if key_success and writer.claim_on_ready
-                else OpEntryResult(
-                    OpEntryStatus.SUCCESS if key_success else OpEntryStatus.FAILED
-                )
-            )
-            return True
-        return False
 
     def _resolve_fetch_waiter(
         self,
@@ -1298,14 +1264,12 @@ class _LocalDram:
                     self._capacity_waiters.rotate(-1)
                     continue
 
+                self._capacity_waiters.popleft()
+                op.capacity_waiters.remove(waiter.key)
                 if op.sources is not None:
-                    self._capacity_waiters.popleft()
-                    op.capacity_waiters.remove(waiter.key)
                     self._start_deposits(op, (waiter.key,))
                     continue
 
-                self._capacity_waiters.popleft()
-                op.capacity_waiters.remove(waiter.key)
                 self._resolve_fetch_waiter(waiter.key, op)
                 if waiter.key in op.capacity_waiters:
                     # Keep a pending spill ahead of later capacity waiters.
@@ -1321,7 +1285,6 @@ class _LocalDram:
         key: BlockKey,
         residency: _LocalDramResidency,
         *,
-        include_descriptors: bool,
         slots: Collection[tuple[str, int]] | None = None,
     ) -> OpEntryResult:
         self._acquire_claim(key, residency)
@@ -1336,11 +1299,9 @@ class _LocalDram:
                     label=pool_name,
                     element_index=slot,
                 )
-                for pool_name, slot in (
-                    residency.committed_slots() if slots is None else slots
-                )
+                for pool_name, slot in slots
             ]
-            if include_descriptors
+            if slots is not None
             else None,
             handle,
         )

@@ -18,6 +18,7 @@ from _kvcr_test_utils import (
     FakePrimaryPinning,
     FakeTelemetryStats,
     PendingPrimaryPinning,
+    _buffer_region,
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
@@ -242,6 +243,80 @@ def test_local_source_starts_inline_and_holds_its_slot(
     finally:
         agent.state = "DONE"
         source.close()
+
+
+@pytest.mark.parametrize("first_piece_ready", [False, True])
+@pytest.mark.parametrize("timeout", [False, True])
+def test_local_source_waits_for_declared_pieces(first_piece_ready, timeout) -> None:
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    local = ctypes.create_string_buffer(32)
+    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        framework_regions=[_buffer_region(primary, 16, ":*")],
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), 32)]),
+    )
+    now = 0.0
+    source._core._clock = lambda: now
+    key = BlockKey(b"partial")
+    layout = [":a", ":b"]
+    first = source.deposit(
+        {key: [_mem_descriptor(0, label=":a", end_point_name="source")]},
+        expected_layout=layout,
+    )
+    _wait_until(lambda: len(agent.xfers) == 1)
+    if first_piece_ready:
+        agent.state = "DONE"
+        assert dict(_poll_until(source, bool))[first][key].success
+        agent.state = "PROC"
+
+    request = msgspec.msgpack.decode(_start_write_message(12, key))
+    request.update(
+        key_layout=layout,
+        target_regions=({":*": _buffer_region(primary, 16, ":*")}, {}),
+        dst_descriptors=[
+            [_TransferRef("target", i, label) for i, label in enumerate(layout)]
+        ],
+    )
+    control.incoming.append(msgspec.msgpack.encode(request))
+    _poll_until(source, lambda _: bool(source._core._remote_fw_dram._source_pin_ops))
+    assert len(agent.xfers) == 1
+    residency = source._core._block_record_map[key].local_dram
+    producer_claims = int(not first_piece_ready)
+    assert residency.claim_count == producer_claims + 1
+
+    if timeout:
+        now = 2.0
+        _poll_until(source, lambda _: bool(agent.sent_notifs))
+        notification = agent.sent_notifs[-1][1]
+        _poll_until(source, lambda _: not source._core._local_dram_sources_by_op)
+        assert residency.claim_count == producer_claims
+        assert len(agent.xfers) == 1
+        agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    else:
+        second = source.deposit(
+            {key: [_mem_descriptor(1, label=":b", end_point_name="source")]}
+        )
+        _wait_until(lambda: len(agent.xfers) == 2)
+        agent.state = "DONE"
+        completed = dict(
+            _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        )
+        assert completed[second][key].success
+        assert len(agent.xfers) == 3
+        assert [
+            ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+        ] == [b"a" * 16, b"b" * 16]
+        notification = agent.xfers[-1][5]
+    assert _decode_notif(notification)["success"] is not timeout
+    assert not source._core._remote_fw_dram._source_pin_ops
+    assert not source._core._local_dram_sources_by_op
+    assert residency.claim_count == 0
+    assert pinning.searches == []
 
 
 def test_local_source_falls_back_during_fill_publication_without_blocking_progress():
