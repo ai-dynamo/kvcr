@@ -7,7 +7,6 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -781,7 +780,8 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence():
         )
         payload["keys"] = [key, missing, framework_hit]
         payload["dst_descriptors"] = [
-            [asdict(_TransferRef("target", index))] for index in range(3)
+            [msgspec.structs.asdict(_TransferRef("target", index))]
+            for index in range(3)
         ]
         control.incoming.append(msgspec.msgpack.encode(payload))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
@@ -999,7 +999,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
                     ),
                     "keys": list(op_keys),
                     "dst_descriptors": [
-                        [asdict(_TransferRef("target", index))]
+                        [msgspec.structs.asdict(_TransferRef("target", index))]
                         for index in range(len(op_keys))
                     ],
                 }

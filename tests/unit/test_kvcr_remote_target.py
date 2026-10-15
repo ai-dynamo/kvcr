@@ -643,9 +643,16 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     _wait_until(lambda: bool(target_control.sent))
     message = _decode_control_message(target_control.sent[0][1])
     assert message["keys"] == [other_group]
-    assert message["dst_descriptors"] == msgspec.to_builtins(
-        [target._core._normalize_descriptors(other_destination)]
-    )
+    assert message["dst_descriptors"] == [
+        [
+            {
+                "end_point_name": "target",
+                "element_index": 8,
+                "label": "",
+                "framework": True,
+            }
+        ]
+    ]
     target_agent.notifs["source"] = [_write_done_notification(mixed_handle)]
     assert _poll_until(target, bool) == [
         (mixed_handle, _op_entries({key: False, other_group: True}))
