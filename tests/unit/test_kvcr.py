@@ -1018,6 +1018,7 @@ def test_named_reference_validation_and_address_reporting():
             }
         )
     assert agent.xfers == agent.transfers == []
+    prefix = MemoryRef(end_point_name="target", element_index=1, label="pool:k")
     for bad in (
         MemoryRef(end_point_name="other", label="pool:layer:v:", element_index=2),
         MemoryRef(end_point_name="target", label="pool:layer:v:", element_index=-1),
@@ -1029,7 +1030,7 @@ def test_named_reference_validation_and_address_reporting():
         MemoryRef(end_point_name="target", label="pool", element_index=0),
     ):
         with pytest.raises(ValueError):
-            core._normalize_descriptors([bad])
+            core._normalize_descriptors([prefix, bad])
     for bad in (span, internal):
         with pytest.raises(ValueError, match="must contain only MemoryRef entries"):
             core._normalize_descriptors([bad])

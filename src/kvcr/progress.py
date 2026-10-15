@@ -253,7 +253,7 @@ class _KVCRProgress:
         notif_msg: bytes = b"",
         capture_telemetry: bool = False,
     ) -> tuple[int, bool]:
-        """Submit aligned local and remote descriptors to NIXL."""
+        """Submit aligned descriptors validated at ingress or constructed internally."""
         if not local_descriptors or not remote_descriptors:
             raise ValueError("NIXL transfer descriptors must be non-empty")
         if not isinstance(remote_side_agent, str) or not remote_side_agent:
@@ -391,21 +391,38 @@ class _KVCRProgress:
     def _prepared_indices(
         self, agent_name: str, descriptors: Sequence[_TransferRef]
     ) -> tuple[Any, list[int]]:
+        """Use API/wire-validated metadata; recheck every index's type and bounds."""
         catalog = self._catalogs.get(agent_name)
         if catalog is None:
             raise ValueError(f"no prepared memory for agent {agent_name!r}")
         owner, regions = catalog
-        first = _resolve_region(descriptors[0], regions, owner)
-        handle, (framework_offsets, kvcr_offsets) = self._prepared[agent_name][
-            first.mem_type
-        ]
-        indices = []
-        for ref in descriptors:
-            region = _resolve_region(ref, regions, owner)
-            if region.mem_type != first.mem_type:
-                raise ValueError("one NIXL descriptor list cannot mix memory types")
-            offsets = framework_offsets if ref.framework else kvcr_offsets
-            indices.append(offsets[region.label] + ref.element_index)
+        refs = iter(descriptors)
+        first_ref = next(refs)
+        first = _resolve_region(first_ref, regions, owner)
+        handle, offsets = self._prepared[agent_name][first.mem_type]
+        resolved: tuple[dict[str, tuple[int, int]], ...] = ({}, {})
+        namespace = 0 if first_ref.framework else 1
+        offset = offsets[namespace][first.label]
+        resolved[namespace][first_ref.label] = (first.count, offset)
+        indices = [offset + first_ref.element_index]
+        for ref in refs:
+            namespace = 0 if ref.framework else 1
+            cache = resolved[namespace]
+            entry = cache.get(ref.label)
+            index = ref.element_index
+            if entry is None:
+                region = _resolve_region(ref, regions, owner)
+                if region.mem_type != first.mem_type:
+                    raise ValueError("one NIXL descriptor list cannot mix memory types")
+                offset = offsets[namespace][region.label]
+                cache[ref.label] = (region.count, offset)
+            else:
+                count, offset = entry
+                if type(index) is not int or not 0 <= index < count:
+                    raise ValueError(
+                        "memory reference element_index is outside its region"
+                    )
+            indices.append(offset + index)
         return handle, indices
 
     def _release_transfer(self, transfer_id: int, state: _TransferState) -> bool:

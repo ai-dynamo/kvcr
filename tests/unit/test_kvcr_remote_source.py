@@ -477,7 +477,15 @@ def test_kvcr_close_cleans_pending_pin_operations():
 
 
 @pytest.mark.parametrize(
-    "field", ["remaining_timeout_ms", "allow_layout_subset", "keys"]
+    "field",
+    [
+        "remaining_timeout_ms",
+        "allow_layout_subset",
+        "keys",
+        "framework",
+        "label",
+        "end_point_name",
+    ],
 )
 def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
     source_agent = FakeNixlAgent(metadata=b"source-md")
@@ -492,6 +500,10 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
     elif field == "keys":
         request[field] *= 2
         request["dst_descriptors"] *= 2
+    elif field in ("framework", "label", "end_point_name"):
+        descriptors = request["dst_descriptors"][0]
+        value = "other" if field == "end_point_name" else 1
+        descriptors.append({**descriptors[0], field: value})
     else:
         request[field] = "yes"
     control.incoming.append(msgspec.msgpack.encode(request))
@@ -505,7 +517,8 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
         "success": False,
     }
     assert any(
-        "malformed start_write" in record.getMessage() and field in record.getMessage()
+        "malformed start_write" in record.getMessage()
+        or "start_write setup failed" in record.getMessage()
         for record in kvcr_caplog.records
         if record.levelno == logging.WARNING
     )

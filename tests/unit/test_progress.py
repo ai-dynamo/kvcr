@@ -440,6 +440,7 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
             "cannot mix memory types",
         ),
         ((_mem(0, framework=1),), (_mem(0),), "remote-agent", "framework"),
+        ((_mem(0, label=None),), (_mem(0),), "remote-agent", "label"),
         (
             (_MemDescriptor("DRAM", 128, 128, 0),),
             (_mem(0),),
@@ -447,6 +448,11 @@ def test_progress_supports_backend_scoped_local_g3_descriptors() -> None:
             "_TransferRef",
         ),
         ((_mem(0),), (_mem(0),), "remote-agent", "owning agent"),
+        *[
+            (prefix + (_mem(index),), (_mem(0),), "remote-agent", "element_index")
+            for index in (-1, 4, True, 0.0)
+            for prefix in ((), (_mem(0),))
+        ],
     ],
 )
 def test_progress_rejects_invalid_transfer(
@@ -516,17 +522,18 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
     )
     with pytest.raises(RuntimeError, match="already initialized"):
         progress.prepare_memory("native-peer", ({}, {}))
+    # Repeat framework labels with different indices to verify cached offsets.
     local = (
         _mem(1, label="pool:k"),
         _mem(2, label="pool:v"),
         _mem(3, label="pool:k", framework=False),
-        _mem(1, label="pool:k"),
+        _mem(0, label="pool:k"),
     )
     remote = (
         _mem(1, owner="remote-agent", label="pool:v", framework=False),
         _mem(0, owner="remote-agent", label="pool:k"),
         _mem(1, owner="remote-agent", label="pool:v"),
-        _mem(0, owner="remote-agent", label="pool:k"),
+        _mem(1, owner="remote-agent", label="pool:k"),
     )
     for _ in range(2):
         transfer_id, submitted = progress.submit_transfer(
@@ -549,8 +556,8 @@ def test_progress_reuses_strided_catalogs_with_physical_indices() -> None:
         ("native-peer", "VRAM", [[5000, 16, 3, 32, 8]]),
     ]
     assert agent.make_calls == [
-        ("dlist-2", [4, 2, 8, 4], "dlist-3", [6, 0, 3, 0]),
-        ("dlist-2", [4, 2, 8, 4], "dlist-3", [6, 0, 3, 0]),
+        ("dlist-2", [4, 2, 8, 3], "dlist-3", [6, 0, 3, 1]),
+        ("dlist-2", [4, 2, 8, 3], "dlist-3", [6, 0, 3, 1]),
     ]
     assert agent.events.count("make:WRITE:['UCX']:b''") == 2
 
