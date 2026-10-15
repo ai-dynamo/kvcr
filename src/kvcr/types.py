@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, NewType
 
+import msgspec
+
 BlockKey = NewType("BlockKey", bytes)
 PinHandle = str
 PinRequestId = NewType("PinRequestId", int)
@@ -35,8 +37,7 @@ class RegionDescriptor:
     label: str = ""
 
 
-@dataclass(frozen=True, kw_only=True, slots=True)
-class MemoryRef:
+class MemoryRef(msgspec.Struct, frozen=True, kw_only=True):
     """One element in a named registered buffer.
 
     ``label`` identifies the key piece and selects an exact framework registration,
@@ -137,8 +138,7 @@ class InventoryEvent:
     removed: bool
 
 
-@dataclass(frozen=True, slots=True)
-class BlockMeta:
+class BlockMeta(msgspec.Struct, frozen=True):
     block_key: BlockKey
     size_bytes: int
     access_count: int

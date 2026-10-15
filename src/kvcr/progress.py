@@ -31,8 +31,7 @@ _OpId = tuple[str, Any]
 _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
 
 
-@dataclass(frozen=True)
-class _MemDescriptor:
+class _MemDescriptor(msgspec.Struct, frozen=True):
     """Raw memory addresses or file offsets for FILE transfers."""
 
     mem_type: str

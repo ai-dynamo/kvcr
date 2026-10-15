@@ -6,7 +6,8 @@ import heapq
 import logging
 import math
 from collections.abc import Collection, Generator
-from dataclasses import dataclass
+
+import msgspec
 
 from .policy import KVCachePolicy
 from .types import (
@@ -152,8 +153,7 @@ class _PolicyInvoker:
             logger.warning("KVCR on_align_sequence failed", exc_info=True)
 
 
-@dataclass(frozen=True)
-class _Entry:
+class _Entry(msgspec.Struct, frozen=True):
     score: float
     sequence: int
 
@@ -204,14 +204,16 @@ class _EvictionQueue:
         try:
             while self._heap:
                 item = heapq.heappop(self._heap)
-                score, sequence, key = item
-                if self._live.get(key) != _Entry(score, sequence):
+                _, sequence, key = item
+                current = self._live.get(key)
+                if current is None or current.sequence != sequence:
                     continue
                 skipped.append(item)
                 if key not in excluded:
                     excluded.add(key)
                     yield key
         finally:
-            for score, sequence, key in skipped:
-                if self._live.get(key) == _Entry(score, sequence):
-                    heapq.heappush(self._heap, (score, sequence, key))
+            for item in skipped:
+                current = self._live.get(item[2])
+                if current is not None and current.sequence == item[1]:
+                    heapq.heappush(self._heap, item)

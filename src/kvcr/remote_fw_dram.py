@@ -824,14 +824,12 @@ class _RemoteFWDram:
                     success=False,
                 )
             return
+        success_result = OpEntryResult(OpEntryStatus.SUCCESS)
+        failure_result = OpEntryResult(OpEntryStatus.FAILED)
         kvcr._complete(
             cast(OpHandle, op.op_id[1]),
             {
-                key: OpEntryResult(
-                    OpEntryStatus.SUCCESS
-                    if key in completed_keys
-                    else OpEntryStatus.FAILED
-                )
+                key: success_result if key in completed_keys else failure_result
                 for key in op.keys
             },
         )
