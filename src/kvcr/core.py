@@ -421,7 +421,7 @@ class _KVCRCore:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object] | msgspec.Struct,
+        hints: msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
         hint = _KVFetchHint.from_hint(hints)
