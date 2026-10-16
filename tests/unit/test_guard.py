@@ -604,9 +604,21 @@ def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
     assert guard._serving is False
 
 
-@pytest.mark.parametrize("reader", ["poll", "release", "promote", "cold-promote"])
+@pytest.mark.parametrize(
+    ("reader", "malformed_record"),
+    [
+        ("poll", False),
+        ("poll", True),
+        ("release", False),
+        ("release", True),
+        ("promote", False),
+        ("promote", True),
+        ("cold-promote", False),
+    ],
+)
 def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     reader: str,
+    malformed_record: bool,
 ) -> None:
     """Which reader finds the invalid journal is a race; none may take the service."""
     guard = _configurable_guard()
@@ -617,8 +629,13 @@ def test_a_pool_that_lost_its_recovery_stays_claimable_on_every_path(
     guard._control = None
     journal = Mock()
     error = RecoveryJournalError("recovery journal is invalid")
-    journal.read_next.side_effect = error
-    journal.drain.side_effect = error
+    if malformed_record:
+        frame = (_RECORD_BLOCK, b"broken", b"invalid")
+        journal.read_next.return_value = frame
+        journal.drain.return_value = iter([frame])
+    else:
+        journal.read_next.side_effect = error
+        journal.drain.side_effect = error
     guard._recovery._journal = journal
     written: list[object] = []
     guard._recovery._write_handback = lambda records: written.append(records)

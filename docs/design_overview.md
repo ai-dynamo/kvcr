@@ -104,7 +104,7 @@ A KVCR-owned DRAM pool may be allocated by the framework and passed to KVCR, or 
 
 `compatibility_manifest` identifies the framework, model, KV layout, and host representation needed to interpret cached data. A pool may contain multiple internal pools for different attention-head requirements. When `kvcr_guard_endpoint` is provided, KVCR attaches to the relevant preserved pool and verifies that the supplied manifest is compatible; initialization fails if the pool is unavailable or incompatible.
 
-If the engine or GPU fails, KVCR-Guard verifies that the owning process has died before activating its backup KVCR; a timeout alone is not sufficient. A replacement in-process KVCR can attach to the preserved pool, recover the committed state, resynchronize inventory if needed, and assume ownership through a fenced handoff. Partial writes, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
+If the engine or GPU fails, KVCR-Guard verifies that the owning process has died before activating its backup KVCR; a timeout alone is not sufficient. A replacement in-process KVCR can attach to the preserved pool, recover complete keys and their layout declarations, resynchronize inventory if needed, and assume ownership through a fenced handoff. Incomplete keys, in-flight operations, and framework-owned GPU or host memory are not recovered. Recovery and handoff must preserve committed-data integrity and prevent concurrent ownership.
 
 ### State Model
 
@@ -114,9 +114,9 @@ Framework-owned memory and KVCR-owned memory use different residency types. Fram
 
 Residency state and operation state are deliberately disjoint. A `BlockRecord` does not embed or own operation lifecycle state; it only keeps references to related operation IDs when needed. The progress thread's polymorphic `in_flight_ops` collection owns the operations it advances and their progress-side lifecycle; each operation type defines how completion affects its resources. This lets block lookup remain stable while operations are created, coalesced, completed, cancelled, or removed independently.
 
-Ready, unclaimed KVCR-owned residencies are tracked by a policy-scored eviction queue, while available pool slots are tracked separately for allocation. Auxiliary structures may support completion polling, pins that cover multiple keys, and reuse of established peer connections.
+Complete, unclaimed KVCR-owned residencies are tracked by a policy-scored eviction queue, while available pool slots are tracked separately for allocation. Auxiliary structures may support completion polling, pins that cover multiple keys, and reuse of established peer connections.
 
-Claims are attached to concrete residencies. They prevent KVCR-owned memory from being evicted while in use and keep framework-owned memory pinned until all dependent operations finish. Concurrent operations may share existing residencies, pins, or in-flight work; cancellation of one caller must not invalidate resources still needed by another. When an operation needs a KVCR residency that is currently evictable, the KVCR removes it from the evictable queue and acquires a claim before using it, making it non-evictable. After the last claim is released, a ready residency that is still retained returns to the evictable queue; otherwise its KVCR-owned memory is freed.
+Claims are attached to concrete residencies. They prevent KVCR-owned memory from being evicted while in use and keep framework-owned memory pinned until all dependent operations finish. Concurrent operations may share existing residencies, pins, or in-flight work; cancellation of one caller must not invalidate resources still needed by another. When an operation needs a KVCR residency that is currently evictable, the KVCR removes it from the evictable queue and acquires a claim before using it, making it non-evictable. After the last claim is released, complete retained residencies return to the evictable queue, incomplete retained residencies remain protected, and discarded or wholly uncommitted residencies are freed.
 
 ### Asynchronous Execution
 
@@ -158,7 +158,7 @@ kvcr = KVCR(
     config=config,
 )
 
-kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
+kvcr.deposit(blocks, no_evict=False, hints=None, callback=None, *, expected_layout=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
 kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion includes per-key status, locations, and a release handle
 kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemoryRef]]
@@ -180,13 +180,17 @@ framework.release_pin(pin_handle)                                               
 
 Frameworks register named buffers through `framework_regions` using `RegionDescriptor`. Registration names (`label`) must be unique and use `pool`, `pool:part`, or `pool:*` for a buffer shared across parts; buffers sharing a pool prefix share allocation and eviction.
 
-`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, concrete label, and element index. The label identifies the piece within a key and selects a framework buffer by exact name; a `pool:part` reference without an exact registration requires `pool:*`. A key may span multiple pools. `fetch` accepts the expected layout as an ordered list of labels and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label.
+`deposit`, `deliver`, and framework pin results use `MemoryRef` values identifying an agent, concrete label, and element index. The label identifies the piece within a key and selects a framework buffer by exact name; a `pool:part` reference without an exact registration requires `pool:*`. A key may span multiple pools. `fetch` requests every piece in `expected_layout` and returns per-key status, KVCR-owned locations as `MemoryRef` values, and a release handle. Repeated pool names represent multiple elements from one pool. A single-pool caller may use the empty label. Deposits of the same key and named piece must contain identical immutable bytes; duplicate deposits are not ordered, and already committed pieces are reused.
 
 ### Operating flow
 
 **Using KVCR-owned DRAM**
 
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
+
+Both `deposit` and `fetch` use `expected_layout` to declare the full ordered key layout. KVCR reserves capacity for every declared piece before copying. Without `expected_layout`, the first deposit defines the whole key from its supplied pieces, and fetch expects one unnamed piece. Later calls cannot change the declaration.
+
+Declared immutable pieces may be deposited and delivered independently, allowing transfers to overlap. Each delivery completes for its requested pieces; reserved but unwritten pieces are not readable. Incomplete reservations remain non-evictable while the owner is alive, until every locally reserved piece is ready. A key is journaled only when all its declared pieces are committed. Recovery drops incomplete keys and reclaims their reserved slots.
 
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
@@ -199,7 +203,7 @@ The tradeoff is backpressure: when policy cannot free enough capacity—for exam
 **Block availability query**
 
 When the framework asks the KVCR whether a block is available, the KVCR responds with one of:
-- `HIT(tier)` — locally available at the reported tier at the time of the query
+- `HIT(tier)` — at least one piece is locally readable at the reported tier; other declared pieces may still be pending
 - `FETCHING(destination_tier)` — a fetch into the reported tier is in progress
 - `FETCHABLE(source_tier)` — not started, but the KVCR knows a source tier
 - `MISS(None)` — not found in any tier the KVCR currently knows about
@@ -249,7 +253,7 @@ The router maintains an eventually-consistent global prefix inventory for cache-
 
 Framework-owned memory is reported through the framework's existing router event path. If needed, `tier_enter`/`tier_exit` reporting or `inventory_snapshot()` can be added to the KVCR API later.
 
-KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
+KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once. A DRAM addition is published when every declared piece is committed; it advertises the complete key. Removal withdraws that advertisement.
 
 ### Request-scoped hints
 

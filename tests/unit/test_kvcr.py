@@ -535,9 +535,12 @@ def test_fetch_requires_layout_for_a_named_single_pool() -> None:
         ["named:*"],
         ["named:part", "named:part"],
         ["missing:part"],
+        [],
     ):
         with pytest.raises(ValueError):
             kvcr.fetch((BlockKey(b"key"),), expected_layout=layout)
+        with pytest.raises(ValueError):
+            kvcr.deposit({}, expected_layout=layout)
 
 
 def _assert_state_lock_available(core) -> None:
@@ -571,7 +574,7 @@ def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> 
     boundary = {
         "deliver": "_normalize_descriptors",
         "deposit": "_normalize_descriptors",
-        "fetch": "_validate_block_layout",
+        "fetch": "_validate_expected_layout",
         "poll_completed": "take_completed",
     }[method]
     original = getattr(owner, boundary)

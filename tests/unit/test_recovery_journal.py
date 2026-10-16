@@ -166,7 +166,11 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     caplog.clear()
     with patch.object(journal, "publish", wraps=journal.publish) as publish:
         local_dram.emit(key, _recovered_record(g2=[("pool0", 0)]))
-        local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
+        with patch(
+            "kvcr.recovery_journal._project_recovery_record",
+            side_effect=AssertionError("disabled publication projected a record"),
+        ):
+            local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
     assert publish.call_count == 1
     assert len(caplog.messages) == 1
 
