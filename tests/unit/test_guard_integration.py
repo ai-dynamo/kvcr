@@ -433,7 +433,11 @@ def test_promoted_guard_serves_real_nixl_transfers(
     # Only then does a replacement take the pool back and stand the Guard down.
     # Inline, not a child: adoption only claims and reads, and this process
     # already runs real agents beside the Guard's own.
-    framework = ctypes.create_string_buffer(len(second_payload) * 2)
+    # G3 reads use O_DIRECT: align the destination as well as its length/offset.
+    framework_size = len(second_payload) * 2
+    allocation = ctypes.create_string_buffer(framework_size + page_size - 1)
+    offset = -ctypes.addressof(allocation) % page_size
+    framework = (ctypes.c_char * framework_size).from_buffer(allocation, offset)
     replacement = _make_kvcr(
         str(service.socket_path),
         None if multi_pool else str(g3_path),
