@@ -48,6 +48,9 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
+    # Distinct hinted hashes, not tokens or physical pool keys; 0 disables it.
+    # Ignored when opportunistic_query is enabled.
+    min_hint_blocks: int = 0
 
 
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):

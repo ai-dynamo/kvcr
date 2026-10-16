@@ -72,6 +72,7 @@ class _RequestHint:
     submitted_at: float | None
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
+    below_threshold: bool = False
 
 
 class _TargetPullState(Enum):
@@ -511,6 +512,8 @@ class _RemoteFWDram:
             raise ValueError("metadata_retry_interval_ms must be positive")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
+        if type(options.min_hint_blocks) is not int or options.min_hint_blocks < 0:
+            raise ValueError("min_hint_blocks must be a non-negative integer")
         self._kvcr = kvcr
         self._options = options
         self._key_adapter = key_adapter
@@ -554,6 +557,10 @@ class _RemoteFWDram:
         request_id: str | None,
     ) -> None:
         kvcr = self._kvcr
+        below_threshold = (
+            not self._options.opportunistic_query
+            and len(block_hashes) < self._options.min_hint_blocks
+        )
         if request_id is not None:
             previous = self._request_hints.get(request_id)
             if previous is not None and previous.source != src:
@@ -567,8 +574,9 @@ class _RemoteFWDram:
                     if previous is not None and previous.submitted_at is not None
                     else kvcr._timer()
                 ),
+                below_threshold=below_threshold,
             )
-        if src is not None and self._options.eager_ctrl_connect:
+        if src is not None and self._options.eager_ctrl_connect and not below_threshold:
             kvcr._progress.submit(_TargetMetadataRequest(src))
 
     def query(self, key: BlockKey, request_id: str) -> bool:
@@ -579,6 +587,7 @@ class _RemoteFWDram:
             request_hint is None
             or request_hint.source is None
             or request_hint.failed
+            or request_hint.below_threshold
             or key in request_hint.missing_keys
             or adapter is None
         ):
@@ -606,7 +615,9 @@ class _RemoteFWDram:
             self._request_hints.get(request_id) if request_id is not None else None
         )
         if current_hint is not None and (
-            current_hint.failed or current_hint.missing_keys.issuperset(blocks)
+            current_hint.failed
+            or current_hint.below_threshold
+            or current_hint.missing_keys.issuperset(blocks)
         ):
             kvcr._record_duration(scope, started_at, "failed")
             return False

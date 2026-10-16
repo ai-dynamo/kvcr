@@ -261,6 +261,42 @@ KVCR-to-KVCR movement is destination-initiated. A router hint gives the destinat
 
 The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
+#### Minimum hinted prefix
+
+An integration can suppress remote work for small advertised prefixes through
+`KVCRBackendConfigs.remote_fw_dram`:
+
+```python
+from kvcr.config import KVCRBackendConfigs, RemoteFWDramOptions
+
+backends = KVCRBackendConfigs(
+    remote_fw_dram=RemoteFWDramOptions(
+        opportunistic_query=False,
+        min_hint_blocks=4,
+    ),
+    # Supply framework_regions and other backends as usual.
+)
+```
+
+With this setting, hints containing fewer than four **distinct block hashes** do
+not establish an eager peer connection or make remote keys fetchable. An explicit
+`deliver()` also cannot start a remote transfer for such a hint; remote entries
+complete as failed so the integration can fall back to recomputation. Local DRAM
+and G3 hits remain usable. The default, `0`, preserves existing behavior.
+
+This is a receiver-side filter: it does not prevent the router from emitting or
+forwarding a hint. The count is over the hint's deduplicated hashes, not tokens,
+physical pool components, or the number of keys in a particular transfer batch.
+For an integration advertising one hash per 256-token page, `4` corresponds to
+1,024 advertised prefix tokens. It is not a minimum additional remote-hit length:
+some of that prefix may already be local, and stale hints do not guarantee source
+availability. Integrations must translate their desired token threshold into
+their own hint hash granularity and expose the option in their configuration.
+
+When `opportunistic_query=True`, `min_hint_blocks` is ignored. A short advertised
+prefix must not prevent discovering a longer live match at the hinted source.
+Changing this threshold does not cancel transfers already started for a request.
+
 ### Peer control and liveness
 
 The router is never on the data path: KVCR instances execute transfers peer-to-peer via NIXL. Source endpoints remain request-scoped rather than becoming part of global block state, so this coordination adds no KVCR-side peer inventory.
