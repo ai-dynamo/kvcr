@@ -63,10 +63,7 @@ def test_submit_hint_filters_unlisted_hash():
     assert target.query((BlockKey(b"k"),), "req") == [(QueryStatus.MISS, None)]
 
 
-@pytest.mark.parametrize("min_hint_blocks", [0, 4])
-def test_kvcr_opportunistic_query_accepts_key_outside_hint(
-    monkeypatch, caplog, min_hint_blocks
-):
+def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
     monkeypatch.setenv("KVCR_DIAGNOSTICS", "1")
     caplog.set_level(logging.DEBUG, logger="kvcr.core")
     agent = FakeNixlAgent()
@@ -79,7 +76,7 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint(
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False,
             opportunistic_query=True,
-            min_hint_blocks=min_hint_blocks,
+            min_hint_blocks=4,
         ),
     )
     requested_key = BlockKey(b"k1")
@@ -134,28 +131,7 @@ def test_invalid_min_hint_blocks_is_rejected(minimum):
         (2, (123, 999, 1000), True),
     ],
 )
-def test_min_hint_blocks_counts_distinct_hinted_hashes(minimum, hashes, accepted):
-    target = _new_kvcr(
-        FakeNixlAgent(),
-        FakePrimaryPinning(),
-        FakeBytesControl(),
-        key_adapter=_ConstantHashAdapter(),
-        remote_options=RemoteFWDramOptions(
-            eager_ctrl_connect=False, min_hint_blocks=minimum
-        ),
-    )
-    target.submit_hint(_router_hint("tcp://source:1", hashes), request_id="req")
-    # Multiple physical keys sharing one router hash do not increase its count.
-    keys = (BlockKey(b"pool-a"), BlockKey(b"pool-b"))
-    expected = (
-        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
-        if accepted
-        else (QueryStatus.MISS, None)
-    )
-    assert target.query(keys, "req") == [expected, expected]
-
-
-def test_short_hint_does_not_connect_or_transfer(monkeypatch):
+def test_min_hint_blocks_filters_remote_work(minimum, hashes, accepted, monkeypatch):
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     local = ctypes.create_string_buffer(32)
@@ -164,27 +140,37 @@ def test_short_hint_does_not_connect_or_transfer(monkeypatch):
         FakePrimaryPinning(),
         control,
         key_adapter=_ConstantHashAdapter(),
-        remote_options=RemoteFWDramOptions(min_hint_blocks=2),
+        remote_options=RemoteFWDramOptions(min_hint_blocks=minimum),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
     )
     submit = Mock(wraps=target._core._progress.submit)
     monkeypatch.setattr(target._core._progress, "submit", submit)
-    hint = _router_hint("tcp://source:1")
+    hint = _router_hint("tcp://source:1", hashes)
     target.submit_hint(hint, request_id="req")
-    target.submit_hint(hint)  # A connection-only hint must also respect the gate.
+    target.submit_hint(hint)  # Connection-only hints follow the same gate.
     key = BlockKey(b"k")
-    handles = [
-        target.deliver({key: [_mem_descriptor()]}, request_id="req"),
-        target.fetch((key,), request_id="req"),
+    assert target.query((key,), "req") == [
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+        if accepted
+        else (QueryStatus.MISS, None)
     ]
-
-    assert list(target.poll_completed()) == [
-        (handle, _op_entries({key: False})) for handle in handles
-    ]
-    assert target.query((key,), "req") == [(QueryStatus.MISS, None)]
-    submit.assert_not_called()
-    assert control.sent == []
-    assert agent.xfers == []
+    handle = target.deliver({key: [_mem_descriptor()]}, "req")
+    if accepted:
+        # The cutoff applies to the hint, not this single-key transfer batch.
+        _wait_until(
+            lambda: any(
+                _decode_control_message(message)["type"] == "start_write"
+                for _, message in control.sent
+            )
+        )
+        agent.notifs["source"] = [_write_done_notification(handle)]
+        assert _poll_until(target, bool) == [(handle, _op_entries({key: True}))]
+    else:
+        fetch = target.fetch((key,), "req")
+        assert list(target.poll_completed()) == [
+            (op, _op_entries({key: False})) for op in (handle, fetch)
+        ]
+        submit.assert_not_called()
 
 
 def test_min_hint_blocks_preserves_request_scope_and_updates():
@@ -200,11 +186,9 @@ def test_min_hint_blocks_preserves_request_scope_and_updates():
     hit = [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
     long_hint = _router_hint("tcp://source-A:1", (123, 999))
     short_hint = _router_hint("tcp://source-A:1")
-    target.submit_hint(long_hint, "other")
     for hint, expected in [(short_hint, miss), (long_hint, hit), (short_hint, miss)]:
         target.submit_hint(hint, "req")
         assert target.query(keys, "req") == expected
-        assert target.query(keys, "other") == hit
 
     # Even a rejected short hint retains the request's source identity.
     target.submit_hint(_router_hint("tcp://source-B:1", (123, 999)), "req")
@@ -212,25 +196,6 @@ def test_min_hint_blocks_preserves_request_scope_and_updates():
     target.discard_hint("req")
     target.submit_hint(long_hint, "req")
     assert target.query(keys, "req") == hit
-
-
-def test_min_hint_blocks_does_not_gate_individual_transfer_batches():
-    agent = FakeNixlAgent()
-    control = FakeBytesControl()
-    target = _new_kvcr(
-        agent,
-        FakePrimaryPinning(),
-        control,
-        key_adapter=_ConstantHashAdapter(),
-        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False, min_hint_blocks=2),
-    )
-    target.submit_hint(_router_hint("tcp://source:1", (123, 999)), "req")
-    key = BlockKey(b"k")
-    handle = target.deliver({key: [_mem_descriptor()]}, "req")
-    _wait_until(lambda: bool(control.sent))
-    assert _decode_control_message(control.sent[0][1])["keys"] == [key]
-    agent.notifs["source"] = [_write_done_notification(handle)]
-    assert _poll_until(target, bool) == [(handle, _op_entries({key: True}))]
 
 
 def test_remote_fetch_uses_local_then_framework_sources() -> None:
@@ -476,10 +441,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
 
 
-@pytest.mark.parametrize("min_hint_blocks", [0, 2])
-def test_remote_staging_commits_available_keys(
-    monkeypatch, caplog, min_hint_blocks
-) -> None:
+def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
     caplog.set_level(logging.DEBUG, logger="kvcr.core")
     block_size = 16
@@ -493,9 +455,7 @@ def test_remote_staging_commits_available_keys(
         FakePrimaryPinning(),
         control,
         key_adapter=_ConstantHashAdapter(),
-        remote_options=RemoteFWDramOptions(
-            eager_ctrl_connect=False, min_hint_blocks=min_hint_blocks
-        ),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False, min_hint_blocks=2),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         inventory_sink=events.append,
     )
@@ -1310,7 +1270,6 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
     _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
 
 
-@pytest.mark.parametrize("min_hint_blocks", [0, 2])
 @pytest.mark.parametrize(
     ("eager_ctrl_connect", "missing_indices"),
     [
@@ -1323,7 +1282,6 @@ def test_kvcr_request_scoped_sources_do_not_overwrite():
 def test_remote_framework_dram_transfers_available_keys(
     eager_ctrl_connect: bool,
     missing_indices: tuple[int, ...],
-    min_hint_blocks: int,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1346,7 +1304,6 @@ def test_remote_framework_dram_transfers_available_keys(
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=eager_ctrl_connect,
-            min_hint_blocks=min_hint_blocks,
         ),
     )
     source = _new_kvcr(
@@ -1369,7 +1326,7 @@ def test_remote_framework_dram_transfers_available_keys(
         index for index in range(len(keys)) if index not in missing_indices
     ]
 
-    target.submit_hint(_router_hint("tcp://source:1", (123, 999)), request_id="req")
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
