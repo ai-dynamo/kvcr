@@ -115,6 +115,8 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    # Whether the last start_write carried this target's agent metadata.
+    sent_metadata: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -132,25 +134,36 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
-            sent = backend._send_control(
-                progress,
-                self.remote_ctrl_ep,
-                {
-                    "type": "start_write",
-                    "op_handle": self.op_id[1],
-                    "remaining_timeout_ms": (self.deadline - now) * 1000,
-                    "source_incarnation": self.source_incarnation,
-                    "keys": list(self.ordered_keys),
-                    "dst_descriptors": self.dst_descriptors,
-                    "allow_layout_subset": not self.local_fill,
-                },
-            )
+            payload = {
+                "type": "start_write",
+                "op_handle": self.op_id[1],
+                "remaining_timeout_ms": (self.deadline - now) * 1000,
+                "source_incarnation": self.source_incarnation,
+                "keys": list(self.ordered_keys),
+                "dst_descriptors": self.dst_descriptors,
+                "allow_layout_subset": not self.local_fill,
+            }
+            sent = backend._send_control(progress, self.remote_ctrl_ep, payload)
+            self.sent_metadata = "target_agent_metadata" in payload
             if not sent:
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
             self.state = _TargetPullState.WAITING_WRITE_DONE
+            return False, True
+
+        if (
+            self.state is _TargetPullState.WAITING_WRITE_DONE
+            and isinstance(event, Mapping)
+            and event.get("refused") is True
+            and not self.sent_metadata
+        ):
+            # A source that restarted behind the same control endpoint refuses a
+            # start_write that relied on metadata its predecessor held. Nothing
+            # was written, and the refusal dropped the cached ack, so resend once
+            # carrying the metadata instead of failing this request.
+            self.state = _TargetPullState.START_WRITE
             return False, True
 
         if (
@@ -1015,18 +1028,22 @@ class _RemoteFWDram:
         if getattr(op, "remote_ctrl_ep", None) != endpoint:
             return
         # Whatever answered is not the process our metadata was loaded into, so
-        # drop the snapshot and let the next request republish it.
+        # drop the snapshot; the refused operation, or the next one, republishes it.
         self._invalidate_control_peer(endpoint)
         # Refresh the generation for future writes, not already in-flight ones.
         # A delayed refusal must not evict a generation learned after this op.
         refused_incarnation = getattr(op, "source_incarnation", None)
         if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
             self._dangling_ops.sources.pop(endpoint, None)
-        # A refusal is only sent before a write is submitted, so it is as terminal as a
-        # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
-        # unauthenticated: a "resend it" signal on a channel already trusted to let a
-        # start_write make a source write.
-        self._refused_writes[("target", op_handle)] = {"success": False}
+        # A refusal is only sent before a write is submitted, so nothing was written:
+        # the operation may resend (see _TargetPullOp.progress) or end as a failed
+        # write_done, even from WAITING_TERMINAL. Deliberately unauthenticated: a
+        # "resend it" signal on a channel already trusted to let a start_write make a
+        # source write.
+        self._refused_writes[("target", op_handle)] = {
+            "success": False,
+            "refused": True,
+        }
 
     def _handle_target_metadata_ack(
         self, progress: _KVCRProgress, payload: dict[str, Any]
