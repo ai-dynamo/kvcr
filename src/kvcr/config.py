@@ -54,6 +54,7 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     """Bounded file-backed cache storage owned by this KVCR process."""
 
     paths: tuple[Path, ...]
+    # Rounded down to complete slots; must hold at least one slot per file.
     capacity_bytes_per_file: int
     backend: str = "GDS_MT"
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
