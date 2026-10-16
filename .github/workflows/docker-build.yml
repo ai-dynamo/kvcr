@@ -1,0 +1,108 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Docker Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: vLLM image reference (nightly or PR image)
+        required: true
+        type: string
+        default: vllm/vllm-openai:nightly
+      dynamo_version:
+        description: Dynamo wheel version, or nightly for the latest prerelease
+        required: true
+        type: string
+        default: nightly
+      kvcr_ref:
+        description: KVCR ref to test (optional; e.g. refs/pull/23/merge)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out CI recipe
+        uses: actions/checkout@v4
+
+      - name: Check out KVCR source to test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.kvcr_ref || github.sha }}
+          path: kvcr-source
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Inspect build environment
+        run: |
+          docker version
+          docker buildx inspect --bootstrap
+          df -h
+
+      - name: Resolve build inputs
+        id: source
+        env:
+          BASE_IMAGE: ${{ inputs.base_image }}
+          DYNAMO_VERSION: ${{ inputs.dynamo_version }}
+        run: |
+          set -euo pipefail
+          kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
+          docker pull --platform linux/amd64 "$BASE_IMAGE"
+          base_image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")
+          image_tag="kvcr-vllm-e2e:${kvcr_sha}"
+          printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\n' \
+            "$kvcr_sha" "$base_image" "$image_tag" >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg kvcr_sha "$kvcr_sha" \
+            --arg requested_base_image "$BASE_IMAGE" \
+            --arg resolved_base_image "$base_image" \
+            --arg image_tag "$image_tag" \
+            --arg dynamo_version "$DYNAMO_VERSION" \
+            '{kvcr_sha: $kvcr_sha, requested_base_image: $requested_base_image,
+              resolved_base_image: $resolved_base_image, image_tag: $image_tag,
+              requested_dynamo_version: $dynamo_version}' \
+            > "$RUNNER_TEMP/kvcr-build-metadata.json"
+
+      # Keep the local build separate from setup so it can later be routed
+      # to the build service and published to the infrastructure-owned registry.
+      - name: Build local integration image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./kvcr-source
+          file: Dockerfile.ci
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ steps.source.outputs.image_tag }}
+          build-args: |
+            VLLM_IMAGE=${{ steps.source.outputs.base_image }}
+            DYNAMO_VERSION=${{ inputs.dynamo_version }}
+            KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
+
+      - name: Verify local image
+        env:
+          IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
+        run: |
+          docker image inspect "$IMAGE_TAG"
+          docker run --rm --entrypoint cat "$IMAGE_TAG" \
+            /opt/kvcr-build-metadata.json > "$RUNNER_TEMP/kvcr-installed-packages.json"
+          docker run --rm --entrypoint cat "$IMAGE_TAG" \
+            /opt/kvcr-dynamo-install-report.json > "$RUNNER_TEMP/kvcr-dynamo-install-report.json"
+
+      - name: Save build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcr-build-metadata
+          path: |
+            ${{ runner.temp }}/kvcr-build-metadata.json
+            ${{ runner.temp }}/kvcr-installed-packages.json
+            ${{ runner.temp }}/kvcr-dynamo-install-report.json
+          retention-days: 7

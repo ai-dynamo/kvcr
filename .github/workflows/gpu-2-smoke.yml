@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: GPU 2 Smoke
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-two-gpus:
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container: nvidia/cuda:12.8.1-base-ubuntu24.04
+    timeout-minutes: 10
+    steps:
+      - name: Show NVIDIA devices
+        run: nvidia-smi
+      - name: Require two visible GPUs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gpu_count=$(nvidia-smi -L | wc -l)
+          echo "visible_gpu_count=${gpu_count}"
+          test "${gpu_count}" -ge 2
