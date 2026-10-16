@@ -115,6 +115,9 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    # One start_write re-send after a refusal from a peer that replaced the
+    # process our metadata was loaded into (a promoted Guard, a replacement).
+    republished: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -867,11 +870,17 @@ class _RemoteFWDram:
         # Warning suppression can be added if persistent backend faults
         # cause excessive polling logs.
         observed_work |= self._process_control_messages(progress)
-        # Only terminal notifications outrank a refusal for the same operation.
+        # Only terminal notifications outrank a refusal for the same operation:
+        # a write the old peer finished in this same cycle is kept, not retried.
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
-            if not events.get(op_id, {}).get("terminal"):
-                events[op_id] = refusal
+            if events.get(op_id, {}).get("terminal"):
+                continue
+            if refusal.get("republish") and self._republish_start_write(
+                progress, op_id
+            ):
+                continue
+            events[op_id] = {"success": False}
         self._refused_writes.clear()
         observed_work |= bool(events)
         return events, observed_work
@@ -1025,8 +1034,41 @@ class _RemoteFWDram:
         # A refusal is only sent before a write is submitted, so it is as terminal as a
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
-        # start_write make a source write.
-        self._refused_writes[("target", op_handle)] = {"success": False}
+        # start_write make a source write. Whether it ends the operation or re-sends
+        # the start_write is decided in poll_progress, after this cycle's
+        # notifications are known (#51).
+        self._refused_writes[("target", op_handle)] = {
+            "success": False,
+            "republish": payload.get("reason") == "missing_target_agent_metadata",
+        }
+
+    def _republish_start_write(self, progress: _KVCRProgress, op_id: _OpId) -> bool:
+        """Re-send a refused start_write once, now carrying our metadata (#51).
+
+        The peer could not resolve us because it never saw our metadata: a
+        promoted Guard or a replacement adopted the endpoint without the old
+        peer table. _handle_write_refused un-acked the endpoint, so moving the
+        operation back to START_WRITE re-sends the same start_write with the
+        metadata and this request keeps its hit instead of paying a full
+        recomputation. Once only: a second refusal means something other than a
+        missing snapshot.
+        """
+        op = progress._in_flight_ops.get(op_id)
+        if not (
+            isinstance(op, _TargetPullOp)
+            and not op.republished
+            and op.state is _TargetPullState.WAITING_WRITE_DONE
+            and self._kvcr._clock() < op.deadline
+        ):
+            return False
+        op.republished = True
+        op.state = _TargetPullState.START_WRITE
+        logger.info(
+            "KVCR_EVENT start_write_republished op=%d source=%s",
+            op_id[1],
+            op.remote_ctrl_ep,
+        )
+        return True
 
     def _handle_target_metadata_ack(
         self, progress: _KVCRProgress, payload: dict[str, Any]
@@ -1403,6 +1445,8 @@ class _RemoteFWDram:
                         "type": "write_refused",
                         "sender_control_endpoint": reflected_self,
                         "op_handle": op_handle,
+                        # Tells the target why: it can republish its metadata.
+                        "reason": "missing_target_agent_metadata",
                     },
                 )
             return
