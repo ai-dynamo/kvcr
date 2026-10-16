@@ -748,6 +748,13 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     refuse(source, op_handle + 10)
     assert sources[source] == "source"
 
+    # A source restarted behind the endpoint lost our metadata: resend it once.
+    refuse(source)
+    _wait_until(lambda: len(control.sent) == 2)
+    resent = _decode_control_message(control.sent[1][1])
+    assert resent["op_handle"] == op_handle
+    assert resent["target_agent_metadata"] == b"target-md"
+    assert resent["source_incarnation"] is None
     refuse(source)
     assert _poll_until(kvcr, lambda done: bool(done)) == [
         (handle, _op_entries({key: False}))
@@ -762,6 +769,10 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     sources[source] = "replacement"
     refuse(source, later_handle)
     assert sources[source] == "replacement"
+    # Refuse its resend too, so the deliver ends and the fixture can close.
+    _wait_until(lambda: len(control.sent) == 2)
+    refuse(source, later_handle)
+    assert _poll_until(kvcr, bool)
 
 
 def test_kvcr_metadata_ack_retry_lifecycle():
