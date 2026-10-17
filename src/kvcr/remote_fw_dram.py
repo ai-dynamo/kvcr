@@ -652,6 +652,8 @@ class _RemoteFWDram:
             )
         kvcr._add_block_dependencies(op, new_operation=True)
         kvcr._progress.submit(op)
+        if not local_fill and request_id is not None:
+            kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
         return True
 
     def deliver(
