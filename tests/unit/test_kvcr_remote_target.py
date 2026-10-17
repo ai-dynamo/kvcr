@@ -35,6 +35,8 @@ from _kvcr_test_utils import (
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
+from kvcr.dangling_ops import _SourceWriteStatus
+from kvcr.remote_fw_dram import _SourceWriteOp, _SourceWriteState
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -722,6 +724,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     target_control = FakeBytesControl("tcp://target:1")
     source_control = FakeBytesControl("tcp://source:1")
     source_pinning = FakePrimaryPinning(prefix_length=0)
+    source_local = ctypes.create_string_buffer(16)
     target = _new_kvcr(
         target_agent,
         FakePrimaryPinning(),
@@ -736,8 +739,10 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         source_control,
         KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
         name="source",
+        local_dram=LocalDramOptions([("", ctypes.addressof(source_local), 16)]),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
+    source._core._clock = lambda: 0.0  # An absent key must not wait for timeout.
     key = _make_block_key(b"k0", 0)
     other_group = _make_block_key(b"k0", 1)
 
@@ -1059,6 +1064,33 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         for _, raw in control.sent
         if (message := _decode_control_message(raw))["type"] == "write_probe"
     ] == [handle, handle]
+
+
+def test_empty_terminal_wave_confirms_previous_completions():
+    backend, progress = Mock(), Mock()
+    backend._kvcr._clock.return_value = 0.0
+    backend._dangling_ops.source_writes = {
+        ("", 7): _SourceWriteStatus(completed_indices=(1,))
+    }
+    write = _SourceWriteOp(
+        op_id=("source", 1),
+        keys=frozenset(),
+        started_at=None,
+        deadline=1.0,
+        state=_SourceWriteState.READY_TO_WRITE,
+        remote_agent="peer",
+        op_handle=7,
+        source_keys=(),
+        dst_descriptors=(),
+        _backend=backend,
+    )
+
+    assert write.progress(progress, None) == (True, True)
+    # This terminal can arrive before the prior wave's native notification.
+    backend._send_write_done.assert_called_once_with(
+        progress, "peer", 7, True, confirmed_indices=(1,)
+    )
+    progress.submit_transfer.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1399,6 +1431,179 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
     assert claim is not None
     assert kvcr.query([key], "req-b") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert kvcr.release([claim]) == [(claim, True)]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "deposit",
+        "deposit_reordered",
+        "source_timeout",
+        "source_timeout_reordered",
+        "source_timeout_same_poll",
+        "target_timeout",
+        "target_abandon",
+        "cancel",
+        "cancel_same_poll",
+    ],
+)
+def test_remote_deliver_streams_deposited_pieces_to_target(outcome):
+    primary = ctypes.create_string_buffer(
+        b"a" * 16 + b"b" * 16 + b"c" * 16 + b"d" * 16, 64
+    )
+    local, destination = (
+        ctypes.create_string_buffer(64),
+        ctypes.create_string_buffer(64),
+    )
+    source_agent, target_agent = _CopyingWriteAgent(), FakeNixlAgent()
+    errors = []
+    source_control = FakeBytesControl("tcp://source:1")
+    target_control = FakeBytesControl("tcp://target:1")
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(prefix_length=0),
+        source_control,
+        name="source",
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(primary, 16, ":*")],
+    )
+    target = _new_kvcr(
+        target_agent,
+        FakePrimaryPinning(),
+        target_control,
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        framework_regions=[_buffer_region(destination, 16, ":*")],
+        on_resilience_event=errors.append,
+    )
+    source_now = target_now = 0.0
+    source._core._clock = lambda: source_now
+    target._core._clock = lambda: target_now
+    source_agent.state = "DONE"
+    pending, ready = BlockKey(b"pending"), BlockKey(b"ready")
+    first = source.deposit(
+        {
+            pending: [_mem_descriptor(0, ":a", end_point_name="source")],
+            ready: [
+                _mem_descriptor(2, ":a", end_point_name="source"),
+                _mem_descriptor(3, ":b", end_point_name="source"),
+            ],
+        },
+        expected_layout=[":a", ":b"],
+    )
+    assert _poll_until(source, bool) == [
+        (first, _op_entries({pending: True, ready: True}))
+    ]
+    target.submit_hint(_router_hint("tcp://source:1"), "req")
+    assert target.query((pending, ready), "req") == [
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
+    ]
+    deliveries = [
+        target.deliver(
+            {
+                pending: [_mem_descriptor(i, label)],
+                ready: [_mem_descriptor(i + 2, label)],
+            },
+            "req",
+        )
+        for i, label in enumerate((":a", ":b"))
+    ]
+    _wait_until(lambda: len(target_control.sent) == 2)
+    source_control.incoming.extend(raw for _, raw in target_control.sent)
+    target_control.sent.clear()
+    _poll_until(
+        source,
+        lambda _: len(source_agent.released_xfers) == 3,
+    )
+    target_control.incoming.extend(raw for _, raw in source_control.sent)
+    source_control.sent.clear()
+    target_agent.notifs["source"] = [source_agent.xfers[1][5]]
+    if outcome not in (
+        "deposit_reordered",
+        "source_timeout_reordered",
+        "source_timeout_same_poll",
+        "target_timeout",
+        "cancel_same_poll",
+    ):
+        target_agent.notifs["source"].append(source_agent.xfers[2][5])
+    assert _poll_until(target, bool) == [
+        (deliveries[0], _op_entries({pending: True, ready: True}))
+    ]
+    assert target.poll_completed() == []
+    assert source._core._remote_fw_dram._source_pin_ops
+    assert destination.raw == b"a" * 16 + b"\0" * 16 + b"c" * 16 + b"d" * 16
+
+    completed = None
+    if outcome in ("target_timeout", "target_abandon", "cancel", "cancel_same_poll"):
+        if outcome in ("target_timeout", "target_abandon"):
+            target_now = 1.0
+        else:
+            target_agent.notifs["source"] = [
+                _write_done_notification(deliveries[1], success=False, terminal=False)
+            ]
+            if outcome == "cancel_same_poll":
+                target_agent.notifs["source"].insert(0, source_agent.xfers[2][5])
+        _wait_until(
+            lambda: any(
+                _decode_control_message(raw)["type"] == "write_probe"
+                for _, raw in target_control.sent
+            )
+        )
+        assert target.poll_completed() == []
+        if outcome == "target_abandon":
+            target_now = 5.0
+            completed = _poll_until(target, bool)
+            assert len(errors) == 1
+            assert errors[0].destination_regions == [_mem_descriptor(1, ":b")]
+    if outcome in ("deposit", "deposit_reordered", "cancel", "cancel_same_poll"):
+        second = source.deposit(
+            {pending: [_mem_descriptor(1, ":b", end_point_name="source")]}
+        )
+        assert _poll_until(source, lambda _: len(source_agent.released_xfers) == 5) == [
+            (second, _op_entries({pending: True}))
+        ]
+        target_agent.notifs["source"] = [source_agent.xfers[4][5]]
+    else:
+        if outcome == "target_timeout":
+            # Only the probe reply can confirm the lost completion notification.
+            source_control.incoming.extend(raw for _, raw in target_control.sent)
+            _wait_until(lambda: bool(source_control.sent))
+            target_control.incoming.extend(raw for _, raw in source_control.sent)
+            completed = _poll_until(target, bool)
+        source_now = 100.0
+        _poll_until(
+            source,
+            lambda _: (
+                bool(source_agent.sent_notifs)
+                and not _has_outstanding_operations(source)
+            ),
+        )
+        if outcome != "target_timeout":
+            target_agent.notifs["source"] = [source_agent.sent_notifs[-1][1]]
+        if outcome == "source_timeout_same_poll":
+            target_agent.notifs["source"].insert(0, source_agent.xfers[2][5])
+    if completed is None:
+        completed = _poll_until(target, bool)
+    else:
+        assert (
+            _poll_until(target, lambda _: not _has_outstanding_operations(target)) == []
+        )
+    assert completed == [
+        (
+            deliveries[1],
+            _op_entries(
+                {pending: outcome in ("deposit", "deposit_reordered"), ready: True}
+            ),
+        )
+    ]
+    assert destination.raw == (
+        primary.raw
+        if outcome in ("deposit", "deposit_reordered", "cancel", "cancel_same_poll")
+        else b"a" * 16 + b"\0" * 16 + b"c" * 16 + b"d" * 16
+    )
+    assert not _has_outstanding_operations(source)
+    assert not _has_outstanding_operations(target)
 
 
 @pytest.mark.parametrize(
