@@ -620,7 +620,9 @@ class _KVCRCore:
                 for key, descriptors in blocks.items()
             }
             if declaration is not None:
-                local_layout = list(declaration)
+                local_layout = [
+                    label for label in declaration if not label.startswith("!")
+                ]
                 indices = {}
                 for index, label in enumerate(local_layout):
                     indices[label] = None if label in indices else index
@@ -662,7 +664,7 @@ class _KVCRCore:
         declaration = self._validate_expected_layout(
             [""] if expected_layout is None else expected_layout
         )
-        requested = list(declaration)
+        requested = [label for label in declaration if not label.startswith("!")]
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -1083,7 +1085,11 @@ class _KVCRCore:
             region = self._region(ref, regions=regions, agent_name=agent_name)
             pool, separator, part = ref.label.partition(":")
             block_size = self._block_sizes.get(pool)
-            if block_size is None or (separator and part in ("", "*")):
+            if (
+                ref.label.startswith("!")
+                or block_size is None
+                or (separator and part in ("", "*"))
+            ):
                 raise ValueError("block descriptors must use configured pools")
             if region.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
@@ -1099,23 +1105,40 @@ class _KVCRCore:
     ) -> tuple[str, ...] | None:
         if layout is None:
             return None
-        if any(not isinstance(label, str) for label in layout):
-            raise ValueError("expected layout labels must be strings")
+        local_count = 0
+        local_named = False
+        named = set()
+        bare_exclusions = {}
         invalid_message = "expected layout must include configured local pools"
-        if not layout:
-            raise ValueError(invalid_message)
-        labels = set()
-        for label in layout:
+        for entry in layout:
+            if not isinstance(entry, str):
+                raise ValueError("expected layout labels must be strings")
+            excluded = entry.startswith("!")
+            label = entry[1:] if excluded else entry
             pool, separator, part = label.partition(":")
-            if pool not in self._block_sizes or (separator and part in ("", "*")):
-                raise ValueError(invalid_message)
+            if (
+                label.startswith("!")
+                or (excluded and not label)
+                or (separator and part in ("", "*"))
+            ):
+                raise ValueError("invalid expected layout label")
             if separator:
-                if label in labels:
-                    raise ValueError("block part labels must be unique")
-                labels.add(label)
-        if self._g3 is not None and (len(layout) != 1 or labels):
+                if label in named:
+                    raise ValueError("expected layout part labels must be unique")
+                named.add(label)
+            else:
+                if label in bare_exclusions and (excluded or bare_exclusions[label]):
+                    raise ValueError("excluded repeated pools require named pieces")
+                bare_exclusions[label] = excluded
+            if not excluded:
+                if pool not in self._block_sizes:
+                    raise ValueError(invalid_message)
+                local_count += 1
+                local_named |= bool(separator)
+        if not local_count:
+            raise ValueError(invalid_message)
+        if self._g3 is not None and (local_count != 1 or local_named):
             raise ValueError("G3 does not support multi-block layouts or part labels")
-
         return tuple(layout)
 
     def _release_local_dram_sources(

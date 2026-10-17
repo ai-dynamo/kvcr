@@ -173,7 +173,7 @@ class KVCR:
         *,
         expected_layout: list[str] | None = None,
     ) -> OpHandle:
-        """Deposit pieces with a fixed expected layout."""
+        """Deposit pieces with a fixed expected layout; ! excludes local storage."""
         return self._core.deposit(
             blocks, no_evict, hints, expected_layout=expected_layout
         )
@@ -185,7 +185,7 @@ class KVCR:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        """Fetch every piece of the full ordered expected layout."""
+        """Fetch the non-! pieces of the full ordered expected layout."""
         return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(

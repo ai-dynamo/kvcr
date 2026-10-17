@@ -409,7 +409,9 @@ class _LocalDram:
             declaration = self._kvcr._validate_expected_layout(
                 list(residency.key_layout)
             )
-            if list(declaration) != residency.layout:
+            if [
+                label for label in declaration if not label.startswith("!")
+            ] != residency.layout:
                 raise ValueError("invalid local DRAM recovery layout")
             # Byte counts depend on the receiving core's pool geometry.
             residency._cached_size = None
@@ -485,7 +487,11 @@ class _LocalDram:
         src_descriptors: list[_TransferRef] = []
         dst_descriptors: list[_TransferRef] = []
         evicted: list[BlockKey] = []
-        declared_local = list(op.key_layout) if op.key_layout is not None else None
+        declared_local = (
+            [label for label in op.key_layout if not label.startswith("!")]
+            if op.key_layout is not None
+            else None
+        )
         for key in keys:
             if key in op.results or key in op.capacity_waiters or key in op.active_keys:
                 continue
@@ -669,7 +675,14 @@ class _LocalDram:
                     op.results[key] = _FAILED_RESULT
                 return None
             residency = record.local_dram
-        elif op.key_layout is not None and op.key_layout != residency.key_layout:
+        elif (
+            op.key_layout is not None
+            and op.key_layout != residency.key_layout
+            and (
+                tuple(label.removeprefix("!") for label in op.key_layout)
+                != tuple(label.removeprefix("!") for label in residency.key_layout)
+            )
+        ):
             op.results[key] = _FAILED_RESULT
             return None
         residency.prepare_label_index()
@@ -1179,8 +1192,16 @@ class _LocalDram:
         if op.op_id[0] == "fetch":
             remote_keys = self._kvcr._remote_delivery_keys.get(op.request_id)
             if remote_keys is not None:
+                # Subset fetches can leave declared pieces unavailable locally.
                 remote_keys.difference_update(
-                    key for key, result in op.results.items() if result.success
+                    key
+                    for key, result in op.results.items()
+                    if result.success
+                    and (residency := self._kvcr._block_record_map[key].local_dram)
+                    is not None
+                    and residency.state is _LocalDramState.READY
+                    and not residency.pending_labels
+                    and len(residency.slots) == len(residency.key_layout)
                 )
         op.capacity_waiters.clear()
         self._pending_residency_ops.pop(op.op_id)
