@@ -104,7 +104,7 @@ class _LocalDramResidency:
             self.key_layout = tuple(label for label, _ in self.slots)
         if self.state is _LocalDramState.FILLING:
             self.pending_labels.update(label for label, _ in self.slots)
-        if not self.writers:
+        if self.pending_labels and not self.writers:
             self.writers = [0] * len(self.slots)
 
     @property
@@ -496,7 +496,7 @@ class _LocalDram:
             layout = [descriptor.label for descriptor in sources]
             record = self._kvcr._block_record(key)
             residency = record.local_dram
-            created = residency is None
+            full_deposit = False
             if residency is not None:
                 if (
                     residency.state is _LocalDramState.DISCARDING
@@ -531,14 +531,17 @@ class _LocalDram:
                     else:
                         op.results[key] = _FAILED_RESULT
                     continue
+                full_deposit = layout == local_layout
                 residency = record.local_dram = _LocalDramResidency(
-                    locations, _LocalDramState.FILLING, key_layout=declaration
+                    locations,
+                    _LocalDramState.FILLING,
+                    key_layout=declaration,
+                    writers=[1 if full_deposit else 0] * len(locations),
                 )
-            if created and layout == residency.layout:
+            if full_deposit:
                 selected_slots = residency.slots
                 selected_indices = tuple(range(len(selected_slots)))
                 src_descriptors.extend(sources)
-                residency.writers = [1] * len(selected_slots)
             else:
                 residency.prepare_label_index()
                 indices = _layout_indices(
@@ -957,9 +960,12 @@ class _LocalDram:
                 residency.remote_cancelled = False
             if key_success:
                 pending_count = len(residency.pending_labels)
-                residency.pending_labels.difference_update(
-                    residency.slots[index][0] for index in indices
-                )
+                if len(indices) == len(residency.slots):
+                    residency.pending_labels.clear()
+                else:
+                    residency.pending_labels.difference_update(
+                        residency.slots[index][0] for index in indices
+                    )
                 if len(residency.pending_labels) < pending_count:
                     residency.state = _LocalDramState.READY
                     residency.prepare_label_index()
@@ -998,6 +1004,8 @@ class _LocalDram:
 
             # Releasing the final claim may retire this residency and wake a waiter.
             for op_id in record.active_op_ids:
+                if writer is not None and op_id == writer.op_id:
+                    continue
                 residency_op = self._pending_residency_ops.get(op_id)
                 if (
                     residency_op is not None
