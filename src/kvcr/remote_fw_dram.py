@@ -110,6 +110,7 @@ class _TargetPullOp(_RemoteOp):
     ordered_keys: tuple[BlockKey, ...] = ()
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
+    key_layout: tuple[str, ...] = ()
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
@@ -142,7 +143,7 @@ class _TargetPullOp(_RemoteOp):
                     "source_incarnation": self.source_incarnation,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
-                    "allow_layout_subset": not self.local_fill,
+                    **({"key_layout": self.key_layout} if self.local_fill else {}),
                 },
             )
             if not sent:
@@ -273,10 +274,11 @@ class _SourcePinOp(_Op):
     deadline: float
     remote_agent: str
     op_handle: int
+    # Preserve request positions even when keys drops rejected dependencies.
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
-    allow_layout_subset: bool = False
+    key_layout: tuple[str, ...] = ()
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -631,6 +633,11 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             request_id=request_id,
+            key_layout=(
+                kvcr._block_record_map[keys[0]].local_dram.key_layout
+                if local_fill
+                else ()
+            ),
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -1099,10 +1106,10 @@ class _RemoteFWDram:
                 or remaining_timeout_ms <= 0
             ):
                 raise TypeError("invalid remaining_timeout_ms")
-            allow_layout_subset = payload.get("allow_layout_subset", False)
-            if type(allow_layout_subset) is not bool:
-                raise TypeError("invalid allow_layout_subset")
             keys = _message_keys(payload)
+            key_layout = msgspec.convert(
+                payload.get("key_layout", ()), type=tuple[str, ...]
+            )
             dst_descriptors = msgspec.convert(
                 payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
             )
@@ -1198,7 +1205,7 @@ class _RemoteFWDram:
             op_handle=op_handle,
             ordered_keys=keys,
             dst_descriptors=dst_descriptors,
-            allow_layout_subset=allow_layout_subset,
+            key_layout=key_layout,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
         )
         if not self._try_local_source_write(progress, source_pin):
@@ -1225,12 +1232,12 @@ class _RemoteFWDram:
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
                     return False
-                indices = _layout_indices(
-                    residency.layout,
-                    layout,
-                    allow_subset=source_pin.allow_layout_subset,
-                    indices_by_label=residency.indices_by_label,
-                )
+                if (
+                    source_pin.key_layout
+                    and source_pin.key_layout != residency.key_layout
+                ):
+                    return False
+                indices = residency.ready_indices(layout)
                 if indices is None:
                     return False
                 selected.append(indices)
@@ -1285,39 +1292,59 @@ class _RemoteFWDram:
             # write the dead generation's destinations through the new route.
             force_failure = True
         local_sources = kvcr._claim_local_dram_sources(
-            source_pin.op_id, source_pin.ordered_keys
+            source_pin.op_id, source_pin.keys
         )
         framework_sources = {
             key: record.fw_mem.descriptors
-            for key in source_pin.ordered_keys
+            for key in source_pin.keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
         completed_indices = []
         selected_sources = []
+        waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
+            if key not in source_pin.keys:
+                continue
             residency = local_sources.get(key)
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
                 continue
-            indices = _layout_indices(
-                residency.layout
+            labels = [descriptor.label for descriptor in destination]
+            layout = (
+                residency.key_layout
                 if residency is not None
-                else [descriptor.label for descriptor in source],
-                [descriptor.label for descriptor in destination],
-                allow_subset=source_pin.allow_layout_subset,
-                indices_by_label=(
-                    residency.indices_by_label if residency is not None else None
-                ),
+                else [descriptor.label for descriptor in source]
             )
+            if source_pin.key_layout and source_pin.key_layout != tuple(layout):
+                indices = None
+            elif residency is not None:
+                indices = (
+                    residency.ready_indices(labels)
+                    if residency.state is _LocalDramState.READY
+                    else None
+                )
+                if (
+                    indices is None
+                    and residency.state is not _LocalDramState.DISCARDING
+                    and residency.can_wait_for_pieces(labels)
+                ):
+                    waiting = True
+                    continue
+            else:
+                indices = _layout_indices(layout, labels)
             if indices is None:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",
                     source_pin.op_handle,
                     key,
                 )
+                source_pin.keys -= {key}
+                record = kvcr._block_record_map[key]
+                record.discard_in_flight_op(op_id)
+                kvcr._prune_block_record(key)
                 continue
             completed_indices.append(index)
             selected_sources.append(
@@ -1329,12 +1356,11 @@ class _RemoteFWDram:
             source_pin.ordered_keys[index] for index in completed_indices
         )
 
-        kvcr._release_local_dram_sources(
-            source_pin.op_id, local_sources.keys() - set(completed_keys)
-        )
+        retained_keys = source_pin.keys if waiting else set(completed_keys)
+        kvcr._release_local_dram_sources(op_id, local_sources.keys() - retained_keys)
         relevant_pins = {
             record.fw_mem.pin_handle
-            for key in completed_keys
+            for key in retained_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
@@ -1344,6 +1370,10 @@ class _RemoteFWDram:
         # release from unpinning it mid-read.
         framework_pins = set(relevant_pins)
         unused_pins = source_pin.framework_pins - framework_pins
+        if waiting:
+            source_pin.framework_pins = framework_pins
+            self._release_framework_pins(unused_pins)
+            return
         source_pin.framework_pins.clear()
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
@@ -1354,7 +1384,7 @@ class _RemoteFWDram:
                 if not force_failure
                 else _SourceWriteState.NOTIFY_FAILURE
             ),
-            keys=frozenset(completed_keys or source_pin.ordered_keys),
+            keys=frozenset(completed_keys or source_pin.keys),
             started_at=source_pin.started_at,
             deadline=source_pin.deadline,
             op_id=source_pin.op_id,
@@ -1510,9 +1540,13 @@ class _RemoteFWDram:
             self._submit_prepared_source_write(op.op_id, op, force_failure=True)
             return
 
-        local_sources = kvcr._claim_local_dram_sources(op.op_id, op.ordered_keys)
+        local_sources = kvcr._claim_local_dram_sources(
+            op.op_id, op.keys, allow_filling=True
+        )
         unresolved_keys = tuple(
-            key for key in op.ordered_keys if key not in local_sources
+            key
+            for key in op.ordered_keys
+            if key in op.keys and key not in local_sources
         )
         if unresolved_keys and not op.framework_acquire_attempted:
             if any(

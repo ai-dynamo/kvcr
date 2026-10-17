@@ -18,6 +18,7 @@ from _kvcr_test_utils import (
     FakePrimaryPinning,
     FakeTelemetryStats,
     PendingPrimaryPinning,
+    _buffer_region,
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
@@ -32,7 +33,9 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _STOP, _TransferRef
+from kvcr.recovery_journal import install_recovery_records
 from kvcr.remote_fw_dram import (
     _FwMemResidency,
     _RemoteFWDram,
@@ -86,8 +89,10 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     )
 
 
-@pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypatch):
+@pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
+def test_local_source_starts_inline_and_holds_its_slot(
+    transfer_state, recovered, monkeypatch
+):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -119,26 +124,31 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
     key = BlockKey(b"local")
     try:
         agent.state = "DONE"
-        deposit = source.deposit({key: descriptors})
-        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        if recovered:
+            install_recovery_records(
+                source._core,
+                {
+                    key: _BlockRecord(
+                        local_dram=_LocalDramResidency(
+                            [("", 0), (":b", 1), (":c", 2)], _LocalDramState.READY
+                        )
+                    )
+                },
+            )
+        else:
+            deposit = source.deposit({key: descriptors})
+            assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        prior_transfers = len(agent.xfers)
         local = source._core._local_dram
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
         make_ref = Mock(wraps=local._descriptor)
         monkeypatch.setattr(local, "_descriptor", make_ref)
-        assert not source._core._remote_fw_dram._try_local_source_write(
-            source._core._progress,
-            SimpleNamespace(
-                ordered_keys=(key,),
-                dst_descriptors=((descriptors[2], descriptors[0]),),
-                allow_layout_subset=False,
-            ),
-        )
         callbacks.clear()
         agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
+        requested_labels = (":c", "")
         request.update(
-            allow_layout_subset=True,
             target_regions=(
                 {
                     label: RegionDescriptor(
@@ -146,7 +156,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                         size=16,
                         mem_type="VRAM",
                         device_Id=7,
-                        count=2,
+                        count=len(requested_labels),
                         label=label,
                     )
                     for label in ("", ":*")
@@ -154,7 +164,10 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                 {},
             ),
             dst_descriptors=[
-                [_TransferRef("target", i, label) for i, label in enumerate((":c", ""))]
+                [
+                    _TransferRef("target", i, label)
+                    for i, label in enumerate(requested_labels)
+                ]
             ],
         )
         preparing, resume = threading.Event(), threading.Event()
@@ -184,19 +197,21 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                     source._core._state_lock.release()
             finally:
                 resume.set()
-            _wait_until(lambda: len(agent.xfers) == 2)
+            _wait_until(lambda: len(agent.xfers) == prior_transfers + 1)
 
         # The peer request must be served without another caller-side poll.
         assert residency.claim_count == 1
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
         ] == [
-            b"c" * 16,
-            b"a" * 16,
+            label.removeprefix(":").encode() * 16 if label else b"a" * 16
+            for label in requested_labels
         ]
-        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
+        assert agent.xfers[-1][3] == [
+            (4096 + i * 16, 16, 7) for i in range(len(requested_labels))
+        ]
         assert pinning.searches == []
-        assert make_ref.call_count == 2
+        assert make_ref.call_count == len(requested_labels)
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
         if transfer_state == "PROC":
@@ -204,7 +219,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
             assert callbacks == [(threading.get_ident(), [("", 3)])]
 
         agent.state = "DONE"
-        _wait_until(lambda: len(agent.released_xfers) == 2)
+        _wait_until(lambda: len(agent.released_xfers) == prior_transfers + 1)
         assert residency.claim_count == 1  # Native completion does not release it.
         assert _poll_until(source, lambda _: residency.claim_count == 0) == []
         assert not source._core._local_dram_sources_by_op
@@ -217,14 +232,120 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
             control.incoming.append(msgspec.msgpack.encode(request))
             _poll_until(
                 source,
-                lambda _: len(agent.released_xfers) == 3 and residency.claim_count == 0,
+                lambda _: (
+                    len(agent.released_xfers) == prior_transfers + 2
+                    and residency.claim_count == 0
+                ),
             )
-        assert make_ref.call_count == 2
+        assert make_ref.call_count == len(requested_labels)
         assert agent.xfers[-1][1] == agent.xfers[-2][1]
         assert pinning.searches == []
     finally:
         agent.state = "DONE"
         source.close()
+
+
+@pytest.mark.parametrize(
+    "first_piece_ready,mixed", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("timeout", [False, True])
+def test_local_source_waits_for_declared_pieces(
+    first_piece_ready, timeout, mixed, caplog, request
+) -> None:
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    local = ctypes.create_string_buffer(32)
+    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        framework_regions=[
+            _buffer_region(primary, 16),
+            _buffer_region(primary, 16, ":*"),
+        ],
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), 32)]),
+    )
+    now = 0.0
+    source._core._clock = lambda: now
+    backend = source._core._remote_fw_dram
+    key = BlockKey(b"partial")
+    layout = [":a", ":b"]
+    first = source.deposit(
+        {key: [_mem_descriptor(0, label=":a", end_point_name="source")]},
+        expected_layout=layout,
+    )
+    _wait_until(lambda: len(agent.xfers) == 1)
+    if first_piece_ready:
+        agent.state = "DONE"
+        assert dict(_poll_until(source, bool))[first][key].success
+        agent.state = "PROC"
+
+    message = msgspec.msgpack.decode(_start_write_message(12, key))
+    rejected = (BlockKey(b"wrong-before"), BlockKey(b"wrong-after")) if mixed else ()
+    keys = [rejected[0], key, rejected[1]] if mixed else [key]
+    message.update(
+        keys=keys,
+        key_layout=layout,
+        target_regions=({":*": _buffer_region(primary, 16, ":*")}, {}),
+        dst_descriptors=[
+            [_TransferRef("target", i, label) for i, label in enumerate(layout)]
+            for _ in keys
+        ],
+    )
+    control.incoming.append(msgspec.msgpack.encode(message))
+    _poll_until(source, lambda _: bool(backend._source_pin_ops))
+    assert len(agent.xfers) == 1
+    residency = source._core._block_record_map[key].local_dram
+    producer_claims = int(not first_piece_ready)
+    if mixed:
+        _poll_until(
+            source,
+            lambda _: pinning.searches and not backend._pending_pin_ops,
+        )
+        assert pinning.unpins == ["pin"]
+        for rejected_key in rejected:
+            assert rejected_key not in source._core._block_record_map
+        for _ in range(3):
+            assert source.poll_completed() == []
+    assert residency.claim_count == producer_claims + 1
+
+    if timeout:
+        now = 2.0
+        _poll_until(source, lambda _: bool(agent.sent_notifs))
+        notification = agent.sent_notifs[-1][1]
+        _poll_until(source, lambda _: not source._core._local_dram_sources_by_op)
+        assert residency.claim_count == producer_claims
+        assert len(agent.xfers) == 1
+        agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    else:
+        second = source.deposit(
+            {key: [_mem_descriptor(1, label=":b", end_point_name="source")]}
+        )
+        _wait_until(lambda: len(agent.xfers) == 2)
+        agent.state = "DONE"
+        completed = dict(
+            _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        )
+        assert completed[second][key].success
+        assert len(agent.xfers) == 3
+        assert [
+            ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+        ] == [b"a" * 16, b"b" * 16]
+        notification = agent.xfers[-1][5]
+        assert _decode_notif(notification)["completed_indices"] == [1 if mixed else 0]
+    assert _decode_notif(notification)["success"] is not timeout
+    assert not backend._source_pin_ops
+    assert not source._core._local_dram_sources_by_op
+    assert residency.claim_count == 0
+    assert pinning.searches == ([rejected] if mixed else [])
+    assert [
+        record.args[1]
+        for record in caplog.records
+        if "start_write layout mismatch" in record.message
+    ] == list(rejected)
 
 
 def test_local_source_falls_back_during_fill_publication_without_blocking_progress():
@@ -480,7 +601,7 @@ def test_kvcr_close_cleans_pending_pin_operations():
     "field",
     [
         "remaining_timeout_ms",
-        "allow_layout_subset",
+        "key_layout",
         "keys",
         "framework",
         "label",
@@ -1135,17 +1256,12 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
 
 
 @pytest.mark.parametrize(
-    ("parts", "allow_subset", "selected"),
-    [
-        ("abc", False, (0, 1, 2)),
-        ("ca", True, (2, 0)),
-        ("x", True, ()),
-        ("ca", False, ()),
-    ],
-    ids=["whole", "partial", "unknown", "strict-fetch"],
+    ("parts", "selected"),
+    [("abc", (0, 1, 2)), ("ca", (2, 0)), ("x", ())],
+    ids=["whole", "partial", "unknown"],
 )
 def test_a_resumed_write_holds_a_pin_another_operation_acquired(
-    parts, allow_subset, selected
+    parts, selected
 ) -> None:
     """fw_mem belongs to the block, so two writes can want the same pin."""
     backend = object.__new__(_RemoteFWDram)
@@ -1186,7 +1302,6 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         op_id=("source", 1),
         keys=frozenset((key,)),
         framework_pins={stale},
-        allow_layout_subset=allow_subset,
     )
     backend._source_pin_ops[("source", 1)] = waiting
 
