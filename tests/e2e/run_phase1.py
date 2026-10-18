@@ -23,11 +23,11 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
-import platform
 import os
+import platform
 import re
-import socket
 import signal
+import socket
 import sys
 import time
 import uuid
@@ -38,7 +38,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from phase1.cases import CASES, Context, Prompts, run_case  # noqa: E402
 from phase1.client import Client  # noqa: E402
-from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
 from phase1.common import (  # noqa: E402
     BLOCKED,
     FAIL,
@@ -52,6 +51,7 @@ from phase1.common import (  # noqa: E402
     utc_now,
     write_junit,
 )
+from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
 from phase1.stack import GUARD, MODES, Settings, Stack  # noqa: E402
 
 CASES.update(PERF_CASES)
@@ -101,8 +101,10 @@ class Runner:
             # A remote kvcr_service sidecar (two-node run) logs into
             # <output>/stack before the harness starts; anything else is stale.
             stray = [
-                p for p in self.output.rglob("*")
-                if p.is_file() and not (
+                p
+                for p in self.output.rglob("*")
+                if p.is_file()
+                and not (
                     p.parent == self.output / "stack"
                     and re.fullmatch(r"kvcr-service-\d\.log", p.name)
                 )
@@ -131,7 +133,9 @@ class Runner:
             readiness_timeout=args.readiness_timeout,
             request_timeout=args.request_timeout,
             extra_worker_args=list(args.worker_arg),
-            frontend_env=dict(item.split("=", 1) for item in args.frontend_env if "=" in item),
+            frontend_env=dict(
+                item.split("=", 1) for item in args.frontend_env if "=" in item
+            ),
             disable_hybrid_kv_cache_manager=not args.keep_hybrid_kv_cache_manager,
             enforce_eager=not args.no_enforce_eager,
             external_services=args.external_services,
@@ -177,11 +181,18 @@ class Runner:
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
-            "topology": ("two-node" if args.remote_workers
-                         else "sidecar" if args.external_services else "single-container"),
+            "topology": (
+                "two-node"
+                if args.remote_workers
+                else "sidecar"
+                if args.external_services
+                else "single-container"
+            ),
             "remote_workers": args.remote_workers or None,
             "discovery": "etcd" if args.etcd else "file",
-            "external_services": str(args.external_services) if args.external_services else None,
+            "external_services": str(args.external_services)
+            if args.external_services
+            else None,
             "batch_invariant": args.batch_invariant,
             "state_agent": not args.no_state_agent,
             "selected_cases": list(args.cases),
@@ -217,7 +228,9 @@ class Runner:
         )
         worker = stack.start_worker(0, kvcr=False, tag="-reference")
         decode_ref = (
-            stack.start_worker(2, kvcr=False, tag="-reference") if stack.disagg else None
+            stack.start_worker(2, kvcr=False, tag="-reference")
+            if stack.disagg
+            else None
         )
         client = Client(
             f"http://127.0.0.1:{self.settings.reference_http_port}",
@@ -232,7 +245,8 @@ class Runner:
         stack.discover_worker(client, 0)
         launch = json.loads((stack.evidence / f"{worker.name}.launch.json").read_text())
         bypass = not any(
-            "OffloadingConnector" in part or '"kvcr"' in part for part in launch["command"]
+            "OffloadingConnector" in part or '"kvcr"' in part
+            for part in launch["command"]
         )
         samples: dict[str, list[TokenSample]] = {}
         unstable = []
@@ -240,7 +254,9 @@ class Runner:
         perf_names = set(self.prompts.perf_names()) if self.wants_perf else set()
         # TC-06 prompts are generated with the perf token budget too, but need no
         # KVCR-disabled timing baseline.
-        long_names = perf_names | (set(self.prompts.tc06_names()) if self.wants_perf else set())
+        long_names = perf_names | (
+            set(self.prompts.tc06_names()) if self.wants_perf else set()
+        )
         # Only the prompts the requested cases use: a long prompt of a case not
         # being run must not block the run when the bare engine is unstable on it.
         case_prompts = {
@@ -255,7 +271,9 @@ class Runner:
         for case in self.args.cases:
             wanted |= case_prompts.get(case, set())
         selected = {
-            name: prompt for name, prompt in self.prompts.all().items() if name in wanted
+            name: prompt
+            for name, prompt in self.prompts.all().items()
+            if name in wanted
         }
         for name, prompt in selected.items():
             runs = []
@@ -284,14 +302,18 @@ class Runner:
                     f"ref-{name}-{repeat}",
                     prompt,
                     **stack.pin(0),
-                    max_tokens=self.args.perf_max_tokens if name in long_names else None,
+                    max_tokens=self.args.perf_max_tokens
+                    if name in long_names
+                    else None,
                 )
                 if not response.ok or response.body is None:
                     raise ValidationError(
                         f"reference request {name} failed: {response.error}"
                     )
                 runs.append(extract_sample(response.body))
-                details = (response.body.get("usage") or {}).get("prompt_tokens_details") or {}
+                details = (response.body.get("usage") or {}).get(
+                    "prompt_tokens_details"
+                ) or {}
                 cached_value = details.get("cached_tokens")
                 self.reference_cached.setdefault(name, []).append(
                     cached_value if type(cached_value) is int else None
@@ -303,20 +325,28 @@ class Runner:
             divergence = {}
             for label, run in zip(labels, runs):
                 problems = [
-                    p for p in compare_tokens(canonical, run) if "prompt token IDs" not in p
+                    p
+                    for p in compare_tokens(canonical, run)
+                    if "prompt token IDs" not in p
                 ]
                 if problems:
                     first = next(
                         (
                             i
                             for i, (x, y) in enumerate(
-                                zip(canonical.completion_token_ids, run.completion_token_ids)
+                                zip(
+                                    canonical.completion_token_ids,
+                                    run.completion_token_ids,
+                                )
                             )
                             if x != y
                         ),
                         min(canonical.length, run.length),
                     )
-                    divergence[label] = {"first_divergent_token": first, "problems": problems}
+                    divergence[label] = {
+                        "first_divergent_token": first,
+                        "problems": problems,
+                    }
             if divergence:
                 unstable.append(name)
                 unstable_detail[name] = divergence
@@ -325,16 +355,21 @@ class Runner:
         # Filesystem paths the harness itself chose may contain "kvcr" (an HF
         # cache under /cache/doxu-kvcr/, the evidence tree); they say nothing
         # about the engine, so blank them before counting mentions.
-        own_names = [str(self.output), os.environ.get("HF_HOME", ""), socket.gethostname(),
-                     self.settings.etcd_endpoints or "", *(self.settings.remote_workers or {}).values()]
+        own_names = [
+            str(self.output),
+            os.environ.get("HF_HOME", ""),
+            socket.gethostname(),
+            self.settings.etcd_endpoints or "",
+            *(self.settings.remote_workers or {}).values(),
+        ]
         scrubbed = worker.log_text()
-        for name in sorted({n for n in own_names if n and "kvcr" in n.lower()}, key=len, reverse=True):
+        for name in sorted(
+            {n for n in own_names if n and "kvcr" in n.lower()}, key=len, reverse=True
+        ):
             scrubbed = scrubbed.replace(name, "<harness-name>")
         kvcr_mentions = len(re.findall(r"(?i)kvcr", scrubbed))
         kvcr_lines = [
-            line[:200]
-            for line in scrubbed.splitlines()
-            if re.search(r"(?i)kvcr", line)
+            line[:200] for line in scrubbed.splitlines() if re.search(r"(?i)kvcr", line)
         ][:10]
         self.result["reference"] = {
             "kvcr_disabled_in_launch": bypass,
@@ -531,8 +566,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gpus",
         default="0,1",
-        help="CUDA device indices: two for --topology agg (0,1), three for disagg (0,1,2; "
-        "two-node disagg: 0,0,1 = P0 on GPU0 of node a, P1 on GPU0 of node b, D0 on GPU1 of node a)",
+        help="CUDA device indices: two for --topology agg (0,1), three for disagg "
+        "(0,1,2; "
+        "two-node disagg: 0,0,1 = P0 on GPU0 of node a, P1 on GPU0 of node b, D0 "
+        "on GPU1 of node a)",
     )
     parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04,TC-05,TC-06")
     parser.add_argument("--http-port", type=int, default=8000)
@@ -542,15 +579,21 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--compatibility-digest", default=None)
     parser.add_argument(
-        "--gpu-memory-utilization", type=float, default=0.8,
-        help="vLLM --gpu-memory-utilization per worker (<= 0.45 when both share one GPU)",
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.8,
+        help="vLLM --gpu-memory-utilization per worker (<= 0.45 when both share "
+        "one GPU)",
     )
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
         "--perf-repeats", type=int, default=5, help="perf prompts per arm (TC-05/06)"
     )
     parser.add_argument(
-        "--perf-max-tokens", type=int, default=128, help="output tokens per perf request"
+        "--perf-max-tokens",
+        type=int,
+        default=128,
+        help="output tokens per perf request",
     )
     parser.add_argument(
         "--perf-concurrency", type=int, default=1, help="parallel perf requests per arm"
@@ -562,7 +605,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="TC-05: after the local-hit arm send this many never-seen prompts to "
         "worker 0 to evict its GPU prefix cache, then re-request the perf prompts "
         "so the hit must come from the KVCR DRAM pool (local_deliver); 0 = skip. "
-        "Size it above the GPU KV capacity (see --worker-arg=--num-gpu-blocks-override)",
+        "Size it above the GPU KV capacity (see "
+        "--worker-arg=--num-gpu-blocks-override)",
     )
     parser.add_argument(
         "--perf-concurrency-levels",
@@ -595,15 +639,18 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--tc02-extra-shared-sections",
         type=int,
         default=0,
-        help="TC-02: sections shared by full and partial prompts after P1 (never served "
-        "alone); with --tc02-seed-prefix the shared prefix then exceeds the last SSM checkpoint",
+        help="TC-02: sections shared by full and partial prompts after P1 (never "
+        "served "
+        "alone); with --tc02-seed-prefix the shared prefix then exceeds the last "
+        "SSM checkpoint",
     )
     parser.add_argument(
         "--tc02-evict-target",
         type=int,
         default=0,
         help="TC-02: after the partial delivery, send this many sub-block prompts to "
-        "worker 1 to evict its GPU prefix cache, then re-request the partial prompt and "
+        "worker 1 to evict its GPU prefix cache, then re-request the partial "
+        "prompt and "
         "record where the delivered prefix is served from (0 = skip)",
     )
     parser.add_argument(
@@ -611,7 +658,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="TC-02: serve the shared prefix P1 alone on worker 0 before the full "
         "prompt (hybrid models: vLLM mamba_cache_mode=align keeps SSM state only at "
-        "a request's last aligned boundary, so the P1/P2 junction needs its own request)",
+        "a request's last aligned boundary, so the P1/P2 junction needs its own "
+        "request)",
     )
     parser.add_argument(
         "--topology",
@@ -633,7 +681,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--cpu-bytes-to-use",
         type=int,
         default=2_000_000_000,
-        help="vLLM host primary tier bytes per worker (OffloadingConnector cpu_bytes_to_use)",
+        help="vLLM host primary tier bytes per worker (OffloadingConnector "
+        "cpu_bytes_to_use)",
     )
     parser.add_argument(
         "--max-model-len",
@@ -666,7 +715,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="INDEX=URL",
-        help="two-node topology: run worker INDEX (and expect its kvcr_service sidecar) on "
+        help="two-node topology: run worker INDEX (and expect its kvcr_service "
+        "sidecar) on "
         "the node whose phase1.node_agent listens at URL; repeatable; requires "
         "--external-services and --etcd",
     )
@@ -681,7 +731,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--worker-arg",
         action="append",
         default=[],
-        help="extra dynamo.vllm argument, repeatable (e.g. --worker-arg=--mamba-cache-mode=align)",
+        help="extra dynamo.vllm argument, repeatable (e.g. "
+        "--worker-arg=--mamba-cache-mode=align)",
     )
     parser.add_argument(
         "--prompt-tag", default=None, help="Fixed tag for reproducible prompts"
@@ -711,14 +762,20 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     wanted_gpus = 3 if args.topology == "disagg" else 2
     if len(gpus) != wanted_gpus or not all(part.isdecimal() for part in gpus):
         parser.error(
-            f"--gpus needs {wanted_gpus} CUDA device indices for --topology {args.topology}"
+            f"--gpus needs {wanted_gpus} CUDA device indices for --topology "
+            f"{args.topology}"
         )
     args.gpus = [int(part) for part in gpus]
     if args.topology == "disagg" and args.external_services is None:
-        parser.error("--topology disagg needs --external-services (kvcr_service sidecars)")
+        parser.error(
+            "--topology disagg needs --external-services (kvcr_service sidecars)"
+        )
     # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
-    if (args.gpus[0] == args.gpus[1] and not args.remote_worker
-            and args.gpu_memory_utilization > 0.45):
+    if (
+        args.gpus[0] == args.gpus[1]
+        and not args.remote_worker
+        and args.gpu_memory_utilization > 0.45
+    ):
         parser.error("two workers on one GPU need --gpu-memory-utilization <= 0.45")
     if not 0.05 <= args.gpu_memory_utilization <= 0.95:
         parser.error("--gpu-memory-utilization must be within 0.05..0.95")
@@ -744,7 +801,9 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--perf-repeats must be 1..32 and --perf-max-tokens 1..2048")
     try:
         args.perf_concurrency_levels = [
-            int(item) for item in args.perf_concurrency_levels.split(",") if item.strip()
+            int(item)
+            for item in args.perf_concurrency_levels.split(",")
+            if item.strip()
         ]
     except ValueError:
         parser.error("--perf-concurrency-levels expects integers like 4,8")
@@ -764,19 +823,29 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         if args.mode != GUARD:
             parser.error("--external-services requires --mode guard")
         if not args.compatibility_digest:
-            parser.error("--external-services needs --compatibility-digest matching the sidecars")
+            parser.error(
+                "--external-services needs --compatibility-digest matching the sidecars"
+            )
     remote: dict[int, str] = {}
     for item in args.remote_worker:
         index, sep, url = item.partition("=")
         if not sep or index not in ("0", "1") or not url.startswith("http"):
-            parser.error(f"--remote-worker expects 0=http://host:port or 1=http://host:port, got {item!r}")
+            parser.error(
+                f"--remote-worker expects 0=http://host:port or "
+                f"1=http://host:port, got {item!r}"
+            )
         remote[int(index)] = url
     args.remote_workers = remote
     if remote:
         if args.external_services is None:
-            parser.error("--remote-worker needs --external-services (the remote kvcr_service is a sidecar)")
+            parser.error(
+                "--remote-worker needs --external-services (the remote "
+                "kvcr_service is a sidecar)"
+            )
         if not args.etcd:
-            parser.error("--remote-worker needs --etcd (file discovery does not cross nodes)")
+            parser.error(
+                "--remote-worker needs --etcd (file discovery does not cross nodes)"
+            )
         if len(remote) == 2:
             parser.error("at least one worker must run on the harness node")
     return args

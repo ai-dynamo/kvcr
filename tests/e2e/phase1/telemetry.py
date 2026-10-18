@@ -122,7 +122,9 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
                 if isinstance(block, dict):
                     parsed += 1
                     for name, value in block.items():
-                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        if isinstance(value, (int, float)) and not isinstance(
+                            value, bool
+                        ):
                             values[str(name)] = value
             if not parsed:
                 errors.append(f"line {number}: unparsable per-connector metrics")

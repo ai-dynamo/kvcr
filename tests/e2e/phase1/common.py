@@ -113,7 +113,9 @@ def cached_tokens(body: dict[str, Any]) -> int | None:
     return value if type(value) is int else None
 
 
-def worker_identity(body: dict[str, Any], role: str = "decode") -> tuple[str | None, int | None]:
+def worker_identity(
+    body: dict[str, Any], role: str = "decode"
+) -> tuple[str | None, int | None]:
     identity = (body.get("nvext") or {}).get("worker_id") or {}
     worker = identity.get(f"{role}_worker_id")
     rank = identity.get("decode_dp_rank")
@@ -230,11 +232,7 @@ def summarize(values: list[float]) -> dict[str, Any]:
         return {"n": 0}
     ordered = sorted(clean)
     mid = len(ordered) // 2
-    median = (
-        ordered[mid]
-        if len(ordered) % 2
-        else (ordered[mid - 1] + ordered[mid]) / 2
-    )
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
     return {
         "n": len(ordered),
         "median": round(median, 6),

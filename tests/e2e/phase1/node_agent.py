@@ -9,13 +9,14 @@ Stdlib only; no authentication - it is meant for a private pod network.
 
 Endpoints (JSON bodies):
     GET  /info                      {"ip","hostname","kernel","pid"}
-    POST /spawn                     {"name","command":[...],"env":{...},"log":"/path"} -> {"pid"}
+    POST /spawn                     {"name","command","env","log"} -> {"pid"}
     GET  /status/<name>             {"alive","returncode","pid"}
     POST /signal/<name>             {"signal": 9} -> {"ok"}
     POST /wait/<name>               {"timeout": 30} -> {"exited","returncode"}
     GET  /socket?path=/run/x.sock   {"alive"}
-    GET  /log/<name>                text/plain (fallback when the log file is not shared)
+    GET  /log/<name>                text/plain (when the log file is not shared)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -83,18 +84,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         url = urlparse(self.path)
         if url.path == "/info":
-            self._json(200, {"ip": local_ip(), "hostname": socket.gethostname(),
-                             "kernel": platform.release(), "pid": os.getpid(),
-                             "children": sorted(_children)})
+            self._json(
+                200,
+                {
+                    "ip": local_ip(),
+                    "hostname": socket.gethostname(),
+                    "kernel": platform.release(),
+                    "pid": os.getpid(),
+                    "children": sorted(_children),
+                },
+            )
             return
         if url.path.startswith("/status/"):
-            entry = self._child(url.path[len("/status/"):])
+            entry = self._child(url.path[len("/status/") :])
             if entry is None:
                 self._json(404, {"error": "unknown child"})
                 return
             proc, _ = entry
             code = proc.poll()
-            self._json(200, {"alive": code is None, "returncode": code, "pid": proc.pid})
+            self._json(
+                200, {"alive": code is None, "returncode": code, "pid": proc.pid}
+            )
             return
         if url.path == "/socket":
             path = parse_qs(url.query).get("path", [""])[0]
@@ -110,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"alive": alive, "path": path})
             return
         if url.path.startswith("/log/"):
-            entry = self._child(url.path[len("/log/"):])
+            entry = self._child(url.path[len("/log/") :])
             if entry is None:
                 self._json(404, {"error": "unknown child"})
                 return
@@ -131,7 +141,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == "/spawn":
             name, command, log = body.get("name"), body.get("command"), body.get("log")
-            if not (isinstance(name, str) and isinstance(command, list) and isinstance(log, str)):
+            if not (
+                isinstance(name, str)
+                and isinstance(command, list)
+                and isinstance(log, str)
+            ):
                 self._json(400, {"error": "need name, command[], log"})
                 return
             env = os.environ.copy()
@@ -143,9 +157,14 @@ class Handler(BaseHTTPRequestHandler):
                 os.makedirs(os.path.dirname(log), exist_ok=True)
                 handle = open(log, "ab")
                 try:
-                    proc = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT,
-                                            env=env, start_new_session=True,
-                                            cwd=body.get("cwd") or "/tmp")
+                    proc = subprocess.Popen(
+                        command,
+                        stdout=handle,
+                        stderr=subprocess.STDOUT,
+                        env=env,
+                        start_new_session=True,
+                        cwd=body.get("cwd") or "/tmp",
+                    )
                 except OSError as error:
                     handle.close()
                     self._json(500, {"error": str(error)})
@@ -154,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"pid": proc.pid, "log": log})
             return
         if url.path.startswith("/signal/"):
-            entry = self._child(url.path[len("/signal/"):])
+            entry = self._child(url.path[len("/signal/") :])
             if entry is None:
                 self._json(404, {"error": "unknown child"})
                 return
@@ -166,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": False})
             return
         if url.path.startswith("/wait/"):
-            entry = self._child(url.path[len("/wait/"):])
+            entry = self._child(url.path[len("/wait/") :])
             if entry is None:
                 self._json(404, {"error": "unknown child"})
                 return
@@ -185,8 +204,11 @@ def main() -> None:
     parser.add_argument("--bind", default="0.0.0.0")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"node agent on {args.bind}:{args.port} ip={local_ip()} kernel={platform.release()}",
-          flush=True)
+    print(
+        f"node agent on {args.bind}:{args.port} ip={local_ip()} "
+        f"kernel={platform.release()}",
+        flush=True,
+    )
     try:
         server.serve_forever()
     finally:

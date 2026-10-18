@@ -39,7 +39,6 @@ from .telemetry import (
     TIER_READ_BYTES,
     TIER_WRITE_BYTES,
     latest_gauge,
-    read_window,
 )
 
 STREAM_FIELDS = [
@@ -186,7 +185,8 @@ def validate_stream(
     result.check(
         f"{stage}: streamed tokens equal reference ({reference_key})",
         not problems,
-        "; ".join(problems) or f"{observed.length} tokens, finish={observed.finish_reason}",
+        "; ".join(problems)
+        or f"{observed.length} tokens, finish={observed.finish_reason}",
     )
     if expect_hit is None:
         return not problems
@@ -281,17 +281,23 @@ def tc05(ctx: Context) -> CaseResult:
     # pages, so the target must be given time to report as many pages as the
     # source wrote, not only as many as the hit blocks.
     source = ctx.wait_window(
-        0, remote_start, lambda w: w.blocks(SOURCE_WRITE) >= hit_blocks and hit_blocks > 0
+        0,
+        remote_start,
+        lambda w: w.blocks(SOURCE_WRITE) >= hit_blocks and hit_blocks > 0,
     )
     written = max(hit_blocks, source.blocks(SOURCE_WRITE))
     target = ctx.wait_window(
-        1, remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= written and hit_blocks > 0
+        1,
+        remote_start,
+        lambda w: w.blocks(REMOTE_DELIVER) >= written and hit_blocks > 0,
     )
     result.check(
-        "tc05 remote: KVCR transfer delivered the cached blocks (remote_deliver covers hits)",
+        "tc05 remote: KVCR transfer delivered the cached blocks (remote_deliver "
+        "covers hits)",
         ctx.delivery_covers(target.blocks(REMOTE_DELIVER), hit_blocks)
         and source.blocks(SOURCE_WRITE) == target.blocks(REMOTE_DELIVER),
-        f"remote_deliver={target.blocks(REMOTE_DELIVER)}, source_write={source.blocks(SOURCE_WRITE)}, "
+        f"remote_deliver={target.blocks(REMOTE_DELIVER)}, "
+        f"source_write={source.blocks(SOURCE_WRITE)}, "
         f"cached blocks={hit_blocks}, block tokens={ctx.hit_block_tokens}",
     )
     result.check(
@@ -321,7 +327,12 @@ def tc05(ctx: Context) -> CaseResult:
         ]
         evict_start = utc_now()
         filler_responses = run_arm(
-            ctx, "tc05-evict", fillers, 0, concurrency=max(4, ctx.perf_concurrency), max_tokens=1
+            ctx,
+            "tc05-evict",
+            fillers,
+            0,
+            concurrency=max(4, ctx.perf_concurrency),
+            max_tokens=1,
         )
         result.check(
             "tc05 dram: every eviction filler request succeeded",
@@ -340,13 +351,17 @@ def tc05(ctx: Context) -> CaseResult:
             if validate_stream(ctx, result, response, name, 0, expect_hit=True):
                 dram_hits += (response.cached_tokens or 0) // ctx.hit_block_tokens
         dram_window = ctx.wait_window(
-            0, dram_start, lambda w: w.blocks(LOCAL_DELIVER) >= dram_hits and dram_hits > 0
+            0,
+            dram_start,
+            lambda w: w.blocks(LOCAL_DELIVER) >= dram_hits and dram_hits > 0,
         )
         result.check(
-            "tc05 dram: GPU cache evicted, hits delivered from the KVCR pool (local_deliver > 0)",
+            "tc05 dram: GPU cache evicted, hits delivered from the KVCR pool "
+            "(local_deliver > 0)",
             dram_window.blocks(LOCAL_DELIVER) > 0 and dram_hits > 0,
             f"local_deliver blocks={dram_window.blocks(LOCAL_DELIVER)}, "
-            f"cached blocks={dram_hits}, tier read bytes={dram_window.get(TIER_READ_BYTES)}",
+            f"cached blocks={dram_hits}, tier read "
+            f"bytes={dram_window.get(TIER_READ_BYTES)}",
         )
         result.measurements["arm_kvcr_dram_hit"] = arm_summary(dram)
         result.measurements["arm_kvcr_dram_hit_window"] = dram_window.totals
@@ -372,10 +387,16 @@ def tc05(ctx: Context) -> CaseResult:
         ctx.wait_window(0, s_cold_start, lambda w: w.blocks(LOCAL_FILL) > 0)
         time.sleep(ctx.index_wait)
         s_remote_start = utc_now()
-        s_remote = run_arm(ctx, f"tc05-sweep{level}-remote", items, 1, concurrency=level)
-        s_hits = sum((r.cached_tokens or 0) // ctx.hit_block_tokens for r in s_remote if r.ok)
+        s_remote = run_arm(
+            ctx, f"tc05-sweep{level}-remote", items, 1, concurrency=level
+        )
+        s_hits = sum(
+            (r.cached_tokens or 0) // ctx.hit_block_tokens for r in s_remote if r.ok
+        )
         s_target = ctx.wait_window(
-            1, s_remote_start, lambda w: w.blocks(REMOTE_DELIVER) >= s_hits and s_hits > 0
+            1,
+            s_remote_start,
+            lambda w: w.blocks(REMOTE_DELIVER) >= s_hits and s_hits > 0,
         )
         s_source = ctx.wait_window(
             0, s_remote_start, lambda w: w.blocks(SOURCE_WRITE) >= s_hits and s_hits > 0

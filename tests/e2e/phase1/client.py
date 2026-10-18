@@ -342,12 +342,20 @@ class Client:
                             result.chunk_token_counts.append(len(ids))
                             result.completion_token_ids.extend(int(i) for i in ids)
                         prompt_ids = nvext.get("prompt_token_ids")
-                        if isinstance(prompt_ids, list) and prompt_ids and not result.prompt_token_ids:
+                        if (
+                            isinstance(prompt_ids, list)
+                            and prompt_ids
+                            and not result.prompt_token_ids
+                        ):
                             result.prompt_token_ids = [int(i) for i in prompt_ids]
                         identity = nvext.get("worker_id") or {}
-                        if isinstance(identity, dict) and identity.get("decode_worker_id"):
+                        if isinstance(identity, dict) and identity.get(
+                            "decode_worker_id"
+                        ):
                             result.worker = str(identity["decode_worker_id"])
-                        if isinstance(identity, dict) and identity.get("prefill_worker_id"):
+                        if isinstance(identity, dict) and identity.get(
+                            "prefill_worker_id"
+                        ):
                             result.prefill_worker = str(identity["prefill_worker_id"])
                         if isinstance(nvext.get("timing"), dict):
                             result.timing = nvext["timing"]

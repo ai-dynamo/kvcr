@@ -29,7 +29,6 @@ from .common import (
     extract_sample,
     save_json,
     utc_now,
-    worker_identity,
 )
 from .stack import GUARD, GUARD_PROMOTED, RECOVERY_DISABLED, Stack
 from .telemetry import (
@@ -104,13 +103,17 @@ class Prompts:
     @property
     def tc02_full(self) -> str:
         start = self.tc02_shared + self.tc02_extra_shared
-        rest = self.prefix(self.tag + "c", start, start + self.tc02_sections - self.tc02_shared)
+        rest = self.prefix(
+            self.tag + "c", start, start + self.tc02_sections - self.tc02_shared
+        )
         return self.tc02_p1 + self.tc02_q + " " + rest + self.tail
 
     @property
     def tc02_partial(self) -> str:
         start = self.tc02_shared + self.tc02_extra_shared
-        rest = self.prefix(self.tag + "d", start, start + self.tc02_sections - self.tc02_shared)
+        rest = self.prefix(
+            self.tag + "d", start, start + self.tc02_sections - self.tc02_shared
+        )
         return self.tc02_p1 + self.tc02_q + " " + rest + self.tail
 
     @property
@@ -592,7 +595,8 @@ def tc02(ctx: Context) -> CaseResult:
                 True,
                 f"cached_tokens={ctx.cached(partial)}, remote_deliver pages="
                 f"{window.blocks(REMOTE_DELIVER)}, source_write pages="
-                f"{source.blocks(SOURCE_WRITE)}, target failures={window.peer_failures}",
+                f"{source.blocks(SOURCE_WRITE)}, target "
+                f"failures={window.peer_failures}",
             )
             result.measurements["tc02 partial (engine limit)"] = {
                 "target_window": window.totals,
@@ -649,12 +653,16 @@ def tc02(ctx: Context) -> CaseResult:
     # cached_tokens=0 = gone.
     if ctx.tc02_evict_target > 0 and ctx.require_ok(result, partial, 1):
         evict_start = utc_now()
-        fillers = [(f"short_{i}", p.short_filler(i)) for i in range(ctx.tc02_evict_target)]
+        fillers = [
+            (f"short_{i}", p.short_filler(i)) for i in range(ctx.tc02_evict_target)
+        ]
         pin = ctx.stack.pin(1)
 
         def one(item: tuple[str, str]) -> Response:
             name, prompt = item
-            return ctx.client.completion(f"tc02-evict-{name}", prompt, max_tokens=1, **pin)
+            return ctx.client.completion(
+                f"tc02-evict-{name}", prompt, max_tokens=1, **pin
+            )
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             evict_responses = list(pool.map(one, fillers))
@@ -672,16 +680,20 @@ def tc02(ctx: Context) -> CaseResult:
             window2 = ctx.settle(1, again2.started_at)
             cached2 = ctx.cached(again2)
             served_from = (
-                "gone (cold)" if cached2 == 0
-                else "worker 0 via KVCR again" if window2.blocks(REMOTE_DELIVER) > 0
+                "gone (cold)"
+                if cached2 == 0
+                else "worker 0 via KVCR again"
+                if window2.blocks(REMOTE_DELIVER) > 0
                 else "worker 1 local (host tier or GPU)"
             )
             result.check(
                 "tc02 after-evict: delivered prefix location recorded (informational)",
                 True,
-                f"cached_tokens={cached2}, remote_deliver={window2.blocks(REMOTE_DELIVER)}, "
+                f"cached_tokens={cached2}, "
+                f"remote_deliver={window2.blocks(REMOTE_DELIVER)}, "
                 f"local_deliver={window2.blocks(LOCAL_DELIVER)}, "
-                f"host load bytes={window2.get('vllm:kv_offload_load_bytes')}, -> {served_from}",
+                f"host load bytes={window2.get('vllm:kv_offload_load_bytes')}, -> "
+                f"{served_from}",
             )
             result.measurements["tc02_after_evict"] = {
                 "cached_tokens": cached2,

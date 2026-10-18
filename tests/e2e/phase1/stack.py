@@ -126,7 +126,8 @@ class Settings:
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
-    # Extra environment for the Dynamo frontend only (e.g. DYN_LOG for router debugging).
+    # Extra environment for the Dynamo frontend only (e.g. DYN_LOG for router
+    # debugging).
     frontend_env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -208,7 +209,9 @@ class _RemoteProcess:
         return None if status.get("alive") else self.returncode
 
     def wait(self, timeout: float = 30) -> int | None:
-        outcome = self._owner.agent("POST", f"/wait/{self._owner.name}", {"timeout": timeout})
+        outcome = self._owner.agent(
+            "POST", f"/wait/{self._owner.name}", {"timeout": timeout}
+        )
         if not outcome.get("exited"):
             raise subprocess.TimeoutExpired(self._owner.command, timeout)
         self.returncode = outcome.get("returncode")
@@ -222,30 +225,49 @@ class RemoteManaged:
     the checks read it like a local file.
     """
 
-    def __init__(self, name: str, command: list[str], env: dict[str, str],
-                 log: Path, agent_url: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str],
+        log: Path,
+        agent_url: str,
+    ) -> None:
         self.name = name
         self.command = command
         self.log_path = log
         self.agent_url = agent_url.rstrip("/")
         self.started_at = utc_now()
         self.stopped = False
-        reply = self.agent("POST", "/spawn", {"name": name, "command": command,
-                                              "env": env, "log": str(log)})
+        reply = self.agent(
+            "POST",
+            "/spawn",
+            {"name": name, "command": command, "env": env, "log": str(log)},
+        )
         self.pid = int(reply["pid"])
         self.process = _RemoteProcess(self)
 
-    def agent(self, method: str, route: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def agent(
+        self, method: str, route: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         return node_agent_call(self.agent_url, method, route, body)
 
     def alive(self) -> bool:
         return self.process.poll() is None
 
     def signal_group(self, number: int) -> bool:
-        return bool(self.agent("POST", f"/signal/{self.name}", {"signal": int(number)}).get("ok"))
+        return bool(
+            self.agent("POST", f"/signal/{self.name}", {"signal": int(number)}).get(
+                "ok"
+            )
+        )
 
     def stop(self, grace: float = 20) -> dict[str, Any]:
-        outcome: dict[str, Any] = {"name": self.name, "pid": self.pid, "remote": self.agent_url}
+        outcome: dict[str, Any] = {
+            "name": self.name,
+            "pid": self.pid,
+            "remote": self.agent_url,
+        }
         self.stopped = True
         self.signal_group(signal.SIGTERM)
         try:
@@ -270,19 +292,32 @@ class RemoteManaged:
             return ""
 
 
-def node_agent_call(base: str, method: str, route: str,
-                    body: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+def node_agent_call(
+    base: str,
+    method: str,
+    route: str,
+    body: dict[str, Any] | None = None,
+    timeout: float = 60,
+) -> dict[str, Any]:
     data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(base.rstrip("/") + route, data=data, method=method,
-                                     headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(
+        base.rstrip("/") + route,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read() or b"{}")
     except urllib.error.HTTPError as error:
         detail = error.read().decode(errors="replace")
-        raise ValidationError(f"node agent {base}{route} -> {error.code}: {detail}") from error
+        raise ValidationError(
+            f"node agent {base}{route} -> {error.code}: {detail}"
+        ) from error
     except urllib.error.URLError as error:
-        raise ValidationError(f"node agent {base}{route} unreachable: {error.reason}") from error
+        raise ValidationError(
+            f"node agent {base}{route} unreachable: {error.reason}"
+        ) from error
 
 
 def node_agent_text(base: str, route: str, timeout: float = 60) -> str:
@@ -298,8 +333,9 @@ class ExternalService:
     belongs to the orchestrator, which is exactly what TC-04 relies on.
     """
 
-    def __init__(self, name: str, socket_path: Path, log_path: Path,
-                 agent_url: str | None = None) -> None:
+    def __init__(
+        self, name: str, socket_path: Path, log_path: Path, agent_url: str | None = None
+    ) -> None:
         self.name = name
         self.socket_path = socket_path
         self.log_path = log_path
@@ -310,8 +346,11 @@ class ExternalService:
     def alive(self) -> bool:
         if self.agent_url is not None:
             try:
-                return bool(node_agent_call(self.agent_url, "GET",
-                                            f"/socket?path={self.socket_path}").get("alive"))
+                return bool(
+                    node_agent_call(
+                        self.agent_url, "GET", f"/socket?path={self.socket_path}"
+                    ).get("alive")
+                )
             except ValidationError:
                 return False
         try:
@@ -397,7 +436,9 @@ class Stack:
                         break
                     except ValidationError as error:
                         if time.monotonic() > deadline:
-                            raise BlockedError(f"node agent for worker {index} never answered: {error}") from error
+                            raise BlockedError(
+                                f"node agent for worker {index} never answered: {error}"
+                            ) from error
                         time.sleep(5)
                 self._remote_info[index] = info
                 data.setdefault("remote_nodes", {})[str(index)] = info
@@ -411,7 +452,10 @@ class Stack:
             if data["libatomic"] is None:
                 raise BlockedError("Guard mode needs the system libatomic runtime")
             needed = 2 * (self.settings.pool_gb * 1024**3 + 128 * 1024**2)
-            if self.settings.external_services is None and data["shm_available_bytes"] < needed:
+            if (
+                self.settings.external_services is None
+                and data["shm_available_bytes"] < needed
+            ):
                 raise BlockedError(
                     f"/dev/shm has {data['shm_available_bytes']} bytes free; two Guard "
                     f"pools need at least {needed}"
@@ -582,7 +626,11 @@ class Stack:
         # attach the KV state agent; nested inside MultiConnector they are
         # invisible, so no hints reach a prefill worker. Mirror them at the top
         # level (vLLM's MultiConnector ignores keys other than "connectors").
-        for key in ("secondary_tiers", "dynamo_state_agent", "self_describing_kv_events"):
+        for key in (
+            "secondary_tiers",
+            "dynamo_state_agent",
+            "self_describing_kv_events",
+        ):
             if key in kvcr_cfg["kv_connector_extra_config"]:
                 extra[key] = kvcr_cfg["kv_connector_extra_config"][key]
         return {
@@ -658,8 +706,12 @@ class Stack:
                 self.services[index] = service  # type: ignore[assignment]
                 save_json(
                     self.evidence / f"{service.name}.launch.json",
-                    {"external": True, "socket": str(service.socket_path),
-                     "log": str(service.log_path), "attached_at": utc_now()},
+                    {
+                        "external": True,
+                        "socket": str(service.socket_path),
+                        "log": str(service.log_path),
+                        "attached_at": utc_now(),
+                    },
                 )
                 return service
             time.sleep(1)
@@ -669,8 +721,13 @@ class Stack:
 
     # -- launching ---------------------------------------------------------
 
-    def _spawn(self, name: str, command: list[str], env: dict[str, str],
-               agent_url: str | None = None) -> Managed:
+    def _spawn(
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str],
+        agent_url: str | None = None,
+    ) -> Managed:
         log = self.evidence / f"{name}.log"
         if agent_url is not None:
             # Only pass what differs from the agent's own environment: the
@@ -797,7 +854,9 @@ class Stack:
             host = self.worker_host(index)
             env["DYN_EVENT_PLANE_HOST"] = host
             env["DYN_TCP_RPC_HOST"] = host
-            worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env, agent_url=agent)
+            worker = self._spawn(
+                name, self.worker_command(index, kvcr=kvcr), env, agent_url=agent
+            )
         else:
             worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env)
         self.workers[index] = worker
@@ -840,7 +899,10 @@ class Stack:
                     m.get("id") == self.settings.model for m in data.get("data", [])
                 ):
                     return data
-                last = f"model not listed yet: {[m.get('id') for m in data.get('data', [])]}"
+                last = (
+                    f"model not listed yet: "
+                    f"{[m.get('id') for m in data.get('data', [])]}"
+                )
             time.sleep(2)
         raise ValidationError(f"model readiness timed out: {last}")
 
