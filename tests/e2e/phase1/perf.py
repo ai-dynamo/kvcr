@@ -274,9 +274,11 @@ def tc05(ctx: Context) -> CaseResult:
     remote_start = utc_now()
     remote = run_arm(ctx, "tc05-remote", prompts, 1)
     hit_blocks = 0
+    hits = 0
     for response, name in zip(remote, names):
         if validate_stream(ctx, result, response, name, 1, expect_hit=True):
             hit_blocks += (response.cached_tokens or 0) // ctx.hit_block_tokens
+            hits += 1
     # Source first: with hybrid models one hit block maps to several KVCR
     # pages, so the target must be given time to report as many pages as the
     # source wrote, not only as many as the hit blocks.
@@ -294,11 +296,16 @@ def tc05(ctx: Context) -> CaseResult:
     result.check(
         "tc05 remote: KVCR transfer delivered the cached blocks (remote_deliver "
         "covers hits)",
-        ctx.delivery_covers(target.blocks(REMOTE_DELIVER), hit_blocks)
+        ctx.delivery_covers(target.blocks(REMOTE_DELIVER), hit_blocks, hits=hits)
         and source.blocks(SOURCE_WRITE) == target.blocks(REMOTE_DELIVER),
         f"remote_deliver={target.blocks(REMOTE_DELIVER)}, "
         f"source_write={source.blocks(SOURCE_WRITE)}, "
-        f"cached blocks={hit_blocks}, block tokens={ctx.hit_block_tokens}",
+        f"cached blocks={hit_blocks}, "
+        f"expected pages={ctx.expected_pages(hit_blocks, hits=hits)}, "
+        f"block tokens={ctx.hit_block_tokens}",
+    )
+    ctx.bytes_match_pages(
+        result, "tc05 remote", source.bytes(SOURCE_WRITE), source.blocks(SOURCE_WRITE)
     )
     result.check(
         "tc05 remote: no positive KVCR failed/partial metrics",
@@ -533,7 +540,15 @@ def tc06(ctx: Context) -> CaseResult:
             }
         )
         result.evidence += [response.request_file, response.response_file]
-        if response.ok and not problems and (response.cached_tokens or 0) > 0:
+        if response.ok and problems:
+            # Wrong tokens are never a recovery in progress: fail at once.
+            result.check(
+                f"{response.stage}: tokens equal reference ({name0})",
+                False,
+                "; ".join(problems),
+            )
+            break
+        if response.ok and (response.cached_tokens or 0) > 0:
             first_correct = response
             t1 = sent_at + (response.first_token_seconds or 0) - t0
         else:
@@ -544,6 +559,34 @@ def tc06(ctx: Context) -> CaseResult:
         first_correct is not None,
         f"{len(attempts)} attempts; t1={t1}",
     )
+    if first_correct is not None:
+        # The hit must come from the Guard, not from a local commit of an
+        # earlier attempt: worker 1 has to report remote_deliver pages for it.
+        blocks = (first_correct.cached_tokens or 0) // ctx.hit_block_tokens
+        window = ctx.wait_window(
+            1,
+            first_correct.started_at,
+            lambda w, b=blocks: w.blocks(REMOTE_DELIVER) >= b and b > 0,
+        )
+        result.check(
+            "tc06: first correct hit was delivered from the Guard (remote_deliver "
+            "on worker 1 covers it)",
+            ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
+            and window.successes(REMOTE_DELIVER) >= 1
+            and not window.peer_failures,
+            f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
+            f"hit blocks={blocks}, "
+            f"expected pages={ctx.expected_pages(blocks)}, "
+            f"tier read bytes={window.get(TIER_READ_BYTES)}, "
+            f"failures={window.peer_failures}",
+        )
+        ctx.bytes_match_pages(
+            result,
+            "tc06 guard-served",
+            window.get(TIER_READ_BYTES),
+            window.blocks(REMOTE_DELIVER),
+        )
+        result.measurements["guard_served_first_window"] = window.totals
     guard_served = [first_correct] if first_correct else []
     if first_correct is not None:
         # Remaining prefixes from the Guard as well, for a latency sample.

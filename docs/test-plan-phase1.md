@@ -111,8 +111,15 @@ compatibility path (TC-04 BLOCKED). `--harness-arg` forwards any
 `--harness-arg=--model=Qwen/Qwen3.5-0.8B`,
 `--harness-arg=--worker-arg=--mamba-cache-mode=align`,
 `--harness-arg=--keep-hybrid-kv-cache-manager`, `--harness-arg=--no-enforce-eager`.
+Hybrid geometry: `--hit-block-tokens 576 --ssm-groups 3` (Qwen3.5-4B) makes
+every transfer check exact, pages == hit blocks + 3 per hit; `--page-bytes N`
+adds bytes == pages * N. Verdict rules that are always on: TC-04's replacement
+must serve the preserved prefix as a block-aligned hit; TC-06's first correct
+Guard response must be covered by `remote_deliver` pages on the target (a local
+re-commit does not count) and any token mismatch fails the case.
 The [GPU workflow](../.github/workflows/vllm-e2e.yml) runs Phase 1 as
-`two-gpu-phase1` after the peer-reuse smoke test.
+`two-gpu-phase1` after the peer-reuse smoke test, with
+`--cases TC-01,TC-02,TC-03,TC-04` (functional gate; TC-05/06 are run separately).
 
 On dlcluster, [`scripts/dlcluster/submit.sh`](../scripts/dlcluster/submit.sh)
 bundles the committed HEAD, ships it and

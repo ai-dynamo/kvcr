@@ -168,6 +168,7 @@ jobs:
         run: >-
           python3 tests/e2e/run_phase1.py
           --output-dir artifacts/phase1/run --mode guard --timeout 2400
+          --cases TC-01,TC-02,TC-03,TC-04
       - name: Retain Phase 1 evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

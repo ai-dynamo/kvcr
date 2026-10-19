@@ -175,6 +175,8 @@ class Runner:
                 "evict_filler": args.perf_evict_filler,
                 "concurrency_levels": args.perf_concurrency_levels,
                 "hit_block_tokens": args.hit_block_tokens,
+                "ssm_groups": args.ssm_groups,
+                "page_bytes": args.page_bytes,
                 "tc02_sections": [args.tc02_shared_sections, args.tc02_sections],
                 "tc02_seed_prefix": args.tc02_seed_prefix,
             },
@@ -467,6 +469,8 @@ class Runner:
             engine_cached=self.reference_cached,
             tc02_seed_prefix=self.args.tc02_seed_prefix,
             tc02_evict_target=self.args.tc02_evict_target,
+            ssm_groups=self.args.ssm_groups,
+            page_bytes=self.args.page_bytes,
         )
         for name in self.args.cases:
             self.check_deadline()
@@ -622,6 +626,21 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="tokens per prefix-cache hit block: 64 for dense models, 576 for Qwen3.5 "
         "hybrid models (vLLM raises the attention block); hit alignment and the "
         "delivered-pages checks use it",
+    )
+    parser.add_argument(
+        "--ssm-groups",
+        type=int,
+        default=0,
+        help="hybrid models: SSM/linear-attention KV cache groups (Qwen3.5-4B: 3); "
+        "with it every transfer must deliver exactly hit blocks + groups pages "
+        "per hit, instead of only >= hit blocks",
+    )
+    parser.add_argument(
+        "--page-bytes",
+        type=int,
+        default=0,
+        help="KVCR page size in bytes when known; transfer bytes must equal "
+        "pages * page bytes (0 = skip)",
     )
     parser.add_argument(
         "--tc02-shared-sections",
@@ -811,6 +830,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--perf-concurrency-levels entries must be 2..64")
     if args.hit_block_tokens < 1 or args.hit_block_tokens % 64:
         parser.error("--hit-block-tokens must be a positive multiple of 64")
+    if args.ssm_groups < 0 or args.page_bytes < 0:
+        parser.error("--ssm-groups and --page-bytes must be >= 0")
+    if args.ssm_groups and args.hit_block_tokens == 64:
+        parser.error("--ssm-groups needs the hybrid --hit-block-tokens")
     if not 2 <= args.tc02_shared_sections < args.tc02_sections <= 1000:
         parser.error("--tc02-shared-sections must be < --tc02-sections (<= 1000)")
     if not 0 <= args.perf_evict_filler <= 512:

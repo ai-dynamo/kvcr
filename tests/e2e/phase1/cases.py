@@ -219,6 +219,8 @@ class Context:
         engine_cached: dict[str, list[int | None]] | None = None,
         tc02_seed_prefix: bool = False,
         tc02_evict_target: int = 0,
+        ssm_groups: int = 0,
+        page_bytes: int = 0,
     ) -> None:
         self.stack = stack
         self.client = client
@@ -236,6 +238,11 @@ class Context:
         # cached_tokens is a multiple of that, and every KVCR transfer carries
         # extra SSM state pages, so delivered pages exceed hit blocks.
         self.hit_block_tokens = hit_block_tokens
+        # Hybrid geometry: KVCR pages per hit = attention blocks + one state page
+        # per SSM group (0 = dense, or unknown: only pages >= blocks is checked).
+        self.ssm_groups = ssm_groups
+        # Bytes per KVCR page when known: transfer bytes must equal pages * size.
+        self.page_bytes = page_bytes
         # Reference-phase cached_tokens per prompt (KVCR disabled), request order.
         self.engine_cached = engine_cached or {}
         self.tc02_seed_prefix = tc02_seed_prefix
@@ -329,18 +336,40 @@ class Context:
         )
         return cached // block
 
-    def delivery_covers(self, delivered: int | float, hit_blocks: int) -> bool:
+    def delivery_covers(
+        self, delivered: int | float, hit_blocks: int, *, hits: int = 1
+    ) -> bool:
         """Delivered KVCR pages account for the reported hit.
 
-        Dense: one page per 64-token block, so pages == hit blocks. Hybrid: the
-        attention pages plus one state page per SSM group, so pages >= blocks;
-        the exact count is checked against the source's source_write instead.
+        Dense: one page per 64-token block, so pages == hit blocks. Hybrid:
+        attention pages plus one state page per SSM group and hit, so pages ==
+        blocks + ssm_groups * hits when the geometry is given (--ssm-groups),
+        else only pages >= blocks.
         """
         if hit_blocks <= 0:
             return False
         if self.hit_block_tokens == BLOCK_SIZE:
             return delivered == hit_blocks
+        if self.ssm_groups > 0:
+            return delivered == hit_blocks + self.ssm_groups * hits
         return delivered >= hit_blocks
+
+    def expected_pages(self, hit_blocks: int, *, hits: int = 1) -> str:
+        if self.hit_block_tokens == BLOCK_SIZE or self.ssm_groups <= 0:
+            return str(hit_blocks)
+        return f"{hit_blocks}+{self.ssm_groups}*{hits}"
+
+    def bytes_match_pages(
+        self, result: CaseResult, label: str, nbytes: int | float, pages: int | float
+    ) -> None:
+        """When the page size is known, transfer bytes must be pages * page size."""
+        if self.page_bytes <= 0:
+            return
+        result.check(
+            f"{label}: transfer bytes == pages * page bytes",
+            pages > 0 and nbytes == pages * self.page_bytes,
+            f"bytes={nbytes}, pages={pages}, page bytes={self.page_bytes}",
+        )
 
     # -- telemetry helpers -------------------------------------------------
 
@@ -414,6 +443,7 @@ class Context:
             f"{label}: target remote_deliver pages cover the cached blocks",
             self.delivery_covers(delivered, hit_blocks),
             f"remote_deliver={delivered}, cached blocks={hit_blocks}, "
+            f"expected pages={self.expected_pages(hit_blocks)}, "
             f"block tokens={self.hit_block_tokens}",
         )
         result.check(
@@ -442,6 +472,7 @@ class Context:
             source_bytes == target_bytes and source_bytes > 0,
             f"source_write bytes={source_bytes}, kvcr tier read bytes={target_bytes}",
         )
+        self.bytes_match_pages(result, label, source_bytes, written)
         failures = source_window.peer_failures + target_window.peer_failures
         if allow_partial:
             expected = (
@@ -900,8 +931,11 @@ def tc04(ctx: Context) -> CaseResult:
             ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
             and window.successes(REMOTE_DELIVER) >= 1,
             f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
-            f"hit blocks={blocks}, "
+            f"hit blocks={blocks}, expected pages={ctx.expected_pages(blocks)}, "
             f"tier read bytes={window.get(TIER_READ_BYTES)}",
+        )
+        ctx.bytes_match_pages(
+            result, stage, window.get(TIER_READ_BYTES), window.blocks(REMOTE_DELIVER)
         )
         result.check(
             f"{stage}: no positive KVCR failed/partial metrics while Guard served",
@@ -943,9 +977,19 @@ def tc04(ctx: Context) -> CaseResult:
     result.evidence += [again.request_file, again.response_file]
     if ctx.require_ok(result, again, 0):
         ctx.compare(result, again, "tc04")
+        # The preserved prefix must be served from the reclaimed pool, not
+        # recomputed: a positive, block-aligned hit with no KVCR failures.
+        ctx.check_hit(result, again)
+        window = ctx.settle(0, again.started_at)
+        result.check(
+            "tc04-preserved-w0-replacement: no positive KVCR failed/partial metrics",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
         result.measurements["replacement_preserved_prefix_cached_tokens"] = ctx.cached(
             again
         )
+        result.measurements["replacement_preserved_prefix_window"] = window.totals
     result.finish()
     return result
 
