@@ -3,9 +3,10 @@
 """Construction and integration configuration for KVCR."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+import msgspec
 
 from .types import (
     BlockKey,
@@ -36,37 +37,35 @@ def _validate_pool_layouts(pool_layouts: PoolBlockLayouts) -> None:
         raise ValueError("pool_layouts cannot use an empty name with multiple pools")
 
 
-@dataclass(frozen=True)
-class LocalDramOptions:
+class LocalDramOptions(msgspec.Struct, frozen=True):
     pools: LocalDramRegions
     backend: str = "UCX"
 
 
 # Early pinning optimization was considered, but its complexity outweighed the benefit.
-@dataclass(frozen=True)
-class RemoteFWDramOptions:
+class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class G3Options:
+class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     """Bounded file-backed cache storage owned by this KVCR process."""
 
     paths: tuple[Path, ...]
     capacity_bytes_per_file: int
     backend: str = "GDS_MT"
-    backend_options: Mapping[str, str] = field(default_factory=dict)
+    backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class KVCRBackendConfigs:
-    framework_regions: list[RegionDescriptor] = field(default_factory=list)
+class KVCRBackendConfigs(msgspec.Struct, frozen=True):
+    framework_regions: list[RegionDescriptor] = msgspec.field(default_factory=list)
     local_dram: LocalDramOptions | None = None
     g3: G3Options | None = None
-    remote_fw_dram: RemoteFWDramOptions = field(default_factory=RemoteFWDramOptions)
+    remote_fw_dram: RemoteFWDramOptions = msgspec.field(
+        default_factory=RemoteFWDramOptions
+    )
 
 
 class TelemetryStats(Protocol):
@@ -115,8 +114,7 @@ class KeyAdapter(Protocol):
     def decode(self, key: BlockKey) -> int | bytes: ...
 
 
-@dataclass(frozen=True)
-class KVCRConfig:
+class KVCRConfig(msgspec.Struct, frozen=True):
     nixl_agent_name: str
     pool_layouts: PoolBlockLayouts
     enable_telemetry: bool = False
@@ -127,8 +125,7 @@ class KVCRConfig:
     startup_timeout_seconds: int | None = None
 
 
-@dataclass(frozen=True)
-class KVCRGuardConfig:
+class KVCRGuardConfig(msgspec.Struct, frozen=True):
     kvcr_service_socket_path: str
     guard_index: int
     compatibility_digest: str

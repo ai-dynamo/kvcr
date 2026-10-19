@@ -5,8 +5,9 @@
 import contextlib
 import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import msgspec
 
 from . import recovery_journal as _recovery
 from .config import (
@@ -53,8 +54,7 @@ logger = logging.getLogger(__name__)
 _NONQUIESCENT_STARTUP_RESOURCES: list[tuple[_KVCRCore, KVCRPoolHold | None]] = []
 
 
-@dataclass(frozen=True)
-class KVCRBindings:
+class KVCRBindings(msgspec.Struct, frozen=True):
     """Framework services and integration callbacks used by KVCR."""
 
     # Framework-owned source pinning.
@@ -133,10 +133,10 @@ class KVCR:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object],
+        hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        """Submit a hint conforming to the hint protocol."""
+        """Submit a mapping or msgspec envelope conforming to the hint protocol."""
         self._core.submit_hint(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:

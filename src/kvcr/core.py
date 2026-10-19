@@ -15,6 +15,8 @@ from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
 
+import msgspec
+
 from . import _nvtx
 from .config import (
     KVCRBackendConfigs,
@@ -28,6 +30,7 @@ from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
 from .policy import G3LRUPolicy, LRUPolicy
 from .policy_runtime import _PolicyInvoker
 from .progress import (
+    _FAILED_RESULT,
     _KVCRProgress,
     _MemDescriptor,
     _Op,
@@ -42,7 +45,6 @@ from .types import (
     InventoryEvent,
     MemoryRef,
     OpEntryResult,
-    OpEntryStatus,
     OpHandle,
     OpResult,
     PinHandle,
@@ -404,7 +406,7 @@ class _KVCRCore:
         for key, record in records.items():
             if record.local_dram is not None or g3 is None:
                 source = CacheTier.LOCAL_G2
-                slot_size = local_dram._size_bytes(record.local_dram.slots)
+                slot_size = local_dram._size_bytes(record.local_dram)
             else:
                 source, slot_size = CacheTier.G3, g3._slot_size
             self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
@@ -422,7 +424,7 @@ class _KVCRCore:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object],
+        hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
         hint = _KVFetchHint.from_hint(hints)
@@ -504,7 +506,7 @@ class _KVCRCore:
                     tier = local_dram if record.local_dram is not None else g3
                     tier._residency_observer(key, record)
                 size_bytes = (
-                    local_dram._size_bytes(record.local_dram.slots)
+                    local_dram._size_bytes(record.local_dram)
                     if record.local_dram is not None
                     else g3._slot_size
                 )
@@ -570,7 +572,7 @@ class _KVCRCore:
                 ):
                     self._complete(
                         op_handle,
-                        {key: OpEntryResult(OpEntryStatus.FAILED) for key in g3_blocks},
+                        dict.fromkeys(g3_blocks, _FAILED_RESULT),
                     )
                 if remote_blocks:
                     self._remote_fw_dram.deliver(
@@ -609,7 +611,7 @@ class _KVCRCore:
             if self._local_dram is None:
                 self._complete(
                     op_handle,
-                    {key: OpEntryResult(OpEntryStatus.FAILED) for key in blocks},
+                    dict.fromkeys(blocks, _FAILED_RESULT),
                 )
             else:
                 self._local_dram.deposit(
@@ -639,7 +641,7 @@ class _KVCRCore:
             if local_dram is None:
                 self._complete(
                     op_handle,
-                    {key: OpEntryResult(OpEntryStatus.FAILED) for key in ordered_keys},
+                    dict.fromkeys(ordered_keys, _FAILED_RESULT),
                 )
                 return op_handle
 
@@ -1031,37 +1033,39 @@ class _KVCRCore:
         normalized = []
         for ref in descriptors:
             if not isinstance(ref, MemoryRef):
-                raise ValueError("each block requires at least one MemoryRef")
+                raise ValueError(
+                    "block descriptors must contain only MemoryRef entries"
+                )
             normalized.append(
                 _TransferRef(ref.end_point_name, ref.element_index, ref.label)
             )
-        return self._validate_descriptors(normalized)
+        self._validate_descriptors(normalized)
+        return normalized
 
     def _validate_descriptors(
         self,
-        descriptors: list[_TransferRef],
+        descriptors: list[_TransferRef] | tuple[_TransferRef, ...],
         *,
         regions=None,
         agent_name: str | None = None,
-    ) -> list[_TransferRef]:
-        if not isinstance(descriptors, list):
-            raise TypeError("block descriptors must be a list")
+    ) -> None:
         if not descriptors:
             raise ValueError("each block requires at least one _TransferRef")
-        layout = []
+        labels = set()
         for ref in descriptors:
             region = self._region(ref, regions=regions, agent_name=agent_name)
-            block_size = self._block_sizes.get(ref.label.partition(":")[0])
-            if block_size is None:
+            pool, separator, part = ref.label.partition(":")
+            block_size = self._block_sizes.get(pool)
+            if block_size is None or (separator and part in ("", "*")):
                 raise ValueError("block descriptors must use configured pools")
             if region.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
-            layout.append(ref.label)
-        self._validate_block_layout(
-            layout,
-            "block descriptors must use configured pools",
-        )
-        return descriptors
+            if separator:
+                if ref.label in labels:
+                    raise ValueError("block part labels must be unique")
+                labels.add(ref.label)
+        if self._g3 is not None and (len(descriptors) != 1 or labels):
+            raise ValueError("G3 does not support multi-block layouts or part labels")
 
     def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
         if not layout:

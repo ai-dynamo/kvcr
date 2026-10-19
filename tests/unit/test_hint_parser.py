@@ -2,33 +2,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from typing import cast
 
+import msgspec
 import pytest
-from _kvcr_test_utils import _router_hint
+from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
 from kvcr.hint_parser import _LOGGED_HINT_ISSUES, _KVFetchHint
 
 
-def test_kv_fetch_hint_parses_first_fetch_action() -> None:
-    fetch_hint = _router_hint("tcp://source:1234", (123, 456, 123))
-    later_fetch_hint = _router_hint("tcp://other:1234", (789,))
-    payload = {
-        "protocol_version": "0.1",
-        "message_id": "test-message",
-        "actions": [
-            {
-                "action_id": "ignored",
-                "action_type": "kv.future_action",
-                "action_version": "9.0",
-                "payload": {"opaque": True},
-            },
-            fetch_hint["actions"][0],
-            later_fetch_hint["actions"][0],
-        ],
-    }
+@pytest.mark.parametrize("as_mapping", [False, True])
+def test_kv_fetch_hint_parses_first_fetch_action(as_mapping) -> None:
+    hint = _router_hint("tcp://source:1234", (123, 456, 123))
+    hint.actions.insert(0, _HintAction("ignored", "kv.future_action", "9.0", {}))
+    hint.actions.extend(_router_hint("tcp://other:1234", (789,)).actions)
 
-    assert _KVFetchHint.from_hint(payload) == _KVFetchHint(
+    hint = msgspec.to_builtins(hint) if as_mapping else hint
+    payload = hint["actions"][1]["payload"] if as_mapping else hint.actions[1].payload
+    parsed = _KVFetchHint.from_hint(hint)
+    payload["source_control_endpoint"] = "tcp://changed:1"
+    payload["block_hashes"].clear()
+    assert parsed == _KVFetchHint(
         source_endpoint="tcp://source:1234",
         block_hashes=frozenset({123, 456}),
     )
@@ -39,15 +32,16 @@ def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
 ) -> None:
     _LOGGED_HINT_ISSUES.clear()
     kv_hint = _router_hint("tcp://source:1234", (123,))
-    action = cast(list[dict[str, object]], kv_hint["actions"])[0]
-    kv_hint["protocol_version"] = "9.0"
-    action["action_version"] = "2.0"
-
     with caplog.at_level(logging.WARNING):
-        parsed = _KVFetchHint.from_hint(kv_hint)
-        kv_hint["protocol_version"] = "10.0"
-        action["action_version"] = "3.0"
-        _KVFetchHint.from_hint(kv_hint)
+        for protocol, version in (("9.0", "2.0"), ("10.0", "3.0")):
+            changed = msgspec.structs.replace(
+                kv_hint,
+                protocol_version=protocol,
+                actions=[
+                    msgspec.structs.replace(kv_hint.actions[0], action_version=version)
+                ],
+            )
+            parsed = _KVFetchHint.from_hint(changed)
 
     assert parsed == _KVFetchHint("tcp://source:1234", frozenset({123}))
     assert caplog.text.count("KV hint protocol_version mismatch") == 1
@@ -59,29 +53,11 @@ def test_kv_fetch_hint_warns_once_per_mismatched_version_field(
     [
         None,
         {},
-        {"protocol_version": "0.1", "actions": "bad"},
-        {
-            "protocol_version": "0.1",
-            "actions": [
-                {
-                    "action_id": "a1",
-                    "action_type": "kv.future_action",
-                    "action_version": "1.0",
-                    "payload": {},
-                }
-            ],
-        },
-        {
-            "protocol_version": "0.1",
-            "actions": [
-                {
-                    "action_id": "a1",
-                    "action_type": "kv.fetch",
-                    "action_version": "1.0",
-                    "payload": "bad",
-                }
-            ],
-        },
+        _HintEnvelope("0.1", "test", "bad"),
+        _HintEnvelope(
+            "0.1", "test", [None, _HintAction("a", "kv.fetch", "1.0", "bad")]
+        ),
+        _HintEnvelope("0.1", "test", [_HintAction("a", "kv.future_action", "1.0", {})]),
     ],
 )
 def test_kv_fetch_hint_rejects_invalid_envelope(kv_hint: object) -> None:
@@ -113,14 +89,9 @@ def test_kv_fetch_hint_rejects_invalid_envelope(kv_hint: object) -> None:
 def test_kv_fetch_hint_rejects_invalid_payload(fetch_payload: object) -> None:
     """Reject malformed payloads on a matching ``kv.fetch`` action."""
     kv_hint = _router_hint("tcp://source:1")
-    kv_hint["actions"] = [
-        {
-            "action_id": "a1",
-            "action_type": "kv.fetch",
-            "action_version": "1.0",
-            "payload": fetch_payload,
-        }
-    ]
+    kv_hint.actions[0] = msgspec.structs.replace(
+        kv_hint.actions[0], payload=fetch_payload
+    )
 
     with pytest.raises(ValueError):
         _KVFetchHint.from_hint(kv_hint)

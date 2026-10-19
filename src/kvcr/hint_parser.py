@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+
+import msgspec
 
 # Public integration constants exported by kvcr.__init__.
 ROUTER_HINT_KEY = "kv_hint"
@@ -43,46 +44,49 @@ def _warn_version_mismatch(
     logger.warning(message, supported, received)
 
 
-@dataclass(frozen=True, slots=True)
-class _KVFetchHint:
+def _hint_field(value: Mapping[str, object] | msgspec.Struct, name: str) -> object:
+    return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+
+
+class _KVFetchHint(msgspec.Struct, frozen=True):
     """Fields KVCR currently supports from the first ``kv.fetch`` action."""
 
     source_endpoint: str
     block_hashes: frozenset[int]
 
     @classmethod
-    def from_hint(cls, hint: Mapping[str, object]) -> _KVFetchHint:
+    def from_hint(cls, hint: Mapping[str, object] | msgspec.Struct) -> _KVFetchHint:
         """Parse and validate a KV hint envelope."""
-        if not isinstance(hint, Mapping):
+        if not isinstance(hint, (Mapping, msgspec.Struct)):
             raise ValueError("invalid router hint")
 
         _warn_version_mismatch(
             supported=_KV_HINT_PROTOCOL_VERSION,
-            received=hint.get("protocol_version"),
+            received=_hint_field(hint, "protocol_version"),
             issue="protocol-version-mismatch",
             message="KV hint protocol_version mismatch; supported=%r received=%r",
         )
 
-        actions = hint.get("actions")
+        actions = _hint_field(hint, "actions")
         if not isinstance(actions, list):
             raise ValueError("invalid router hint")
 
         fetch_payload = None
         for action in actions:
-            if not isinstance(action, Mapping):
+            if not isinstance(action, (Mapping, msgspec.Struct)):
                 continue
-            if action.get("action_type") != _KV_FETCH_ACTION_TYPE:
+            if _hint_field(action, "action_type") != _KV_FETCH_ACTION_TYPE:
                 continue
             _warn_version_mismatch(
                 supported=_KV_FETCH_ACTION_VERSION,
-                received=action.get("action_version"),
+                received=_hint_field(action, "action_version"),
                 issue="fetch-version-mismatch",
                 message=(
                     "kv.fetch action_version mismatch; supported=%r received=%r; "
                     "processing with supported schema"
                 ),
             )
-            fetch_payload = action.get("payload")
+            fetch_payload = _hint_field(action, "payload")
             break
 
         if not isinstance(fetch_payload, Mapping):
