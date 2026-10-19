@@ -178,8 +178,11 @@ class _KVCRCore:
             for region in memory_regions
         ):
             raise ValueError("registration elements must match configured pool sizes")
-        if self.config.operation_timeout_ms <= 0:
-            raise ValueError("operation_timeout_ms must be positive")
+        if (
+            type(self.config.operation_timeout_ms) is not int
+            or self.config.operation_timeout_ms <= 0
+        ):
+            raise ValueError("operation_timeout_ms must be a positive integer")
         startup_timeout_seconds = self.config.startup_timeout_seconds
         if startup_timeout_seconds is not None and (
             type(startup_timeout_seconds) is not int or startup_timeout_seconds <= 0
@@ -187,9 +190,13 @@ class _KVCRCore:
             raise ValueError(
                 "startup_timeout_seconds must be a positive integer or None"
             )
-        if self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms:
+        if (
+            type(self.config.abandon_timeout_ms) is not int
+            or self.config.abandon_timeout_ms < 2 * self.config.operation_timeout_ms
+        ):
             raise ValueError(
-                "abandon_timeout_ms must be at least twice operation_timeout_ms"
+                "abandon_timeout_ms must be an integer at least twice "
+                "operation_timeout_ms"
             )
         if not 0 <= self.config.capacity_low_watermark_percent <= 100:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")

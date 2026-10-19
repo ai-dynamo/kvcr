@@ -65,6 +65,19 @@ def test_invalid_startup_budget_is_rejected(budget):
         )
 
 
+@pytest.mark.parametrize("field", ["operation_timeout_ms", "abandon_timeout_ms"])
+@pytest.mark.parametrize("budget", [float("nan"), float("inf"), True, 1.5])
+def test_invalid_operation_timeout_budget_is_rejected(field, budget):
+    config = KVCRConfig("timeout-test", [("", 16)], **{field: budget})
+    with pytest.raises(ValueError, match=field):
+        _new_kvcr(
+            FakeNixlAgent(),
+            FakePrimaryPinning(),
+            FakeBytesControl(),
+            config=config,
+        )
+
+
 def test_configured_startup_budget_reaches_progress(monkeypatch):
     monkeypatch.setattr(kvcr_progress, "_STARTUP_TIMEOUT_SECONDS", 0)
     runner = _new_kvcr(

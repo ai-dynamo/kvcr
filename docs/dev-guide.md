@@ -183,6 +183,11 @@ initialization waits. Omitting it or setting it to `None` uses 30 seconds.
 The timeout applies separately to the local preparation and startup waits;
 transfer deadlines are unchanged.
 
+`KVCRConfig.operation_timeout_ms` and `abandon_timeout_ms` require positive
+integers in milliseconds (defaults: 1000 and 5000). The abandonment budget must
+be at least twice the operation timeout. Booleans and floating-point values,
+including NaN and infinity, are rejected before the runner starts.
+
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 
