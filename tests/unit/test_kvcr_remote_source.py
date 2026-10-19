@@ -147,7 +147,6 @@ def test_local_source_starts_inline_and_holds_its_slot(
         callbacks.clear()
         agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
-        requested_labels = (":c", "")
         request.update(
             target_regions=(
                 {
@@ -156,7 +155,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
                         size=16,
                         mem_type="VRAM",
                         device_Id=7,
-                        count=len(requested_labels),
+                        count=2,
                         label=label,
                     )
                     for label in ("", ":*")
@@ -164,10 +163,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
                 {},
             ),
             dst_descriptors=[
-                [
-                    _TransferRef("target", i, label)
-                    for i, label in enumerate(requested_labels)
-                ]
+                [_TransferRef("target", i, label) for i, label in enumerate((":c", ""))]
             ],
         )
         preparing, resume = threading.Event(), threading.Event()
@@ -204,14 +200,12 @@ def test_local_source_starts_inline_and_holds_its_slot(
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
         ] == [
-            label.removeprefix(":").encode() * 16 if label else b"a" * 16
-            for label in requested_labels
+            b"c" * 16,
+            b"a" * 16,
         ]
-        assert agent.xfers[-1][3] == [
-            (4096 + i * 16, 16, 7) for i in range(len(requested_labels))
-        ]
+        assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
         assert pinning.searches == []
-        assert make_ref.call_count == len(requested_labels)
+        assert make_ref.call_count == 2
         assert not source._core._remote_fw_dram._source_pin_ops
         assert callbacks == []
         if transfer_state == "PROC":
@@ -237,7 +231,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
                     and residency.claim_count == 0
                 ),
             )
-        assert make_ref.call_count == len(requested_labels)
+        assert make_ref.call_count == 2
         assert agent.xfers[-1][1] == agent.xfers[-2][1]
         assert pinning.searches == []
     finally:

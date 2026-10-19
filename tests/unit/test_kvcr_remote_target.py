@@ -344,11 +344,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         assert dict(_poll_until(target, bool))[deposit][key].success
 
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = target.fetch(
-        (key,),
-        "req",
-        expected_layout=expected_layout,
-    )
+    fetch = target.fetch((key,), "req", expected_layout=expected_layout)
     _wait_until(lambda: bool(target_control.sent))
     assert _decode_control_message(target_control.sent[-1][1])["key_layout"] == (
         expected_layout

@@ -59,11 +59,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
         (
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
             _TWO_POOLS,
-            [
-                [["full", 7], ["full", 2], ["swa", 9]],
-                5,
-                -1,
-            ],
+            [[["full", 7], ["full", 2], ["swa", 9]], 5, -1],
             _recovered_record(g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5),
         ),
         (_BlockRecord(), _ONE_POOL, [None, None, -1], _BlockRecord()),
