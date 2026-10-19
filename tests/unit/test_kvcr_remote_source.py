@@ -40,8 +40,8 @@ from kvcr.remote_fw_dram import (
     _FwMemResidency,
     _RemoteFWDram,
     _SourcePinOp,
-    _SourceWriteOp,
 )
+from kvcr.remote_ops import _SourceWriteOp
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
