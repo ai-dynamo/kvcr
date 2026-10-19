@@ -4,6 +4,13 @@
 name: Docker Build
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/docker-build.yml
+      - Dockerfile.ci
+      - pyproject.toml
+      - src/**
   workflow_dispatch:
     inputs:
       base_image:
@@ -26,9 +33,33 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The cluster runner admits same-repository PRs, not fork PRs.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 45
+    env:
+      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      BUILDKIT_NAMESPACE: ${{ vars.BUILDKIT_NAMESPACE }}
+      BUILDER_NAME: kvcr-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      image: ${{ steps.published.outputs.image }}
+      image_tag: ${{ steps.source.outputs.image_tag }}
     steps:
+      - name: Validate infrastructure settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for setting in AWS_DEFAULT_REGION ECR_REGISTRY ECR_REPOSITORY BUILDKIT_NAMESPACE; do
+            if [[ -z "${!setting:-}" ]]; then
+              echo "::error::Set the ${setting} repository variable before running this workflow."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
       - name: Check out CI recipe
         uses: actions/checkout@v4
 
@@ -38,28 +69,47 @@ jobs:
           ref: ${{ inputs.kvcr_ref || github.sha }}
           path: kvcr-source
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Inspect build environment
         run: |
-          docker version
-          docker buildx inspect --bootstrap
+          docker buildx version
+          aws --version
           df -h
+
+      - name: Log in to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Initialize shared BuildKit builder
+        id: builder
+        # Shared actions PR #9; pin the reviewed revision while testing PR #23.
+        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@e34f91c4470d60856ea77d339c03d69e93285438
+        with:
+          builder_name: ${{ env.BUILDER_NAME }}
+          flavor: vllm
+          arch: linux/amd64
+          namespace: ${{ env.BUILDKIT_NAMESPACE }}
 
       - name: Resolve build inputs
         id: source
+        shell: bash
         env:
-          BASE_IMAGE: ${{ inputs.base_image }}
-          DYNAMO_VERSION: ${{ inputs.dynamo_version }}
+          BASE_IMAGE: ${{ inputs.base_image || 'vllm/vllm-openai:nightly' }}
+          DYNAMO_VERSION: ${{ inputs.dynamo_version || 'nightly' }}
         run: |
           set -euo pipefail
           kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
-          docker pull --platform linux/amd64 "$BASE_IMAGE"
-          base_image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")
-          image_tag="kvcr-vllm-e2e:${kvcr_sha}"
-          printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\n' \
-            "$kvcr_sha" "$base_image" "$image_tag" >> "$GITHUB_OUTPUT"
+          base_digest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')
+          base_name="${BASE_IMAGE%%@*}"
+          if [[ "${base_name##*/}" == *:* ]]; then
+            base_name="${base_name%:*}"
+          fi
+          base_image="${base_name}@${base_digest}"
+          image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}"
+          printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\ndynamo_version=%s\n' \
+            "$kvcr_sha" "$base_image" "$image_tag" "$DYNAMO_VERSION" >> "$GITHUB_OUTPUT"
           jq -n \
             --arg kvcr_sha "$kvcr_sha" \
             --arg requested_base_image "$BASE_IMAGE" \
@@ -71,38 +121,57 @@ jobs:
               requested_dynamo_version: $dynamo_version}' \
             > "$RUNNER_TEMP/kvcr-build-metadata.json"
 
-      # Keep the local build separate from setup so it can later be routed
-      # to the build service and published to the infrastructure-owned registry.
-      - name: Build local integration image
+      - name: Build and publish integration image
+        id: build
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ env.BUILDER_NAME }}
           context: ./kvcr-source
           file: Dockerfile.ci
           platforms: linux/amd64
-          push: false
-          load: true
+          push: true
+          load: false
           tags: ${{ steps.source.outputs.image_tag }}
           build-args: |
             VLLM_IMAGE=${{ steps.source.outputs.base_image }}
-            DYNAMO_VERSION=${{ inputs.dynamo_version }}
+            DYNAMO_VERSION=${{ steps.source.outputs.dynamo_version }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
 
-      - name: Verify local image
+      - name: Record published image
+        id: published
+        shell: bash
         env:
           IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
         run: |
-          docker image inspect "$IMAGE_TAG"
-          docker run --rm --entrypoint cat "$IMAGE_TAG" \
-            /opt/kvcr-build-metadata.json > "$RUNNER_TEMP/kvcr-installed-packages.json"
-          docker run --rm --entrypoint cat "$IMAGE_TAG" \
-            /opt/kvcr-dynamo-install-report.json > "$RUNNER_TEMP/kvcr-dynamo-install-report.json"
+          set -euo pipefail
+          : "${IMAGE_DIGEST:?Build did not return a published image digest}"
+          image="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$image" > "$RUNNER_TEMP/kvcr-image.txt"
+          printf '%s\n' "$BUILD_METADATA" | jq . > "$RUNNER_TEMP/kvcr-build-result.json"
+          {
+            printf 'Published tag: `%s`\n\n' "$IMAGE_TAG"
+            printf 'Image for downstream tests: `%s`\n' "$image"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save build metadata
+        if: always() && steps.source.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: kvcr-build-metadata
           path: |
             ${{ runner.temp }}/kvcr-build-metadata.json
-            ${{ runner.temp }}/kvcr-installed-packages.json
-            ${{ runner.temp }}/kvcr-dynamo-install-report.json
+            ${{ runner.temp }}/kvcr-build-result.json
+            ${{ runner.temp }}/kvcr-image.txt
           retention-days: 7
+
+      - name: Remove builder configuration
+        if: always() && (steps.builder.outcome == 'success' || steps.builder.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          if docker buildx inspect "$BUILDER_NAME" > /dev/null 2>&1; then
+            docker buildx rm "$BUILDER_NAME"
+          fi
