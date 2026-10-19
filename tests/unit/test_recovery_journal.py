@@ -311,10 +311,14 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
         }
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
         written = [r for r in caplog.records if "snapshot_written " in r.message]
-        assert written[-1].args == (
-            pool._spec.pool_id,
-            path.stat().st_size - pool._spec.mapping_bytes,
-        )
+        with pool.mapped_snapshot() as region:
+            assert region is not None
+            assert written[-1].args == (pool._spec.pool_id, len(region))
+            # File alignment may leave padding between the pool and snapshot;
+            # those bytes are not part of the reported snapshot payload.
+            snapshot_offset = path.stat().st_size - len(region)
+            assert snapshot_offset >= pool._spec.mapping_bytes
+            assert snapshot_offset % mmap.ALLOCATIONGRANULARITY == 0
         # Inside the pool file, so it has no name of its own to be found under.
         assert set(tmp_path.iterdir()) == {path}
         assert path.stat().st_size > pool._spec.mapping_bytes
