@@ -14,14 +14,20 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .config import G3Options
 from .policy_runtime import _EvictionQueue
-from .progress import _KVCRProgress, _MemDescriptor, _OpId, _ProgressOp, _TransferRef
+from .progress import (
+    _FAILED_RESULT,
+    _SUCCESS_RESULT,
+    _KVCRProgress,
+    _MemDescriptor,
+    _OpId,
+    _ProgressOp,
+    _TransferRef,
+)
 from .types import (
     BlockKey,
     BlockMeta,
     CacheTier,
     MemoryRef,
-    OpEntryResult,
-    OpEntryStatus,
     OpHandle,
     PlacementAction,
     PlacementDecision,
@@ -371,10 +377,7 @@ class _G3:
                 self._record_transfer(item)
                 self._kvcr._complete(
                     item.op_id[1],
-                    {
-                        key: OpEntryResult(OpEntryStatus.FAILED)
-                        for key in item.ordered_keys
-                    },
+                    dict.fromkeys(item.ordered_keys, _FAILED_RESULT),
                 )
                 continue
             if self._active.pop(item.op_id, None) is not item:
@@ -391,13 +394,14 @@ class _G3:
         blocks: dict[BlockKey, _TransferRef],
         deadline: float,
     ) -> bool:
-        reservations = self._reserve(tuple(blocks), set(blocks))
+        keys = frozenset(blocks)
+        reservations = self._reserve(tuple(blocks), keys)
         if len(reservations) != len(blocks):
             self._rollback(reservations)
             return False
         op = _G3TransferOp(
             op_id=op_id,
-            keys=set(blocks),
+            keys=keys,
             kind="store",
             ordered_keys=tuple(item.key for item in reservations),
             memory_descriptors=tuple(
@@ -452,7 +456,7 @@ class _G3:
             )
         op = _G3TransferOp(
             op_id=(f"g3_{kind}", op_handle),
-            keys=set(blocks),
+            keys=frozenset(blocks),
             kind=kind,
             ordered_keys=tuple(item.key for item in claims),
             memory_descriptors=tuple(destinations[item.key] for item in claims),
@@ -530,12 +534,9 @@ class _G3:
             return
         self._kvcr._complete(
             op.op_id[1],
-            {
-                key: OpEntryResult(
-                    OpEntryStatus.SUCCESS if op.success else OpEntryStatus.FAILED
-                )
-                for key in op.ordered_keys
-            },
+            dict.fromkeys(
+                op.ordered_keys, _SUCCESS_RESULT if op.success else _FAILED_RESULT
+            ),
         )
 
     def _record_transfer(self, op: _G3TransferOp, success: bool | None = None) -> None:
@@ -575,7 +576,7 @@ class _G3:
         self._kvcr._release_local_dram_sources(op_id)
 
     def _reserve(
-        self, keys: tuple[BlockKey, ...], protected: set[BlockKey]
+        self, keys: tuple[BlockKey, ...], protected: frozenset[BlockKey]
     ) -> tuple[_Reservation, ...]:
         reservations: list[_Reservation] = []
         for key in keys:
@@ -589,7 +590,7 @@ class _G3:
             reservations.append(_Reservation(key, slot))
         return tuple(reservations)
 
-    def _allocate_slot(self, protected: set[BlockKey]) -> int | None:
+    def _allocate_slot(self, protected: frozenset[BlockKey]) -> int | None:
         if self._free_slots:
             return self._free_slots.popleft()
         self._retry_unscored()

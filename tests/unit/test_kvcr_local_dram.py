@@ -140,11 +140,16 @@ def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history
     assert policy.ingested == []
 
     agent.state = "DONE"
-    completed = _poll_until(kvcr, lambda results: len(results) == 2)
-    assert dict(completed) == {
+    completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
+    assert completed == {
         first: _op_entries({keys[0]: True, keys[1]: True}),
         filling_duplicate: _op_entries({keys[0]: True}),
     }
+    assert (
+        completed[first][keys[0]]
+        is completed[first][keys[1]]
+        is completed[filling_duplicate][keys[0]]
+    )
     assert local.raw == b"a" * block_size + b"b" * block_size
     assert events == [InventoryEvent(keys[:2], CacheTier.LOCAL_G2, False)]
     assert [(meta.block_key, source) for meta, source in policy.ingested] == [
@@ -235,6 +240,11 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
         kvcr.deposit({first: [_mem_descriptor(label="unknown")]})
     operation = kvcr.deposit({first: descriptors})
     _wait_until(lambda: bool(agent.transfers))
+    local_dram = kvcr._core._local_dram
+    residency = kvcr._core._block_record_map[first].local_dram
+    assert local_dram._size_bytes(residency) == 32
+    pool_counts = residency.pool_counts
+    assert pool_counts == {"full": 1, "swa": 2}
     wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
     assert not dict(kvcr.poll_completed())[wrong_layout][first].success
     agent.state = "DONE"
@@ -251,8 +261,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     )
     assert not dict(kvcr.poll_completed())[wrong][first].success
 
-    local_dram = kvcr._core._local_dram
-    residency = kvcr._core._block_record_map[first].local_dram
+    assert residency.pool_counts is pool_counts
     # Ready blocks already have their label index, but references stay incremental.
     assert residency.indices_by_label == (
         {"full": 0, "swa:a": 1, "swa:b": 2} if labeled else {"full": 0, "swa": None}
@@ -421,17 +430,22 @@ def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     queue.insert(first, 0)
     queue.insert(churned, 1)
     queue.insert(excluded, 1)
+    assert all(queue._live[item[2]] is item for item in queue._heap)
 
-    with closing(queue.candidates({excluded})) as candidates:
+    protected = frozenset((excluded,))
+    with closing(queue.candidates(protected)) as candidates:
         assert next(candidates) == first
         for _ in range(100):
             queue.remove(churned)
             queue.insert(churned, 1)
         assert len(queue._heap) <= 2 * len(queue)
-        assert list(candidates) == [churned]
+        assert next(candidates) == churned
+        assert not queue.insert(churned, 2)
+        assert list(candidates) == []
 
+    assert queue.score(churned) == 2
     assert len(queue._heap) == 3
-    assert list(queue.candidates(set())) == [first, excluded, churned]
+    assert list(queue.candidates(frozenset())) == [first, excluded, churned]
 
 
 def test_lru_float_score_uses_small_tail_first_bias() -> None:
@@ -1043,8 +1057,11 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
 
     records = _g2_recovered(first=2, second=0)
     records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
+    residency = records[BlockKey(b"first")].local_dram
+    residency._cached_size = 8  # Cached with a different pool size.
     install_recovery_records(kvcr._core, records)
-    assert records[BlockKey(b"first")].local_dram.indices_by_label == {":first": 0}
+    assert residency.indices_by_label == {":first": 0}
+    assert local_dram._size_bytes(residency) == 16
 
     fresh = (BlockKey(b"fresh0"), BlockKey(b"fresh1"))
     operation = kvcr.deposit(

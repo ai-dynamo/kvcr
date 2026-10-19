@@ -33,13 +33,20 @@ from .core import (
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
 from .local_dram import _layout_indices, _LocalDramState
-from .progress import _KVCRProgress, _Op, _OpId, _ProgressOp, _RegionMaps, _TransferRef
+from .progress import (
+    _FAILED_RESULT,
+    _SUCCESS_RESULT,
+    _KVCRProgress,
+    _Op,
+    _OpId,
+    _ProgressOp,
+    _RegionMaps,
+    _TransferRef,
+)
 from .types import (
     BlockKey,
     CacheTier,
     MemoryRef,
-    OpEntryResult,
-    OpEntryStatus,
     OpHandle,
     PinHandle,
     PinRequestId,
@@ -244,7 +251,6 @@ class _TargetPullOp(_RemoteOp):
                 backend._progress_outbound.append(
                     replace(
                         self,
-                        keys=set(self.keys),
                         completed_keys=set(self.completed_keys),
                     )
                 )
@@ -708,7 +714,7 @@ class _RemoteFWDram:
         op = _TargetPullOp(
             state=_TargetPullState.START_WRITE,
             local_fill=local_fill,
-            keys=set(blocks),
+            keys=frozenset(blocks),
             started_at=started_at,
             deadline=deadline,
             op_id=("target", op_handle),
@@ -755,7 +761,7 @@ class _RemoteFWDram:
             return
         kvcr._complete(
             op_handle,
-            {key: OpEntryResult(OpEntryStatus.FAILED) for key in blocks},
+            dict.fromkeys(blocks, _FAILED_RESULT),
         )
 
     def fetch(
@@ -919,11 +925,7 @@ class _RemoteFWDram:
         kvcr._complete(
             cast(OpHandle, op.op_id[1]),
             {
-                key: OpEntryResult(
-                    OpEntryStatus.SUCCESS
-                    if key in completed_keys
-                    else OpEntryStatus.FAILED
-                )
+                key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
                 for key in op.keys
             },
         )
@@ -1221,7 +1223,7 @@ class _RemoteFWDram:
             )
             for descriptors in dst_descriptors:
                 self._kvcr._validate_descriptors(
-                    list(descriptors),
+                    descriptors,
                     regions=self._remote_agents_by_target[target_agent][2],
                     agent_name=target_agent,
                 )
@@ -1283,7 +1285,7 @@ class _RemoteFWDram:
 
         source_pin = _SourcePinOp(
             op_id=op_id,
-            keys=set(keys),
+            keys=frozenset(keys),
             started_at=started_at,
             deadline=deadline,
             remote_agent=remote_agent,
@@ -1453,7 +1455,7 @@ class _RemoteFWDram:
                 if not force_failure
                 else _SourceWriteState.NOTIFY_FAILURE
             ),
-            keys=set(completed_keys or source_pin.ordered_keys),
+            keys=frozenset(completed_keys or source_pin.ordered_keys),
             started_at=source_pin.started_at,
             deadline=source_pin.deadline,
             op_id=source_pin.op_id,
