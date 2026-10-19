@@ -268,7 +268,7 @@ def test_local_source_waits_for_declared_pieces(
     layout = [":a", ":b"]
     first = source.deposit(
         {key: [_mem_descriptor(0, label=":a", end_point_name="source")]},
-        expected_layout=layout,
+        expected_layout=layout + ["!peer:c"],
     )
     _wait_until(lambda: len(agent.xfers) == 1)
     if first_piece_ready:
@@ -281,7 +281,7 @@ def test_local_source_waits_for_declared_pieces(
     keys = [rejected[0], key, rejected[1]] if mixed else [key]
     message.update(
         keys=keys,
-        key_layout=layout,
+        key_layout=layout + ["peer:c"],
         target_regions=({":*": _buffer_region(primary, 16, ":*")}, {}),
         dst_descriptors=[
             [_TransferRef("target", i, label) for i, label in enumerate(layout)]

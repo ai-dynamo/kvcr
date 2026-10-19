@@ -188,7 +188,7 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
-Partial deposits use `expected_layout` to declare the full, fixed key layout. Immutable named pieces can be deposited across calls and delivered as they become ready. Incomplete keys remain non-evictable; only complete keys are recovered and advertised to the router.
+Partial deposits use `expected_layout` to declare the full, fixed key layout. A leading `!` excludes a piece from local storage; a fetch can exclude additional pieces without changing an existing reservation. Concrete `MemoryRef` labels carry no marker, and excluding repeated pools requires named pieces. Immutable named pieces can be deposited across calls and delivered as they become ready. Incomplete local shares remain non-evictable; only complete local shares are recovered and advertised to the router.
 
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
