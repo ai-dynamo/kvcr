@@ -508,12 +508,17 @@ def tc06(ctx: Context) -> CaseResult:
 
     # t1: first correct Guard-served response on worker 1 (hinted to the dead
     # worker's endpoint). Poll until the reference tokens come back.
+    # Each attempt uses a prompt worker 1 has not seen: a missed attempt is
+    # computed and committed locally on worker 1, so retrying the same prompt
+    # would turn into a local hit and prove nothing about the Guard.
     attempts: list[dict[str, Any]] = []
     first_correct: StreamResponse | None = None
+    first_name: str | None = None
     t1: float | None = None
     deadline = time.monotonic() + ctx.recovery_timeout
-    name0, prompt0 = prompts[0]
-    while time.monotonic() < deadline and first_correct is None:
+    remaining = list(prompts)
+    while time.monotonic() < deadline and first_correct is None and remaining:
+        name0, prompt0 = remaining.pop(0)
         response = ctx.client.stream_completion(
             f"tc06-guard-attempt{len(attempts) + 1}-w1",
             prompt0,
@@ -531,6 +536,7 @@ def tc06(ctx: Context) -> CaseResult:
         attempts.append(
             {
                 "stage": response.stage,
+                "prompt": name0,
                 "ok": response.ok,
                 "error": response.error,
                 "cached_tokens": response.cached_tokens,
@@ -550,6 +556,7 @@ def tc06(ctx: Context) -> CaseResult:
             break
         if response.ok and (response.cached_tokens or 0) > 0:
             first_correct = response
+            first_name = name0
             t1 = sent_at + (response.first_token_seconds or 0) - t0
         else:
             time.sleep(1)
@@ -588,11 +595,14 @@ def tc06(ctx: Context) -> CaseResult:
         )
         result.measurements["guard_served_first_window"] = window.totals
     guard_served = [first_correct] if first_correct else []
-    if first_correct is not None:
-        # Remaining prefixes from the Guard as well, for a latency sample.
-        guard_served += run_arm(ctx, "tc06-guard", prompts[1:], 1)
-        for response, name in zip(guard_served[1:], names[1:]):
+    if first_correct is not None and remaining:
+        # Prefixes worker 1 has not touched, from the Guard as well, for a
+        # latency sample.
+        rest = run_arm(ctx, "tc06-guard", remaining, 1)
+        for response, (name, _) in zip(rest, remaining):
             validate_stream(ctx, result, response, name, 1, expect_hit=True)
+        guard_served += rest
+    result.measurements["guard_first_correct_prompt"] = first_name
     result.measurements["arm_guard_served_remote_hit"] = arm_summary(guard_served)
 
     # t2: replacement re-attaches and serves.
