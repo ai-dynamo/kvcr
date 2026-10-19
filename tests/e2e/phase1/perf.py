@@ -38,6 +38,7 @@ from .telemetry import (
     SOURCE_WRITE,
     TIER_READ_BYTES,
     TIER_WRITE_BYTES,
+    duration_count,
     latest_gauge,
 )
 
@@ -575,17 +576,31 @@ def tc06(ctx: Context) -> CaseResult:
             first_correct.started_at,
             lambda w, b=blocks: w.blocks(REMOTE_DELIVER) >= b and b > 0,
         )
+        # Earlier missed attempts (the first request after a Guard promotion,
+        # kvcr#51) each leave one failed remote_deliver; those are not failures
+        # of the accepted delivery.
+        missed = len(attempts) - 1
+        failures = [
+            entry
+            for entry in window.peer_failures
+            if not (
+                entry["metric"].startswith(
+                    duration_count(REMOTE_DELIVER, "failed")[: -len("_count")]
+                )
+                and entry["value"] <= missed
+            )
+        ]
         result.check(
             "tc06: first correct hit was delivered from the Guard (remote_deliver "
             "on worker 1 covers it)",
             ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
             and window.successes(REMOTE_DELIVER) >= 1
-            and not window.peer_failures,
+            and not failures,
             f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
             f"hit blocks={blocks}, "
             f"expected pages={ctx.expected_pages(blocks)}, "
             f"tier read bytes={window.get(TIER_READ_BYTES)}, "
-            f"failures={window.peer_failures}",
+            f"missed attempts={missed}, failures={failures}",
         )
         ctx.bytes_match_pages(
             result,
