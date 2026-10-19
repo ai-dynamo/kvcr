@@ -335,6 +335,25 @@ finding 1, same standing as dense. Hybrid runs should pass
 cases' prompts; one hybrid run aborted because the bare engine was unstable on
 the 3.9k-token TC-02 prompt (GDN rejects batch-invariant mode).
 
+### Verdict tightening (2026-10-19, review of #103)
+
+Harness `27a227a`, v0.1.1 image, dev-02 2×H100. Changes: TC-04 replacement must
+hit the preserved prefix; TC-06 first correct Guard response must be covered by
+`remote_deliver` on the target, attempts rotate over unseen prompts, any token
+mismatch fails; hybrid `--ssm-groups 3` makes pages exact; CI selects TC-01..04.
+
+| run | result | evidence |
+| --- | --- | --- |
+| dense 8B TC-04 | PASS: replacement `cached_tokens` 1472; Guard-served 23 pages = 23 blocks, 217 MB | `rv-dense8b-tc0406` |
+| dense 8B TC-06 | PASS: first attempt Guard-served, 23 pages, t1 1.42 s | `rv2-dense8b-tc06` |
+| hybrid 4B TC-04 | PASS: Guard-served 5 pages = 2 blocks + 3 SSM, 94 MB; replacement 1152 | `rv2-hyb4b-tc0406` |
+| hybrid 4B TC-06 | PASS: first attempt Guard-served, 5 pages, t1 1.24 s; Guard arm 5/5 hit | `rv3-hyb4b-tc06` |
+
+What the old TC-06 missed: with the kvcr#51 first-request miss, a retry of the
+same prompt is a local re-commit on the target (`remote_deliver` 0), not a Guard
+hit (`rv-dense8b-tc0406`). The hybrid runs need the state-agent overlay for the
+SSM placeholder events; without it the index is quarantined and no hints are sent.
+
 ### 2P+1D disaggregated (2026-10-10)
 
 `--topology disagg` (three GPUs; `--two-node` puts P1 on the second node) runs
