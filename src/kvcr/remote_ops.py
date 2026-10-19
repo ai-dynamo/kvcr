@@ -13,11 +13,64 @@ import msgspec
 
 from . import _nvtx
 from .core import TRANSFER_BLOCKS_METRIC, logger
-from .progress import _KVCRProgress, _ProgressOp, _TransferRef
+from .progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
 from .types import BlockKey, OpHandle, PinHandle
 
 if TYPE_CHECKING:
     from .remote_fw_dram import _RemoteFWDram
+
+
+class _PeerMessage(msgspec.Struct, kw_only=True, omit_defaults=True):
+    target_agent: str | msgspec.UnsetType = msgspec.UNSET
+    target_agent_metadata: bytes | None = None
+    target_regions: _RegionMaps | msgspec.UnsetType = msgspec.UNSET
+    sender_incarnation: str | None = None
+    sender_control_endpoint: str | None = None
+    source_control_endpoint: str | None = None
+
+
+class _StartWrite(_PeerMessage, tag="start_write"):
+    op_handle: OpHandle
+    remaining_timeout_ms: float
+    keys: tuple[BlockKey, ...]
+    dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
+    key_layout: tuple[str, ...] = ()
+    source_incarnation: str | None = None
+
+
+class _TargetMetadata(_PeerMessage, tag="target_metadata"):
+    pass
+
+
+class _TargetMetadataAck(_PeerMessage, tag="target_metadata_ack"):
+    op_handle: OpHandle | None = None
+
+
+class _WriteRefused(_PeerMessage, tag="write_refused"):
+    op_handle: OpHandle
+    reason: str | None = None
+
+
+class _WriteProbe(_PeerMessage, tag="write_probe"):
+    op_handle: OpHandle
+    source_incarnation: str | None = None
+
+
+class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
+    op_handle: OpHandle
+    terminal: bool
+    dead_incarnation: str | None = None
+
+
+_ControlMessage = (
+    _StartWrite
+    | _TargetMetadata
+    | _TargetMetadataAck
+    | _WriteRefused
+    | _WriteProbe
+    | _WriteProbeAck
+)
+_CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
 
 
 class _TargetPullState(Enum):
@@ -103,15 +156,14 @@ class _TargetPullOp(_RemoteOp):
             sent = backend._send_control(
                 progress,
                 self.remote_ctrl_ep,
-                {
-                    "type": "start_write",
-                    "op_handle": self.op_id[1],
-                    "remaining_timeout_ms": (self.deadline - now) * 1000,
-                    "source_incarnation": self.source_incarnation,
-                    "keys": list(self.ordered_keys),
-                    "dst_descriptors": self.dst_descriptors,
-                    **({"key_layout": self.key_layout} if self.local_fill else {}),
-                },
+                _StartWrite(
+                    op_handle=self.op_id[1],
+                    remaining_timeout_ms=(self.deadline - now) * 1000,
+                    source_incarnation=self.source_incarnation,
+                    keys=self.ordered_keys,
+                    dst_descriptors=self.dst_descriptors,
+                    key_layout=self.key_layout if self.local_fill else (),
+                ),
             )
             if not sent:
                 self.success = False
@@ -480,18 +532,6 @@ class _SourceWriteOp(_RemoteOp):
 
 
 _NOTIF_PREFIX = b"KVCR:"
-
-
-def _message_keys(payload: Mapping[str, Any]) -> tuple[BlockKey, ...]:
-    raw_keys = payload["keys"]
-    if (
-        not isinstance(raw_keys, list)
-        or not raw_keys
-        or not all(isinstance(key, bytes) for key in raw_keys)
-        or len(set(raw_keys)) != len(raw_keys)
-    ):
-        raise TypeError("invalid keys")
-    return tuple(BlockKey(key) for key in raw_keys)
 
 
 def _write_done_notif(

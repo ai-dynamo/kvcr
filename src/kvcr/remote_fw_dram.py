@@ -41,14 +41,22 @@ from .progress import (
     _TransferRef,
 )
 from .remote_ops import (
+    _CONTROL_DECODER,
+    _ControlMessage,
     _decode_notif,
-    _message_keys,
     _NvtxState,
+    _PeerMessage,
     _SourceWriteOp,
     _SourceWriteState,
+    _StartWrite,
+    _TargetMetadata,
+    _TargetMetadataAck,
     _TargetPullOp,
     _TargetPullState,
     _write_done_notif,
+    _WriteProbe,
+    _WriteProbeAck,
+    _WriteRefused,
 )
 from .types import (
     BlockKey,
@@ -62,9 +70,6 @@ from .types import (
 
 if TYPE_CHECKING:
     from .core import _KVCRCore
-
-
-_MEMORY_REF_LISTS_TYPE = tuple[tuple[_TransferRef, ...], ...]
 
 
 @dataclass(slots=True)
@@ -507,7 +512,7 @@ class _RemoteFWDram:
                     < self._metadata_retry_after.get(item.endpoint, 0)
                 ):
                     continue
-                self._send_control(progress, item.endpoint, {"type": "target_metadata"})
+                self._send_control(progress, item.endpoint, _TargetMetadata())
             else:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
@@ -563,65 +568,61 @@ class _RemoteFWDram:
         handled = False
         for message in messages:
             try:
-                payload = msgspec.msgpack.decode(message)
+                payload = _CONTROL_DECODER.decode(message)
+            except msgspec.ValidationError:
+                handled |= self._handle_malformed_start_write(progress, message)
+                continue
             except (TypeError, msgspec.DecodeError):
                 continue
-            if not isinstance(payload, dict):
-                continue
-            message_type = payload.get("type")
-            if not isinstance(message_type, str):
-                continue
             handled_at = self._kvcr._timer()
-            if message_type == "target_metadata":
-                self._handle_target_metadata(progress, payload)
-            elif message_type == "target_metadata_ack":
-                self._handle_target_metadata_ack(progress, payload)
-            elif message_type == "write_refused":
-                self._handle_write_refused(progress, payload)
-            elif message_type == "write_probe":
-                self._dangling_ops.handle_probe(progress, payload)
-            elif message_type == "write_probe_ack":
-                self._dangling_ops.handle_probe_ack(progress, payload)
-            elif message_type == "start_write":
+            if isinstance(payload, _StartWrite):
                 self._handle_start_write(progress, payload)
-            else:
-                continue
+            elif isinstance(payload, _TargetMetadata):
+                self._handle_target_metadata(progress, payload)
+            elif isinstance(payload, _TargetMetadataAck):
+                self._handle_target_metadata_ack(progress, payload)
+            elif isinstance(payload, _WriteRefused):
+                self._handle_write_refused(progress, payload)
+            elif isinstance(payload, _WriteProbe):
+                self._dangling_ops.handle_probe(progress, payload)
+            elif isinstance(payload, _WriteProbeAck):
+                self._dangling_ops.handle_probe_ack(progress, payload)
             handled = True
-            self._record_progress_duration(
-                f"control_{message_type}", handled_at, "handled"
-            )
+            if handled_at is not None:
+                self._record_progress_duration(
+                    f"control_{payload.__struct_config__.tag}", handled_at, "handled"
+                )
         return handled
 
     def _send_control(
         self,
         progress: _KVCRProgress,
         endpoint: str,
-        payload: dict[str, Any],
+        payload: _ControlMessage,
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
         if self._control is None or progress.nixl_agent_metadata is None:
             self._record_progress_duration("control_enqueue", started_at, "failed")
             return False
-        payload["target_agent"] = kvcr.nixl_agent_name
-        payload["sender_incarnation"] = self._dangling_ops.incarnation
+        payload.target_agent = kvcr.nixl_agent_name
+        payload.sender_incarnation = self._dangling_ops.incarnation
         sender_endpoint = getattr(self._control, "endpoint", None)
-        if isinstance(sender_endpoint, str):
-            payload.setdefault("sender_control_endpoint", sender_endpoint)
-        message_type = payload.get("type")
-        if message_type != "target_metadata_ack":
-            payload["source_control_endpoint"] = endpoint
+        if isinstance(sender_endpoint, str) and payload.sender_control_endpoint is None:
+            payload.sender_control_endpoint = sender_endpoint
+        if not isinstance(payload, _TargetMetadataAck):
+            payload.source_control_endpoint = endpoint
         includes_metadata = (
-            message_type not in ("target_metadata_ack", "write_refused")
+            not isinstance(payload, (_TargetMetadataAck, _WriteRefused))
             and endpoint not in self._metadata_acked_sources
             and (
-                message_type in ("target_metadata", "start_write")
+                isinstance(payload, (_TargetMetadata, _StartWrite))
                 or kvcr._clock() >= self._metadata_retry_after.get(endpoint, 0)
             )
         )
         if includes_metadata:
-            payload["target_agent_metadata"] = progress.nixl_agent_metadata
-            payload["target_regions"] = progress._memory_regions
+            payload.target_agent_metadata = progress.nixl_agent_metadata
+            payload.target_regions = progress._memory_regions
         try:
             sent = self._control.send(endpoint, msgspec.msgpack.encode(payload))
         except Exception:
@@ -644,22 +645,22 @@ class _RemoteFWDram:
         self._metadata_retry_after.pop(endpoint, None)
 
     def _handle_target_metadata(
-        self, progress: _KVCRProgress, payload: dict[str, Any]
+        self, progress: _KVCRProgress, payload: _TargetMetadata
     ) -> None:
         try:
-            target_agent, _ = self._remote_agent(progress, payload)
-            self._ack_target_metadata(progress, payload, target_agent)
+            self._remote_agent(progress, payload)
+            self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
             raise
         except Exception:
             return
 
     def _handle_write_refused(
-        self, progress: _KVCRProgress, payload: dict[str, Any]
+        self, progress: _KVCRProgress, payload: _WriteRefused
     ) -> None:
-        endpoint = payload.get("sender_control_endpoint")
-        op_handle = payload.get("op_handle")
-        if not isinstance(endpoint, str) or type(op_handle) is not int:
+        endpoint = payload.sender_control_endpoint
+        op_handle = payload.op_handle
+        if endpoint is None:
             return
         op = progress._in_flight_ops.get(("target", op_handle))
         if not isinstance(op, _TargetPullOp) or op.remote_ctrl_ep != endpoint:
@@ -672,10 +673,9 @@ class _RemoteFWDram:
         refused_incarnation = op.source_incarnation
         if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
             self._dangling_ops.sources.pop(endpoint, None)
-        incarnation = payload.get("sender_incarnation")
+        incarnation = payload.sender_incarnation
         if (
-            payload.get("reason") in ("metadata_required", "source_restarted")
-            and isinstance(incarnation, str)
+            payload.reason in ("metadata_required", "source_restarted")
             and incarnation
             and not op.retried
             and op.state is _TargetPullState.WAITING_WRITE_DONE
@@ -694,16 +694,16 @@ class _RemoteFWDram:
         self._refused_writes[("target", op_handle)] = {"success": False}
 
     def _handle_target_metadata_ack(
-        self, progress: _KVCRProgress, payload: dict[str, Any]
+        self, progress: _KVCRProgress, payload: _TargetMetadataAck
     ) -> None:
-        source_endpoint = payload.get("sender_control_endpoint")
-        if not isinstance(source_endpoint, str) or not source_endpoint:
+        source_endpoint = payload.sender_control_endpoint
+        if not source_endpoint:
             return
-        incarnation = payload.get("sender_incarnation")
-        if isinstance(incarnation, str) and incarnation:
+        incarnation = payload.sender_incarnation
+        if incarnation:
             self._dangling_ops.sources[source_endpoint] = incarnation
-            handle = payload.get("op_handle")
-            if type(handle) is int:
+            handle = payload.op_handle
+            if handle is not None:
                 op = progress._in_flight_ops.get(("target", handle))
                 if (
                     isinstance(op, _TargetPullOp)
@@ -717,23 +717,20 @@ class _RemoteFWDram:
     def _ack_target_metadata(
         self,
         progress: _KVCRProgress,
-        payload: Mapping[str, Any],
-        target_agent: str,
+        payload: _TargetMetadata | _StartWrite,
     ) -> None:
-        if not isinstance(payload.get("target_agent_metadata"), bytes):
+        if payload.target_agent_metadata is None:
             return
-        target_control_endpoint = payload.get("sender_control_endpoint")
-        if not isinstance(target_control_endpoint, str) or not target_control_endpoint:
+        target_control_endpoint = payload.sender_control_endpoint
+        if not target_control_endpoint:
             return
-        source_control_endpoint = payload.get("source_control_endpoint")
-        if not isinstance(source_control_endpoint, str) or not source_control_endpoint:
+        source_control_endpoint = payload.source_control_endpoint
+        if not source_control_endpoint:
             return
-        response: dict[str, Any] = {
-            "type": "target_metadata_ack",
-            "sender_control_endpoint": source_control_endpoint,
-        }
-        if payload.get("type") == "start_write":
-            response["op_handle"] = payload["op_handle"]
+        response = _TargetMetadataAck(
+            sender_control_endpoint=source_control_endpoint,
+            op_handle=payload.op_handle if isinstance(payload, _StartWrite) else None,
+        )
         if not self._send_control(progress, target_control_endpoint, response):
             # Kept, route and cache both: an operation this start_write queued
             # still transfers over this route, and the peer re-sends its
@@ -747,41 +744,27 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def _handle_start_write(
-        self, progress: _KVCRProgress, payload: dict[str, Any]
+        self, progress: _KVCRProgress, payload: _StartWrite
     ) -> None:
         started_at = self._kvcr._timer()
         received_at = self._kvcr._clock()
-        op_handle = payload.get("op_handle")
-        if type(op_handle) is not int:
-            logger.warning("KVCR malformed start_write: invalid op_handle")
-            return
-        try:
-            remaining_timeout_ms = payload["remaining_timeout_ms"]
-            if (
-                isinstance(remaining_timeout_ms, bool)
-                or not isinstance(remaining_timeout_ms, (int, float))
-                or not math.isfinite(remaining_timeout_ms)
-                or remaining_timeout_ms <= 0
-            ):
-                raise TypeError("invalid remaining_timeout_ms")
-            keys = _message_keys(payload)
-            key_layout = msgspec.convert(
-                payload.get("key_layout", ()), type=tuple[str, ...]
-            )
-            dst_descriptors = msgspec.convert(
-                payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
-            )
-        except (KeyError, TypeError, ValueError, msgspec.ValidationError) as error:
-            logger.warning("KVCR malformed start_write op=%d: %s", op_handle, error)
-            self._notify_start_write_failure(progress, payload, op_handle)
-            return
-        if not keys or len(keys) != len(dst_descriptors):
+        op_handle = payload.op_handle
+        remaining_timeout_ms = payload.remaining_timeout_ms
+        keys = payload.keys
+        dst_descriptors = payload.dst_descriptors
+        if (
+            not math.isfinite(remaining_timeout_ms)
+            or remaining_timeout_ms <= 0
+            or not keys
+            or len(key_set := frozenset(keys)) != len(keys)
+            or len(keys) != len(dst_descriptors)
+        ):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
 
         remaining_timeout_ms = min(
-            float(remaining_timeout_ms),
+            remaining_timeout_ms,
             self._kvcr.config.operation_timeout_ms,
         )
         deadline = received_at + remaining_timeout_ms / 1000
@@ -798,7 +781,7 @@ class _RemoteFWDram:
                     regions=self._remote_agents_by_target[target_agent][2],
                     agent_name=target_agent,
                 )
-            self._ack_target_metadata(progress, payload, target_agent)
+            self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
             raise
         except Exception:
@@ -813,8 +796,8 @@ class _RemoteFWDram:
             if status.cancel_requested and not status.submitted:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
-        expected = payload.get("source_incarnation")
-        if isinstance(expected, str) and expected != self._dangling_ops.incarnation:
+        expected = payload.source_incarnation
+        if expected is not None and expected != self._dangling_ops.incarnation:
             # Another process was quoted: refuse pre-submit so the target retries
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(progress, payload, op_handle, "source_restarted")
@@ -851,22 +834,18 @@ class _RemoteFWDram:
 
         source_pin = _SourcePinOp(
             op_id=op_id,
-            keys=frozenset(keys),
+            keys=key_set,
             started_at=started_at,
             deadline=deadline,
             remote_agent=remote_agent,
             op_handle=op_handle,
             ordered_keys=keys,
             dst_descriptors=dst_descriptors,
-            key_layout=key_layout,
+            key_layout=payload.key_layout,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
             nvtx_state=_NvtxState(
                 requested_blocks=len(keys),
-                target_incarnation=(
-                    payload.get("sender_incarnation")
-                    if isinstance(payload.get("sender_incarnation"), str)
-                    else None
-                ),
+                target_incarnation=payload.sender_incarnation,
             )
             if self._nvtx is not None
             else None,
@@ -1075,10 +1054,40 @@ class _RemoteFWDram:
         kvcr._progress.submit(source_write)
         self._release_framework_pins(unused_pins)
 
+    def _handle_malformed_start_write(
+        self, progress: _KVCRProgress, message: bytes
+    ) -> bool:
+        # Recover routing fields even when the request body fails typed decoding.
+        try:
+            payload = msgspec.msgpack.decode(message)
+        except (TypeError, msgspec.DecodeError):
+            return False
+        if not isinstance(payload, dict) or payload.get("type") != "start_write":
+            return False
+        op_handle = payload.get("op_handle")
+        if type(op_handle) is not int:
+            logger.warning("KVCR malformed start_write: invalid op_handle")
+            return True
+        logger.warning("KVCR malformed start_write op=%d", op_handle)
+        try:
+            peer = msgspec.convert(payload, type=_PeerMessage)
+        except msgspec.ValidationError:
+            # Keep supplied metadata so malformed requests cannot invite a retry.
+            metadata = payload.get("target_agent_metadata")
+            peer = _PeerMessage(
+                target_agent_metadata=metadata if isinstance(metadata, bytes) else None
+            )
+            for name in ("sender_control_endpoint", "source_control_endpoint"):
+                value = payload.get(name)
+                if isinstance(value, str):
+                    setattr(peer, name, value)
+        self._notify_start_write_failure(progress, peer, op_handle)
+        return True
+
     def _notify_start_write_failure(
         self,
         progress: _KVCRProgress,
-        payload: Mapping[str, Any],
+        payload: _PeerMessage,
         op_handle: OpHandle,
     ) -> None:
         # TODO: reuse this request's peer resolution; if it failed, refuse over
@@ -1095,8 +1104,9 @@ class _RemoteFWDram:
             logger.warning("KVCR refusing unresolvable start_write op=%d", op_handle)
             # No retry invitation from a stopping source: resolution fails here
             # even with good cached metadata, and we will not be around to serve.
-            metadata = payload.get("target_agent_metadata")
-            retryable = not isinstance(metadata, bytes) and not progress._stop_requested
+            retryable = (
+                payload.target_agent_metadata is None and not progress._stop_requested
+            )
             self._refuse_start_write(
                 progress, payload, op_handle, "metadata_required" if retryable else None
             )
@@ -1106,22 +1116,23 @@ class _RemoteFWDram:
     def _refuse_start_write(
         self,
         progress: _KVCRProgress,
-        payload: Mapping[str, Any],
+        payload: _PeerMessage,
         op_handle: OpHandle,
         reason: str | None,
     ) -> None:
-        reply_to = payload.get("sender_control_endpoint")
-        reflected_self = payload.get("source_control_endpoint")
-        if not isinstance(reply_to, str) or not isinstance(reflected_self, str):
+        reply_to = payload.sender_control_endpoint
+        reflected_self = payload.source_control_endpoint
+        if reply_to is None or reflected_self is None:
             return
-        response = {
-            "type": "write_refused",
-            "sender_control_endpoint": reflected_self,
-            "op_handle": op_handle,
-        }
-        if reason is not None:
-            response["reason"] = reason
-        self._send_control(progress, reply_to, response)
+        self._send_control(
+            progress,
+            reply_to,
+            _WriteRefused(
+                sender_control_endpoint=reflected_self,
+                op_handle=op_handle,
+                reason=reason,
+            ),
+        )
 
     # Shared framework-pin coordination.
 
@@ -1612,22 +1623,24 @@ class _RemoteFWDram:
     def _remote_agent(
         self,
         progress: _KVCRProgress,
-        payload: Mapping[str, Any],
+        payload: _PeerMessage,
         fallback_target: str | None = None,
     ) -> tuple[str, str]:
         if progress._stop_requested:
             raise RuntimeError("KVCR progress is stopping")
         kvcr = self._kvcr
         agent = progress.nixl_agent
-        target_agent = payload.get("target_agent", fallback_target)
-        if not isinstance(target_agent, str) or not target_agent:
+        target_agent = payload.target_agent
+        if target_agent is msgspec.UNSET:
+            target_agent = fallback_target
+        if not target_agent:
             raise TypeError("missing target agent")
-        target_metadata = payload.get("target_agent_metadata")
-        regions = (
-            msgspec.convert(payload.get("target_regions", ({}, {})), type=_RegionMaps)
-            if isinstance(target_metadata, bytes)
-            else None
-        )
+        target_metadata = payload.target_agent_metadata
+        regions = None
+        if target_metadata is not None:
+            regions = payload.target_regions
+            if regions is msgspec.UNSET:
+                regions = ({}, {})
         if regions is not None:
             if any(
                 name != region.label
@@ -1651,7 +1664,7 @@ class _RemoteFWDram:
             cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
             cached_metadata, remote_agent, cached_regions = cached
-            if not isinstance(target_metadata, bytes) or (
+            if target_metadata is None or (
                 target_metadata == cached_metadata and regions == cached_regions
             ):
                 reused_at = kvcr._timer()
@@ -1669,7 +1682,7 @@ class _RemoteFWDram:
             )
         started_at = kvcr._timer()
         try:
-            if not isinstance(target_metadata, bytes):
+            if target_metadata is None:
                 raise TypeError("missing target agent metadata")
             remote_agent = agent.add_remote_agent(target_metadata)
             if isinstance(remote_agent, bytes):

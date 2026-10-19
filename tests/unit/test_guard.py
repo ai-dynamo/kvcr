@@ -46,6 +46,7 @@ from kvcr.recovery_journal import (
     _RecoveryBlock,
     _RecoveryMirror,
 )
+from kvcr.remote_ops import _WriteProbe
 from kvcr.types import BlockKey, RegionDescriptor
 
 _TEST_SPEC = KVCRPoolSpec(
@@ -517,20 +518,20 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # Speculative serving cannot certify death, but the same core must
         # publish the tombstone once pidfd confirms the primary has exited.
         backend = cores[0]._remote_fw_dram
-        probe = {
-            "target_agent": "target",
-            "op_handle": 1,
-            "sender_control_endpoint": "tcp://target:1",
-            "source_control_endpoint": "tcp://source:1",
-            "source_incarnation": "primary",
-        }
+        probe = _WriteProbe(
+            target_agent="target",
+            op_handle=1,
+            sender_control_endpoint="tcp://target:1",
+            source_control_endpoint="tcp://source:1",
+            source_incarnation="primary",
+        )
         backend._dangling_ops.handle_probe(Mock(), probe)
-        assert "dead_incarnation" not in backend._send_control.call_args.args[2]
+        assert backend._send_control.call_args.args[2].dead_incarnation is None
         guard._pool_lease.poll_pidfd.return_value = select.POLLIN
         guard._observe_holder()
         assert guard._core is cores[0] and len(cores) == 1
         backend._dangling_ops.handle_probe(Mock(), probe)
-        assert backend._send_control.call_args.args[2]["dead_incarnation"] == "primary"
+        assert backend._send_control.call_args.args[2].dead_incarnation == "primary"
 
         # A replacement claims the pool. What is kept must be what a replay
         # gives: the half-written G2 slot is dropped, and the G3 halves are
