@@ -188,8 +188,7 @@ class _G3:
         self._config = config
         self._paths = paths
         self._slot_size = slot_size
-        # Round each file down so allocation stays within its requested budget
-        # and every registered byte belongs to a complete, page-aligned slot.
+        # Round down to complete slots within the per-file budget.
         self._bytes_per_file = slots_per_file * slot_size
         self._owner_fds: list[int] = []
         self._direct_fds: list[int] = []
