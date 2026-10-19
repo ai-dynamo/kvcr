@@ -5,7 +5,6 @@
 import time
 import uuid
 from dataclasses import dataclass, replace
-from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from .core import logger
@@ -31,6 +30,7 @@ class _SourceWriteStatus:
     cancel_requested: bool = False
     cancel_deadline: float | None = None
     abandoned: bool = False
+    completed_indices: tuple[int, ...] = ()
 
 
 class _DanglingOps:
@@ -77,9 +77,7 @@ class _DanglingOps:
                 op.deadline
                 + (config.abandon_timeout_ms - config.operation_timeout_ms) / 1000
             )
-            self._backend._send_write_done(
-                progress, op.remote_agent, op.op_handle, False, terminal=False
-            )
+            op.notify_failure(progress, terminal=False)
         result = progress.poll_transfer(
             cast(int, op.transfer_id), require_completion=True
         )
@@ -95,6 +93,12 @@ class _DanglingOps:
         return result
 
     def finish_source(self, op: "_SourceWriteOp") -> None:
+        if op.success and not op.terminal:
+            # A completed wave is quiescent, but the request can still await pieces.
+            status = self.source_writes[(op.route[0], op.op_handle)]
+            status.completed_indices += op.completed_indices
+            status.submitted = False
+            return
         status = self.source_writes.pop((op.route[0], op.op_handle), None)
         if status is not None and status.abandoned:
             self.report_source(op, "quiesced")
@@ -149,7 +153,9 @@ class _DanglingOps:
                         label=ref.label,
                         element_index=ref.element_index,
                     )
-                    for ref in chain.from_iterable(op.dst_descriptors)
+                    for key, descriptors in zip(op.ordered_keys, op.dst_descriptors)
+                    if key not in op.completed_keys
+                    for ref in descriptors
                 ],
                 destination_owner="kvcr" if op.local_fill else "framework",
             )
@@ -197,6 +203,7 @@ class _DanglingOps:
             "op_handle": handle,
             "terminal": expected in (None, self.incarnation)
             and (status is None or not status.submitted),
+            "confirmed_indices": status.completed_indices if status is not None else (),
         }
         if expected and expected in self.dead_incarnations:
             response["dead_incarnation"] = expected
@@ -228,4 +235,7 @@ class _DanglingOps:
             self.sources[endpoint] = incarnation
             self._backend._refused_writes[("target", handle)] = {"success": False}
         elif expected == incarnation and terminal:
-            self._backend._refused_writes[("target", handle)] = {"success": False}
+            self._backend._refused_writes[("target", handle)] = {
+                "success": False,
+                "confirmed_indices": payload.get("confirmed_indices", []),
+            }
