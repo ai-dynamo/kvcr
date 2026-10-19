@@ -13,7 +13,8 @@ from .types import MemoryRef, OpHandle, TransferError
 
 if TYPE_CHECKING:
     from .progress import _KVCRProgress
-    from .remote_fw_dram import _RemoteFWDram, _SourceWriteOp, _TargetPullOp
+    from .remote_fw_dram import _RemoteFWDram
+    from .remote_ops import _SourceWriteOp, _TargetPullOp
 
 
 def _log_resilience_event(error: Exception) -> None:
