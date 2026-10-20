@@ -8,8 +8,6 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
-      # TODO: remove before merging; temporary trigger for testing this branch.
-      - "oandreeva/kvcr-gpu-2-smoke"
     paths:
       - .github/workflows/docker-build.yml
       - Dockerfile.ci
