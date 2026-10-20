@@ -77,9 +77,11 @@ def test_repeated_events_reuse_attributes_and_preserve_snapshots(recording):
     assert [int(e["transfer_id"]) for e in events] == [1, 2]
 
 
-def test_reentrant_emission_does_not_overwrite_outer_payload(recording):
+@pytest.mark.parametrize("context", [False, True], ids=["compact", "context"])
+def test_reentrant_emission_does_not_overwrite_outer_payload(recording, context):
     tracer = _nvtx.create_tracer()
-    outer, inner = tracer.lifecycle(), tracer.lifecycle()
+    name = "request.context" if context else "nixl.done_observed"
+    field = "requested_blocks" if context else "transfer_id"
     original = recording.mark
     entering = False
 
@@ -87,20 +89,29 @@ def test_reentrant_emission_does_not_overwrite_outer_payload(recording):
         nonlocal entering
         if not entering:
             entering = True
-            inner.mark("nixl.done_observed", transfer_id=22)
+            tracer._emit(
+                name,
+                22,
+                {} if context else {field: 22},
+                context=context,
+                method=tracer.domain.mark,
+            )
             entering = False
         original(attrs)
 
     recording.mark = reenter
-    outer.mark("nixl.done_observed", transfer_id=11)
-    events = payloads(recording, "nixl.done_observed")
-    assert [int(e["transfer_id"]) for e in events] == [22, 11]
-    assert [int(e["trace_id"]) for e in events] == [inner.trace_id, outer.trace_id]
+    tracer._emit(name, 11, {field: 11}, context=context, method=tracer.domain.mark)
+    assert [(int(p["trace_id"]), int(p[field])) for _, _, p, _ in recording.events] == [
+        (22, -1 if context else 22),
+        (11, 11),
+    ]
 
 
-def test_concurrent_emission_owns_separate_payload_storage(recording):
+@pytest.mark.parametrize("context", [False, True], ids=["compact", "context"])
+def test_concurrent_emission_owns_separate_payload_storage(recording, context):
     tracer = _nvtx.create_tracer()
-    first, second = tracer.lifecycle(), tracer.lifecycle()
+    name = "request.context" if context else "nixl.done_observed"
+    field = "requested_blocks" if context else "transfer_id"
     barrier = threading.Barrier(2)
     original = recording.mark
 
@@ -111,21 +122,23 @@ def test_concurrent_emission_owns_separate_payload_storage(recording):
     recording.mark = overlap
     threads = [
         threading.Thread(
-            target=trace.mark,
-            args=("nixl.done_observed",),
-            kwargs={"transfer_id": value},
+            target=tracer._emit,
+            args=(name, identity, fields),
+            kwargs={"context": context, "method": tracer.domain.mark},
         )
-        for trace, value in ((first, 11), (second, 22))
+        for identity, fields in (
+            (11, {field: 11}),
+            (22, {} if context else {field: 22}),
+        )
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=5)
         assert not thread.is_alive()
-    events = payloads(recording, "nixl.done_observed")
-    assert {(int(e["trace_id"]), int(e["transfer_id"])) for e in events} == {
-        (first.trace_id, 11),
-        (second.trace_id, 22),
+    assert {(int(p["trace_id"]), int(p[field])) for _, _, p, _ in recording.events} == {
+        (11, 11),
+        (22, -1 if context else 22),
     }
 
 
@@ -207,61 +220,3 @@ def test_context_recovers_after_partial_assignment_failure(recording):
     assert int(payload["request_known"]) == 0
     assert int(payload["requested_blocks"]) == -1
     assert payload["value_utf8"].tobytes() == bytes(256)
-
-
-def test_reentrant_context_retains_outer_snapshot(recording):
-    tracer = _nvtx.create_tracer()
-    original = recording.mark
-    entering = False
-
-    def reenter(attrs):
-        nonlocal entering
-        if not entering:
-            entering = True
-            tracer._emit(
-                "request.context", 22, {}, context=True, method=tracer.domain.mark
-            )
-            entering = False
-        original(attrs)
-
-    recording.mark = reenter
-    tracer._emit(
-        "request.context",
-        11,
-        dict(requested_blocks=16),
-        context=True,
-        method=tracer.domain.mark,
-    )
-    snapshots = [e[2] for e in recording.events]
-    assert [(int(p["trace_id"]), int(p["requested_blocks"])) for p in snapshots] == [
-        (22, -1),
-        (11, 16),
-    ]
-
-
-def test_concurrent_contexts_have_independent_defaults(recording):
-    tracer = _nvtx.create_tracer()
-    barrier = threading.Barrier(2)
-    original = recording.mark
-
-    def overlap(attrs):
-        barrier.wait(timeout=5)
-        original(attrs)
-
-    recording.mark = overlap
-    threads = [
-        threading.Thread(
-            target=tracer._emit,
-            args=("request.context", identity, fields),
-            kwargs={"context": True, "method": tracer.domain.mark},
-        )
-        for identity, fields in ((11, dict(requested_blocks=16)), (22, {}))
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
-        assert not thread.is_alive()
-    assert {
-        (int(e[2]["trace_id"]), int(e[2]["requested_blocks"])) for e in recording.events
-    } == {(11, 16), (22, -1)}
