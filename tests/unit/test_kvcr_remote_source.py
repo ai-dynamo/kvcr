@@ -1535,3 +1535,67 @@ def test_route_setup_propagates_cleanup_errors(message_type) -> None:
     assert str(error.value.__cause__) == "route busy"
     assert sticky.remote_agents == [b"gen-1"]
     assert tier._route_generation == {}
+
+
+@pytest.mark.parametrize(
+    "incarnation,with_metadata,stopping,reason",
+    [
+        ("old", False, False, "metadata_required"),
+        ("old", True, False, "source_restarted"),
+        ("unknown", False, False, "metadata_required"),
+        ("unknown", True, False, "source_restarted"),
+        ("guard", False, True, None),
+        ("guard", True, False, None),
+    ],
+)
+def test_start_write_refusal_names_why(incarnation, with_metadata, stopping, reason):
+    """Missing metadata, or a quote of some other process, is refused over
+    control with a reason before anything is submitted; a stopping source
+    refuses without one, and our own quote with metadata is served."""
+    agent = FakeNixlAgent(metadata=b"guard-md")
+    control = FakeBytesControl("tcp://guard:1")
+    source = _new_kvcr(agent, FakePrimaryPinning(), control, name="guard")
+    tier = source._core._remote_fw_dram
+    tier._dangling_ops.incarnation = "guard"
+    tier._dangling_ops.dead_incarnations.add("old")
+    payload = msgspec.msgpack.decode(
+        _start_write_message(17, b"k", target_agent="target")
+    )
+    payload.update(
+        sender_control_endpoint="tcp://target:1",
+        source_control_endpoint="tcp://guard:1",
+        source_incarnation=incarnation,
+    )
+    if not with_metadata:
+        del payload["target_agent_metadata"]
+    progress = source._core._progress
+    delivered = []
+
+    def recv():  # Stop and the request land in one poll, on the progress thread.
+        if delivered:
+            return []
+        delivered.append(True)
+        progress._stop_requested = stopping
+        return [msgspec.msgpack.encode(payload)]
+
+    def refusals():
+        return [
+            message
+            for _, raw in control.sent
+            if (message := _decode_control_message(raw))["type"] == "write_refused"
+        ]
+
+    control.recv = recv
+    if stopping:
+        _wait_until(lambda: not progress._thread.is_alive())
+    elif reason:
+        _wait_until(lambda: bool(refusals()))  # A metadata ACK may go out first.
+    else:
+        _wait_until(lambda: bool(tier._dangling_ops.source_writes))
+
+    refusals = refusals()
+    assert [(m.get("reason"), m["sender_incarnation"]) for m in refusals] == (
+        [(reason, "guard")] if reason or stopping else []
+    )
+    assert not agent.sent_notifs
+    assert bool(tier._dangling_ops.source_writes) is (reason is None and not stopping)

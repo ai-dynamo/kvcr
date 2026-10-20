@@ -116,6 +116,7 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    retried: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -124,10 +125,30 @@ class _TargetPullOp(_RemoteOp):
         now = backend._kvcr._clock()
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
-        if self.state is _TargetPullState.START_WRITE:
-            self.source_incarnation = backend._dangling_ops.sources.get(
-                self.remote_ctrl_ep
+        if (
+            self.state is _TargetPullState.WAITING_WRITE_DONE
+            and not self.retried
+            and isinstance(event, Mapping)
+            and isinstance(event.get("retry_metadata"), str)
+        ):
+            # Pre-submit refusal: nothing was written, so resend in this poll.
+            logger.debug(
+                "KVCR_EVENT metadata_refresh_retry op=%d endpoint=%s incarnation=%s",
+                self.op_id[1],
+                self.remote_ctrl_ep,
+                event["retry_metadata"],
             )
+            self.source_incarnation = event["retry_metadata"]
+            self.retried = True
+            self.state = _TargetPullState.START_WRITE
+        if self.state is _TargetPullState.START_WRITE:
+            if not self.retried:
+                self.source_incarnation = backend._dangling_ops.sources.get(
+                    self.remote_ctrl_ep
+                )
+            else:
+                # A stale ACK from the dead peer may have re-acked the endpoint.
+                backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
             if now >= self.deadline:
                 self.success = False
                 self.state = _TargetPullState.FINISHED
@@ -540,7 +561,7 @@ class _RemoteFWDram:
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
-        self._refused_writes: dict[_OpId, dict[str, bool]] = {}
+        self._refused_writes: dict[_OpId, dict[str, Any]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
@@ -877,7 +898,10 @@ class _RemoteFWDram:
         # Only terminal notifications outrank a refusal for the same operation.
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
-            if not events.get(op_id, {}).get("terminal"):
+            native = events.get(op_id, {})
+            if not native.get("terminal") and not (
+                refusal.get("retry_metadata") and native.get("cancelled")
+            ):
                 events[op_id] = refusal
         self._refused_writes.clear()
         observed_work |= bool(events)
@@ -1019,16 +1043,31 @@ class _RemoteFWDram:
         if not isinstance(endpoint, str) or type(op_handle) is not int:
             return
         op = progress._in_flight_ops.get(("target", op_handle))
-        if getattr(op, "remote_ctrl_ep", None) != endpoint:
+        if not isinstance(op, _TargetPullOp) or op.remote_ctrl_ep != endpoint:
             return
         # Whatever answered is not the process our metadata was loaded into, so
         # drop the snapshot and let the next request republish it.
         self._invalidate_control_peer(endpoint)
         # Refresh the generation for future writes, not already in-flight ones.
         # A delayed refusal must not evict a generation learned after this op.
-        refused_incarnation = getattr(op, "source_incarnation", None)
+        refused_incarnation = op.source_incarnation
         if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
             self._dangling_ops.sources.pop(endpoint, None)
+        incarnation = payload.get("sender_incarnation")
+        if (
+            payload.get("reason") in ("metadata_required", "source_restarted")
+            and isinstance(incarnation, str)
+            and incarnation
+            and not op.retried
+            and op.state is _TargetPullState.WAITING_WRITE_DONE
+            and not progress._stop_requested
+            and self._kvcr._clock() < op.deadline
+        ):
+            self._refused_writes[("target", op_handle)] = {
+                "terminal": False,
+                "retry_metadata": incarnation,
+            }
+            return
         # A refusal is only sent before a write is submitted, so it is as terminal as a
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
@@ -1156,19 +1195,14 @@ class _RemoteFWDram:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.get("source_incarnation")
-        if (
-            progress._stop_requested
-            or not self._dangling_ops.check_source_progress()
-            or (expected is not None and expected != self._dangling_ops.incarnation)
-        ):
+        if isinstance(expected, str) and expected != self._dangling_ops.incarnation:
+            # Another process was quoted: refuse pre-submit so the target retries
+            # once quoting us, instead of failing the request natively.
+            self._refuse_start_write(progress, payload, op_handle, "source_restarted")
+            return
+        if progress._stop_requested or not self._dangling_ops.check_source_progress():
             if logger.isEnabledFor(logging.DEBUG):
-                reason = (
-                    "stopping"
-                    if progress._stop_requested
-                    else "source_stalled"
-                    if self._dangling_ops._source_stalled
-                    else "incarnation_mismatch"
-                )
+                reason = "stopping" if progress._stop_requested else "source_stalled"
                 logger.debug(
                     "KVCR_EVENT source_transfer_refused op=%d target=%s "
                     "blocks=%d reason=%s expected_incarnation=%s incarnation=%s",
@@ -1423,20 +1457,35 @@ class _RemoteFWDram:
             # Refusing over the control channel is the only way this operation
             # ever reaches a terminal.
             logger.warning("KVCR refusing unresolvable start_write op=%d", op_handle)
-            reply_to = payload.get("sender_control_endpoint")
-            reflected_self = payload.get("source_control_endpoint")
-            if isinstance(reply_to, str) and isinstance(reflected_self, str):
-                self._send_control(
-                    progress,
-                    reply_to,
-                    {
-                        "type": "write_refused",
-                        "sender_control_endpoint": reflected_self,
-                        "op_handle": op_handle,
-                    },
-                )
+            # No retry invitation from a stopping source: resolution fails here
+            # even with good cached metadata, and we will not be around to serve.
+            metadata = payload.get("target_agent_metadata")
+            retryable = not isinstance(metadata, bytes) and not progress._stop_requested
+            self._refuse_start_write(
+                progress, payload, op_handle, "metadata_required" if retryable else None
+            )
             return
         self._send_write_done(progress, remote_agent, op_handle, False)
+
+    def _refuse_start_write(
+        self,
+        progress: _KVCRProgress,
+        payload: Mapping[str, Any],
+        op_handle: OpHandle,
+        reason: str | None,
+    ) -> None:
+        reply_to = payload.get("sender_control_endpoint")
+        reflected_self = payload.get("source_control_endpoint")
+        if not isinstance(reply_to, str) or not isinstance(reflected_self, str):
+            return
+        response = {
+            "type": "write_refused",
+            "sender_control_endpoint": reflected_self,
+            "op_handle": op_handle,
+        }
+        if reason is not None:
+            response["reason"] = reason
+        self._send_control(progress, reply_to, response)
 
     # Shared framework-pin coordination.
 
