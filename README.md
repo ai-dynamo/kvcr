@@ -90,6 +90,11 @@ more files. The default file backend is **POSIX with io_uring**; GDS_MT is an
 explicit option. Files can share one mounted RAID filesystem, which handles
 the physical drives.
 
+For a rebuildable cache across SSDs, we recommend one RAID0 mount, or separate
+RAID0 mounts per NUMA domain with instance paths and CPU/memory placement
+aligned for best-effort locality. See the
+[storage deployment guidance](examples/README.md#recommended-storage-deployment).
+
 See the [G3 example README](examples/README.md) for configuration, prerequisites,
 single-file and multi-file commands, a Kimi K3 cache-shape profile, and expected
 results. The standalone example validates cache transfers; full hybrid-model

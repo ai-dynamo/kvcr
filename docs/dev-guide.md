@@ -460,6 +460,14 @@ RAID volume. KVCR uses its existing slot-to-file mapping; the filesystem and
 RAID/block layer handle placement on physical drives. The changes for
 multi-pool keys do not add SSD placement or sharding.
 
+For a rebuildable cache across SSDs, we recommend one RAID0 volume and mount, or
+one RAID0 volume per NUMA domain with separate mounts. For best-effort NUMA
+locality, select an instance's G3 paths from its local mount and align CPU,
+buffer-allocation, and GPU affinity where applicable. Configuring paths from
+several NUMA domains does not make KVCR's allocator NUMA-aware. See the
+[storage deployment guidance](../examples/README.md#recommended-storage-deployment)
+for placement responsibilities and RAID0's lack of redundancy.
+
 The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
 pool sizes, spill, direct delivery, and DRAM refill without a model:
 

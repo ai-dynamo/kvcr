@@ -29,6 +29,40 @@ flowchart LR
 The filesystem and RAID/block layer manage physical drives. This feature uses
 G3's existing file-slot mapping and adds no SSD placement policy.
 
+## Recommended storage deployment
+
+For a rebuildable local G3 cache using several SSDs, we recommend RAID0 with a
+filesystem supporting direct I/O. Choose the layout for the host topology:
+
+| Layout | Mounts | Placement |
+| --- | --- | --- |
+| One RAID0 volume across the selected SSDs | One mount, such as `/mnt/kvcr` | Put the instance's G3 files on this mount. This is the simplest deployment; a volume spanning NUMA domains may use cross-domain I/O paths. |
+| One RAID0 volume per NUMA domain, using SSDs local to that domain | Separate mounts, such as `/mnt/kvcr-numa0` and `/mnt/kvcr-numa1` | Configure each KVCR instance's files on the mount closest to its DRAM buffers and GPU, where applicable. This provides best-effort locality. |
+
+For the NUMA layout, align worker and I/O-thread CPU affinity and DRAM/staging
+memory placement with the selected domain. Apply memory placement where the
+buffers are allocated, including the Guard service when it owns the pools.
+For GPU I/O, also inspect GPU-to-NVMe PCIe affinity. A mount path alone does
+not bind CPUs or memory, and a DRAM pool name does not identify a NUMA domain.
+
+KVCR currently allocates across all configured G3 paths without a NUMA
+preference. To preserve the intended locality, give an instance paths from
+its selected mount. Listing files from both NUMA mounts in one instance does
+not provide automatic local-first allocation. Separate instances can share
+a mount using distinct, exclusively owned cache files. Automatic topology
+selection and cross-domain placement remain outside this change.
+
+One or more G3 files can live under each selected mount; the filesystem and
+RAID layer stripe their contents across that volume's SSDs. Operators provision
+the arrays and mounts before starting KVCR. RAID0 has no redundancy, so use
+this recommendation for cache data that can be regenerated after storage loss.
+
+This deployment recommendation follows the topology considerations in the
+[NVIDIA GDS configuration guide](https://docs.nvidia.com/gpudirect-storage/configuration-guide/index.html).
+See also the [Linux RAID documentation](https://docs.kernel.org/admin-guide/md.html).
+Measure throughput and serving latency on the target topology and file backend;
+the local probe runs documented below have not validated RAID0 or NUMA locality.
+
 ## Prerequisites
 
 - Linux, Python 3.10+, and a KVCR development installation. From the repository
