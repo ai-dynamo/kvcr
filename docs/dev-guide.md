@@ -452,11 +452,28 @@ pool sizes, spill, direct delivery, and DRAM refill without a model:
 PYTHONPATH=src python3 examples/g3_multi_pool.py --backend GDS_MT --directory /path/to/local/ssd
 # For a NIXL build with the POSIX plugin:
 PYTHONPATH=src python3 examples/g3_multi_pool.py --backend POSIX --directory /path/to/local/ssd
+# Requires vLLM and Torch; computes cache shapes without loading model weights:
+PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --backend GDS_MT --directory /path/to/local/ssd
 ```
 
 The probe uses fresh temporary files and checks every returned byte. It requires
 NIXL's UCX and selected file plugin; GDS_MT also requires working cuFile/CUDA
 initialization even though the buffers in this probe are DRAM.
+
+The `kimi-k3` profile uses cache parameters from the
+[Kimi K3 configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)
+and the installed vLLM `MLAAttentionSpec`, `MambaSpec`, and KDA shape/dtype
+calculators. With TP=1, 64-token BF16 MLA blocks, BF16 convolution state,
+FP32 recurrent state, and no speculative decoding or RecoverSSM, the per-layer
+pieces are 73,728 bytes for MLA and 6,512,640 bytes for a KDA snapshot. This is
+a cache-byte round trip, not an end-to-end model or vLLM adapter test. Group
+packing, checkpoint eligibility, tensor parallelism, and cache dtype can change
+the pieces a serving adapter must export.
+
+Some DeepSeek V4 packed layouts do not satisfy the page-alignment requirement.
+For example, a 256-token CSA block with compression ratio 4, 584 bytes per
+state, and 576-byte layout alignment occupies 37,440 bytes. Such pieces need
+an additional layout/padding solution before this G3 path can accept them.
 
 The vLLM adapter uses one unnamed pool per Guard, so start the guard service with
 one pool size, for example `--pool-sizes-gb 48`.

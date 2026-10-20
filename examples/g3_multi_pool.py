@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import mmap
 import time
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +15,42 @@ from kvcr import KVCR, KVCRBindings
 from kvcr.config import G3Options, KVCRBackendConfigs, KVCRConfig, LocalDramOptions
 from kvcr.types import BlockKey, CacheTier, MemoryRef, QueryStatus, RegionDescriptor
 
-LAYOUT = ["full", "swa:a", "swa:b"]
+
+def profile(name):
+    if name == "synthetic":
+        return {"full": 2 * mmap.PAGESIZE, "swa": mmap.PAGESIZE}, [
+            "full",
+            "swa:a",
+            "swa:b",
+        ]
+
+    # Cache-only Kimi K3 configuration, TP=1, 64-token MLA blocks, no speculative
+    # decoding or RecoverSSM. No model code or weights are downloaded.
+    # https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json
+    import torch
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+    mla = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512 + 64,
+        dtype=torch.bfloat16,
+    )
+    kda = MambaSpec(
+        block_size=64,
+        shapes=MambaStateShapeCalculator.kda_state_shape(
+            1, 96, 128, conv_kernel_size=4, num_spec=0
+        ),
+        dtypes=MambaStateDtypeCalculator.kda_state_dtype(
+            torch.bfloat16, "auto", "auto"
+        ),
+    )
+    print("Kimi K3 cache-only profile: TP=1, BF16 MLA, BF16 conv / FP32 recurrent.")
+    return {"mla": mla.page_size_bytes, "kda": kda.page_size_bytes}, ["mla", "kda"]
 
 
 def wait(kvcr, handle):
@@ -29,29 +65,37 @@ def wait(kvcr, handle):
     raise TimeoutError(f"Operation {handle} did not complete")
 
 
-def refs(index):
-    return [
-        MemoryRef(
-            end_point_name="hybrid-g3-demo", label=LAYOUT[0], element_index=index
-        ),
-        MemoryRef(
-            end_point_name="hybrid-g3-demo", label=LAYOUT[1], element_index=2 * index
-        ),
-        MemoryRef(
-            end_point_name="hybrid-g3-demo",
-            label=LAYOUT[2],
-            element_index=2 * index + 1,
-        ),
-    ]
+def refs(index, layout):
+    counts = Counter(label.partition(":")[0] for label in layout)
+    offsets = Counter()
+    result = []
+    for label in layout:
+        pool = label.partition(":")[0]
+        result.append(
+            MemoryRef(
+                end_point_name="hybrid-g3-demo",
+                label=label,
+                element_index=index * counts[pool] + offsets[pool],
+            )
+        )
+        offsets[pool] += 1
+    return result
 
 
-def run(directory, backend):
-    page = mmap.PAGESIZE
-    sizes = {"full": 2 * page, "swa": page}
+def run(directory, backend, profile_name="synthetic"):
+    sizes, layout = profile(profile_name)
+    counts = Counter(label.partition(":")[0] for label in layout)
+    key_bytes = sum(sizes[label.partition(":")[0]] for label in layout)
     with ExitStack() as stack:
         # Anonymous mmaps provide page-aligned buffers for direct file I/O.
-        primary = {name: stack.enter_context(mmap.mmap(-1, 6 * page)) for name in sizes}
-        local = {name: stack.enter_context(mmap.mmap(-1, 2 * page)) for name in sizes}
+        primary = {
+            name: stack.enter_context(mmap.mmap(-1, 3 * counts[name] * size))
+            for name, size in sizes.items()
+        }
+        local = {
+            name: stack.enter_context(mmap.mmap(-1, counts[name] * size))
+            for name, size in sizes.items()
+        }
 
         def address(buffer):
             return ctypes.addressof(ctypes.c_char.from_buffer(buffer))
@@ -78,7 +122,9 @@ def run(directory, backend):
                         addr=address(primary[name]),
                         size=size,
                         count=len(primary[name]) // size,
-                        label="swa:*" if name == "swa" else name,
+                        label=f"{name}:*"
+                        if any(label.startswith(f"{name}:") for label in layout)
+                        else name,
                     )
                     for name, size in sizes.items()
                 ],
@@ -87,43 +133,61 @@ def run(directory, backend):
                 ),
                 g3=G3Options(
                     paths=(directory / "hybrid.data",),
-                    capacity_bytes_per_file=8 * page,
+                    capacity_bytes_per_file=2 * key_bytes,
                     backend=backend,
                 ),
             ),
         )
         stack.callback(kvcr.close)
-        primary["full"][: 4 * page] = b"f" * (2 * page) + b"F" * (2 * page)
-        primary["swa"][: 4 * page] = (
-            b"a" * page + b"b" * page + b"A" * page + b"B" * page
-        )
+        expected = {}
+        for key_index in range(2):
+            for piece_index, ref in enumerate(refs(key_index, layout)):
+                pool = ref.label.partition(":")[0]
+                size = sizes[pool]
+                data = bytes([key_index * 16 + piece_index + 1]) * size
+                offset = ref.element_index * size
+                primary[pool][offset : offset + size] = data
+                expected[key_index, ref.label, piece_index] = data
         first, second = BlockKey(b"first"), BlockKey(b"second")
         print(f"Backend: {backend}; file: {directory / 'hybrid.data'}", flush=True)
-        print(f"Pools: full={2 * page} bytes, swa={page} bytes; layout={LAYOUT}")
-        wait(kvcr, kvcr.deposit({first: refs(0)}))
-        wait(kvcr, kvcr.deposit({second: refs(1)}))
+        print(f"Profile: {profile_name}; pool bytes={sizes}; layout={layout}")
+        wait(kvcr, kvcr.deposit({first: refs(0, layout)}))
+        wait(kvcr, kvcr.deposit({second: refs(1, layout)}))
         assert kvcr.query([first]) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
         print("1. Deposited two keys: first spilled from DRAM to G3.", flush=True)
 
-        wait(kvcr, kvcr.deliver({first: refs(2)}))
-        assert primary["full"][4 * page :] == b"f" * (2 * page)
-        assert primary["swa"][4 * page :] == b"a" * page + b"b" * page
-        print("2. Read G3 into primary buffers: all three pieces match.", flush=True)
+        wait(kvcr, kvcr.deliver({first: refs(2, layout)}))
+        for index, ref in enumerate(refs(2, layout)):
+            pool = ref.label.partition(":")[0]
+            offset = ref.element_index * sizes[pool]
+            assert (
+                primary[pool][offset : offset + sizes[pool]]
+                == expected[0, ref.label, index]
+            )
+        print("2. Read G3 into primary buffers: every piece matches.", flush=True)
 
-        handle = kvcr.fetch([first], expected_layout=LAYOUT)
+        handle = kvcr.fetch([first], expected_layout=layout)
         result = wait(kvcr, handle)[first]
-        assert local["full"][:] == b"f" * (2 * page)
-        assert local["swa"][:] == b"a" * page + b"b" * page
+        for index, ref in enumerate(result.descriptors):
+            pool = ref.label.partition(":")[0]
+            offset = ref.element_index * sizes[pool]
+            assert (
+                local[pool][offset : offset + sizes[pool]]
+                == expected[0, ref.label, index]
+            )
         kvcr.release([result.release_handle])
-        print("3. Refilled both DRAM pools from G3: all bytes match.", flush=True)
+        print("3. Refilled DRAM pools from G3: all bytes match.", flush=True)
         print("PASS: multi-pool DRAM -> G3 -> primary / DRAM round trip.", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", default="GDS_MT")
+    parser.add_argument(
+        "--profile", choices=("synthetic", "kimi-k3"), default="synthetic"
+    )
     parser.add_argument("--directory", type=Path, default=Path("/tmp"))
     args = parser.parse_args()
     # Use fresh files, so this demo never alters another KVCR's disk cache.
     with TemporaryDirectory(prefix="kvcr-multi-pool-", dir=args.directory) as temp:
-        run(Path(temp), args.backend)
+        run(Path(temp), args.backend, args.profile)
