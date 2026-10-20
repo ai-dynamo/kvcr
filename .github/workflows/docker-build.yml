@@ -10,6 +10,11 @@ on:
       - "pull-request/[0-9]+"
       # TODO: remove before merging; temporary trigger for testing this branch.
       - "oandreeva/kvcr-gpu-2-smoke"
+    paths:
+      - .github/workflows/docker-build.yml
+      - Dockerfile.ci
+      - pyproject.toml
+      - src/**
   # Manual runs can override the base image, Dynamo version, and KVCR ref.
   workflow_dispatch:
     inputs:
@@ -44,6 +49,10 @@ jobs:
       AWS_DEFAULT_REGION: us-west-2
       ECR_REGISTRY: 210086341041.dkr.ecr.us-west-2.amazonaws.com
       ECR_REPOSITORY: ai-dynamo/kvcr
+      BUILDER_NAME: kvcr-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      image: ${{ steps.published.outputs.image }}
+      image_tag: ${{ steps.source.outputs.image_tag }}
     steps:
       - name: Check out CI recipe
         uses: actions/checkout@v4
@@ -54,7 +63,16 @@ jobs:
           ref: ${{ inputs.kvcr_ref || github.sha }}
           path: kvcr-source
 
+      - name: Inspect build environment
+        run: |
+          docker buildx version
+          aws --version
+          df -h
+
+      # Credentials come from the runner's IRSA role. buildx forwards them to the
+      # remote BuildKit pod, which performs the push.
       - name: Log in to ECR
+        shell: bash
         run: |
           set -euo pipefail
           aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
@@ -62,22 +80,19 @@ jobs:
 
       # Route the build to the shared BuildKit service. KVCR is built on top of a
       # vLLM image, so it uses the vllm flavor (and its layer cache pool).
+      # TODO: pin to a merged commit SHA once ai-dynamo/.github#9 lands.
       - name: Initialize shared BuildKit builder
+        id: builder
         uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@dillon/ops-8928-enable-kvcr-ci-image-builds-using-shared-buildkit
         with:
-          builder_name: kvcr-${{ github.run_id }}-${{ github.run_attempt }}
+          builder_name: ${{ env.BUILDER_NAME }}
           flavor: vllm
           arch: linux/amd64
           namespace: buildkit
 
-      - name: Inspect build environment
-        run: |
-          docker --version
-          docker buildx inspect
-          df -h
-
       - name: Resolve build inputs
         id: source
+        shell: bash
         env:
           BASE_IMAGE: ${{ inputs.base_image || 'vllm/vllm-openai:nightly' }}
         run: |
@@ -86,39 +101,56 @@ jobs:
           # Resolve the base tag to an immutable digest with a registry query; the
           # builder has no docker daemon, so nothing is pulled locally. BuildKit
           # pulls the base layers itself.
-          manifest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{.Manifest}}')
-          base_name=$(awk '/^Name:/ {print $2; exit}' <<< "$manifest")
-          base_digest=$(awk '/^Digest:/ {print $2; exit}' <<< "$manifest")
-          test -n "$base_name" && test -n "$base_digest"
-          base_repo="${base_name%@*}"
-          if [[ "${base_repo##*/}" == *:* ]]; then base_repo="${base_repo%:*}"; fi
-          base_image="${base_repo}@${base_digest}"
-          image_ref="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}"
-          printf 'kvcr_sha=%s\nbase_image=%s\nimage_ref=%s\n' \
-            "$kvcr_sha" "$base_image" "$image_ref" >> "$GITHUB_OUTPUT"
+          base_digest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')
+          base_name="${BASE_IMAGE%%@*}"
+          if [[ "${base_name##*/}" == *:* ]]; then
+            base_name="${base_name%:*}"
+          fi
+          base_image="${base_name}@${base_digest}"
+          image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}"
+          printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\n' \
+            "$kvcr_sha" "$base_image" "$image_tag" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push image
+      # Built on the shared BuildKit builder and pushed straight to ECR; nothing
+      # is loaded into a local docker daemon (the runner is a thin client without
+      # one).
+      - name: Build and publish integration image
+        id: build
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ env.BUILDER_NAME }}
           context: ./kvcr-source
           file: Dockerfile.ci
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.source.outputs.image_ref }}
+          load: false
+          tags: ${{ steps.source.outputs.image_tag }}
           build-args: |
             VLLM_IMAGE=${{ steps.source.outputs.base_image }}
             DYNAMO_VERSION=${{ inputs.dynamo_version || 'nightly' }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
 
-      - name: Verify pushed image
+      - name: Record published image
+        id: published
+        shell: bash
         env:
-          IMAGE_REF: ${{ steps.source.outputs.image_ref }}
+          IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "$IMAGE_REF"
+          : "${IMAGE_DIGEST:?Build did not return a published image digest}"
+          image="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
           {
-            echo "### KVCR integration image"
-            echo '```'
-            echo "$IMAGE_REF"
-            echo '```'
+            printf 'Published tag: `%s`\n\n' "$IMAGE_TAG"
+            printf 'Image for downstream tests: `%s`\n' "$image"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove builder configuration
+        if: always() && (steps.builder.outcome == 'success' || steps.builder.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          if docker buildx inspect "$BUILDER_NAME" > /dev/null 2>&1; then
+            docker buildx rm "$BUILDER_NAME"
+          fi

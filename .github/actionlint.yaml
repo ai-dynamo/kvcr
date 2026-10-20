@@ -1,0 +1,4 @@
+self-hosted-runner:
+  labels:
+    - prod-kvcr-builder-v1
+    - prod-kvcr-tester-amd-gpu-2-v1
