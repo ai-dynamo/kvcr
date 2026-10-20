@@ -108,14 +108,6 @@ consumes values synchronously; arrays are not shared between threads or
 reassigned through the attributes' payload setter. Older captures used schema 1
 pin payloads and schema 2 lifecycle payloads.
 
-The helper copies a read-only default context and assigns changing fields through
-a cached structured NumPy view. Available payload slots are pooled per thread;
-a slot returns to its pool only after the NVTX call returns, including on error.
-Lifecycle locks protect only range bookkeeping. Payload preparation and NVTX
-calls run outside those locks, so a slow native start cannot block another
-thread from claiming completion. An in-flight start closes its range when it
-returns if completion already claimed it. No recursive lock is required.
-
 | Field | Interpretation |
 | --- | --- |
 | `instance_hi`, `instance_lo` | Two uint64 halves of a UUID assigned to this KVCR tracer instance. |

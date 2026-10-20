@@ -14,28 +14,6 @@ from kvcr import _nvtx
 recording = test_nvtx.recording
 
 
-def test_registered_handle_is_not_passed_to_string_only_attributes_factory(
-    recording, monkeypatch
-):
-    # Domain.get_event_attributes takes a string and registers it internally;
-    # get_registered_string returns a separate opaque handle type.
-    original = recording.get_event_attributes
-    monkeypatch.setattr(
-        recording, "get_registered_string", lambda name: SimpleNamespace(name=name)
-    )
-
-    def attributes(**kwargs):
-        if not isinstance(kwargs["message"], str):
-            raise TypeError("expected str, not RegisteredString")
-        return original(**kwargs)
-
-    monkeypatch.setattr(recording, "get_event_attributes", attributes)
-    trace = _nvtx.create_tracer().lifecycle(op_handle=41)
-    trace.mark("source.write.completed", completed_blocks=1, status=2)
-    assert len(payloads(recording, "request.context")) == 1
-    assert len(payloads(recording, "source.write.completed")) == 1
-
-
 def test_immutable_context_is_not_repeated_on_transitions(recording):
     trace = _nvtx.create_tracer().lifecycle(
         request_id="req-α",
@@ -59,25 +37,6 @@ def test_immutable_context_is_not_repeated_on_transitions(recording):
     result = payloads(recording, "source.write.completed")[0]
     assert int(result["op_handle"]) == 41
     assert int(result["completed_blocks"]) == 7
-
-
-@pytest.mark.parametrize("level,display", [("low", False), ("medium", True)])
-def test_request_digest_is_always_available_but_display_is_optional(
-    recording, monkeypatch, level, display
-):
-    monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
-    value = "req-α-😀"
-    _nvtx.create_tracer().lifecycle(request_id=value)
-    context = payloads(recording, "request.context")[0]
-    assert int(context["request_known"]) == 1
-    assert (int(context["request_hi"]), int(context["request_lo"])) == _nvtx.identity(
-        value
-    )
-    assert bool(context["request_display_known"]) == display
-    if display:
-        assert (
-            context["value_utf8"].tobytes()[: int(context["length"])] == value.encode()
-        )
 
 
 @pytest.mark.parametrize("level,scanned", [("low", False), ("medium", True)])

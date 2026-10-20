@@ -24,7 +24,6 @@ from kvcr.types import BlockKey
 class RecordingDomain:
     def __init__(self):
         self.events = []
-        self.registered = set()
         self.stack = []
         self.fail = None
         self.ranges = {}
@@ -32,13 +31,14 @@ class RecordingDomain:
         self._next_range = 0
 
     def get_registered_string(self, message):
-        self.registered.add(message)
-        return message
+        return SimpleNamespace(name=message)
 
     def get_category_id(self, category):
         return 1
 
     def get_event_attributes(self, **kwargs):
+        if not isinstance(kwargs["message"], str):
+            raise TypeError("expected str, not RegisteredString")
         if self.fail == "attributes":
             raise RuntimeError("annotation failure")
         return SimpleNamespace(**kwargs)
@@ -86,6 +86,10 @@ def recording(monkeypatch):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", "low")
     monkeypatch.setattr(_nvtx, "_load_backend", lambda: (domain, np))
     return domain
+
+
+def spans(domain, name, kind="start"):
+    return [event for event in domain.events if event[0] == kind and event[1] == name]
 
 
 def payloads(domain, name):
@@ -161,7 +165,7 @@ def test_default_low_and_fresh_payloads(recording, monkeypatch):
     first.registered(0)
     second.registered(0)
     first.finish("success", completed_blocks=2)
-    second.finish("failed", reason="unknown")
+    second.finish("failed", reason=_nvtx.Reason.UNKNOWN)
     first.finish("cancelled")
     registered = payloads(recording, "source.pin.registered")
     completed = payloads(recording, "source.pin.completed")
@@ -189,6 +193,8 @@ def test_annotation_failures_preserve_pin_callback_and_release(recording, failur
 def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording):
     source, agent, pinning = make_source(recording, (9, 10))
     assert len(pinning.searches) == 1
+    assert len(spans(recording, "source.pin.wait")) == 1
+    assert not spans(recording, "source.pin.wait", "end")
     agent.state = "DONE"
     pinning.complete(0)
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
@@ -196,10 +202,13 @@ def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording):
     waiters = payloads(recording, "source.pin.waiter")
     completed = payloads(recording, "source.pin.completed")
     assert len(registered) == len(completed) == 1
+    assert len(waiters) == 2
     assert {int(p["op_handle"]) for p in waiters} == {9, 10}
     assert {int(p["pin_id"]) for p in waiters} == {int(registered[0]["pin_id"])}
     assert int(completed[0]["completed_blocks"]) == 1
     assert int(completed[0]["status"]) == int(_nvtx.Status.SUCCESS)
+    assert len(spans(recording, "source.pin.wait", "end")) == 1
+    assert 0 in recording.ended  # Zero is a valid native range ID.
     assert not recording.stack
 
 

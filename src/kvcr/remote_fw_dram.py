@@ -354,14 +354,7 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
-                    trace.mark(
-                        "source.write.completed",
-                        once=True,
-                        status=_nvtx.Status.FAILED,
-                        reason=failure_reason,
-                        completed_blocks=0,
-                        completed_bytes=0,
-                    )
+                    trace.complete_source(False, 0, reason=failure_reason)
                 return True, True
             if self.state is not _SourceWriteState.READY_TO_WRITE:
                 raise RuntimeError(f"KVCR source operation {self.op_id!r} is not ready")
@@ -458,14 +451,7 @@ class _SourceWriteOp(_RemoteOp):
                 self.state = _SourceWriteState.FINISHED
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
-                    trace.mark(
-                        "source.write.completed",
-                        once=True,
-                        status=_nvtx.Status.FAILED,
-                        reason=_nvtx.Reason.CREATE_ERROR,
-                        completed_blocks=0,
-                        completed_bytes=0,
-                    )
+                    trace.complete_source(False, 0, reason=_nvtx.Reason.CREATE_ERROR)
                 return True, True
 
         transfer_id = self.transfer_id
@@ -550,15 +536,12 @@ class _SourceWriteOp(_RemoteOp):
         )
         self._backend._dangling_ops.finish_source(self)
         if self.trace is not None:
-            self.trace.mark(
-                "source.write.completed",
-                once=True,
-                status=_nvtx.Status.FAILED,
+            self.trace.complete_source(
+                False,
+                0,
                 reason=self.trace.failure_reason
                 if self.trace.failure_reason is not _nvtx.Reason.UNKNOWN
                 else _nvtx.Reason.SHUTDOWN,
-                completed_blocks=0,
-                completed_bytes=0,
             )
         return True
 

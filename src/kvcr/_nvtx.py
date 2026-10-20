@@ -198,59 +198,38 @@ class _LifecycleTrace:
         self._fields = MappingProxyType(fields)
         self._observed = set()
         self.failure_reason = Reason.UNKNOWN
-        self._context_emitted = False
         self._ranges = {}
-        # Native calls run outside this lock; recursive acquisition is unnecessary.
         self._range_lock = Lock()
 
-    def start(self, name, *, range_key=None, category=None, **fields):
-        """Start an independent range, even when another trace overlaps it."""
-        key = (name, range_key)
-        # Identity keeps an in-flight start separate from a later restart.
-        entry = [None]
-        with self._range_lock:
-            if key in self._ranges:
-                return
-            self._ranges[key] = entry
+    def start(self, name, **fields):
+        """The owner finishes start before handing work to another thread.
+
+        Each source operation submits one native write. Source/native ranges
+        have distinct names; the operation state machine owns their lifetimes.
+        """
+        if name in self._ranges:
+            return
         try:
-            range_id = self.tracer._emit(
+            self._ranges[name] = self.tracer._emit(
                 name,
                 self.trace_id,
                 fields,
-                category=category,
                 method=self.tracer.domain.start_range,
             )
         except Exception:
-            with self._range_lock:
-                if self._ranges.get(key) is entry:
-                    self._ranges.pop(key, None)
-            return
+            pass
+
+    def end(self, name):
+        """Claim the ending once; zero is a valid native range ID."""
         with self._range_lock:
-            if self._ranges.get(key) is entry:
-                entry[0] = range_id
-                return
+            range_id = self._ranges.pop(name, None)
         if range_id is not None:
-            # An overlapping or reentrant end already claimed this start.
             try:
                 self.tracer.domain.end_range(range_id)
             except Exception:
                 pass
 
-    def end(self, name, *, range_key=None):
-        """Claim the ending once; zero is a valid native range ID."""
-        key = (name, range_key)
-        with self._range_lock:
-            entry = self._ranges.pop(key, None)
-        if entry is not None and entry[0] is not None:
-            try:
-                self.tracer.domain.end_range(entry[0])
-            except Exception:
-                pass
-
     def context(self, request_id):
-        if self._context_emitted:
-            return
-        self._context_emitted = True
         try:
             t = self.tracer
             values = dict(self._fields)
@@ -275,7 +254,7 @@ class _LifecycleTrace:
         except Exception:
             pass
 
-    def complete_source(self, success, blocks):
+    def complete_source(self, success, blocks, *, reason=None):
         requested = self._fields.get("requested_blocks", -1)
         status = Status.FAILED
         if success:
@@ -284,13 +263,15 @@ class _LifecycleTrace:
                 if blocks < requested
                 else Status.SUCCESS
             )
+        if reason is None:
+            reason = (
+                Reason.NONE if success and blocks >= requested else self.failure_reason
+            )
         self.mark(
             "source.write.completed",
             once=True,
             status=status,
-            reason=Reason.NONE
-            if success and blocks >= requested
-            else self.failure_reason,
+            reason=reason,
             completed_blocks=blocks if success else 0,
             completed_bytes=self._fields.get("selected_bytes", -1) if success else 0,
         )
