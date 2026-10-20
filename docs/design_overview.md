@@ -207,6 +207,7 @@ When the framework asks the KVCR whether a block is available, the KVCR responds
 - `MISS(None)` — not found in any tier the KVCR currently knows about
 
 These statuses describe current KVCR knowledge, not a reservation or guarantee. A local DRAM `HIT` may be evicted before a later operation claims it, and a `FETCHABLE` result for peer DRAM means a request-scoped router hint identifies a peer KVCR that may source the block. The peer may ultimately serve it from KVCR-owned or pinned framework-owned DRAM; actual readability is confirmed only when the transfer and any required `request_pin` succeed. Framework-owned HBM can follow the same path if a deployment exposes GPU KV through the pin API. The framework may use the query result to decide whether to issue either call. To obtain the data, the framework calls `fetch` or `deliver` and waits for completion; either operation may return an error.
+A remote `FETCHABLE` result also records a source preference for later deliveries of that key within the request.
 
 `query` is fast and non-blocking because it reads local KVCR knowledge rather than calling the router. Remote source information arrives through `submit_hint`. If a two-step `query` is enabled, it may enqueue a configured object-store existence check, but it does not allocate memory, acquire pins, change residency, or start a transfer. After the first `MISS`, the framework can issue a follow-up `query` to get an updated evaluation.
 

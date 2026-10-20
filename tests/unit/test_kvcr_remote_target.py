@@ -1235,8 +1235,11 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
 
 
 @pytest.mark.parametrize("select_with_query", [False, True])
-def test_kvcr_request_scoped_sources_survive_local_deposits(select_with_query):
-    agent = FakeNixlAgent(metadata=b"target-md")
+@pytest.mark.parametrize("fail_remote", [False, True])
+def test_kvcr_request_scoped_sources_survive_local_deposits(
+    select_with_query, fail_remote
+):
+    agent = _CopyingWriteAgent(metadata=b"target-md")
     control = FakeBytesControl()
     local = ctypes.create_string_buffer(32)
     framework = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
@@ -1301,13 +1304,22 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(select_with_query):
     delivered = kvcr.deliver({key: [_mem_descriptor(0, ":a")]}, "req-a")
     assert dict(_poll_until(kvcr, bool))[delivered][key].success
 
-    # Only successful staging switches an existing remote selection to local.
+    # A usable remote selection survives deposits until successful staging.
     rejected = kvcr.fetch([key], "req-b", expected_layout=[":a"])
     assert not dict(kvcr.poll_completed())[rejected][key].success
     assert kvcr.query([key], "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
     deposit = kvcr.deposit({key: [_mem_descriptor(1, ":b")]})
     assert dict(_poll_until(kvcr, bool))[deposit][key].success
     assert kvcr.query([key], "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    if fail_remote:
+        kvcr.submit_hint(_router_hint("tcp://different:1"), request_id="req-b")
+        assert kvcr.query([key], "req-b") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+        framework[:] = b"\0" * 32
+        delivered = kvcr.deliver(
+            {key: [_mem_descriptor(0, ":a"), _mem_descriptor(1, ":b")]}, "req-b"
+        )
+        assert dict(_poll_until(kvcr, bool))[delivered][key].success
+        assert framework.raw == b"a" * 16 + b"b" * 16
     staged = kvcr.fetch([key], "req-b", expected_layout=[":a", ":b"])
     claim = dict(kvcr.poll_completed())[staged][key].release_handle
     assert claim is not None
