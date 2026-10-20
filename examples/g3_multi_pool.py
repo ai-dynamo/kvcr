@@ -8,6 +8,7 @@ import mmap
 import time
 from collections import Counter
 from contextlib import ExitStack
+from math import gcd
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -82,10 +83,16 @@ def refs(index, layout):
     return result
 
 
-def run(directory, backend, profile_name="synthetic"):
+def run(directory, backend, profile_name="synthetic", file_count=1):
+    if file_count < 1:
+        raise ValueError("file count must be positive")
     sizes, layout = profile(profile_name)
     counts = Counter(label.partition(":")[0] for label in layout)
     key_bytes = sum(sizes[label.partition(":")[0]] for label in layout)
+    unit = gcd(*sizes.values())
+    key_units = key_bytes // unit
+    units_per_file = (2 * key_units + file_count - 1) // file_count
+    paths = tuple(directory / f"hybrid-{index}.data" for index in range(file_count))
     with ExitStack() as stack:
         # Anonymous mmaps provide page-aligned buffers for direct file I/O.
         primary = {
@@ -132,8 +139,8 @@ def run(directory, backend, profile_name="synthetic"):
                     [(name, address(buf), len(buf)) for name, buf in local.items()]
                 ),
                 g3=G3Options(
-                    paths=(directory / "hybrid.data",),
-                    capacity_bytes_per_file=2 * key_bytes,
+                    paths=paths,
+                    capacity_bytes_per_file=units_per_file * unit,
                     backend=backend,
                 ),
             ),
@@ -149,12 +156,16 @@ def run(directory, backend, profile_name="synthetic"):
                 primary[pool][offset : offset + size] = data
                 expected[key_index, ref.label, piece_index] = data
         first, second = BlockKey(b"first"), BlockKey(b"second")
-        print(f"Backend: {backend}; file: {directory / 'hybrid.data'}", flush=True)
+        print(f"Backend: {backend}; files: {file_count}; directory: {directory}")
+        print(f"Per-file capacity: {units_per_file * unit} bytes", flush=True)
         print(f"Profile: {profile_name}; pool bytes={sizes}; layout={layout}")
         wait(kvcr, kvcr.deposit({first: refs(0, layout)}))
         wait(kvcr, kvcr.deposit({second: refs(1, layout)}))
         assert kvcr.query([first]) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
         print("1. Deposited two keys: first spilled from DRAM to G3.", flush=True)
+        used = [path for path in paths if any(path.read_bytes())]
+        assert len(used) == min(file_count, key_units)
+        print(f"   Confirmed written payload in {len(used)}/{file_count} files.")
 
         wait(kvcr, kvcr.deliver({first: refs(2, layout)}))
         for index, ref in enumerate(refs(2, layout)):
@@ -183,11 +194,14 @@ def run(directory, backend, profile_name="synthetic"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", default="GDS_MT")
+    parser.add_argument("--files", type=int, default=1)
     parser.add_argument(
         "--profile", choices=("synthetic", "kimi-k3"), default="synthetic"
     )
     parser.add_argument("--directory", type=Path, default=Path("/tmp"))
     args = parser.parse_args()
+    if args.files < 1:
+        parser.error("--files must be positive")
     # Use fresh files, so this demo never alters another KVCR's disk cache.
     with TemporaryDirectory(prefix="kvcr-multi-pool-", dir=args.directory) as temp:
-        run(Path(temp), args.backend, args.profile)
+        run(Path(temp), args.backend, args.profile, args.files)

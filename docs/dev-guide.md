@@ -445,12 +445,12 @@ file-content validation during recovery or change native-error quiescence.
 
 Small common units increase descriptor and metadata counts when pool block
 sizes differ greatly. Measure this overhead before choosing production layouts.
-For multi-pool DRAM support, configure one G3 file path. Pieces from all DRAM
-pools use slots in that file, and KVCR retains their pool labels for restoration.
-Multiple DRAM pools do not require multiple SSDs. The changes for multi-pool
-keys do not add SSD placement or sharding; the pre-existing multi-file mapping
-remains unchanged. Drive aggregation belongs to the deployment's filesystem or
-block layer, or to NIXLShard.
+Multi-pool DRAM support works with one or more G3 files. Pieces from all DRAM
+pools use the configured files, and KVCR retains their pool labels for
+restoration. These files can all live on one filesystem, including a mounted
+RAID volume. KVCR uses its existing slot-to-file mapping; the filesystem and
+RAID/block layer handle placement on physical drives. The changes for
+multi-pool keys do not add SSD placement or sharding.
 
 The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
 pool sizes, spill, direct delivery, and DRAM refill without a model:
@@ -461,9 +461,14 @@ PYTHONPATH=src python3 examples/g3_multi_pool.py --backend GDS_MT --directory /p
 PYTHONPATH=src python3 examples/g3_multi_pool.py --backend POSIX --directory /path/to/local/ssd
 # Requires vLLM and Torch; computes cache shapes without loading model weights:
 PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --backend GDS_MT --directory /path/to/local/ssd
+# Three files on the same mounted filesystem, for example a RAID volume:
+PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --files 3 --backend GDS_MT --directory /mnt/raid
 ```
 
-The probe uses fresh temporary files and checks every returned byte. It requires
+The probe uses fresh temporary files, checks that payload reaches the expected
+files, and checks every returned byte. `--files` defaults to one; all files
+are created below the specified directory. Per-file capacity is rounded up to
+an allocation unit so the combined budget fits two complete keys. It requires
 NIXL's UCX and selected file plugin; GDS_MT also requires working cuFile/CUDA
 initialization even though the buffers in this probe are DRAM.
 

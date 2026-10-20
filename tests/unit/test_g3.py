@@ -204,7 +204,7 @@ def _deposit(kvcr, key, index):
 
 
 def _multi_pool_g3(
-    tmp_path, *, disk_units=8, agent=None, swa_label="swa:*", policy=None
+    tmp_path, *, disk_units=8, agent=None, swa_label="swa:*", policy=None, file_count=1
 ):
     page = os.sysconf("SC_PAGE_SIZE")
     primary = {
@@ -232,8 +232,11 @@ def _multi_pool_g3(
             [(name, ctypes.addressof(buf), len(buf)) for name, buf in local.items()]
         ),
         g3=G3Options(
-            paths=(tmp_path / "hybrid.data",),
-            capacity_bytes_per_file=disk_units * page,
+            paths=tuple(
+                tmp_path / f"hybrid-{index}.data" for index in range(file_count)
+            ),
+            capacity_bytes_per_file=((disk_units + file_count - 1) // file_count)
+            * page,
             backend="MOCK",
         ),
     )
@@ -249,11 +252,15 @@ def _hybrid_refs(index, layout):
 
 
 @pytest.mark.parametrize("layout", [("full", "swa:a", "swa:b"), ("full", "swa", "swa")])
-def test_g3_multi_pool_round_trip(tmp_path, layout):
+@pytest.mark.parametrize("file_count", [1, 2, 3])
+def test_g3_multi_pool_round_trip(tmp_path, layout, file_count):
     """Unequal pools and multiple pieces survive spill, delivery and refill."""
     page = os.sysconf("SC_PAGE_SIZE")
     kvcr, primary, local = _multi_pool_g3(
-        tmp_path, disk_units=4, swa_label="swa:*" if ":" in layout[1] else "swa"
+        tmp_path,
+        disk_units=4,
+        swa_label="swa:*" if ":" in layout[1] else "swa",
+        file_count=file_count,
     )
     primary["full"].raw = b"f" * (2 * page) + b"F" * (2 * page)
     primary["swa"].raw = b"a" * page + b"b" * page + b"A" * page + b"B" * page
@@ -264,6 +271,7 @@ def test_g3_multi_pool_round_trip(tmp_path, layout):
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
     disk = kvcr._core._block_record_map[first].g3
     assert disk.layout == layout and len(set(disk.slots)) == 4
+    assert {slot % file_count for slot in disk.slots} == set(range(file_count))
     assert kvcr._core._g3.telemetry_state()["g3_evictable_slots"] == 4
 
     handle = kvcr.deliver({first: _hybrid_refs(2, layout)})
@@ -287,12 +295,13 @@ def test_g3_multi_pool_round_trip(tmp_path, layout):
     ]
     assert len(occupied) == len(set(occupied))
     assert set(occupied).isdisjoint(g3._free_slots)
-    assert len(occupied) + len(g3._free_slots) == 4
+    assert len(occupied) + len(g3._free_slots) == g3._total_slots
 
 
-def test_g3_multi_pool_eviction_reuses_every_unit(tmp_path):
+@pytest.mark.parametrize("file_count", [1, 2])
+def test_g3_multi_pool_eviction_reuses_every_unit(tmp_path, file_count):
     page = os.sysconf("SC_PAGE_SIZE")
-    kvcr, primary, local = _multi_pool_g3(tmp_path, disk_units=4)
+    kvcr, primary, local = _multi_pool_g3(tmp_path, disk_units=4, file_count=file_count)
     primary["full"].raw = b"f" * (2 * page) + b"F" * (2 * page)
     primary["swa"].raw = b"a" * page + b"b" * page + b"A" * page + b"B" * page
     layout = ("full", "swa:a", "swa:b")
@@ -314,10 +323,13 @@ def test_g3_multi_pool_eviction_reuses_every_unit(tmp_path):
     assert primary["swa"].raw[4 * page :] == b"A" * page + b"B" * page
 
 
-def test_g3_multi_pool_partial_reservation_rolls_back(tmp_path):
+@pytest.mark.parametrize("file_count", [1, 2, 3])
+def test_g3_multi_pool_partial_reservation_rolls_back(tmp_path, file_count):
     policy = _MoveLocalToG3Policy()
     policy.keep_g3 = True
-    kvcr, primary, local = _multi_pool_g3(tmp_path, disk_units=6, policy=policy)
+    kvcr, primary, local = _multi_pool_g3(
+        tmp_path, disk_units=6, policy=policy, file_count=file_count
+    )
     layout = ("full", "swa:a", "swa:b")
     keys = [BlockKey(f"key-{index}".encode()) for index in range(3)]
     for index, key in enumerate(keys):
@@ -404,8 +416,11 @@ def test_g3_multi_pool_failed_spill_does_not_publish_partial_key(tmp_path, failu
     assert sorted(g3._free_slots) == list(range(g3._total_slots))
 
 
-def test_g3_multi_pool_recovery_adopts_all_units_and_validates_layout(tmp_path):
-    kvcr, primary, local = _multi_pool_g3(tmp_path)
+@pytest.mark.parametrize("file_count", [1, 2])
+def test_g3_multi_pool_recovery_adopts_all_units_and_validates_layout(
+    tmp_path, file_count
+):
+    kvcr, primary, local = _multi_pool_g3(tmp_path, file_count=file_count)
     g3 = kvcr._core._g3
     key = BlockKey(b"recovered")
     disk = _G3Residency(1, layout=("full", "swa:a", "swa:b"), extra_slots=(3, 5, 7))
