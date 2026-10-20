@@ -372,14 +372,15 @@ def test_gpu_explicit_ucx_none_before_vram_validation(monkeypatch):
     monkeypatch.setenv("NIXL_UCX_CUDA_IPC_ONLY", "1")
     agent, configured = GPUAgent(), []
     with _use_nixl_agent(agent):
-        monkeypatch.setattr(
-            kvcr_progress,
-            "nixl_agent_config",
-            lambda **kwargs: configured.append(kwargs) or kwargs,
-        )
-        progress = native_progress()
-        progress._initialize_nixl()
-        progress._initialize_nixl()  # No duplicate backend initialization.
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                kvcr_progress,
+                "nixl_agent_config",
+                lambda **kwargs: configured.append(kwargs) or kwargs,
+            )
+            progress = native_progress()
+            progress._initialize_nixl()
+            progress._initialize_nixl()  # No duplicate backend initialization.
     assert configured[0]["backends"] == []
     assert agent.backend_calls == [
         ("defaults", "UCX"),
@@ -422,14 +423,31 @@ def test_gpu_backend_configuration_fails_before_vram(monkeypatch, failure):
 def test_cpu_native_backend_defaults_are_untouched(monkeypatch):
     agent, configured = GPUAgent(), []
     with _use_nixl_agent(agent):
-        monkeypatch.setattr(
-            kvcr_progress,
-            "nixl_agent_config",
-            lambda **kwargs: configured.append(kwargs) or kwargs,
-        )
-        native_progress(gpu=False)._initialize_nixl()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                kvcr_progress,
+                "nixl_agent_config",
+                lambda **kwargs: configured.append(kwargs) or kwargs,
+            )
+            native_progress(gpu=False)._initialize_nixl()
     assert configured[0]["backends"] == ["UCX"]
     assert agent.backend_calls == []
+
+
+@pytest.mark.parametrize(
+    "exercise",
+    [
+        test_gpu_explicit_ucx_none_before_vram_validation,
+        test_cpu_native_backend_defaults_are_untouched,
+    ],
+)
+def test_native_agent_and_config_restore_after_outer_fixture_undo(exercise):
+    original_agent = kvcr_progress.nixl_agent
+    original_config = kvcr_progress.nixl_agent_config
+    with pytest.MonkeyPatch.context() as outer:
+        exercise(outer)
+    assert kvcr_progress.nixl_agent is original_agent
+    assert kvcr_progress.nixl_agent_config is original_config
 
 
 def test_gpu_source_preserves_fragment_device_indices_and_pin_until_done(monkeypatch):
