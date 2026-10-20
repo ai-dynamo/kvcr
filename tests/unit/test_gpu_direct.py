@@ -123,7 +123,7 @@ class GPUAgent(FakeNixlAgent):
     def get_backend_mem_types(self, backend):
         assert backend == "UCX"
         self.backend_calls.append(("memory_types", backend))
-        return ["DRAM", "VRAM"]
+        return ["DRAM_SEG", "VRAM_SEG"]
 
     def prep_xfer_dlist(self, agent_name, descs, *, mem_type, backends):
         self.prep_types.append(mem_type)
@@ -595,9 +595,22 @@ def test_gpu_source_timeout_keeps_allocation_pinned_until_native_done(monkeypatc
         kvcr.close()
 
 
-def test_gpu_native_backend_without_vram_support_fails_closed(monkeypatch):
+@pytest.mark.parametrize("memory_type", ["VRAM_SEG", "VRAM"])
+def test_gpu_native_vram_enum_and_legacy_alias_are_supported(monkeypatch, memory_type):
     agent = GPUAgent()
-    agent.get_backend_mem_types = lambda _: ["DRAM"]
+    agent.get_backend_mem_types = lambda _: ["DRAM_SEG", memory_type]
+    kvcr, _, _, _ = new_gpu(monkeypatch, agent=agent)
+    assert agent.registrations
+    assert {kind for _, kind in agent.registrations} == {"VRAM"}
+    kvcr.close()
+
+
+@pytest.mark.parametrize("memory_types", [["DRAM_SEG"], ["DRAM"], ["UNKNOWN"], []])
+def test_gpu_native_backend_without_vram_support_fails_closed(
+    monkeypatch, memory_types
+):
+    agent = GPUAgent()
+    agent.get_backend_mem_types = lambda _: memory_types
     with pytest.raises(RuntimeError, match="native UCX VRAM"):
         new_gpu(monkeypatch, agent=agent)
     assert agent.xfers == agent.registrations == []

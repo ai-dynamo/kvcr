@@ -693,7 +693,12 @@ class _KVCRProgress:
                     != "none"
                 ):
                     raise RuntimeError("GPU UCX endpoint mode was not accepted")
-                if "VRAM" not in self._nixl_agent.get_backend_mem_types("UCX"):
+                # Native getBackendMemTypes reports enum strings (VRAM_SEG in
+                # NIXL 1.5); older Python wrappers exposed the VRAM alias.
+                # Registration still uses the separate API token "VRAM".
+                if not {"VRAM_SEG", "VRAM"}.intersection(
+                    self._nixl_agent.get_backend_mem_types("UCX")
+                ):
                     raise RuntimeError("GPU endpoint requires native UCX VRAM support")
 
     def _register_memory_regions(self) -> None:
