@@ -374,7 +374,7 @@ class _KVCRProgress:
             raise
         finally:
             if trace is not None:
-                trace.pop(pushed)
+                trace.tracer.pop(pushed)
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type

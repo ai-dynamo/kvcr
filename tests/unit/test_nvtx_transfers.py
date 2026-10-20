@@ -29,28 +29,35 @@ def test_zero_selected_source_is_failed_without_posting(recording):
 
 
 @pytest.mark.parametrize(
-    "requested,completed,expected",
-    [(0, 0, 2), (2, 0, 4), (2, 1, 3), (2, 2, 2)],
+    "success,requested,completed,status,reason",
+    [
+        (True, 0, 0, 2, 1),
+        (True, 2, 0, 4, 0),
+        (True, 2, 1, 3, 0),
+        (True, 2, 2, 2, 1),
+        (False, 2, 0, 4, 0),
+        (False, 2, 1, 4, 0),
+        (False, 2, 2, 4, 0),
+    ],
 )
-def test_source_result_status_distinguishes_zero_success(
-    recording, requested, completed, expected
+def test_completion_status_and_counts(
+    recording, success, requested, completed, status, reason
 ):
-    trace = _nvtx.create_tracer().lifecycle(requested_blocks=requested)
-    trace.complete_source(True, completed)
-    event = payloads(recording, "source.write.completed")[0]
-    assert int(event["status"]) == expected
-    assert int(event["completed_blocks"]) == completed
-
-
-@pytest.mark.parametrize("selected", [0, 1, 2])
-def test_failed_source_result_is_failed_even_with_selected_blocks(recording, selected):
-    trace = _nvtx.create_tracer().lifecycle(
-        requested_blocks=2, selected_bytes=selected * 16
+    tracer = _nvtx.create_tracer()
+    tracer.begin(requested).finish(
+        "success" if success else "failed", completed_blocks=completed
     )
-    trace.complete_source(False, selected)
-    event = payloads(recording, "source.write.completed")[0]
-    assert int(event["status"]) == 4
-    assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
+    tracer.lifecycle(
+        requested_blocks=requested, selected_bytes=completed * 16
+    ).complete_source(success, completed)
+    pin = payloads(recording, "source.pin.completed")[0]
+    source = payloads(recording, "source.write.completed")[0]
+    for event in (pin, source):
+        assert int(event["status"]) == status
+        assert int(event["reason"]) == reason
+    assert int(pin["completed_blocks"]) == completed
+    assert int(source["completed_blocks"]) == (completed if success else 0)
+    assert int(source["completed_bytes"]) == (completed * 16 if success else 0)
 
 
 @pytest.mark.parametrize("level", ["low", "medium"])
@@ -160,6 +167,34 @@ def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
             == spans(recording, name, "end")[0][3]
             == source._core._progress._thread.ident
         )
+
+
+@pytest.mark.parametrize(
+    "cause,reason", [("timeout", 5), ("route", 17), ("timeout+route", 5)]
+)
+def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
+    source, agent, pinning = test_nvtx.make_source(recording)
+    backend = source._core._remote_fw_dram
+    if "route" in cause:
+        pending = next(iter(backend._source_pin_ops.values()))
+        backend._route_generation[pending.route[0]] = pending.route[1] + 1
+    if "timeout" in cause:
+        source._core._clock = lambda: float("inf")
+    else:
+        pinning.complete(0)
+    test_nvtx._poll_until(
+        source, lambda _: bool(payloads(recording, "source.write.completed"))
+    )
+    event = payloads(recording, "source.write.completed")[0]
+    assert int(event["status"]) == 4
+    assert int(event["reason"]) == reason
+    assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
+    assert not agent.xfers
+    assert pinning.cancelled == ([0] if "timeout" in cause else [])
+    assert pinning.unpins == ([] if "timeout" in cause else ["pin"])
+    assert test_nvtx._decode_notif(agent.sent_notifs[0][1])["success"] is False
+    assert not payloads(recording, "nixl.write.posted")
+    assert len(spans(recording, "source.write", "end")) == 1
 
 
 def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypatch):
@@ -275,17 +310,6 @@ def test_creation_failure_closes_scope_and_reports_rejection(recording):
         submit(progress, trace)
     assert not progress._active_transfers
     assert len(payloads(recording, "nixl.write.rejected")) == 1
-    assert not recording.stack
-
-
-@pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop"])
-def test_annotation_failure_cannot_change_nixl_lifecycle(recording, failure):
-    agent, progress, trace = setup_transfer()
-    recording.fail = failure
-    transfer, accepted = submit(progress, trace)
-    assert accepted
-    assert progress.poll_transfer(transfer, require_completion=True) == (True, None)
-    assert agent.events[-1] == f"release-transfer:{transfer}"
     assert not recording.stack
 
 

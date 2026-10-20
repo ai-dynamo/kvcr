@@ -33,6 +33,8 @@ the trace/work. The helper synchronizes competing ends, not overlapping start/en
 unresolved ownership boundaries. Elapsed time does not prove DMA quiescence.
 `source.write.refused` identifies a stale route before posting. No native numeric
 error is inferred from exception text; `native_error_known=0` means unavailable.
+Source completion also preserves deadline and stale-route causes detected while
+pinning is pending; a known deadline is retained if the route has also changed.
 
 Schema 3 stores immutable lifecycle fields once in `request.context`. Compact
 events carry `(instance_hi, instance_lo, trace_id)`, status/reason and only the

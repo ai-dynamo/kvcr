@@ -14,7 +14,6 @@ from functools import lru_cache
 from hashlib import blake2b
 from importlib import import_module
 from threading import Lock
-from types import MappingProxyType
 
 from ._nvtx_payload import Reason, Status, _PayloadEmitter
 from ._nvtx_pin import _PinTrace
@@ -97,6 +96,13 @@ class _PinTracer(_PayloadEmitter):
             _wait_range_id=wait_range_id,
         )
 
+    def pop(self, pushed):
+        if pushed:
+            try:
+                self.domain.pop_range()
+            except Exception:
+                pass
+
     def name_progress_thread(self):
         # Python 3.12 does not propagate Thread.name to Linux. Nsight displays
         # the OS name; nvtx 0.2.16 has no Python thread-naming API.
@@ -114,7 +120,7 @@ class _PinTracer(_PayloadEmitter):
             hi, lo = self._worker_identity(target_agent)
             inc_hi, inc_lo = self._worker_identity(target_incarnation)
             req_hi, req_lo = identity(request_id)
-            trace = _LifecycleTrace(
+            return _LifecycleTrace(
                 self,
                 next(self._ids),
                 {
@@ -127,9 +133,8 @@ class _PinTracer(_PayloadEmitter):
                     "request_known": request_id is not None,
                     **fields,
                 },
+                request_id,
             )
-            trace.context(request_id)
-            return trace
         except Exception:
             return None
 
@@ -227,16 +232,39 @@ def memory_kind(refs, regions):
 
 
 class _LifecycleTrace:
-    """Immutable context plus event bookkeeping owned by the operation lifecycle."""
+    """One-time context emission plus operation lifecycle bookkeeping."""
 
-    def __init__(self, tracer, trace_id, fields):
+    def __init__(self, tracer, trace_id, fields, request_id):
         self.tracer, self.trace_id = tracer, trace_id
-        self._fields = MappingProxyType(fields)
+        self.requested_blocks = fields.get("requested_blocks", -1)
+        self.selected_bytes = fields.get("selected_bytes", -1)
+        self.requested_bytes = fields.get("requested_bytes", -1)
         self._observed = set()
         self.failure_reason = Reason.UNKNOWN
         self.completion_fields = {}
         self._ranges = {}
         self._range_lock = Lock()
+        try:
+            if tracer.level == "medium" and request_id is not None:
+                encoded = request_id.encode("utf-8")
+                display = tracer.numpy.frombuffer(
+                    encoded[:256].ljust(256, b"\0"), dtype="u1"
+                )
+                fields.update(
+                    request_display_known=1,
+                    length=min(len(encoded), 256),
+                    truncated=len(encoded) > 256,
+                    value_utf8=display,
+                )
+            tracer._emit(
+                "request.context",
+                self.trace_id,
+                fields,
+                method=tracer.domain.mark,
+                context=True,
+            )
+        except Exception:
+            pass
 
     def start(self, name, **fields):
         """The owner finishes start before handing work to another thread.
@@ -278,7 +306,7 @@ class _LifecycleTrace:
                 else Status.FAILED,
                 reason=Reason.NONE if all_completed else self.failure_reason,
                 completed_blocks=completed,
-                completed_bytes=self._fields.get("requested_bytes", -1)
+                completed_bytes=self.requested_bytes
                 if all_completed
                 else -1
                 if completed
@@ -324,41 +352,11 @@ class _LifecycleTrace:
         except Exception:
             pass
 
-    def context(self, request_id):
-        try:
-            t = self.tracer
-            values = self._fields
-            if t.level == "medium" and request_id is not None:
-                encoded = request_id.encode("utf-8")
-                display = t.numpy.frombuffer(
-                    encoded[:256].ljust(256, b"\0"), dtype="u1"
-                )
-                values = dict(
-                    values,
-                    request_display_known=1,
-                    length=min(len(encoded), 256),
-                    truncated=len(encoded) > 256,
-                    value_utf8=display,
-                )
-            t._emit(
-                "request.context",
-                self.trace_id,
-                values,
-                method=t.domain.mark,
-                context=True,
-            )
-        except Exception:
-            pass
-
     def complete_source(self, success, blocks, *, reason=None):
-        requested = self._fields.get("requested_blocks", -1)
-        status = Status.FAILED
-        if success:
-            status = (
-                (Status.FAILED if blocks == 0 else Status.PARTIAL)
-                if blocks < requested
-                else Status.SUCCESS
-            )
+        requested = self.requested_blocks
+        status = Status.SUCCESS if success else Status.FAILED
+        if success and blocks < requested:
+            status = Status.FAILED if blocks == 0 else Status.PARTIAL
         if reason is None:
             reason = (
                 Reason.NONE if success and blocks >= requested else self.failure_reason
@@ -369,7 +367,7 @@ class _LifecycleTrace:
             status=status,
             reason=reason,
             completed_blocks=blocks if success else 0,
-            completed_bytes=self._fields.get("selected_bytes", -1) if success else 0,
+            completed_bytes=self.selected_bytes if success else 0,
         )
 
     def mark(self, name, *, once=False, detail=False, retain_cause=False, **fields):
@@ -406,10 +404,3 @@ class _LifecycleTrace:
             return True
         except Exception:
             return False
-
-    def pop(self, pushed):
-        if pushed:
-            try:
-                self.tracer.domain.pop_range()
-            except Exception:
-                pass

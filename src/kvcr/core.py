@@ -591,7 +591,7 @@ class _KVCRCore:
             raise
         finally:
             if trace is not None:
-                trace.pop(pushed)
+                trace.tracer.pop(pushed)
         return op_handle
 
     def deposit(

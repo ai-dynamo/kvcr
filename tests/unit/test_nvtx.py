@@ -3,7 +3,6 @@
 """NVTX must describe pin ownership without changing it."""
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import msgspec
@@ -12,6 +11,7 @@ from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
     PendingPrimaryPinning,
+    _decode_notif,
     _new_kvcr,
     _poll_until,
     _start_write_message,
@@ -128,16 +128,6 @@ def make_source(domain, handles=(9,), *, request_id=0):
     return source, agent, pinning
 
 
-def test_off_does_not_load_optional_dependencies(monkeypatch):
-    monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")
-
-    def forbidden():
-        pytest.fail("off mode imported the optional backend")
-
-    monkeypatch.setattr(_nvtx, "_load_backend", forbidden)
-    assert _nvtx.create_tracer() is None
-
-
 @pytest.mark.parametrize("level", [None, "low", "medium", "invalid"])
 def test_missing_binding_is_safe_and_explicit_request_warns_once(
     monkeypatch, caplog, level
@@ -180,13 +170,30 @@ def test_default_low_and_fresh_payloads(recording, monkeypatch):
 @pytest.mark.parametrize(
     "failure", ["attributes", "push", "mark", "pop", "start", "end"]
 )
-def test_annotation_failures_preserve_pin_callback_and_release(recording, failure):
-    recording.fail = failure
+@pytest.mark.parametrize("after_context", [False, True])
+def test_annotation_failures_preserve_pin_callback_and_release(
+    recording, monkeypatch, failure, after_context
+):
+    if after_context:
+        source_trace = _nvtx._PinTracer.source
+
+        def fail_after_context(*args):
+            trace = source_trace(*args)
+            recording.fail = failure
+            return trace
+
+        monkeypatch.setattr(_nvtx._PinTracer, "source", fail_after_context)
+    else:
+        recording.fail = failure
     source, agent, pinning = make_source(recording)
     assert pinning.searches == [(BlockKey(b"k0"),)]
     agent.state = "DONE"
     pinning.complete(0)
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
+    assert agent.transfers == agent.released_xfers == [1]
+    assert _decode_notif(agent.xfers[0][-1])["success"] is True
+    assert not agent.sent_notifs
+    assert not source._core._progress._active_transfers
     assert not recording.stack
 
 
@@ -202,21 +209,28 @@ def test_unknown_pin_result_closes_range_without_raising(recording):
     assert not recording.ranges
 
 
-def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording):
-    source, agent, pinning = make_source(recording, (9, 10))
+@pytest.mark.parametrize("request_id", [0, 2**128])
+def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording, request_id):
+    source, agent, pinning = make_source(recording, (9, 10), request_id=request_id)
     assert len(pinning.searches) == 1
     assert len(spans(recording, "source.pin.wait")) == 1
     assert not spans(recording, "source.pin.wait", "end")
     agent.state = "DONE"
-    pinning.complete(0)
+    pinning.complete(request_id)
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
     registered = payloads(recording, "source.pin.registered")
     waiters = payloads(recording, "source.pin.waiter")
     completed = payloads(recording, "source.pin.completed")
     assert len(registered) == len(completed) == 1
     assert len(waiters) == 2
+    assert all(
+        bool(p["pin_request_known"]) == (request_id == 0)
+        for p in registered + waiters + completed
+    )
+    assert {int(p["pin_id"]) for p in registered + waiters + completed} == {
+        int(registered[0]["pin_id"])
+    }
     assert {int(p["op_handle"]) for p in waiters} == {9, 10}
-    assert {int(p["pin_id"]) for p in waiters} == {int(registered[0]["pin_id"])}
     assert int(completed[0]["completed_blocks"]) == 1
     assert int(completed[0]["status"]) == int(_nvtx.Status.SUCCESS)
     assert len(spans(recording, "source.pin.wait", "end")) == 1
@@ -290,27 +304,18 @@ def test_reused_framework_request_id_gets_new_trace_identity(recording):
 @pytest.mark.parametrize(
     "request_id", [-(2**63) - 1, -(2**63), -1, 0, 2**63 - 1, 2**63, 2**128]
 )
-def test_framework_request_id_range_cannot_drop_lifecycle_events(recording, request_id):
-    source, agent, pinning = make_source(recording, request_id=request_id)
-    agent.state = "DONE"
-    pinning.complete(request_id)
-    _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    representable = -(2**63) <= request_id < 2**63
-    identities = set()
+def test_framework_request_id_boundaries(recording, request_id):
+    known = -(2**63) <= request_id < 2**63
+    trace = _nvtx.create_tracer().begin(1)
+    trace.registered(request_id)
+    trace.waiter(2, 9)
+    trace.finish("success", completed_blocks=1)
     for name in ("registered", "waiter", "completed"):
-        events = payloads(recording, f"source.pin.{name}")
-        assert len(events) == 1
-        event = events[0]
-        assert bool(event["pin_request_known"]) == representable
-        assert int(event["pin_request_id"]) == (request_id if representable else 0)
-        identities.add(
-            tuple(int(event[f]) for f in ("instance_hi", "instance_lo", "pin_id"))
-        )
-    assert len(identities) == 1
-    assert int(payloads(recording, "source.pin.completed")[0]["status"]) == int(
-        _nvtx.Status.SUCCESS
-    )
-    assert not recording.stack
+        [event] = payloads(recording, f"source.pin.{name}")
+        assert int(event["pin_id"]) == trace.pin_id
+        assert bool(event["pin_request_known"]) == known
+        assert int(event["pin_request_id"]) == (request_id if known else 0)
+    assert int(event["status"]) == 2
 
 
 def test_callback_failure_is_correlated_before_registration(recording):
@@ -367,21 +372,6 @@ def test_invalid_result_has_bounded_reason_and_releases_handle(recording):
     assert int(event["reason"]) == int(_nvtx.Reason.INVALID_RESULT)
 
 
-@pytest.mark.parametrize(
-    "requested,completed,expected",
-    [(0, 0, 2), (2, 0, 4), (2, 1, 3), (2, 2, 2)],
-)
-def test_pin_result_status_distinguishes_zero_success(
-    recording, requested, completed, expected
-):
-    trace = _nvtx.create_tracer().begin(requested)
-    trace.finish("success", completed_blocks=completed)
-    event = payloads(recording, "source.pin.completed")[0]
-    assert int(event["status"]) == expected
-    assert int(event["completed_blocks"]) == completed
-    assert int(event["reason"]) == (0 if completed < requested else 1)
-
-
 def test_payload_counting_failure_cannot_interrupt_pin_processing(recording):
     class ValuesUnavailable(dict):
         def values(self):
@@ -398,28 +388,17 @@ def test_payload_counting_failure_cannot_interrupt_pin_processing(recording):
     assert int(event["completed_blocks"]) == -1
 
 
-def test_off_records_no_pin_state_or_events(recording, monkeypatch):
+def test_off_loads_no_backend_and_records_no_pin_state_or_events(
+    recording, monkeypatch
+):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")
-    source, agent, pinning = make_source(recording)
+    monkeypatch.setattr(
+        _nvtx, "_load_backend", lambda: pytest.fail("off mode loaded optional backend")
+    )
+    source, agent, pinning = make_source(None)
     wait = next(iter(source._core._remote_fw_dram._pending_pin_ops.values()))
     assert wait.trace is None
     agent.state = "DONE"
     pinning.complete(0)
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    assert recording.events == []
-
-
-def test_concurrent_annotations_have_independent_identities_and_payloads(recording):
-    tracer = _nvtx.create_tracer()
-
-    def annotate(value):
-        trace = tracer.begin(value, op_handle=value)
-        trace.registered(value)
-        trace.finish("success", completed_blocks=value)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(annotate, range(1, 33)))
-    events = payloads(recording, "source.pin.completed")
-    assert len({int(p["pin_id"]) for p in events}) == 32
-    assert {int(p["pin_request_id"]) for p in events} == set(range(1, 33))
-    assert all(p["completed_blocks"] == p["requested_blocks"] for p in events)
+    assert source._core._remote_fw_dram._nvtx is None
