@@ -14,7 +14,7 @@ import pytest
 E2E = Path(__file__).parents[1] / "e2e"
 sys.path.insert(0, str(E2E))
 
-from phase1 import cases, common, stack, telemetry  # noqa: E402
+from phase1 import cases, common, perf, stack, telemetry  # noqa: E402
 
 _SPEC = importlib.util.spec_from_file_location(
     "kvcr_phase1_runner", E2E / "run_phase1.py"
@@ -327,3 +327,100 @@ def test_state_agent_config_only_in_guard_mode(tmp_path, monkeypatch):
     assert (
         "dynamo_state_agent" not in off.transfer_config(0)["kv_connector_extra_config"]
     )
+
+
+# -- negative verdicts (review of #103) ----------------------------------------
+
+
+def _ctx(**geometry):
+    return cases.Context(
+        None,
+        None,
+        None,
+        {},
+        index_wait=0,
+        telemetry_timeout=0,
+        recovery_timeout=0,
+        **geometry,
+    )
+
+
+def _window(remote_deliver_blocks=0, successes=0, read_bytes=0, failures=()):
+    totals = {
+        telemetry.metric(
+            telemetry.TRANSFER_BLOCKS, telemetry.REMOTE_DELIVER
+        ): remote_deliver_blocks,
+        telemetry.duration_count(telemetry.REMOTE_DELIVER): successes,
+        telemetry.TIER_READ_BYTES: read_bytes,
+    }
+    return telemetry.Window(
+        totals=totals,
+        samples=1,
+        first_after_end=True,
+        peer_failures=list(failures),
+        parse_errors=[],
+    )
+
+
+def test_zero_hit_replacement_recovery_fails():
+    # A replacement that answers correctly but recomputed the prefix is not a recovery.
+    assert cases.hit_verdict(0, 64) == (False, "cached_tokens=0 (block 64)")
+    assert cases.hit_verdict(1472, 64)[0]
+    assert not cases.hit_verdict(1500, 576)[0], "hybrid hits must be 576-aligned"
+    assert not cases.hit_verdict(1472, 64, max_blocks=10)[0], (
+        "above the shared-prefix bound"
+    )
+
+
+def test_local_hit_without_guard_delivery_fails():
+    ctx = _ctx(hit_block_tokens=64)
+    local_recommit = _window(remote_deliver_blocks=0, successes=0)
+    ok, detail = perf.guard_delivery_verdict(ctx, local_recommit, 23, 0)
+    assert not ok and "remote_deliver blocks=0" in detail
+
+    guard = _window(remote_deliver_blocks=23, successes=1, read_bytes=23 * 9437184)
+    assert perf.guard_delivery_verdict(ctx, guard, 23, 0)[0]
+
+    short = _window(remote_deliver_blocks=20, successes=1)
+    assert not perf.guard_delivery_verdict(ctx, short, 23, 0)[0], (
+        "pages must cover the hit"
+    )
+
+    # One failed remote_deliver is the kvcr#51 miss of an earlier attempt, and
+    # is tolerated only when such an attempt happened.
+    failed = {
+        "metric": telemetry.duration_count(telemetry.REMOTE_DELIVER, "failed"),
+        "value": 1,
+    }
+    after_miss = _window(remote_deliver_blocks=23, successes=1, failures=[failed])
+    assert perf.guard_delivery_verdict(ctx, after_miss, 23, 1)[0]
+    assert not perf.guard_delivery_verdict(ctx, after_miss, 23, 0)[0]
+
+
+def test_token_mismatch_during_recovery_fails():
+    assert perf.attempt_outcome(True, ["token 3: 11 != 12"], 1472) == "fail"
+    assert perf.attempt_outcome(True, ["token 3: 11 != 12"], 0) == "fail"
+    assert perf.attempt_outcome(True, [], 1472) == "accept"
+    assert perf.attempt_outcome(True, [], 0) == "retry", "kvcr#51 first-request miss"
+    assert perf.attempt_outcome(False, ["no tokens"], None) == "retry"
+
+
+def test_missing_ssm_pages_fail_hybrid_delivery():
+    page = 18874368  # Qwen3.5-4B KVCR page: 94371840 bytes / 5 pages
+    strict = _ctx(hit_block_tokens=576, ssm_groups=3, page_bytes=page)
+    assert strict.delivery_covers(5, 2), "2 attention + 3 SSM pages"
+    assert not strict.delivery_covers(2, 2), "attention pages only: SSM state missing"
+    assert not strict.delivery_covers(4, 2), "one SSM group missing"
+    assert not strict.delivery_covers(6, 2), "an extra page is also wrong"
+    assert strict.expected_pages(2) == "2+3*1"
+    result = common.CaseResult("TC-05", "x", "perf")
+    strict.bytes_match_pages(result, "short", 4 * page, 5)
+    strict.bytes_match_pages(result, "exact", 5 * page, 5)
+    assert [check.passed for check in result.checks] == [False, True]
+
+    # Without the geometry the check is only a lower bound; that is why the
+    # hybrid job must pass --ssm-groups and --page-bytes.
+    lenient = _ctx(hit_block_tokens=576)
+    assert lenient.delivery_covers(2, 2)
+    lenient.bytes_match_pages(result, "skipped", 1, 5)
+    assert len(result.checks) == 2

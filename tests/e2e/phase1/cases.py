@@ -324,11 +324,7 @@ class Context:
     ) -> int:
         cached = self.cached(response)
         block = self.hit_block_tokens
-        aligned = cached > 0 and cached % block == 0
-        detail = f"cached_tokens={cached} (block {block})"
-        if max_blocks is not None:
-            detail += f", upper bound {max_blocks * block}"
-            aligned = aligned and cached <= max_blocks * block
+        aligned, detail = hit_verdict(cached, block, max_blocks)
         result.check(
             f"{response.stage}: cache hit is positive and block-aligned",
             aligned,
@@ -523,6 +519,21 @@ class Context:
         path = self.client.evidence / f"{result.case}.{name}.json"
         save_json(path, value)
         result.evidence.append(path.name)
+
+
+def hit_verdict(
+    cached: int, block: int, max_blocks: int | None = None
+) -> tuple[bool, str]:
+    """A served prefix counts as a hit only if cached_tokens is a positive
+    multiple of the hit block (and within the bound when one is given). A
+    correct answer with zero cached tokens is a recomputation, not a recovery.
+    """
+    aligned = cached > 0 and cached % block == 0
+    detail = f"cached_tokens={cached} (block {block})"
+    if max_blocks is not None:
+        detail += f", upper bound {max_blocks * block}"
+        aligned = aligned and cached <= max_blocks * block
+    return aligned, detail
 
 
 # -- cases -------------------------------------------------------------------

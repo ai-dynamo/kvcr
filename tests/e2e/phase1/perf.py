@@ -38,6 +38,7 @@ from .telemetry import (
     SOURCE_WRITE,
     TIER_READ_BYTES,
     TIER_WRITE_BYTES,
+    Window,
     duration_count,
     latest_gauge,
 )
@@ -460,6 +461,53 @@ def tc05(ctx: Context) -> CaseResult:
 # -- TC-06 ---------------------------------------------------------------------
 
 
+def attempt_outcome(ok: bool, problems: list[str], cached_tokens: int | None) -> str:
+    """Classify one Guard-serve attempt.
+
+    ``fail``: tokens differ from the reference (never a recovery in progress);
+    ``accept``: correct tokens with a positive hit; ``retry``: no response or a
+    correct cold answer (the kvcr#51 first-request miss).
+    """
+    if ok and problems:
+        return "fail"
+    if ok and (cached_tokens or 0) > 0:
+        return "accept"
+    return "retry"
+
+
+def guard_delivery_verdict(
+    ctx: Context, window: Window, hit_blocks: int, missed_attempts: int
+) -> tuple[bool, str]:
+    """The accepted hit must have been delivered from the Guard.
+
+    A local re-commit from an earlier attempt also yields cached_tokens > 0 but
+    no remote_deliver pages on the target, so pages must cover the hit and at
+    least one delivery must have succeeded. Each earlier missed attempt leaves
+    one failed remote_deliver (kvcr#51); other failures fail the verdict.
+    """
+    tolerated = duration_count(REMOTE_DELIVER, "failed")[: -len("_count")]
+    failures = [
+        entry
+        for entry in window.peer_failures
+        if not (
+            entry["metric"].startswith(tolerated) and entry["value"] <= missed_attempts
+        )
+    ]
+    ok = (
+        ctx.delivery_covers(window.blocks(REMOTE_DELIVER), hit_blocks)
+        and window.successes(REMOTE_DELIVER) >= 1
+        and not failures
+    )
+    detail = (
+        f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
+        f"hit blocks={hit_blocks}, "
+        f"expected pages={ctx.expected_pages(hit_blocks)}, "
+        f"tier read bytes={window.get(TIER_READ_BYTES)}, "
+        f"missed attempts={missed_attempts}, failures={failures}"
+    )
+    return ok, detail
+
+
 def tc06(ctx: Context) -> CaseResult:
     result = CaseResult("TC-06", "Guard recovery timing", "perf")
     if ctx.stack.settings.mode != GUARD:
@@ -547,15 +595,15 @@ def tc06(ctx: Context) -> CaseResult:
             }
         )
         result.evidence += [response.request_file, response.response_file]
-        if response.ok and problems:
-            # Wrong tokens are never a recovery in progress: fail at once.
+        outcome = attempt_outcome(response.ok, problems, response.cached_tokens)
+        if outcome == "fail":
             result.check(
                 f"{response.stage}: tokens equal reference ({name0})",
                 False,
                 "; ".join(problems),
             )
             break
-        if response.ok and (response.cached_tokens or 0) > 0:
+        if outcome == "accept":
             first_correct = response
             first_name = name0
             t1 = sent_at + (response.first_token_seconds or 0) - t0
@@ -576,31 +624,14 @@ def tc06(ctx: Context) -> CaseResult:
             first_correct.started_at,
             lambda w, b=blocks: w.blocks(REMOTE_DELIVER) >= b and b > 0,
         )
-        # Earlier missed attempts (the first request after a Guard promotion,
-        # kvcr#51) each leave one failed remote_deliver; those are not failures
-        # of the accepted delivery.
-        missed = len(attempts) - 1
-        failures = [
-            entry
-            for entry in window.peer_failures
-            if not (
-                entry["metric"].startswith(
-                    duration_count(REMOTE_DELIVER, "failed")[: -len("_count")]
-                )
-                and entry["value"] <= missed
-            )
-        ]
+        delivered, detail = guard_delivery_verdict(
+            ctx, window, blocks, len(attempts) - 1
+        )
         result.check(
             "tc06: first correct hit was delivered from the Guard (remote_deliver "
             "on worker 1 covers it)",
-            ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
-            and window.successes(REMOTE_DELIVER) >= 1
-            and not failures,
-            f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
-            f"hit blocks={blocks}, "
-            f"expected pages={ctx.expected_pages(blocks)}, "
-            f"tier read bytes={window.get(TIER_READ_BYTES)}, "
-            f"missed attempts={missed}, failures={failures}",
+            delivered,
+            detail,
         )
         ctx.bytes_match_pages(
             result,

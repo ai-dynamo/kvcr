@@ -26,7 +26,7 @@ Path evidence is required in addition to equal tokens.
 | KVCR (Guard mode) | one `kvcr.kvcr_service` per worker (`--guard-count 1 --pool-sizes-gb 2`); the worker's tier sets `kvcr_service_socket_path` and `compatibility_digest` |
 | KVCR (non-Guard) | tier sets `secondary_g2_slots` instead; no service, TC-04 is BLOCKED |
 | KV state agent (Guard mode) | one `dynamo.kv_state_agent --max-slots 2`; each worker sets `dynamo_state_agent` with a stable per-slot `cache_owner_ids` entry so the router keeps a dead engine's blocks routable to its Guard (`--no-state-agent` disables) |
-| Model | dense `Qwen/Qwen3-0.6B` and hybrid attention `Qwen/Qwen3.5-0.8B` (Gated DeltaNet + attention), bf16, `--block-size 64`; `--enforce-eager` unless `--no-enforce-eager`; the hybrid model needs `--worker-arg=--mamba-cache-mode=align` and `--keep-hybrid-kv-cache-manager` |
+| Model | dense `Qwen/Qwen3-0.6B` (CI) or `Qwen/Qwen3-8B`, and hybrid attention `Qwen/Qwen3.5-4B` (Gated DeltaNet + attention), bf16, `--block-size 64`; `--enforce-eager` unless `--no-enforce-eager`; the hybrid model needs `--worker-arg=--mamba-cache-mode=align`, `--keep-hybrid-kv-cache-manager`, and its geometry `--hit-block-tokens 576 --ssm-groups 3 --page-bytes 18874368` so the page and byte checks are exact |
 | Decoding | `temperature 0`, `seed 0`, fixed `max_tokens` (default 32) |
 | Token capture | `nvext.extra_fields: ["prompt_token_ids", "completion_token_ids", "worker_id", "detailed_finish_reason"]` through the Dynamo frontend; a build without these fields is BLOCKED |
 | Determinism | optional `--batch-invariant` sets `VLLM_BATCH_INVARIANT=1`; an unstable reference is an error (required for the dense model, rejected by Qwen3.5's GDN layers) |
@@ -108,12 +108,16 @@ bash .github/scripts/run_phase1.sh --gpus GPU-…,GPU-… --image <ref> \
 `--cases TC-01,TC-03` selects cases; `--mode nonguard` runs the non-Guard
 compatibility path (TC-04 BLOCKED). `--harness-arg` forwards any
 `run_phase1.py` option, e.g. `--harness-arg=--batch-invariant`,
-`--harness-arg=--model=Qwen/Qwen3.5-0.8B`,
+`--harness-arg=--model=Qwen/Qwen3.5-4B`,
 `--harness-arg=--worker-arg=--mamba-cache-mode=align`,
 `--harness-arg=--keep-hybrid-kv-cache-manager`, `--harness-arg=--no-enforce-eager`.
-Hybrid geometry: `--hit-block-tokens 576 --ssm-groups 3` (Qwen3.5-4B) makes
-every transfer check exact, pages == hit blocks + 3 per hit; `--page-bytes N`
-adds bytes == pages * N. Verdict rules that are always on: TC-04's replacement
+Hybrid geometry: `--hit-block-tokens 576 --ssm-groups 3 --page-bytes 18874368`
+(Qwen3.5-4B; the `hybrid` matrix entry of `scripts/dlcluster/phase1.sbatch`
+always passes them) makes every transfer check exact: pages == hit blocks + 3
+per hit and bytes == pages * 18 MiB. Without them the checks are lower bounds.
+Negative unit tests in `tests/ci/test_phase1.py` pin the verdicts: a zero-hit
+replacement, a local hit without Guard delivery, a token mismatch during
+recovery, and a delivery missing SSM pages all fail. Verdict rules that are always on: TC-04's replacement
 must serve the preserved prefix as a block-aligned hit; TC-06's first correct
 Guard response must be covered by `remote_deliver` pages on the target (a local
 re-commit does not count) and any token mismatch fails the case.

@@ -193,10 +193,19 @@ for cfg in $MATRIX; do
   # shellcheck disable=SC2086
   case $cfg in
     dense)  run_config dense  --harness-arg=--model=Qwen/Qwen3-0.6B ${KVCR_EXTRA:-} ;;
-    hybrid) run_config hybrid --harness-arg=--model=Qwen/Qwen3.5-0.8B \
+    # Qwen3.5-4B geometry (measured 2026-10-08/19): attention block raised to
+    # 576 tokens, 3 SSM groups, 18 MiB KVCR pages; the flags make every
+    # delivered-pages and bytes check exact instead of a lower bound.
+    hybrid) run_config hybrid --harness-arg=--model=Qwen/Qwen3.5-4B \
                               --harness-arg=--worker-arg=--mamba-cache-mode=align \
                               --harness-arg=--keep-hybrid-kv-cache-manager \
-                              --harness-arg=--no-enforce-eager ${KVCR_EXTRA:-} ;;
+                              --harness-arg=--no-enforce-eager \
+                              --harness-arg=--hit-block-tokens --harness-arg=576 \
+                              --harness-arg=--ssm-groups --harness-arg=3 \
+                              --harness-arg=--page-bytes --harness-arg=18874368 \
+                              --harness-arg=--tc02-shared-sections --harness-arg=140 \
+                              --harness-arg=--tc02-sections --harness-arg=200 \
+                              ${KVCR_EXTRA:-} ;;
     *) log "unknown config $cfg"; exit 5 ;;
   esac
 done
