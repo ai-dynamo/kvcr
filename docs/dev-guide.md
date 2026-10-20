@@ -430,6 +430,14 @@ The secondary tier can optionally own local G2 capacity through
 `secondary_g2_slots`, attach to a service-owned pool through
 `kvcr_service_socket_path` together with `compatibility_digest`, or configure
 file-backed storage through `g3`.
+G3 defaults to NIXL `POSIX` with `backend_options={"use_uring": "true"}`.
+Additional POSIX tuning options preserve this engine default. Explicit
+`use_uring`, `use_aio`, or `use_posix_aio` settings override the engine default;
+for example, `{"use_aio": "true"}` selects Linux AIO instead. Set
+`backend="GDS_MT"` to use GDS explicitly; POSIX engine defaults are not passed
+to other backends. There is no automatic fallback if io_uring initialization
+fails.
+
 `g3.capacity_bytes_per_file` is rounded down to whole allocation units and must
 fit at least one. The unit is the greatest common divisor of the configured
 pool block sizes; a larger piece uses multiple units. Existing nonempty files
@@ -456,13 +464,13 @@ The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
 pool sizes, spill, direct delivery, and DRAM refill without a model:
 
 ```bash
+PYTHONPATH=src python3 examples/g3_multi_pool.py --directory /path/to/local/ssd
+# Explicitly opt into GDS_MT:
 PYTHONPATH=src python3 examples/g3_multi_pool.py --backend GDS_MT --directory /path/to/local/ssd
-# For a NIXL build with the POSIX plugin:
-PYTHONPATH=src python3 examples/g3_multi_pool.py --backend POSIX --directory /path/to/local/ssd
 # Requires vLLM and Torch; computes cache shapes without loading model weights:
-PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --backend GDS_MT --directory /path/to/local/ssd
+PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --directory /path/to/local/ssd
 # Three files on the same mounted filesystem, for example a RAID volume:
-PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --files 3 --backend GDS_MT --directory /mnt/raid
+PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --files 3 --directory /mnt/raid
 ```
 
 The probe uses fresh temporary files, checks that payload reaches the expected
@@ -471,6 +479,11 @@ are created below the specified directory. Per-file capacity is rounded up to
 an allocation unit so the combined budget fits two complete keys. It requires
 NIXL's UCX and selected file plugin; GDS_MT also requires working cuFile/CUDA
 initialization even though the buffers in this probe are DRAM.
+The default POSIX path requires NIXL to be built with liburing and the runtime
+to allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`. Docker's
+default seccomp profile blocks these calls; use a profile that permits them
+for io_uring deployments. See the
+[NIXL POSIX guide](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/posix/README.md).
 
 The `kimi-k3` profile uses cache parameters from the
 [Kimi K3 configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)

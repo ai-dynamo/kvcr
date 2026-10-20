@@ -110,6 +110,12 @@ def run(directory, backend, profile_name="synthetic", file_count=1):
         def no_pin(_keys):
             raise RuntimeError("This local-only demo should not request peer pins")
 
+        backend_settings = {} if backend is None else {"backend": backend}
+        g3_config = G3Options(
+            paths=paths,
+            capacity_bytes_per_file=units_per_file * unit,
+            **backend_settings,
+        )
         kvcr = KVCR(
             KVCRConfig(
                 nixl_agent_name="hybrid-g3-demo",
@@ -138,11 +144,7 @@ def run(directory, backend, profile_name="synthetic", file_count=1):
                 local_dram=LocalDramOptions(
                     [(name, address(buf), len(buf)) for name, buf in local.items()]
                 ),
-                g3=G3Options(
-                    paths=paths,
-                    capacity_bytes_per_file=units_per_file * unit,
-                    backend=backend,
-                ),
+                g3=g3_config,
             ),
         )
         stack.callback(kvcr.close)
@@ -156,7 +158,10 @@ def run(directory, backend, profile_name="synthetic", file_count=1):
                 primary[pool][offset : offset + size] = data
                 expected[key_index, ref.label, piece_index] = data
         first, second = BlockKey(b"first"), BlockKey(b"second")
-        print(f"Backend: {backend}; files: {file_count}; directory: {directory}")
+        print(
+            f"Backend: {g3_config.backend}; options: {dict(g3_config.backend_options)}"
+        )
+        print(f"Files: {file_count}; directory: {directory}")
         print(f"Per-file capacity: {units_per_file * unit} bytes", flush=True)
         print(f"Profile: {profile_name}; pool bytes={sizes}; layout={layout}")
         wait(kvcr, kvcr.deposit({first: refs(0, layout)}))
@@ -193,7 +198,9 @@ def run(directory, backend, profile_name="synthetic", file_count=1):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", default="GDS_MT")
+    parser.add_argument(
+        "--backend", help="NIXL file plugin (default: POSIX with io_uring)"
+    )
     parser.add_argument("--files", type=int, default=1)
     parser.add_argument(
         "--profile", choices=("synthetic", "kimi-k3"), default="synthetic"
