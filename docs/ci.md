@@ -76,6 +76,10 @@ hit on recomputed KV cannot satisfy a retry. It waits for model registration,
 allows asynchronous offload and router indexing, and stops the process groups
 on completion or failure. Frontend/worker logs, request responses, and the result
 are uploaded as `kvcr-vllm-e2e-<attempt>` artifacts for seven days.
+The **Verify cross-rank KVCR reuse** step prints the image and model, seed and
+retrieval worker IDs/ranks, prompt and cached token counts, transfer success
+counts, and final pass/fail status directly to the CI terminal as checks complete.
+Output is unbuffered; full JSON responses and server logs remain in the artifacts.
 
 The default test model is the public `Qwen/Qwen3-0.6B`; its first run downloads
 the model into `/scratch/huggingface`. The runner supplies two GPUs, shared

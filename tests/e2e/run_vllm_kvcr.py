@@ -68,6 +68,17 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def print_completion(label, response):
+    identity = response["nvext"]["worker_id"]
+    usage = response["usage"]
+    print(
+        f"{label}: worker={identity['decode_worker_id']} "
+        f"rank={identity['decode_dp_rank']} prompt_tokens={usage['prompt_tokens']} "
+        f"cached_tokens={usage['prompt_tokens_details']['cached_tokens']}",
+        flush=True,
+    )
+
+
 def run(args):
     import torch
 
@@ -212,6 +223,7 @@ def run(args):
         prefix = " ".join(f"{tag} section{i} cache routing data" for i in range(80))
         seed = complete(prefix + " seed source", {**headers, "x-dynamo-dp-rank": "0"})
         write_json(output / "seed.json", seed)
+        print_completion("Seed", seed)
         identity = seed["nvext"]["worker_id"]
         if identity["decode_worker_id"] != worker_id or identity["decode_dp_rank"] != 0:
             raise RuntimeError(f"Seed was not served by the requested rank: {identity}")
@@ -226,6 +238,7 @@ def run(args):
             {**headers, "x-dynamo-dp-rank": "1"},
         )
         write_json(output / "target.json", target)
+        print_completion("Retrieval", target)
         identity = target["nvext"]["worker_id"]
         if identity["decode_worker_id"] != worker_id or identity["decode_dp_rank"] != 1:
             raise RuntimeError(
@@ -259,7 +272,15 @@ def run(args):
         )
         result = {"status": "success", "cached_tokens": cached, "metrics": metrics}
         write_json(output / "result.json", result)
-        print(json.dumps(result, indent=2), flush=True)
+        print(
+            f"Source transfer: success (count={metrics['transfer/success']:g})",
+            flush=True,
+        )
+        print(
+            f"Remote delivery: success (count={metrics['remote_deliver/success']:g})",
+            flush=True,
+        )
+    print("KVCR peer-transfer validation: PASSED", flush=True)
 
 
 def main():
@@ -272,9 +293,17 @@ def main():
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if image := os.environ.get("KVCR_TEST_IMAGE"):
+        print(f"Test image: {image}", flush=True)
+    print(f"Test model: {args.model}", flush=True)
     try:
         run(args)
     except Exception as error:
+        print(
+            f"KVCR peer-transfer validation: FAILED ({error})",
+            file=sys.stderr,
+            flush=True,
+        )
         write_json(
             args.output_dir / "result.json", {"status": "failed", "error": str(error)}
         )
