@@ -105,6 +105,11 @@ base image. See the
 [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
 for source installation and verification.
 
+The [SGLang integration guide](docs/quick-start-sglang.md) is a preparation-stage
+preview covering HiCache storage and direct-linker modes. Its public image
+recipe and end-to-end acceptance run are not yet release-validated; use the
+status notes in that guide before trying the candidate commands.
+
 ### Development
 
 For local development, API lifecycle guidance, validation, integration, and
