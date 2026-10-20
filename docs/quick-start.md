@@ -324,6 +324,9 @@ telemetry criteria above.
 
 - Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach
   the public vLLM source, Dynamo's GitHub repository, and PyPI.
+- On a host with many CPUs, the Dynamo build can fail with `Too many open
+  files` from `cargo`. Add `--ulimit nofile=262144:262144` to the
+  `docker build` command.
 - Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and
   `KVCR_VLLM_REF` is the pinned adapter commit SHA in the build step above.
 - Read the final compatibility-check output. It identifies whether the Dynamo
@@ -343,6 +346,31 @@ telemetry criteria above.
 - Make `control_ports` a list with exactly one entry per local DP rank.
 - Check that every control and KV-events port is unique and available.
 - Confirm that the installed NIXL version matches the `kvcr` pin.
+
+### Startup is slow or fails on a host with many network interfaces
+
+`--network host` exposes every network interface of the host to UCX when each
+rank creates its NIXL agent. UCX considers each interface that carries an IPv4
+address. Agent creation time grows roughly with the square of that number, and
+ranks that start together on one node largely wait on each other. UCX also
+refuses to create a context for more than 128 transports/devices.
+
+- Symptoms: startup fails with `KVCR progress initialization timed out after
+  30s (stage: NIXL agent initialization)`, or with `NIXL_ERR_BACKEND` and a UCX
+  log line `exceeded transports/devices limit (up to 128 are supported)`.
+- Count what the container sees. In the container, `ls /sys/class/net | wc -l`
+  prints the number of interfaces, and
+  `ip -4 -o addr show | awk '{print $2}' | sort -u | wc -l` prints the number
+  that carry an IPv4 address. As a rough guide, about 120 of the latter were
+  enough for eight ranks to exceed the 30 s startup budget.
+- Restrict UCX to the interface or interfaces that carry traffic to your peers
+  by exporting `UCX_NET_DEVICES=<interface>[,<interface>...]` in the worker
+  terminal before starting the worker, or by adding
+  `--env UCX_NET_DEVICES=<interface>` to the `docker run` command in step 2.
+  A wrong choice can break transfers to remote peers.
+- `UCX_NET_DEVICES` does not help when the host exposes many interfaces
+  without an IPv4 address, such as the host-side ends of container veth pairs.
+  Startup is slower there but still succeeds unless it exceeds the 30 s budget.
 
 ### Dynamo does not produce router hints
 
