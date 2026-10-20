@@ -109,6 +109,8 @@ for source installation and verification.
 
 For local development, API lifecycle guidance, validation, integration, and
 KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
+For the two-GPU functionality CI and its operations setup, see the
+[CI guide](docs/ci.md).
 
 ## License
 

@@ -11,4 +11,5 @@ __pycache__/
 /build/
 /dist/
 /htmlcov/
+/artifacts/
 *.egg-info/

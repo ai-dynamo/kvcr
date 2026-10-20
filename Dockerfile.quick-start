@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG VLLM_IMAGE=vllm/vllm-openai:nightly-43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5@sha256:f8696a5176c1fb61e025b0772505674a3e092c25597eb26117003945b5121e8d
+ARG DYNAMO_REF=ea23e5130c1bfbadec477b99449d0cee5598caa0
+ARG KVCR_VLLM_REF=08567505b09324f891797f4a13c1bd73fc75a827
 
 # The vLLM image, adapter source, and Dynamo revision below are one validated
 # compatibility set. Change them together and repeat the end-to-end test.
@@ -15,12 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin the merged vLLM KVCR integration to an exact commit SHA.
 FROM build-base AS vllm-kvcr-source
 ARG KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG KVCR_VLLM_REF=08567505b09324f891797f4a13c1bd73fc75a827
+ARG KVCR_VLLM_REF
 RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr remote add origin "${KVCR_VLLM_REPO}" \
  && git -C /src/vllm-kvcr fetch --depth 1 origin "${KVCR_VLLM_REF}" \
  && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
- && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}"
+ && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}" \
+ && git -C /src/vllm-kvcr rev-parse HEAD > /vllm-source.sha
 WORKDIR /src/vllm-kvcr
 RUN mkdir -p /overlay \
  && cp --parents \
@@ -35,10 +38,12 @@ RUN mkdir -p /overlay \
 # Pin a landed Dynamo revision with the versioned KV hint protocol and
 # per-rank KVCR control ports.
 FROM build-base AS dynamo-builder
-ARG DYNAMO_REF=ea23e5130c1bfbadec477b99449d0cee5598caa0
+ARG DYNAMO_REF
 RUN git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git /src/dynamo \
  && git -C /src/dynamo fetch --depth 1 origin "${DYNAMO_REF}" \
- && git -C /src/dynamo checkout --detach "${DYNAMO_REF}"
+ && git -C /src/dynamo checkout --detach "${DYNAMO_REF}" \
+ && test "$(git -C /src/dynamo rev-parse HEAD)" = "${DYNAMO_REF}" \
+ && git -C /src/dynamo rev-parse HEAD > /dynamo-source.sha
 RUN python3 -m venv /venv \
  && /venv/bin/pip install --no-cache-dir "maturin[patchelf]"
 RUN cd /src/dynamo/lib/bindings/python \
@@ -164,10 +169,47 @@ for distribution in (
     print(f"{distribution}=={metadata.version(distribution)}")
 PY
 
+ARG VLLM_IMAGE
+ARG DYNAMO_REF
+ARG KVCR_VLLM_REF
+ARG KVCR_COMMIT=unknown
+
+LABEL org.opencontainers.image.revision="${KVCR_COMMIT}" \
+      io.ai-dynamo.kvcr.dynamo.sha="${DYNAMO_REF}" \
+      io.ai-dynamo.kvcr.vllm.sha="${KVCR_VLLM_REF}" \
+      io.ai-dynamo.kvcr.base-image="${VLLM_IMAGE}"
+
+# Keep the revisions observed inside the source stages in the final image.
+# Local quick-start builds may omit KVCR_COMMIT; CI supplies the PR merge SHA.
+COPY --from=dynamo-builder /dynamo-source.sha /opt/kvcr-build/dynamo.sha
+COPY --from=vllm-kvcr-source /vllm-source.sha /opt/kvcr-build/vllm.sha
+RUN python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+
+out = Path("/opt/kvcr-build")
+kvcr_commit = os.environ["KVCR_COMMIT"]
+assert kvcr_commit == "unknown" or re.fullmatch(r"[0-9a-f]{40}", kvcr_commit)
+dynamo_commit = (out / "dynamo.sha").read_text().strip()
+vllm_commit = (out / "vllm.sha").read_text().strip()
+assert dynamo_commit == os.environ["DYNAMO_REF"]
+assert vllm_commit == os.environ["KVCR_VLLM_REF"]
+(out / "source-revisions.json").write_text(json.dumps({
+    "schema_version": 1,
+    "kvcr_commit": kvcr_commit,
+    "dynamo_commit": dynamo_commit,
+    "vllm_adapter_commit": vllm_commit,
+    "vllm_base_image": os.environ["VLLM_IMAGE"],
+}, indent=2) + "\n")
+PY
+
 ENV HF_HOME=/home/vllm/.cache/huggingface
 RUN mkdir -p "${HF_HOME}" \
  && chown -R vllm:0 "${HF_HOME}"
 
 WORKDIR /workspace
-USER vllm
+ARG KVCR_RUNTIME_USER=vllm
+USER ${KVCR_RUNTIME_USER}
 ENTRYPOINT []
