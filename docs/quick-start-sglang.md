@@ -122,6 +122,14 @@ The control endpoint's `tcp://` scheme does not prove payload TCP or RDMA.
 
 ## Linker mode: alternative worker configuration
 
+> [!IMPORTANT]
+> The linker emits `ownership="kvcr"` inventory events. Dynamo's ordinary
+> SGLang `KvEventPublisher` path rejects that ownership domain. Router-hint
+> forwarding in PR #16117 is not sufficient by itself: an ownership-aware
+> state-agent ingress and its worker lifecycle wiring must be validated before
+> this section can be used as a Dynamo peer-discovery recipe. The flag fragment
+> below documents the engine configuration only.
+
 Do not run this at the same time as the HiCache example on the same GPUs.
 Keep the common model, event and worker setup, but replace **all** hierarchical
 cache flags and the HiCache JSON with:
