@@ -463,6 +463,9 @@ multi-pool keys do not add SSD placement or sharding.
 The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
 pool sizes, spill, direct delivery, and DRAM refill without a model:
 
+See the [G3 example README](../examples/README.md) for prerequisites, a complete
+walkthrough, expected output, and Docker setup.
+
 ```bash
 PYTHONPATH=src python3 examples/g3_multi_pool.py --directory /path/to/local/ssd
 # Explicitly opt into GDS_MT:

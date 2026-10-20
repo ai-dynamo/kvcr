@@ -83,6 +83,18 @@ The [quick start](docs/quick-start.md) is a public preview that builds and runs 
 
 For local development, API lifecycle guidance, validation, integration, and KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
 
+### G3 multi-pool disk caching
+
+G3 can store keys containing pieces from several named DRAM pools in one or
+more files. The default file backend is **POSIX with io_uring**; GDS_MT is an
+explicit option. Files can share one mounted RAID filesystem, which handles
+the physical drives.
+
+See the [G3 example README](examples/README.md) for configuration, prerequisites,
+single-file and multi-file commands, a Kimi K3 cache-shape profile, and expected
+results. The standalone example validates cache transfers; full hybrid-model
+serving still needs the vLLM adapter to export the model's pools and pieces.
+
 ## License
 
 KVCR is released under the Apache License 2.0. The full license text is in [LICENSE](LICENSE).
