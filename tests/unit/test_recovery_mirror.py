@@ -17,6 +17,7 @@ from kvcr.recovery_journal import (
     _decode_recovery_record,
     _project_recovery_record,
     _recovery_frames,
+    _RecoveryBlock,
     _RecoveryMirror,
 )
 from kvcr.types import BlockKey
@@ -116,17 +117,14 @@ def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
     encoded = _payload(record)
 
     # The outer record stays positional; G2 locations carry their pool names.
-    assert msgspec.msgpack.decode(encoded) == wire
+    assert msgspec.msgpack.decode(encoded) == [*wire, None, None]
     assert _decode_recovery_record(encoded, pool_names) == recovered
 
 
 def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     """Appending is the one change this format allows, and it has to work."""
 
-    class _RecoveryBlockV2(msgspec.Struct, frozen=True, array_like=True):
-        g2: list[tuple[str, int]] | None = None
-        g3: int | None = None
-        position: int = -1
+    class _RecoveryBlockV2(_RecoveryBlock):
         appended: int = 0
 
     legacy = msgspec.msgpack.encode([[["", 3]], 5])
@@ -141,7 +139,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     assert upgraded.g3 == 5
     assert upgraded.position == 6
     assert upgraded.appended == 0
-    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, 42))
+    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], 5, 6, None, None, 42))
     assert _decode_recovery_record(future, _ONE_POOL) == positioned
 
 

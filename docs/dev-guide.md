@@ -250,7 +250,11 @@ Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the l
 
 A worker calls `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)` with its Guard's control address and each ordered pool's name and block size. The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block sizes may differ. The pre-release wire protocol remains version 1.
 
-`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and `KVCRGuardConfig`-driven construction. Remote peers must match pool names, block sizes, and order. G3 currently supports one pool and one block per key.
+`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and
+`KVCRGuardConfig`-driven construction. Remote peers must match pool names,
+block sizes, and order. G3 supports multiple pools and multiple pieces per key,
+including repeated pool names and concrete part labels. Each pool's block size
+must be a multiple of the native memory-page size.
 
 The compatibility digest must match the service and change whenever the KV layout changes. A group's first claim fixes its ordered pool layout and, when G3 is configured, its ordered paths, per-file capacity, backend and options, and remote framework DRAM backend. Later mismatches are refused; changing the layout requires restarting the service, which recreates the groups.
 
@@ -422,7 +426,43 @@ The important fields are:
 
 For several local DP ranks, provide one `control_ports` entry per local rank in local-rank order. Every worker must advertise an address reachable from its peers, and every port must be unique on that host.
 
-The secondary tier can optionally own local G2 capacity through `secondary_g2_slots`, attach to a service-owned pool through `kvcr_service_socket_path` together with `compatibility_digest`, or configure file-backed storage through `g3`. `g3.capacity_bytes_per_file` is rounded down to whole blocks and must fit at least one. Blocks must be page aligned; existing nonempty files must match the rounded capacity. The vLLM adapter uses one unnamed pool per Guard, so start the guard service with one pool size, for example `--pool-sizes-gb 48`. Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes precedence over an in-process `secondary_g2_slots` allocation. Policy names and diagnostic options must match the KVCR and vLLM revisions being tested.
+The secondary tier can optionally own local G2 capacity through
+`secondary_g2_slots`, attach to a service-owned pool through
+`kvcr_service_socket_path` together with `compatibility_digest`, or configure
+file-backed storage through `g3`.
+`g3.capacity_bytes_per_file` is rounded down to whole allocation units and must
+fit at least one. The unit is the greatest common divisor of the configured
+pool block sizes; a larger piece uses multiple units. Existing nonempty files
+must match the rounded capacity. A key must fit in the combined file capacity
+to spill; G3 reserves and evicts complete keys, and publishes a key only after
+all its pieces have been written successfully. Fetches retain the key's ordered
+layout; deliveries may select unambiguous labeled pieces in a different order.
+G3 recovery records retain the layout and every allocated unit. Legacy
+single-pool records remain readable; older readers discard multi-piece disk
+records rather than exposing an incomplete key. Changing pool geometry still
+requires a new compatibility digest and service restart. This does not add
+file-content validation during recovery or change native-error quiescence.
+
+Small common units increase descriptor and metadata counts when pool block
+sizes differ greatly. Measure this overhead before choosing production layouts.
+The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
+pool sizes, spill, direct delivery, and DRAM refill without a model:
+
+```bash
+PYTHONPATH=src python3 examples/g3_multi_pool.py --backend GDS_MT --directory /path/to/local/ssd
+# For a NIXL build with the POSIX plugin:
+PYTHONPATH=src python3 examples/g3_multi_pool.py --backend POSIX --directory /path/to/local/ssd
+```
+
+The probe uses fresh temporary files and checks every returned byte. It requires
+NIXL's UCX and selected file plugin; GDS_MT also requires working cuFile/CUDA
+initialization even though the buffers in this probe are DRAM.
+
+The vLLM adapter uses one unnamed pool per Guard, so start the guard service with
+one pool size, for example `--pool-sizes-gb 48`.
+Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes
+precedence over an in-process `secondary_g2_slots` allocation. Policy names and
+diagnostic options must match the KVCR and vLLM revisions being tested.
 
 The worker configuration enables its side of the contract. Dynamo must still run a KV-aware router that consumes KV events, selects a source and destination, and places the resulting plan in the request metadata. A plain round-robin router does not create KVCR source hints.
 

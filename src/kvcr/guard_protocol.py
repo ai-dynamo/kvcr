@@ -13,6 +13,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from math import gcd
 from typing import Annotated, Literal
 
 import msgspec
@@ -76,9 +77,7 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     def __post_init__(self) -> None:
         _validate_pool_layouts(self.pool_layouts)
         if self.g3 is not None:
-            if len(self.pool_layouts) != 1:
-                raise ValueError("G3 does not support multiple pools")
-            block_size_bytes = self.pool_layouts[0][1]
+            block_size_bytes = gcd(*(size for _, size in self.pool_layouts))
             if block_size_bytes % mmap.PAGESIZE:
                 raise ValueError("G3 requires page-aligned slots")
             if self.g3.capacity_bytes_per_file < block_size_bytes:

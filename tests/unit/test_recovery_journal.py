@@ -15,6 +15,7 @@ from _kvcr_test_utils import _recovered_record
 
 from kvcr.core import _BlockRecord
 from kvcr.guard_protocol import _PoolDescriptor
+from kvcr.local_disk import _G3Residency
 from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.recovery_journal import (
     _JOURNAL_HEADER_BYTES,
@@ -25,6 +26,7 @@ from kvcr.recovery_journal import (
     RecoveryJournalTornError,
     _attach_journal,
     _decode_recovery_record,
+    _project_recovery_record,
     _recovery_frames,
     _RecoveryMirror,
     canonical_pool_terms,
@@ -40,6 +42,43 @@ _PUBLISHED_OFFSET = 128
 _CONSUMED_OFFSET = 192
 _GENERATION = "a" * 32
 _TEST_DIGEST = "Opaque-Digest"
+
+
+def test_multi_piece_g3_recovery_round_trip_and_legacy_reader():
+    record = _BlockRecord(
+        g3=_G3Residency(1, layout=("full", "swa:a", "swa:b"), extra_slots=(3, 5, 7)),
+        position=12,
+    )
+    payload = msgspec.msgpack.encode(_project_recovery_record(record))
+    assert _decode_recovery_record(payload, ("full", "swa")) == record
+
+    class LegacyRecord(msgspec.Struct, array_like=True):
+        g2: list[tuple[str, int]] | None = None
+        g3: int | None = None
+        position: int = -1
+
+    # An older process must drop the new disk entry, never read a partial key.
+    assert msgspec.msgpack.decode(payload, type=LegacyRecord).g3 is None
+    legacy = _recovered_record(g3=2)
+    assert (
+        _decode_recovery_record(msgspec.msgpack.encode([None, 2, -1]), ("full",))
+        == legacy
+    )
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        [None, None, -1, ["full"], None],
+        [None, None, -1, None, [0]],
+        [None, 0, -1, ["full"], [0]],
+        [None, None, -1, ["missing"], [0]],
+        [None, None, -1, ["swa:a", "swa:a"], [0, 1]],
+    ],
+)
+def test_multi_piece_g3_recovery_rejects_incomplete_or_invalid_metadata(wire):
+    with pytest.raises(ValueError):
+        _decode_recovery_record(msgspec.msgpack.encode(wire), ("full", "swa"))
 
 
 def _attachment(mapping: mmap.mmap, journal_bytes: int) -> KVCRPoolAttachment:

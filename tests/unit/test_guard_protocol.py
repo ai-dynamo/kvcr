@@ -236,7 +236,7 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
     with pytest.raises(ValueError, match="unique"):
         _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")})
 
-    with pytest.raises(ValueError, match="does not support multiple pools"):
+    with pytest.raises(ValueError, match="page-aligned"):
         _TierConfig(
             _POOL_LAYOUTS,
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
@@ -253,7 +253,7 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
         )
 
     tier = _TierConfig(
-        [("pool", mmap.PAGESIZE)],
+        [("full", 2 * mmap.PAGESIZE), ("swa", mmap.PAGESIZE)],
         _G3Config(**{**good, "capacity_bytes_per_file": 2 * mmap.PAGESIZE - 1}),
     )
     assert (
