@@ -35,6 +35,25 @@ Standard GitHub PR workflow:
 For security disclosures, do **not** open a public issue or pull request - see
 [SECURITY.md](SECURITY.md).
 
+## Testing and CI
+
+Before opening a PR, run lint and unit tests:
+
+```bash
+uv run ruff check src tests
+uv run pytest tests/unit -q
+```
+
+CI runs both checks automatically.
+
+GPU E2E tests require maintainer approval with `/ok to test <commit-sha>`
+on the PR. The Docker Build workflow builds and publishes the test image,
+then runs the two-GPU test to verify cross-rank KV cache reuse.
+
+Check the “Verify cross-rank KVCR reuse” step for results.
+Full logs and responses are available in the `kvcr-vllm-e2e-<attempt>`
+artifact.
+
 ## Signing Your Work
 
 We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.
