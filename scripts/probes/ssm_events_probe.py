@@ -1,3 +1,4 @@
+# ruff: noqa: E402, E501  -- throwaway probe, imports after the server is up
 """Bare vLLM + CPU offload + self-describing KV events: dump what the offload
 tracker emits per KV cache group for a hybrid model. Arg: label."""
 

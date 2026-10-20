@@ -1,3 +1,4 @@
+# ruff: noqa: E402, E501  -- throwaway probe, imports after the server is up
 import json
 import random
 import re
