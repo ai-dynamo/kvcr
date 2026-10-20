@@ -126,3 +126,68 @@ class _KVFetchHint(msgspec.Struct, frozen=True):
 
         # Add other fields to the parsed result when KVCR starts consuming them.
         return cls(source, frozenset(hashes))
+
+
+class _KVGPUFetchHint(msgspec.Struct, frozen=True):
+    """GPU-only action; legacy CPU actions never authorize a CUDA transfer."""
+
+    source_endpoint: str
+    block_hashes: frozenset[int]
+    compatibility_domain: str
+
+    @classmethod
+    def from_hint(cls, hint: Mapping[str, object] | msgspec.Struct) -> _KVGPUFetchHint:
+        if (
+            not isinstance(hint, (Mapping, msgspec.Struct))
+            or _hint_field(hint, "protocol_version") != "0.1"
+        ):
+            raise ValueError("invalid GPU router hint protocol")
+        actions = _hint_field(hint, "actions")
+        if not isinstance(actions, list):
+            raise ValueError("invalid GPU router hint actions")
+        for action in actions:
+            if not isinstance(action, (Mapping, msgspec.Struct)):
+                continue
+            if _hint_field(action, "action_type") != "kv.fetch_gpu":
+                continue
+            payload = _hint_field(action, "payload")
+            if _hint_field(action, "action_version") != "1.0" or not isinstance(
+                payload, Mapping
+            ):
+                raise ValueError("invalid GPU router hint action")
+            if any(
+                payload.get(name) != value
+                for name, value in (
+                    ("source_memory_kind", "gpu"),
+                    ("target_memory_kind", "gpu"),
+                    ("transport", "nixl_gpu_direct"),
+                )
+            ):
+                raise ValueError(
+                    "GPU router hint requires direct GPU memory on both peers"
+                )
+            domain = payload.get("compatibility_domain")
+            if (
+                not isinstance(domain, str)
+                or not domain
+                or domain.strip() != domain
+                or "\x00" in domain
+            ):
+                raise ValueError(
+                    "GPU router hint requires an explicit compatibility domain"
+                )
+            # Retain existing key/endpoint/copy validation and CPU parsing behavior.
+            parsed = _KVFetchHint.from_hint(
+                {
+                    "protocol_version": "0.1",
+                    "actions": [
+                        {
+                            "action_type": "kv.fetch",
+                            "action_version": "1.0",
+                            "payload": payload,
+                        }
+                    ],
+                }
+            )
+            return cls(parsed.source_endpoint, parsed.block_hashes, domain)
+        raise ValueError("GPU endpoint requires a kv.fetch_gpu action")

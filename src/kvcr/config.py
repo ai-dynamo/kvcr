@@ -50,6 +50,48 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     backend: str = "UCX"
 
 
+class RemoteFWGPUOptions(msgspec.Struct, frozen=True, kw_only=True):
+    """An isolated CUDA-IPC-only framework-memory endpoint.
+
+    Host transports in ``ucx_tls`` carry control metadata only: CUDA copy and
+    network transports are excluded, so a missing CUDA IPC route must fail
+    rather than stage KV payloads in host memory. Both peers must share the
+    explicit compatibility domain and host. Framework callbacks fence producer
+    writes before returning pin results and retain CUDA allocations until release.
+    """
+
+    compatibility_domain: str
+    ucx_tls: tuple[str, ...] = ("cuda_ipc", "posix", "self")
+    eager_ctrl_connect: bool = True
+    opportunistic_query: bool = False
+    metadata_retry_interval_ms: int = 100
+    backend: str = "UCX"
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.compatibility_domain, str)
+            or not self.compatibility_domain
+            or self.compatibility_domain.strip() != self.compatibility_domain
+            or "\x00" in self.compatibility_domain
+        ):
+            raise ValueError("GPU compatibility_domain must be explicit and non-empty")
+        allowed = {"cuda_ipc", "posix", "sysv", "self"}
+        if (
+            not isinstance(self.ucx_tls, tuple)
+            or not self.ucx_tls
+            or any(
+                type(token) is not str or token not in allowed for token in self.ucx_tls
+            )
+            or len(set(self.ucx_tls)) != len(self.ucx_tls)
+            or "cuda_ipc" not in self.ucx_tls
+        ):
+            raise ValueError(
+                "GPU ucx_tls must select CUDA IPC and only host control transports"
+            )
+        if self.backend != "UCX":
+            raise ValueError("direct GPU transfer currently requires the UCX backend")
+
+
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     """Bounded file-backed cache storage owned by this KVCR process.
 
@@ -69,6 +111,7 @@ class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     remote_fw_dram: RemoteFWDramOptions = msgspec.field(
         default_factory=RemoteFWDramOptions
     )
+    remote_fw_gpu: RemoteFWGPUOptions | None = None
 
 
 class TelemetryStats(Protocol):

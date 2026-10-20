@@ -1431,6 +1431,7 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
     )
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _gpu=False,
         _record_progress_duration=lambda *_args: None,
         _remote_agents_by_target={},
         _route_generation={},
