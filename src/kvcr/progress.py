@@ -665,10 +665,34 @@ class _KVCRProgress:
                     capture_telemetry=True,
                     enable_listen_thread=True,
                     listen_port=self._nixl_listen_port,
-                    backends=self._dram_backends,
+                    # IPC-only transports cannot provide UCX's PEER error
+                    # mode. Build that backend explicitly before any VRAM
+                    # registration; ordinary CPU defaults remain unchanged.
+                    backends=(
+                        []
+                        if self._required_gpu_ucx_tls is not None
+                        else self._dram_backends
+                    ),
                 ),
             )
             if self._required_gpu_ucx_tls is not None:
+                if getattr(self._nixl_agent, "backends", None) != {}:
+                    raise RuntimeError("GPU agent eagerly initialized a backend")
+                defaults = self._nixl_agent.get_plugin_params("UCX")
+                if defaults.get("ucx_error_handling_mode") not in ("peer", "none"):
+                    raise RuntimeError(
+                        "GPU endpoint requires UCX's explicit error-handling option"
+                    )
+                params = dict(defaults)
+                params.update(ucx_error_handling_mode="none", num_threads="4")
+                self._nixl_agent.create_backend("UCX", params)
+                if (
+                    self._nixl_agent.get_backend_params("UCX").get(
+                        "ucx_error_handling_mode"
+                    )
+                    != "none"
+                ):
+                    raise RuntimeError("GPU UCX endpoint mode was not accepted")
                 if "VRAM" not in self._nixl_agent.get_backend_mem_types("UCX"):
                     raise RuntimeError("GPU endpoint requires native UCX VRAM support")
 

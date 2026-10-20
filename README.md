@@ -154,6 +154,16 @@ this strict policy and verifies initialized CUDA memory support. GPU endpoint
 startup rejects a missing policy flag; it does not enable CUDA copy to work
 around a native initialization failure.
 
+GPU-only instances initialize UCX explicitly with the supported
+`ucx_error_handling_mode=none` option. The same-host IPC transports cannot
+provide UCX's native peer-error handling; ordinary CPU instances retain their
+existing backend defaults. The actual initialized option is checked before
+VRAM registration. This profile does **not** promise native peer-death recovery:
+deadlines do not cancel native writes or make destination slots reusable.
+Uncertain operations retain their pins and GPU allocations until actual native
+completion/quiescence, and a transport failure can still terminate the process.
+No TCP or host-copy fallback is added to obtain peer-error handling.
+
 The framework must fence producer writes before returning a GPU pin result and
 retain the entire registered allocation until quiescent shutdown. Source block
 pins are held through native completion, including timeout/cancellation grace
