@@ -57,10 +57,39 @@ also covers ECR-hosted base images; other private registries need their own
 login, which is not configured yet.
 
 The build job exposes `image` as a digest-pinned reference and `image_tag` as the
-SHA tag. A subsequent job can use `needs: build` and
-`container.image: ${{ needs.build.outputs.image }}` on
-`prod-kvcr-tester-amd-gpu-2-v1`. The current workflow builds and publishes only;
-it does not run the two-rank serving test.
+SHA tag. Its dependent `e2e` job calls `gpu-2-smoke.yml` with that image. The
+two-GPU runner pulls it as the job container before running the test steps;
+image-pull authorization comes from the Kubernetes runner infrastructure.
+
+The E2E workflow runs `tests/e2e/run_vllm_kvcr.py`, which automates the
+[quick-start peer-transfer check](quick-start.md#5-verify-a-kvcr-peer-to-peer-transfer):
+
+1. Start a KV-aware Dynamo frontend and vLLM with two data-parallel ranks.
+2. Seed a fresh, multi-block prefix on rank 0, then retrieve it on rank 1.
+3. Verify both responses identify the requested ranks and the target reports
+   positive, block-aligned cached tokens.
+4. Require positive `transfer/success` and `remote_deliver/success` telemetry,
+   with no positive remote-delivery failure or partial count.
+
+The test starts fresh processes and never retries the target prefix, so a local
+hit on recomputed KV cannot satisfy a retry. It waits for model registration,
+allows asynchronous offload and router indexing, and stops the process groups
+on completion or failure. Frontend/worker logs, request responses, and the result
+are uploaded as `kvcr-vllm-e2e-<attempt>` artifacts for seven days.
+
+The default test model is the public `Qwen/Qwen3-0.6B`; its first run downloads
+the model into `/scratch/huggingface`. The runner supplies two GPUs, shared
+memory, and writable scratch storage. The peer-only test shares vLLM's host
+tiers; it does not exercise a Guard-owned pool, disk caching, or failure recovery.
+
+To rerun the test without rebuilding, use **Run workflow** on **KVCR vLLM E2E**
+and supply the published image digest (once that workflow is on the default
+branch). Its optional `model` input selects a different compatible model.
+Inside an equivalent container with two visible GPUs, run:
+
+```bash
+python3 tests/e2e/run_vllm_kvcr.py --output-dir e2e-artifacts
+```
 
 To build the same layer locally:
 
