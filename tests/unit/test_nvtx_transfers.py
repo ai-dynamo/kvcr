@@ -73,6 +73,22 @@ def test_context_mapping_preserves_identity_and_bounded_utf8(
     assert int(event["session_known"]) == int(event["parent_session_known"]) == 0
 
 
+def test_request_churn_does_not_evict_worker_identities(recording, monkeypatch):
+    identify, calls = _nvtx.identity, []
+
+    def counted(value):
+        calls.append(value)
+        return identify(value)
+
+    monkeypatch.setattr(_nvtx, "identity", counted)
+    tracer = _nvtx.create_tracer()
+    tracer.lifecycle(target_agent="worker", target_incarnation="boot")
+    for index in range(130):
+        tracer.lifecycle(request_id=f"request-{index}")
+    tracer.lifecycle(target_agent="worker", target_incarnation="boot")
+    assert calls.count("worker") == calls.count("boot") == 1
+
+
 def test_source_deadline_and_unresolved_close_are_not_native_completion(recording):
     source, agent, pinning = test_nvtx.make_source(recording)
     agent.state = "PROC"
@@ -138,6 +154,12 @@ def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     else:
         assert int(submitted[0]["selected_bytes"]) == -1
     assert len(payloads(recording, "source.write.completed")) == 1
+    for name in ("source.write", "nixl.write"):
+        assert (
+            spans(recording, name)[0][3]
+            == spans(recording, name, "end")[0][3]
+            == source._core._progress._thread.ident
+        )
 
 
 def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypatch):

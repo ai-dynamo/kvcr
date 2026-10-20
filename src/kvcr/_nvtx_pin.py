@@ -111,7 +111,9 @@ class _PinTrace:
                 return
             self.finished = True
         self._context()
-        status, default_reason = _PIN_RESULTS[result]
+        status, default_reason = _PIN_RESULTS.get(
+            result, (Status.UNRESOLVED, Reason.UNKNOWN)
+        )
         if status is Status.SUCCESS and 0 <= completed_blocks < self.requested_blocks:
             status = Status.FAILED if completed_blocks == 0 else Status.PARTIAL
         if reason is None:
