@@ -4,6 +4,13 @@
 name: Docker Build
 
 on:
+  # copy-pr-bot mirrors trusted PR commits to pull-request/<number> branches.
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+      # TODO: remove before merging; temporary trigger for testing this branch.
+      - "oandreeva/kvcr-gpu-2-smoke"
+  # Manual runs can override the base image, Dynamo version, and KVCR ref.
   workflow_dispatch:
     inputs:
       base_image:
@@ -21,13 +28,22 @@ on:
         required: false
         type: string
 
+concurrency:
+  # Runs for the same PR branch cancel each other.
+  group: docker-build-${{ github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 45
+    env:
+      AWS_DEFAULT_REGION: us-west-2
+      ECR_REGISTRY: 210086341041.dkr.ecr.us-west-2.amazonaws.com
+      ECR_REPOSITORY: ai-dynamo/kvcr
     steps:
       - name: Check out CI recipe
         uses: actions/checkout@v4
@@ -38,71 +54,71 @@ jobs:
           ref: ${{ inputs.kvcr_ref || github.sha }}
           path: kvcr-source
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Log in to ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      # Route the build to the shared BuildKit service. KVCR is built on top of a
+      # vLLM image, so it uses the vllm flavor (and its layer cache pool).
+      - name: Initialize shared BuildKit builder
+        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@dillon/ops-8928-enable-kvcr-ci-image-builds-using-shared-buildkit
+        with:
+          builder_name: kvcr-${{ github.run_id }}-${{ github.run_attempt }}
+          flavor: vllm
+          arch: linux/amd64
+          namespace: buildkit
 
       - name: Inspect build environment
         run: |
-          docker version
-          docker buildx inspect --bootstrap
+          docker --version
+          docker buildx inspect
           df -h
 
       - name: Resolve build inputs
         id: source
         env:
-          BASE_IMAGE: ${{ inputs.base_image }}
-          DYNAMO_VERSION: ${{ inputs.dynamo_version }}
+          BASE_IMAGE: ${{ inputs.base_image || 'vllm/vllm-openai:nightly' }}
         run: |
           set -euo pipefail
           kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
-          docker pull --platform linux/amd64 "$BASE_IMAGE"
-          base_image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")
-          image_tag="kvcr-vllm-e2e:${kvcr_sha}"
-          printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\n' \
-            "$kvcr_sha" "$base_image" "$image_tag" >> "$GITHUB_OUTPUT"
-          jq -n \
-            --arg kvcr_sha "$kvcr_sha" \
-            --arg requested_base_image "$BASE_IMAGE" \
-            --arg resolved_base_image "$base_image" \
-            --arg image_tag "$image_tag" \
-            --arg dynamo_version "$DYNAMO_VERSION" \
-            '{kvcr_sha: $kvcr_sha, requested_base_image: $requested_base_image,
-              resolved_base_image: $resolved_base_image, image_tag: $image_tag,
-              requested_dynamo_version: $dynamo_version}' \
-            > "$RUNNER_TEMP/kvcr-build-metadata.json"
+          # Resolve the base tag to an immutable digest with a registry query; the
+          # builder has no docker daemon, so nothing is pulled locally. BuildKit
+          # pulls the base layers itself.
+          manifest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{.Manifest}}')
+          base_name=$(awk '/^Name:/ {print $2; exit}' <<< "$manifest")
+          base_digest=$(awk '/^Digest:/ {print $2; exit}' <<< "$manifest")
+          test -n "$base_name" && test -n "$base_digest"
+          base_repo="${base_name%@*}"
+          if [[ "${base_repo##*/}" == *:* ]]; then base_repo="${base_repo%:*}"; fi
+          base_image="${base_repo}@${base_digest}"
+          image_ref="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}"
+          printf 'kvcr_sha=%s\nbase_image=%s\nimage_ref=%s\n' \
+            "$kvcr_sha" "$base_image" "$image_ref" >> "$GITHUB_OUTPUT"
 
-      # Keep the local build separate from setup so it can later be routed
-      # to the build service and published to the infrastructure-owned registry.
-      - name: Build local integration image
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: ./kvcr-source
           file: Dockerfile.ci
           platforms: linux/amd64
-          push: false
-          load: true
-          tags: ${{ steps.source.outputs.image_tag }}
+          push: true
+          tags: ${{ steps.source.outputs.image_ref }}
           build-args: |
             VLLM_IMAGE=${{ steps.source.outputs.base_image }}
-            DYNAMO_VERSION=${{ inputs.dynamo_version }}
+            DYNAMO_VERSION=${{ inputs.dynamo_version || 'nightly' }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
 
-      - name: Verify local image
+      - name: Verify pushed image
         env:
-          IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
+          IMAGE_REF: ${{ steps.source.outputs.image_ref }}
         run: |
-          docker image inspect "$IMAGE_TAG"
-          docker run --rm --entrypoint cat "$IMAGE_TAG" \
-            /opt/kvcr-build-metadata.json > "$RUNNER_TEMP/kvcr-installed-packages.json"
-          docker run --rm --entrypoint cat "$IMAGE_TAG" \
-            /opt/kvcr-dynamo-install-report.json > "$RUNNER_TEMP/kvcr-dynamo-install-report.json"
-
-      - name: Save build metadata
-        uses: actions/upload-artifact@v4
-        with:
-          name: kvcr-build-metadata
-          path: |
-            ${{ runner.temp }}/kvcr-build-metadata.json
-            ${{ runner.temp }}/kvcr-installed-packages.json
-            ${{ runner.temp }}/kvcr-dynamo-install-report.json
-          retention-days: 7
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE_REF"
+          {
+            echo "### KVCR integration image"
+            echo '```'
+            echo "$IMAGE_REF"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
