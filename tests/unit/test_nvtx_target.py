@@ -23,7 +23,7 @@ from test_nvtx import payloads, spans
 
 from kvcr import _nvtx
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
-from kvcr.types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
+from kvcr.types import BlockKey, RegionDescriptor
 
 recording = test_nvtx.recording
 
@@ -97,6 +97,8 @@ def test_rejected_progress_submission_closes_unaccepted_target_range(
     assert len(rejected) == 1
     assert int(rejected[0]["status"]) == int(_nvtx.Status.REJECTED)
     assert not payloads(recording, "target.start_write.enqueued")
+    assert not kvcr._core._nvtx_operations
+    assert not recording.stack
 
 
 @pytest.mark.parametrize(
@@ -149,25 +151,12 @@ def test_target_receipt_consumption_and_caller_return(recording, indices, expect
     assert len(payloads(recording, "hint.discarded")) == 1
 
 
-def test_joined_completion_waits_for_all_tiers(recording):
-    kvcr, _, _ = target()
-    core = kvcr._core
-    trace = core._nvtx.lifecycle(op_handle=777, requested_blocks=2)
-    core._nvtx_operations[777] = trace
-    keys = (BlockKey(b"a"), BlockKey(b"b"))
-    core._joined_completions[777] = (set(keys), {})
-    core._complete(777, {keys[0]: OpEntryResult(OpEntryStatus.SUCCESS)})
-    assert not payloads(recording, "op.completion_queued")
-    core._complete(777, {keys[1]: OpEntryResult(OpEntryStatus.FAILED)})
-    assert len(payloads(recording, "op.completion_queued")) == 1
-    assert len(list(kvcr.poll_completed())) == 1
-    event = payloads(recording, "op.completion_returned")[0]
-    assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
-    assert int(event["completed_blocks"]) == 1
-
-
-@pytest.mark.parametrize("first", ["local", "remote"])
-def test_public_mixed_delivery_waits_for_both_branches(recording, first):
+@pytest.mark.parametrize(
+    "first,remote_success", [("local", True), ("remote", True), ("remote", False)]
+)
+def test_public_mixed_delivery_waits_for_both_branches(
+    recording, first, remote_success
+):
     primary = ctypes.create_string_buffer(b"a" * 16 + b"\0" * 16, 32)
     local = ctypes.create_string_buffer(16)
     agent, control = FakeNixlAgent(), FakeBytesControl()
@@ -210,26 +199,31 @@ def test_public_mixed_delivery_waits_for_both_branches(recording, first):
         == int(queued["hint_trace_id"])
     )
     assert int(used["op_handle"]) == handle
+    notification = _write_done_notification(handle, success=remote_success)
     if first == "local":
         agent.state = "DONE"
         _wait_until(lambda: agent.transfers[-1] in agent.released_xfers)
         assert list(kvcr.poll_completed()) == []
         assert not payloads(recording, "op.completion_queued")
-        agent.notifs["source"] = [_write_done_notification(handle)]
+        agent.notifs["source"] = [notification]
     else:
-        agent.notifs["source"] = [_write_done_notification(handle)]
+        agent.notifs["source"] = [notification]
         _wait_until(lambda: bool(payloads(recording, "target.write_done.received")))
         assert list(kvcr.poll_completed()) == []
         assert not payloads(recording, "op.completion_queued")
         agent.state = "DONE"
     result = dict(_poll_until(kvcr, bool))
     assert set(result) == {handle}
-    assert all(entry.success for entry in result[handle].values())
+    assert result[handle][local_key].success
+    assert result[handle][remote_key].success == remote_success
     assert set(result[handle]) == {local_key, remote_key}
     assert len(payloads(recording, "op.completion_queued")) == 1
     returned = payloads(recording, "op.completion_returned")
     assert len(returned) == 1
-    assert int(returned[0]["completed_blocks"]) == 2
+    assert int(returned[0]["completed_blocks"]) == 1 + remote_success
+    assert int(returned[0]["status"]) == int(
+        _nvtx.Status.SUCCESS if remote_success else _nvtx.Status.PARTIAL
+    )
     assert (
         int(returned[0]["request_hi"]),
         int(returned[0]["request_lo"]),
@@ -326,9 +320,7 @@ def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     assert len(payloads(recording, "target.quiesced")) == 1
 
 
-def test_missing_hint_has_specific_reason_and_failed_dispatch_cleans_up(
-    recording, monkeypatch
-):
+def test_missing_hint_has_specific_reason(recording):
     kvcr, _, _ = target()
     handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
     result = dict(kvcr.poll_completed())
@@ -336,15 +328,6 @@ def test_missing_hint_has_specific_reason_and_failed_dispatch_cleans_up(
     assert int(payloads(recording, "op.completion_returned")[0]["reason"]) == int(
         _nvtx.Reason.HINT_UNAVAILABLE
     )
-
-    def reject(*a, **kw):
-        raise ValueError("test dispatch error")
-
-    monkeypatch.setattr(kvcr._core._remote_fw_dram, "deliver", reject)
-    with pytest.raises(ValueError, match="test dispatch error"):
-        kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
-    assert not kvcr._core._nvtx_operations
-    assert not recording.stack
 
 
 @pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop"])

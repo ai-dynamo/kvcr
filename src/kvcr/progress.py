@@ -318,7 +318,6 @@ class _KVCRProgress:
             if trace is not None:
                 trace.start("nixl.write", transfer_id=transfer_id)
             submitted = True
-            post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE
             try:
                 post_state = agent.transfer(handle)
                 if post_state == "DONE":
@@ -326,16 +325,8 @@ class _KVCRProgress:
                 elif post_state == "ERR":
                     state.outcome = False
                     submitted = False
-                    post_status, post_reason = (
-                        _nvtx.Status.REJECTED,
-                        _nvtx.Reason.SUBMIT_REJECTED,
-                    )
                 elif post_state not in ("PROC", "PEND"):
                     submitted = False
-                    post_status, post_reason = (
-                        _nvtx.Status.AMBIGUOUS,
-                        _nvtx.Reason.SUBMIT_AMBIGUOUS,
-                    )
                     logger.warning(
                         "NIXL transfer returned unexpected state %r", post_state
                     )
@@ -343,12 +334,20 @@ class _KVCRProgress:
                 if isinstance(error, nixlRemoteDisconnectError):
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                 submitted = False
-                post_status, post_reason = (
-                    _nvtx.Status.AMBIGUOUS,
-                    _nvtx.Reason.SUBMIT_AMBIGUOUS,
-                )
                 logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
             if trace is not None:
+                if submitted:
+                    post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE
+                elif state.outcome is False:
+                    post_status, post_reason = (
+                        _nvtx.Status.REJECTED,
+                        _nvtx.Reason.SUBMIT_REJECTED,
+                    )
+                else:
+                    post_status, post_reason = (
+                        _nvtx.Status.AMBIGUOUS,
+                        _nvtx.Reason.SUBMIT_AMBIGUOUS,
+                    )
                 trace.mark(
                     "nixl.write.posted",
                     once=True,

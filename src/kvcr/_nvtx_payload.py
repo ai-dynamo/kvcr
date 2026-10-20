@@ -59,7 +59,7 @@ class _PayloadEmitter:
         self.category = domain.get_category_id("framework_pin")
         self.lifecycle_category = domain.get_category_id("remote_deliver")
         self._thread = _ThreadBuffers()
-        self.event_dtype = numpy.dtype(
+        self.context_dtype = numpy.dtype(
             [
                 ("schema_version", "u2"),
                 ("instance_hi", "u8"),
@@ -97,13 +97,8 @@ class _PayloadEmitter:
                 ("destination_memory", "u1"),
                 ("native_error_known", "u1"),
                 ("native_error", "i8"),
-            ]
-        )
-        # Nsight 2025.3 exports NumPy Unicode payloads as empty strings. A
-        # bounded byte array and explicit length also preserve embedded NULs.
-        self.context_dtype = numpy.dtype(
-            self.event_dtype.descr
-            + [
+                # Nsight 2025.3 exports NumPy Unicode as empty strings. Bounded
+                # bytes and an explicit length also preserve embedded NULs.
                 ("pin_id", "u8"),
                 ("pin_request_known", "u1"),
                 ("pin_request_id", "i8"),
@@ -126,7 +121,6 @@ class _PayloadEmitter:
             status=Status.PENDING,
             reason=Reason.NONE,
         )
-        self._prefix_names = frozenset(self._defaults)
         self._prefix = [(name, self._field_types[name]) for name in self._defaults]
         context_defaults = {
             name: -1 if name.endswith(("_blocks", "_bytes")) else 0
@@ -156,7 +150,7 @@ class _PayloadEmitter:
                     + [
                         (key, self._field_types[key])
                         for key in field_names
-                        if key not in self._prefix_names
+                        if key not in self._defaults
                     ]
                 )
             )
@@ -179,20 +173,13 @@ class _PayloadEmitter:
             slot = (payload, attributes, {})
         payload, attributes, views = slot
         try:
-            update_names = (
-                field_names if "trace_id" in fields else ("trace_id", *field_names)
-            )
-            updates = views.get(update_names)
+            updates = views.get(field_names)
             if updates is None:
-                updates = payload[list(update_names)]
-                views[update_names] = updates
+                updates = payload[["trace_id", *field_names]]
+                views[field_names] = updates
             if context:
                 payload[()] = self._context_template
-            updates[()] = (
-                tuple(fields.values())
-                if "trace_id" in fields
-                else (trace_id, *fields.values())
-            )
+            updates[()] = (trace_id, *fields.values())
             return method(attributes)
         finally:
             available.append(slot)

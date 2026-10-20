@@ -10,15 +10,11 @@ from pathlib import Path
 
 import pytest
 
-validate = runpy.run_path(str(Path(__file__).parents[2] / "examples/nvtx_decode.py"))[
-    "validate"
-]
-decode = runpy.run_path(str(Path(__file__).parents[2] / "examples/nvtx_decode.py"))[
-    "decode"
-]
-require_range = runpy.run_path(
-    str(Path(__file__).parents[2] / "examples/nvtx_decode.py")
-)["require_range"]
+decoder = runpy.run_path(str(Path(__file__).parents[2] / "examples/nvtx_decode.py"))
+validate, decode, require_range, reconstruct_context = (
+    decoder[name]
+    for name in ("validate", "decode", "require_range", "reconstruct_context")
+)
 
 
 @pytest.mark.parametrize("range_id", [None, 0, 7])
@@ -271,7 +267,7 @@ def compact_failed_events():
         )
         for context in contexts.values()
     )
-    return events
+    return reconstruct_context(events)
 
 
 @pytest.mark.parametrize("scenario", ["zero", "failure", "timeout"])

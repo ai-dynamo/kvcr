@@ -28,9 +28,7 @@ def reconstruct_context(events):
             key = tuple(event[field] for field in _IDENTITY)
             assert key not in contexts, "duplicate lifecycle context"
             contexts[key] = {
-                field: value
-                for field, value in event.items()
-                if field not in _METADATA and field != "_payload_fields"
+                field: value for field, value in event.items() if field not in _METADATA
             }
     result = []
     for event in events:
@@ -41,18 +39,7 @@ def reconstruct_context(events):
             continue
         key = tuple(event[field] for field in _IDENTITY)
         assert key in contexts, "missing lifecycle context"
-        fields = event.get(
-            "_payload_fields", tuple(field for field in event if field not in _METADATA)
-        )
-        emitted = {field: event[field] for field in fields}
-        result.append(
-            dict(
-                contexts[key],
-                **emitted,
-                **{field: event[field] for field in _METADATA if field in event},
-                _payload_fields=fields,
-            )
-        )
+        result.append(dict(contexts[key], **event))
     return result
 
 
@@ -131,10 +118,10 @@ def operation_key(event):
 
 
 def validate(events, scenario, operations):
+    """Check lifecycle joins and ranges in events returned by decode()."""
     if scenario == "off":
         assert not events, "off mode emitted KVCR payloads"
         return dict(events=0)
-    events = reconstruct_context(events)
     named = {}
     for event in events:
         named.setdefault(event["name"], []).append(event)

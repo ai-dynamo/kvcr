@@ -324,13 +324,14 @@ class _LifecycleTrace:
     def context(self, request_id):
         try:
             t = self.tracer
-            values = dict(self._fields)
+            values = self._fields
             if t.level == "medium" and request_id is not None:
                 encoded = request_id.encode("utf-8")
                 display = t.numpy.frombuffer(
                     encoded[:256].ljust(256, b"\0"), dtype="u1"
                 )
-                values.update(
+                values = dict(
+                    values,
                     request_display_known=1,
                     length=min(len(encoded), 256),
                     truncated=len(encoded) > 256,
