@@ -10,7 +10,7 @@ on:
       - "pull-request/[0-9]+"
     paths:
       - .github/workflows/docker-build.yml
-      - .github/workflows/gpu-2-smoke.yml
+      - .github/workflows/vllm-e2e.yml
       - Dockerfile.ci
       - pyproject.toml
       - src/**
@@ -157,6 +157,6 @@ jobs:
 
   e2e:
     needs: build
-    uses: ./.github/workflows/gpu-2-smoke.yml
+    uses: ./.github/workflows/vllm-e2e.yml
     with:
       image: ${{ needs.build.outputs.image }}
