@@ -82,13 +82,6 @@ class _PinTrace:
         except Exception:
             return False
 
-    def pop(self, pushed):
-        if pushed:
-            try:
-                self.tracer.domain.pop_range()
-            except Exception:
-                pass
-
     def registered(self, request_id):
         self.request_id = request_id
         self._context()

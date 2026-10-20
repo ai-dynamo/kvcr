@@ -312,6 +312,7 @@ class _SourceWriteOp(_RemoteOp):
     target_incarnation: str | None = None
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
     trace_initialized: bool = False
+    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -338,7 +339,7 @@ class _SourceWriteOp(_RemoteOp):
                     if status.cancel_requested
                     else _nvtx.Reason.SOURCE_STALLED
                     if not source_responsive
-                    else _nvtx.Reason.UNKNOWN
+                    else self.failure_reason
                     if self.state is _SourceWriteState.NOTIFY_FAILURE
                     else _nvtx.Reason.DEADLINE
                 )
@@ -1358,6 +1359,7 @@ class _RemoteFWDram:
         source_pin: _SourcePinOp,
         *,
         force_failure: bool = False,
+        failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN,
     ) -> None:
         kvcr = self._kvcr
         route_name, route_generation = source_pin.route
@@ -1368,6 +1370,8 @@ class _RemoteFWDram:
             # the same handle back for a reused name, so submitting would
             # write the dead generation's destinations through the new route.
             force_failure = True
+            if failure_reason is _nvtx.Reason.UNKNOWN:
+                failure_reason = _nvtx.Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.ordered_keys
         )
@@ -1455,6 +1459,7 @@ class _RemoteFWDram:
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
+            failure_reason=failure_reason,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1595,7 +1600,9 @@ class _RemoteFWDram:
             len(op.pending_pin_ids),
         )
         self._cancel_pending_pin_for_op(op_id, op, result="timeout")
-        self._submit_prepared_source_write(op_id, op, force_failure=True)
+        self._submit_prepared_source_write(
+            op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
+        )
 
     def _start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
@@ -1608,7 +1615,9 @@ class _RemoteFWDram:
             return
         kvcr = self._kvcr
         if kvcr._clock() >= op.deadline:
-            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+            self._submit_prepared_source_write(
+                op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
+            )
             return
 
         local_sources = kvcr._claim_local_dram_sources(op.op_id, op.ordered_keys)
@@ -1788,7 +1797,7 @@ class _RemoteFWDram:
                 request = kvcr._request_pin_callback(keys)
             finally:
                 if trace is not None:
-                    trace.pop(pushed)
+                    trace.tracer.pop(pushed)
             if trace is not None:
                 trace.request_id = request
             if request in self._pending_pin_ops:

@@ -110,8 +110,6 @@ def test_reentrant_emission_does_not_overwrite_outer_payload(recording, context)
 @pytest.mark.parametrize("context", [False, True], ids=["compact", "context"])
 def test_concurrent_emission_owns_separate_payload_storage(recording, context):
     tracer = _nvtx.create_tracer()
-    name = "request.context" if context else "nixl.done_observed"
-    field = "requested_blocks" if context else "transfer_id"
     barrier = threading.Barrier(2)
     original = recording.mark
 
@@ -119,27 +117,31 @@ def test_concurrent_emission_owns_separate_payload_storage(recording, context):
         barrier.wait(timeout=5)
         original(attrs)
 
+    def annotate(value):
+        if context:
+            tracer.lifecycle(**({"requested_blocks": value} if value == 11 else {}))
+        else:
+            trace = tracer.begin(value)
+            trace.registered(value)
+            trace.finish("success", completed_blocks=value)
+
     recording.mark = overlap
-    threads = [
-        threading.Thread(
-            target=tracer._emit,
-            args=(name, identity, fields),
-            kwargs={"context": context, "method": tracer.domain.mark},
-        )
-        for identity, fields in (
-            (11, {field: 11}),
-            (22, {} if context else {field: 22}),
-        )
-    ]
+    threads = [threading.Thread(target=annotate, args=(value,)) for value in (11, 22)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=5)
         assert not thread.is_alive()
-    assert {(int(p["trace_id"]), int(p[field])) for _, _, p, _ in recording.events} == {
-        (11, 11),
-        (22, -1 if context else 22),
-    }
+    events = payloads(
+        recording, "request.context" if context else "source.pin.completed"
+    )
+    assert len(events) == len({int(p["trace_id"]) for p in events}) == 2
+    assert {int(p["requested_blocks"]) for p in events} == {11, -1 if context else 22}
+    if not context:
+        assert all(
+            p["pin_request_id"] == p["completed_blocks"] == p["requested_blocks"]
+            for p in events
+        )
 
 
 @pytest.mark.parametrize("name", ["request.context", "source.pin.context"])
@@ -178,26 +180,19 @@ def test_reused_context_clears_optional_values_without_rebinding(recording, name
     assert int(second["instance_hi"]) == tracer.instance_hi
     assert int(second["instance_lo"]) == tracer.instance_lo
     assert int(second["trace_id"]) == 12
-    for field in (
-        "requested_blocks",
-        "requested_bytes",
-        "selected_blocks",
-        "selected_bytes",
-        "completed_blocks",
-        "completed_bytes",
+    for fields, expected in (
+        (
+            "requested_blocks requested_bytes selected_blocks selected_bytes "
+            "completed_blocks completed_bytes",
+            -1,
+        ),
+        (
+            "request_hi request_known pin_id pin_request_known pin_request_id "
+            "request_display_known length truncated",
+            0,
+        ),
     ):
-        assert int(second[field]) == -1
-    for field in (
-        "request_hi",
-        "request_known",
-        "pin_id",
-        "pin_request_known",
-        "pin_request_id",
-        "request_display_known",
-        "length",
-        "truncated",
-    ):
-        assert int(second[field]) == 0
+        assert all(int(second[field]) == expected for field in fields.split())
     assert second["value_utf8"].tobytes() == bytes(256)
     assert int(second["status"]) == _nvtx.Status.PENDING
     assert int(second["reason"]) == _nvtx.Reason.NONE
