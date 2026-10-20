@@ -83,7 +83,7 @@ jobs:
       # TODO: pin to a merged commit SHA once ai-dynamo/.github#9 lands.
       - name: Initialize shared BuildKit builder
         id: builder
-        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@dillon/ops-8928-enable-kvcr-ci-image-builds-using-shared-buildkit
+        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@e8cb76eeca91bbac2ab5c2702bd8bd629b20dd3a
         with:
           builder_name: ${{ env.BUILDER_NAME }}
           flavor: vllm
