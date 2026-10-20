@@ -55,7 +55,7 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
 
     Per-file capacity is rounded down to complete slots and must fit at least one.
     Slot size is the greatest common divisor of the pool block sizes, which must
-    each be page aligned. A key may occupy multiple slots across the files.
+    each be page aligned. A key may occupy multiple slots.
     """
 
     paths: tuple[Path, ...]

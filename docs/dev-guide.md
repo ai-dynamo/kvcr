@@ -445,6 +445,13 @@ file-content validation during recovery or change native-error quiescence.
 
 Small common units increase descriptor and metadata counts when pool block
 sizes differ greatly. Measure this overhead before choosing production layouts.
+For multi-pool DRAM support, configure one G3 file path. Pieces from all DRAM
+pools use slots in that file, and KVCR retains their pool labels for restoration.
+Multiple DRAM pools do not require multiple SSDs. The changes for multi-pool
+keys do not add SSD placement or sharding; the pre-existing multi-file mapping
+remains unchanged. Drive aggregation belongs to the deployment's filesystem or
+block layer, or to NIXLShard.
+
 The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
 pool sizes, spill, direct delivery, and DRAM refill without a model:
 
