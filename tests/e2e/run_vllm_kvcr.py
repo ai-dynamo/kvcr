@@ -34,16 +34,12 @@ def request_json(url, payload=None, headers=None):
         return json.load(response)
 
 
-def check_processes(processes):
-    for name, process in processes:
-        if process.poll() is not None:
-            raise RuntimeError(f"{name} exited with code {process.returncode}")
-
-
 def wait_until(check, timeout, processes, description):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        check_processes(processes)
+        for name, process in processes:
+            if process.poll() is not None:
+                raise RuntimeError(f"{name} exited with code {process.returncode}")
         result = check()
         if result:
             return result
@@ -55,10 +51,8 @@ def stop_process(process):
     # The vLLM parent starts engine children; stop the whole process group.
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGTERM)
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
     process.wait(timeout=10)
@@ -66,17 +60,6 @@ def stop_process(process):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
-
-
-def print_completion(label, response):
-    identity = response["nvext"]["worker_id"]
-    usage = response["usage"]
-    print(
-        f"{label}: worker={identity['decode_worker_id']} "
-        f"rank={identity['decode_dp_rank']} prompt_tokens={usage['prompt_tokens']} "
-        f"cached_tokens={usage['prompt_tokens_details']['cached_tokens']}",
-        flush=True,
-    )
 
 
 def run(args):
@@ -132,10 +115,10 @@ def run(args):
         }
         env.pop("NATS_SERVER", None)
 
-        def start(name, command):
+        def start(name, module, *arguments):
             log = resources.enter_context((output / f"{name}.log").open("wb"))
             process = subprocess.Popen(
-                command,
+                [sys.executable, "-m", module, *arguments],
                 env=env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -147,42 +130,24 @@ def run(args):
 
         start(
             "frontend",
-            [
-                sys.executable,
-                "-m",
-                "dynamo.frontend",
-                "--router-mode",
-                "kv",
-                "--http-port",
-                str(args.port),
-            ],
+            "dynamo.frontend",
+            *f"--router-mode kv --http-port {args.port}".split(),
         )
         start(
             "worker",
-            [
-                sys.executable,
-                "-m",
-                "dynamo.vllm",
-                "--model",
-                args.model,
-                "--tensor-parallel-size",
-                "1",
-                "--data-parallel-size",
-                "2",
-                "--block-size",
-                str(BLOCK_SIZE),
-                "--max-model-len",
-                "8192",
-                "--enable-prefix-caching",
-                "--disable-hybrid-kv-cache-manager",
-                "--enforce-eager",
-                "--gpu-memory-utilization",
-                "0.5",
-                "--kv-transfer-config",
-                json.dumps(transfer_config),
-                "--kv-events-config",
-                json.dumps(events_config),
-            ],
+            "dynamo.vllm",
+            "--model",
+            args.model,
+            *f"""
+                --tensor-parallel-size 1 --data-parallel-size 2
+                --block-size {BLOCK_SIZE} --max-model-len 8192
+                --enable-prefix-caching --disable-hybrid-kv-cache-manager
+                --enforce-eager --gpu-memory-utilization 0.5
+            """.split(),
+            "--kv-transfer-config",
+            json.dumps(transfer_config),
+            "--kv-events-config",
+            json.dumps(events_config),
         )
         base_url = f"http://127.0.0.1:{args.port}"
 
@@ -196,7 +161,15 @@ def run(args):
         print("Waiting for model registration and engine startup", flush=True)
         wait_until(model_ready, args.startup_timeout, processes, "model registration")
 
-        def complete(prompt, headers=None):
+        worker_id = None
+
+        def complete(name, prompt, rank=None):
+            headers = {}
+            if rank is not None:
+                headers = {
+                    "x-dynamo-worker-instance-id": str(worker_id),
+                    "x-dynamo-dp-rank": str(rank),
+                }
             response = request_json(
                 base_url + "/v1/completions",
                 {
@@ -208,43 +181,36 @@ def run(args):
                 },
                 headers,
             )
+            write_json(output / f"{name}.json", response)
             if not response.get("choices"):
                 raise RuntimeError(f"Completion has no choices: {response}")
-            return response
+            identity = response["nvext"]["worker_id"]
+            actual_worker = identity["decode_worker_id"]
+            actual_rank = identity["decode_dp_rank"]
+            usage = response["usage"]
+            cached = usage["prompt_tokens_details"]["cached_tokens"]
+            print(
+                f"{name}: worker={actual_worker} rank={actual_rank} "
+                f"prompt_tokens={usage['prompt_tokens']} cached_tokens={cached}",
+                flush=True,
+            )
+            if rank is not None and (actual_worker, actual_rank) != (worker_id, rank):
+                raise RuntimeError(f"{name} reached the wrong worker/rank: {identity}")
+            return actual_worker, cached
 
-        probe = complete(f"Worker identity probe {uuid.uuid4().hex}")
-        write_json(output / "probe.json", probe)
-        worker_id = probe["nvext"]["worker_id"]["decode_worker_id"]
-        headers = {"x-dynamo-worker-instance-id": str(worker_id)}
+        worker_id, _ = complete("probe", f"Worker identity probe {uuid.uuid4().hex}")
 
         # A fresh prefix makes a target-local hit impossible. Never retry a
         # target request with this prefix: it could then hit recomputed KV.
         tag = uuid.uuid4().hex
         prefix = " ".join(f"{tag} section{i} cache routing data" for i in range(80))
-        seed = complete(prefix + " seed source", {**headers, "x-dynamo-dp-rank": "0"})
-        write_json(output / "seed.json", seed)
-        print_completion("Seed", seed)
-        identity = seed["nvext"]["worker_id"]
-        if identity["decode_worker_id"] != worker_id or identity["decode_dp_rank"] != 0:
-            raise RuntimeError(f"Seed was not served by the requested rank: {identity}")
-        if seed["usage"]["prompt_tokens_details"]["cached_tokens"] != 0:
+        _, cached = complete("seed", prefix + " seed source", rank=0)
+        if cached != 0:
             raise RuntimeError("Fresh seed unexpectedly reported cached tokens")
 
         print("Seeded rank 0; waiting for host offload and router indexing", flush=True)
         time.sleep(args.offload_wait)
-        check_processes(processes)
-        target = complete(
-            prefix + " retrieve on target",
-            {**headers, "x-dynamo-dp-rank": "1"},
-        )
-        write_json(output / "target.json", target)
-        print_completion("Retrieval", target)
-        identity = target["nvext"]["worker_id"]
-        if identity["decode_worker_id"] != worker_id or identity["decode_dp_rank"] != 1:
-            raise RuntimeError(
-                f"Retrieval was not served by the requested rank: {identity}"
-            )
-        cached = target["usage"]["prompt_tokens_details"]["cached_tokens"]
+        _, cached = complete("target", prefix + " retrieve on target", rank=1)
         if cached <= 0 or cached % BLOCK_SIZE:
             raise RuntimeError(
                 f"Expected positive block-aligned cached tokens, got {cached}"
@@ -257,8 +223,7 @@ def run(args):
                 key = f"{scope}/{result}"
                 metrics[key] = metrics.get(key, 0) + float(count)
             if any(
-                metrics.get(f"remote_deliver/{result}", 0)
-                for result in ("partial", "failed")
+                metrics.get(f"remote_deliver/{s}", 0) for s in ("partial", "failed")
             ):
                 raise RuntimeError(f"Remote delivery failed or was partial: {metrics}")
             if metrics.get("transfer/success", 0) and metrics.get(
@@ -270,13 +235,12 @@ def run(args):
         metrics = wait_until(
             transfer_succeeded, 60, processes, "successful transfer telemetry"
         )
-        result = {"status": "success", "cached_tokens": cached, "metrics": metrics}
-        write_json(output / "result.json", result)
-        print(
-            f"Source transfer: success (count={metrics['transfer/success']:g})",
-            flush=True,
+        write_json(
+            output / "result.json",
+            {"status": "success", "cached_tokens": cached, "metrics": metrics},
         )
         print(
+            f"Source transfer: success (count={metrics['transfer/success']:g})\n"
             f"Remote delivery: success (count={metrics['remote_deliver/success']:g})",
             flush=True,
         )
