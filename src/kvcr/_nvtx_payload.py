@@ -8,14 +8,6 @@ from operator import itemgetter
 from threading import local
 from uuid import uuid4
 
-_NAMES = (
-    "source.pin.framework",
-    "source.pin.registered",
-    "source.pin.waiter",
-    "source.pin.completed",
-    "source.pin.detached",
-)
-
 
 class Status(IntEnum):
     PENDING = 1
@@ -66,7 +58,6 @@ class _PayloadEmitter:
         self._ids = count(1)
         self.category = domain.get_category_id("framework_pin")
         self.lifecycle_category = domain.get_category_id("remote_deliver")
-        self._messages = {name: domain.get_registered_string(name) for name in _NAMES}
         self._thread = _ThreadBuffers()
         self.event_dtype = numpy.dtype(
             [
@@ -127,27 +118,6 @@ class _PayloadEmitter:
             name: self.context_dtype.fields[name][0]
             for name in self.context_dtype.names
         }
-        self._prefix_names = frozenset(
-            (
-                "schema_version",
-                "instance_hi",
-                "instance_lo",
-                "trace_id",
-                "status",
-                "reason",
-            )
-        )
-        self._prefix = [
-            (name, self._field_types[name])
-            for name in (
-                "schema_version",
-                "instance_hi",
-                "instance_lo",
-                "trace_id",
-                "status",
-                "reason",
-            )
-        ]
         self._defaults = dict(
             schema_version=3,
             instance_hi=self.instance_hi,
@@ -156,6 +126,8 @@ class _PayloadEmitter:
             status=Status.PENDING,
             reason=Reason.NONE,
         )
+        self._prefix_names = frozenset(self._defaults)
+        self._prefix = [(name, self._field_types[name]) for name in self._defaults]
         context_defaults = {
             name: -1 if name.endswith(("_blocks", "_bytes")) else 0
             for name in self.context_dtype.names
@@ -198,9 +170,7 @@ class _PayloadEmitter:
             if not context:
                 for field_name, value in self._defaults.items():
                     payload[field_name] = value
-            if name not in self._messages:
-                self._messages[name] = self.domain.get_registered_string(name)
-            # nvtx 0.2.16 accepts text here, not the registered-string handle.
+            # The factory registers/caches the textual name internally.
             # Keep the original array bound: resetting the payload property
             # traverses dtype metadata again on every event.
             attributes = self.domain.get_event_attributes(

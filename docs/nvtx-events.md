@@ -5,10 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Remote delivery NVTX events
 
-Install the `profiling` extra. `KVCR_NVTX_LEVEL=off|low|medium` selects
-library-side detail; the default is low when the optional binding is available.
-Annotations do not depend on whether Nsight is attached. See [profiling](profiling.md)
-for capture commands and the pin schema.
+See [profiling](profiling.md) for installation, detail levels and capture commands.
 
 ## Source transfers
 
@@ -109,6 +106,4 @@ Unknown remote/framework causes remain unknown rather than guessed.
 
 Nonempty source and pin requests with zero completed blocks report FAILED;
 positive incomplete results report PARTIAL. This is a diagnostic convention and
-does not change control notifications or transfer ownership. See the
-[identity producer map](nvtx-context.md) for inference versus framework pin IDs
-and the unavailable session/utilization input seams.
+does not change control notifications or transfer ownership.

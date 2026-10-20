@@ -19,8 +19,7 @@ from _kvcr_test_utils import (
     _wait_until,
     _write_done_notification,
 )
-from test_nvtx import payloads
-from test_nvtx_ranges import spans
+from test_nvtx import payloads, spans
 
 from kvcr import _nvtx
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
@@ -83,6 +82,9 @@ def test_rejected_progress_submission_closes_unaccepted_target_range(
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id=request)
 
     def reject(_op):
+        for name in ("op.deliver.lifecycle", "target.remote"):
+            assert len(spans(recording, name)) == 1
+            assert not spans(recording, name, "end")
         raise RuntimeError("progress submission rejected")
 
     monkeypatch.setattr(kvcr._core._progress, "submit", reject)

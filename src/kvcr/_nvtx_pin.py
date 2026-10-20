@@ -116,8 +116,6 @@ class _PinTrace:
             status = Status.FAILED if completed_blocks == 0 else Status.PARTIAL
         if reason is None:
             reason = default_reason
-        elif isinstance(reason, str):
-            reason = Reason[reason.upper()]
         if status in (Status.PARTIAL, Status.FAILED) and reason is Reason.NONE:
             reason = Reason.UNKNOWN
         self._mark(
