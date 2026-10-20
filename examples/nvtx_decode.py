@@ -104,6 +104,28 @@ def require_range(named, name, reference):
     return span
 
 
+def require_pin_completion(named, source):
+    waiters = [
+        event
+        for event in named.get("source.pin.waiter", [])
+        if all(
+            event[field] == source[field]
+            for field in ("instance_hi", "instance_lo", "source_op_id")
+        )
+    ]
+    assert len(waiters) == 1, "missing source pin association"
+    pins = [
+        event
+        for event in named.get("source.pin.completed", [])
+        if all(
+            event[field] == waiters[0][field]
+            for field in ("instance_hi", "instance_lo", "pin_id")
+        )
+    ]
+    assert len(pins) == 1, "missing source pin completion"
+    return pins[0]
+
+
 def operation_key(event):
     return tuple(
         event[key]
@@ -237,28 +259,11 @@ def validate(events, scenario, operations):
             source_span = require_range(named, "source.write", completed[0])
             assert source_span["start"] <= completed[0]["start"] <= source_span["end"]
             assert source_span["thread"] >> 24 != result["thread"] >> 24
-            waiters = [
-                event
-                for event in named.get("source.pin.waiter", [])
-                if all(
-                    event[field] == completed[0][field]
-                    for field in ("instance_hi", "instance_lo", "source_op_id")
-                )
-            ]
-            assert len(waiters) == 1, "missing source pin association"
-            pins = [
-                event
-                for event in named.get("source.pin.completed", [])
-                if all(
-                    event[field] == waiters[0][field]
-                    for field in ("instance_hi", "instance_lo", "pin_id")
-                )
-            ]
-            assert len(pins) == 1, "missing source pin completion"
-            pin_span = require_range(named, "source.pin.wait", pins[0])
+            pin = require_pin_completion(named, completed[0])
+            pin_span = require_range(named, "source.pin.wait", pin)
             assert (
                 pin_span["start"]
-                <= pins[0]["start"]
+                <= pin["start"]
                 <= pin_span["end"]
                 <= source_span["start"]
             )
@@ -300,23 +305,8 @@ def validate(events, scenario, operations):
                 result["instance_lo"],
             ), "source and target share a tracer instance"
             assert posted[0]["thread"] >> 24 != result["thread"] >> 24
-            waiters = [
-                e
-                for e in named["source.pin.waiter"]
-                if e["instance_hi"] == posted[0]["instance_hi"]
-                and e["instance_lo"] == posted[0]["instance_lo"]
-                and e["source_op_id"] == posted[0]["source_op_id"]
-            ]
-            assert len(waiters) == 1
-            pins = [
-                e
-                for e in named["source.pin.completed"]
-                if e["instance_hi"] == waiters[0]["instance_hi"]
-                and e["instance_lo"] == waiters[0]["instance_lo"]
-                and e["pin_id"] == waiters[0]["pin_id"]
-            ]
-            assert len(pins) == 1
-            assert pins[0]["start"] <= posted[0]["start"]
+            pin = require_pin_completion(named, posted[0])
+            assert pin["start"] <= posted[0]["start"]
             if compact:
                 native_span = require_range(named, "nixl.write", posted[0])
                 assert native_span["transfer_id"] == posted[0]["transfer_id"]
@@ -334,7 +324,7 @@ def validate(events, scenario, operations):
                 )
                 assert (
                     pin_span["start"]
-                    <= pins[0]["start"]
+                    <= pin["start"]
                     <= pin_span["end"]
                     <= posted[0]["start"]
                 )

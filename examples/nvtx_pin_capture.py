@@ -27,9 +27,26 @@ def control_channel():
     return ZmqPeerControlChannel("127.0.0.1", port, "127.0.0.1")
 
 
+def remote_hint(endpoint, blocks):
+    return {
+        "protocol_version": "0.1",
+        "actions": [
+            {
+                "action_type": "kv.fetch",
+                "action_version": "1.0",
+                "payload": {
+                    "source_control_endpoint": endpoint,
+                    "block_hashes": list(range(blocks)),
+                },
+            }
+        ],
+    }
+
+
 class Framework:
-    def __init__(self, name, keys, delay, fail):
+    def __init__(self, name, keys, delay, fail, *, missing_keys=()):
         self.name, self.keys, self.delay, self.fail = name, keys, delay, fail
+        self.missing_keys = frozenset(missing_keys)
         self.pending = {}
         self.requests, self.releases, self.cancelled = 0, [], []
 
@@ -51,7 +68,9 @@ class Framework:
                 else (
                     f"pin-{request}",
                     {
-                        key: [
+                        key: None
+                        if key in self.missing_keys
+                        else [
                             MemoryRef(
                                 end_point_name=self.name,
                                 element_index=self.keys.index(key),
@@ -125,19 +144,7 @@ def run(blocks, delay_ms, scenario):
             workers.append(worker)
         source, target = workers
         target.submit_hint(
-            {
-                "protocol_version": "0.1",
-                "actions": [
-                    {
-                        "action_type": "kv.fetch",
-                        "action_version": "1.0",
-                        "payload": {
-                            "source_control_endpoint": channels[0].endpoint,
-                            "block_hashes": list(range(blocks)),
-                        },
-                    }
-                ],
-            },
+            remote_hint(channels[0].endpoint, blocks),
             request_id="nvtx-pin-example",
         )
         operation = target.deliver(

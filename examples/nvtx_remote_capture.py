@@ -15,7 +15,7 @@ import statistics
 import time
 from contextlib import closing
 
-from nvtx_pin_capture import Framework, control_channel
+from nvtx_pin_capture import Framework, control_channel, remote_hint
 
 from kvcr import KVCR, KVCRBindings
 from kvcr.config import KVCRBackendConfigs, KVCRConfig, RemoteFWDramOptions
@@ -41,39 +41,23 @@ class Buffer:
         return self.data.raw
 
 
-class PartialFramework(Framework):
-    def poll_pin_results(self):
-        results = super().poll_pin_results()
-        for _, result in results:
-            if result is not None:
-                result[1][self.keys[-1]] = None
-        return results
-
-
-class ZeroFramework(Framework):
-    def poll_pin_results(self):
-        results = super().poll_pin_results()
-        for _, result in results:
-            if result is not None:
-                result[1].update(dict.fromkeys(result[1]))
-        return results
-
-
 def worker(role, args, pipe, endpoint=None):
     name = "nvtx-" + role
     keys = tuple(BlockKey(f"block-{i}".encode()) for i in range(args.blocks))
     size = args.blocks * args.block_bytes
     memory = Buffer(size, 73 if role == "source" else 0, args.memory)
-    framework_type = {"partial": PartialFramework, "zero": ZeroFramework}.get(
-        args.scenario, Framework
-    )
-    framework = framework_type(
+    framework = Framework(
         name,
         keys,
         max(5, args.pin_delay_ms / 1000)
         if args.scenario == "timeout"
         else args.pin_delay_ms / 1000,
         args.scenario == "failure",
+        missing_keys=keys[-1:]
+        if args.scenario == "partial"
+        else keys
+        if args.scenario == "zero"
+        else (),
     )
     control = control_channel()
     with closing(
@@ -130,22 +114,7 @@ def worker(role, args, pipe, endpoint=None):
         latencies = []
         for iteration in range(args.warmup + args.iterations):
             request = f"capture-α-😀-{iteration}"
-            kvcr.submit_hint(
-                {
-                    "protocol_version": "0.1",
-                    "actions": [
-                        {
-                            "action_type": "kv.fetch",
-                            "action_version": "1.0",
-                            "payload": {
-                                "source_control_endpoint": endpoint,
-                                "block_hashes": list(range(args.blocks)),
-                            },
-                        }
-                    ],
-                },
-                request,
-            )
+            kvcr.submit_hint(remote_hint(endpoint, args.blocks), request)
             started = time.perf_counter_ns()
             handle = kvcr.deliver(
                 {

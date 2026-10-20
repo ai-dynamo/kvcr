@@ -101,6 +101,43 @@ def test_rejected_progress_submission_closes_unaccepted_target_range(
     assert not recording.stack
 
 
+@pytest.mark.parametrize("failure", ["expired", "false", "exception"])
+def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure):
+    kvcr, _, control = target()
+    control.send_result = False
+    if failure == "expired":
+        submit = kvcr._core._progress.submit
+
+        def expire(op):
+            op.deadline = 0
+            submit(op)
+
+        monkeypatch.setattr(kvcr._core._progress, "submit", expire)
+    elif failure == "exception":
+
+        def fail_send(endpoint, message):
+            control.sent.append((endpoint, message))
+            raise RuntimeError("control enqueue failed")
+
+        monkeypatch.setattr(control, "send", fail_send)
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request_id="req")
+    result = dict(_poll_until(kvcr, lambda entries: handle in dict(entries)))
+    assert not result[handle][BlockKey(b"k")].success
+    rejected = payloads(recording, "target.start_write.rejected")
+    assert len(rejected) == 1
+    assert int(rejected[0]["status"]) == int(
+        _nvtx.Status.TIMEOUT if failure == "expired" else _nvtx.Status.REJECTED
+    )
+    assert int(rejected[0]["reason"]) == int(
+        _nvtx.Reason.DEADLINE if failure == "expired" else _nvtx.Reason.CONTROL_ERROR
+    )
+    assert len(control.sent) == (failure != "expired")
+    assert not payloads(recording, "target.start_write.enqueued")
+    assert len(spans(recording, "target.remote", "end")) == 1
+    assert not recording.stack
+
+
 @pytest.mark.parametrize(
     "indices,expected",
     [
@@ -318,6 +355,8 @@ def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     assert int(queued[0]["op_handle"]) < 0
     assert int(queued[0]["local_fill"]) == 1
     assert len(payloads(recording, "target.quiesced")) == 1
+
+    assert not recording.stack
 
 
 def test_missing_hint_has_specific_reason(recording):
