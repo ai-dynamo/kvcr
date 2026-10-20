@@ -333,17 +333,16 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
-                failure_reason = (
-                    _nvtx.Reason.CANCELLED
-                    if status.cancel_requested
-                    else _nvtx.Reason.SOURCE_STALLED
-                    if not source_responsive
-                    else _nvtx.Reason.UNKNOWN
-                    if self.state is _SourceWriteState.NOTIFY_FAILURE
-                    else _nvtx.Reason.DEADLINE
-                )
-                if failure_reason is _nvtx.Reason.UNKNOWN and trace is not None:
-                    failure_reason = trace.failure_reason
+                if trace is not None:
+                    failure_reason = (
+                        _nvtx.Reason.CANCELLED
+                        if status.cancel_requested
+                        else _nvtx.Reason.SOURCE_STALLED
+                        if not source_responsive
+                        else trace.failure_reason
+                        if self.state is _SourceWriteState.NOTIFY_FAILURE
+                        else _nvtx.Reason.DEADLINE
+                    )
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
