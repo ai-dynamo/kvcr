@@ -74,6 +74,27 @@ def target(*, eager=False):
     return kvcr, agent, control
 
 
+@pytest.mark.parametrize("failure", ["metadata", "bookkeeping"])
+def test_return_annotation_failure_preserves_completion_batch(recording, failure):
+    kvcr, _, _ = target()
+    handles = [kvcr.deliver({}) for _ in range(2)]
+    trace = kvcr._core._nvtx_operations[handles[0]]
+    if failure == "metadata":
+        del trace.completion_fields
+    else:
+
+        class FailedBookkeeping(set):
+            def add(self, name):
+                raise RuntimeError("annotation bookkeeping failed")
+
+        trace._observed = FailedBookkeeping(trace._observed)
+    assert list(kvcr.poll_completed()) == [(handle, {}) for handle in handles]
+    assert not list(kvcr.poll_completed())
+    assert not kvcr._core._nvtx_operations
+    assert len(spans(recording, "op.deliver.lifecycle", "end")) == 2
+    assert not recording.ranges
+
+
 def test_rejected_progress_submission_closes_unaccepted_target_range(
     recording, monkeypatch
 ):

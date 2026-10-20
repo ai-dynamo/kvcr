@@ -289,7 +289,10 @@ class _LifecycleTrace:
             pass
 
     def returned(self):
-        self.mark("op.completion_returned", once=True, **self.completion_fields)
+        try:
+            self.mark("op.completion_returned", once=True, **self.completion_fields)
+        except Exception:
+            self.end("op.deliver.lifecycle")
 
     def target_result(self, op, reason):
         try:
