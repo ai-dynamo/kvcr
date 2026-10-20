@@ -153,6 +153,9 @@ Set `NIXL_UCX_CUDA_IPC_ONLY=1` as well, with a NIXL UCX plugin that implements
 this strict policy and verifies initialized CUDA memory support. GPU endpoint
 startup rejects a missing policy flag; it does not enable CUDA copy to work
 around a native initialization failure.
+The experimental [native dependency patches and build contract](docs/gpu-direct-native-dependencies/README.md)
+pin the NIXL/UCX source changes required by this profile. They are separate from
+the KVCR wheel and do not establish compatibility with arbitrary native builds.
 
 GPU-only instances initialize UCX explicitly with the supported
 `ucx_error_handling_mode=none` option. The same-host IPC transports cannot
