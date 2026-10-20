@@ -190,6 +190,18 @@ def test_annotation_failures_preserve_pin_callback_and_release(recording, failur
     assert not recording.stack
 
 
+def test_unknown_pin_result_closes_range_without_raising(recording):
+    pin = _nvtx.create_tracer().begin(1)
+    pin.finish("unknown-result")
+    pin.finish("success", completed_blocks=1)
+    completed = payloads(recording, "source.pin.completed")
+    assert len(completed) == 1
+    assert int(completed[0]["status"]) == int(_nvtx.Status.UNRESOLVED)
+    assert int(completed[0]["reason"]) == int(_nvtx.Reason.UNKNOWN)
+    assert recording.ended == [0]
+    assert not recording.ranges
+
+
 def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording):
     source, agent, pinning = make_source(recording, (9, 10))
     assert len(pinning.searches) == 1

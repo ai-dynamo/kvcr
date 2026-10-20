@@ -24,6 +24,10 @@ Observed DONE, timeout and a failed release attempt do not end the native range.
 Unresolved shutdown leaves it open with an unresolved mark; successful source
 cleanup closes the source range with a terminal result mark.
 
+Source/native ranges start and end on the progress thread. Before another
+thread can complete a range, its owner must finish starting it and then publish
+the trace/work. The helper synchronizes competing ends, not overlapping start/end.
+
 `nixl.write.error`, `source.write.cancel_requested`, and
 `source.write.shutdown_unresolved` preserve the error, timeout/cancellation, and
 unresolved ownership boundaries. Elapsed time does not prove DMA quiescence.
@@ -57,7 +61,9 @@ bytes as UTF-8 when the display is known; a truncated prefix may end inside a ch
 never by the display prefix. Empty strings and unavailable IDs are distinct via
 `request_known`. Request strings never become registered event names. Session,
 parent-session and framework utilization remain explicitly unknown because the
-current bindings do not provide them.
+current bindings do not provide them. Only worker agent/incarnation identities
+use a bounded cache; request identities are hashed directly to avoid request
+churn evicting those reusable entries.
 
 ## Target and caller
 

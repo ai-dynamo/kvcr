@@ -74,7 +74,7 @@ def create_tracer():
 class _PinTracer(_PayloadEmitter):
     def __init__(self, domain, numpy, level):
         super().__init__(domain, numpy, level)
-        self._identity = lru_cache(maxsize=128)(identity)
+        self._worker_identity = lru_cache(maxsize=128)(identity)
 
     def begin(self, block_count, *, source_op_id=0, op_handle=0):
         pin_id = next(self._ids)
@@ -111,9 +111,9 @@ class _PinTracer(_PayloadEmitter):
         self, *, target_agent=None, target_incarnation=None, request_id=None, **fields
     ):
         try:
-            hi, lo = self._identity(target_agent)
-            inc_hi, inc_lo = self._identity(target_incarnation)
-            req_hi, req_lo = self._identity(request_id)
+            hi, lo = self._worker_identity(target_agent)
+            inc_hi, inc_lo = self._worker_identity(target_incarnation)
+            req_hi, req_lo = identity(request_id)
             trace = _LifecycleTrace(
                 self,
                 next(self._ids),
@@ -241,8 +241,8 @@ class _LifecycleTrace:
     def start(self, name, **fields):
         """The owner finishes start before handing work to another thread.
 
-        Each source operation submits one native write. Source/native ranges
-        have distinct names; the operation state machine owns their lifetimes.
+        Source/native start and end stay on the progress thread. Concurrent
+        endings are supported; overlapping start/end of one range is not.
         """
         if name in self._ranges:
             return
