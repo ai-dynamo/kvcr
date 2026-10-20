@@ -34,7 +34,12 @@ from packaging.utils import parse_wheel_filename
 # Keep the selected vLLM and torch stack while installing Dynamo's Python
 # dependencies. Do not request ai-dynamo[vllm], which pins a different backend.
 backend_versions = {}
-for name in ("vllm", "torch", "torchvision", "torchaudio", "numpy", "protobuf"):
+# grpcio-observability requires an exactly matching grpcio version. Preserve
+# the installed gRPC family so Dynamo's tooling dependencies cannot split it.
+for name in (
+    "vllm", "torch", "torchvision", "torchaudio", "numpy", "protobuf",
+    "grpcio", "grpcio-tools", "grpcio-observability",
+):
     try:
         backend_versions[name] = metadata.version(name)
     except metadata.PackageNotFoundError:

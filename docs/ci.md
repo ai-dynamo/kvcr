@@ -22,8 +22,10 @@ resolves the base digest through registry inspection without pulling the image
 onto the runner, installs Dynamo's wheels, and installs KVCR from that checkout.
 No Dynamo source compilation or vLLM source overlay is required. Dynamo is
 installed without the `[vllm]` extra to keep the selected backend, and
-constraints preserve the base's vLLM, torch, NumPy, and protobuf versions. Only
-Dynamo's version resolution enables prereleases; installing the resolved version
+constraints preserve the base's vLLM, torch, NumPy, protobuf, and installed gRPC
+package versions. In particular, `grpcio-observability` requires a matching
+`grpcio` version. Only Dynamo's version resolution enables prereleases;
+installing the resolved version
 does not enable prereleases for unrelated dependencies. It pushes the image to
 ECR as
 `210086341041.dkr.ecr.us-west-2.amazonaws.com/ai-dynamo/kvcr:<checked-out KVCR commit SHA>`,
