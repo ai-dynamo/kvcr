@@ -142,3 +142,5 @@ governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 To report a security vulnerability, do not open a public issue — follow
 [SECURITY.md](SECURITY.md).
+
+<!-- copy-pr-bot test: safe to close without merging -->
