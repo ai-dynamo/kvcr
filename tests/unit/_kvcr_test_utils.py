@@ -440,8 +440,11 @@ class FakeBytesControl:
         return self.send_result
 
     def recv(self) -> list[bytes]:
-        incoming = self.incoming
-        self.incoming = []
+        # The sole progress consumer must keep the producer's list identity:
+        # incoming.append(encode(...)) binds append before encoding can yield.
+        # Remove only the copied prefix so appends during the copy stay queued.
+        incoming = self.incoming[:]
+        del self.incoming[: len(incoming)]
         return incoming
 
 
