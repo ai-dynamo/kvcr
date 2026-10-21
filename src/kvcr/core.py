@@ -362,6 +362,8 @@ class _KVCRCore:
             dram_backends=list(dram_backends),
             memory_regions=self._memory_regions,
             startup_timeout_seconds=startup_timeout_seconds,
+            coalesce_remote_dram_descriptors=self.config.coalesce_remote_dram_descriptors,
+            nixl_ucx_split_batch_size=self.config.nixl_ucx_split_batch_size,
         )
 
     def start(self) -> None:

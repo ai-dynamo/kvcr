@@ -1191,7 +1191,9 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
 
         def get_xfer_telemetry(self, handle):
             self.lifecycle.append(("telemetry", handle))
-            return super().get_xfer_telemetry(handle)
+            value = super().get_xfer_telemetry(handle)
+            value.descCount = 3
+            return value
 
         def release_xfer_handle(self, handle):
             self.lifecycle.append(("release", handle))
@@ -1235,6 +1237,12 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
         and record[3] == ("transfer", "success")
     ]
     assert len(transfer_durations) == 1
+    assert (
+        stats.records.count(
+            ("counter", "kvcr_transfer_descriptors_total", 3, ("source_write",))
+        )
+        == 1
+    )
     assert (
         "counter",
         TRANSFER_BYTES_METRIC,
