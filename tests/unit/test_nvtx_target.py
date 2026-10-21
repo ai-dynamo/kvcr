@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_kvcr_remote_target
+import test_nvtx
 from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
@@ -18,11 +19,13 @@ from _kvcr_test_utils import (
     _wait_until,
     _write_done_notification,
 )
-from _nvtx_test_utils import payloads, spans, wait_for_payload
+from test_nvtx import payloads, spans
 
 from kvcr import _nvtx
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import BlockKey, RegionDescriptor
+
+recording = test_nvtx.recording
 
 
 @pytest.mark.parametrize("level", ["low", "medium"])
@@ -357,7 +360,9 @@ def test_cancellation_cause_survives_grace_deadline(recording):
     assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not spans(recording, "target.remote", "end")
     agent.notifs["source"] = [_write_done_notification(handle)]
-    wait_for_payload(kvcr, recording, "target.quiesced", ended="target.remote")
+    test_nvtx.wait_for_payload(
+        kvcr, recording, "target.quiesced", ended="target.remote"
+    )
     assert len(spans(recording, "target.remote", "end")) == 1
     assert len(payloads(recording, "op.completion_returned")) == 1
     kvcr.close()

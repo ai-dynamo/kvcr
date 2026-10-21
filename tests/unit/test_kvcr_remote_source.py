@@ -1149,7 +1149,6 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
 ) -> None:
     """fw_mem belongs to the block, so two writes can want the same pin."""
     backend = object.__new__(_RemoteFWDram)
-    backend._nvtx = None
     kvcr = object.__new__(_KVCRCore)
     kvcr._block_record_map = {}
     kvcr._framework_pin_keys = {}
