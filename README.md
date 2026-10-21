@@ -105,10 +105,9 @@ base image. See the
 [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
 for source installation and verification.
 
-The [SGLang HiCache quick start](docs/quick-start-sglang.md) includes a pinned
-public-source Docker build and an automatic launch/verification script. It
-does not enable the direct linker. Read its validation status before use;
-build/import success alone is not a passed peer-restore test.
+The [SGLang HiCache quick start](docs/quick-start-sglang.md) uses the same
+Dockerfile with an SGLang target and inline build, launch, and peer-transfer
+checks. It is a draft preview; read its validation status before use.
 
 ### Development
 
