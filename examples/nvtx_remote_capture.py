@@ -15,10 +15,8 @@ import statistics
 import time
 from contextlib import closing
 
-from nvtx_pin_capture import Framework, control_channel, remote_hint
+from nvtx_pin_capture import Framework, control_channel, create_worker, remote_hint
 
-from kvcr import KVCR, KVCRBindings
-from kvcr.config import KVCRBackendConfigs, KVCRConfig, RemoteFWDramOptions
 from kvcr.types import BlockKey, MemoryRef, RegionDescriptor
 
 
@@ -61,33 +59,18 @@ def worker(role, args, pipe, endpoint=None):
     )
     control = control_channel()
     with closing(
-        KVCR(
-            KVCRConfig(
-                nixl_agent_name=name,
-                nixl_listen_port=0,
-                pool_layouts=[("", args.block_bytes)],
-                operation_timeout_ms=1000 if args.scenario == "timeout" else 10_000,
-                abandon_timeout_ms=5000 if args.scenario == "timeout" else 20_000,
+        create_worker(
+            name,
+            framework,
+            control,
+            RegionDescriptor(
+                addr=memory.address,
+                size=args.block_bytes,
+                count=args.blocks,
+                mem_type="VRAM" if args.memory == "vram" else "DRAM",
+                device_Id=0,
             ),
-            KVCRBindings(
-                framework.request_pin,
-                framework.poll_pin_results,
-                framework.release_pin,
-                cancel_pin_request=framework.cancel_pin_request,
-                framework_control=control,
-            ),
-            KVCRBackendConfigs(
-                framework_regions=[
-                    RegionDescriptor(
-                        addr=memory.address,
-                        size=args.block_bytes,
-                        count=args.blocks,
-                        mem_type="VRAM" if args.memory == "vram" else "DRAM",
-                        device_Id=0,
-                    )
-                ],
-                remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
-            ),
+            short_timeout=args.scenario == "timeout",
         )
     ) as kvcr:
         if role == "source":

@@ -187,6 +187,18 @@ def test_decoder_rejects_broken_hint_association(damage):
         validate(events, "failure", 1)
 
 
+def test_decoder_rejects_incomplete_legacy_hint_identity():
+    events = capture_events()
+    for event in events:
+        event["schema_version"] = 2
+    submitted = next(event for event in events if event["name"] == "hint.submitted")
+    malformed = dict(submitted, instance_hi=999, instance_lo=999)
+    del malformed["trace_id"]
+    events.append(malformed)
+    with pytest.raises(KeyError, match="trace_id"):
+        validate(events, "failure", 1)
+
+
 def test_decoder_accepts_replacement_of_an_older_hint():
     events = capture_events()
     submitted = next(e for e in events if e["name"] == "hint.submitted")

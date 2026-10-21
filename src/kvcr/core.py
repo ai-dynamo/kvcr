@@ -779,12 +779,7 @@ class _KVCRCore:
 
         self._closed = True
         for trace in self._nvtx_operations.values():
-            trace.mark(
-                "op.shutdown_unreturned",
-                once=True,
-                status=_nvtx.Status.UNRESOLVED,
-                reason=_nvtx.Reason.SHUTDOWN,
-            )
+            trace.shutdown_unresolved("op.shutdown_unreturned")
         self._nvtx_operations.clear()
         try:
             self._close_main_resources()

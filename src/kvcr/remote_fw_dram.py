@@ -141,11 +141,10 @@ class _TargetPullOp(_RemoteOp):
             )
             if now >= self.deadline:
                 if trace is not None:
-                    trace.mark(
+                    trace.reject(
                         "target.start_write.rejected",
-                        once=True,
+                        _nvtx.Reason.DEADLINE,
                         status=_nvtx.Status.TIMEOUT,
-                        reason=_nvtx.Reason.DEADLINE,
                     )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
@@ -166,11 +165,8 @@ class _TargetPullOp(_RemoteOp):
             )
             if not sent:
                 if trace is not None:
-                    trace.mark(
-                        "target.start_write.rejected",
-                        once=True,
-                        status=_nvtx.Status.REJECTED,
-                        reason=_nvtx.Reason.CONTROL_ERROR,
+                    trace.reject(
+                        "target.start_write.rejected", _nvtx.Reason.CONTROL_ERROR
                     )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
@@ -297,16 +293,7 @@ class _TargetPullOp(_RemoteOp):
                 return False, True
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
-                trace.mark(
-                    "target.cancel_requested",
-                    once=True,
-                    status=_nvtx.Status.CANCELLED
-                    if cancelled
-                    else _nvtx.Status.TIMEOUT,
-                    reason=_nvtx.Reason.CANCELLED
-                    if cancelled
-                    else _nvtx.Reason.DEADLINE,
-                )
+                trace.cancel_requested("target.cancel_requested", cancelled)
             config = backend._kvcr.config
             self.deadline += (
                 config.abandon_timeout_ms - config.operation_timeout_ms
@@ -331,12 +318,7 @@ class _TargetPullOp(_RemoteOp):
         # Shutdown must not release destinations still awaiting a remote write.
         safe = self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
         if not safe and self.trace is not None:
-            self.trace.mark(
-                "target.shutdown_unresolved",
-                once=True,
-                status=_nvtx.Status.UNRESOLVED,
-                reason=_nvtx.Reason.SHUTDOWN,
-            )
+            self.trace.shutdown_unresolved("target.shutdown_unresolved")
         elif safe and self.trace is not None:
             self.trace.end("target.remote")
         return safe
@@ -445,12 +427,7 @@ class _SourceWriteOp(_RemoteOp):
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
                 if trace is not None:
-                    trace.mark(
-                        "source.write.refused",
-                        once=True,
-                        status=_nvtx.Status.REJECTED,
-                        reason=_nvtx.Reason.ROUTE_CHANGED,
-                    )
+                    trace.reject("source.write.refused", _nvtx.Reason.ROUTE_CHANGED)
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(
@@ -539,15 +516,8 @@ class _SourceWriteOp(_RemoteOp):
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
             if trace is not None:
-                trace.mark(
-                    "source.write.cancel_requested",
-                    once=True,
-                    status=_nvtx.Status.CANCELLED
-                    if status.cancel_requested
-                    else _nvtx.Status.TIMEOUT,
-                    reason=_nvtx.Reason.CANCELLED
-                    if status.cancel_requested
-                    else _nvtx.Reason.DEADLINE,
+                trace.cancel_requested(
+                    "source.write.cancel_requested", status.cancel_requested
                 )
             observed_work = True
         cancelling = self.state is _SourceWriteState.CANCEL_PENDING
@@ -600,12 +570,7 @@ class _SourceWriteOp(_RemoteOp):
                 is None
             ):
                 if self.trace is not None:
-                    self.trace.mark(
-                        "source.write.shutdown_unresolved",
-                        once=True,
-                        status=_nvtx.Status.UNRESOLVED,
-                        reason=_nvtx.Reason.SHUTDOWN,
-                    )
+                    self.trace.shutdown_unresolved("source.write.shutdown_unresolved")
                 return False
             self.transfer_id = None
         self._backend._send_write_done(

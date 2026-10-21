@@ -5,7 +5,7 @@
 import threading
 
 import test_nvtx
-from test_nvtx import payloads, spans
+from test_nvtx import spans
 
 from kvcr import _nvtx
 
@@ -34,9 +34,7 @@ def test_source_close_ends_range_after_native_completion(recording):
     source, agent, pinning = test_nvtx.make_source(recording)
     agent.state = "PROC"
     pinning.complete(0)
-    test_nvtx._poll_until(
-        source, lambda _: bool(payloads(recording, "nixl.write.posted"))
-    )
+    test_nvtx.wait_for_payload(source, recording, "nixl.write.posted")
     agent.state = "DONE"
     source.close()
     assert len(spans(recording, "source.write")) == 1

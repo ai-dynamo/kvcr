@@ -109,10 +109,6 @@ class _PayloadEmitter:
                 ("value_utf8", "u1", (256,)),
             ]
         )
-        self._field_types = {
-            name: self.context_dtype.fields[name][0]
-            for name in self.context_dtype.names
-        }
         self._defaults = dict(
             schema_version=3,
             instance_hi=self.instance_hi,
@@ -121,7 +117,9 @@ class _PayloadEmitter:
             status=Status.PENDING,
             reason=Reason.NONE,
         )
-        self._prefix = [(name, self._field_types[name]) for name in self._defaults]
+        self._prefix = [
+            (name, self.context_dtype.fields[name][0]) for name in self._defaults
+        ]
         context_defaults = {
             name: -1 if name.endswith(("_blocks", "_bytes")) else 0
             for name in self.context_dtype.names
@@ -148,7 +146,7 @@ class _PayloadEmitter:
                 else self.numpy.dtype(
                     self._prefix
                     + [
-                        (key, self._field_types[key])
+                        (key, self.context_dtype.fields[key][0])
                         for key in field_names
                         if key not in self._defaults
                     ]

@@ -365,12 +365,7 @@ class _KVCRProgress:
             return transfer_id, submitted
         except Exception:
             if trace is not None:
-                trace.mark(
-                    "nixl.write.rejected",
-                    once=True,
-                    status=_nvtx.Status.REJECTED,
-                    reason=_nvtx.Reason.CREATE_ERROR,
-                )
+                trace.reject("nixl.write.rejected", _nvtx.Reason.CREATE_ERROR)
             raise
         finally:
             if trace is not None:

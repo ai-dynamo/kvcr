@@ -92,6 +92,29 @@ class Framework:
         self.pending.pop(request, None)
 
 
+def create_worker(name, framework, control, region, *, short_timeout=False):
+    return KVCR(
+        KVCRConfig(
+            nixl_agent_name=name,
+            nixl_listen_port=0,
+            pool_layouts=[("", region.size)],
+            operation_timeout_ms=1000 if short_timeout else 10_000,
+            abandon_timeout_ms=5000 if short_timeout else 20_000,
+        ),
+        KVCRBindings(
+            framework.request_pin,
+            framework.poll_pin_results,
+            framework.release_pin,
+            cancel_pin_request=framework.cancel_pin_request,
+            framework_control=control,
+        ),
+        KVCRBackendConfigs(
+            framework_regions=[region],
+            remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+        ),
+    )
+
+
 def run(blocks, delay_ms, scenario):
     size = 4096
     keys = tuple(BlockKey(f"block-{i}".encode()) for i in range(blocks))
@@ -114,30 +137,12 @@ def run(blocks, delay_ms, scenario):
             (source_framework, target_framework),
             channels,
         ):
-            worker = KVCR(
-                KVCRConfig(
-                    nixl_agent_name=name,
-                    nixl_listen_port=0,
-                    pool_layouts=[("", size)],
-                    operation_timeout_ms=10_000,
-                    abandon_timeout_ms=20_000,
-                ),
-                KVCRBindings(
-                    framework.request_pin,
-                    framework.poll_pin_results,
-                    framework.release_pin,
-                    cancel_pin_request=framework.cancel_pin_request,
-                    framework_control=control,
-                ),
-                KVCRBackendConfigs(
-                    framework_regions=[
-                        RegionDescriptor(
-                            addr=ctypes.addressof(memory),
-                            size=size,
-                            count=blocks,
-                        )
-                    ],
-                    remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+            worker = create_worker(
+                name,
+                framework,
+                control,
+                RegionDescriptor(
+                    addr=ctypes.addressof(memory), size=size, count=blocks
                 ),
             )
             stack.callback(worker.close)

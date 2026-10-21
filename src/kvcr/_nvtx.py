@@ -294,6 +294,20 @@ class _LifecycleTrace:
             except Exception:
                 pass
 
+    def shutdown_unresolved(self, name):
+        self.mark(name, once=True, status=Status.UNRESOLVED, reason=Reason.SHUTDOWN)
+
+    def reject(self, name, reason, *, status=Status.REJECTED):
+        self.mark(name, once=True, status=status, reason=reason)
+
+    def cancel_requested(self, name, cancelled):
+        self.mark(
+            name,
+            once=True,
+            status=Status.CANCELLED if cancelled else Status.TIMEOUT,
+            reason=Reason.CANCELLED if cancelled else Reason.DEADLINE,
+        )
+
     def completed(self, entries):
         try:
             completed = sum(entry.success for entry in entries.values())

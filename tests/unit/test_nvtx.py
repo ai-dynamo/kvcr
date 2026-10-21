@@ -114,6 +114,11 @@ def payloads(domain, name):
     return result
 
 
+def wait_for_payload(kvcr, recording, name):
+    _poll_until(kvcr, lambda _: bool(payloads(recording, name)))
+    return payloads(recording, name)[0]
+
+
 def make_source(domain, handles=(9,), *, request_id=0):
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning, control = PendingPrimaryPinning(), FakeBytesControl()

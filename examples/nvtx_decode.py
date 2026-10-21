@@ -86,12 +86,16 @@ def decode(path):
     return reconstruct_context(events)
 
 
-def require_range(named, name, reference):
-    spans = [
+def matching_events(named, name, reference, fields=_IDENTITY):
+    return [
         event
         for event in named.get(name, [])
-        if all(event[field] == reference[field] for field in _IDENTITY)
+        if all(event[field] == reference[field] for field in fields)
     ]
+
+
+def require_range(named, name, reference):
+    spans = matching_events(named, name, reference)
     assert len(spans) == 1, f"missing or duplicate {name} range"
     span = spans[0]
     assert span["event_type"] == 60, f"{name} is not a start/end range"
@@ -105,23 +109,19 @@ def require_range(named, name, reference):
 
 
 def require_pin_completion(named, source):
-    waiters = [
-        event
-        for event in named.get("source.pin.waiter", [])
-        if all(
-            event[field] == source[field]
-            for field in ("instance_hi", "instance_lo", "source_op_id")
-        )
-    ]
+    waiters = matching_events(
+        named,
+        "source.pin.waiter",
+        source,
+        ("instance_hi", "instance_lo", "source_op_id"),
+    )
     assert len(waiters) == 1, "missing source pin association"
-    pins = [
-        event
-        for event in named.get("source.pin.completed", [])
-        if all(
-            event[field] == waiters[0][field]
-            for field in ("instance_hi", "instance_lo", "pin_id")
-        )
-    ]
+    pins = matching_events(
+        named,
+        "source.pin.completed",
+        waiters[0],
+        ("instance_hi", "instance_lo", "pin_id"),
+    )
     assert len(pins) == 1, "missing source pin completion"
     return pins[0]
 
@@ -173,14 +173,7 @@ def validate(events, scenario, operations):
     for result in returned:
         assert result["status"] == expected, result
         if result["request_known"]:
-            contexts = [
-                event
-                for event in named.get("request.context", [])
-                if all(
-                    event[field] == result[field]
-                    for field in ("instance_hi", "instance_lo", "trace_id")
-                )
-            ]
+            contexts = matching_events(named, "request.context", result)
             assert len(contexts) == 1, "missing or duplicate request context"
             assert all(
                 contexts[0][field] == result[field]
