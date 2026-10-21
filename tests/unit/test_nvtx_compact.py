@@ -14,6 +14,40 @@ from kvcr import _nvtx
 recording = test_nvtx.recording
 
 
+def test_compact_fields_preserve_types_values_and_order(recording):
+    tracer = _nvtx.create_tracer()
+    fields = dict(op_handle=-(2**63), transfer_id=2**64 - 1, value_utf8=255, status=4)
+    tracer._emit("typed", 7, fields, method=recording.mark)
+    payload = recording.events[0][2]
+    assert payload.dtype.names == (
+        "schema_version",
+        "instance_hi",
+        "instance_lo",
+        "trace_id",
+        "status",
+        "reason",
+        "op_handle",
+        "transfer_id",
+        "value_utf8",
+    )
+    for name, dtype in (
+        ("schema_version", "u2"),
+        ("trace_id", "u8"),
+        ("status", "u1"),
+        ("op_handle", "i8"),
+        ("transfer_id", "u8"),
+        ("value_utf8", ("u1", (256,))),
+    ):
+        assert payload.dtype[name] == tracer.numpy.dtype(dtype)
+    assert int(payload["op_handle"]) == -(2**63)
+    assert int(payload["transfer_id"]) == 2**64 - 1
+    assert int(payload["status"]) == 4
+    assert payload["value_utf8"].tobytes() == b"\xff" * 256
+    with pytest.raises(KeyError):
+        tracer._emit("typed", 8, dict(unknown_field=1), method=recording.mark)
+    assert len(recording.events) == 1
+
+
 def test_immutable_context_is_not_repeated_on_transitions(recording):
     trace = _nvtx.create_tracer().lifecycle(
         request_id="req-α",

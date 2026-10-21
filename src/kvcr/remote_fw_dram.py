@@ -369,12 +369,7 @@ class _SourceWriteOp(_RemoteOp):
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
                 if trace is not None:
-                    trace.mark(
-                        "source.write.refused",
-                        once=True,
-                        status=_nvtx.Status.REJECTED,
-                        reason=_nvtx.Reason.ROUTE_CHANGED,
-                    )
+                    trace.reject("source.write.refused", _nvtx.Reason.ROUTE_CHANGED)
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(

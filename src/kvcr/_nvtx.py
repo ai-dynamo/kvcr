@@ -256,6 +256,9 @@ class _LifecycleTrace:
             except Exception:
                 pass
 
+    def reject(self, name, reason, *, status=Status.REJECTED):
+        self.mark(name, once=True, status=status, reason=reason)
+
     def complete_source(self, success, blocks, *, reason=None):
         requested = self.requested_blocks
         status = Status.SUCCESS if success else Status.FAILED
