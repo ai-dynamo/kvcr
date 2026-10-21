@@ -106,7 +106,7 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
                 pool_file.write(journal_marker)
                 pool_file.seek(spec.journal_bytes)
                 pool_file.write(data_marker)
-            with patch("kvcr.memory.mmap.mmap", wraps=mmap.mmap) as map_file:
+            with patch("mmap.mmap", wraps=mmap.mmap) as map_file:
                 attachment = KVCRPoolAttachment.attach(spec)
             map_file.assert_called_once()
             assert map_file.call_args.args[1:] == (spec.mapping_bytes,)
@@ -219,7 +219,7 @@ def test_attachment_refuses_a_tampered_pool_without_mapping_it(
         assert replacement_stat.st_size == original_stat.st_size
         assert stat.S_IMODE(replacement_stat.st_mode) == 0o600
     with (
-        patch("kvcr.memory.mmap.mmap") as map_file,
+        patch("mmap.mmap") as map_file,
         pytest.raises(error, match=match),
     ):
         KVCRPoolAttachment.attach(spec)
@@ -275,7 +275,7 @@ def test_page_population_backs_only_the_asked_range_without_mapping(
         pool_file.flush()
         # Written, not mapped: a store that cannot be backed raises SIGBUS.
         with (
-            patch("kvcr.memory.mmap.mmap") as map_file,
+            patch("mmap.mmap") as map_file,
             patch("kvcr.memory.os.pwrite", side_effect=pwrite) as write,
         ):
             if error_match is None:

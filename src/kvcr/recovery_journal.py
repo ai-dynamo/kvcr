@@ -634,7 +634,7 @@ def write_recovery_snapshot(
         # which is discarded.
         region[: _SNAPSHOT_HEADER.size] = bytes(_SNAPSHOT_HEADER.size)
         region.flush()
-        region[_SNAPSHOT_HEADER.size :] = body
+        region[_SNAPSHOT_HEADER.size : _SNAPSHOT_HEADER.size + len(body)] = body
         region[: _SNAPSHOT_HEADER.size] = _SNAPSHOT_HEADER.pack(
             digest.digest(), len(body)
         )

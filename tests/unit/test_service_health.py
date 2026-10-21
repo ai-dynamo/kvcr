@@ -24,7 +24,7 @@ from test_kvcr_service import (
     _service_args,
 )
 
-from kvcr import kvcr_service
+from kvcr import kvcr_service, memmap
 from kvcr.health import _serve_health
 from kvcr.kvcr_service import _KVCRService
 from kvcr.memory import _KVCRPoolOwner
@@ -182,6 +182,7 @@ def test_health_fails_closed_without_waiting_on_guard(failure):
 
 def _health_cli():
     """Run the real CLI, with pipe-controlled allocation and cleanup boundaries."""
+    memmap._hugetlbfs_mounts = lambda: []  # keep host hugetlbfs out of the daemon
     allocate_pool, close_service = _KVCRPoolOwner.allocate, _KVCRService.close
 
     def allocate(**kwargs):
@@ -234,6 +235,7 @@ def test_service_health_startup_and_cleanup(tmp_path, outcome):
                 str(health.server_address[1]),
                 "--health-timeout-seconds",
                 "2",
+                "--disable-hugepages",
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

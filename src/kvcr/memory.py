@@ -6,7 +6,6 @@ import contextlib
 import ctypes
 import errno
 import fcntl
-import mmap
 import os
 import stat
 import uuid
@@ -16,14 +15,10 @@ from typing import Annotated
 
 import msgspec
 
+from . import memmap
+
 _POOL_MODE = 0o600
 _POOL_PREFIX = "kvcr"
-
-
-def _snapshot_offset(mapping_bytes: int) -> int:
-    """Where a pool's handback region starts, past everything it was granted."""
-    granularity = mmap.ALLOCATIONGRANULARITY
-    return -(-mapping_bytes // granularity) * granularity
 
 
 _JOURNAL_HEADER_BYTES = 4096
@@ -76,17 +71,19 @@ class KVCRPoolAttachment:
         self,
         *,
         _file_descriptor: int,
-        _mapping: mmap.mmap,
+        _mapping: memmap.PoolMapping,
         _spec: KVCRPoolSpec,
     ) -> None:
         self._file_descriptor = _file_descriptor
-        self._mapping: mmap.mmap | None = _mapping
+        self._mapping: memmap.PoolMapping | None = _mapping
         self._spec = _spec
 
     @classmethod
-    def attach(cls, spec: KVCRPoolSpec) -> "KVCRPoolAttachment":
+    def attach(
+        cls, spec: KVCRPoolSpec, *, collapse: bool = False
+    ) -> "KVCRPoolAttachment":
         file_descriptor = os.open(spec.path, _OPEN_FLAGS)
-        mapping: mmap.mmap | None = None
+        mapping: memmap.PoolMapping | None = None
         try:
             # Held for the mapping's lifetime: a worker can outlive its
             # daemon, and this stops a replacement reclaiming the pool.
@@ -108,13 +105,9 @@ class KVCRPoolAttachment:
                     "KVCR pool is smaller than the grant describes: "
                     f"{file_stat.st_size} < {spec.mapping_bytes}"
                 )
-            mapping = mmap.mmap(
-                file_descriptor,
-                spec.mapping_bytes,
-                access=mmap.ACCESS_WRITE,
+            mapping = memmap.map_pool(
+                file_descriptor, spec.mapping_bytes, collapse=collapse
             )
-            # A forked child is not the pidfd-bound claimant.
-            mapping.madvise(mmap.MADV_DONTFORK)
             return cls(
                 _file_descriptor=file_descriptor,
                 _mapping=mapping,
@@ -138,21 +131,20 @@ class KVCRPoolAttachment:
         return ctypes.addressof(ctypes.c_char.from_buffer(mapping))
 
     @contextlib.contextmanager
-    def snapshot_region(self, size: int) -> Iterator[mmap.mmap]:
+    def snapshot_region(self, size: int) -> Iterator[memmap.Region]:
         """Map `size` writable bytes past the pool, backed before they are used.
 
         Past the pool rather than inside it, so the grant still describes exactly what
         a claimant maps. Mapped separately because the pool's own mapping is
         registered with NIXL and mremap may move it.
         """
-        offset = _snapshot_offset(self._spec.mapping_bytes)
+        offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
+        size = memmap.align(self._file_descriptor, size)  # the backing's page multiple
         os.ftruncate(self._file_descriptor, offset + size)
         try:
             _populate_pages(self._file_descriptor, offset, size)
             # Mapping must close before the truncate; shrinking under it would fault.
-            with mmap.mmap(
-                self._file_descriptor, size, offset=offset, access=mmap.ACCESS_WRITE
-            ) as region:
+            with memmap.map_range(self._file_descriptor, size, offset) as region:
                 yield region
         except BaseException:
             # Truncate back: a partial or stale tail still reads as a region; a
@@ -162,15 +154,15 @@ class KVCRPoolAttachment:
             raise
 
     @contextlib.contextmanager
-    def mapped_snapshot(self) -> Iterator[mmap.mmap | None]:
+    def mapped_snapshot(self) -> Iterator[memmap.Region | None]:
         """Whatever a previous Guard left past the pool, if anything is there."""
-        offset = _snapshot_offset(self._spec.mapping_bytes)
+        offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
         size = os.fstat(self._file_descriptor).st_size - offset
         if size <= 0:
             yield None
             return
-        with mmap.mmap(
-            self._file_descriptor, size, offset=offset, access=mmap.ACCESS_READ
+        with memmap.map_range(
+            self._file_descriptor, size, offset, writable=False
         ) as region:
             yield region
 
@@ -181,7 +173,10 @@ class KVCRPoolAttachment:
         readers map it inside a context manager and a pool grants itself to one
         claimant at a time.
         """
-        os.ftruncate(self._file_descriptor, _snapshot_offset(self._spec.mapping_bytes))
+        os.ftruncate(
+            self._file_descriptor,
+            memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes),
+        )
 
     def close(self) -> None:
         """Unmap the pool without unlinking the server-owned file."""
@@ -193,7 +188,7 @@ class KVCRPoolAttachment:
             os.close(self._file_descriptor)
             self._file_descriptor = -1
 
-    def _require_mapping(self) -> mmap.mmap:
+    def _require_mapping(self) -> memmap.PoolMapping:
         if self._mapping is None:
             raise RuntimeError("KVCR pool attachment is closed")
         return self._mapping
@@ -227,8 +222,24 @@ class _KVCRPoolOwner:
         exclusively, so a pool under construction cannot be reclaimed.
         """
         _validate_pool_layout(pool_size_bytes, journal_bytes)
+        return memmap.create_pool(
+            pool_dir,
+            pool_size_bytes,
+            lambda directory, backing: cls._create(
+                pool_id, pool_size_bytes, journal_bytes, directory, backing
+            ),
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        pool_id: str,
+        pool_size_bytes: int,
+        journal_bytes: int,
+        directory: Path,
+        backing_bytes: int,
+    ) -> "_KVCRPoolOwner":
         generation = uuid.uuid4().hex
-        directory = Path(pool_dir).resolve()
         path = directory / _pool_filename(pool_id, generation)
         flags = _OPEN_FLAGS | os.O_CREAT | os.O_EXCL
         with _pool_dir_guard(directory, exclusive=False):
@@ -255,8 +266,9 @@ class _KVCRPoolOwner:
                 raise
         try:
             os.fchmod(file_descriptor, _POOL_MODE)
-            os.ftruncate(file_descriptor, pool_size_bytes)
-            _populate_pages(file_descriptor, 0, pool_size_bytes)
+            os.ftruncate(file_descriptor, backing_bytes)
+            _populate_pages(file_descriptor, 0, backing_bytes)
+            memmap.map_range(file_descriptor, backing_bytes).close()  # refuse early
         except BaseException:
             os.close(file_descriptor)
             # Identity-guarded: something may have replaced the file since it
@@ -393,9 +405,10 @@ def _populate_pages(file_descriptor: int, offset: int, length: int) -> None:
     # where the same write through the descriptor reports ENOSPC. A whole page at a
     # time, so a filesystem with sub-page blocks does not leave every block but the
     # first sparse.
-    chunk, position, end = bytes(mmap.PAGESIZE), offset, offset + length
+    page = os.sysconf("SC_PAGESIZE")
+    chunk, position, end = bytes(page), offset, offset + length
     while position < end:
-        span = min(mmap.PAGESIZE, end - position)
+        span = min(page, end - position)
         count = os.pwrite(file_descriptor, chunk[:span], position)
         if count == 0:
             raise OSError(errno.EIO, "zero-length write reserving KVCR pool pages")

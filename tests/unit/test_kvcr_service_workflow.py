@@ -93,8 +93,10 @@ def _running_daemon(pool_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], P
     daemon = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "kvcr.kvcr_service",
+            "-c",
+            # Host hugetlbfs mounts stay out of the daemon's placement and purge.
+            "from kvcr import kvcr_service as s, memmap;"
+            "memmap._hugetlbfs_mounts = lambda: []; s.main()",
             "--socket-path",
             str(socket_path),
             "--pool-dir",
@@ -105,6 +107,8 @@ def _running_daemon(pool_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], P
             _CLI_POOL_SIZE_GB,
             "--compatibility-digest",
             _DIGEST,
+            # The tests inspect pool_dir, which a host with free hugepages would bypass.
+            "--disable-hugepages",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

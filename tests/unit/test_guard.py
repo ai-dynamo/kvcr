@@ -487,7 +487,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     guard._refuse_incompatible(_tier(16))
     guard._adopt(new_channel(), tier)
     try:
-        attach.assert_called_once_with(_PAGE_SPEC)
+        attach.assert_called_once_with(_PAGE_SPEC, collapse=True)
         assert journal.reset_called
         # Adoption registers the Guard transport without starting it.
         assert len(cores) == 1
@@ -993,7 +993,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
 
 
 def test_a_handback_with_an_unexpected_storage_error_fails() -> None:
-    """Only capacity errors (ENOSPC/EDQUOT) are survivable at the handback writer."""
+    """Only capacity errors (ENOSPC/EDQUOT/ENOMEM) survive at the handback writer."""
     guard = _configurable_guard()
     guard._recovery.mirror = _RecoveryMirror(("",))
     _give_serving_core(guard)
@@ -1033,7 +1033,7 @@ def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
     assert guard._recovery.mirror is None
 
 
-@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT, errno.ENOMEM])
 def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(
     code: int, monkeypatch
 ) -> None:

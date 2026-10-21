@@ -22,6 +22,7 @@ from types import FrameType
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import memmap
 from .control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -156,8 +157,16 @@ class _PoolRegistry:
         Crash leftovers fill the fixed-size directory and fail the next eager
         allocation. Use is decided by the shared flock, never the filename.
         """
-        with _pool_dir_guard(self._pool_dir, exclusive=True):
-            for path in sorted(self._pool_dir.glob(f"{_POOL_PREFIX}-*")):
+        self._purge_orphaned_pools_in(self._pool_dir)
+        for directory in memmap.pool_dirs():
+            try:
+                self._purge_orphaned_pools_in(directory)
+            except OSError as error:  # optional cleanup must not stop the service
+                logger.warning("Purge skipped for %s: %s", directory, error)
+
+    def _purge_orphaned_pools_in(self, directory: Path) -> None:
+        with _pool_dir_guard(directory, exclusive=True):
+            for path in sorted(directory.glob(f"{_POOL_PREFIX}-*")):
                 recognized = _ORPHANED_POOL_NAME.fullmatch(path.name) is not None
                 if not recognized or path.is_symlink():
                     continue
@@ -712,6 +721,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Guard core preparation and startup budget (default: %(default)s s)",
     )
     parser.add_argument(
+        "--disable-hugepages",
+        action="store_true",
+        help="never place pools on hugetlbfs",
+    )
+    parser.add_argument(
         "--log-level",
         type=str.upper,
         choices=_LOG_LEVELS,
@@ -753,6 +767,7 @@ def main() -> None:
     """Run the standalone KVCR service daemon."""
     args = _parse_args()
     logging.basicConfig(level=args.log_level)
+    memmap.hugetlb_enabled = not args.disable_hugepages
 
     shutdown_signals = {signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)

@@ -56,7 +56,8 @@ logger = logging.getLogger(__name__)
 # TODO: Wake the mirror on publication rather than polling. A standby still
 # drains at roughly a fifth of the rate a primary can publish.
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
-_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
+# ENOMEM: no memory left to back the handback region.
+_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT, errno.ENOMEM)
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
 # object, so nothing stale (reused pid, retried release) can touch a newer lease.
@@ -196,7 +197,7 @@ class _RecoveryState:
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
-        self.attachment = KVCRPoolAttachment.attach(self._spec)
+        self.attachment = KVCRPoolAttachment.attach(self._spec, collapse=True)
         self._journal = RecoveryJournal(self.attachment)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
