@@ -831,12 +831,7 @@ class _RemoteFWDram:
             return
         trace = kvcr._nvtx_operations.get(op_handle)
         if trace is not None:
-            trace.mark(
-                "target.hint_unavailable",
-                once=True,
-                status=_nvtx.Status.REJECTED,
-                reason=_nvtx.Reason.HINT_UNAVAILABLE,
-            )
+            trace.reject("target.hint_unavailable", _nvtx.Reason.HINT_UNAVAILABLE)
         kvcr._complete(
             op_handle,
             dict.fromkeys(blocks, _FAILED_RESULT),

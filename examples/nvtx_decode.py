@@ -127,15 +127,12 @@ def require_pin_completion(named, source):
 
 
 def operation_key(event):
-    return tuple(
-        event[key]
-        for key in (
-            "target_agent_hi",
-            "target_agent_lo",
-            "target_incarnation_hi",
-            "target_incarnation_lo",
-            "op_handle",
-        )
+    return (
+        event["target_agent_hi"],
+        event["target_agent_lo"],
+        event["target_incarnation_hi"],
+        event["target_incarnation_lo"],
+        event["op_handle"],
     )
 
 
