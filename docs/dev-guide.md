@@ -295,6 +295,41 @@ listed usable sizes. The example therefore creates one mapping of 64 GiB plus
 100 MiB, laid out as `[journal header + journal payload][pool 0][pool 1]`.
 Pool sizes are rounded down to the native memory-page boundary.
 
+On Linux with Python 3.12+, Guard and worker attachments use a PMD-aligned
+shared mapping for pools at least one huge page long. Guard initialization
+requests `MADV_HUGEPAGE` and best-effort `MADV_COLLAPSE` on complete huge-page
+regions before NIXL registration; a partial trailing region may use base pages.
+Workers map the same backing without repeating collapse. Older Python versions,
+missing kernel PMD support, and small pools use ordinary mappings. Unsupported
+advice or unavailable collapse logs a warning and retains the aligned mapping
+with its available backing, including base pages or partially collapsed regions.
+No configuration or wire-protocol mode is required. Backing-file preallocation
+still runs first, preserving early out-of-space detection.
+
+THP is not HugeTLB (`MAP_HUGETLB`): no reserved HugeTLB pool is required.
+For tmpfs, mount policies such as `huge=always` or `huge=within_size` can permit
+huge pages during preallocation; `huge=advise` may depend on later collapse.
+Explicit `MADV_COLLAPSE` (Linux 6.1+) can work even when automatic shmem THP is
+disabled. Memory pressure, unsupported backing, or NIXL-pinned pages can still
+prevent collapse. KVCR changes no node settings and guarantees neither full
+huge-page allocation nor a performance improvement. Synchronous collapse can
+add initialization latency; compare total startup time, not just registration.
+
+Verify the target pool's VMA in `/proc/<pid>/smaps`: `ShmemPmdMapped` reports
+PMD huge-page mappings for these writable tmpfs pools. `THPeligible`
+and `VmFlags: ... hg ...` indicate eligibility/advice, not allocated huge pages.
+`/proc/meminfo`'s `ShmemHugePages` is a host-wide total, not proof for this pool.
+
+On a Linux/Python 3.12+ host with working tmpfs collapse, explicitly require
+real THP backing in the focused tests with:
+
+```bash
+KVCR_TEST_THP=1 uv run pytest tests/unit/test_transparent_hugepages.py -q
+```
+
+Without this opt-in, the allocation-proof test is skipped; alignment, shared
+buffers, lifetime, and fallback tests still run on supported Python versions.
+
 A worker calls
 `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)`
 with its Guard's control address and each ordered pool's name and block size.

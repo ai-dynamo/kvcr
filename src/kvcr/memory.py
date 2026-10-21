@@ -16,6 +16,8 @@ from typing import Annotated
 
 import msgspec
 
+from .hugepages import AlignedSharedMapping, try_aligned_shared_mapping
+
 _POOL_MODE = 0o600
 _POOL_PREFIX = "kvcr"
 
@@ -76,17 +78,19 @@ class KVCRPoolAttachment:
         self,
         *,
         _file_descriptor: int,
-        _mapping: mmap.mmap,
+        _mapping: mmap.mmap | AlignedSharedMapping,
         _spec: KVCRPoolSpec,
     ) -> None:
         self._file_descriptor = _file_descriptor
-        self._mapping: mmap.mmap | None = _mapping
+        self._mapping: mmap.mmap | AlignedSharedMapping | None = _mapping
         self._spec = _spec
 
     @classmethod
-    def attach(cls, spec: KVCRPoolSpec) -> "KVCRPoolAttachment":
+    def attach(
+        cls, spec: KVCRPoolSpec, *, collapse: bool = False
+    ) -> "KVCRPoolAttachment":
         file_descriptor = os.open(spec.path, _OPEN_FLAGS)
-        mapping: mmap.mmap | None = None
+        mapping: mmap.mmap | AlignedSharedMapping | None = None
         try:
             # Held for the mapping's lifetime: a worker can outlive its
             # daemon, and this stops a replacement reclaiming the pool.
@@ -108,13 +112,17 @@ class KVCRPoolAttachment:
                     "KVCR pool is smaller than the grant describes: "
                     f"{file_stat.st_size} < {spec.mapping_bytes}"
                 )
-            mapping = mmap.mmap(
-                file_descriptor,
-                spec.mapping_bytes,
-                access=mmap.ACCESS_WRITE,
+            mapping = try_aligned_shared_mapping(
+                file_descriptor, spec.mapping_bytes, collapse=collapse
             )
-            # A forked child is not the pidfd-bound claimant.
-            mapping.madvise(mmap.MADV_DONTFORK)
+            if mapping is None:
+                mapping = mmap.mmap(
+                    file_descriptor,
+                    spec.mapping_bytes,
+                    access=mmap.ACCESS_WRITE,
+                )
+                # A forked child is not the pidfd-bound claimant.
+                mapping.madvise(mmap.MADV_DONTFORK)
             return cls(
                 _file_descriptor=file_descriptor,
                 _mapping=mapping,
@@ -193,7 +201,7 @@ class KVCRPoolAttachment:
             os.close(self._file_descriptor)
             self._file_descriptor = -1
 
-    def _require_mapping(self) -> mmap.mmap:
+    def _require_mapping(self) -> mmap.mmap | AlignedSharedMapping:
         if self._mapping is None:
             raise RuntimeError("KVCR pool attachment is closed")
         return self._mapping

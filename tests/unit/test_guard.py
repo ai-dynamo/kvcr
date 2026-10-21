@@ -476,7 +476,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     guard._refuse_incompatible(_tier(16))
     guard._adopt(new_channel(), tier)
     try:
-        attach.assert_called_once_with(_PAGE_SPEC)
+        attach.assert_called_once_with(_PAGE_SPEC, collapse=True)
         assert journal.reset_called
         # Adoption registers the Guard transport without starting it.
         assert len(cores) == 1
