@@ -129,6 +129,73 @@ def _mem(
     return _TransferRef(owner, element_index, label, framework)
 
 
+@pytest.mark.parametrize("split", [0, -1, True, False, 1.5, "32", 2**32])
+def test_ucx_split_rejects_non_uint32_before_agent_start(split):
+    """Reject booleans/coercions/overflow before passing counts to native UCX."""
+    with pytest.raises(ValueError, match="nixl_ucx_split_batch_size"):
+        _KVCRProgress(
+            lambda _: None,
+            lambda _, __: ({}, False),
+            list,
+            lambda: None,
+            dram_backends=["UCX"],
+            nixl_ucx_split_batch_size=split,
+        )
+
+
+def test_ucx_split_requires_a_matching_backend():
+    """An opt-in cannot be silently ignored by an unrelated native backend."""
+    with pytest.raises(ValueError, match="requires the UCX backend"):
+        _KVCRProgress(
+            lambda _: None,
+            lambda _, __: ({}, False),
+            list,
+            lambda: None,
+            dram_backends=["LIBFABRIC"],
+            nixl_ucx_split_batch_size=32,
+        )
+
+
+@pytest.mark.parametrize("split", [None, 32])
+def test_ucx_split_backend_configuration_preserves_other_backends(monkeypatch, split):
+    """The opt-in must reach UCX, not alter other backends or listen identity."""
+
+    class BackendAgent:
+        def __init__(self, name, config):
+            self.name = name
+            self.config = config
+            self.options = {
+                backend: {"num_threads": str(config.num_threads)}
+                for backend in config.backends
+            }
+
+        def create_backend(self, backend, options):
+            assert backend not in self.options
+            self.options[backend] = options
+
+    monkeypatch.setattr(progress_module, "nixl_agent", BackendAgent)
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        dram_backends=["UCX", "LIBFABRIC"],
+        nixl_agent_name="ucx-options",
+        nixl_listen_port=12345,
+        nixl_ucx_split_batch_size=split,
+    )
+    progress._initialize_nixl()
+    agent = progress.nixl_agent
+    assert agent.name == "ucx-options" and agent.config.port == 12345
+    assert agent.config.enable_listen and agent.config.capture_telemetry
+    assert agent.options["LIBFABRIC"] == {"num_threads": "4"}
+    expected = {"num_threads": "4"}
+    if split is not None:
+        expected["split_batch_size"] = "32"
+    assert agent.options["UCX"] == expected
+    assert ("UCX" in agent.config.backends) is (split is None)
+
+
 def _transfer_progress(
     agent: _TransferAgent, *, prepare: bool = True, coalesce: bool = False
 ) -> _KVCRProgress:

@@ -134,12 +134,22 @@ class _KVCRProgress:
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
         coalesce_remote_dram_descriptors: bool = False,
+        nixl_ucx_split_batch_size: int | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
         if type(coalesce_remote_dram_descriptors) is not bool:
             raise ValueError("coalesce_remote_dram_descriptors must be a bool")
         self._coalesce_remote_dram_descriptors = coalesce_remote_dram_descriptors
+        if nixl_ucx_split_batch_size is not None:
+            if (
+                type(nixl_ucx_split_batch_size) is not int
+                or not 1 <= nixl_ucx_split_batch_size <= 2**32 - 1
+            ):
+                raise ValueError("nixl_ucx_split_batch_size must be a positive uint32")
+            if "UCX" not in dram_backends:
+                raise ValueError("nixl_ucx_split_batch_size requires the UCX backend")
+        self._nixl_ucx_split_batch_size = nixl_ucx_split_batch_size
         self._initialize = initialize
         self._poll = poll
         self._flush = flush
@@ -704,6 +714,9 @@ class _KVCRProgress:
         if self._nixl_agent is None and self._nixl_agent_name is not None:
             if self._nixl_listen_port is None:
                 raise RuntimeError("KVCR NIXL listen port is not configured")
+            backends = self._dram_backends
+            if self._nixl_ucx_split_batch_size is not None:
+                backends = [backend for backend in backends if backend != "UCX"]
             self._nixl_agent = nixl_agent(
                 self._nixl_agent_name,
                 nixl_agent_config(
@@ -711,9 +724,17 @@ class _KVCRProgress:
                     capture_telemetry=True,
                     enable_listen_thread=True,
                     listen_port=self._nixl_listen_port,
-                    backends=self._dram_backends,
+                    backends=backends,
                 ),
             )
+            if self._nixl_ucx_split_batch_size is not None:
+                self._nixl_agent.create_backend(
+                    "UCX",
+                    {
+                        "num_threads": "4",
+                        "split_batch_size": str(self._nixl_ucx_split_batch_size),
+                    },
+                )
 
     def _register_memory_regions(self) -> None:
         if self._nixl_agent is None or not any(self._memory_regions):
