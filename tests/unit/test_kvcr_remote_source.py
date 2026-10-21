@@ -1180,8 +1180,14 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
 
 
-def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
+@pytest.mark.parametrize(
+    "log_transfer,descriptors", [(False, 3), (True, 3), (True, None)]
+)
+def test_source_telemetry_precedes_release_and_is_not_duplicated(
+    log_transfer, descriptors, caplog
+) -> None:
     """Telemetry is captured once before a transfer handle is released."""
+    caplog.set_level(logging.INFO, logger="kvcr.core")
 
     class LifecycleAgent(FakeNixlAgent):
         def __init__(self):
@@ -1191,7 +1197,10 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
 
         def get_xfer_telemetry(self, handle):
             self.lifecycle.append(("telemetry", handle))
-            return super().get_xfer_telemetry(handle)
+            value = super().get_xfer_telemetry(handle)
+            if descriptors is not None:
+                value.descCount = descriptors
+            return value
 
         def release_xfer_handle(self, handle):
             self.lifecycle.append(("release", handle))
@@ -1213,6 +1222,7 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
             nixl_agent_name="source",
             pool_layouts=[("", 16)],
             enable_telemetry=True,
+            log_transfer_telemetry=log_transfer,
         ),
         name="source",
     )
@@ -1235,6 +1245,15 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
         and record[3] == ("transfer", "success")
     ]
     assert len(transfer_durations) == 1
+    assert stats.records.count(
+        ("counter", "kvcr_transfer_descriptors_total", 3, ("source_write",))
+    ) == (descriptors is not None)
+    transfer_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("KVCR NIXL transfer ")
+    ]
+    assert len(transfer_logs) == (log_transfer and descriptors is not None)
     assert (
         "counter",
         TRANSFER_BYTES_METRIC,

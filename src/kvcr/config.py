@@ -132,6 +132,8 @@ class KVCRConfig(msgspec.Struct, frozen=True):
     # UCX native descriptor threshold after coalescing, not cache pages/tokens.
     # None preserves NIXL defaults and the existing backend initialization.
     nixl_ucx_split_batch_size: int | None = None
+    # Per-transfer INFO logs; requires enable_telemetry.
+    log_transfer_telemetry: bool = False
 
 
 class KVCRGuardConfig(msgspec.Struct, frozen=True):

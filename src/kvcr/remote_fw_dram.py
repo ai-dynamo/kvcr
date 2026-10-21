@@ -11,6 +11,7 @@ Target: hint/query -> fetch/deliver -> start_write -> write_done.
 Source: start_write -> local claim/framework pin -> write -> write_done.
 """
 
+import json
 import logging
 import math
 import time
@@ -2046,6 +2047,25 @@ class _RemoteFWDram:
                 telemetry.totalBytes,
                 ("source_write",),
             )
+            descriptors = getattr(telemetry, "descCount", None)
+            if descriptors is not None:
+                self._record_progress_counter(
+                    "kvcr_transfer_descriptors_total", descriptors, ("source_write",)
+                )
+                if self._kvcr.config.log_transfer_telemetry:
+                    logger.info(
+                        "KVCR NIXL transfer %s",
+                        json.dumps(
+                            {
+                                "epoch": time.time(),
+                                "desc_count": descriptors,
+                                "bytes": telemetry.totalBytes,
+                                "post_duration_native": telemetry.postDuration,
+                                "xfer_duration_native": telemetry.xferDuration,
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
         except Exception:
             logger.debug("KVCR failed to collect NIXL telemetry", exc_info=True)
 
