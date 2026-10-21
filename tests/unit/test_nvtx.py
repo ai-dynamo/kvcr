@@ -30,9 +30,6 @@ class RecordingDomain:
         self.ended = []
         self._next_range = 0
 
-    def get_registered_string(self, message):
-        return SimpleNamespace(name=message)
-
     def get_category_id(self, category):
         return 1
 
