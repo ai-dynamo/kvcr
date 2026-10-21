@@ -42,14 +42,29 @@ cross-host RDMA performance claim.
 
 The image must include compatible SGLang, KVCR, NIXL/UCX and Dynamo revisions,
 including [Dynamo PR #16117](https://github.com/ai-dynamo/dynamo/pull/16117).
+For the ownership-aware direct linker, also use its companion
+[Dynamo PR #16827](https://github.com/ai-dynamo/dynamo/pull/16827).
 Use an immutable image identity and retain its source/dependency manifest.
 Installing all projects' latest branches is not a compatibility check.
 
-The HiCache implementation is tracked in
-[SGLang PR #43635](https://github.com/sgl-project/sglang/pull/43635).
-The linker preparation starts from
-[Lin's agreed source revision](https://github.com/linhu-nv/sglang/commit/561eccf1a5f868e476c911d998441c0011e000c7);
-that reference is not a claim that its pending upstream port has passed.
+The new SGLang review stack starts with
+[shared endpoint contracts](https://github.com/sgl-project/sglang/pull/45646),
+then separates [HiCacheStorage](https://github.com/sgl-project/sglang/pull/45647)
+from [linker lifetime/inventory contracts](https://github.com/sgl-project/sglang/pull/45648).
+Their respective leaves are the
+[HiCache performance follow-up](https://github.com/sgl-project/sglang/pull/45649)
+and [direct-device linker](https://github.com/sgl-project/sglang/pull/45650).
+The original [SGLang PR #43635](https://github.com/sgl-project/sglang/pull/43635)
+remains available for provenance. The modes use different leaf branches; do not
+assume either leaf contains the other implementation.
+
+Recorded source-checkout acceptance used Qwen3-32B-FP8 revision
+`aa55da1ecc13d006e8b8e4f54579b1ea8c3db2df` with two same-host B200 TP1 workers.
+The HiCache performance leaf was `142e34c04b9dc828553178c0b600dc9aa2cb9b42`;
+the direct-linker leaf was `20cdafc07c42f4c78767e41ad34058f627a8da13`, tested
+with Dynamo `a310f33e9b55e90a8da0ef742e0ca4cb3491bec2`.
+These results do not validate the small-model Docker commands below, publish a
+compatible public image, or qualify Guard replacement/cross-host/TP>1 operation.
 
 For this draft, supply an already-built compatible image explicitly. Do not
 substitute the vLLM quick-start image; it does not provide this SGLang stack.
@@ -125,10 +140,22 @@ The control endpoint's `tcp://` scheme does not prove payload TCP or RDMA.
 > [!IMPORTANT]
 > The linker emits `ownership="kvcr"` inventory events. Dynamo's ordinary
 > SGLang `KvEventPublisher` path rejects that ownership domain. Router-hint
-> forwarding in PR #16117 is not sufficient by itself: an ownership-aware
-> state-agent ingress and its worker lifecycle wiring must be validated before
-> this section can be used as a Dynamo peer-discovery recipe. The flag fragment
-> below documents the engine configuration only.
+> forwarding in PR #16117 is not sufficient by itself. PR #16827 implements the
+> ownership-aware state-agent ingress and worker lifecycle wiring for opt-in
+> TP1 aggregated direct-linker workers. Its `--kvcr-state-agent-owner` option
+> requires an explicit valid owner identity; it is not a boolean and must not
+> be used with HiCache. The fragment below documents only the SGLang engine
+> options, not a complete state-agent launch recipe. The final public guide
+> still needs a pinned, runnable owner/discovery configuration and acceptance
+> script for this exact setup.
+
+The current linker draft still backs externally restored prefixes up into
+destination DRAM. Its bounded-deposit fix prevents an oversized-copy timeout,
+but does **not** restore the original no-retain behavior. Suppressing redundant
+backup requires successful-restore provenance through post-forward insertion;
+it must not advertise nonexistent destination-owned DRAM or omit offload of
+newly computed KV. Treat no-retain and multi-source/replication policy as
+explicit outstanding work, not an implicit property of this recipe.
 
 Do not run this at the same time as the HiCache example on the same GPUs.
 Keep the common model, event and worker setup, but replace **all** hierarchical
