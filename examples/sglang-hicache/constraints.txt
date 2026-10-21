@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Serving-critical pins. The base is digest-pinned; the build saves the full
+# resolved package inventory. Do not relax these just to make a build pass.
+torch==2.14.1
+transformers==5.19.0
+flashinfer-python==0.7.2
+nvidia-cutlass-dsl==4.8.0
+sgl-deep-gemm==0.2.3
+sglang-kernel==0.4.10
+apache-tvm-ffi==0.1.11
+nixl==1.5.0
+msgspec==0.22.0
+pyzmq==27.1.0
+numpy==2.3.5
+protobuf==7.36.2

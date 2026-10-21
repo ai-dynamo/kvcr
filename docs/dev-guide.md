@@ -6,7 +6,8 @@ It covers the local development path from environment setup through
 standalone validation.
 
 To try the integrated stack without modifying source, follow the
-[quick start](quick-start.md).
+[vLLM quick start](quick-start-vllm.md) or
+[SGLang HiCache quick start](quick-start-sglang.md).
 
 ---
 
@@ -421,7 +422,7 @@ Pair it with a landed Dynamo revision such as
 [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0),
 which supports the versioned KV hint contract and one KVCR control port per
 local data-parallel rank. The
-[quick start](quick-start.md) records a pinned combination for its container.
+[vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
 
 ### Build the integration environment
 
@@ -537,7 +538,7 @@ pinning, or remote transfers.
 
 On a compatible vLLM revision, KVCR is a secondary tier behind
 `OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's
-[worker configuration](quick-start.md#4-start-a-kvcr-enabled-worker) for the
+[worker configuration](quick-start-vllm.md#4-start-a-kvcr-enabled-worker) for the
 `--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities,
 ports, and local DP ranks for your environment.
 

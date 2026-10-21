@@ -99,16 +99,16 @@ the future.
 
 ### Quick start
 
-The [quick start](docs/quick-start.md) is a public preview that builds and runs
+The [vLLM quick start](docs/quick-start-vllm.md) is a public preview that builds and runs
 KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible
 base image. See the
 [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional)
 for source installation and verification.
 
-The [SGLang integration guide](docs/quick-start-sglang.md) is a preparation-stage
-preview covering HiCache storage and direct-linker modes. Its public image
-recipe and end-to-end acceptance run are not yet release-validated; use the
-status notes in that guide before trying the candidate commands.
+The [SGLang HiCache quick start](docs/quick-start-sglang.md) includes a pinned
+public-source Docker build and an automatic launch/verification script. It
+does not enable the direct linker. Read its validation status before use;
+build/import success alone is not a passed peer-restore test.
 
 ### Development
 
@@ -128,7 +128,7 @@ build retain their Apache-2.0 contributor headers.
 
 vLLM and Dynamo are installed separately in the quick-start image and are not
 bundled into the `kvcr` wheel. The build uses the public sources and
-pinned revisions described in the [quick start](docs/quick-start.md).
+pinned revisions described in the [vLLM quick start](docs/quick-start-vllm.md).
 
 KVCR declares runtime dependencies on `msgspec`, `pyzmq`, and `nixl`. Each is
 installed from its own distribution under its own license. None of them are
