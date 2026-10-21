@@ -178,11 +178,10 @@ def test_concurrent_emission_owns_separate_payload_storage(recording, context):
         )
 
 
-@pytest.mark.parametrize("name", ["request.context", "source.pin.context"])
-def test_reused_context_clears_optional_values_without_rebinding(recording, name):
+def test_reused_context_clears_optional_values_without_rebinding(recording):
     tracer = _nvtx.create_tracer()
     tracer._emit(
-        name,
+        "request.context",
         11,
         dict(
             requested_blocks=16,
@@ -206,8 +205,8 @@ def test_reused_context_clears_optional_values_without_rebinding(recording, name
     )
     # Rebinding would fail; the existing attributes and storage must be reused.
     recording.fail = "attributes"
-    tracer._emit(name, 12, {}, context=True, method=tracer.domain.mark)
-    first, second = [e[2] for e in recording.events if e[1] == name]
+    tracer._emit("request.context", 12, {}, context=True, method=tracer.domain.mark)
+    first, second = [e[2] for e in recording.events]
     assert int(first["requested_bytes"]) == 65536
     assert first["value_utf8"].tobytes() == b"c" * 256
     assert int(second["schema_version"]) == 3

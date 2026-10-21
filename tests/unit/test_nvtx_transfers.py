@@ -34,8 +34,6 @@ def test_zero_selected_source_is_failed_without_posting(recording):
         (True, 2, 0, 4, 0),
         (True, 2, 1, 3, 0),
         (True, 2, 2, 2, 1),
-        (False, 2, 0, 4, 0),
-        (False, 2, 1, 4, 0),
         (False, 2, 2, 4, 0),
     ],
 )

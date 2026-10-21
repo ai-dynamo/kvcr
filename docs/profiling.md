@@ -5,14 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX framework-pin tracing
 
-This first instrumentation checkpoint traces framework pin requests used by the
-remote-memory path. It separates the synchronous `request_pin` callback from the
-asynchronous wait for its result. A shared pin has one lifetime and separate
-associations to each waiting source operation.
-
-Source NIXL submission, native completion, release and cancellation are also
-traced; see the [source lifecycle reference](nvtx-events.md). Target processing,
-router hints and caller polling remain separate work in this source checkpoint.
+This checkpoint traces framework pins and source NIXL transfers on the remote
+memory path. See the [source lifecycle reference](nvtx-events.md) for submission,
+completion, release and cancellation. Target processing, router hints and caller
+polling remain separate work.
 
 ## Enable tracing
 
