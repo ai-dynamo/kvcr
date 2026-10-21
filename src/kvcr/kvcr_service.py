@@ -21,6 +21,9 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
+import msgspec
+
+from .config import KVCRMemoryConfig
 from .control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -79,6 +82,7 @@ class _PoolRegistry:
         journal_bytes: int,
         compatibility_digest: str,
         heartbeat_timeout_seconds: float | None = None,
+        memory_config: KVCRMemoryConfig = KVCRMemoryConfig(),
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -99,6 +103,7 @@ class _PoolRegistry:
                     pool_size_bytes=mapping_bytes,
                     journal_bytes=journal_bytes,
                     pool_dir=self._pool_dir,
+                    memory_mode=memory_config.mode,
                 )
                 # Built with the group, not a claim: a Guard that cannot attach its
                 # allocation is better discovered at startup than when a worker dies.
@@ -492,6 +497,7 @@ class _KVCRService:
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
         heartbeat_timeout_seconds: float | None = None,
+        memory_config: KVCRMemoryConfig = KVCRMemoryConfig(),
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -515,6 +521,7 @@ class _KVCRService:
             journal_bytes,
             compatibility_digest,
             heartbeat_timeout_seconds,
+            memory_config,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -640,6 +647,13 @@ def _parse_pool_sizes_gb(value: str) -> tuple[int, ...]:
     return sizes_bytes
 
 
+def _parse_memory_config(value: str) -> KVCRMemoryConfig:
+    try:
+        return msgspec.json.decode(value, type=KVCRMemoryConfig)
+    except (ValueError, msgspec.DecodeError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse and validate the service's command line."""
     parser = argparse.ArgumentParser()
@@ -663,6 +677,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str.upper,
         choices=_LOG_LEVELS,
         default=os.environ.get("KVCR_LOG_LEVEL", "INFO"),
+    )
+    parser.add_argument(
+        "--memory-config",
+        type=_parse_memory_config,
+        default=KVCRMemoryConfig(),
+        help='pool memory policy JSON: {"mode":"default"} or {"mode":"thp"}',
     )
     args = parser.parse_args(argv)
     if args.guard_count < 1:
@@ -693,6 +713,7 @@ def main() -> None:
             guard_count=args.guard_count,
             pool_sizes_bytes=args.pool_sizes_bytes,
             compatibility_digest=args.compatibility_digest,
+            memory_config=args.memory_config,
             heartbeat_timeout_seconds=(
                 args.heartbeat_timeout_ms / 1000
                 if args.heartbeat_timeout_ms is not None

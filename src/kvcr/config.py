@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import msgspec
 
@@ -35,6 +35,23 @@ def _validate_pool_layouts(pool_layouts: PoolBlockLayouts) -> None:
         raise ValueError("pool_layouts pool names must be unique")
     if len(names) > 1 and "" in names:
         raise ValueError("pool_layouts cannot use an empty name with multiple pools")
+
+
+MemoryMode = Literal["default", "thp"]
+
+
+def _validate_memory_mode(mode: str) -> None:
+    if mode not in ("default", "thp"):
+        raise ValueError(f"unsupported KVCR memory mode: {mode!r}")
+
+
+class KVCRMemoryConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Service-owned pool allocation policy, extensible to future memory modes."""
+
+    mode: MemoryMode = "default"
+
+    def __post_init__(self) -> None:
+        _validate_memory_mode(self.mode)
 
 
 class LocalDramOptions(msgspec.Struct, frozen=True):

@@ -21,6 +21,8 @@ end-to-end performance.
 
 KVCR is agentic-native and built to accelerate AI workloads of every kind.
 
+For opt-in shared DRAM memory policies, see [Transparent hugepages for Guard pools](docs/transparent-hugepages.md).
+
 ## Architecture
 
 KVCR is at its most powerful when working in tandem with a KV-aware request
