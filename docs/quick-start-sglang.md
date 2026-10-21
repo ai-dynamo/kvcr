@@ -10,16 +10,16 @@ SGLang stages KV through HiCache host memory; KVCR stores it in DRAM and
 delivers it to another worker using Dynamo's source hints.
 
 > [!IMPORTANT]
-> Draft preview. The pinned source combination passed a two-B200 peer-restore
-> test, but this public Docker build and the walkthrough below have not yet
-> been run end to end. Build/import success alone is not transfer validation.
+> This public Docker build and walkthrough passed a two-H100 NVL peer-restore
+> smoke test on 2026-10-21. The integration still uses pinned development
+> revisions; build/import success alone is not transfer validation.
 
 For vLLM, use the [vLLM quick start](quick-start-vllm.md). For implementation
 and API development, use the [developer guide](dev-guide.md).
 
 ## Prerequisites
 
-- Linux x86-64, two idle B200 GPUs allocated to you, and a CUDA 13-compatible
+- Linux x86-64, two idle H100 or B200 GPUs allocated to you, and a CUDA 13-compatible
   NVIDIA driver (580.126.20 or newer recommended).
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
   Git, and public access to Docker Hub, GitHub, PyPI, `pypi.nvidia.com`,
@@ -158,6 +158,8 @@ curl --fail --silent --show-error "http://127.0.0.1:24000/v1/models/$MODEL/ready
 This inline check sends a fresh 2048-token prefix to worker 0, then requests
 the identical prefix on worker 1. It pins only the destination; Dynamo still
 supplies the source hint. Do not probe this prefix before the test.
+The first request can compile additional attention kernels after readiness;
+that startup cost is not cache-transfer latency.
 
 ```bash
 python3 - <<'PY'
@@ -271,8 +273,8 @@ choose to release them. For a failed run, collect whichever evidence exists.
 - **Transfer failure:** retain `UCX_TLS=tcp,sm,self,cuda_copy`; missing CUDA memory
   support can prevent NIXL startup even for host-staged data.
 
-Prior source-runtime testing restored 1984 tokens with matching native bytes and
-all 16 output IDs equal across cold source, restored destination, HBM repeat and
-an independent cold destination. It does **not** certify this unbuilt public
-image or the shorter walkthrough. Complete the build and checks above before
-reporting success; keep this guide a draft until then.
+The two-H100 run built this public recipe, then passed the commands above:
+0 cold / 1984 restored tokens, all 16 output IDs identical, and a successful
+31-block / 227,540,992-byte native peer transfer with no failed keys. Earlier
+two-B200 source-runtime tests are separate evidence, not a B200 qualification
+of this Docker build. Run all checks above on your own environment.
