@@ -15,8 +15,8 @@ from hashlib import blake2b
 from importlib import import_module
 from threading import Lock
 
-from ._nvtx_payload import Reason, Status, _PayloadEmitter
-from ._nvtx_pin import _PinTrace
+from .payload import Reason, Status, _PayloadEmitter
+from .pin import _PinTrace
 
 _LOGGER = logging.getLogger(__name__)
 _WARNED: set[str] = set()
@@ -51,8 +51,7 @@ def pin_result_blocks(result):
 
 def create_tracer():
     """Return None before optional imports when off; absence is harmless."""
-    configured = os.getenv("KVCR_NVTX_LEVEL")
-    level = configured if configured is not None else "low"
+    level = os.getenv("KVCR_NVTX_LEVEL", "off")
     if level == "off":
         return None
     if level not in ("low", "medium"):
@@ -62,11 +61,10 @@ def create_tracer():
         domain, numpy = _load_backend()
         return _PinTracer(domain, numpy, level)
     except Exception:
-        if configured is not None:
-            _warn_once(
-                "backend",
-                "KVCR NVTX unavailable; install the profiling extra to enable it.",
-            )
+        _warn_once(
+            "backend",
+            "KVCR NVTX unavailable; install the profiling extra to enable it.",
+        )
         return None
 
 
@@ -114,27 +112,45 @@ class _PinTracer(_PayloadEmitter):
             pass
 
     def lifecycle(
-        self, *, target_agent=None, target_incarnation=None, request_id=None, **fields
+        self,
+        *,
+        target_agent=None,
+        target_incarnation=None,
+        request_id=None,
+        _trace=None,
+        **fields,
     ):
         try:
             hi, lo = self._worker_identity(target_agent)
             inc_hi, inc_lo = self._worker_identity(target_incarnation)
             req_hi, req_lo = identity(request_id)
-            return _LifecycleTrace(
-                self,
-                next(self._ids),
-                {
-                    "target_agent_hi": hi,
-                    "target_agent_lo": lo,
-                    "target_incarnation_hi": inc_hi,
-                    "target_incarnation_lo": inc_lo,
-                    "request_hi": req_hi,
-                    "request_lo": req_lo,
-                    "request_known": request_id is not None,
-                    **fields,
-                },
-                request_id,
-            )
+            fields = {
+                "target_agent_hi": hi,
+                "target_agent_lo": lo,
+                "target_incarnation_hi": inc_hi,
+                "target_incarnation_lo": inc_lo,
+                "request_hi": req_hi,
+                "request_lo": req_lo,
+                "request_known": request_id is not None,
+                **fields,
+            }
+            trace = _trace if _trace is not None else _LifecycleTrace(self)
+            trace.trace_id = next(self._ids)
+            trace.requested_blocks = fields.get("requested_blocks", -1)
+            trace.selected_bytes = fields.get("selected_bytes", -1)
+            trace._context(fields, request_id)
+            return trace
+        except Exception:
+            return None
+
+    def prepare_source(self, op, reason=Reason.UNKNOWN):
+        """Hold diagnostics until progress owns the prepared source operation."""
+        try:
+            trace = _LifecycleTrace(self)
+            trace.requested_blocks = len(op.ordered_keys)
+            trace.target_incarnation = op.target_incarnation
+            trace.failure_reason = reason
+            return trace
         except Exception:
             return None
 
@@ -151,14 +167,16 @@ class _PinTracer(_PayloadEmitter):
                     destination_tier=tier(targets),
                     source_memory=memory_kind(refs, kvcr._memory_regions),
                 )
+            context = op.trace
             trace = self.lifecycle(
                 target_agent=op.route[0] or None,
-                target_incarnation=op.target_incarnation,
+                target_incarnation=context.target_incarnation,
                 op_handle=op.op_handle,
                 source_op_id=op.op_id[1],
                 route_generation=op.route[1],
-                requested_blocks=op.requested_blocks,
+                requested_blocks=context.requested_blocks,
                 selected_blocks=len(op.source_keys),
+                _trace=context,
                 **detail,
             )
             if trace is not None:
@@ -198,14 +216,16 @@ def memory_kind(refs, regions):
 class _LifecycleTrace:
     """One-time context emission plus operation lifecycle bookkeeping."""
 
-    def __init__(self, tracer, trace_id, fields, request_id):
-        self.tracer, self.trace_id = tracer, trace_id
-        self.requested_blocks = fields.get("requested_blocks", -1)
-        self.selected_bytes = fields.get("selected_bytes", -1)
+    def __init__(self, tracer):
+        self.tracer = tracer
+        self.trace_id = None
         self._observed = set()
         self.failure_reason = Reason.UNKNOWN
         self._ranges = {}
         self._range_lock = Lock()
+
+    def _context(self, fields, request_id):
+        tracer = self.tracer
         try:
             if tracer.level == "medium" and request_id is not None:
                 encoded = request_id.encode("utf-8")
@@ -258,6 +278,16 @@ class _LifecycleTrace:
 
     def reject(self, name, reason, *, status=Status.REJECTED):
         self.mark(name, once=True, status=status, reason=reason)
+
+    def empty_source(self):
+        self.mark(
+            "source.write.completed",
+            once=True,
+            status=Status.FAILED if self.requested_blocks else Status.SUCCESS,
+            reason=Reason.UNKNOWN if self.requested_blocks else Reason.NONE,
+            completed_blocks=0,
+            completed_bytes=0,
+        )
 
     def complete_source(self, success, blocks, *, reason=None):
         requested = self.requested_blocks

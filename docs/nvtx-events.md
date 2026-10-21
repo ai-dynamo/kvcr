@@ -9,7 +9,8 @@ See [profiling](profiling.md) for installation, detail levels and capture comman
 
 ## Source transfers
 
-`nixl.write.submit` is a same-thread synchronous scope. `nixl.write.posted`
+`nixl.write.submit` is a same-thread synchronous scope including native handle
+creation. `nixl.write.posted`
 reports the native posting result, including rejection and ambiguity.
 `nixl.done_observed` records the first observed native DONE, including synchronous
 DONE returned by posting. It is distinct from `nixl.write.released` (successful
@@ -19,7 +20,8 @@ The status on the release event reflects the transfer outcome, not a release
 failure. Release failures emit `nixl.write.release_retry` at medium detail.
 
 `source.write` is a start/end range for the progress-owned source operation.
-`nixl.write` separately covers native handle creation through successful release.
+`nixl.write` starts after successful handle creation, before posting, and ends
+after successful release.
 Observed DONE, timeout and a failed release attempt do not end the native range.
 Unresolved shutdown leaves it open with an unresolved mark; successful source
 cleanup closes the source range with a terminal result mark.

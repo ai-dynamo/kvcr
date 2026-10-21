@@ -6,12 +6,9 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-import test_nvtx
-from test_nvtx import payloads
+from _nvtx_test_utils import payloads
 
 from kvcr import _nvtx
-
-recording = test_nvtx.recording
 
 
 def test_compact_fields_preserve_types_values_and_order(recording):
@@ -89,13 +86,15 @@ def test_low_avoids_descriptor_diagnostics(recording, monkeypatch, level, scanne
         src_descriptors=((object(),),),
         dst_descriptors=((object(),),),
         route=("target", 1),
-        target_incarnation="inc",
         op_handle=41,
         op_id=("source", 9),
-        requested_blocks=1,
         source_keys=(b"key",),
     )
-    trace = _nvtx.create_tracer().source(op, kvcr)
+    tracer = _nvtx.create_tracer()
+    op.trace = tracer.prepare_source(
+        SimpleNamespace(ordered_keys=(b"key",), target_incarnation="inc")
+    )
+    trace = tracer.source(op, kvcr)
     assert trace is not None
     assert bool(calls) == scanned
     context = payloads(recording, "request.context")[0]

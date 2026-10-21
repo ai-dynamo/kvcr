@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from ._nvtx_payload import Reason, Status
+from .payload import Reason, Status
 
 if TYPE_CHECKING:
-    from ._nvtx import _PinTracer
+    from . import _PinTracer
 
 _PIN_RESULTS = {
     "success": (Status.SUCCESS, Reason.NONE),
@@ -69,7 +69,13 @@ class _PinTrace:
         except Exception:
             pass  # Annotation errors never alter KVCR results or resources.
 
-    def push(self):
+    def registered(self, request_id):
+        self.request_id = request_id
+        self._context()
+        self._mark("source.pin.registered")
+
+    def call_framework(self, callback, keys):
+        pushed = False
         try:
             self.tracer._emit(
                 "source.pin.framework",
@@ -78,14 +84,13 @@ class _PinTrace:
                 category=self.tracer.category,
                 method=self.tracer.domain.push_range,
             )
-            return True
+            pushed = True
         except Exception:
-            return False
-
-    def registered(self, request_id):
-        self.request_id = request_id
-        self._context()
-        self._mark("source.pin.registered")
+            pass
+        try:
+            return callback(keys)
+        finally:
+            self.tracer.pop(pushed)
 
     def waiter(self, source_op_id, op_handle):
         self._mark("source.pin.waiter", source_op_id=source_op_id, op_handle=op_handle)

@@ -26,8 +26,8 @@ uv sync --extra profiling
 
 | Value | Behavior |
 | --- | --- |
-| `off` | No NVTX/NumPy import, pin trace objects, or payload construction. |
-| `low` | Essential identities, pin/source lifetimes, transitions and outcomes. Default when the profiling dependencies are available. |
+| `off` (default) | No optional NVTX backend loading, trace objects, or payload construction. |
+| `low` | Essential identities, pin/source lifetimes, transitions and outcomes. |
 | `medium` | Low plus descriptor byte/tier/memory diagnostics, bounded request display labels, waiter detachment and native release retries. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for
@@ -79,8 +79,9 @@ ORDER BY e.start;
 
 ## Interpretation
 
-All annotations use the `KVCR` domain and `framework_pin` category. Event names
-are bounded static strings. IDs and counts are payloads, never registered names.
+All annotations use the `KVCR` domain: pin events use `framework_pin`, and
+lifecycle events use `remote_deliver`. Event names are bounded static strings.
+IDs and counts are payloads, never registered names.
 
 | Event | Meaning |
 | --- | --- |
