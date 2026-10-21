@@ -4,7 +4,6 @@
 
 from enum import IntEnum
 from itertools import count
-from operator import itemgetter
 from threading import local
 from uuid import uuid4
 
@@ -111,18 +110,14 @@ class _PayloadEmitter:
             status=Status.PENDING,
             reason=Reason.NONE,
         )
-        self._prefix = [
-            (name, self.context_dtype.fields[name][0]) for name in self._defaults
-        ]
-        context_defaults = {
-            name: -1 if name.endswith(("_blocks", "_bytes")) else 0
+        template = numpy.zeros((), dtype=self.context_dtype)
+        count_fields = [
+            name
             for name in self.context_dtype.names
-        }
-        context_defaults.update(self._defaults)
-        template = numpy.array(
-            itemgetter(*self.context_dtype.names)(context_defaults),
-            dtype=self.context_dtype,
-        )
+            if name.endswith(("_blocks", "_bytes"))
+        ]
+        template[count_fields] = -1
+        template[list(self._defaults)] = tuple(self._defaults.values())
         template.flags.writeable = False
         self._context_template = template[()]
 
@@ -138,16 +133,13 @@ class _PayloadEmitter:
                 self.context_dtype
                 if context
                 else self.numpy.dtype(
-                    self._prefix
-                    + [
-                        (key, self.context_dtype.fields[key][0])
-                        for key in field_names
-                        if key not in self._defaults
+                    [
+                        (name, self.context_dtype.fields[name][0])
+                        for name in dict.fromkeys((*self._defaults, *field_names))
                     ]
                 )
             )
-            pool = (dtype, [])
-            buffers[key] = pool
+            pool = buffers[key] = (dtype, [])
         dtype, available = pool
         if available:
             slot = available.pop()
