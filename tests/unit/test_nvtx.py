@@ -393,9 +393,7 @@ def test_payload_counting_failure_cannot_interrupt_pin_processing(recording):
     assert int(event["completed_blocks"]) == -1
 
 
-def test_off_loads_no_backend_and_records_no_pin_state_or_events(
-    recording, monkeypatch
-):
+def test_off_loads_no_backend_and_records_no_pin_state_or_events(monkeypatch):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")
     monkeypatch.setattr(
         _nvtx, "_load_backend", lambda: pytest.fail("off mode loaded optional backend")
