@@ -3,19 +3,19 @@
 """Observe NIXL state and resource release without changing their ordering."""
 
 import pytest
-import test_nvtx
-from test_nvtx import payloads, spans
+from _kvcr_test_utils import _decode_notif, _poll_until
+from _nvtx_test_utils import make_source, payloads, spans, wait_for_payload
 from test_progress import _mem, _transfer_progress, _TransferAgent
 
 from kvcr import _nvtx
 
-recording = test_nvtx.recording
-
 
 def test_zero_selected_source_is_failed_without_posting(recording):
-    source, agent, pinning = test_nvtx.make_source(recording)
+    source, agent, pinning = make_source(recording)
     pinning.complete(0, missing_indices=(0,))
-    event = test_nvtx.wait_for_payload(source, recording, "source.write.completed")
+    event = wait_for_payload(
+        source, recording, "source.write.completed", ended="source.write"
+    )
     assert int(event["status"]) == 4
     assert int(event["reason"]) == 0
     assert int(event["requested_blocks"]) == 1
@@ -94,13 +94,13 @@ def test_request_churn_does_not_evict_worker_identities(recording, monkeypatch):
 
 
 def test_source_deadline_and_unresolved_close_are_not_native_completion(recording):
-    source, agent, pinning = test_nvtx.make_source(recording)
+    source, agent, pinning = make_source(recording)
     agent.state = "PROC"
     pinning.complete(0)
     backend = source._core._remote_fw_dram
-    test_nvtx.wait_for_payload(source, recording, "nixl.write.posted")
+    wait_for_payload(source, recording, "nixl.write.posted")
     source._core._clock = lambda: float("inf")
-    test_nvtx.wait_for_payload(source, recording, "source.write.cancel_requested")
+    wait_for_payload(source, recording, "source.write.cancel_requested")
     assert not payloads(recording, "nixl.done_observed")
     assert not payloads(recording, "source.write.completed")
     for name in ("source.write", "nixl.write"):
@@ -116,7 +116,9 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
     for name in ("source.write", "nixl.write"):
         assert not spans(recording, name, "end")
     agent.state = "DONE"
-    final = test_nvtx.wait_for_payload(source, recording, "source.write.completed")
+    final = wait_for_payload(
+        source, recording, "source.write.completed", ended="source.write"
+    )
     assert int(final["reason"]) == int(_nvtx.Reason.DEADLINE)
     assert not backend._pending_pin_ops
     for name in ("source.write", "nixl.write"):
@@ -126,7 +128,7 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
 @pytest.mark.parametrize("level", ["low", "medium"])
 def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
-    source, agent, pinning = test_nvtx.make_source(recording)
+    source, agent, pinning = make_source(recording)
     native_submit = agent.transfer
     open_at_submit = []
 
@@ -137,7 +139,7 @@ def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     monkeypatch.setattr(agent, "transfer", submit_with_started_ranges)
     agent.state = "DONE"
     pinning.complete(0)
-    test_nvtx._poll_until(source, lambda _: pinning.unpins == ["pin"])
+    _poll_until(source, lambda _: pinning.unpins == ["pin"])
     assert open_at_submit == [{"source.write", "nixl.write"}]
     pin = payloads(recording, "source.pin.completed")[0]
     submitted = payloads(recording, "nixl.write.posted")
@@ -163,7 +165,7 @@ def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     "cause,reason", [("timeout", 5), ("route", 17), ("timeout+route", 5)]
 )
 def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
-    source, agent, pinning = test_nvtx.make_source(recording)
+    source, agent, pinning = make_source(recording)
     backend = source._core._remote_fw_dram
     if "route" in cause:
         pending = next(iter(backend._source_pin_ops.values()))
@@ -172,14 +174,16 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
         source._core._clock = lambda: float("inf")
     else:
         pinning.complete(0)
-    event = test_nvtx.wait_for_payload(source, recording, "source.write.completed")
+    event = wait_for_payload(
+        source, recording, "source.write.completed", ended="source.write"
+    )
     assert int(event["status"]) == 4
     assert int(event["reason"]) == reason
     assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
     assert not agent.xfers
     assert pinning.cancelled == ([0] if "timeout" in cause else [])
     assert pinning.unpins == ([] if "timeout" in cause else ["pin"])
-    assert test_nvtx._decode_notif(agent.sent_notifs[0][1])["success"] is False
+    assert _decode_notif(agent.sent_notifs[0][1])["success"] is False
     assert not payloads(recording, "nixl.write.posted")
     assert len(spans(recording, "source.write", "end")) == 1
 
@@ -187,7 +191,7 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
 def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypatch):
     from kvcr.remote_fw_dram import _SourceWriteOp
 
-    source, agent, pinning = test_nvtx.make_source(recording)
+    source, agent, pinning = make_source(recording)
     backend = source._core._remote_fw_dram
     submit = source._core._progress.submit
 
@@ -199,7 +203,7 @@ def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypat
     monkeypatch.setattr(source._core._progress, "submit", replace_route)
     agent.state = "DONE"
     pinning.complete(0)
-    test_nvtx.wait_for_payload(source, recording, "source.write.completed")
+    wait_for_payload(source, recording, "source.write.completed", ended="source.write")
     assert len(payloads(recording, "source.write.refused")) == 1
     assert not payloads(recording, "nixl.write.posted")
     assert int(payloads(recording, "source.write.completed")[0]["reason"]) == int(

@@ -366,21 +366,15 @@ class _SourceWriteOp(_RemoteOp):
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
-    requested_blocks: int = -1
-    target_incarnation: str | None = None
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
-    trace_initialized: bool = False
-    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
     ) -> tuple[bool, bool]:
         backend = self._backend
-        if not self.trace_initialized:
-            self.trace_initialized = True
-            if backend._nvtx is not None:
-                self.trace = backend._nvtx.source(self, backend._kvcr)
         trace = self.trace
+        if trace is not None and trace.trace_id is None:
+            self.trace = trace = trace.tracer.source(self, backend._kvcr)
         observed_work = False
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
@@ -392,17 +386,16 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
-                failure_reason = (
-                    _nvtx.Reason.CANCELLED
-                    if status.cancel_requested
-                    else _nvtx.Reason.SOURCE_STALLED
-                    if not source_responsive
-                    else self.failure_reason
-                    if self.state is _SourceWriteState.NOTIFY_FAILURE
-                    else _nvtx.Reason.DEADLINE
-                )
-                if failure_reason is _nvtx.Reason.UNKNOWN and trace is not None:
-                    failure_reason = trace.failure_reason
+                if trace is not None:
+                    failure_reason = (
+                        _nvtx.Reason.CANCELLED
+                        if status.cancel_requested
+                        else _nvtx.Reason.SOURCE_STALLED
+                        if not source_responsive
+                        else trace.failure_reason
+                        if self.state is _SourceWriteState.NOTIFY_FAILURE
+                        else _nvtx.Reason.DEADLINE
+                    )
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
@@ -440,18 +433,7 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
-                    trace.mark(
-                        "source.write.completed",
-                        once=True,
-                        status=_nvtx.Status.FAILED
-                        if self.requested_blocks
-                        else _nvtx.Status.SUCCESS,
-                        reason=_nvtx.Reason.UNKNOWN
-                        if self.requested_blocks
-                        else _nvtx.Reason.NONE,
-                        completed_blocks=0,
-                        completed_bytes=0,
-                    )
+                    trace.empty_source()
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -577,7 +559,7 @@ class _SourceWriteOp(_RemoteOp):
             progress, self.remote_agent, self.op_handle, False
         )
         self._backend._dangling_ops.finish_source(self)
-        if self.trace is not None:
+        if self.trace is not None and self.trace.trace_id is not None:
             self.trace.complete_source(
                 False,
                 0,
@@ -1449,8 +1431,9 @@ class _RemoteFWDram:
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
-            requested_blocks=len(source_pin.ordered_keys),
-            target_incarnation=source_pin.target_incarnation,
+            trace=self._nvtx.prepare_source(source_pin)
+            if self._nvtx is not None
+            else None,
             _backend=self,
         )
         # Already on progress: retain cleanup ownership before starting the write.
@@ -1560,14 +1543,14 @@ class _RemoteFWDram:
                 source_pin.dst_descriptors[index] for index in completed_indices
             ),
             route=source_pin.route,
-            requested_blocks=len(source_pin.ordered_keys),
-            target_incarnation=source_pin.target_incarnation,
+            trace=self._nvtx.prepare_source(source_pin, failure_reason)
+            if self._nvtx is not None
+            else None,
             _backend=self,
             framework_pins=framework_pins,
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
-            failure_reason=failure_reason,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1900,12 +1883,11 @@ class _RemoteFWDram:
             except Exception:
                 pass
         try:
-            pushed = trace.push() if trace is not None else False
-            try:
-                request = kvcr._request_pin_callback(keys)
-            finally:
-                if trace is not None:
-                    trace.tracer.pop(pushed)
+            request = (
+                trace.call_framework(kvcr._request_pin_callback, keys)
+                if trace is not None
+                else kvcr._request_pin_callback(keys)
+            )
             if trace is not None:
                 trace.request_id = request
             if request in self._pending_pin_ops:

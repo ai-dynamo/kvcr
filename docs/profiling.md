@@ -24,8 +24,8 @@ uv sync --extra profiling
 
 | Value | Behavior |
 | --- | --- |
-| `off` | No tracing imports, trace objects or payload construction. |
-| `low` | Essential identities, pin/transfer/target/caller lifetimes, hints, transitions and outcomes. Default when profiling dependencies are available. |
+| `off` (default) | No optional NVTX backend loading, trace objects, or payload construction. |
+| `low` | Essential identities, pin/transfer/target/caller lifetimes, hints, transitions and outcomes. |
 | `medium` | Low plus descriptor byte/tier/memory diagnostics, bounded request display labels, waiter detachment and native release retries. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for
@@ -86,8 +86,9 @@ reports delivery latency and its reciprocal operation rate. Off disables KVCR
 annotations; other libraries can still emit NVTX events. The decoder also reads
 schema 1/2 captures and verifies medium's bounded Unicode display mapping.
 
-Pin annotations use the `KVCR` domain and `framework_pin` category. Event names
-are bounded static strings. IDs and counts are payloads, never registered names.
+All annotations use the `KVCR` domain: pin events use `framework_pin`, and
+lifecycle events use `remote_deliver`. Event names are bounded static strings.
+IDs and counts are payloads, never registered names.
 
 | Event | Meaning |
 | --- | --- |
