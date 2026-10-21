@@ -22,7 +22,8 @@ and API development, use the [developer guide](dev-guide.md).
 - Linux x86-64, two idle B200 GPUs allocated to you, and a CUDA 13-compatible
   NVIDIA driver (580.126.20 or newer recommended).
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
-  Git, and public access to Docker Hub, GitHub, PyPI, crates.io and Hugging Face.
+  Git, and public access to Docker Hub, GitHub, PyPI, `pypi.nvidia.com`,
+  `flashinfer.ai`, crates.io and Hugging Face. These public indexes need no login.
 - Allow 32 GiB host RAM and 150 GiB disk for the build, image and model cache.
 
 This example uses two independent TP1 workers on one host, Qwen3-0.6B BF16,

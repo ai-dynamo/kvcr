@@ -64,6 +64,7 @@ RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-
  && python3 -m pip uninstall -y sglang \
  && python3 -m pip install --no-cache-dir --no-build-isolation \
       --constraint /opt/sglang-constraints.txt \
+      --find-links https://pypi.nvidia.com/aisimulate/ \
       /opt/sglang-src/python /opt/kvcr-src /tmp/dynamo-wheels/*.whl \
       'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
  && python3 -m pip install --no-cache-dir --no-deps \
