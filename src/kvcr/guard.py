@@ -452,14 +452,20 @@ class _Guard:
         self._thread.start()
 
     def claim(
-        self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
+        self,
+        liveness: PidfdLiveness,
+        tier_config: _TierConfig,
+        bind: tuple[str, int],
+        startup_timeout_seconds: int | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
         immediately instead of queueing the claimant.
         """
         self._reserve_claim()
-        return self._submit(_Command("claim", (liveness, tier_config, bind)))
+        return self._submit(
+            _Command("claim", (liveness, tier_config, bind, startup_timeout_seconds))
+        )
 
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
@@ -759,7 +765,11 @@ class _Guard:
         return True
 
     def _claim(
-        self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
+        self,
+        liveness: PidfdLiveness,
+        tier_config: _TierConfig,
+        bind: tuple[str, int],
+        startup_timeout_seconds: int | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
@@ -776,7 +786,7 @@ class _Guard:
             except BaseException:
                 duplicate.close()
                 raise
-            self._adopt(control, tier_config)
+            self._adopt(control, tier_config, startup_timeout_seconds)
             with self._phase_lock:
                 if not self._closing and not self._refusing():
                     self._pool_lease.current = liveness
@@ -866,7 +876,12 @@ class _Guard:
         with self._phase_lock:
             self._phase = _Phase.CLOSED
 
-    def _adopt(self, control: ZmqPeerControlChannel, tier_config: _TierConfig) -> None:
+    def _adopt(
+        self,
+        control: ZmqPeerControlChannel,
+        tier_config: _TierConfig,
+        startup_timeout_seconds: int | None = None,
+    ) -> None:
         """Take up a new primary, handing over whatever the last one left.
         A serving Guard hands back first, so it stops answering before the
         replacement starts; held records are kept, not re-read from the region.
@@ -899,7 +914,7 @@ class _Guard:
             if self._control is not None:
                 self._control.close()
             self._control = control
-            self._prepare_core()
+            self._prepare_core(startup_timeout_seconds)
         except BaseException as error:
             # The pool has changed hands and nothing here can put it back, so
             # this stopped being something a claimant could be told about.
@@ -1032,7 +1047,7 @@ class _Guard:
             (serving - started) * 1000,
         )
 
-    def _prepare_core(self) -> None:
+    def _prepare_core(self, startup_timeout_seconds: int | None = None) -> None:
         """Register the Guard's pool without accepting control traffic."""
 
         def reject_pin(keys: object) -> int:
@@ -1055,6 +1070,7 @@ class _Guard:
                 nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
                 pool_layouts=self._configured.pool_layouts,
                 nixl_listen_port=0,
+                startup_timeout_seconds=startup_timeout_seconds,
             ),
             KVCRBindings(
                 reject_pin,

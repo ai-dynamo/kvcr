@@ -258,10 +258,29 @@ def _wait_for_connection_state(
         time.sleep(_CONNECTION_POLL_INTERVAL_SECONDS)
 
 
-def test_socket_is_private(tmp_path: Path) -> None:
+def test_socket_is_private_and_claim_honors_startup_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Only the service owner can access its Unix socket."""
     with _running_server(tmp_path) as harness:
         assert stat.S_IMODE(harness.server.socket_path.stat().st_mode) == 0o600
+        monkeypatch.setattr("kvcr.control_channels._TIMEOUT_SECONDS", 0.05)
+        guard = harness.server._registry._guards[0]
+        monkeypatch.setattr(
+            guard,
+            "_prepare_core",
+            Mock(side_effect=lambda _budget: threading.Event().wait(0.15)),
+        )
+        hold = harness.client.claim(
+            0,
+            _TEST_POOL_LAYOUTS,
+            _TEST_DIGEST,
+            _control_bind(0),
+            startup_timeout_seconds=600,
+        )
+        guard._prepare_core.assert_called_once_with(600)
+        assert hold._connection._connection.gettimeout() == 0.05
+        hold.release()
 
 
 def test_client_claims_with_worker_pidfd_when_peer_option_is_unavailable(
@@ -1317,8 +1336,8 @@ def test_refuse_claims_is_a_barrier_no_grant_can_cross(tmp_path: Path) -> None:
     returned = threading.Event()
     real_adopt = guard._adopt
 
-    def gated_adopt(control, tier_config) -> None:
-        real_adopt(control, tier_config)
+    def gated_adopt(control, tier_config, startup_timeout_seconds=None) -> None:
+        real_adopt(control, tier_config, startup_timeout_seconds)
         in_adopt.set()
         assert resume.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
 

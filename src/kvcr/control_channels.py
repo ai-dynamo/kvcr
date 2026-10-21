@@ -13,7 +13,7 @@ import os
 import socket
 import struct
 from array import array
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from typing import TypeVar
 
 import msgspec
@@ -73,6 +73,17 @@ class FramedConnection:
 
     def close(self) -> None:
         self._connection.close()
+
+    @contextmanager
+    def extended_timeout(self, extra_seconds: int | None):
+        """Extend claim reception without changing subsequent lease traffic."""
+        previous = self._connection.gettimeout()
+        if extra_seconds is not None and previous is not None:
+            self._connection.settimeout(previous + extra_seconds)
+        try:
+            yield
+        finally:
+            self._connection.settimeout(previous)
 
     def send(self, message: object) -> None:
         self._connection.sendall(self._encode_frame(message))

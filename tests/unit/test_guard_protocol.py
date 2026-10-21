@@ -116,6 +116,11 @@ class _RecordingConnection:
         self.received_fd: int | None = os.open(os.devnull, os.O_RDONLY)
         self.handed_fd: int | None = None
         self.closed = False
+        self._connection = Mock()
+        self._connection.gettimeout.return_value = 60.0
+
+    def extended_timeout(self, extra_seconds):
+        return protocol_module.FramedConnection.extended_timeout(self, extra_seconds)
 
     def send(self, message: object) -> None:
         self.events.append("send")
@@ -261,8 +266,10 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
     )
 
 
+@pytest.mark.parametrize("startup_budget", [None, 600])
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
+    startup_budget,
 ) -> None:
     """A claim/release round-trips typed wire messages, geometry, and ownership."""
     events: list[str] = []
@@ -277,7 +284,11 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
 
     hold = KVCRClient("/unused").claim(
-        _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
+        _GUARD_INDEX,
+        _POOL_LAYOUTS,
+        _DIGEST,
+        ("127.0.0.1", 5555),
+        startup_timeout_seconds=startup_budget,
     )
 
     assert hold._incarnation
@@ -295,6 +306,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "control_port": 5555,
         "version": 1,
         "incarnation": hold._incarnation,
+        "startup_timeout_seconds": startup_budget,
     }
     grant_wire = msgspec.to_builtins(grant)
     assert grant_wire["dead_incarnations"] == ("dead-primary",)
@@ -311,6 +323,9 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     assert hold.local_dram == _local_dram()
     # The endpoint a Guard will answer on, handed over with the grant.
     assert hold._control_listener_fd == connection.handed_fd
+    assert connection._connection.settimeout.call_args_list[-1].args == (60.0,)
+    if startup_budget is not None:
+        assert connection._connection.settimeout.call_args_list[0].args == (660.0,)
 
     hold.release()
 

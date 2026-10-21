@@ -190,6 +190,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
+        startup_timeout_seconds: int | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -198,7 +199,9 @@ class _PoolRegistry:
         """
         if self._refusing.is_set():
             raise KVCRServiceError("KVCR pool registry is closed")
-        return self._guard(guard_index).claim(liveness, tier_config, control_bind)
+        return self._guard(guard_index).claim(
+            liveness, tier_config, control_bind, startup_timeout_seconds
+        )
 
     def release(self, guard_index: int, lease: "_Lease") -> None:
         self._guard(guard_index).release(lease)
@@ -433,6 +436,7 @@ class _ThreadingUnixServer(
             request.tier_config,
             liveness,
             (request.control_host, request.control_port),
+            request.startup_timeout_seconds,
         )
         if guard is None:
             raise KVCRServiceError("KVCR claim succeeded without a Guard")
