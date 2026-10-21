@@ -31,14 +31,13 @@ when it samples, and how unknown/zero-capacity states are represented.
 Dynamo's inspected hint producer writes
 `sampling_params.extra_args['kv_transfer_params']['kv_hint']`; the inspected
 vLLM KVCR adapter reads `ReqContext.kv_hints`. Those fields remain separate on the
-examined request path. A compatible carrier must be verified before claiming
-Dynamo remote reuse. Session/parent propagation and framework utilization likewise
-need explicit framework-to-KVCR seams. They are outside these instrumentation
-PRs, which preserve the public API and wire contract.
+examined request path. KVCR's hint parser retains source endpoint and block
+hashes. A compatible carrier must be verified before claiming Dynamo remote
+reuse. These missing integration seams are outside the instrumentation PRs,
+which preserve the public API and wire contract.
 
-The existing two-process example uses a synthetic framework binding with real
-KVCR/NIXL. It proves the supplied request-to-hint and worker-to-worker joins; it
-does not prove Dynamo propagates the inputs above.
+The [two-process example](nvtx-walkthrough.md) proves the supplied request-to-hint
+and worker joins, not Dynamo propagation of these inputs.
 
 ## Immutable source references
 

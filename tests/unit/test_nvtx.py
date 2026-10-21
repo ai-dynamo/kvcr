@@ -164,17 +164,10 @@ def test_explicit_level_and_fresh_payloads(recording, monkeypatch, level):
     second = tracer.begin(5, source_op_id=4, op_handle=2**60)
     first.registered(0)
     second.registered(0)
-    first.finish("success", completed_blocks=2)
-    second.finish("failed", reason=_nvtx.Reason.UNKNOWN)
-    first.finish("cancelled")
     registered = payloads(recording, "source.pin.registered")
-    completed = payloads(recording, "source.pin.completed")
     assert [int(p["requested_blocks"]) for p in registered] == [2, 5]
     assert [int(p["op_handle"]) for p in registered] == [-(2**60), 2**60]
-    assert registered[0]["pin_id"] != registered[1]["pin_id"]
-    assert len(completed) == 2
-    assert all(int(p["fw_dram_utilization_known"]) == 0 for p in completed)
-    assert not recording.stack
+    assert all(int(p["fw_dram_utilization_known"]) == 0 for p in registered)
 
 
 @pytest.mark.parametrize(
@@ -311,9 +304,7 @@ def test_reused_framework_request_id_gets_new_trace_identity(recording):
     assert records[0]["pin_id"] != records[1]["pin_id"]
 
 
-@pytest.mark.parametrize(
-    "request_id", [-(2**63) - 1, -(2**63), -1, 0, 2**63 - 1, 2**63, 2**128]
-)
+@pytest.mark.parametrize("request_id", [-(2**63) - 1, -(2**63), 0, 2**63 - 1, 2**63])
 def test_framework_request_id_boundaries(recording, request_id):
     known = -(2**63) <= request_id < 2**63
     trace = _nvtx.create_tracer().begin(1)

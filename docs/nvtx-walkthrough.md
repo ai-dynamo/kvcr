@@ -7,7 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 
 The two-process example uses real KVCR/NIXL UCX with a synthetic framework
 binding and registered memory. Start with DRAM; `--memory vram` additionally
-requires compatible CUDA PyTorch. It does not run Dynamo or an inference model.
+requires compatible CUDA PyTorch and uses GPU 0. It does not run Dynamo or an
+inference model or validate hints in an LLM serving framework.
 Keep raw reports outside the checkout.
 
 ```bash
@@ -34,11 +35,8 @@ tuple to find the source write, then source instance/operation ID to find its
 pin waiter and pin ID. The [event reference](nvtx-events.md) and
 [producer map](nvtx-context.md) define each join.
 
-Schema 3 emits immutable fields once in `request.context` or
-`source.pin.context`. The decoder reconstructs these fields before joining
-compact transition payloads. Low retains identities and ranges; medium also
-records the bounded request display and optional descriptor byte counts used
-in the table below.
+The decoder accepts schemas 1/2/3 and checks medium's bounded Unicode display.
+Off disables KVCR annotations; other libraries can still emit NVTX events.
 
 ## Worked operation
 
@@ -120,8 +118,9 @@ collection mode's off baseline. Verify each run's bytes and 330 pin
 requests/releases with zero cancellations; preserve raw runs, versions and
 source hashes alongside the summary.
 
-The timed interval starts at `deliver()` and ends at caller completion. Hint
-creation, byte verification, startup and teardown are excluded. Report size
+The JSON reports delivery latency and its reciprocal operation rate. Timing
+starts at `deliver()` and ends at caller completion; hint creation, byte
+verification, startup and teardown are excluded. Report size
 includes warmups and other libraries. Successful runs exercise few medium-only
 events, and run-to-run variation can reverse low/medium ordering. These DRAM
 measurements do not establish model throughput or a production overhead budget;

@@ -38,6 +38,8 @@ error is inferred from exception text; `native_error_known=0` means unavailable.
 Source completion also preserves deadline and stale-route causes detected while
 pinning is pending; a known deadline is retained if the route has also changed.
 
+## Payloads and identities
+
 Schema 3 stores immutable lifecycle fields once in `request.context`. Compact
 events carry `(instance_hi, instance_lo, trace_id)`, status/reason and only the
 changing fields supplied by that transition. Reconstruct context before joining
@@ -49,6 +51,10 @@ target_incarnation_hi, target_incarnation_lo, op_handle)`; incarnation is taken
 from existing control metadata, without extending the wire protocol. Zero
 identity fields mean unavailable. Handles remain signed, including local fills.
 Transfer IDs are local to the source instance. Unknown counts/bytes are `-1`.
+
+Attributes and arrays are reused per emitting thread, with separate storage for
+reentrant calls. NVTX consumes values synchronously; arrays are not shared
+between threads or reassigned through the attributes' payload setter.
 
 At medium detail, `source_tier`/`destination_tier` describe memory ownership: 0 unknown, 1 framework,
 2 KVCR-owned, 3 mixed. `source_memory`/`destination_memory` describe a verified
@@ -103,9 +109,8 @@ cleanup. A late success after cancellation cannot create a second successful
 caller completion. `op.shutdown_unreturned` records operations whose results
 were not returned before successful shutdown; it is not a DMA-state assertion.
 
-Source and target lifecycle events use the `remote_deliver` category. Incidental
-remote local-fill events retain negative handles and `local_fill=1`; this is not
-full public-fetch fan-out instrumentation. Source request IDs remain unknown;
+Incidental remote local-fill events retain negative handles and `local_fill=1`;
+this is not full public-fetch fan-out instrumentation. Source request IDs remain unknown;
 the existing target identity/handle links to the target's request mapping.
 
 Additional status codes: 7 rejected, 8 ambiguous, 9 unresolved. Additional reason
