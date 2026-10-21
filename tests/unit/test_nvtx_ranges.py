@@ -4,9 +4,12 @@
 
 import threading
 
-from _nvtx_test_utils import make_source, spans, wait_for_payload
+import test_nvtx
+from test_nvtx import spans
 
 from kvcr import _nvtx
+
+recording = test_nvtx.recording
 
 
 def test_overlapping_pin_ranges_can_end_on_another_thread(recording):
@@ -28,10 +31,10 @@ def test_overlapping_pin_ranges_can_end_on_another_thread(recording):
 
 
 def test_source_close_ends_range_after_native_completion(recording):
-    source, agent, pinning = make_source(recording)
+    source, agent, pinning = test_nvtx.make_source(recording)
     agent.state = "PROC"
     pinning.complete(0)
-    wait_for_payload(source, recording, "nixl.write.posted")
+    test_nvtx.wait_for_payload(source, recording, "nixl.write.posted")
     agent.state = "DONE"
     source.close()
     assert len(spans(recording, "source.write")) == 1

@@ -5,9 +5,6 @@ import logging
 
 import pytest
 from _kvcr_test_utils import _OPEN_KVCRS
-from _nvtx_test_utils import RecordingDomain
-
-from kvcr import _nvtx
 
 
 @pytest.fixture(autouse=True)
@@ -26,12 +23,3 @@ def kvcr_caplog(caplog):
             yield caplog
     finally:
         kvcr_logger.removeHandler(caplog.handler)
-
-
-@pytest.fixture
-def recording(monkeypatch):
-    np = pytest.importorskip("numpy")
-    domain = RecordingDomain()
-    monkeypatch.setenv("KVCR_NVTX_LEVEL", "low")
-    monkeypatch.setattr(_nvtx, "_load_backend", lambda: (domain, np))
-    return domain
