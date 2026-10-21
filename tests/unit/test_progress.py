@@ -129,13 +129,16 @@ def _mem(
     return _TransferRef(owner, element_index, label, framework)
 
 
-def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRProgress:
+def _transfer_progress(
+    agent: _TransferAgent, *, prepare: bool = True, coalesce: bool = False
+) -> _KVCRProgress:
     progress = _KVCRProgress(
         lambda _: None,
         lambda _, __: ({}, False),
         list,
         lambda: None,
         nixl_agent_name=agent.name,
+        coalesce_remote_dram_descriptors=coalesce,
     )
     progress._nixl_agent = agent
     if prepare:
@@ -151,6 +154,103 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
         for name in ("", agent.name, "remote-agent"):
             progress.prepare_memory(name, regions)
     return progress
+
+
+def _simulate_prepared_copy(agent, source, call):
+    """Apply the native boundary's address/length pairs to observable bytes."""
+    local_handle, local_indices, remote_handle, remote_indices = call
+
+    def expand(handle):
+        _, _, compressed = agent.prep_calls[int(handle.split("-")[1]) - 1]
+        return [
+            (address + stride * index, size)
+            for address, size, _, stride, count in compressed
+            for index in range(count)
+        ]
+
+    local, remote = expand(local_handle), expand(remote_handle)
+    destination = {}
+    runs = 0
+    previous = None
+    for source_index, target_index in zip(local_indices, remote_indices, strict=True):
+        src, src_size = local[source_index]
+        dst, dst_size = remote[target_index]
+        assert src_size == dst_size
+        for offset in range(src_size):
+            destination[dst + offset] = source[src + offset]
+        if previous != (src, dst):
+            runs += 1
+        previous = (src + src_size, dst + dst_size)
+    return destination, runs
+
+
+@pytest.mark.parametrize("coalesce", [False, True])
+@pytest.mark.parametrize("permuted", [False, True])
+@pytest.mark.parametrize("aliased", [False, True])
+def test_remote_component_order_preserves_bytes_and_alias_write_order(
+    coalesce, permuted, aliased
+):
+    """Page-interleaved K/V pairs hide contiguous runs from native merging.
+
+    The candidate may reorder independent pairs, never just one side. Aliased
+    destinations must keep the old write order; fragmented destinations still
+    need the correct page permutation even when they cannot merge.
+    """
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent, prepare=False, coalesce=coalesce)
+    source_regions = {
+        label: RegionDescriptor(addr=address, size=4, count=4, label=label)
+        for label, address in (("k", 4096), ("v", 8192))
+    }
+    target_regions = {
+        label: RegionDescriptor(addr=address, size=4, count=4, label=label)
+        for label, address in (("k", 12288), ("v", 12292 if aliased else 16384))
+    }
+    progress.prepare_memory("", ({}, source_regions))
+    progress.prepare_memory("remote-agent", (target_regions, {}))
+    local = [
+        _mem(page, label=label, framework=False)
+        for page in range(4)
+        for label in ("k", "v")
+    ]
+    remote = [
+        _mem(
+            (page * 3) % 4 if permuted else page,
+            owner="remote-agent",
+            label=label,
+        )
+        for page in range(4)
+        for label in ("k", "v")
+    ]
+    source = {
+        region.addr + page * 4 + offset: bytes([17 + part * 61 + page])[0]
+        for part, region in enumerate(source_regions.values())
+        for page in range(4)
+        for offset in range(4)
+    }
+    progress.submit_transfer("WRITE", local, remote, remote_side_agent="remote-agent")
+    call = agent.make_calls[-1]
+    actual, runs = _simulate_prepared_copy(agent, source, call)
+    original_local = [value for page in range(4) for value in (page, 4 + page)]
+    original_remote = [
+        value
+        for page in range(4)
+        for value in (
+            (page * 3) % 4 if permuted else page,
+            4 + ((page * 3) % 4 if permuted else page),
+        )
+    ]
+    expected, _ = _simulate_prepared_copy(
+        agent, source, (call[0], original_local, call[2], original_remote)
+    )
+    assert actual == expected
+    if coalesce and not permuted and not aliased:
+        assert runs == 2
+    else:
+        assert runs == 8
+    # No source bytes, completion ownership or selected byte count changed.
+    assert len(call[1]) == len(call[3]) == 8
+    assert len(progress._active_transfers) == 1
 
 
 @pytest.mark.parametrize("fail_post", [False, True])

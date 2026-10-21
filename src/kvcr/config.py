@@ -126,6 +126,9 @@ class KVCRConfig(msgspec.Struct, frozen=True):
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
     startup_timeout_seconds: int | None = None
+    # Opt-in for disjoint G2 -> remote framework DRAM copies. Reorder paired
+    # descriptors so NIXL can merge contiguous component/page runs.
+    coalesce_remote_dram_descriptors: bool = False
 
 
 class KVCRGuardConfig(msgspec.Struct, frozen=True):

@@ -133,9 +133,13 @@ class _KVCRProgress:
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
+        coalesce_remote_dram_descriptors: bool = False,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
+        if type(coalesce_remote_dram_descriptors) is not bool:
+            raise ValueError("coalesce_remote_dram_descriptors must be a bool")
+        self._coalesce_remote_dram_descriptors = coalesce_remote_dram_descriptors
         self._initialize = initialize
         self._poll = poll
         self._flush = flush
@@ -277,6 +281,20 @@ class _KVCRProgress:
             remote, remote_indices = self._prepared_indices(
                 remote_side_agent, remote_descriptors
             )
+            if (
+                self._coalesce_remote_dram_descriptors
+                and operation == "WRITE"
+                and remote_side_agent != self.nixl_agent_name
+                and all(not ref.framework for ref in local_descriptors)
+                and all(ref.framework for ref in remote_descriptors)
+            ):
+                local_indices, remote_indices = self._order_remote_dram_pairs(
+                    local_descriptors,
+                    remote_descriptors,
+                    local_indices,
+                    remote_indices,
+                    remote_side_agent,
+                )
             handle = agent.make_prepped_xfer(
                 operation,
                 local,
@@ -309,6 +327,47 @@ class _KVCRProgress:
             submitted = False
             logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
         return transfer_id, submitted
+
+    def _order_remote_dram_pairs(
+        self,
+        local_refs: Sequence[_TransferRef],
+        remote_refs: Sequence[_TransferRef],
+        local_indices: list[int],
+        remote_indices: list[int],
+        remote_agent: str,
+    ) -> tuple[list[int], list[int]]:
+        """Preserve byte pairs while grouping independent component runs.
+
+        NIXL merges adjacent descriptors, not interleaved K/V pages. Sorting
+        source/destination pairs together exposes contiguous runs without
+        changing any block identity, pin, completion index or copied byte.
+        Aliasing destinations retain their original order. The opt-in caller
+        must provide distinct source G2 and destination framework allocations;
+        loopback, framework-source, VRAM and FILE paths do not use this helper.
+        """
+        if len(local_indices) != len(remote_indices) or len(local_indices) < 2:
+            return local_indices, remote_indices
+        order = sorted(range(len(local_indices)), key=local_indices.__getitem__)
+        if all(index == original for index, original in enumerate(order)):
+            return local_indices, remote_indices
+        owner, local_regions = self._catalogs[""]
+        if _resolve_region(local_refs[0], local_regions, owner).mem_type != "DRAM":
+            return local_indices, remote_indices
+        owner, remote_regions = self._catalogs[remote_agent]
+        ranges = []
+        for ref in remote_refs:
+            region = _resolve_region(ref, remote_regions, owner)
+            if region.mem_type != "DRAM":
+                return local_indices, remote_indices
+            begin = region.addr + ref.element_index * (region.stride or region.size)
+            ranges.append((begin, begin + region.size))
+        physical = sorted(ranges)
+        if any(right[0] < left[1] for left, right in zip(physical, physical[1:])):
+            return local_indices, remote_indices
+        return (
+            [local_indices[index] for index in order],
+            [remote_indices[index] for index in order],
+        )
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type
