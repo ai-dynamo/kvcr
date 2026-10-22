@@ -254,8 +254,8 @@ def test_native_done_and_release_are_distinct_once(recording, post):
     assert not payloads(recording, "nixl.write.released")
     assert progress.poll_transfer(transfer, require_completion=True) == (True, None)
     assert transfer not in progress._active_transfers
-    done = payloads(recording, "nixl.done_observed")[0]
-    released = payloads(recording, "nixl.write.released")[0]
+    [done] = payloads(recording, "nixl.done_observed")
+    [released] = payloads(recording, "nixl.write.released")
     assert int(done["transfer_id"]) == int(released["transfer_id"]) == transfer
     assert int(done["trace_id"]) == int(released["trace_id"])
     assert int(released["op_handle"]) == -9
