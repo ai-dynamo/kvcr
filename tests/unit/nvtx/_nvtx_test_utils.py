@@ -64,8 +64,8 @@ class RecordingDomain:
         return range_id
 
     def end_range(self, range_id):
-        name, payload = self.ranges.pop(range_id)
         self.ended.append(range_id)
+        name, payload = self.ranges.pop(range_id)
         if self.fail == "end":
             raise RuntimeError("annotation failure")
         self.events.append(("end", name, payload, threading.get_ident()))
