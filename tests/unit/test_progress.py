@@ -197,7 +197,7 @@ def test_ucx_split_backend_configuration_preserves_other_backends(monkeypatch, s
 
 
 def _transfer_progress(
-    agent: _TransferAgent, *, prepare: bool = True, coalesce: bool = False
+    agent: _TransferAgent, *, prepare: bool = True, sort_descs: bool = False
 ) -> _KVCRProgress:
     progress = _KVCRProgress(
         lambda _: None,
@@ -205,7 +205,7 @@ def _transfer_progress(
         list,
         lambda: None,
         nixl_agent_name=agent.name,
-        coalesce_remote_dram_descriptors=coalesce,
+        sort_descs=sort_descs,
     )
     progress._nixl_agent = agent
     if prepare:
@@ -251,11 +251,12 @@ def _simulate_prepared_copy(agent, source, call):
     return destination, runs
 
 
-@pytest.mark.parametrize("coalesce", [False, True])
+@pytest.mark.parametrize("sort_descs", [False, True])
 @pytest.mark.parametrize("permuted", [False, True])
 @pytest.mark.parametrize("aliased", [False, True])
+@pytest.mark.parametrize("target_mem_type", ["DRAM", "VRAM"])
 def test_remote_component_order_preserves_bytes_and_alias_write_order(
-    coalesce, permuted, aliased
+    sort_descs, permuted, aliased, target_mem_type
 ):
     """Page-interleaved K/V pairs hide contiguous runs from native merging.
 
@@ -264,13 +265,15 @@ def test_remote_component_order_preserves_bytes_and_alias_write_order(
     need the correct page permutation even when they cannot merge.
     """
     agent = _TransferAgent()
-    progress = _transfer_progress(agent, prepare=False, coalesce=coalesce)
+    progress = _transfer_progress(agent, prepare=False, sort_descs=sort_descs)
     source_regions = {
         label: RegionDescriptor(addr=address, size=4, count=4, label=label)
         for label, address in (("k", 4096), ("v", 8192))
     }
     target_regions = {
-        label: RegionDescriptor(addr=address, size=4, count=4, label=label)
+        label: RegionDescriptor(
+            addr=address, size=4, count=4, label=label, mem_type=target_mem_type
+        )
         for label, address in (("k", 12288), ("v", 12292 if aliased else 16384))
     }
     progress.prepare_memory("", ({}, source_regions))
@@ -311,7 +314,7 @@ def test_remote_component_order_preserves_bytes_and_alias_write_order(
         agent, source, (call[0], original_local, call[2], original_remote)
     )
     assert actual == expected
-    if coalesce and not permuted and not aliased:
+    if sort_descs and not permuted and not aliased:
         assert runs == 2
     else:
         assert runs == 8
