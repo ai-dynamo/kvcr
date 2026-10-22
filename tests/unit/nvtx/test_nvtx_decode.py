@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-decoder = runpy.run_path(str(Path(__file__).parents[2] / "examples/nvtx_decode.py"))
+decoder = runpy.run_path(str(Path(__file__).parents[3] / "examples/nvtx_decode.py"))
 validate, decode, require_range, reconstruct_context = (
     decoder[name]
     for name in ("validate", "decode", "require_range", "reconstruct_context")

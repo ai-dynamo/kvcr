@@ -392,17 +392,18 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
-                failure_reason = (
-                    _nvtx.Reason.CANCELLED
-                    if status.cancel_requested
-                    else _nvtx.Reason.SOURCE_STALLED
-                    if not source_responsive
-                    else self.failure_reason
-                    if self.state is _SourceWriteState.NOTIFY_FAILURE
-                    else _nvtx.Reason.DEADLINE
-                )
-                if failure_reason is _nvtx.Reason.UNKNOWN and trace is not None:
-                    failure_reason = trace.failure_reason
+                if trace is not None:
+                    failure_reason = (
+                        _nvtx.Reason.CANCELLED
+                        if status.cancel_requested
+                        else _nvtx.Reason.SOURCE_STALLED
+                        if not source_responsive
+                        else self.failure_reason
+                        if self.state is _SourceWriteState.NOTIFY_FAILURE
+                        else _nvtx.Reason.DEADLINE
+                    )
+                    if failure_reason is _nvtx.Reason.UNKNOWN:
+                        failure_reason = trace.failure_reason
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
@@ -440,18 +441,7 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
-                    trace.mark(
-                        "source.write.completed",
-                        once=True,
-                        status=_nvtx.Status.FAILED
-                        if self.requested_blocks
-                        else _nvtx.Status.SUCCESS,
-                        reason=_nvtx.Reason.UNKNOWN
-                        if self.requested_blocks
-                        else _nvtx.Reason.NONE,
-                        completed_blocks=0,
-                        completed_bytes=0,
-                    )
+                    trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -1769,12 +1759,12 @@ class _RemoteFWDram:
                 request,
             )
             return
-        new_waiter = op_id not in wait.op_ids
+        new_waiter = wait.trace is not None and op_id not in wait.op_ids
         wait.op_ids.add(op_id)
         op = self._source_pin_ops.get(op_id)
         if op is not None:
             op.pending_pin_ids.add(request)
-            if new_waiter and wait.trace is not None:
+            if new_waiter:
                 wait.trace.waiter(op_id[1], op.op_handle)
 
     def _remove_pending_pin_state(

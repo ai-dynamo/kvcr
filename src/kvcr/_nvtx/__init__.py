@@ -15,8 +15,8 @@ from hashlib import blake2b
 from importlib import import_module
 from threading import Lock
 
-from ._nvtx_payload import Reason, Status, _PayloadEmitter
-from ._nvtx_pin import _PinTrace
+from .payload import Reason, Status, _PayloadEmitter
+from .pin import _PinTrace
 
 _LOGGER = logging.getLogger(__name__)
 _WARNED: set[str] = set()

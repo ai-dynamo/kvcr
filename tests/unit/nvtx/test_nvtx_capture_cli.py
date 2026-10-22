@@ -11,7 +11,7 @@ def test_partial_capture_requires_two_blocks():
     result = subprocess.run(
         [
             sys.executable,
-            str(Path(__file__).parents[2] / "examples/nvtx_remote_capture.py"),
+            str(Path(__file__).parents[3] / "examples/nvtx_remote_capture.py"),
             "--scenario",
             "partial",
             "--blocks",

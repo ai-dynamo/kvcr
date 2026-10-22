@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from ._nvtx_payload import Reason, Status
+from .payload import Reason, Status
 
 if TYPE_CHECKING:
-    from ._nvtx import _PinTracer
+    from . import _PinTracer
 
 _PIN_RESULTS = {
     "success": (Status.SUCCESS, Reason.NONE),
