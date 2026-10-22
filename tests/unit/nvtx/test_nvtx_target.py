@@ -357,9 +357,9 @@ def test_replaced_hint_is_used_and_conflicting_hint_is_rejected(recording):
     assert int(payloads(recording, "hint.replaced")[0]["trace_id"]) == int(
         submitted[0]["trace_id"]
     )
-    for _ in range(2):
+    for expected in (1, 2):
         handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request)
-        _wait_until(lambda: ("target", handle) in kvcr._core._progress._in_flight_ops)
+        _wait_until(lambda: len(control.sent) == expected)
         agent.notifs["source"] = [_write_done_notification(handle)]
         assert handle in dict(_poll_until(kvcr, bool))
     used = payloads(recording, "hint.used")
