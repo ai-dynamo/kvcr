@@ -1,0 +1,10 @@
+{
+  "scope": "Experimental dependency patches, not upstream releases or bundled native libraries",
+  "nixl_base_commit": "075b2397029fc67a0b69a34df566c1ae3d00f5ab",
+  "ucx_base_commit": "65e342a82dd2609a28c8c2b8c45ed7fe2cb33fa0",
+  "files_sha256": {
+    "UCX-LICENSE.txt": "d0587ab717730987d94bed94b238c0db9d4cc7500901085f8ad109cda9c06e2a",
+    "nixl-cuda-ipc-only.patch": "a7e3761adc8bb4a227eaafc5ba0ec0294798c09ea76f3564c9c7643cda9531f3",
+    "ucx-cuda-ipc-detection.patch": "1cf36c45331de51373d3c192c1c18fb4901a849f25992c8cc3e84da52cbb7b35"
+  }
+}

@@ -434,10 +434,7 @@ def test_promoted_guard_serves_real_nixl_transfers(
     # Inline, not a child: adoption only claims and reads, and this process
     # already runs real agents beside the Guard's own.
     # G3 reads use O_DIRECT: align the destination as well as its length/offset.
-    framework_size = len(second_payload) * 2
-    allocation = ctypes.create_string_buffer(framework_size + page_size - 1)
-    offset = -ctypes.addressof(allocation) % page_size
-    framework = (ctypes.c_char * framework_size).from_buffer(allocation, offset)
+    framework = _page_aligned_framework_buffer(len(second_payload) * 2)
     replacement = _make_kvcr(
         str(service.socket_path),
         None if multi_pool else str(g3_path),
@@ -865,6 +862,16 @@ def _real_nixl_refs(
     ]
 
 
+def _page_aligned_framework_buffer(size: int) -> ctypes.Array:
+    """Provide G3 POSIX O_DIRECT alignment while retaining the backing owner."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    owner = ctypes.create_string_buffer(size + page_size - 1)
+    offset = -ctypes.addressof(owner) % page_size
+    framework = (ctypes.c_char * size).from_buffer(owner, offset)
+    assert ctypes.addressof(framework) % page_size == 0
+    return framework
+
+
 def _real_nixl_primary_child(
     socket_path: str, g3_path: str, control_port: str, multi_pool: str
 ) -> None:
@@ -872,7 +879,7 @@ def _real_nixl_primary_child(
     kvcr_progress._STARTUP_TIMEOUT_SECONDS = _REAL_NIXL_TIMEOUT_SECONDS
     page_size = os.sysconf("SC_PAGE_SIZE")
     layout = _real_nixl_layout(multi_pool == "True")
-    framework = ctypes.create_string_buffer(sum(size for _, size in layout) * 2)
+    framework = _page_aligned_framework_buffer(sum(size for _, size in layout) * 2)
     kvcr = _make_kvcr(
         socket_path,
         None if multi_pool == "True" else g3_path,

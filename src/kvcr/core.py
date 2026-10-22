@@ -23,7 +23,7 @@ from .config import (
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hint_parser import _KVFetchHint
+from .hint_parser import _KVFetchHint, _KVGPUFetchHint
 from .local_disk import _G3, _G3Residency
 from .local_dram import (
     _layout_indices,
@@ -183,6 +183,44 @@ class _KVCRCore:
             for region in memory_regions
         ):
             raise ValueError("registration elements must match configured pool sizes")
+        self._gpu_options = backend_configs.remote_fw_gpu
+        if self._gpu_options is not None:
+            if backend_configs.local_dram is not None or backend_configs.g3 is not None:
+                raise ValueError("GPU endpoints cannot configure CPU or disk storage")
+            if not memory_regions or any(
+                region.mem_type != "VRAM" or region.addr == 0
+                for region in memory_regions
+            ):
+                raise ValueError("GPU endpoints require non-empty VRAM registrations")
+            if bindings.framework_control is None:
+                raise ValueError(
+                    "GPU endpoints require an isolated framework control channel"
+                )
+            if self._gpu_options.gpu_transport == "cuda_ipc":
+                if os.environ.get("NIXL_UCX_CUDA_IPC_ONLY") != "1":
+                    raise ValueError("GPU endpoints require NIXL_UCX_CUDA_IPC_ONLY=1")
+                actual_tls = os.environ.get("UCX_TLS", "").split(",")
+                if len(actual_tls) != len(self._gpu_options.ucx_tls) or set(
+                    actual_tls
+                ) != set(self._gpu_options.ucx_tls):
+                    raise ValueError(
+                        "GPU endpoint UCX_TLS must exactly match its CUDA IPC policy"
+                    )
+            elif os.environ.get("NIXL_UCX_CUDA_IPC_ONLY", "").lower() not in (
+                "",
+                "0",
+                "n",
+                "no",
+                "false",
+                "off",
+            ):
+                raise ValueError("MNNVL cannot use the global CUDA IPC-only policy")
+        self._remote_tier = (
+            CacheTier.REMOTE_G1
+            if self._gpu_options is not None
+            else CacheTier.REMOTE_G2
+        )
+        remote_options = self._gpu_options or backend_configs.remote_fw_dram
         if self.config.operation_timeout_ms <= 0:
             raise ValueError("operation_timeout_ms must be positive")
         startup_timeout_seconds = self.config.startup_timeout_seconds
@@ -313,7 +351,7 @@ class _KVCRCore:
             self._capacity_needed_callback = None
         self._remote_fw_dram = _RemoteFWDram(
             self,
-            backend_configs.remote_fw_dram,
+            remote_options,
             bindings.key_adapter,
         )
         self._g3 = (
@@ -336,7 +374,7 @@ class _KVCRCore:
         if self._local_dram is not None:
             dram_backends.add(local_dram_config.backend)
         if self.framework_control is not None:
-            dram_backends.add(backend_configs.remote_fw_dram.backend)
+            dram_backends.add(remote_options.backend)
         if not dram_backends:
             raise ValueError("at least one DRAM backend must be configured")
 
@@ -362,6 +400,14 @@ class _KVCRCore:
             dram_backends=list(dram_backends),
             memory_regions=self._memory_regions,
             startup_timeout_seconds=startup_timeout_seconds,
+            required_gpu_ucx_tls=(
+                self._gpu_options.ucx_tls if self._gpu_options is not None else None
+            ),
+            required_gpu_transport=(
+                self._gpu_options.gpu_transport
+                if self._gpu_options is not None
+                else "cuda_ipc"
+            ),
         )
 
     def start(self) -> None:
@@ -431,7 +477,12 @@ class _KVCRCore:
         hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        hint = _KVFetchHint.from_hint(hints)
+        if self._gpu_options is None:
+            hint = _KVFetchHint.from_hint(hints)
+        else:
+            hint = _KVGPUFetchHint.from_hint(hints)
+            if hint.compatibility_domain != self._gpu_options.compatibility_domain:
+                raise ValueError("GPU router hint compatibility domain mismatch")
         self._remote_fw_dram.submit_hint(
             hint.source_endpoint, hint.block_hashes, request_id
         )
@@ -482,7 +533,7 @@ class _KVCRCore:
                 )
                 if not fetching_locally:
                     if self._remote_fw_dram.query(key, request_id):
-                        statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
+                        statuses.append((QueryStatus.FETCHABLE, self._remote_tier))
                         continue
                     if not self._has_complete_local(key):
                         statuses.append((QueryStatus.MISS, None))
@@ -495,7 +546,7 @@ class _KVCRCore:
                 statuses.append((QueryStatus.FETCHABLE, CacheTier.G3))
             # Remote hints are request-scoped and advisory, not block residency.
             elif request_id is not None and self._remote_fw_dram.query(key, request_id):
-                statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
+                statuses.append((QueryStatus.FETCHABLE, self._remote_tier))
                 if not remote_keys:
                     remote_keys = self._remote_delivery_keys.setdefault(
                         request_id, set()
@@ -626,6 +677,8 @@ class _KVCRCore:
         *,
         expected_layout: list[str] | None = None,
     ) -> OpHandle:
+        if self._gpu_options is not None:
+            raise ValueError("GPU endpoints have no KVCR-managed storage; use deliver")
         declaration = self._validate_expected_layout(expected_layout)
         op_handle = self._next_op_handle
         self._next_op_handle += 1
@@ -674,6 +727,8 @@ class _KVCRCore:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
+        if self._gpu_options is not None:
+            raise ValueError("GPU endpoints have no KVCR-managed storage; use deliver")
         declaration = self._validate_expected_layout(
             [""] if expected_layout is None else expected_layout
         )
@@ -891,7 +946,7 @@ class _KVCRCore:
                     statuses.count((QueryStatus.HIT, CacheTier.LOCAL_G2)),
                     statuses.count((QueryStatus.FETCHING, CacheTier.LOCAL_G2)),
                     statuses.count((QueryStatus.FETCHABLE, CacheTier.G3)),
-                    statuses.count((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)),
+                    statuses.count((QueryStatus.FETCHABLE, self._remote_tier)),
                     statuses.count((QueryStatus.MISS, None)),
                     remote._options.opportunistic_query,
                     hint is not None,
@@ -1102,6 +1157,12 @@ class _KVCRCore:
                 raise ValueError("block descriptors must use configured pools")
             if region.size != block_size:
                 raise ValueError("block descriptor has the wrong byte count")
+            if self._gpu_options is not None and (
+                not ref.framework or region.mem_type != "VRAM"
+            ):
+                raise ValueError(
+                    "GPU endpoints require framework-owned VRAM descriptors"
+                )
             if separator:
                 if ref.label in labels:
                     raise ValueError("block part labels must be unique")
@@ -1207,7 +1268,9 @@ class _KVCRCore:
     ) -> BlockMeta:
         resident_tiers = set()
         if record.fw_mem is not None:
-            resident_tiers.add(CacheTier.FW_G2)
+            resident_tiers.add(
+                CacheTier.FW_G1 if self._gpu_options is not None else CacheTier.FW_G2
+            )
         if record.local_dram is not None:
             resident_tiers.add(CacheTier.LOCAL_G2)
         if record.g3 is not None:

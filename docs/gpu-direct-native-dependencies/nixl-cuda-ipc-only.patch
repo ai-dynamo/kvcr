@@ -1,0 +1,260 @@
+diff --git a/fern/docs/pages/resources/environment-variables.md b/fern/docs/pages/resources/environment-variables.md
+index 26f7120..63f2d34 100644
+--- a/fern/docs/pages/resources/environment-variables.md
++++ b/fern/docs/pages/resources/environment-variables.md
+@@ -26,8 +26,17 @@ These variables control fundamental NIXL behavior across all backends.
+ |----------|------|---------|-------------|
+ | `NIXL_LOG_LEVEL` | String | `WARN` | Controls log verbosity. Values: `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. |
+ | `NIXL_PLUGIN_DIR` | String (path) | System default | Custom directory to search for backend plug-in shared libraries. |
++| `NIXL_UCX_CUDA_IPC_ONLY` | Boolean | `false` | Require explicit `UCX_TLS=cuda_ipc` with only optional `posix`, `sysv`, `self` host control transports. Excludes host-staging and network transports; the initialized UCX context must support CUDA memory. Same-host transfers only. The UCX endpoint default becomes `none`; explicit `peer` is rejected because these transports cannot provide native peer-error handling. Actual VRAM registration and transfer must still succeed. |
+ | `NIXL_DISABLE_CUDA_ADDR_WA` | Boolean (presence) | Not set (workaround enabled) | Disables CUDA address workaround in the Libfabric backend. Set this variable to any value to disable the workaround. |
+ 
++The IPC-only endpoint profile does not guarantee recovery after peer death.
++Callers must not interpret a deadline as cancellation or permission to reuse
++memory while native operations remain uncertain. Retain registered source and
++destination allocations until actual completion/quiescence; transport failures
++may still terminate the process. Ordinary default UCX endpoints continue to use
++`peer` when the IPC-only policy is not enabled. No additional transport is
++enabled to obtain error handling.
++
+ ## etcd Variables
+ 
+ These variables configure NIXL's distributed metadata exchange via etcd.
+diff --git a/src/plugins/ucx/config.cpp b/src/plugins/ucx/config.cpp
+index a93a162..b0c259e 100644
+--- a/src/plugins/ucx/config.cpp
++++ b/src/plugins/ucx/config.cpp
+@@ -41,6 +41,30 @@ tlsEnablesCudaSupport(std::string_view tls) {
+     return deny_list ? !has_cuda_support : has_cuda_support;
+ }
+ 
++bool
++tlsIsCudaIpcOnly(std::string_view tls) {
++    constexpr std::array<std::string_view, 4> allowed = {"cuda_ipc", "posix", "sysv", "self"};
++    unsigned seen = 0;
++    size_t begin = 0;
++    while (true) {
++        const auto end = tls.find(',', begin);
++        const auto token = tls.substr(begin, end == std::string_view::npos ? end : end - begin);
++        const auto selected = std::ranges::find(allowed, token);
++        if (selected == allowed.end()) {
++            return false;
++        }
++        const unsigned bit = 1U << (selected - allowed.begin());
++        if ((seen & bit) != 0) {
++            return false;
++        }
++        seen |= bit;
++        if (end == std::string_view::npos) {
++            return (seen & 1) != 0;
++        }
++        begin = end + 1;
++    }
++}
++
+ } // namespace
+ 
+ namespace nixl::ucx {
+@@ -73,6 +97,25 @@ config::modifyAlways(std::string_view key, std::string_view value) const {
+ void
+ config::validateTlsCudaSupport() const {
+     const auto tls = nixl::config::getValueOptional<std::string>("UCX_TLS");
++    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false)) {
++        // CUDA IPC is itself a GPU memory transport. Permit a deliberately
++        // restricted profile without enabling CUDA copy's host-staging paths.
++        // The initialized context must still prove CUDA support before use.
++        const auto actual_tls = nixl::config::internal::getenvOptional("UCX_TLS");
++        if (!actual_tls || !tlsIsCudaIpcOnly(*actual_tls)) {
++            const std::string error =
++                "NIXL_UCX_CUDA_IPC_ONLY requires explicit UCX_TLS=cuda_ipc "
++                "with only optional posix,sysv,self control transports";
++            NIXL_ERROR << error;
++            throw std::runtime_error(error);
++        }
++        // Bind the validated policy to the actual UCP configuration, including
++        // when a caller prepared the configuration before setting the variable.
++        if (ucp_config_modify(config_.get(), "TLS", actual_tls->c_str()) != UCS_OK) {
++            throw std::runtime_error("Failed to configure CUDA IPC-only UCX transports");
++        }
++        return;
++    }
+     if (nixl::hwInfo::instance().numNvidiaGpus == 0 || !tls || tlsEnablesCudaSupport(*tls)) {
+         return;
+     }
+diff --git a/src/plugins/ucx/ucx_backend.cpp b/src/plugins/ucx/ucx_backend.cpp
+index 769c7ca..301a2cb 100644
+--- a/src/plugins/ucx/ucx_backend.cpp
++++ b/src/plugins/ucx/ucx_backend.cpp
+@@ -786,10 +786,15 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params, size_t nu
+         nixl::getBackendParamDefaulted(custom_params, "ucx_num_device_channels", 4u);
+ 
+ 
+-    ucp_err_handling_mode_t err_handling_mode = UCP_ERR_HANDLING_MODE_PEER;
+-    if (const auto opt = nixl::getBackendParamOptional<std::string>(
+-            custom_params, std::string(nixl_ucx_err_handling_param_name))) {
+-        err_handling_mode = ucx_err_mode_from_string(*opt);
++    const auto err_handling_mode = resolve_ucx_error_handling_mode(custom_params);
++    const auto err_mode_key = std::string(nixl_ucx_err_handling_param_name);
++    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false) &&
++        !nixl::getBackendParamOptional<std::string>(custom_params, err_mode_key)) {
++        // Record the strict profile's effective default for ordinary eager
++        // callers as well as callers that explicitly supplied the option.
++        if (setInitParam(err_mode_key, "none") != NIXL_SUCCESS) {
++            throw std::runtime_error("Unable to record CUDA IPC-only UCX endpoint mode");
++        }
+     }
+ 
+     const auto engine_config =
+diff --git a/src/plugins/ucx/ucx_utils.cpp b/src/plugins/ucx/ucx_utils.cpp
+index 7b799c9..96c4b2c 100644
+--- a/src/plugins/ucx/ucx_utils.cpp
++++ b/src/plugins/ucx/ucx_utils.cpp
+@@ -26,6 +26,8 @@
+ 
+ #include <nixl_types.h>
+ 
++#include "common/backend.h"
++#include "common/configuration.h"
+ #include "common/hw_info.h"
+ #include "common/nixl_log.h"
+ #include "config.h"
+@@ -36,7 +38,7 @@ get_ucx_backend_common_options() {
+     nixl_b_params_t params = {{"ucx_devices", ""}, {"num_workers", "1"}};
+ 
+     params.emplace(nixl_ucx_err_handling_param_name,
+-                   ucx_err_mode_to_string(UCP_ERR_HANDLING_MODE_PEER));
++                   ucx_err_mode_to_string(resolve_ucx_error_handling_mode(nullptr)));
+     return params;
+ }
+ 
+@@ -78,6 +80,23 @@ ucx_err_mode_from_string(std::string_view s) {
+     throw std::invalid_argument(err_msg.str());
+ }
+ 
++[[nodiscard]] ucp_err_handling_mode_t
++resolve_ucx_error_handling_mode(const nixl_b_params_t *params) {
++    const bool ipc_only = nixl::config::getValueDefaulted<bool>(
++        "NIXL_UCX_CUDA_IPC_ONLY", false);
++    auto mode = ipc_only ? UCP_ERR_HANDLING_MODE_NONE : UCP_ERR_HANDLING_MODE_PEER;
++    if (const auto option = nixl::getBackendParamOptional<std::string>(
++            params, std::string(nixl_ucx_err_handling_param_name))) {
++        mode = ucx_err_mode_from_string(*option);
++    }
++    if (ipc_only && mode != UCP_ERR_HANDLING_MODE_NONE) {
++        throw std::invalid_argument(
++            "CUDA IPC-only UCX requires ucx_error_handling_mode=none; "
++            "native peer-failure recovery is unsupported");
++    }
++    return mode;
++}
++
+ static void
+ err_cb_wrapper(void *arg, ucp_ep_h ucp_ep, ucs_status_t status) {
+     auto ep = static_cast<nixlUcxEp *>(arg);
+@@ -531,6 +550,10 @@ nixlUcxContext::nixlUcxContext(const std::vector<std::string> &devs,
+     }
+ 
+     ctx.reset(new_ctx);
++    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false) &&
++        !supportsMemoryType(UCS_MEMORY_TYPE_CUDA)) {
++        throw std::runtime_error("CUDA IPC-only UCX context does not support CUDA memory");
++    }
+ }
+ 
+ std::ostream &
+diff --git a/src/plugins/ucx/ucx_utils.h b/src/plugins/ucx/ucx_utils.h
+index b3d0265..bfef1a4 100644
+--- a/src/plugins/ucx/ucx_utils.h
++++ b/src/plugins/ucx/ucx_utils.h
+@@ -290,4 +290,7 @@ ucx_err_mode_to_string(ucp_err_handling_mode_t t);
+ [[nodiscard]] ucp_err_handling_mode_t
+ ucx_err_mode_from_string(std::string_view s);
+ 
++[[nodiscard]] ucp_err_handling_mode_t
++resolve_ucx_error_handling_mode(const nixl_b_params_t *params);
++
+ #endif
+diff --git a/test/gtest/hw_warning_test.cpp b/test/gtest/hw_warning_test.cpp
+index 87eaf85..7d670b7 100644
+--- a/test/gtest/hw_warning_test.cpp
++++ b/test/gtest/hw_warning_test.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <gtest/gtest.h>
+ #include <cstdlib>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -24,6 +25,7 @@
+ #include "common.h"
+ #include "nixl.h"
+ #include "ucx_utils.h"
++#include "config.h"
+ #include "common/hw_info.h"
+ 
+ class HardwareWarningTest : public ::testing::Test {
+@@ -83,6 +85,63 @@ protected:
+     }
+ };
+ 
++TEST(UcxCudaIpcOnlyValidation, AcceptsOnlyExplicitDirectProfile) {
++    gtest::ScopedEnv env_helper;
++    env_helper.addVar("NIXL_UCX_CUDA_IPC_ONLY", "1");
++    for (const auto tls : {"cuda_ipc", "cuda_ipc,posix,self", "sysv,cuda_ipc,self,posix"}) {
++        env_helper.addVar("UCX_TLS", tls);
++        nixl::ucx::config config;
++        EXPECT_NO_THROW(config.validateTlsCudaSupport()) << tls;
++        env_helper.popVar();
++    }
++}
++
++TEST(UcxCudaIpcOnlyValidation, RejectsHostPayloadFallbackAndAmbiguousProfiles) {
++    gtest::ScopedEnv env_helper;
++    env_helper.addVar("NIXL_UCX_CUDA_IPC_ONLY", "1");
++    for (const auto tls : {"", "posix,self", "cuda", "all", "^tcp", "cuda_ipc,tcp",
++                           "cuda_ipc,cuda_copy", "cuda_ipc,gdr_copy", "cuda_ipc,rc",
++                           "cuda_ipc,sm", "cuda_ipc,", ",cuda_ipc", "cuda_ipc,cuda_ipc",
++                           "cuda_ipc, posix", "cuda_ipc,\\cuda_copy"}) {
++        env_helper.addVar("UCX_TLS", tls);
++        const gtest::LogIgnoreGuard ignore("NIXL_UCX_CUDA_IPC_ONLY requires explicit.*");
++        nixl::ucx::config config;
++        EXPECT_THROW(config.validateTlsCudaSupport(), std::runtime_error) << tls;
++        env_helper.popVar();
++    }
++}
++
++TEST(UcxCudaIpcOnlyEndpointMode, OrdinaryDefaultsAndExplicitOptionsArePreserved) {
++    gtest::ScopedEnv env_helper;
++    env_helper.addVar("NIXL_UCX_CUDA_IPC_ONLY", "0");
++    EXPECT_EQ(get_ucx_backend_common_options().at("ucx_error_handling_mode"), "peer");
++    EXPECT_EQ(resolve_ucx_error_handling_mode(nullptr), UCP_ERR_HANDLING_MODE_PEER);
++    nixl_b_params_t explicit_none = {{"ucx_error_handling_mode", "none"}};
++    nixl_b_params_t explicit_peer = {{"ucx_error_handling_mode", "peer"}};
++    EXPECT_EQ(resolve_ucx_error_handling_mode(&explicit_none), UCP_ERR_HANDLING_MODE_NONE);
++    EXPECT_EQ(resolve_ucx_error_handling_mode(&explicit_peer), UCP_ERR_HANDLING_MODE_PEER);
++}
++
++TEST(UcxCudaIpcOnlyEndpointMode, StrictDefaultsAndExplicitNoneUseSamePolicy) {
++    gtest::ScopedEnv env_helper;
++    env_helper.addVar("NIXL_UCX_CUDA_IPC_ONLY", "1");
++    EXPECT_EQ(get_ucx_backend_common_options().at("ucx_error_handling_mode"), "none");
++    EXPECT_EQ(resolve_ucx_error_handling_mode(nullptr), UCP_ERR_HANDLING_MODE_NONE);
++    nixl_b_params_t omitted;
++    nixl_b_params_t explicit_none = {{"ucx_error_handling_mode", "none"}};
++    EXPECT_EQ(resolve_ucx_error_handling_mode(&omitted), UCP_ERR_HANDLING_MODE_NONE);
++    EXPECT_EQ(resolve_ucx_error_handling_mode(&explicit_none), UCP_ERR_HANDLING_MODE_NONE);
++}
++
++TEST(UcxCudaIpcOnlyEndpointMode, StrictRejectsPeerAndInvalidExplicitOptions) {
++    gtest::ScopedEnv env_helper;
++    env_helper.addVar("NIXL_UCX_CUDA_IPC_ONLY", "1");
++    nixl_b_params_t explicit_peer = {{"ucx_error_handling_mode", "peer"}};
++    nixl_b_params_t invalid = {{"ucx_error_handling_mode", "invalid"}};
++    EXPECT_THROW(resolve_ucx_error_handling_mode(&explicit_peer), std::invalid_argument);
++    EXPECT_THROW(resolve_ucx_error_handling_mode(&invalid), std::invalid_argument);
++}
++
+ /**
+  * Test that a warning is logged when NVIDIA GPUs are present but UCX
+  * CUDA support is not available.

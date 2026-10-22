@@ -1,0 +1,518 @@
+diff --git a/src/plugins/ucx/config.cpp b/src/plugins/ucx/config.cpp
+--- a/src/plugins/ucx/config.cpp
++++ b/src/plugins/ucx/config.cpp
+@@ -20,6 +20,7 @@
+ #include <array>
+ #include <stdexcept>
+ #include <string>
++#include <utility>
+ 
+ #include "common/configuration.h"
+ #include "common/hw_info.h"
+@@ -95,6 +96,30 @@
+ }
+ 
+ void
++config::configureMnnvlOnly(std::string_view tls) const {
++    if (tls != "cuda_ipc,tcp,self") {
++        throw std::invalid_argument("MNNVL requires gpu_direct_ucx_tls=cuda_ipc,tcp,self");
++    }
++    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false)) {
++        throw std::invalid_argument("MNNVL backend cannot coexist with CUDA IPC-only global policy");
++    }
++    // TCP carries UCP active-message control only. Disable both its native PUT
++    // capability and UCP software PUT/GET emulation before creating this context.
++    // cuda_ipc is therefore the only selected native CUDA-memory RMA transport.
++    for (const auto &[key, value] : std::array{
++             std::pair{"TLS", "cuda_ipc,tcp,self"},
++             std::pair{"CUDA_IPC_ENABLE_MNNVL", "y"},
++             std::pair{"CUDA_IPC_GPU_DIRECT_FABRIC_ONLY", "y"},
++             std::pair{"PROTO_ENABLE", "y"},
++             std::pair{"PROTO_EMULATION_ENABLE", "n"},
++             std::pair{"TCP_PUT_ENABLE", "n"}}) {
++        if (ucp_config_modify(config_.get(), key, value) != UCS_OK) {
++            throw std::runtime_error(std::string("Unsupported required MNNVL UCX setting: ") + key);
++        }
++    }
++}
++
++void
+ config::validateTlsCudaSupport() const {
+     const auto tls = nixl::config::getValueOptional<std::string>("UCX_TLS");
+     if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false)) {
+diff --git a/src/plugins/ucx/config.h b/src/plugins/ucx/config.h
+--- a/src/plugins/ucx/config.h
++++ b/src/plugins/ucx/config.h
+@@ -46,6 +46,10 @@
+     void
+     validateTlsCudaSupport() const;
+ 
++    // Closed per-context MNNVL profile; never modifies process environment.
++    void
++    configureMnnvlOnly(std::string_view tls) const;
++
+ private:
+     [[nodiscard]] static ucp_config_t *
+     readUcpConfig();
+diff --git a/src/plugins/ucx/meson.build b/src/plugins/ucx/meson.build
+--- a/src/plugins/ucx/meson.build
++++ b/src/plugins/ucx/meson.build
+@@ -35,6 +35,12 @@
+                             thread_dep,
+                             ucx_dep]
+ 
++ucx_backend_cpp_args = []
++if cuda_dep.found()
++    ucx_backend_dependencies += [cuda_dep]
++    ucx_backend_cpp_args += ['-DNIXL_UCX_HAVE_CUDA']
++endif
++
+ ucx_backend_include_directories = [nixl_inc_dirs,
+                                    utils_inc_dirs]
+ 
+@@ -43,6 +49,7 @@
+                ucx_backend_sources,
+                dependencies: ucx_backend_dependencies,
+                include_directories: ucx_backend_include_directories,
++               cpp_args: ucx_backend_cpp_args,
+                install: false,
+                name_prefix: 'libplugin_')  # Custom prefix for plugin libraries
+ else
+@@ -51,7 +58,7 @@
+                dependencies: ucx_backend_dependencies,
+                include_directories: ucx_backend_include_directories,
+                install: true,
+-               cpp_args : ['-fPIC'],
++               cpp_args : ucx_backend_cpp_args + ['-fPIC'],
+                name_prefix: 'libplugin_',  # Custom prefix for plugin libraries
+                install_dir: plugin_install_dir,
+                build_rpath: get_option('ucx_path') != '' ? get_option('ucx_path') + '/lib' : '',
+diff --git a/src/plugins/ucx/ucx_backend.cpp b/src/plugins/ucx/ucx_backend.cpp
+--- a/src/plugins/ucx/ucx_backend.cpp
++++ b/src/plugins/ucx/ucx_backend.cpp
+@@ -786,9 +786,10 @@
+         nixl::getBackendParamDefaulted(custom_params, "ucx_num_device_channels", 4u);
+ 
+ 
++    const bool mnnvl_only = resolve_ucx_mnnvl_only(custom_params);
+     const auto err_handling_mode = resolve_ucx_error_handling_mode(custom_params);
+     const auto err_mode_key = std::string(nixl_ucx_err_handling_param_name);
+-    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false) &&
++    if ((mnnvl_only || nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false)) &&
+         !nixl::getBackendParamOptional<std::string>(custom_params, err_mode_key)) {
+         // Record the strict profile's effective default for ordinary eager
+         // callers as well as callers that explicitly supplied the option.
+@@ -806,7 +807,9 @@
+                                           init_params.syncMode,
+                                           num_device_channels,
+                                           engine_config,
+-                                          localAgent);
++                                          localAgent,
++                                          mnnvl_only,
++                                          mnnvl_only ? "cuda_ipc,tcp,self" : "");
+ 
+     uc->warnAboutHardwareSupportMismatch();
+ 
+diff --git a/src/plugins/ucx/ucx_utils.cpp b/src/plugins/ucx/ucx_utils.cpp
+--- a/src/plugins/ucx/ucx_utils.cpp
++++ b/src/plugins/ucx/ucx_utils.cpp
+@@ -23,6 +23,10 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <limits>
++#if defined(NIXL_UCX_HAVE_CUDA)
++#include <cuda.h>
++#endif
+ 
+ #include <nixl_types.h>
+ 
+@@ -37,6 +41,8 @@
+ get_ucx_backend_common_options() {
+     nixl_b_params_t params = {{"ucx_devices", ""}, {"num_workers", "1"}};
+ 
++    params.emplace("gpu_direct_transport", "");
++    params.emplace("gpu_direct_ucx_tls", "");
+     params.emplace(nixl_ucx_err_handling_param_name,
+                    ucx_err_mode_to_string(resolve_ucx_error_handling_mode(nullptr)));
+     return params;
+@@ -80,19 +86,41 @@
+     throw std::invalid_argument(err_msg.str());
+ }
+ 
++[[nodiscard]] bool
++resolve_ucx_mnnvl_only(const nixl_b_params_t *params) {
++    const auto transport = nixl::getBackendParamDefaulted(
++        params, "gpu_direct_transport", std::string());
++    const auto tls = nixl::getBackendParamDefaulted(
++        params, "gpu_direct_ucx_tls", std::string());
++    if (transport.empty()) {
++        if (!tls.empty()) {
++            throw std::invalid_argument("gpu_direct_ucx_tls requires gpu_direct_transport=mnnvl");
++        }
++        return false;
++    }
++    if (transport != "mnnvl" || tls != "cuda_ipc,tcp,self") {
++        throw std::invalid_argument("Unsupported closed MNNVL backend transport profile");
++    }
++    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false)) {
++        throw std::invalid_argument("MNNVL backend cannot coexist with CUDA IPC-only global policy");
++    }
++    return true;
++}
++
+ [[nodiscard]] ucp_err_handling_mode_t
+ resolve_ucx_error_handling_mode(const nixl_b_params_t *params) {
+     const bool ipc_only = nixl::config::getValueDefaulted<bool>(
+         "NIXL_UCX_CUDA_IPC_ONLY", false);
+-    auto mode = ipc_only ? UCP_ERR_HANDLING_MODE_NONE : UCP_ERR_HANDLING_MODE_PEER;
++    const bool mnnvl_only = resolve_ucx_mnnvl_only(params);
++    auto mode = (ipc_only || mnnvl_only) ? UCP_ERR_HANDLING_MODE_NONE : UCP_ERR_HANDLING_MODE_PEER;
+     if (const auto option = nixl::getBackendParamOptional<std::string>(
+             params, std::string(nixl_ucx_err_handling_param_name))) {
+         mode = ucx_err_mode_from_string(*option);
+     }
+-    if (ipc_only && mode != UCP_ERR_HANDLING_MODE_NONE) {
++    if ((ipc_only || mnnvl_only) && mode != UCP_ERR_HANDLING_MODE_NONE) {
+         throw std::invalid_argument(
+-            "CUDA IPC-only UCX requires ucx_error_handling_mode=none; "
+-            "native peer-failure recovery is unsupported");
++            mnnvl_only ? "MNNVL UCX requires ucx_error_handling_mode=none; native peer-failure recovery is unsupported"
++                       : "CUDA IPC-only UCX requires ucx_error_handling_mode=none; native peer-failure recovery is unsupported");
+     }
+     return mode;
+ }
+@@ -466,10 +494,13 @@
+                                nixl_thread_sync_t sync_mode,
+                                size_t num_device_channels,
+                                const std::string &engine_config,
+-                               const std::string &name)
++                               const std::string &name,
++                               bool mnnvl_only,
++                               const std::string &gpu_direct_ucx_tls)
+     : mtType_(makeMtType(prog_thread, sync_mode)),
+       ucpVersion_(makeUcpVersion()),
+-      name_(name) {
++      name_(name),
++      mnnvlOnly_(mnnvl_only) {
+ 
+     ucp_params_t ucp_params;
+     ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_MT_WORKERS_SHARED;
+@@ -540,7 +571,11 @@
+         }
+     }
+ 
+-    config.validateTlsCudaSupport();
++    if (mnnvlOnly_) {
++        config.configureMnnvlOnly(gpu_direct_ucx_tls);
++    } else {
++        config.validateTlsCudaSupport();
++    }
+ 
+     ucp_context_h new_ctx = nullptr;
+     const auto status = ucp_init(&ucp_params, config.getUcpConfig(), &new_ctx);
+@@ -550,7 +585,7 @@
+     }
+ 
+     ctx.reset(new_ctx);
+-    if (nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false) &&
++    if ((mnnvlOnly_ || nixl::config::getValueDefaulted<bool>("NIXL_UCX_CUDA_IPC_ONLY", false)) &&
+         !supportsMemoryType(UCS_MEMORY_TYPE_CUDA)) {
+         throw std::runtime_error("CUDA IPC-only UCX context does not support CUDA memory");
+     }
+@@ -665,8 +700,96 @@
+  * =========================================== */
+ 
+ 
++bool
++validate_mnnvl_fabric_range(const void *address, size_t length) {
++#if defined(NIXL_UCX_HAVE_CUDA) && CUDA_VERSION >= 12040
++    if (address == nullptr || length == 0) {
++        return false;
++    }
++    CUmemorytype memory_type = CU_MEMORYTYPE_HOST;
++    unsigned managed = 0;
++    int ordinal = -1;
++    unsigned long long allowed_handles = 0;
++    int legacy_capable = 0;
++    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
++        CU_POINTER_ATTRIBUTE_IS_MANAGED, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
++        CU_POINTER_ATTRIBUTE_ALLOWED_HANDLE_TYPES, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE};
++    void *values[] = {&memory_type, &managed, &ordinal, &allowed_handles, &legacy_capable};
++    const auto pointer = reinterpret_cast<CUdeviceptr>(address);
++    if (length - 1 > std::numeric_limits<CUdeviceptr>::max() - pointer) {
++        return false;
++    }
++    if (cuPointerGetAttributes(5, attributes, values, pointer) != CUDA_SUCCESS ||
++        memory_type != CU_MEMORYTYPE_DEVICE || managed || ordinal < 0 || legacy_capable ||
++        !(allowed_handles & CU_MEM_HANDLE_TYPE_FABRIC)) {
++        return false;
++    }
++    CUdevice device;
++    int fabric_supported = 0;
++    if (cuDeviceGet(&device, ordinal) != CUDA_SUCCESS ||
++        cuDeviceGetAttribute(&fabric_supported,
++            CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device) != CUDA_SUCCESS ||
++        !fabric_supported) {
++        return false;
++    }
++    CUcontext primary;
++    if (cuDevicePrimaryCtxRetain(&primary, device) != CUDA_SUCCESS) {
++        return false;
++    }
++    if (cuCtxPushCurrent(primary) != CUDA_SUCCESS) {
++        cuDevicePrimaryCtxRelease(device);
++        return false;
++    }
++    const bool valid = [&]() {
++        CUdeviceptr base = 0;
++        size_t extent = 0;
++        unsigned mapped = 0;
++        CUpointer_attribute range_attributes[] = {CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
++            CU_POINTER_ATTRIBUTE_MAPPING_SIZE, CU_POINTER_ATTRIBUTE_MAPPED};
++        void *range_values[] = {&base, &extent, &mapped};
++        if (cuPointerGetAttributes(3, range_attributes, range_values, pointer) != CUDA_SUCCESS ||
++            !mapped || pointer < base || length > extent || pointer - base > extent - length) {
++            return false;
++        }
++        // A reservation can span multiple mappings. Require both endpoints to
++        // resolve to the same retained physical VMM handle before accepting it.
++        CUmemGenericAllocationHandle first = 0, last = 0;
++        if (cuMemRetainAllocationHandle(&first, const_cast<void *>(address)) != CUDA_SUCCESS) {
++            return false;
++        }
++        if (cuMemRetainAllocationHandle(&last, reinterpret_cast<void *>(pointer + length - 1)) != CUDA_SUCCESS) {
++            cuMemRelease(first);
++            return false;
++        }
++        CUmemAllocationProp properties = {};
++        CUmemFabricHandle exported = {};
++        const bool physical = first == last &&
++            cuMemGetAllocationPropertiesFromHandle(&properties, first) == CUDA_SUCCESS &&
++            properties.type == CU_MEM_ALLOCATION_TYPE_PINNED &&
++            properties.location.type == CU_MEM_LOCATION_TYPE_DEVICE &&
++            (properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
++            cuMemExportToShareableHandle(&exported, first, CU_MEM_HANDLE_TYPE_FABRIC, 0) == CUDA_SUCCESS;
++        const auto release_last = cuMemRelease(last);
++        const auto release_first = cuMemRelease(first);
++        return physical && release_last == CUDA_SUCCESS && release_first == CUDA_SUCCESS;
++    }();
++    CUcontext popped = nullptr;
++    const auto pop_status = cuCtxPopCurrent(&popped);
++    const auto release_status = cuDevicePrimaryCtxRelease(device);
++    return valid && pop_status == CUDA_SUCCESS && popped == primary && release_status == CUDA_SUCCESS;
++#else
++    // A CPU-only or pre-FABRIC build must never accept a claimed MNNVL buffer.
++    return false;
++#endif
++}
++
+ int
+ nixlUcxContext::memReg(void *addr, size_t size, nixlUcxMem &mem, nixl_mem_t nixl_mem_type) {
++    if (mnnvlOnly_ && nixl_mem_type == nixl_mem_t::VRAM_SEG &&
++        !validate_mnnvl_fabric_range(addr, size)) {
++        NIXL_ERROR << "MNNVL VRAM registration requires a bounded physical FABRIC VMM allocation";
++        return -1;
++    }
+     mem.base = addr;
+     mem.size = size;
+ 
+@@ -693,7 +816,8 @@
+             return -1;
+         }
+ 
+-        if (attr.mem_type == UCS_MEMORY_TYPE_HOST) {
++        if (attr.mem_type == UCS_MEMORY_TYPE_HOST ||
++            (mnnvlOnly_ && attr.mem_type != UCS_MEMORY_TYPE_CUDA)) {
+             NIXL_ERROR << *this
+                        << ": VRAM memory is detected as host by UCX. "
+                           "UCX is likely not configured with CUDA/ROCm support. "
+diff --git a/src/plugins/ucx/ucx_utils.h b/src/plugins/ucx/ucx_utils.h
+--- a/src/plugins/ucx/ucx_utils.h
++++ b/src/plugins/ucx/ucx_utils.h
+@@ -159,6 +159,7 @@
+     const nixl::ucx::mt_mode_t mtType_;
+     const unsigned ucpVersion_;
+     const std::string name_;
++    const bool mnnvlOnly_;
+ 
+     [[nodiscard]] bool
+     supportsMemoryType(ucs_memory_type_t mem_type) const;
+@@ -170,7 +171,9 @@
+                    nixl_thread_sync_t sync_mode,
+                    size_t num_device_channels,
+                    const std::string &engine_conf = "",
+-                   const std::string &name = "");
++                   const std::string &name = "",
++                   bool mnnvl_only = false,
++                   const std::string &gpu_direct_ucx_tls = "");
+     nixlUcxContext(nixlUcxContext &&) = delete;
+     nixlUcxContext(const nixlUcxContext &) = delete;
+ 
+@@ -293,4 +296,12 @@
+ [[nodiscard]] ucp_err_handling_mode_t
+ resolve_ucx_error_handling_mode(const nixl_b_params_t *params);
+ 
++// Parse only the explicit per-backend MNNVL profile, preserving ordinary defaults.
++[[nodiscard]] bool
++resolve_ucx_mnnvl_only(const nixl_b_params_t *params);
++
++// Physical DEVICE + FABRIC VMM allocation validation; no payload is read.
++[[nodiscard]] bool
++validate_mnnvl_fabric_range(const void *address, size_t length);
++
+ #endif
+diff --git a/test/gtest/hw_warning_test.cpp b/test/gtest/hw_warning_test.cpp
+--- a/test/gtest/hw_warning_test.cpp
++++ b/test/gtest/hw_warning_test.cpp
+@@ -20,6 +20,10 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <limits>
++#if defined(HAVE_CUDA)
++#include <cuda.h>
++#endif
+ 
+ #include "absl/strings/str_join.h"
+ #include "common.h"
+@@ -315,3 +319,139 @@
+         agent.registerMem(descs);
+     }
+ }
++
++
++TEST(UcxMnnvlOnlyValidation, OrdinaryBackendDefaultsRemainEmptyAndPeer) {
++    gtest::ScopedEnv env;
++    env.addVar("NIXL_UCX_CUDA_IPC_ONLY", "0");
++    const auto defaults = get_ucx_backend_common_options();
++    EXPECT_EQ(defaults.at("gpu_direct_transport"), "");
++    EXPECT_EQ(defaults.at("gpu_direct_ucx_tls"), "");
++    EXPECT_FALSE(resolve_ucx_mnnvl_only(nullptr));
++    EXPECT_EQ(resolve_ucx_error_handling_mode(nullptr), UCP_ERR_HANDLING_MODE_PEER);
++}
++
++TEST(UcxMnnvlOnlyValidation, AcceptsOnlyExplicitClosedPerBackendProfile) {
++    gtest::ScopedEnv env;
++    env.addVar("NIXL_UCX_CUDA_IPC_ONLY", "0");
++    nixl_b_params_t params = {{"gpu_direct_transport", "mnnvl"},
++                             {"gpu_direct_ucx_tls", "cuda_ipc,tcp,self"}};
++    EXPECT_TRUE(resolve_ucx_mnnvl_only(&params));
++    EXPECT_EQ(resolve_ucx_error_handling_mode(&params), UCP_ERR_HANDLING_MODE_NONE);
++    params["ucx_error_handling_mode"] = "peer";
++    EXPECT_THROW(resolve_ucx_error_handling_mode(&params), std::invalid_argument);
++    params["ucx_error_handling_mode"] = "none";
++    EXPECT_EQ(resolve_ucx_error_handling_mode(&params), UCP_ERR_HANDLING_MODE_NONE);
++}
++
++TEST(UcxMnnvlOnlyValidation, RejectsAliasesStagingNetworkDataAndMissingBindings) {
++    gtest::ScopedEnv env;
++    env.addVar("NIXL_UCX_CUDA_IPC_ONLY", "0");
++    for (const auto tls : {"", "cuda_ipc,tcp", "tcp,cuda_ipc,self", "cuda,tcp,self",
++                           "cuda_ipc,tcp,self,cuda_copy", "cuda_ipc,tcp,self,gdr_copy",
++                           "cuda_ipc,tcp,self,rc", "cuda_ipc,tcp,self,tcp", "all", "^cuda_copy"}) {
++        nixl_b_params_t params = {{"gpu_direct_transport", "mnnvl"},
++                                 {"gpu_direct_ucx_tls", tls}};
++        EXPECT_THROW(resolve_ucx_mnnvl_only(&params), std::invalid_argument) << tls;
++    }
++    nixl_b_params_t orphan = {{"gpu_direct_ucx_tls", "cuda_ipc,tcp,self"}};
++    EXPECT_THROW(resolve_ucx_mnnvl_only(&orphan), std::invalid_argument);
++    nixl_b_params_t unknown = {{"gpu_direct_transport", "rdma"},
++                              {"gpu_direct_ucx_tls", "cuda_ipc,tcp,self"}};
++    EXPECT_THROW(resolve_ucx_mnnvl_only(&unknown), std::invalid_argument);
++}
++
++TEST(UcxMnnvlOnlyValidation, RejectsLegacyGlobalProfileCoexistence) {
++    gtest::ScopedEnv env;
++    env.addVar("NIXL_UCX_CUDA_IPC_ONLY", "1");
++    nixl_b_params_t params = {{"gpu_direct_transport", "mnnvl"},
++                             {"gpu_direct_ucx_tls", "cuda_ipc,tcp,self"}};
++    EXPECT_THROW(resolve_ucx_mnnvl_only(&params), std::invalid_argument);
++    EXPECT_EQ(resolve_ucx_error_handling_mode(nullptr), UCP_ERR_HANDLING_MODE_NONE);
++}
++
++TEST(UcxMnnvlOnlyRegistration, RejectsNullHostInvalidAndOverflowRanges) {
++    int host = 0;
++    EXPECT_FALSE(validate_mnnvl_fabric_range(nullptr, 4096));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(&host, sizeof(host)));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(1), 1));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(1), 0));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(4096),
++                                             std::numeric_limits<size_t>::max()));
++}
++
++#if defined(HAVE_CUDA) && CUDA_VERSION >= 12040
++namespace {
++struct MnnvlFabricTestAllocation {
++    CUdeviceptr address = 0;
++    CUmemGenericAllocationHandle handle = 0;
++    size_t bytes = 0;
++    bool mapped = false;
++    ~MnnvlFabricTestAllocation() {
++        if (mapped) cuMemUnmap(address, bytes);
++        if (address) cuMemAddressFree(address, bytes);
++        if (handle) cuMemRelease(handle);
++    }
++    CUresult allocate() {
++        CUdevice device;
++        CUresult status = cuCtxGetDevice(&device);
++        if (status != CUDA_SUCCESS) return status;
++        CUmemAllocationProp prop = {};
++        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        prop.location.id = device;
++        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
++        status = cuMemGetAllocationGranularity(&bytes, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
++        if (status != CUDA_SUCCESS) return status;
++        status = cuMemCreate(&handle, bytes, &prop, 0);
++        if (status != CUDA_SUCCESS) return status;
++        status = cuMemAddressReserve(&address, bytes, 0, 0, 0);
++        if (status != CUDA_SUCCESS) return status;
++        status = cuMemMap(address, bytes, 0, handle, 0);
++        if (status != CUDA_SUCCESS) return status;
++        mapped = true;
++        CUmemAccessDesc access = {};
++        access.location = prop.location;
++        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        return cuMemSetAccess(address, bytes, &access, 1);
++    }
++};
++}
++
++TEST(UcxMnnvlOnlyRegistration, RealFabricVmmInteriorExtentAndLegacyNegative) {
++    int count = 0;
++    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
++        GTEST_SKIP() << "Actual CUDA GPU required";
++    }
++    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
++    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
++    MnnvlFabricTestAllocation allocation;
++    const auto status = allocation.allocate();
++    if (status == CUDA_ERROR_NOT_SUPPORTED || status == CUDA_ERROR_NOT_PERMITTED) {
++        GTEST_SKIP() << "Actual FABRIC allocation/IMEX permission unavailable";
++    }
++    ASSERT_EQ(status, CUDA_SUCCESS);
++    CUdeviceptr observed_base = 0;
++    size_t observed_extent = 0;
++    unsigned mapped = 0;
++    CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
++        CU_POINTER_ATTRIBUTE_MAPPING_SIZE, CU_POINTER_ATTRIBUTE_MAPPED};
++    void *values[] = {&observed_base, &observed_extent, &mapped};
++    ASSERT_EQ(cuPointerGetAttributes(3, attrs, values, allocation.address), CUDA_SUCCESS);
++    EXPECT_TRUE(mapped);
++    EXPECT_EQ(observed_base, allocation.address);
++    EXPECT_EQ(observed_extent, allocation.bytes);
++    EXPECT_TRUE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address), allocation.bytes));
++    EXPECT_TRUE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address + 17), 100));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address + 17), allocation.bytes));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address), allocation.bytes + 1));
++    void *legacy = nullptr;
++    ASSERT_EQ(cudaMalloc(&legacy, 4096), cudaSuccess);
++    EXPECT_FALSE(validate_mnnvl_fabric_range(legacy, 4096));
++    EXPECT_EQ(cudaFree(legacy), cudaSuccess);
++    void *managed = nullptr;
++    ASSERT_EQ(cudaMallocManaged(&managed, 4096), cudaSuccess);
++    EXPECT_FALSE(validate_mnnvl_fabric_range(managed, 4096));
++    EXPECT_EQ(cudaFree(managed), cudaSuccess);
++}
++#endif

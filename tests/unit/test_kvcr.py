@@ -195,7 +195,9 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
     hold = _fake_hold(
-        local_dram=LocalDramOptions([("", 1234, 8192)]),
+        # Reach G3's alignment check even when the invalid half-page block
+        # exceeds 8192 bytes on hosts with large pages.
+        local_dram=LocalDramOptions([("", 1234, max(8192, 2 * mmap.PAGESIZE))]),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=lambda **_kwargs: events.append("hold.release"),

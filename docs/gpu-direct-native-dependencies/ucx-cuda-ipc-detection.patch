@@ -1,0 +1,221 @@
+diff --git a/src/uct/cuda/cuda_ipc/cuda_ipc_md.c b/src/uct/cuda/cuda_ipc/cuda_ipc_md.c
+index c067b6a9bf1037b6f310254b068f8774971c7a1d..76498c57f864a0e8a0cb29edfe8fc9c914db07b8 100644
+--- a/src/uct/cuda/cuda_ipc/cuda_ipc_md.c
++++ b/src/uct/cuda/cuda_ipc/cuda_ipc_md.c
+@@ -13,6 +13,7 @@
+ 
+ #include <ucs/debug/log.h>
+ #include <ucs/debug/memtrack_int.h>
++#include <ucs/memory/memtype_cache.h>
+ #include <ucs/profile/profile.h>
+ #include <ucs/sys/string.h>
+ #include <ucs/sys/sys.h>
+@@ -213,12 +214,107 @@ uct_cuda_ipc_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
+     md_attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_CUDA);
+     md_attr->cache_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_CUDA);
+     md_attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_CUDA);
++    md_attr->detect_mem_types = UCS_BIT(UCS_MEMORY_TYPE_CUDA);
+     md_attr->rkey_packed_size = ucs_sys_ns_is_default(UCS_SYS_NS_TYPE_PID) ?
+                                         sizeof(uct_cuda_ipc_rkey_t) :
+                                         sizeof(uct_cuda_ipc_extended_rkey_t);
+     return UCS_OK;
+ }
+ 
++static ucs_status_t
++uct_cuda_ipc_md_mem_query(uct_md_h md, const void *address, size_t length,
++                         uct_md_mem_attr_v2_t *mem_attr)
++{
++    CUpointer_attribute attributes[] = {
++        CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_IS_MANAGED,
++        CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
++        CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE
++    };
++    CUmemorytype memory_type = CU_MEMORYTYPE_HOST;
++    unsigned is_managed     = 0;
++    int device_ordinal      = -1;
++    int legacy_capable      = 0;
++    void *values[]          = {&memory_type, &is_managed, &device_ordinal,
++                               &legacy_capable};
++    CUdeviceptr base_address;
++    size_t alloc_length;
++    CUdevice device;
++    int is_ctx_pushed;
++    ucs_sys_device_t sys_dev;
++    ucs_status_t status;
++
++    if (mem_attr->field_mask & (UCT_MD_MEM_ATTR_V2_FIELD_DMABUF_FD |
++                               UCT_MD_MEM_ATTR_V2_FIELD_DMABUF_OFFSET)) {
++        return UCS_ERR_UNSUPPORTED;
++    }
++    if ((address == NULL) || (length == 0)) {
++        return UCS_ERR_INVALID_ADDR;
++    }
++
++    /* This detector only recognizes ordinary device allocations. In
++     * particular, managed and host-backed VMM memory must not become CUDA
++     * merely because it has a CUDA virtual address. No payload is read. */
++    status = UCT_CUDADRV_FUNC(
++            cuPointerGetAttributes(ucs_static_array_size(attributes),
++                                   attributes, values, (CUdeviceptr)address),
++            UCS_LOG_LEVEL_TRACE);
++    if ((status != UCS_OK) || (memory_type != CU_MEMORYTYPE_DEVICE) ||
++        is_managed || (device_ordinal < 0) || !legacy_capable) {
++        return UCS_ERR_INVALID_ADDR;
++    }
++
++    status = uct_cuda_ipc_check_and_push_ctx((CUdeviceptr)address, &device,
++                                             &is_ctx_pushed);
++    if (status != UCS_OK) {
++        return status;
++    }
++    status = UCT_CUDADRV_FUNC_LOG_DEBUG(cuMemGetAddressRange(
++            &base_address, &alloc_length, (CUdeviceptr)address));
++    uct_cuda_ipc_check_and_pop_ctx(is_ctx_pushed);
++    if ((status != UCS_OK) || ((CUdeviceptr)address < base_address) ||
++        (length > alloc_length) ||
++        (((CUdeviceptr)address - base_address) > (alloc_length - length))) {
++        return UCS_ERR_INVALID_ADDR;
++    }
++
++    sys_dev = uct_cuda_get_sys_dev(device);
++    if (mem_attr->field_mask & UCT_MD_MEM_ATTR_V2_FIELD_MEM_TYPE) {
++        mem_attr->mem_type = UCS_MEMORY_TYPE_CUDA;
++    }
++    if (mem_attr->field_mask & UCT_MD_MEM_ATTR_V2_FIELD_SYS_DEV) {
++        mem_attr->sys_dev = sys_dev;
++    }
++    if (mem_attr->field_mask & UCT_MD_MEM_ATTR_V2_FIELD_BASE_ADDRESS) {
++        mem_attr->base_address = (void*)base_address;
++    }
++    if (mem_attr->field_mask & UCT_MD_MEM_ATTR_V2_FIELD_ALLOC_LENGTH) {
++        mem_attr->alloc_length = alloc_length;
++    }
++    if (mem_attr->field_mask & UCT_MD_MEM_ATTR_V2_FIELD_MEM_FLAGS) {
++        mem_attr->mem_flags = UCS_MEM_FLAG_REGISTRABLE;
++    }
++    ucs_memtype_cache_update((void*)base_address, alloc_length,
++                             UCS_MEMORY_TYPE_CUDA, sys_dev,
++                             UCS_MEM_FLAG_REGISTRABLE);
++    return UCS_OK;
++}
++
++static ucs_status_t
++uct_cuda_ipc_md_detect_memory_type(uct_md_h md, const void *address,
++                                   size_t length,
++                                   ucs_memory_type_t *mem_type_p)
++{
++    uct_md_mem_attr_v2_t attr;
++    ucs_status_t status;
++
++    attr.field_mask = UCT_MD_MEM_ATTR_V2_FIELD_MEM_TYPE;
++    status         = uct_cuda_ipc_md_mem_query(md, address, length, &attr);
++    if (status == UCS_OK) {
++        *mem_type_p = attr.mem_type;
++    }
++    return status;
++}
++
+ #if HAVE_DECL_SYS_PIDFD_GETFD
+ static ucs_status_t
+ uct_cuda_ipc_mem_export_posix_fd(void *addr, uct_cuda_ipc_lkey_t *key)
+@@ -830,12 +926,12 @@ uct_cuda_ipc_md_open(uct_component_t *component, const char *md_name,
+         .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+         .mem_reg            = uct_cuda_ipc_mem_reg,
+         .mem_dereg          = uct_cuda_ipc_mem_dereg,
+-        .mem_query          = (uct_md_mem_query_func_t)ucs_empty_function_return_unsupported,
++        .mem_query          = uct_cuda_ipc_md_mem_query,
+         .mkey_pack          = uct_cuda_ipc_mkey_pack,
+         .mem_elem_pack      = uct_cuda_ipc_md_mem_elem_pack,
+         .mem_elem_release   = uct_cuda_ipc_md_mem_elem_release,
+         .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+-        .detect_memory_type = (uct_md_detect_memory_type_func_t)ucs_empty_function_return_unsupported
++        .detect_memory_type = uct_cuda_ipc_md_detect_memory_type
+     };
+     uct_cuda_ipc_md_config_t *ipc_config = ucs_derived_of(config,
+                                                           uct_cuda_ipc_md_config_t);
+diff --git a/test/gtest/uct/cuda/test_cuda_ipc_md.cc b/test/gtest/uct/cuda/test_cuda_ipc_md.cc
+index 0cfbf5f8d84a3577f0c6617e41fb42b83c437c37..d6f50dbee5a801d0708144227dc7d3516fcbbb85 100644
+--- a/test/gtest/uct/cuda/test_cuda_ipc_md.cc
++++ b/test/gtest/uct/cuda/test_cuda_ipc_md.cc
+@@ -11,6 +11,7 @@
+ #include "cuda_vmm_mem_buffer.h"
+ 
+ #include <cuda_runtime.h>
++#include <limits>
+ #include <thread>
+ #include <vector>
+ 
+@@ -393,6 +394,73 @@ UCS_TEST_P(test_cuda_ipc_md, posix_fd_same_node_ipc)
+ #endif
+ }
+ 
++UCS_TEST_P(test_cuda_ipc_md, device_pointer_detection)
++{
++    mem_buffer buffer(4096, UCS_MEMORY_TYPE_CUDA);
++    uct_md_mem_attr_t attr;
++    attr.field_mask = UCT_MD_MEM_ATTR_FIELD_MEM_TYPE |
++                      UCT_MD_MEM_ATTR_FIELD_BASE_ADDRESS |
++                      UCT_MD_MEM_ATTR_FIELD_ALLOC_LENGTH;
++    void *address = UCS_PTR_BYTE_OFFSET(buffer.ptr(), 17);
++
++    EXPECT_TRUE(md_attr().detect_mem_types & UCS_BIT(UCS_MEMORY_TYPE_CUDA));
++    ASSERT_UCS_OK(uct_md_mem_query(md(), address, 100, &attr));
++    EXPECT_EQ(UCS_MEMORY_TYPE_CUDA, attr.mem_type);
++    EXPECT_EQ(buffer.ptr(), attr.base_address);
++    EXPECT_GE(attr.alloc_length, buffer.size());
++    ASSERT_UCS_OK(uct_md_mem_query(md(), attr.base_address, attr.alloc_length,
++                                  &attr));
++
++    ucs_memory_type_t detected = UCS_MEMORY_TYPE_UNKNOWN;
++    ASSERT_UCS_OK(uct_md_detect_memory_type(md(), address, 100, &detected));
++    EXPECT_EQ(UCS_MEMORY_TYPE_CUDA, detected);
++}
++
++UCS_TEST_P(test_cuda_ipc_md, reject_non_device_pointer_detection)
++{
++    mem_buffer host(4096, UCS_MEMORY_TYPE_HOST);
++    uct_md_mem_attr_t attr;
++    attr.field_mask = UCT_MD_MEM_ATTR_FIELD_MEM_TYPE;
++
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), host.ptr(), host.size(), &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), reinterpret_cast<void*>(1), 1, &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), NULL, 1, &attr));
++}
++
++UCS_TEST_P(test_cuda_ipc_md, reject_outside_allocation_detection)
++{
++    mem_buffer device(4096, UCS_MEMORY_TYPE_CUDA);
++    uct_md_mem_attr_t attr;
++    attr.field_mask = UCT_MD_MEM_ATTR_FIELD_MEM_TYPE |
++                      UCT_MD_MEM_ATTR_FIELD_BASE_ADDRESS |
++                      UCT_MD_MEM_ATTR_FIELD_ALLOC_LENGTH;
++    ASSERT_UCS_OK(uct_md_mem_query(md(), device.ptr(), 1, &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), attr.base_address, attr.alloc_length + 1,
++                               &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), device.ptr(),
++                               std::numeric_limits<size_t>::max(), &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), UCS_PTR_BYTE_OFFSET(device.ptr(), 17),
++                               attr.alloc_length, &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), device.ptr(), 0, &attr));
++}
++
++UCS_TEST_P(test_cuda_ipc_md, reject_managed_pointer_detection)
++{
++    mem_buffer managed(4096, UCS_MEMORY_TYPE_CUDA_MANAGED);
++    uct_md_mem_attr_t attr;
++    attr.field_mask = UCT_MD_MEM_ATTR_FIELD_MEM_TYPE;
++
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), managed.ptr(), managed.size(), &attr));
++}
++
+ _UCT_MD_INSTANTIATE_TEST_CASE(test_cuda_ipc_md, cuda_ipc);
+ 
+ 

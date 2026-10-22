@@ -88,6 +88,8 @@ class KVCR:
         backend_configs: KVCRBackendConfigs,
         guard_config: KVCRGuardConfig | None = None,
     ) -> None:
+        if backend_configs.remote_fw_gpu is not None and guard_config is not None:
+            raise ValueError("GPU endpoints cannot adopt CPU Guard pools")
         claimed: _recovery.ClaimedPool | None = None
         pool_hold: KVCRPoolHold | None = None
         core: _KVCRCore | None = None
@@ -162,7 +164,16 @@ class KVCR:
         blocks: Mapping[BlockKey, list[MemoryRef]],
         request_id: str | None = None,
     ) -> OpHandle:
-        """Asynchronously deliver whole blocks or named parts to caller destinations."""
+        """Asynchronously deliver whole blocks or named parts to caller destinations.
+
+        A ``remote_fw_gpu`` instance accepts only VRAM destinations and explicit
+        ``kv.fetch_gpu`` hints. Keep destinations reserved until completion; an
+        uncertain ``TransferError`` requires quarantine until its matching
+        quiesced event. Abort or an elapsed timeout alone does not permit reuse.
+        GPU-mode FAILED results are withheld until quiescence; SUCCESS alone
+        makes the transferred contents valid. ``abort()`` is currently best
+        effort and returns False; callers must continue draining completions.
+        """
         return self._core.deliver(blocks, request_id)
 
     def deposit(
