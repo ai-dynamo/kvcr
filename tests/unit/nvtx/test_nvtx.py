@@ -159,14 +159,27 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
 
 
 @pytest.mark.parametrize("level,expected", [("low", 0), ("medium", 1)])
-def test_detail_level_gates_waiter_detach(recording, monkeypatch, level, expected):
+def test_shared_pin_detach_and_late_result(recording, monkeypatch, level, expected):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
-    source, agent, _ = make_source((9, 10))
+    source, agent, pinning = make_source((9, 10))
     backend = source._core._remote_fw_dram
-    op_id, op = next(iter(backend._source_pin_ops.items()))
-    backend._cancel_pending_pin_for_op(op_id, op)
+    first, last = backend._source_pin_ops.items()
+    backend._cancel_pending_pin_for_op(*first)
     assert len(payloads(recording, "source.pin.detached")) == expected
     assert not payloads(recording, "source.pin.completed")
+    assert not pinning.cancelled
+    backend._cancel_pending_pin_for_op(*last)
+    assert pinning.cancelled == [0]
+    assert len(payloads(recording, "source.pin.detached")) == 2 * expected
+    assert len(payloads(recording, "source.pin.completed")) == 1
+    assert len(spans(recording, "source.pin.wait", "end")) == 1
+    pinning.complete(0)
+    backend._process_pending_pin_results()
+    assert pinning.unpins == ["pin"]
+    [completed] = payloads(recording, "source.pin.completed")
+    assert int(completed["status"]) == int(_nvtx.Status.CANCELLED)
+    assert int(completed["reason"]) == int(_nvtx.Reason.CANCELLED)
+    assert len(spans(recording, "source.pin.wait", "end")) == 1
     agent.state = "DONE"
 
 
