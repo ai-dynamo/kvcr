@@ -1830,6 +1830,22 @@ class _RemoteFWDram:
                     completed_blocks=completed_blocks,
                 )
             self._kvcr._record_duration("framework_pin_wait", wait.started_at, result)
+            if logger.isEnabledFor(logging.DEBUG):
+                # A cancelling op has left wait.op_ids but still holds the request.
+                source_ops = set(wait.op_ids)
+                source_ops.update(
+                    op_id
+                    for op_id, op in self._source_pin_ops.items()
+                    if wait.request in op.pending_pin_ids
+                )
+                logger.debug(
+                    "KVCR_EVENT framework_pin_result pin_request=%d source_ops=%s "
+                    "requested_keys=%d result=%s",
+                    wait.request,
+                    sorted(source_ops),
+                    len(wait.keys),
+                    result,
+                )
 
     def _discard_pin_result(
         self, result: PinResult, keys: Collection[BlockKey] = ()
