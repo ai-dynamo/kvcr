@@ -295,8 +295,8 @@ def test_decoder_rejects_missing_source_ranges_on_failed_results(scenario, name)
         validate(events, scenario, 1)
 
 
-def successful_events():
-    events = capture_events()
+def successful_events(compact=False):
+    events = compact_failed_events() if compact else capture_events()
     result = next(e for e in events if e["name"] == "op.completion_returned")
     result["status"] = 2
     source = dict(
@@ -308,12 +308,28 @@ def successful_events():
         transfer_id=40,
         thread=2 << 24,
     )
+    if compact:
+        source = next(e for e in events if e["name"] == "source.write.completed")
+        source.update(status=2, completed_blocks=1, completed_bytes=16, transfer_id=40)
     events.extend(
         dict(source, name=name, start=33 + index)
         for index, name in enumerate(
             ("nixl.write.posted", "nixl.done_observed", "nixl.write.released")
         )
     )
+    if compact:
+        events.append(
+            dict(
+                source,
+                name="nixl.write",
+                start=33,
+                end=35,
+                end_thread=source["thread"],
+                event_type=60,
+                range_id=1,
+            )
+        )
+        return events
     events.extend(
         [
             dict(source, name="source.pin.waiter", pin_id=50, start=31),
@@ -321,6 +337,46 @@ def successful_events():
         ]
     )
     return events
+
+
+@pytest.mark.parametrize("scenario", ["success", "partial"])
+@pytest.mark.parametrize(
+    "field", [None, "instance_hi", "instance_lo", "trace_id", "source_op_id"]
+)
+def test_decoder_matches_compact_native_and_logical_source(scenario, field):
+    events = successful_events(compact=True)
+    next(e for e in events if e["name"] == "op.completion_returned")["status"] = (
+        2 if scenario == "success" else 3
+    )
+    if field is None:
+        validate(reconstruct_context(events), scenario, 1)
+        return
+    for event in events:
+        if event["name"].startswith("nixl."):
+            event[field] += 1
+    # Keep the disconnected native lifecycle's context and pin joins valid.
+    if field != "source_op_id":
+        context = next(
+            e for e in events if e["name"] == "request.context" and e["trace_id"] == 30
+        )
+        events.append(dict(context, **{field: context[field] + 1}))
+    if field != "trace_id":
+        names = ("source.pin.waiter",)
+        if field != "source_op_id":
+            names += ("source.pin.completed", "source.pin.context")
+        events.extend(
+            [dict(e, **{field: e[field] + 1}) for e in events if e["name"] in names]
+        )
+    with pytest.raises(AssertionError, match="mismatched source lifecycle"):
+        validate(reconstruct_context(events), scenario, 1)
+
+
+@pytest.mark.parametrize("name", ["source.write", "nixl.write"])
+def test_decoder_rejects_compact_range_with_wrong_source_operation(name):
+    events = successful_events(compact=True)
+    next(e for e in events if e["name"] == name)["source_op_id"] += 1
+    with pytest.raises(AssertionError, match="mismatched source lifecycle"):
+        validate(events, "success", 1)
 
 
 @pytest.mark.parametrize("name", ["nixl.done_observed", "nixl.write.released"])

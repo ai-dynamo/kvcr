@@ -118,9 +118,11 @@ collection mode's off baseline. Verify each run's bytes and 330 pin
 requests/releases with zero cancellations; preserve raw runs, versions and
 source hashes alongside the summary.
 
+Use the same capture harness for both variants, including destination resets.
+
 The JSON reports delivery latency and its reciprocal operation rate. Timing
 starts at `deliver()` and ends at caller completion; hint creation, byte
-verification, startup and teardown are excluded. Report size
+verification, destination reset, startup and teardown are excluded. Report size
 includes warmups and other libraries. Successful runs exercise few medium-only
 events, and run-to-run variation can reverse low/medium ordering. These DRAM
 measurements do not establish model throughput or a production overhead budget;

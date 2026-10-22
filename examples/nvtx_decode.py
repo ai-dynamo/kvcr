@@ -299,6 +299,11 @@ def validate(events, scenario, operations):
             assert pin["start"] <= posted[0]["start"]
             if compact:
                 native_span = require_range(named, "nixl.write", posted[0])
+                assert all(
+                    event[field] == completed[0][field]
+                    for event in (source_span, posted[0], native_span)
+                    for field in (*_IDENTITY, "source_op_id")
+                ), "mismatched source lifecycle"
                 assert native_span["transfer_id"] == posted[0]["transfer_id"]
                 assert (
                     native_span["start"]

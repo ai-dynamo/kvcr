@@ -22,6 +22,7 @@ from _nvtx_test_utils import payloads, spans, wait_for_payload
 
 from kvcr import _nvtx
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
+from kvcr.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
 from kvcr.types import BlockKey, RegionDescriptor
 
 
@@ -69,6 +70,61 @@ def target(*, eager=False):
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=eager),
     )
     return kvcr, agent, control
+
+
+@pytest.mark.parametrize(
+    "local_fill,results,prior,reason",
+    [
+        (True, (True,), _nvtx.Reason.UNKNOWN, _nvtx.Reason.DEADLINE),
+        (False, (False,), _nvtx.Reason.DEADLINE, _nvtx.Reason.DEADLINE),
+        (False, (False,), _nvtx.Reason.UNKNOWN, _nvtx.Reason.REMOTE_FAILURE),
+        (True, (False, True), _nvtx.Reason.UNKNOWN, _nvtx.Reason.REMOTE_FAILURE),
+        (False, (True,), _nvtx.Reason.UNKNOWN, _nvtx.Reason.NONE),
+        (False, (True,), _nvtx.Reason.CANCELLED, _nvtx.Reason.CANCELLED),
+    ],
+)
+def test_target_terminal_reason_preserves_cause(
+    recording, local_fill, results, prior, reason
+):
+    key, handle = BlockKey(b"k"), -7 if local_fill else 7
+    trace = _nvtx.create_tracer().lifecycle(requested_blocks=1, op_handle=handle)
+    trace.start("target.remote")
+    trace.failure_reason = prior
+    backend = SimpleNamespace(
+        _kvcr=SimpleNamespace(_clock=lambda: 10.0, _descriptor_bytes=lambda refs: 0),
+        _record_progress_duration=lambda *args: None,
+        _record_progress_counter=lambda *args: None,
+    )
+    op = _TargetPullOp(
+        op_id=("target", handle),
+        keys=frozenset({key}),
+        started_at=0.0,
+        deadline=1.0,
+        state=_TargetPullState.WAITING_WRITE_DONE
+        if prior is _nvtx.Reason.UNKNOWN
+        else _TargetPullState.WAITING_TERMINAL,
+        local_fill=local_fill,
+        remote_ctrl_ep="tcp://source:1",
+        _backend=backend,
+        ordered_keys=(key,),
+        dst_descriptors=((),),
+        trace=trace,
+    )
+    notifications = [_write_done_notification(handle, success=ok) for ok in results]
+    progress = SimpleNamespace(
+        nixl_agent=SimpleNamespace(get_new_notifs=lambda: {"source": notifications})
+    )
+    event = _RemoteFWDram._poll_notifications(backend, progress)[op.op_id]
+    assert op.progress(progress, event) == (True, True)
+    assert op.state is _TargetPullState.FINISHED
+    assert op.success is (reason is _nvtx.Reason.NONE)
+    [received] = payloads(recording, "target.write_done.received")
+    assert int(received["reason"]) == reason
+    assert int(received["status"]) == (
+        _nvtx.Status.SUCCESS if op.success else _nvtx.Status.FAILED
+    )
+    assert len(spans(recording, "target.remote", "end")) == 1
+    assert not recording.ranges
 
 
 @pytest.mark.parametrize("failure", ["metadata", "bookkeeping"])
@@ -278,6 +334,9 @@ def test_public_mixed_delivery_waits_for_both_branches(
     assert int(returned[0]["completed_blocks"]) == 1 + remote_success
     assert int(returned[0]["status"]) == int(
         _nvtx.Status.SUCCESS if remote_success else _nvtx.Status.PARTIAL
+    )
+    assert int(returned[0]["reason"]) == (
+        _nvtx.Reason.NONE if remote_success else _nvtx.Reason.REMOTE_FAILURE
     )
     assert (
         int(returned[0]["request_hi"]),

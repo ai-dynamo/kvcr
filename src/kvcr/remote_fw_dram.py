@@ -205,11 +205,15 @@ class _TargetPullOp(_RemoteOp):
             reason = (
                 _nvtx.Reason.NONE
                 if success
-                else _nvtx.Reason.CANCELLED
-                if cancelled
                 else trace.failure_reason
                 if trace is not None
                 and trace.failure_reason is not _nvtx.Reason.UNKNOWN
+                else _nvtx.Reason.DEADLINE
+                if self.local_fill
+                and not cancelled
+                and self.state is _TargetPullState.WAITING_WRITE_DONE
+                and event.get("success") is True
+                and now >= self.deadline
                 else _nvtx.Reason.REMOTE_FAILURE
             )
             try:

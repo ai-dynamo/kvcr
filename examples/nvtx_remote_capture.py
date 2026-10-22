@@ -38,6 +38,15 @@ class Buffer:
             return self.data.cpu().numpy().tobytes()
         return self.data.raw
 
+    def reset(self):
+        if self.memory == "vram":
+            import torch
+
+            self.data.zero_()
+            torch.cuda.synchronize()
+        else:
+            ctypes.memset(self.address, 0, len(self.data))
+
 
 def worker(role, args, pipe, endpoint=None):
     name = "nvtx-" + role
@@ -130,6 +139,8 @@ def worker(role, args, pipe, endpoint=None):
                     memory.read()[: expected * args.block_bytes]
                     == bytes([73]) * expected * args.block_bytes
                 )
+                # Failed/timed-out destinations may still have writes in flight.
+                memory.reset()
             kvcr.discard_hint(request)
             if iteration >= args.warmup:
                 latencies.append(elapsed)
