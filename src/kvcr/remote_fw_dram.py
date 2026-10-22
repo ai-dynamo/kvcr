@@ -1709,6 +1709,15 @@ class _RemoteFWDram:
     ) -> None:
         if wait is not None:
             self._kvcr._record_duration("framework_pin_wait", wait.started_at, result)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KVCR_EVENT framework_pin_result pin_request=%d source_ops=%s "
+                    "requested_keys=%d result=%s",
+                    wait.request,
+                    sorted(wait.op_ids),
+                    len(wait.keys),
+                    result,
+                )
 
     def _discard_pin_result(
         self, result: PinResult, keys: Collection[BlockKey] = ()
