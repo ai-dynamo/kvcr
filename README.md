@@ -142,7 +142,7 @@ metadata handshake with the exact source endpoint and GPU contract. Legacy,
 mismatched or silent peers fail before any writable destination descriptors or
 native peer connection are exposed; they do not create a target write hazard.
 
-The initial transport policy is **same-host CUDA IPC only**, with
+The default transport policy is **same-host CUDA IPC**, with
 `UCX_TLS=cuda_ipc,posix,self` set before starting either process. The explicit
 allowlist also permits `sysv` for host control metadata, but excludes TCP, CUDA
 copy, GDR copy, aliases and network transports. Native UCX must support VRAM.
@@ -153,8 +153,43 @@ Set `NIXL_UCX_CUDA_IPC_ONLY=1` as well, with a NIXL UCX plugin that implements
 this strict policy and verifies initialized CUDA memory support. GPU endpoint
 startup rejects a missing policy flag; it does not enable CUDA copy to work
 around a native initialization failure.
+
+For cross-host NVLink, select the experimental **MNNVL** profile explicitly:
+
+```python
+RemoteFWGPUOptions(
+    compatibility_domain=compatible_layout_and_fabric_domain,
+    gpu_transport="mnnvl",
+    fabric_domain=observed_fabric_domain,
+    ucx_tls=("cuda_ipc", "tcp", "self"),
+)
+```
+
+Both endpoints must register physical CUDA VMM allocations created with
+`CU_MEM_HANDLE_TYPE_FABRIC`. Ordinary `cudaMalloc` and managed allocations are
+rejected by this profile's native registration checks. The framework observes
+the allocated GPU's completed, successful NVML fabric and supplies its canonical
+`mnnvl:<32-lowercase-hex-cluster-UUID>:<unsigned-clique-ID>` identity; a zero cluster
+UUID is invalid, while clique zero is valid. Bind the routing compatibility domain
+to the raw layout, MNNVL transport and this observed fabric. The operation-bound
+handshake also checks the transport profile and fabric before offering writable
+destination memory. Different fabrics, legacy peers and mixed profiles fail.
+
+MNNVL requires a common IMEX channel with export/import permission on both hosts.
+On SLURM, reserve the channel through the site's IMEX plugin and verify its
+visibility inside both allocated containers. A device file or NVML fabric state
+alone does not prove that a peer can import a handle.
+
+The MNNVL backend sets its own closed UCP configuration; it does not change
+process-wide `UCX_TLS` or the ordinary engine's P-to-D backend. TCP carries active
+message control; TCP puts and software PUT/GET emulation are disabled. CUDA-copy,
+GDR-copy and RDMA payload transports are excluded. An unavailable NVLink route
+fails rather than staging KV payload in CPU memory. Do not enable the legacy
+global `NIXL_UCX_CUDA_IPC_ONLY` flag for an MNNVL endpoint. GPUDirect RDMA for
+this GPU-only endpoint remains outside these profiles.
+
 The experimental [native dependency patches and build contract](docs/gpu-direct-native-dependencies/README.md)
-pin the NIXL/UCX source changes required by this profile. They are separate from
+pin the NIXL/UCX source changes required by these profiles. They are separate from
 the KVCR wheel and do not establish compatibility with arbitrary native builds.
 
 GPU-only instances initialize UCX explicitly with the supported
@@ -165,7 +200,7 @@ VRAM registration. This profile does **not** promise native peer-death recovery:
 deadlines do not cancel native writes or make destination slots reusable.
 Uncertain operations retain their pins and GPU allocations until actual native
 completion/quiescence, and a transport failure can still terminate the process.
-No TCP or host-copy fallback is added to obtain peer-error handling.
+Neither profile adds a host-payload fallback to obtain peer-error handling.
 
 The framework must fence producer writes before returning a GPU pin result and
 retain the entire registered allocation until quiescent shutdown. Source block

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Construction and integration configuration for KVCR."""
 
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
@@ -51,12 +52,15 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
 
 
 class RemoteFWGPUOptions(msgspec.Struct, frozen=True, kw_only=True):
-    """An isolated CUDA-IPC-only framework-memory endpoint.
+    """An isolated GPU framework-memory endpoint with an explicit transport.
 
-    Host transports in ``ucx_tls`` carry control metadata only: CUDA copy and
-    network transports are excluded, so a missing CUDA IPC route must fail
-    rather than stage KV payloads in host memory. Both peers must share the
-    explicit compatibility domain and host. Framework callbacks fence producer
+    Host transports in ``ucx_tls`` carry control metadata only. CUDA copy,
+    GDR copy and alternate GPU transports are excluded, so a missing NVLink
+    route must fail rather than stage KV payloads in host memory. Peers share the
+    explicit compatibility domain. The default profile requires the same host;
+    MNNVL requires fabric-capable allocations in the same observed fabric domain.
+    Its TCP transport carries control messages, with software RMA and TCP puts
+    disabled by the dedicated native backend. Framework callbacks fence producer
     writes before returning pin results and retain CUDA allocations until release.
     """
 
@@ -66,6 +70,8 @@ class RemoteFWGPUOptions(msgspec.Struct, frozen=True, kw_only=True):
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
+    gpu_transport: str = "cuda_ipc"
+    fabric_domain: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -75,7 +81,29 @@ class RemoteFWGPUOptions(msgspec.Struct, frozen=True, kw_only=True):
             or "\x00" in self.compatibility_domain
         ):
             raise ValueError("GPU compatibility_domain must be explicit and non-empty")
-        allowed = {"cuda_ipc", "posix", "sysv", "self"}
+        if self.gpu_transport not in ("cuda_ipc", "mnnvl"):
+            raise ValueError("GPU transport must be cuda_ipc or mnnvl")
+        if self.gpu_transport == "mnnvl":
+            match = (
+                re.fullmatch(
+                    r"mnnvl:([0-9a-f]{32}):(0|[1-9][0-9]{0,9})", self.fabric_domain
+                )
+                if isinstance(self.fabric_domain, str)
+                else None
+            )
+            if match is None or int(match[1], 16) == 0 or int(match[2]) > 0xFFFFFFFF:
+                raise ValueError(
+                    "MNNVL requires an observed nonzero fabric UUID and clique"
+                )
+            if self.ucx_tls != ("cuda_ipc", "tcp", "self"):
+                raise ValueError("MNNVL ucx_tls must be exactly cuda_ipc,tcp,self")
+        elif self.fabric_domain is not None:
+            raise ValueError("CUDA IPC does not accept an MNNVL fabric domain")
+        allowed = (
+            {"cuda_ipc", "tcp", "self"}
+            if self.gpu_transport == "mnnvl"
+            else {"cuda_ipc", "posix", "sysv", "self"}
+        )
         if (
             not isinstance(self.ucx_tls, tuple)
             or not self.ucx_tls

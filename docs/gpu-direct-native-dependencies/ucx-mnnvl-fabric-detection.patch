@@ -1,0 +1,291 @@
+diff --git a/src/uct/cuda/cuda_ipc/cuda_ipc_md.c b/src/uct/cuda/cuda_ipc/cuda_ipc_md.c
+--- a/src/uct/cuda/cuda_ipc/cuda_ipc_md.c
++++ b/src/uct/cuda/cuda_ipc/cuda_ipc_md.c
+@@ -57,6 +57,11 @@
+     {"ENABLE_MNNVL", "try",
+      "Enable multi-node NVLINK capabilities.",
+      ucs_offsetof(uct_cuda_ipc_md_config_t, enable_mnnvl), UCS_CONFIG_TYPE_TERNARY},
++
++    {"GPU_DIRECT_FABRIC_ONLY", "n",
++     "Recognize only physical DEVICE FABRIC VMM allocations for a strict MNNVL context.\n"
++     "Requires enabled MNNVL and accessible fabric IPC support; never accepts legacy or managed memory.",
++     ucs_offsetof(uct_cuda_ipc_md_config_t, gpu_direct_fabric_only), UCS_CONFIG_TYPE_BOOL},
+ 
+     {"CACHE_MAX_REGIONS", "inf",
+      "Maximum number of regions in each per-peer CUDA IPC remote handle cache.\n"
+@@ -225,6 +230,7 @@
+ uct_cuda_ipc_md_mem_query(uct_md_h md, const void *address, size_t length,
+                          uct_md_mem_attr_v2_t *mem_attr)
+ {
++    uct_cuda_ipc_md_t *ipc_md = ucs_derived_of(md, uct_cuda_ipc_md_t);
+     CUpointer_attribute attributes[] = {
+         CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_IS_MANAGED,
+         CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+@@ -234,10 +240,11 @@
+     unsigned is_managed     = 0;
+     int device_ordinal      = -1;
+     int legacy_capable      = 0;
++    unsigned long long allowed_handles = 0;
+     void *values[]          = {&memory_type, &is_managed, &device_ordinal,
+                                &legacy_capable};
+-    CUdeviceptr base_address;
+-    size_t alloc_length;
++    CUdeviceptr base_address = 0;
++    size_t alloc_length = 0;
+     CUdevice device;
+     int is_ctx_pushed;
+     ucs_sys_device_t sys_dev;
+@@ -259,7 +266,8 @@
+                                    attributes, values, (CUdeviceptr)address),
+             UCS_LOG_LEVEL_TRACE);
+     if ((status != UCS_OK) || (memory_type != CU_MEMORYTYPE_DEVICE) ||
+-        is_managed || (device_ordinal < 0) || !legacy_capable) {
++        is_managed || (device_ordinal < 0) ||
++        (!ipc_md->gpu_direct_fabric_only && !legacy_capable)) {
+         return UCS_ERR_INVALID_ADDR;
+     }
+ 
+@@ -268,8 +276,61 @@
+     if (status != UCS_OK) {
+         return status;
+     }
+-    status = UCT_CUDADRV_FUNC_LOG_DEBUG(cuMemGetAddressRange(
+-            &base_address, &alloc_length, (CUdeviceptr)address));
++    if (ipc_md->gpu_direct_fabric_only) {
++#if HAVE_CUDA_FABRIC
++        CUmemGenericAllocationHandle handle;
++        CUmemAllocationProp properties = {0};
++        CUmemFabricHandle exported;
++        if (legacy_capable || !ipc_md->enable_mnnvl || !ipc_md->fabric_supported ||
++            (UCT_CUDADRV_FUNC_LOG_DEBUG(cuPointerGetAttribute(
++                &allowed_handles, CU_POINTER_ATTRIBUTE_ALLOWED_HANDLE_TYPES,
++                (CUdeviceptr)address)) != UCS_OK) ||
++            !(allowed_handles & CU_MEM_HANDLE_TYPE_FABRIC)) {
++            status = UCS_ERR_INVALID_ADDR;
++            goto out_pop;
++        }
++        status = UCT_CUDADRV_FUNC_LOG_DEBUG(
++                cuMemRetainAllocationHandle(&handle, (void*)address));
++        if (status != UCS_OK) {
++            goto out_pop;
++        }
++        status = UCT_CUDADRV_FUNC_LOG_DEBUG(
++                cuMemGetAllocationPropertiesFromHandle(&properties, handle));
++        if ((status == UCS_OK) &&
++            ((properties.type != CU_MEM_ALLOCATION_TYPE_PINNED) ||
++             (properties.location.type != CU_MEM_LOCATION_TYPE_DEVICE) ||
++             !(properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC))) {
++            status = UCS_ERR_INVALID_ADDR;
++        }
++        if (status == UCS_OK) {
++            status = UCT_CUDADRV_FUNC_LOG_DEBUG(cuMemExportToShareableHandle(
++                    &exported, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
++        }
++        UCT_CUDADRV_FUNC_LOG_WARN(cuMemRelease(handle));
++        if (status != UCS_OK) {
++            goto out_pop;
++        }
++#else
++        status = UCS_ERR_UNSUPPORTED;
++        goto out_pop;
++#endif
++    }
++    if (ipc_md->gpu_direct_fabric_only) {
++        unsigned mapped = 0;
++        CUpointer_attribute range_attributes[] = {
++            CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
++            CU_POINTER_ATTRIBUTE_MAPPING_SIZE, CU_POINTER_ATTRIBUTE_MAPPED};
++        void *range_values[] = {&base_address, &alloc_length, &mapped};
++        status = UCT_CUDADRV_FUNC_LOG_DEBUG(cuPointerGetAttributes(3,
++                range_attributes, range_values, (CUdeviceptr)address));
++        if ((status == UCS_OK) && !mapped) {
++            status = UCS_ERR_INVALID_ADDR;
++        }
++    } else {
++        status = UCT_CUDADRV_FUNC_LOG_DEBUG(cuMemGetAddressRange(
++                &base_address, &alloc_length, (CUdeviceptr)address));
++    }
++out_pop:
+     uct_cuda_ipc_check_and_pop_ctx(is_ctx_pushed);
+     if ((status != UCS_OK) || ((CUdeviceptr)address < base_address) ||
+         (length > alloc_length) ||
+@@ -408,10 +469,11 @@
+ #endif /* HAVE_CUDA_FABRIC */
+ 
+ static ucs_status_t
+-uct_cuda_ipc_mem_add_reg(void *addr, uct_cuda_ipc_memh_t *memh,
++uct_cuda_ipc_mem_add_reg(uct_md_h md, void *addr, uct_cuda_ipc_memh_t *memh,
+                          uct_cuda_ipc_lkey_t **key_p)
+ {
+     uct_cuda_ipc_lkey_t *key;
++    uct_cuda_ipc_md_t *ipc_md = ucs_derived_of(md, uct_cuda_ipc_md_t);
+     ucs_status_t status;
+     int is_ctx_pushed;
+     CUdevice cuda_device;
+@@ -435,8 +497,21 @@
+         goto out;
+     }
+ 
+-    status = UCT_CUDADRV_FUNC_LOG_ERR(
+-            cuMemGetAddressRange(&key->d_bptr, &key->b_len, (CUdeviceptr)addr));
++    if (ipc_md->gpu_direct_fabric_only) {
++        unsigned mapped = 0;
++        CUpointer_attribute range_attributes[] = {
++            CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
++            CU_POINTER_ATTRIBUTE_MAPPING_SIZE, CU_POINTER_ATTRIBUTE_MAPPED};
++        void *range_values[] = {&key->d_bptr, &key->b_len, &mapped};
++        status = UCT_CUDADRV_FUNC_LOG_ERR(cuPointerGetAttributes(3,
++                range_attributes, range_values, (CUdeviceptr)addr));
++        if ((status == UCS_OK) && !mapped) {
++            status = UCS_ERR_INVALID_ADDR;
++        }
++    } else {
++        status = UCT_CUDADRV_FUNC_LOG_ERR(
++                cuMemGetAddressRange(&key->d_bptr, &key->b_len, (CUdeviceptr)addr));
++    }
+     if (status != UCS_OK) {
+         goto out_pop_ctx;
+     }
+@@ -464,6 +539,24 @@
+                 attr_data, (CUdeviceptr)addr));
+     if (status != UCS_OK) {
+         goto out_pop_ctx;
++    }
++
++    if (ipc_md->gpu_direct_fabric_only) {
++#if HAVE_CUDA_FABRIC
++        if (legacy_capable || mempool != NULL ||
++            !(allowed_handle_types & CU_MEM_HANDLE_TYPE_FABRIC)) {
++            status = UCS_ERR_INVALID_ADDR;
++            goto out_pop_ctx;
++        }
++        status = uct_cuda_ipc_mem_export_fabric(addr, key, mempool);
++        if (status != UCS_OK) {
++            goto out_pop_ctx;
++        }
++        goto common_path;
++#else
++        status = UCS_ERR_UNSUPPORTED;
++        goto out_pop_ctx;
++#endif
+     }
+ 
+     if (legacy_capable) {
+@@ -541,12 +634,18 @@
+         }
+     }
+ 
+-    status = uct_cuda_ipc_mem_add_reg(address, memh, &key);
++    status = uct_cuda_ipc_mem_add_reg(md, address, memh, &key);
+     if (status != UCS_OK) {
+         return status;
+     }
+ 
+ found:
++    if (ucs_derived_of(md, uct_cuda_ipc_md_t)->gpu_direct_fabric_only &&
++        ((length == 0) || (length > key->b_len) ||
++         ((uintptr_t)address - key->d_bptr > key->b_len - length) ||
++         (key->ph.handle_type != UCT_CUDA_IPC_KEY_HANDLE_TYPE_VMM))) {
++        return UCS_ERR_INVALID_ADDR;
++    }
+     ucs_assertv(((uintptr_t)address + length) <= (key->d_bptr + key->b_len),
+                 "buffer 0x%lx..0x%lx region 0x%llx..0x%llx", (uintptr_t)address,
+                 (uintptr_t)address + length, key->d_bptr, key->d_bptr +
+@@ -960,6 +1059,13 @@
+     md->enable_mnnvl     = uct_cuda_ipc_md_check_fabric_info(
+                                                   md, ipc_config->enable_mnnvl);
+     md->fabric_supported = uct_cuda_ipc_md_check_fabric_support();
++    md->gpu_direct_fabric_only = ipc_config->gpu_direct_fabric_only;
++    if (md->gpu_direct_fabric_only &&
++        (!md->enable_mnnvl || !md->fabric_supported)) {
++        ucs_error("strict MNNVL FABRIC memory requested without usable fabric capability");
++        ucs_free(md);
++        return UCS_ERR_UNSUPPORTED;
++    }
+ 
+     uct_cuda_ipc_cache_set_global_limits(ipc_config->cache_max_regions,
+                                          ipc_config->cache_max_size);
+diff --git a/src/uct/cuda/cuda_ipc/cuda_ipc_md.h b/src/uct/cuda/cuda_ipc/cuda_ipc_md.h
+--- a/src/uct/cuda/cuda_ipc/cuda_ipc_md.h
++++ b/src/uct/cuda/cuda_ipc/cuda_ipc_md.h
+@@ -49,6 +49,7 @@
+ typedef struct uct_cuda_ipc_md {
+     uct_md_t                 super;             /**< Domain info */
+     int                      enable_mnnvl;      /**< Multi-node NVLINK support status */
++    int                      gpu_direct_fabric_only; /**< Strict per-MD FABRIC admission */
+     int                      fabric_supported;  /**< CUDA fabric support status */
+ } uct_cuda_ipc_md_t;
+ 
+@@ -112,6 +113,7 @@
+ typedef struct uct_cuda_ipc_md_config {
+     uct_md_config_t          super;
+     ucs_ternary_auto_value_t enable_mnnvl;
++    int                     gpu_direct_fabric_only;
+     unsigned long            cache_max_regions; /**< Max cached IPC regions per peer */
+     size_t                   cache_max_size;    /**< Max total cached IPC mapping size */
+     /** Enable remote IPC memory handle mapping cache */
+diff --git a/test/gtest/uct/cuda/test_cuda_ipc_md.cc b/test/gtest/uct/cuda/test_cuda_ipc_md.cc
+--- a/test/gtest/uct/cuda/test_cuda_ipc_md.cc
++++ b/test/gtest/uct/cuda/test_cuda_ipc_md.cc
+@@ -461,6 +461,61 @@
+               uct_md_mem_query(md(), managed.ptr(), managed.size(), &attr));
+ }
+ 
++UCS_TEST_P(test_cuda_ipc_md, strict_fabric_detection_is_explicit_and_bounded)
++{
++#if HAVE_CUDA_FABRIC
++    mem_buffer legacy(4096, UCS_MEMORY_TYPE_CUDA);
++    uct_cuda_ipc_md_t *ipc = ucs_derived_of(md(), uct_cuda_ipc_md_t);
++    if (!ipc->enable_mnnvl || !ipc->fabric_supported) {
++        UCS_TEST_SKIP_R("Actual enabled MNNVL and accessible fabric IPC required");
++    }
++    cuda_vmm_mem_buffer fabric;
++    CUresult status = fabric.alloc(4096, CU_MEM_HANDLE_TYPE_FABRIC);
++    if ((status == CUDA_ERROR_NOT_PERMITTED) || (status == CUDA_ERROR_NOT_SUPPORTED)) {
++        UCS_TEST_SKIP_R("Actual FABRIC allocation/IMEX access unavailable");
++    }
++    ASSERT_EQ(CUDA_SUCCESS, status);
++    uct_md_mem_attr_t attr;
++    attr.field_mask = UCT_MD_MEM_ATTR_FIELD_MEM_TYPE;
++    ASSERT_EQ(0, ipc->gpu_direct_fabric_only);
++    // The existing legacy detector is not broadened by an enabled fabric.
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), fabric.ptr(), fabric.size(), &attr));
++    ASSERT_UCS_OK(uct_md_mem_query(md(), legacy.ptr(), legacy.size(), &attr));
++    ipc->gpu_direct_fabric_only = 1;
++    ASSERT_UCS_OK(uct_md_mem_query(md(), fabric.ptr(), fabric.size(), &attr));
++    EXPECT_EQ(UCS_MEMORY_TYPE_CUDA, attr.mem_type);
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), legacy.ptr(), legacy.size(), &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), fabric.ptr(), fabric.size() + 1, &attr));
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mem_query(md(), UCS_PTR_BYTE_OFFSET(fabric.ptr(), 17),
++                               fabric.size(), &attr));
++    uct_md_mem_reg_params_t reg_params = {};
++    reg_params.field_mask = UCT_MD_MEM_REG_FIELD_MEM_TYPE;
++    reg_params.mem_type = UCS_MEMORY_TYPE_CUDA;
++    uct_mem_h memh;
++    ASSERT_UCS_OK(uct_md_mem_reg_v2(md(), fabric.ptr(), fabric.size(), &reg_params, &memh));
++    uct_md_mkey_pack_params_t pack_params = {};
++    std::vector<uint8_t> packed(md_attr().rkey_packed_size);
++    ASSERT_UCS_OK(uct_md_mkey_pack_v2(md(), memh, fabric.ptr(), fabric.size(),
++                                     &pack_params, packed.data()));
++    EXPECT_EQ(UCT_CUDA_IPC_KEY_HANDLE_TYPE_VMM,
++              reinterpret_cast<uct_cuda_ipc_rkey_t*>(packed.data())->ph.handle_type);
++    EXPECT_EQ(UCS_ERR_INVALID_ADDR,
++              uct_md_mkey_pack_v2(md(), memh, fabric.ptr(), fabric.size() + 1,
++                                   &pack_params, packed.data()));
++    uct_md_mem_dereg_params_t dereg_params = {};
++    dereg_params.field_mask = UCT_MD_MEM_DEREG_FIELD_MEMH;
++    dereg_params.memh = memh;
++    EXPECT_UCS_OK(uct_md_mem_dereg_v2(md(), &dereg_params));
++    ipc->gpu_direct_fabric_only = 0;
++#else
++    UCS_TEST_SKIP_R("Built without CUDA FABRIC support");
++#endif
++}
++
+ _UCT_MD_INSTANTIATE_TEST_CASE(test_cuda_ipc_md, cuda_ipc);
+ 
+ 

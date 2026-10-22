@@ -599,12 +599,26 @@ class _RemoteFWDram:
     def _gpu_contract(self) -> dict[str, str]:
         if not self._gpu:
             return {}
-        return {
+        contract = {
             "source_memory_kind": "gpu",
             "target_memory_kind": "gpu",
             "transport": "nixl_gpu_direct",
             "compatibility_domain": self._options.compatibility_domain,
         }
+        if self._options.gpu_transport == "mnnvl":
+            assert self._options.fabric_domain is not None
+            contract.update(
+                gpu_transport="mnnvl", fabric_domain=self._options.fabric_domain
+            )
+        return contract
+
+    def _matches_gpu_contract(self, payload: Mapping[str, Any]) -> bool:
+        return all(
+            payload.get(name) == value for name, value in self._gpu_contract().items()
+        ) and (
+            payload.get("gpu_transport", "cuda_ipc") == self._options.gpu_transport
+            and payload.get("fabric_domain") == self._options.fabric_domain
+        )
 
     # -------------------------------------------------------------------------
     # Backend interface used by KVCR.
@@ -1096,10 +1110,9 @@ class _RemoteFWDram:
             endpoint = payload.get("sender_control_endpoint")
             if not isinstance(endpoint, str) or not endpoint:
                 return
-            accepted = payload.get("gpu_capability_only") is True and all(
-                payload.get(name) == value
-                for name, value in self._gpu_contract().items()
-            )
+            accepted = payload.get(
+                "gpu_capability_only"
+            ) is True and self._matches_gpu_contract(payload)
             reply: dict[str, Any] = {
                 "type": "target_metadata_ack",
                 "gpu_capability_only": True,
@@ -1174,14 +1187,13 @@ class _RemoteFWDram:
                 or op.remote_ctrl_ep != source_endpoint
             ):
                 return
-            if op.state is not _TargetPullState.START_WRITE and (
+            if (op.state is not _TargetPullState.START_WRITE or op.retried) and (
                 payload.get("sender_incarnation") != op.source_incarnation
             ):
                 return
-            if payload.get("gpu_peer_accepted") is not True or any(
-                payload.get(name) != value
-                for name, value in self._gpu_contract().items()
-            ):
+            if payload.get(
+                "gpu_peer_accepted"
+            ) is not True or not self._matches_gpu_contract(payload):
                 if op.state is _TargetPullState.START_WRITE:
                     op.gpu_peer_refused = True
                 return
@@ -1257,10 +1269,9 @@ class _RemoteFWDram:
             return
         try:
             if self._gpu:
-                if payload.get("type") != "start_write_gpu" or any(
-                    payload.get(name) != value
-                    for name, value in self._gpu_contract().items()
-                ):
+                if payload.get(
+                    "type"
+                ) != "start_write_gpu" or not self._matches_gpu_contract(payload):
                     raise ValueError(
                         "GPU write requires a matching explicit GPU contract"
                     )
@@ -2040,9 +2051,7 @@ class _RemoteFWDram:
     ) -> tuple[str, str]:
         if progress._stop_requested:
             raise RuntimeError("KVCR progress is stopping")
-        if self._gpu and any(
-            payload.get(name) != value for name, value in self._gpu_contract().items()
-        ):
+        if self._gpu and not self._matches_gpu_contract(payload):
             raise ValueError(
                 "GPU peer metadata requires a matching explicit GPU contract"
             )

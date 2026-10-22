@@ -135,6 +135,7 @@ class _KVCRProgress:
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
         required_gpu_ucx_tls: tuple[str, ...] | None = None,
+        required_gpu_transport: str = "cuda_ipc",
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -177,6 +178,15 @@ class _KVCRProgress:
         self._startup_stage = "thread startup"
         self._startup_timeout_seconds = startup_timeout_seconds
         self._required_gpu_ucx_tls = required_gpu_ucx_tls
+        if required_gpu_transport not in ("cuda_ipc", "mnnvl"):
+            raise ValueError("Unsupported GPU transport")
+        if required_gpu_transport == "mnnvl" and required_gpu_ucx_tls != (
+            "cuda_ipc",
+            "tcp",
+            "self",
+        ):
+            raise ValueError("MNNVL requires its exact native transport policy")
+        self._required_gpu_transport = required_gpu_transport
 
     @property
     def nixl_agent(self) -> Any:
@@ -646,7 +656,10 @@ class _KVCRProgress:
 
     def _initialize_nixl(self) -> None:
         if self._nixl_agent is None and self._nixl_agent_name is not None:
-            if self._required_gpu_ucx_tls is not None:
+            if (
+                self._required_gpu_ucx_tls is not None
+                and self._required_gpu_transport == "cuda_ipc"
+            ):
                 actual = os.environ.get("UCX_TLS", "").split(",")
                 if len(actual) != len(self._required_gpu_ucx_tls) or set(actual) != set(
                     self._required_gpu_ucx_tls
@@ -656,6 +669,10 @@ class _KVCRProgress:
                     )
                 if os.environ.get("NIXL_UCX_CUDA_IPC_ONLY") != "1":
                     raise RuntimeError("GPU native CUDA IPC-only policy is not enabled")
+            elif self._required_gpu_transport == "mnnvl" and os.environ.get(
+                "NIXL_UCX_CUDA_IPC_ONLY", ""
+            ).lower() not in ("", "0", "n", "no", "false", "off"):
+                raise RuntimeError("MNNVL cannot use the global CUDA IPC-only policy")
             if self._nixl_listen_port is None:
                 raise RuntimeError("KVCR NIXL listen port is not configured")
             self._nixl_agent = nixl_agent(
@@ -685,13 +702,21 @@ class _KVCRProgress:
                     )
                 params = dict(defaults)
                 params.update(ucx_error_handling_mode="none", num_threads="4")
-                self._nixl_agent.create_backend("UCX", params)
-                if (
-                    self._nixl_agent.get_backend_params("UCX").get(
-                        "ucx_error_handling_mode"
+                required = {"ucx_error_handling_mode": "none"}
+                if self._required_gpu_transport == "mnnvl":
+                    if any(
+                        key not in defaults
+                        for key in ("gpu_direct_transport", "gpu_direct_ucx_tls")
+                    ):
+                        raise RuntimeError("Native UCX backend lacks the MNNVL policy")
+                    required.update(
+                        gpu_direct_transport="mnnvl",
+                        gpu_direct_ucx_tls="cuda_ipc,tcp,self",
                     )
-                    != "none"
-                ):
+                    params.update(required)
+                self._nixl_agent.create_backend("UCX", params)
+                accepted = self._nixl_agent.get_backend_params("UCX")
+                if any(accepted.get(key) != value for key, value in required.items()):
                     raise RuntimeError("GPU UCX endpoint mode was not accepted")
                 # Native getBackendMemTypes reports enum strings (VRAM_SEG in
                 # NIXL 1.5); older Python wrappers exposed the VRAM alias.

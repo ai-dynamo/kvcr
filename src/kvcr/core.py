@@ -196,15 +196,25 @@ class _KVCRCore:
                 raise ValueError(
                     "GPU endpoints require an isolated framework control channel"
                 )
-            if os.environ.get("NIXL_UCX_CUDA_IPC_ONLY") != "1":
-                raise ValueError("GPU endpoints require NIXL_UCX_CUDA_IPC_ONLY=1")
-            actual_tls = os.environ.get("UCX_TLS", "").split(",")
-            if len(actual_tls) != len(self._gpu_options.ucx_tls) or set(
-                actual_tls
-            ) != set(self._gpu_options.ucx_tls):
-                raise ValueError(
-                    "GPU endpoint UCX_TLS must exactly match its CUDA IPC policy"
-                )
+            if self._gpu_options.gpu_transport == "cuda_ipc":
+                if os.environ.get("NIXL_UCX_CUDA_IPC_ONLY") != "1":
+                    raise ValueError("GPU endpoints require NIXL_UCX_CUDA_IPC_ONLY=1")
+                actual_tls = os.environ.get("UCX_TLS", "").split(",")
+                if len(actual_tls) != len(self._gpu_options.ucx_tls) or set(
+                    actual_tls
+                ) != set(self._gpu_options.ucx_tls):
+                    raise ValueError(
+                        "GPU endpoint UCX_TLS must exactly match its CUDA IPC policy"
+                    )
+            elif os.environ.get("NIXL_UCX_CUDA_IPC_ONLY", "").lower() not in (
+                "",
+                "0",
+                "n",
+                "no",
+                "false",
+                "off",
+            ):
+                raise ValueError("MNNVL cannot use the global CUDA IPC-only policy")
         self._remote_tier = (
             CacheTier.REMOTE_G1
             if self._gpu_options is not None
@@ -392,6 +402,11 @@ class _KVCRCore:
             startup_timeout_seconds=startup_timeout_seconds,
             required_gpu_ucx_tls=(
                 self._gpu_options.ucx_tls if self._gpu_options is not None else None
+            ),
+            required_gpu_transport=(
+                self._gpu_options.gpu_transport
+                if self._gpu_options is not None
+                else "cuda_ipc"
             ),
         )
 
