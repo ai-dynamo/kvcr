@@ -191,7 +191,27 @@ diff --git a/src/uct/cuda/cuda_ipc/cuda_ipc_md.c b/src/uct/cuda/cuda_ipc/cuda_ip
      ucs_assertv(((uintptr_t)address + length) <= (key->d_bptr + key->b_len),
                  "buffer 0x%lx..0x%lx region 0x%llx..0x%llx", (uintptr_t)address,
                  (uintptr_t)address + length, key->d_bptr, key->d_bptr +
-@@ -960,6 +1059,13 @@
+@@ -807,12 +906,14 @@
+     char buf[64];
+     int64_t *cluster_uuid;
+ 
++    /* This is per-MD policy, not a cached hardware capability. A disabled
++     * ordinary context must neither poison nor inherit another context's
++     * MNNVL policy. Keep only the NVML hardware result in the shared cache. */
++    if (mnnvl_enable == UCS_NO) {
++        return 0;
++    }
++
+     if (mnnvl_supported != -1) {
+-        goto out;
+-    }
+-
+-    if (mnnvl_enable == UCS_NO) {
+-        mnnvl_supported = 0;
+         goto out;
+     }
+ 
+@@ -960,6 +1061,13 @@
      md->enable_mnnvl     = uct_cuda_ipc_md_check_fabric_info(
                                                    md, ipc_config->enable_mnnvl);
      md->fabric_supported = uct_cuda_ipc_md_check_fabric_support();
@@ -227,7 +247,7 @@ diff --git a/src/uct/cuda/cuda_ipc/cuda_ipc_md.h b/src/uct/cuda/cuda_ipc/cuda_ip
 diff --git a/test/gtest/uct/cuda/test_cuda_ipc_md.cc b/test/gtest/uct/cuda/test_cuda_ipc_md.cc
 --- a/test/gtest/uct/cuda/test_cuda_ipc_md.cc
 +++ b/test/gtest/uct/cuda/test_cuda_ipc_md.cc
-@@ -461,6 +461,61 @@
+@@ -461,6 +461,105 @@
                uct_md_mem_query(md(), managed.ptr(), managed.size(), &attr));
  }
  
@@ -283,6 +303,50 @@ diff --git a/test/gtest/uct/cuda/test_cuda_ipc_md.cc b/test/gtest/uct/cuda/test_
 +    ipc->gpu_direct_fabric_only = 0;
 +#else
 +    UCS_TEST_SKIP_R("Built without CUDA FABRIC support");
++#endif
++}
++
++UCS_TEST_P(test_cuda_ipc_md, mnnvl_enable_policy_is_per_context)
++{
++#if HAVE_CUDA_FABRIC && HAVE_NVML_FABRIC_INFO
++    const uct_cuda_ipc_md_t *fixture = ucs_derived_of(md(), uct_cuda_ipc_md_t);
++    if (!fixture->enable_mnnvl || !fixture->fabric_supported) {
++        UCS_TEST_SKIP_R("Actual enabled MNNVL fabric is required for policy isolation");
++    }
++    // Copy this fixture's configuration so the other MD and test owners retain
++    // their own policy. Exercise NO->YES and YES->NO with real isolated MDs.
++    uct_cuda_ipc_md_config_t config =
++        *reinterpret_cast<const uct_cuda_ipc_md_config_t*>(m_md_config.get());
++    config.gpu_direct_fabric_only = 0;
++    config.enable_mnnvl = UCS_NO;
++    ucs::handle<uct_md_h> disabled_before;
++    UCS_TEST_CREATE_HANDLE(uct_md_h, disabled_before, uct_md_close, uct_md_open,
++                           GetParam().component, GetParam().md_name.c_str(),
++                           &config.super);
++    EXPECT_FALSE(ucs_derived_of(disabled_before.get(),
++                                uct_cuda_ipc_md_t)->enable_mnnvl);
++
++    config.gpu_direct_fabric_only = 1;
++    config.enable_mnnvl = UCS_YES;
++    ucs::handle<uct_md_h> enabled;
++    UCS_TEST_CREATE_HANDLE(uct_md_h, enabled, uct_md_close, uct_md_open,
++                           GetParam().component, GetParam().md_name.c_str(),
++                           &config.super);
++    EXPECT_TRUE(ucs_derived_of(enabled.get(),
++                               uct_cuda_ipc_md_t)->enable_mnnvl);
++    EXPECT_TRUE(ucs_derived_of(enabled.get(),
++                               uct_cuda_ipc_md_t)->gpu_direct_fabric_only);
++
++    config.gpu_direct_fabric_only = 0;
++    config.enable_mnnvl = UCS_NO;
++    ucs::handle<uct_md_h> disabled_after;
++    UCS_TEST_CREATE_HANDLE(uct_md_h, disabled_after, uct_md_close, uct_md_open,
++                           GetParam().component, GetParam().md_name.c_str(),
++                           &config.super);
++    EXPECT_FALSE(ucs_derived_of(disabled_after.get(),
++                                uct_cuda_ipc_md_t)->enable_mnnvl);
++#else
++    UCS_TEST_SKIP_R("Built without CUDA FABRIC/NVML fabric support");
 +#endif
 +}
 +

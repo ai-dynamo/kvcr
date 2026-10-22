@@ -12,7 +12,7 @@
   "nixl_base": "075b2397029fc67a0b69a34df566c1ae3d00f5ab",
   "patches_sha256": {
     "nixl-mnnvl-only.patch": "1f4f0751dba74af4e58ed0db3ccc12dc7a42090e104b3fd2495ce48dc65a6626",
-    "ucx-mnnvl-fabric-detection.patch": "dac1317d211847b5b948011d7664487b05700600aa31916cc7629ddb92a6cf25"
+    "ucx-mnnvl-fabric-detection.patch": "3d6f9a31aca61b8a0389d5b34a7044b6c3b5fc14cff81f3a650a5224050e9878"
   },
   "status": "EXPERIMENTAL_SOURCE_PATCHES_NOT_NATIVE_OR_HARDWARE_QUALIFICATION",
   "ucx_base": "65e342a82dd2609a28c8c2b8c45ed7fe2cb33fa0"
