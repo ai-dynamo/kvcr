@@ -287,6 +287,44 @@ def test_decoder_accepts_closed_source_ranges_on_failed_results(scenario):
     validate(compact_failed_events(), scenario, 1)
 
 
+@pytest.mark.parametrize("schema", [1, 2, 3])
+def test_decoder_rejects_duplicate_returned_operation(schema):
+    events = compact_failed_events()
+    for event in events:
+        event["schema_version"] = schema
+    validate(events, "failure", 1)
+    result = next(e for e in events if e["name"] == "op.completion_returned")
+    events.append(dict(result))
+    with pytest.raises(AssertionError, match="duplicate returned operation"):
+        validate(events, "failure", 2)
+
+
+@pytest.mark.parametrize("schema", [1, 2, 3])
+@pytest.mark.parametrize("identity", ["trace", "instance", "duplicate"])
+def test_decoder_requires_distinct_caller_lifecycles(schema, identity):
+    events, second = compact_failed_events(), compact_failed_events()
+    fields = ("source_op_id", "pin_id")
+    fields += (
+        ("instance_lo", "target_incarnation_lo")
+        if identity == "instance"
+        else ("trace_id", "hint_trace_id", "op_handle")
+    )
+    for event in second:
+        for field in fields:
+            if event.get(field):
+                event[field] += 100
+    if identity == "duplicate":
+        next(e for e in second if e["name"] == "op.completion_returned")["trace_id"] = 3
+    events.extend(second)
+    for event in events:
+        event["schema_version"] = schema
+    if identity == "duplicate":
+        with pytest.raises(AssertionError, match="duplicate caller lifecycle"):
+            validate(events, "failure", 2)
+    else:
+        validate(events, "failure", 2)
+
+
 @pytest.mark.parametrize("scenario", ["zero", "failure", "timeout"])
 @pytest.mark.parametrize("name", ["source.write", "source.pin.wait"])
 def test_decoder_rejects_missing_source_ranges_on_failed_results(scenario, name):

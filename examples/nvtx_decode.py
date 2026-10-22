@@ -163,6 +163,13 @@ def validate(events, scenario, operations):
             assert event["session_known"] == event["parent_session_known"] == 0
     returned = named.get("op.completion_returned", [])
     assert len(returned) == operations, (len(returned), operations)
+    assert len({operation_key(result) for result in returned}) == operations, (
+        "duplicate returned operation"
+    )
+    assert (
+        len({tuple(result[field] for field in _IDENTITY) for result in returned})
+        == operations
+    ), "duplicate caller lifecycle"
     expected = {"success": 2, "partial": 3, "zero": 4, "failure": 4, "timeout": 4}[
         scenario
     ]
