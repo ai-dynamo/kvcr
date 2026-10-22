@@ -199,6 +199,11 @@ def validate(events, scenario, operations):
         assert all(
             branch[field] == result[field] for field in ("instance_hi", "instance_lo")
         ), "hint branch and caller use different tracer instances"
+        assert all(
+            event[field] == reference[field]
+            for event, reference in ((queued[0], result), (received[0], branch))
+            for field in _IDENTITY
+        ), "mismatched target lifecycle"
         hint_id = branch.get("hint_trace_id", 0)
         assert hint_id, "missing hint trace identity"
 

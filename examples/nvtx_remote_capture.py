@@ -170,9 +170,8 @@ def run(args):
         )
         target.start()
         target_child.close()
-        assert target_pipe.poll(max(120, (args.warmup + args.iterations) * 30)), (
-            "target timed out"
-        )
+        timeout = (args.warmup + args.iterations) * (30 + args.poll_delay_ms / 1000)
+        assert target_pipe.poll(max(120, timeout)), "target timed out"
         result = target_pipe.recv()
         target.join(30)
         assert target.exitcode == 0, target.exitcode

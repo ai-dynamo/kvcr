@@ -120,6 +120,7 @@ def capture_events():
         )
     ]
     events[0].update(trace_id=9, hint_trace_id=20)
+    events[1]["trace_id"] = 9
     hint = dict(
         common,
         trace_id=20,
@@ -446,4 +447,16 @@ def test_decoder_rejects_missing_context_association(damage):
     else:
         events[-1]["instance_lo"] += 1
     with pytest.raises(AssertionError, match="request context"):
+        validate(events, "failure", 1)
+
+
+@pytest.mark.parametrize("schema", [1, 2, 3])
+@pytest.mark.parametrize("name", ["op.completion_queued", "target.write_done.received"])
+@pytest.mark.parametrize("field", ["instance_hi", "instance_lo", "trace_id"])
+def test_decoder_rejects_mismatched_target_lifecycle(schema, name, field):
+    events = compact_failed_events()
+    for event in events:
+        event["schema_version"] = schema
+    next(e for e in events if e["name"] == name)[field] += 1
+    with pytest.raises(AssertionError, match="mismatched target lifecycle"):
         validate(events, "failure", 1)
