@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: KVCR vLLM E2E
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Published KVCR image reference, preferably pinned by digest
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: Qwen/Qwen3-0.6B
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Published KVCR image reference, preferably pinned by digest
+        required: true
+        type: string
+      model:
+        required: true
+        type: string
+        default: Qwen/Qwen3-0.6B
+
+permissions:
+  contents: read
+
+jobs:
+  peer-transfer:
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: ${{ inputs.image }}
+    timeout-minutes: 30
+    env:
+      HF_HOME: /scratch/huggingface
+      VLLM_CACHE_ROOT: /scratch/vllm
+      XDG_CACHE_HOME: /scratch/cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show NVIDIA devices
+        run: nvidia-smi
+      - name: Verify cross-rank KVCR reuse
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+          KVCR_TEST_IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          python3 -u tests/e2e/run_vllm_kvcr.py --model "$MODEL"
+      - name: Save serving logs and responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcr-vllm-e2e-${{ github.run_attempt }}
+          path: e2e-artifacts/
+          retention-days: 7

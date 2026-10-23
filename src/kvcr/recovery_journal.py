@@ -107,14 +107,20 @@ def _is_recoverable(record: _BlockRecord) -> bool:
     """
     local_dram = record.local_dram
     return record.g3 is not None or (
-        local_dram is not None and local_dram.state is _LocalDramState.READY
+        local_dram is not None
+        and local_dram.state is _LocalDramState.READY
+        and not local_dram.pending_labels
     )
 
 
 def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
     g3 = record.g3.slot if record.g3 is not None else None
     local_dram = record.local_dram
-    if local_dram is None or local_dram.state is not _LocalDramState.READY:
+    if (
+        local_dram is None
+        or local_dram.state is not _LocalDramState.READY
+        or local_dram.pending_labels
+    ):
         return _RecoveryBlock(g3=g3, position=record.position)
     return _RecoveryBlock(g2=local_dram.slots, g3=g3, position=record.position)
 
@@ -328,14 +334,13 @@ class _RecoveryMirror:
         self._records: dict[BlockKey, _BlockRecord] = {}
 
     def apply(self, record_type: int, key: bytes, payload: bytes) -> None:
-        # Taken so a frame can be applied as it is read; the type is refused
-        # where frames are published and read, not again here.
-        del record_type
+        block_key = BlockKey(key)
         try:
+            if record_type != _RECORD_BLOCK:
+                raise ValueError(f"unknown recovery record type: {record_type}")
             record = _decode_recovery_record(payload, self._pool_names)
         except (TypeError, ValueError, msgspec.DecodeError) as error:
             raise RecoveryMirrorError("recovery record is malformed") from error
-        block_key = BlockKey(key)
         if record.local_dram is None and record.g3 is None:
             self._records.pop(block_key, None)
         else:
@@ -345,16 +350,22 @@ class _RecoveryMirror:
         """Take a closed core's records as this mirror's state, canonicalized in place.
 
         In place because rebuilding costs a second copy of the set per million
-        blocks. Canonicalizing is required: a half-written G2 slot would otherwise be
-        seated as READY.
+        blocks. Only complete residencies survive; writer ownership does not.
         """
         stale = []
         for key, record in records.items():
             local_dram = record.local_dram
             if local_dram is not None:
-                if local_dram.state is not _LocalDramState.READY:
+                if (
+                    local_dram.state is not _LocalDramState.READY
+                    or local_dram.pending_labels
+                ):
                     record.local_dram = None
                 else:
+                    local_dram.pending_deposits = 0
+                    local_dram.writers.clear()
+                    local_dram.remote_indices = None
+                    local_dram.remote_cancelled = False
                     local_dram.claim_count = 0
                     local_dram.retire_on_release = False
                     # References name the previous agent, unlike the slot layout.
@@ -388,12 +399,13 @@ def _attach_journal(
     """Attach stable G2/G3 residency publication to one journal."""
     enabled = True
 
-    def publish_frame(record_type: int, key: bytes, payload: bytes) -> None:
+    def publish(key: BlockKey, record: _BlockRecord) -> None:
         nonlocal enabled
         if not enabled:
             return
+        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
         try:
-            if not journal.publish(record_type, key, payload):
+            if not journal.publish(_RECORD_BLOCK, bytes(key), payload):
                 logger.warning(
                     "KVCR recovery publication disabled after a rejected frame"
                 )
@@ -403,11 +415,6 @@ def _attach_journal(
             enabled = False
             with suppress(Exception):
                 journal.invalidate()
-
-    def publish(key: BlockKey, record: _BlockRecord) -> None:
-        # TODO: Publish per-tier deltas if full-record journal traffic is material.
-        recovered = _project_recovery_record(record)
-        publish_frame(_RECORD_BLOCK, bytes(key), _RECOVERY_ENCODER.encode(recovered))
 
     if g3 is not None:
         g3.observe_residency(publish)

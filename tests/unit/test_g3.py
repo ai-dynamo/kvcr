@@ -159,6 +159,7 @@ def _new_g3_kvcr(
     policy=None,
     slot_count=1,
     g3_slot_count=2,
+    g3_capacity_bytes_per_file=None,
     control=None,
     telemetry=False,
     key_adapter=None,
@@ -181,7 +182,11 @@ def _new_g3_kvcr(
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
             paths=((tmp_path / "g3.data",) if g3_paths is None else tuple(g3_paths)),
-            capacity_bytes_per_file=page_size * g3_slot_count,
+            capacity_bytes_per_file=(
+                page_size * g3_slot_count
+                if g3_capacity_bytes_per_file is None
+                else g3_capacity_bytes_per_file
+            ),
             backend="MOCK",
             backend_options={"threads": "2"},
         ),
@@ -295,11 +300,19 @@ def test_g3_rejects_hard_linked_paths_and_releases_the_first_lock(
     path.touch()
     os.link(path, alias)
 
+    capacity = 3 * page_size - 1
     with pytest.raises(ValueError, match="must not alias the same file"):
-        _new_g3_kvcr(tmp_path, local, g3_paths=(path, alias))
+        _new_g3_kvcr(
+            tmp_path, local, g3_paths=(path, alias), g3_capacity_bytes_per_file=capacity
+        )
 
-    # A new controller can lock it only if failure cleanup closed the owner FD.
-    assert _new_g3_kvcr(tmp_path, local, g3_paths=(path,))._core._g3 is not None
+    # Reopening with the same budget checks rounded size and failure cleanup.
+    assert (
+        _new_g3_kvcr(
+            tmp_path, local, g3_paths=(path,), g3_capacity_bytes_per_file=capacity
+        )._core._g3
+        is not None
+    )
 
 
 def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
@@ -321,7 +334,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         local,
         agent=agent,
         g3_paths=paths,
-        g3_slot_count=2,
+        g3_capacity_bytes_per_file=3 * page_size - 1,
         framework_regions=[
             _buffer_region(primary, page_size),
         ],
@@ -340,6 +353,13 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     ]
     g3 = kvcr._core._g3
     assert g3 is not None
+    assert all(path.stat().st_size == 2 * page_size for path in paths)
+    file_descriptors = next(
+        descriptors
+        for descriptors, mem_type in agent.registrations
+        if mem_type == "FILE"
+    )
+    assert [size for _, size, _, _ in file_descriptors] == [2 * page_size] * len(paths)
     first_fd, second_fd = g3._direct_fds
     locations = []
     for key in keys[:4]:
@@ -386,6 +406,14 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     assert replacement_destination.raw == payloads[4]
 
 
+def test_g3_rejects_capacity_smaller_than_one_slot(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size)
+    with pytest.raises(ValueError, match="at least one complete slot"):
+        _new_g3_kvcr(tmp_path, local, g3_capacity_bytes_per_file=page_size - 1)
+    assert not (tmp_path / "g3.data").exists()
+
+
 @pytest.mark.parametrize("policy", [G3FIFOPolicy(), G3LRUPolicy()], ids=["fifo", "lru"])
 def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     tmp_path,
@@ -402,7 +430,8 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         local,
         agent=agent,
         policy=policy,
-        g3_slot_count=3,
+        g3_paths=tuple(tmp_path / f"g3-{i}.data" for i in range(3)),
+        g3_capacity_bytes_per_file=2 * page_size - 1,
         framework_regions=[
             _buffer_region(primary, page_size),
         ],
@@ -419,7 +448,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
         },
     )
     # _free_slots is the allocator's free list: recovery must rebuild it as the
-    # complement of the adopted slots without disturbing the records themselves.
+    # complement of the adopted slots, excluding the unused tails in each file.
     assert tuple(g3._free_slots) == (1,)
     assert kvcr._core._block_record_map[first].g3 == _G3Residency(0)
     assert kvcr._core._block_record_map[second].g3 == _G3Residency(2)
@@ -468,7 +497,12 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
     """Duplicate or out-of-range recovered slots are refused and none adopted."""
     page_size = os.sysconf("SC_PAGE_SIZE")
     local = ctypes.create_string_buffer(page_size)
-    kvcr = _new_g3_kvcr(tmp_path, local, g3_slot_count=4)
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        g3_paths=(tmp_path / "first.data", tmp_path / "second.data"),
+        g3_capacity_bytes_per_file=3 * page_size - 1,
+    )
     g3 = kvcr._core._g3
     assert g3 is not None
 
@@ -481,6 +515,7 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
         )
 
     assert kvcr._core._block_record_map == {}
+    assert tuple(g3._free_slots) == (0, 1, 2, 3)
 
 
 @pytest.mark.parametrize("slots", [[("", 0), ("", 1)], [(":part", 0)]])
@@ -849,8 +884,10 @@ def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
 
+@pytest.mark.parametrize("queued_deposit", [False, True])
 def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     tmp_path,
+    queued_deposit,
 ) -> None:
     class _StuckReadAgent(_FakeG3Agent):
         """Keep a G3 read in flight so its fill is abandoned, not resolved."""
@@ -879,6 +916,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     local = ctypes.create_string_buffer(page_size * 2)
     first, second = BlockKey(b"first"), BlockKey(b"second")
     third, other_key = BlockKey(b"third"), BlockKey(b"other")
+    fourth = BlockKey(b"fourth")
     agent = _StuckReadAgent()
     policy = _MoveLocalToG3Policy()
     kvcr = _new_g3_kvcr(
@@ -887,26 +925,42 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
         agent=agent,
         policy=policy,
         slot_count=2,
+        g3_slot_count=4,
         framework_regions=[_buffer_region(primary, page_size)],
     )
 
     assert _deposit(kvcr, first, 0).success
     assert _deposit(kvcr, second, 1).success
     assert _deposit(kvcr, third, 0).success
+    assert _deposit(kvcr, fourth, 0).success
     _poll_until(kvcr, lambda _: kvcr._core._block_record_map[first].g3 is not None)
-    policy.move = False  # later evictions drop instead of spilling
+    policy.move = queued_deposit
 
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
     fetch = kvcr.fetch((first,))
+    if queued_deposit:
+        # Public claims hold both spill victims until the waiters are queued.
+        hold = kvcr.fetch((third,))
+        claim = dict(kvcr.poll_completed())[hold][third].release_handle
+        now[0] = 0.5
+        other = kvcr.fetch((second,))
+        deposit = kvcr.deposit({first: [_mem_descriptor(0)]})
+        _poll_until(kvcr, lambda _: kvcr._core._block_record_map[third].g3 is not None)
+        kvcr.release((claim,))
+        hold = kvcr.fetch((fourth,))
+        claim = dict(kvcr.poll_completed())[hold][fourth].release_handle
+        _poll_until(kvcr, lambda _: kvcr._core._block_record_map[fourth].g3 is not None)
     _poll_until(
         kvcr,
         lambda _: any(
             agent.xfers[handle - 1][0] == "READ" for handle in agent.transfers
         ),
     )
-    native_handle = agent.transfers[-1]
-    now[0] = 100.0
+    native_handle = next(
+        handle for handle in agent.transfers if agent.xfers[handle - 1][0] == "READ"
+    )
+    now[0] = 1.1
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert not result[fetch][first].success
 
@@ -920,6 +974,20 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     # The abandoned fill still owns the slot, so the retry waits for it.
     retry = kvcr.fetch((first,))
     assert retry not in dict(kvcr.poll_completed())
+    if queued_deposit:
+        # Finishing the second spill must not fail the queued deposit early.
+        kvcr.release((claim,))
+        completed = kvcr.poll_completed()
+        agent.stuck = False
+        assert completed == []
+        completed = dict(
+            _poll_until(kvcr, lambda done: {other, deposit, retry} <= dict(done).keys())
+        )
+        assert completed[deposit][first].success
+        assert completed[other][second].success
+        assert completed[retry][first].release_handle is not None
+        assert local.raw == primary.raw
+        return
     # An unrelated spill must not fail this retry or be blocked behind it.
     policy.move = True
     other = kvcr.deposit({other_key: [_mem_descriptor(0)]})

@@ -26,7 +26,12 @@ from .config import (
 )
 from .hint_parser import _KVFetchHint
 from .local_disk import _G3, _G3Residency
-from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
+from .local_dram import (
+    _layout_indices,
+    _LocalDram,
+    _LocalDramResidency,
+    _LocalDramState,
+)
 from .policy import G3LRUPolicy, LRUPolicy
 from .policy_runtime import _PolicyInvoker
 from .progress import (
@@ -244,6 +249,8 @@ class _KVCRCore:
         # Serialize caller metadata transactions with progress-side source claims.
         self._state_lock = threading.RLock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
+        # Preserve remote selections until a successful fetch or discard_hint().
+        self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
@@ -433,7 +440,18 @@ class _KVCRCore:
         )
 
     def discard_hint(self, request_id: str) -> None:
+        self._remote_delivery_keys.pop(request_id, None)
         self._remote_fw_dram.discard_hint(request_id)
+
+    def _has_complete_local(self, key: BlockKey) -> bool:
+        record = self._block_record_map.get(key)
+        residency = record.local_dram if record is not None else None
+        return (
+            residency is not None
+            and residency.state is _LocalDramState.READY
+            and not residency.pending_labels
+            and len(residency.slots) == len(residency.key_layout)
+        )
 
     # TODO(kvcr-g3): Prefer REMOTE_G2 over G3 in query/fetch/deliver once one
     # operation can fall back between both sources.
@@ -445,11 +463,33 @@ class _KVCRCore:
         """Return the best available local or remote path for each key.
 
         Exact hint membership is used unless opportunistic querying is enabled.
+        Usable remote selections persist until successful fetch or discard_hint.
         """
         statuses = []
+        remote_keys = self._remote_delivery_keys.get(request_id, ())
         for key in keys:
             record = self._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
+            if key in remote_keys:
+                fetching_locally = (
+                    residency is not None
+                    and residency.state is _LocalDramState.FILLING
+                    and any(
+                        op_id[0] == "fetch"
+                        and (op := self._local_dram._pending_residency_ops.get(op_id))
+                        is not None
+                        and op.request_id == request_id
+                        and key not in op.results
+                        for op_id in record.active_op_ids
+                    )
+                )
+                if not fetching_locally:
+                    if self._remote_fw_dram.query(key, request_id):
+                        statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
+                        continue
+                    if not self._has_complete_local(key):
+                        statuses.append((QueryStatus.MISS, None))
+                        continue
             if residency is not None and residency.state is _LocalDramState.READY:
                 statuses.append((QueryStatus.HIT, CacheTier.LOCAL_G2))
             elif residency is not None and residency.state is _LocalDramState.FILLING:
@@ -459,6 +499,11 @@ class _KVCRCore:
             # Remote hints are request-scoped and advisory, not block residency.
             elif request_id is not None and self._remote_fw_dram.query(key, request_id):
                 statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
+                if not remote_keys:
+                    remote_keys = self._remote_delivery_keys.setdefault(
+                        request_id, set()
+                    )
+                remote_keys.add(key)
             else:
                 statuses.append((QueryStatus.MISS, None))
         if self._query_diagnostics is not None:
@@ -503,8 +548,12 @@ class _KVCRCore:
                 record.last_access = timestamp
                 if record.position != position:
                     record.position = position
-                    tier = local_dram if record.local_dram is not None else g3
-                    tier._residency_observer(key, record)
+                    residency = record.local_dram
+                    if record.g3 is not None or (
+                        residency is not None and not residency.pending_labels
+                    ):
+                        tier = local_dram if residency is not None else g3
+                        tier._residency_observer(key, record)
                 size_bytes = (
                     local_dram._size_bytes(record.local_dram)
                     if record.local_dram is not None
@@ -547,8 +596,14 @@ class _KVCRCore:
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 g3_blocks: dict[BlockKey, _TransferRef] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                remote_keys = self._remote_delivery_keys.get(request_id, ())
                 for key, destination in normalized.items():
-                    if self._is_local_resident(key):
+                    if key in remote_keys and (
+                        not self._has_complete_local(key)
+                        or self._remote_fw_dram.query(key, request_id)
+                    ):
+                        remote_blocks[key] = destination
+                    elif self._is_local_resident(key):
                         local_blocks[key] = destination
                     elif self._g3 is not None and self._g3.is_ready(key):
                         g3_blocks[key] = destination[0]
@@ -599,7 +654,10 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[MemoryRef]],
         no_evict: bool = False,
         hints: object | None = None,
+        *,
+        expected_layout: list[str] | None = None,
     ) -> OpHandle:
+        declaration = self._validate_expected_layout(expected_layout)
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         if self._local_dram is not None:
@@ -607,6 +665,23 @@ class _KVCRCore:
                 key: self._normalize_descriptors(descriptors)
                 for key, descriptors in blocks.items()
             }
+            if declaration is not None:
+                local_layout = list(declaration)
+                indices = {}
+                for index, label in enumerate(local_layout):
+                    indices[label] = None if label in indices else index
+                if any(
+                    _layout_indices(
+                        local_layout,
+                        [ref.label for ref in refs],
+                        indices_by_label=indices,
+                    )
+                    is None
+                    for refs in blocks.values()
+                ):
+                    raise ValueError(
+                        "deposit pieces must belong to the local key layout"
+                    )
         with self._state_lock:
             if self._local_dram is None:
                 self._complete(
@@ -619,6 +694,7 @@ class _KVCRCore:
                     blocks,
                     no_evict=no_evict,
                     hints=hints,
+                    key_layout=declaration,
                 )
         return op_handle
 
@@ -629,10 +705,10 @@ class _KVCRCore:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        expected_layout = [""] if expected_layout is None else list(expected_layout)
-        self._validate_block_layout(
-            expected_layout, "expected layout must use configured pools"
+        declaration = self._validate_expected_layout(
+            [""] if expected_layout is None else expected_layout
         )
+        requested = list(declaration)
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         local_dram = self._local_dram
@@ -647,7 +723,12 @@ class _KVCRCore:
 
             sources = {}
             for key in ordered_keys:
-                if self._is_local_resident(key):
+                record = self._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if (
+                    residency is not None
+                    and residency.ready_indices(requested) is not None
+                ):
                     continue
                 if self._g3 is not None and self._g3.is_ready(key):
                     sources[key] = CacheTier.G3
@@ -663,7 +744,8 @@ class _KVCRCore:
                 request_id,
                 deadline,
                 hints=hints,
-                layout=expected_layout,
+                layout=requested,
+                key_layout=declaration,
             )
             for source in (CacheTier.G3, CacheTier.REMOTE_G2):
                 self._start_local_fill(
@@ -790,6 +872,7 @@ class _KVCRCore:
             raise progress_error
 
     def _close_main_resources(self) -> None:
+        self._remote_delivery_keys.clear()
         # Every stage runs even if an earlier one failed: skipping the rest
         # would leak files and pins for a failure that says nothing about them.
         first_error: BaseException | None = None
@@ -985,12 +1068,14 @@ class _KVCRCore:
         keys: Collection[BlockKey],
         *,
         notify_capacity: bool = True,
+        allow_filling: bool = False,
     ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
                 tuple(key for key in keys if key not in sources),
                 notify_capacity=notify_capacity,
+                allow_filling=allow_filling,
             )
             if claimed:
                 sources.update(claimed)
@@ -1062,7 +1147,14 @@ class _KVCRCore:
         if self._g3 is not None and (len(descriptors) != 1 or labels):
             raise ValueError("G3 does not support multi-block layouts or part labels")
 
-    def _validate_block_layout(self, layout: list[str], invalid_message: str) -> None:
+    def _validate_expected_layout(
+        self, layout: list[str] | None
+    ) -> tuple[str, ...] | None:
+        if layout is None:
+            return None
+        if any(not isinstance(label, str) for label in layout):
+            raise ValueError("expected layout labels must be strings")
+        invalid_message = "expected layout must include configured local pools"
         if not layout:
             raise ValueError(invalid_message)
         labels = set()
@@ -1076,6 +1168,8 @@ class _KVCRCore:
                 labels.add(label)
         if self._g3 is not None and (len(layout) != 1 or labels):
             raise ValueError("G3 does not support multi-block layouts or part labels")
+
+        return tuple(layout)
 
     def _release_local_dram_sources(
         self,

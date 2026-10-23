@@ -114,9 +114,9 @@ Framework-owned memory and KVCR-owned memory use different residency types. Fram
 
 Residency state and operation state are deliberately disjoint. A `BlockRecord` does not embed or own operation lifecycle state; it only keeps references to related operation IDs when needed. The progress thread's polymorphic `in_flight_ops` collection owns the operations it advances and their progress-side lifecycle; each operation type defines how completion affects its resources. This lets block lookup remain stable while operations are created, coalesced, completed, cancelled, or removed independently.
 
-Ready, unclaimed KVCR-owned residencies are tracked by a policy-scored eviction queue, while available pool slots are tracked separately for allocation. Auxiliary structures may support completion polling, pins that cover multiple keys, and reuse of established peer connections.
+Complete, unclaimed KVCR-owned residencies are tracked by a policy-scored eviction queue, while available pool slots are tracked separately for allocation. Auxiliary structures may support completion polling, pins that cover multiple keys, and reuse of established peer connections.
 
-Claims are attached to concrete residencies. They prevent KVCR-owned memory from being evicted while in use and keep framework-owned memory pinned until all dependent operations finish. Concurrent operations may share existing residencies, pins, or in-flight work; cancellation of one caller must not invalidate resources still needed by another. When an operation needs a KVCR residency that is currently evictable, the KVCR removes it from the evictable queue and acquires a claim before using it, making it non-evictable. After the last claim is released, a ready residency that is still retained returns to the evictable queue; otherwise its KVCR-owned memory is freed.
+Claims are attached to concrete residencies. They prevent KVCR-owned memory from being evicted while in use and keep framework-owned memory pinned until all dependent operations finish. Concurrent operations may share existing residencies, pins, or in-flight work; cancellation of one caller must not invalidate resources still needed by another. When an operation needs a KVCR residency that is currently evictable, the KVCR removes it from the evictable queue and acquires a claim before using it, making it non-evictable. After the last claim is released, complete retained residencies become evictable; incomplete retained residencies stay allocated and non-evictable. Discarded or wholly uncommitted residencies are freed.
 
 ### Asynchronous Execution
 
@@ -158,7 +158,7 @@ kvcr = KVCR(
     config=config,
 )
 
-kvcr.deposit(blocks, no_evict=False, hints=None, callback=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
+kvcr.deposit(blocks, no_evict=False, hints=None, callback=None, *, expected_layout=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
 kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion includes per-key status, locations, and a release handle
 kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemoryRef]]
@@ -188,6 +188,8 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 `deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
+Partial deposits use `expected_layout` to declare the full, fixed key layout. Immutable named pieces can be deposited across calls and delivered as they become ready. Incomplete keys remain non-evictable; only complete keys are recovered and advertised to the router.
+
 `fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
 `align_sequence` lets the framework supply sequence order and align the recency of ready blocks in KVCR-managed storage. It uses the newest access time among those blocks, or the current time when `use_current_time=True`. Missing or non-ready blocks are ignored. Alignment does not increment access counts or reserve residency.
@@ -199,12 +201,13 @@ The tradeoff is backpressure: when policy cannot free enough capacity—for exam
 **Block availability query**
 
 When the framework asks the KVCR whether a block is available, the KVCR responds with one of:
-- `HIT(tier)` — locally available at the reported tier at the time of the query
+- `HIT(tier)` — locally available at the reported tier at the time of the query (with partial deposits, some pieces may still be pending)
 - `FETCHING(destination_tier)` — a fetch into the reported tier is in progress
 - `FETCHABLE(source_tier)` — not started, but the KVCR knows a source tier
 - `MISS(None)` — not found in any tier the KVCR currently knows about
 
 These statuses describe current KVCR knowledge, not a reservation or guarantee. A local DRAM `HIT` may be evicted before a later operation claims it, and a `FETCHABLE` result for peer DRAM means a request-scoped router hint identifies a peer KVCR that may source the block. The peer may ultimately serve it from KVCR-owned or pinned framework-owned DRAM; actual readability is confirmed only when the transfer and any required `request_pin` succeed. Framework-owned HBM can follow the same path if a deployment exposes GPU KV through the pin API. The framework may use the query result to decide whether to issue either call. To obtain the data, the framework calls `fetch` or `deliver` and waits for completion; either operation may return an error.
+A remote `FETCHABLE` result also records a source preference for later deliveries of that key within the request.
 
 `query` is fast and non-blocking because it reads local KVCR knowledge rather than calling the router. Remote source information arrives through `submit_hint`. If a two-step `query` is enabled, it may enqueue a configured object-store existence check, but it does not allocate memory, acquire pins, change residency, or start a transfer. After the first `MISS`, the framework can issue a follow-up `query` to get an updated evaluation.
 

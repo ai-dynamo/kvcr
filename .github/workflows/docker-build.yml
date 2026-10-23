@@ -1,0 +1,162 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Docker Build
+
+on:
+  # copy-pr-bot mirrors trusted PR commits to pull-request/<number> branches.
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+    paths:
+      - .github/workflows/docker-build.yml
+      - .github/workflows/vllm-e2e.yml
+      - Dockerfile.ci
+      - pyproject.toml
+      - src/**
+      - tests/e2e/**
+  # Manual runs can override the base image, Dynamo version, and KVCR ref.
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: vLLM image reference (nightly or PR image)
+        required: true
+        type: string
+        default: vllm/vllm-openai:nightly
+      dynamo_version:
+        description: Dynamo wheel version, or nightly for the latest prerelease
+        required: true
+        type: string
+        default: nightly
+      kvcr_ref:
+        description: KVCR ref to test (optional; e.g. refs/pull/23/merge)
+        required: false
+        type: string
+
+concurrency:
+  # Runs for the same PR branch cancel each other.
+  group: docker-build-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 45
+    env:
+      AWS_DEFAULT_REGION: us-west-2
+      ECR_REGISTRY: 210086341041.dkr.ecr.us-west-2.amazonaws.com
+      ECR_REPOSITORY: ai-dynamo/kvcr
+      BUILDER_NAME: kvcr-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      image: ${{ steps.published.outputs.image }}
+      image_tag: ${{ steps.source.outputs.image_tag }}
+    steps:
+      - name: Check out CI recipe
+        uses: actions/checkout@v4
+
+      - name: Check out KVCR source to test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.kvcr_ref || github.sha }}
+          path: kvcr-source
+
+      - name: Inspect build environment
+        run: |
+          docker buildx version
+          aws --version
+          df -h
+
+      # Credentials come from the runner's IRSA role. buildx forwards them to the
+      # remote BuildKit pod, which performs the push.
+      - name: Log in to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      # Route the build to the shared BuildKit service. KVCR is built on top of a
+      # vLLM image, so it uses the vllm flavor (and its layer cache pool).
+      # TODO: pin to a merged commit SHA once ai-dynamo/.github#9 lands.
+      - name: Initialize shared BuildKit builder
+        id: builder
+        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@e8cb76eeca91bbac2ab5c2702bd8bd629b20dd3a
+        with:
+          builder_name: ${{ env.BUILDER_NAME }}
+          flavor: vllm
+          arch: linux/amd64
+          namespace: buildkit
+
+      - name: Resolve build inputs
+        id: source
+        shell: bash
+        env:
+          BASE_IMAGE: ${{ inputs.base_image || 'vllm/vllm-openai:nightly' }}
+        run: |
+          set -euo pipefail
+          kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
+          # Resolve the base tag to an immutable digest with a registry query; the
+          # builder has no docker daemon, so nothing is pulled locally. BuildKit
+          # pulls the base layers itself.
+          base_digest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')
+          base_name="${BASE_IMAGE%%@*}"
+          if [[ "${base_name##*/}" == *:* ]]; then
+            base_name="${base_name%:*}"
+          fi
+          base_image="${base_name}@${base_digest}"
+          image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}"
+          printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\n' \
+            "$kvcr_sha" "$base_image" "$image_tag" >> "$GITHUB_OUTPUT"
+
+      # Built on the shared BuildKit builder and pushed straight to ECR; nothing
+      # is loaded into a local docker daemon (the runner is a thin client without
+      # one).
+      - name: Build and publish integration image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ env.BUILDER_NAME }}
+          context: ./kvcr-source
+          file: Dockerfile.ci
+          platforms: linux/amd64
+          push: true
+          load: false
+          tags: ${{ steps.source.outputs.image_tag }}
+          build-args: |
+            VLLM_IMAGE=${{ steps.source.outputs.base_image }}
+            DYNAMO_VERSION=${{ inputs.dynamo_version || 'nightly' }}
+            KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
+
+      - name: Record published image
+        id: published
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          : "${IMAGE_DIGEST:?Build did not return a published image digest}"
+          image="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          {
+            printf 'Published tag: `%s`\n\n' "$IMAGE_TAG"
+            printf 'Image for downstream tests: `%s`\n' "$image"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove builder configuration
+        if: always() && (steps.builder.outcome == 'success' || steps.builder.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          if docker buildx inspect "$BUILDER_NAME" > /dev/null 2>&1; then
+            docker buildx rm "$BUILDER_NAME"
+          fi
+
+  e2e:
+    needs: build
+    uses: ./.github/workflows/vllm-e2e.yml
+    with:
+      image: ${{ needs.build.outputs.image }}

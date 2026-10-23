@@ -134,22 +134,13 @@ def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history
         hints={"priority": "test"},
     )
     _wait_until(lambda: len(agent.transfers) == 1)
-    filling_duplicate = kvcr.deposit({keys[0]: [_mem_descriptor()]})
     assert list(kvcr.poll_completed()) == []
-    assert len(agent.transfers) == 1
     assert policy.ingested == []
 
     agent.state = "DONE"
-    completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
-    assert completed == {
-        first: _op_entries({keys[0]: True, keys[1]: True}),
-        filling_duplicate: _op_entries({keys[0]: True}),
-    }
-    assert (
-        completed[first][keys[0]]
-        is completed[first][keys[1]]
-        is completed[filling_duplicate][keys[0]]
-    )
+    completed = _poll_until(kvcr, bool)
+    assert completed == [(first, _op_entries({keys[0]: True, keys[1]: True}))]
+    assert completed[0][1][keys[0]] is completed[0][1][keys[1]]
     assert local.raw == b"a" * block_size + b"b" * block_size
     assert events == [InventoryEvent(keys[:2], CacheTier.LOCAL_G2, False)]
     assert [(meta.block_key, source) for meta, source in policy.ingested] == [
@@ -192,6 +183,213 @@ def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history
         assert removal["reason"] == "capacity_eviction"
         assert removal["key_sha256"] == hashlib.sha256(keys[0]).hexdigest()
         assert {r["event"] for r in records} >= {"ready", "inventory_accepted"}
+
+
+def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(24)]
+    source = ctypes.create_string_buffer(
+        b"_" * 8 + b"a" * 8 + b"b" * 8 + b"c" * 8 + b"b" * 8
+    )
+    agent = FakeNixlAgent()
+    states = {}
+
+    def check_state(handle):
+        state = states.get(handle, "PROC")
+        if state == "ERR":
+            states[handle] = "DONE"
+        return state
+
+    monkeypatch.setattr(agent, "check_xfer_state", check_state)
+    kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
+    journal = Mock()
+    journal.publish.return_value = True
+    _attach_journal(kvcr._core._local_dram, journal)
+    events = []
+    kvcr._core._inventory_sink_callback = events.append
+    key = BlockKey(b"layered")
+    layout = ["swa:a", "swa:b", "swa:c"]
+    first = kvcr.deposit({key: [_mem_descriptor(0, "swa:a")]}, expected_layout=layout)
+    second = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+    duplicate = kvcr.deposit({key: [_mem_descriptor(3, "swa:b")]}, no_evict=True)
+    _wait_until(lambda: len(agent.transfers) == 2)
+    assert kvcr.poll_completed() == []
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_allocated_slots"] == 3
+    assert kvcr.query([key]) == [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
+
+    # b finishes while a is still copying; the duplicate reuses b without a DMA.
+    states[agent.transfers[1]] = "DONE"
+    completed = dict(_poll_until(kvcr, lambda done: len(done) == 2))
+    assert completed[second][key].success and completed[duplicate][key].success
+    claim = completed[duplicate][key].release_handle
+    assert claim is not None
+    assert len(agent.transfers) == 2
+    assert kvcr.query([key]) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    assert events == []
+    kvcr.align_sequence([key])
+    journal.publish.assert_not_called()
+    assert kvcr.release([claim]) == [(claim, True)]
+    # The earlier writer protects the key even after the public claim is released.
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
+    duplicate = kvcr.deposit({key: [_mem_descriptor(3, "swa:b")]}, no_evict=True)
+    claim = dict(kvcr.poll_completed())[duplicate][key].release_handle
+    assert claim is not None
+
+    pieces = [_mem_descriptor(i, f"swa:{part}") for i, part in enumerate("abc")]
+    third = kvcr.deposit({key: pieces})
+    _wait_until(lambda: len(agent.transfers) == 3)
+    assert agent.xfers[2][3][0] == agent.xfers[0][3][0]
+    assert len(agent.xfers[2][3]) == 2  # b is already committed; only a and c copy.
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_allocated_slots"] == 3
+    assert kvcr.poll_completed() == []
+    source[32:40] = b"\0" * 8
+    delivery = kvcr.deliver({key: [_mem_descriptor(3, "swa:b")]})
+    _wait_until(lambda: len(agent.transfers) == 4)
+    delivery_handle = agent.transfers[3]
+    _wait_until(lambda: source.raw[32:40] == b"b" * 8)
+
+    states[agent.transfers[2]] = "DONE"
+    assert dict(_poll_until(kvcr, bool))[third][key].success
+    assert events == [InventoryEvent((key,), CacheTier.LOCAL_G2, False)]
+    assert journal.publish.call_count == 1
+    mirror = _RecoveryMirror(("full", "swa"))
+    for call in journal.publish.call_args_list:
+        mirror.apply(*call.args)
+    recovered = mirror.take_records()[key].local_dram
+    assert recovered.slots == list(zip(layout, range(3)))
+    assert not recovered.pending_labels
+    published = journal.publish.call_count
+    states[agent.transfers[0]] = "ERR"
+    assert not dict(_poll_until(kvcr, bool))[first][key].success
+    assert journal.publish.call_count == published
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_allocated_slots"] == 3
+    # Complete the older delivery after all reserved pieces become ready.
+    states[delivery_handle] = "DONE"
+    assert dict(_poll_until(kvcr, bool))[delivery][key].success
+    source[8:32] = b"\0" * 24
+    delivery = kvcr.deliver({key: pieces})
+    _wait_until(lambda: len(agent.transfers) == 5)
+    states[agent.transfers[4]] = "DONE"
+    assert dict(_poll_until(kvcr, bool))[delivery][key].success
+    assert source.raw[8:32] == b"a" * 8 + b"b" * 8 + b"c" * 8
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
+    assert kvcr.release([claim]) == [(claim, True)]
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
+    for conflicting in (
+        list(reversed(layout)),
+        ["swa:a", "swa:b"],
+        layout + ["swa:d"],
+    ):
+        rejected = kvcr.deposit({key: pieces[:1]}, expected_layout=conflicting)
+        assert not dict(kvcr.poll_completed())[rejected][key].success
+    rejected = kvcr.deposit({key: [_mem_descriptor(0, "swa:unknown")]})
+    assert not dict(kvcr.poll_completed())[rejected][key].success
+    assert len(agent.transfers) == 5
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_failed_labelled_deposit_keeps_previous_parts(monkeypatch, timeout) -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(b"_" * 8 + b"a" * 8 + b"b" * 8)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
+    key = BlockKey(b"layered")
+    first = kvcr.deposit(
+        {key: [_mem_descriptor(0, "swa:a")]}, expected_layout=["swa:a", "swa:b"]
+    )
+    assert dict(_poll_until(kvcr, bool))[first][key].success
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    with monkeypatch.context() as patch:
+        if timeout:
+            patch.setattr(agent, "check_xfer_state", lambda handle: "PEND")
+        else:
+            patch.setattr(
+                agent,
+                "make_prepped_xfer",
+                Mock(side_effect=RuntimeError("submission failed")),
+            )
+        failed = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+        if timeout:
+            _wait_until(lambda: len(agent.transfers) == 2)
+            now = 5.0
+        assert not dict(_poll_until(kvcr, bool))[failed][key].success
+        if timeout:
+            assert agent.transfers[-1] not in agent.released_xfers
+            assert kvcr._core._local_dram.telemetry_state()["local_g2_free_slots"] == 1
+    agent.state = "DONE"
+    if timeout:
+        assert _poll_until(kvcr, lambda _: len(agent.released_xfers) == 2) == []
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
+    delivery = kvcr.deliver({key: [_mem_descriptor(1, "swa:a")]})
+    assert dict(_poll_until(kvcr, bool))[delivery][key].success
+    assert source.raw[16:24] == b"a" * 8
+    source[16:24] = b"b" * 8
+    retry = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+    assert dict(_poll_until(kvcr, bool))[retry][key].success
+    assert pools[1].raw == b"a" * 8 + b"b" * 8
+
+
+@pytest.mark.parametrize("case", ["pending", "retry"])
+def test_local_reads_wait_for_later_piece_and_release_claims(monkeypatch, case):
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(b"_" * 8 + b"a" * 8 + b"b" * 8)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    key = BlockKey(b"partial")
+    pieces = [_mem_descriptor(0, "swa:a"), _mem_descriptor(1, "swa:b")]
+    first = kvcr.deposit({key: pieces[:1]}, expected_layout=["swa:a", "swa:b"])
+    assert dict(_poll_until(kvcr, bool))[first][key].success
+    initial_transfers = len(agent.transfers)
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
+    assert kvcr.query([key]) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    other = BlockKey(b"other")
+    blocked = kvcr.deposit({other: pieces})
+    assert not dict(_poll_until(kvcr, bool))[blocked][other].success
+    agent.state = "PROC"
+    if case == "pending":
+        deposit = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+        _wait_until(lambda: len(agent.transfers) == initial_transfers + 1)
+    delivery = kvcr.deliver({key: [_mem_descriptor(0, "swa:b")]})
+    assert kvcr.poll_completed() == []
+    assert len(agent.transfers) == initial_transfers + int(case == "pending")
+    assert source.raw[8:16] == b"a" * 8
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
+    fetch = kvcr.fetch([key], expected_layout=["swa:a", "swa:b"])
+    assert kvcr.poll_completed() == []
+    now = 0.75
+    try:
+        if case == "retry":
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    agent, "make_prepped_xfer", Mock(side_effect=RuntimeError)
+                )
+                failed = kvcr.deposit({key: pieces[1:]})
+                completed = dict(_poll_until(kvcr, bool))
+                assert set(completed) == {failed}
+                assert not completed[failed][key].success
+        if case != "pending":
+            deposit = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+    finally:
+        agent.state = "DONE"
+    completed = dict(_poll_until(kvcr, lambda done: len(done) == 3))
+    assert completed[deposit][key].success and completed[delivery][key].success
+    fetched = completed[fetch][key]
+    assert fetched.success
+    assert fetched.descriptors == [
+        _mem_descriptor(0, "swa:a"),
+        _mem_descriptor(1, "swa:b"),
+    ]
+    assert source.raw[8:16] == b"b" * 8
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 0
+    assert kvcr.release([fetched.release_handle]) == [(fetched.release_handle, True)]
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 2
+    replacement = kvcr.deposit({other: pieces})
+    assert dict(_poll_until(kvcr, bool))[replacement][other].success
+    assert kvcr.query([key]) == [(QueryStatus.MISS, None)]
 
 
 def test_local_dram_rejects_overlapping_pools() -> None:
@@ -245,17 +443,29 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     assert local_dram._size_bytes(residency) == 32
     pool_counts = residency.pool_counts
     assert pool_counts == {"full": 1, "swa": 2}
-    wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
-    assert not dict(kvcr.poll_completed())[wrong_layout][first].success
+    duplicate = kvcr.deposit({first: descriptors})
+    assert kvcr._core._local_dram.telemetry_state()["local_g2_allocated_slots"] == 3
+    invalid_layout = ["swa:missing"] if labeled else layout[1:]
+    wrong_layout = kvcr.fetch((first,), expected_layout=invalid_layout)
+    early = dict(kvcr.poll_completed())
     agent.state = "DONE"
-    _poll_until(kvcr, lambda done: operation in dict(done))
+    assert set(early) == {wrong_layout}
+    assert not early[wrong_layout][first].success
+    done = dict(_poll_until(kvcr, lambda done: len(done) == 2))
+    assert done[operation][first].success and done[duplicate][first].success
+    assert len(agent.transfers) == 1
     assert full.raw + swa.raw == payload
-    wrong_layout = kvcr.fetch((first,), expected_layout=layout[1:])
+    duplicate = kvcr.deposit({first: descriptors[1:] + descriptors[:1]})
+    assert dict(kvcr.poll_completed())[duplicate][first].success is labeled
+    assert len(agent.transfers) == 1
+    wrong_layout = kvcr.fetch((first,), expected_layout=invalid_layout)
     assert not dict(kvcr.poll_completed())[wrong_layout][first].success
     claim = kvcr.fetch((first,), expected_layout=layout)
     result = dict(_poll_until(kvcr, lambda done: claim in dict(done)))[claim][first]
     assert result.success and result.release_handle is not None
     assert result.descriptors == descriptors
+    now = 0.0
+    kvcr._core._clock = lambda: now
     wrong = kvcr.deliver(
         {first: [_mem_descriptor(label="swa:missing" if labeled else "swa")]}
     )
@@ -290,9 +500,10 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
         assert dict(_poll_until(kvcr, bool))[partial][first].success
         assert source.raw == b"a" * 16 + b"c" * 8 + b"b" * 8
     else:
-        assert not dict(kvcr.poll_completed())[partial][first].success
-        kvcr.release([result.release_handle])
         agent.state = "DONE"
+        assert dict(_poll_until(kvcr, bool))[partial][first].success
+        assert source.raw == payload  # Repeated pools retain their original order.
+        kvcr.release([result.release_handle])
     assert kvcr._core._local_dram.telemetry_state()["local_g2_evictable_slots"] == 3
 
     source.raw = b"\x00" * len(source)
@@ -309,24 +520,24 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
 
 
 @pytest.mark.parametrize(
-    "requested,allow_subset,expected",
+    "requested,expected",
     [
-        (["", "swa:a", "swa", "swa"], False, [0, 1, 2, 3]),
-        (["swa:a", ""], True, [1, 0]),
-        (["swa"], True, None),
-        (["missing"], True, None),
-        (["", ""], True, None),
-        ([], True, None),
-        (["swa:a"], False, None),
+        (["", "swa:a", "swa", "swa"], [0, 1, 2, 3]),
+        (["swa:a", ""], [1, 0]),
+        (["swa", "swa"], [2, 3]),
+        (["swa", "swa", ""], None),
+        (["swa"], None),
+        (["missing"], None),
+        (["", ""], None),
+        ([], None),
     ],
 )
-def test_layout_matching_with_and_without_index(requested, allow_subset, expected):
+def test_layout_matching_with_and_without_index(requested, expected):
     for index in (None, {"": 0, "swa:a": 1, "swa": None}):
         assert (
             _layout_indices(
                 ["", "swa:a", "swa", "swa"],
                 requested,
-                allow_subset=allow_subset,
                 indices_by_label=index,
             )
             == expected
@@ -356,9 +567,13 @@ def test_failed_group_reservation_does_not_evict_a_partial_group() -> None:
     claim = completed[fetch][swa]
     assert claim.success
 
-    operation = kvcr.deposit({grouped: descriptors})
+    transfers = len(agent.transfers)
+    operation = kvcr.deposit(
+        {grouped: descriptors[:1]}, expected_layout=["full", "swa"]
+    )
     result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
     assert result[grouped].status is OpEntryStatus.FAILED
+    assert len(agent.transfers) == transfers
     assert kvcr.query((full, swa)) == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
@@ -745,6 +960,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     assert fetch_result.descriptors == [_mem_descriptor()]
     fetch_claim = fetch_result.release_handle
     assert fetch_claim is not None
+    assert policy.scored == []
 
     ready_fetch = kvcr.fetch((first_key,))
     ready_fetch_result = dict(kvcr.poll_completed())[ready_fetch][first_key]
@@ -784,7 +1000,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         (meta.access_count, meta.last_access)
         for meta, _ in policy.scored
         if meta.block_key == first_key
-    ] == [(0, 0.0), (3, 0.25)]
+    ] == [(3, 0.25)]
     assert [meta.block_key for meta, *_ in policy.ingested] == [first_key]
     assert policy.removed == []
 
@@ -845,19 +1061,22 @@ def test_capacity_pressure_is_pool_local() -> None:
 
 
 @pytest.mark.parametrize(
-    ("kind", "failure", "abandon"),
+    ("kind", "failure", "abandon", "duplicate"),
     [
-        ("deposit", "submission", False),
-        ("deposit", "timeout", False),
-        ("deposit", "timeout", True),
-        ("deposit", "sticky_error", True),
-        ("deliver", "timeout", True),
+        ("deposit", "submission", False, False),
+        ("deposit", "timeout", False, False),
+        ("deposit", "timeout", True, False),
+        ("deposit", "sticky_error", True, False),
+        ("deliver", "timeout", True, False),
+        ("deposit", "timeout", True, True),
+        ("deposit", "discard", True, True),
     ],
 )
 def test_local_copy_timeout_retains_memory_until_completion(
-    kind: str, failure: str, abandon: bool, caplog, request
+    kind: str, failure: str, abandon: bool, duplicate: bool, caplog, request
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+    states = {}
 
     class PendingAgent(FakeNixlAgent):
         error_polls = 0
@@ -867,14 +1086,17 @@ def test_local_copy_timeout_retains_memory_until_completion(
             return "ERR" if failure == "submission" else result
 
         def check_xfer_state(self, handle):
-            if failure == "sticky_error" and self.state != "DONE":
+            state = states.get(handle, self.state)
+            if failure == "sticky_error" and state != "DONE":
                 self.error_polls += 1
                 raise RuntimeError("cached native error")
-            return super().check_xfer_state(handle)
+            return state
 
     now = 0.0
     block_size = 16
-    primary = ctypes.create_string_buffer(block_size * 2)
+    primary = ctypes.create_string_buffer(
+        b"a" * block_size + b"b" * block_size, block_size * 2
+    )
     local = ctypes.create_string_buffer(block_size)
     agent = PendingAgent()
     # Fake-only teardown: real cached NIXL errors cannot transition to DONE.
@@ -888,7 +1110,7 @@ def test_local_copy_timeout_retains_memory_until_completion(
         on_resilience_event=errors.append,
     )
     kvcr._core._clock = lambda: now
-    key = BlockKey(b"k0")
+    key, other = BlockKey(b"k0"), BlockKey(b"other")
 
     if kind == "deliver":
         agent.state = "DONE"
@@ -898,17 +1120,37 @@ def test_local_copy_timeout_retains_memory_until_completion(
     released = list(agent.released_xfers)
     op_handle = getattr(kvcr, kind)({key: [_mem_descriptor()]})
     _wait_until(lambda: len(agent.transfers) > len(released))
+    native_handle = agent.transfers[-1]
+    expired = (
+        kvcr.deposit({key: [_mem_descriptor()]})
+        if duplicate and failure == "timeout"
+        else None
+    )
     if failure in ("timeout", "sticky_error"):
         now = 2.0
     progress = kvcr._core._progress
     copy = next(iter(progress._in_flight_ops.values()))
-    _wait_until(lambda: copy.failure_latched)
+    if failure != "discard":
+        _wait_until(lambda: copy.failure_latched)
 
-    assert list(kvcr.poll_completed()) == []
+    assert list(kvcr.poll_completed()) == (
+        [(expired, _op_entries({key: False}))] if expired is not None else []
+    )
     residency = kvcr._core._block_record_map[key].local_dram
     assert residency is not None
     assert agent.released_xfers == released
-    if abandon:
+    if duplicate:
+        now = 4.5 if failure == "timeout" else 0.0
+        second = kvcr.deposit({key: [_mem_descriptor()]})
+        assert kvcr.poll_completed() == []
+        assert len(agent.transfers) == 1
+    if failure == "discard":
+        kvcr._core._local_dram.discard_fill([key])
+        assert dict(kvcr.poll_completed()) == {
+            op_handle: _op_entries({key: False}),
+            second: _op_entries({key: False}),
+        }
+    elif abandon:
         now = 5.0
         assert _poll_until(kvcr, bool) == [(op_handle, _op_entries({key: False}))]
         assert [error.state for error in errors] == ["uncertain"]
@@ -918,10 +1160,10 @@ def test_local_copy_timeout_retains_memory_until_completion(
         else:
             assert errors[0].destination_regions == [_mem_descriptor()]
             assert errors[0].destination_owner == "framework"
-        assert residency.claim_count == (kind == "deliver")
+    if abandon:
         assert agent.released_xfers == released
-        blocked = kvcr.deposit({BlockKey(b"other"): [_mem_descriptor(1)]})
-        assert dict(kvcr.poll_completed())[blocked][BlockKey(b"other")].success is False
+        blocked = kvcr.deposit({other: [_mem_descriptor(1)]})
+        assert dict(kvcr.poll_completed())[blocked][other].success is False
 
     if failure == "sticky_error":
         checked = agent.error_polls
@@ -934,27 +1176,42 @@ def test_local_copy_timeout_retains_memory_until_completion(
         assert key in kvcr._core._block_record_map
         return
 
-    agent.state = "DONE"
-    assert _poll_until(
-        kvcr,
-        lambda _: (
-            residency.claim_count == 0
-            if kind == "deliver"
-            else key not in kvcr._core._block_record_map
-        ),
-    ) == ([] if abandon else [(op_handle, _op_entries({key: False}))])
-    assert [error.state for error in errors] == (
-        ["uncertain", "quiesced"] if abandon else []
-    )
-    if abandon:
-        assert errors[0].op_handle == errors[1].op_handle
-    assert (key in kvcr._core._block_record_map) is (kind == "deliver")
+    if duplicate and failure == "timeout":
+        states[native_handle] = "DONE"
+        # The attachment retries only after the failed native writer has drained.
+        assert _poll_until(kvcr, lambda _: len(agent.transfers) == 2) == []
+        assert native_handle in agent.released_xfers
+        residency = kvcr._core._block_record_map[key].local_dram
+        assert agent.transfers[1] not in agent.released_xfers
+        blocked = kvcr.deposit({other: [_mem_descriptor(1)]})
+        assert dict(kvcr.poll_completed())[blocked][other].success is False
 
-    for event, expected in [
+    agent.state = "DONE"
+    expected = [] if abandon else [(op_handle, _op_entries({key: False}))]
+    if duplicate and failure == "timeout":
+        expected = [(second, _op_entries({key: True}))]
+    assert _poll_until(kvcr, lambda _: residency.claim_count == 0) == expected
+    assert [error.state for error in errors] == (
+        ["uncertain", "quiesced"] if abandon and failure == "timeout" else []
+    )
+    if errors:
+        assert errors[0].op_handle == errors[1].op_handle
+    retained = kind == "deliver" or (duplicate and failure == "timeout")
+    assert (key in kvcr._core._block_record_map) is retained
+    assert kvcr.query([key]) == [
+        (QueryStatus.HIT, CacheTier.LOCAL_G2) if retained else (QueryStatus.MISS, None)
+    ]
+    if duplicate:
+        replacement = kvcr.deposit({other: [_mem_descriptor(1)]})
+        assert _poll_until(kvcr, bool) == [(replacement, _op_entries({other: True}))]
+        assert agent.xfers[-1][3] == agent.xfers[0][3]
+        assert local.raw == b"b" * block_size
+
+    for event, expected_failure in [
         ("submit_failed", "submission"),
         ("deadline_expired", "timeout"),
     ]:
-        assert caplog.text.count(f"local_copy_{event}") == (failure == expected)
+        assert caplog.text.count(f"local_copy_{event}") == (failure == expected_failure)
 
 
 def test_close_retains_pending_local_copy_resources(monkeypatch) -> None:
@@ -1056,7 +1313,9 @@ def test_a_recovered_pool_deposits_into_free_rows_then_evicts_to_admit_more() ->
     assert local_dram is not None
 
     records = _g2_recovered(first=2, second=0)
-    records[BlockKey(b"first")].local_dram.slots = [(":first", 2)]
+    records[BlockKey(b"first")].local_dram = _LocalDramResidency(
+        [(":first", 2)], _LocalDramState.READY
+    )
     residency = records[BlockKey(b"first")].local_dram
     residency._cached_size = 8  # Cached with a different pool size.
     install_recovery_records(kvcr._core, records)
@@ -1123,6 +1382,15 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         {BlockKey(b"first"): _recovered_record(g2=[(":*", 0)])},
         {
             BlockKey(b"first"): _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":a", 0), (":b", 1)],
+                    _LocalDramState.READY,
+                    pending_labels={":b"},
+                )
+            )
+        },
+        {
+            BlockKey(b"first"): _BlockRecord(
                 local_dram=_LocalDramResidency([("", 0)], _LocalDramState.FILLING)
             )
         },
@@ -1134,6 +1402,7 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
         "duplicate-label",
         "empty-label",
         "wildcard-label",
+        "partial-key",
         "row-never-settled",
     ],
 )

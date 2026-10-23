@@ -51,7 +51,10 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
 
 
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):
-    """Bounded file-backed cache storage owned by this KVCR process."""
+    """Bounded file-backed cache storage owned by this KVCR process.
+
+    Per-file capacity is rounded down to complete slots and must fit at least one.
+    """
 
     paths: tuple[Path, ...]
     capacity_bytes_per_file: int

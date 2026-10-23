@@ -30,7 +30,7 @@ def _payload(record: _BlockRecord) -> bytes:
     return _RECOVERY_ENCODER.encode(_project_recovery_record(record))
 
 
-# Live-only fields are stripped; settled slots and position survive.
+# Live-only fields are stripped; complete residencies and position survive.
 _FULLY_LOADED_RECORD = _BlockRecord(
     fw_mem=object(),
     local_dram=_LocalDramResidency(
@@ -92,6 +92,19 @@ _FULLY_LOADED_RECORD = _BlockRecord(
             [None, None, -1],
             _BlockRecord(),
         ),
+        (
+            _BlockRecord(
+                local_dram=_LocalDramResidency(
+                    [(":pending", 0), (":ready", 1)],
+                    _LocalDramState.READY,
+                    pending_labels={":pending"},
+                    pending_deposits=1,
+                )
+            ),
+            _ONE_POOL,
+            [None, None, -1],
+            _BlockRecord(),
+        ),
     ],
 )
 def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
@@ -100,7 +113,7 @@ def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
     wire: list[object],
     recovered: _BlockRecord,
 ) -> None:
-    """Settled slots and position survive; decode rebuilds other live state."""
+    """Complete residencies survive; decode rebuilds other live state."""
     encoded = _payload(record)
 
     # The outer record stays positional; G2 locations carry their pool names.
@@ -194,13 +207,19 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     filling, forgotten = BlockKey(b"filling"), BlockKey(b"forgotten")
     filling_spill = BlockKey(b"filling-spill")
     discarding_spill = BlockKey(b"discarding-spill")
+    partially_ready = BlockKey(b"partially-ready")
+    partial_spill = BlockKey(b"partial-spill")
     served = {
         ready: _BlockRecord(
             local_dram=_LocalDramResidency(
                 [("full", 0), ("swa", 10)],
                 _LocalDramState.READY,
-                claim_count=1,
+                claim_count=2,
                 retire_on_release=True,
+                pending_deposits=1,
+                writers=[1, 1],
+                remote_indices=(0,),
+                remote_cancelled=True,
             ),
             in_flight_ops={("target", 7)},
             access_count=12,
@@ -227,6 +246,21 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
             ),
             g3=_G3Residency(5),
         ),
+        partially_ready: _BlockRecord(
+            local_dram=_LocalDramResidency(
+                [("full:a", 2), ("full:b", 3)],
+                _LocalDramState.READY,
+                pending_labels={"full:a"},
+            ),
+        ),
+        partial_spill: _BlockRecord(
+            local_dram=_LocalDramResidency(
+                [("full:a", 4), ("full:b", 5)],
+                _LocalDramState.READY,
+                pending_labels={"full:b"},
+            ),
+            g3=_G3Residency(6),
+        ),
     }
     # A kept mirror must match exactly what the handback frames carry.
     residency = served[ready].local_dram
@@ -241,10 +275,12 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records is served
     assert mirror._records[ready].local_dram is residency
     assert not residency.refs  # A new agent must regenerate its own references.
+    assert partially_ready not in mirror._records
     assert mirror._records == framed
     assert mirror._records == {
         ready: replace(_recovered_record(g2=[("full", 0), ("swa", 10)]), position=7),
         spilled: _recovered_record(g3=3),
         filling_spill: _recovered_record(g3=4),
         discarding_spill: _recovered_record(g3=5),
+        partial_spill: _recovered_record(g3=6),
     }

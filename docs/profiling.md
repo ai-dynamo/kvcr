@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX remote-delivery tracing
 
-Tracing covers framework pins, source NIXL writes, target processing, hints and caller completion. Shared pins have one lifetime and per-source associations. See the [lifecycle event reference](nvtx-events.md) for source/target events and the [capture walkthrough](nvtx-walkthrough.md) for two-worker captures, decoded joins, failure scenarios and repeatable overhead comparisons.
+Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The examples use synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics, the [capture walkthrough](nvtx-walkthrough.md) for two-worker captures and overhead comparisons, and the [producer map](nvtx-context.md) for the inspected Dynamo/vLLM identity inputs.
 
 ## Enable tracing
 

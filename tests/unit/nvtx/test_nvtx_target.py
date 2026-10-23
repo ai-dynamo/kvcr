@@ -5,6 +5,7 @@
 import ctypes
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import test_kvcr_remote_target
 from _kvcr_test_utils import (
@@ -212,6 +213,7 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
     assert not recording.stack
 
 
+@pytest.mark.parametrize("retry", [False, True])
 @pytest.mark.parametrize(
     "indices,expected",
     [
@@ -220,7 +222,9 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
         ((9,), _nvtx.Status.FAILED),
     ],
 )
-def test_target_receipt_consumption_and_caller_return(recording, indices, expected):
+def test_target_receipt_consumption_and_caller_return(
+    recording, indices, expected, retry
+):
     kvcr, agent, control = target()
     request = "real-request-α"
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id=request)
@@ -229,6 +233,15 @@ def test_target_receipt_consumption_and_caller_return(recording, indices, expect
         request_id=request,
     )
     _wait_until(lambda: bool(control.sent))
+    if retry:
+        ranges = set(recording.ranges)
+        assert len(ranges) == 2
+        refusal = test_kvcr_remote_target._metadata_refusal("tcp://source:1", handle)
+        control.incoming.append(msgspec.msgpack.encode(refusal))
+        _wait_until(lambda: len(control.sent) == 2)
+        assert not list(kvcr.poll_completed())
+        assert set(recording.ranges) == ranges
+        assert not payloads(recording, "target.write_done.received")
     agent.notifs["source"] = [
         _write_done_notification(handle, completed_indices=indices)
     ]
@@ -238,6 +251,7 @@ def test_target_receipt_consumption_and_caller_return(recording, indices, expect
     assert not payloads(recording, "op.completion_returned")
     assert len(spans(recording, "op.deliver.lifecycle")) == 1
     assert not spans(recording, "op.deliver.lifecycle", "end")
+    assert len(spans(recording, "target.remote")) == 1
     assert len(spans(recording, "target.remote", "end")) == 1
     result = _poll_until(kvcr, bool)
     assert len(result) == 1

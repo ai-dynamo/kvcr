@@ -112,11 +112,13 @@ class _TargetPullOp(_RemoteOp):
     ordered_keys: tuple[BlockKey, ...] = ()
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
+    key_layout: tuple[str, ...] = ()
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    retried: bool = False
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
@@ -135,10 +137,30 @@ class _TargetPullOp(_RemoteOp):
         now = backend._kvcr._clock()
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
-        if self.state is _TargetPullState.START_WRITE:
-            self.source_incarnation = backend._dangling_ops.sources.get(
-                self.remote_ctrl_ep
+        if (
+            self.state is _TargetPullState.WAITING_WRITE_DONE
+            and not self.retried
+            and isinstance(event, Mapping)
+            and isinstance(event.get("retry_metadata"), str)
+        ):
+            # Pre-submit refusal: nothing was written, so resend in this poll.
+            logger.debug(
+                "KVCR_EVENT metadata_refresh_retry op=%d endpoint=%s incarnation=%s",
+                self.op_id[1],
+                self.remote_ctrl_ep,
+                event["retry_metadata"],
             )
+            self.source_incarnation = event["retry_metadata"]
+            self.retried = True
+            self.state = _TargetPullState.START_WRITE
+        if self.state is _TargetPullState.START_WRITE:
+            if not self.retried:
+                self.source_incarnation = backend._dangling_ops.sources.get(
+                    self.remote_ctrl_ep
+                )
+            else:
+                # A stale ACK from the dead peer may have re-acked the endpoint.
+                backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
             if now >= self.deadline:
                 if trace is not None:
                     trace.reject(
@@ -160,7 +182,7 @@ class _TargetPullOp(_RemoteOp):
                     "source_incarnation": self.source_incarnation,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
-                    "allow_layout_subset": not self.local_fill,
+                    **({"key_layout": self.key_layout} if self.local_fill else {}),
                 },
             )
             if not sent:
@@ -345,10 +367,11 @@ class _SourcePinOp(_Op):
     deadline: float
     remote_agent: str
     op_handle: int
+    # Preserve request positions even when keys drops rejected dependencies.
     ordered_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
-    allow_layout_subset: bool = False
+    key_layout: tuple[str, ...] = ()
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -655,7 +678,7 @@ class _RemoteFWDram:
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
-        self._refused_writes: dict[_OpId, dict[str, bool]] = {}
+        self._refused_writes: dict[_OpId, dict[str, Any]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
@@ -766,6 +789,11 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             request_id=request_id,
+            key_layout=(
+                kvcr._block_record_map[keys[0]].local_dram.key_layout
+                if local_fill
+                else ()
+            ),
             trace=self._nvtx.operation(
                 kvcr,
                 op_handle,
@@ -807,6 +835,8 @@ class _RemoteFWDram:
                 )
                 op.trace.end("target.remote")
             raise
+        if not local_fill and request_id is not None:
+            kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
         return True
 
     def deliver(
@@ -1056,7 +1086,10 @@ class _RemoteFWDram:
         # Only terminal notifications outrank a refusal for the same operation.
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
-            if not events.get(op_id, {}).get("terminal"):
+            native = events.get(op_id, {})
+            if not native.get("terminal") and not (
+                refusal.get("retry_metadata") and native.get("cancelled")
+            ):
                 events[op_id] = refusal
         self._refused_writes.clear()
         observed_work |= bool(events)
@@ -1198,16 +1231,31 @@ class _RemoteFWDram:
         if not isinstance(endpoint, str) or type(op_handle) is not int:
             return
         op = progress._in_flight_ops.get(("target", op_handle))
-        if getattr(op, "remote_ctrl_ep", None) != endpoint:
+        if not isinstance(op, _TargetPullOp) or op.remote_ctrl_ep != endpoint:
             return
         # Whatever answered is not the process our metadata was loaded into, so
         # drop the snapshot and let the next request republish it.
         self._invalidate_control_peer(endpoint)
         # Refresh the generation for future writes, not already in-flight ones.
         # A delayed refusal must not evict a generation learned after this op.
-        refused_incarnation = getattr(op, "source_incarnation", None)
+        refused_incarnation = op.source_incarnation
         if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
             self._dangling_ops.sources.pop(endpoint, None)
+        incarnation = payload.get("sender_incarnation")
+        if (
+            payload.get("reason") in ("metadata_required", "source_restarted")
+            and isinstance(incarnation, str)
+            and incarnation
+            and not op.retried
+            and op.state is _TargetPullState.WAITING_WRITE_DONE
+            and not progress._stop_requested
+            and self._kvcr._clock() < op.deadline
+        ):
+            self._refused_writes[("target", op_handle)] = {
+                "terminal": False,
+                "retry_metadata": incarnation,
+            }
+            return
         # A refusal is only sent before a write is submitted, so it is as terminal as a
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
@@ -1285,10 +1333,10 @@ class _RemoteFWDram:
                 or remaining_timeout_ms <= 0
             ):
                 raise TypeError("invalid remaining_timeout_ms")
-            allow_layout_subset = payload.get("allow_layout_subset", False)
-            if type(allow_layout_subset) is not bool:
-                raise TypeError("invalid allow_layout_subset")
             keys = _message_keys(payload)
+            key_layout = msgspec.convert(
+                payload.get("key_layout", ()), type=tuple[str, ...]
+            )
             dst_descriptors = msgspec.convert(
                 payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
             )
@@ -1335,19 +1383,14 @@ class _RemoteFWDram:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.get("source_incarnation")
-        if (
-            progress._stop_requested
-            or not self._dangling_ops.check_source_progress()
-            or (expected is not None and expected != self._dangling_ops.incarnation)
-        ):
+        if isinstance(expected, str) and expected != self._dangling_ops.incarnation:
+            # Another process was quoted: refuse pre-submit so the target retries
+            # once quoting us, instead of failing the request natively.
+            self._refuse_start_write(progress, payload, op_handle, "source_restarted")
+            return
+        if progress._stop_requested or not self._dangling_ops.check_source_progress():
             if logger.isEnabledFor(logging.DEBUG):
-                reason = (
-                    "stopping"
-                    if progress._stop_requested
-                    else "source_stalled"
-                    if self._dangling_ops._source_stalled
-                    else "incarnation_mismatch"
-                )
+                reason = "stopping" if progress._stop_requested else "source_stalled"
                 logger.debug(
                     "KVCR_EVENT source_transfer_refused op=%d target=%s "
                     "blocks=%d reason=%s expected_incarnation=%s incarnation=%s",
@@ -1384,7 +1427,7 @@ class _RemoteFWDram:
             op_handle=op_handle,
             ordered_keys=keys,
             dst_descriptors=dst_descriptors,
-            allow_layout_subset=allow_layout_subset,
+            key_layout=key_layout,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
             nvtx_state=_NvtxState(
                 requested_blocks=len(keys),
@@ -1421,12 +1464,12 @@ class _RemoteFWDram:
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
                     return False
-                indices = _layout_indices(
-                    residency.layout,
-                    layout,
-                    allow_subset=source_pin.allow_layout_subset,
-                    indices_by_label=residency.indices_by_label,
-                )
+                if (
+                    source_pin.key_layout
+                    and source_pin.key_layout != residency.key_layout
+                ):
+                    return False
+                indices = residency.ready_indices(layout)
                 if indices is None:
                     return False
                 selected.append(indices)
@@ -1485,39 +1528,59 @@ class _RemoteFWDram:
             if failure_reason is _nvtx.Reason.UNKNOWN:
                 failure_reason = _nvtx.Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
-            source_pin.op_id, source_pin.ordered_keys
+            source_pin.op_id, source_pin.keys
         )
         framework_sources = {
             key: record.fw_mem.descriptors
-            for key in source_pin.ordered_keys
+            for key in source_pin.keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
         completed_indices = []
         selected_sources = []
+        waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
+            if key not in source_pin.keys:
+                continue
             residency = local_sources.get(key)
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
                 continue
-            indices = _layout_indices(
-                residency.layout
+            labels = [descriptor.label for descriptor in destination]
+            layout = (
+                residency.key_layout
                 if residency is not None
-                else [descriptor.label for descriptor in source],
-                [descriptor.label for descriptor in destination],
-                allow_subset=source_pin.allow_layout_subset,
-                indices_by_label=(
-                    residency.indices_by_label if residency is not None else None
-                ),
+                else [descriptor.label for descriptor in source]
             )
+            if source_pin.key_layout and source_pin.key_layout != tuple(layout):
+                indices = None
+            elif residency is not None:
+                indices = (
+                    residency.ready_indices(labels)
+                    if residency.state is _LocalDramState.READY
+                    else None
+                )
+                if (
+                    indices is None
+                    and residency.state is not _LocalDramState.DISCARDING
+                    and residency.can_wait_for_pieces(labels)
+                ):
+                    waiting = True
+                    continue
+            else:
+                indices = _layout_indices(layout, labels)
             if indices is None:
                 logger.warning(
                     "KVCR start_write layout mismatch op=%d key=%r",
                     source_pin.op_handle,
                     key,
                 )
+                source_pin.keys -= {key}
+                record = kvcr._block_record_map[key]
+                record.discard_in_flight_op(op_id)
+                kvcr._prune_block_record(key)
                 continue
             completed_indices.append(index)
             selected_sources.append(
@@ -1529,12 +1592,11 @@ class _RemoteFWDram:
             source_pin.ordered_keys[index] for index in completed_indices
         )
 
-        kvcr._release_local_dram_sources(
-            source_pin.op_id, local_sources.keys() - set(completed_keys)
-        )
+        retained_keys = source_pin.keys if waiting else set(completed_keys)
+        kvcr._release_local_dram_sources(op_id, local_sources.keys() - retained_keys)
         relevant_pins = {
             record.fw_mem.pin_handle
-            for key in completed_keys
+            for key in retained_keys
             if key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
@@ -1544,6 +1606,10 @@ class _RemoteFWDram:
         # release from unpinning it mid-read.
         framework_pins = set(relevant_pins)
         unused_pins = source_pin.framework_pins - framework_pins
+        if waiting:
+            source_pin.framework_pins = framework_pins
+            self._release_framework_pins(unused_pins)
+            return
         source_pin.framework_pins.clear()
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
@@ -1556,7 +1622,7 @@ class _RemoteFWDram:
                 if not force_failure
                 else _SourceWriteState.NOTIFY_FAILURE
             ),
-            keys=frozenset(completed_keys or source_pin.ordered_keys),
+            keys=frozenset(completed_keys or source_pin.keys),
             started_at=source_pin.started_at,
             deadline=source_pin.deadline,
             op_id=source_pin.op_id,
@@ -1596,20 +1662,35 @@ class _RemoteFWDram:
             # Refusing over the control channel is the only way this operation
             # ever reaches a terminal.
             logger.warning("KVCR refusing unresolvable start_write op=%d", op_handle)
-            reply_to = payload.get("sender_control_endpoint")
-            reflected_self = payload.get("source_control_endpoint")
-            if isinstance(reply_to, str) and isinstance(reflected_self, str):
-                self._send_control(
-                    progress,
-                    reply_to,
-                    {
-                        "type": "write_refused",
-                        "sender_control_endpoint": reflected_self,
-                        "op_handle": op_handle,
-                    },
-                )
+            # No retry invitation from a stopping source: resolution fails here
+            # even with good cached metadata, and we will not be around to serve.
+            metadata = payload.get("target_agent_metadata")
+            retryable = not isinstance(metadata, bytes) and not progress._stop_requested
+            self._refuse_start_write(
+                progress, payload, op_handle, "metadata_required" if retryable else None
+            )
             return
         self._send_write_done(progress, remote_agent, op_handle, False)
+
+    def _refuse_start_write(
+        self,
+        progress: _KVCRProgress,
+        payload: Mapping[str, Any],
+        op_handle: OpHandle,
+        reason: str | None,
+    ) -> None:
+        reply_to = payload.get("sender_control_endpoint")
+        reflected_self = payload.get("source_control_endpoint")
+        if not isinstance(reply_to, str) or not isinstance(reflected_self, str):
+            return
+        response = {
+            "type": "write_refused",
+            "sender_control_endpoint": reflected_self,
+            "op_handle": op_handle,
+        }
+        if reason is not None:
+            response["reason"] = reason
+        self._send_control(progress, reply_to, response)
 
     # Shared framework-pin coordination.
 
@@ -1732,9 +1813,13 @@ class _RemoteFWDram:
             )
             return
 
-        local_sources = kvcr._claim_local_dram_sources(op.op_id, op.ordered_keys)
+        local_sources = kvcr._claim_local_dram_sources(
+            op.op_id, op.keys, allow_filling=True
+        )
         unresolved_keys = tuple(
-            key for key in op.ordered_keys if key not in local_sources
+            key
+            for key in op.ordered_keys
+            if key in op.keys and key not in local_sources
         )
         if unresolved_keys and not op.framework_acquire_attempted:
             if any(

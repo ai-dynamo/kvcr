@@ -224,7 +224,7 @@ def test_pool_descriptor_constraints_are_part_of_the_wire_contract() -> None:
         _PoolDescriptor("pool", 1023, 1024)
 
 
-def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
+def test_g3_config_validates_paths_and_tier_capacity() -> None:
     good = {
         "paths": ("/g3/a",),
         "capacity_bytes_per_file": 1,
@@ -241,16 +241,24 @@ def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
             _POOL_LAYOUTS,
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
         )
-    with pytest.raises(ValueError, match="complete slots"):
+    with pytest.raises(ValueError, match="at least one complete slot"):
         _TierConfig(
             [("pool", mmap.PAGESIZE)],
-            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE + 1}),
+            _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE - 1}),
         )
     with pytest.raises(ValueError, match="page-aligned"):
         _TierConfig(
             [("pool", mmap.PAGESIZE // 2)],
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
         )
+
+    tier = _TierConfig(
+        [("pool", mmap.PAGESIZE)],
+        _G3Config(**{**good, "capacity_bytes_per_file": 2 * mmap.PAGESIZE - 1}),
+    )
+    assert (
+        msgspec.msgpack.decode(msgspec.msgpack.encode(tier), type=_TierConfig) == tier
+    )
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(

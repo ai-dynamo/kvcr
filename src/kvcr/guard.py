@@ -237,7 +237,7 @@ class _RecoveryState:
                     return False
                 mirror.apply(*frame)
             return True
-        except RecoveryJournalError as error:
+        except (RecoveryJournalError, RecoveryMirrorError) as error:
             self._drop_recovery(error)
         return False
 
@@ -258,7 +258,7 @@ class _RecoveryState:
                 for frame in self._journal.drain():
                     mirror.apply(*frame)
                 records = mirror.take_records()
-            except RecoveryJournalError as error:
+            except (RecoveryJournalError, RecoveryMirrorError) as error:
                 self._drop_recovery(error)
         # A handover still needs somewhere to put the core's eventual records.
         self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
@@ -306,7 +306,7 @@ class _RecoveryState:
             while (frame := self._journal.read_next()) is not None:
                 mirror.apply(*frame)
             self._write_handback(mirror.take_records())
-        except RecoveryJournalError as error:
+        except (RecoveryJournalError, RecoveryMirrorError) as error:
             self._drop_recovery(error)
         except OSError as error:
             if error.errno not in _RECOVERY_CAPACITY_ERRORS:
@@ -314,7 +314,9 @@ class _RecoveryState:
             self._drop_recovery(error)
         self.mirror = None
 
-    def _drop_recovery(self, error: RecoveryJournalError | OSError) -> None:
+    def _drop_recovery(
+        self, error: RecoveryJournalError | RecoveryMirrorError | OSError
+    ) -> None:
         logger.warning(
             "KVCR pool recovery disabled; claimable but cold if this primary dies: %s",
             error,

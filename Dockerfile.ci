@@ -1,0 +1,138 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The CI workflow resolves the selected vLLM nightly or PR image to a digest.
+ARG VLLM_IMAGE=vllm/vllm-openai:nightly
+FROM ${VLLM_IMAGE}
+
+USER root
+ARG VLLM_IMAGE
+ARG DYNAMO_VERSION=nightly
+ARG KVCR_COMMIT
+LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/kvcr" \
+      org.opencontainers.image.revision="${KVCR_COMMIT}" \
+      org.opencontainers.image.base.name="${VLLM_IMAGE}"
+
+# Recovery uses libatomic even though it is not a Python package dependency.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
+COPY src /opt/kvcr-src/src
+RUN python3 - <<'PY'
+from importlib import metadata
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+from packaging.utils import parse_wheel_filename
+
+# Keep the selected vLLM and torch stack while installing Dynamo's Python
+# dependencies. Do not request ai-dynamo[vllm], which pins a different backend.
+backend_versions = {}
+# grpcio-observability requires an exactly matching grpcio version. Preserve
+# the installed gRPC family so Dynamo's tooling dependencies cannot split it.
+for name in (
+    "vllm", "torch", "torchvision", "torchaudio", "numpy", "protobuf",
+    "grpcio", "grpcio-tools", "grpcio-observability",
+):
+    try:
+        backend_versions[name] = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        if name == "vllm":
+            raise
+constraints = Path("/tmp/kvcr-backend-constraints.txt")
+constraints.write_text("".join(
+    f"{name}=={version}\n" for name, version in backend_versions.items()
+))
+pip_check = [sys.executable, "-m", "pip", "check"]
+base_conflicts = set(subprocess.run(
+    pip_check, capture_output=True, text=True,
+).stdout.splitlines())
+
+# Serving images can intentionally carry a newer NCCL than torch declares.
+# Installing Dynamo or KVCR must not silently undo that base-image pin.
+nccl_versions = {}
+for name in ("nvidia-nccl-cu12", "nvidia-nccl-cu13"):
+    try:
+        nccl_versions[name] = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        pass
+requested_dynamo_version = os.environ["DYNAMO_VERSION"]
+dynamo_version = requested_dynamo_version
+if dynamo_version == "nightly":
+    # Resolve only Dynamo with --pre. Installing its exact version then avoids
+    # enabling prereleases for unrelated transitive dependencies.
+    with tempfile.TemporaryDirectory() as wheel_dir:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "download", "--no-cache-dir",
+            "--no-deps", "--only-binary=:all:", "--pre",
+            "--extra-index-url", "https://pypi.nvidia.com/",
+            "--dest", wheel_dir, "ai-dynamo",
+        ])
+        wheel, = Path(wheel_dir).glob("*.whl")
+        _, version, _, _ = parse_wheel_filename(wheel.name)
+        if not version.is_devrelease:
+            raise RuntimeError(f"Expected a Dynamo nightly, resolved {version}")
+        dynamo_version = str(version)
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade",
+    "--extra-index-url", "https://pypi.nvidia.com/",
+    "--constraint", str(constraints),
+    "--report", "/opt/kvcr-dynamo-install-report.json",
+    f"ai-dynamo=={dynamo_version}",
+])
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "--no-cache-dir", "/opt/kvcr-src",
+    "--constraint", str(constraints),
+])
+restore = [
+    f"{name}=={version}"
+    for name, version in nccl_versions.items()
+    if metadata.version(name) != version
+]
+if restore:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--no-cache-dir", "--no-deps",
+        *restore,
+    ])
+for name, version in {**backend_versions, **nccl_versions}.items():
+    assert metadata.version(name) == version, f"Base package changed: {name}"
+check = subprocess.run(pip_check, capture_output=True, text=True)
+new_conflicts = set(check.stdout.splitlines()) - base_conflicts
+if check.returncode and new_conflicts:
+    raise RuntimeError("New dependency conflicts:\n" + "\n".join(sorted(new_conflicts)))
+packages = {
+    name: metadata.version(name)
+    for name in ("ai-dynamo", "ai-dynamo-runtime", "vllm", "kvcr", "nixl")
+}
+Path("/opt/kvcr-build-metadata.json").write_text(json.dumps({
+    "kvcr_sha": os.environ.get("KVCR_COMMIT", ""),
+    "base_image": os.environ["VLLM_IMAGE"],
+    "requested_dynamo_version": requested_dynamo_version,
+    "packages": packages,
+    "nccl_versions": nccl_versions,
+}, indent=2) + "\n")
+print(json.dumps(packages, indent=2))
+PY
+
+# A successful pip install alone does not prove the base's adapter supports
+# this KVCR API. Fail the build before handing an incompatible image to E2E.
+RUN python3 - <<'PY'
+from importlib import metadata
+
+import kvcr
+import dynamo.vllm
+from vllm.v1.kv_offload.tiering.kvcr import manager
+
+print("kvcr==" + metadata.version("kvcr"))
+print("dynamo.vllm:", dynamo.vllm.__file__)
+print("KVCR adapter:", manager.__file__)
+PY
+
+# The vLLM image normally starts an API server. E2E launches Dynamo explicitly.
+ENTRYPOINT []

@@ -79,11 +79,12 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             if len(self.pool_layouts) != 1:
                 raise ValueError("G3 does not support multiple pools")
             block_size_bytes = self.pool_layouts[0][1]
-            if (
-                block_size_bytes % mmap.PAGESIZE
-                or self.g3.capacity_bytes_per_file % block_size_bytes
-            ):
-                raise ValueError("G3 requires page-aligned complete slots")
+            if block_size_bytes % mmap.PAGESIZE:
+                raise ValueError("G3 requires page-aligned slots")
+            if self.g3.capacity_bytes_per_file < block_size_bytes:
+                raise ValueError(
+                    "G3 file capacity must contain at least one complete slot"
+                )
 
 
 class _Claim(msgspec.Struct, frozen=True, tag="claim"):

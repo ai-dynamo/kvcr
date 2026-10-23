@@ -173,11 +173,9 @@ class _G3:
             raise ValueError("G3 file paths must be unique")
         if slot_size <= 0 or slot_size % page_size:
             raise ValueError("G3 slot size must be positive and page aligned")
-        if (
-            config.capacity_bytes_per_file <= 0
-            or config.capacity_bytes_per_file % slot_size
-        ):
-            raise ValueError("G3 file capacity must contain complete slots")
+        slots_per_file = config.capacity_bytes_per_file // slot_size
+        if slots_per_file < 1:
+            raise ValueError("G3 file capacity must contain at least one complete slot")
         if not config.backend:
             raise ValueError("G3 NIXL backend must be non-empty")
         if not all(
@@ -186,12 +184,12 @@ class _G3:
         ):
             raise TypeError("G3 backend options must map strings to strings")
 
-        slots_per_file = config.capacity_bytes_per_file // slot_size
         self._kvcr = kvcr
         self._config = config
         self._paths = paths
         self._slot_size = slot_size
-        self._bytes_per_file = config.capacity_bytes_per_file
+        # Round down to complete slots within the per-file budget.
+        self._bytes_per_file = slots_per_file * slot_size
         self._owner_fds: list[int] = []
         self._direct_fds: list[int] = []
         self._free_slots = deque(range(slots_per_file * len(paths)))
