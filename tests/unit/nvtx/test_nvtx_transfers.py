@@ -2,14 +2,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Observe NIXL state and resource release without changing their ordering."""
 
+import ctypes
 import threading
 
 import pytest
-from _kvcr_test_utils import _decode_notif, _poll_until
+from _kvcr_test_utils import (
+    FakeBytesControl,
+    FakeNixlAgent,
+    FakePrimaryPinning,
+    _buffer_region,
+    _decode_notif,
+    _mem_descriptor,
+    _new_kvcr,
+    _poll_until,
+    _start_write_message,
+    _wait_until,
+)
 from _nvtx_test_utils import make_source, payloads, spans, wait_for_payload
 from test_progress import _mem, _transfer_progress, _TransferAgent
 
 from kvcr import _nvtx
+from kvcr.config import LocalDramOptions
+from kvcr.types import BlockKey
 
 
 def test_zero_selected_source_is_failed_without_posting(recording):
@@ -250,10 +264,6 @@ def test_failed_source_trace_initialization_is_not_retried(recording, monkeypatc
 def test_local_source_reuses_nvtx_state_on_both_write_paths(
     recording, monkeypatch, level
 ):
-    from test_kvcr_remote_source import (
-        test_local_source_starts_inline_and_holds_its_slot,
-    )
-
     from kvcr.remote_fw_dram import _SourcePinOp, _SourceWriteOp
 
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
@@ -266,7 +276,32 @@ def test_local_source_reuses_nvtx_state_on_both_write_paths(
             states[op.op_id] = op.nvtx_state
 
         monkeypatch.setattr(cls, "__init__", capture)
-    test_local_source_starts_inline_and_holds_its_slot("PROC", monkeypatch)
+    memory = ctypes.create_string_buffer(16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+    )
+    agent.state = "DONE"
+    key = BlockKey(b"local")
+    source.deposit({key: [_mem_descriptor(end_point_name="source")]})
+    _poll_until(source, bool)
+    control.incoming.append(_start_write_message(12, key))
+    _wait_until(lambda: len(writes) == 1)  # Inline progress needs no caller polling.
+    _poll_until(source, lambda _: not source._core._local_dram_sources_by_op)
+    monkeypatch.setattr(
+        source._core._remote_fw_dram, "_try_local_source_write", lambda *args: False
+    )
+    control.incoming.append(_start_write_message(13, key))
+    _poll_until(
+        source,
+        lambda _: len(writes) == 2 and not source._core._local_dram_sources_by_op,
+    )
+    assert len(agent.released_xfers) == 3
     assert pins.keys() == writes.keys() and len(pins) == 2
     for op_id, state in pins.items():
         assert writes[op_id] is state
