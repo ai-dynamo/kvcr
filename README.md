@@ -77,6 +77,8 @@ the future.
 
 - Dynamo KV Router — supported
 
+A hint envelope may carry several hints. KVCR parses and dispatches each one independently and records a per-hint outcome.
+
 ### Engine support
 
 - TRT-LLM
