@@ -23,7 +23,7 @@ from .config import (
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hint_parser import _KVFetchHint
+from .hints.dispatcher import HintDispatcher
 from .local_disk import _G3, _G3Residency
 from .local_dram import (
     _layout_indices,
@@ -325,6 +325,8 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
+        # Built after the backends so hint handlers can bind to them.
+        self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
             {region.label: region for region in self._local_dram.memory_regions}
             if self._local_dram is not None
@@ -431,10 +433,7 @@ class _KVCRCore:
         hints: Mapping[str, object] | msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        hint = _KVFetchHint.from_hint(hints)
-        self._remote_fw_dram.submit_hint(
-            hint.source_endpoint, hint.block_hashes, request_id
-        )
+        self._hints_dispatcher.submit(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_delivery_keys.pop(request_id, None)
@@ -833,6 +832,10 @@ class _KVCRCore:
         if progress_error is not None:
             raise progress_error
 
+    def _close_hint_handlers(self) -> None:
+        with self._state_lock:
+            self._hints_dispatcher.close()
+
     def _close_main_resources(self) -> None:
         self._remote_delivery_keys.clear()
         # Every stage runs even if an earlier one failed: skipping the rest
@@ -852,6 +855,7 @@ class _KVCRCore:
                         exc_info=True,
                     )
 
+        run(self._close_hint_handlers)
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:
