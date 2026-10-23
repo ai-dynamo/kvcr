@@ -373,14 +373,17 @@ class _LifecycleTrace:
             reason = (
                 Reason.NONE if success and blocks >= requested else self.failure_reason
             )
-        self.mark(
-            "source.write.completed",
-            once=True,
-            status=status,
-            reason=reason,
-            completed_blocks=blocks if success else 0,
-            completed_bytes=self.selected_bytes if success else 0,
-        )
+        try:
+            self.mark(
+                "source.write.completed",
+                once=True,
+                status=status,
+                reason=reason,
+                completed_blocks=blocks if success else 0,
+                completed_bytes=self.selected_bytes if success else 0,
+            )
+        finally:
+            self.end("source.write")
 
     def mark(self, name, *, once=False, detail=False, retain_cause=False, **fields):
         reason = fields.get("reason", Reason.NONE)
@@ -399,9 +402,7 @@ class _LifecycleTrace:
         except Exception:
             pass
         finally:
-            if name == "source.write.completed":
-                self.end("source.write")
-            elif name in (
+            if name in (
                 "op.completion_returned",
                 "op.rejected",
                 "op.shutdown_unreturned",

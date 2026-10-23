@@ -5,9 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX identity producers and unavailable inputs
 
-This contract describes the instrumented KVCR API based on `fb4f264`, plus the
-immutable Dynamo/vLLM integration snapshots below. It is a map of observed input
-seams, not a claim that newer releases have the same integration gaps.
+This contract describes the instrumented KVCR API based on `fb4f264`, plus the immutable Dynamo/vLLM integration snapshots below. It is a map of observed input seams, not a claim that newer releases have the same integration gaps.
 
 | Identity / value | Producer and meaning | Availability and join |
 | --- | --- | --- |
@@ -20,24 +18,13 @@ seams, not a claim that newer releases have the same integration gaps.
 | Target operation | Target KVCR allocates a signed handle; existing control metadata identifies target agent and incarnation. | Join workers by `(target_agent_hi, target_agent_lo, target_incarnation_hi, target_incarnation_lo, op_handle)`. Local-fill handles can be negative; a handle alone is insufficient. |
 | Framework DRAM utilization | The inspected vLLM primary CPU tier owns its cache statistics. | KVCR has no reader callback for them. `fw_dram_utilization_known=0`; registered capacity, pin counts and local G2 occupancy are not substitutes. |
 
-The inspected CPU metric `vllm:kv_offload_cpu_cache_usage_perc` is
-`(allocated_chunks - free_chunks - evictable_cache_chunks) / capacity_chunks`,
-with zero for zero capacity. It measures the non-evictable fraction, not all
-resident cached bytes. A future input seam must name which definition it exposes,
-when it samples, and how unknown/zero-capacity states are represented.
+The inspected CPU metric `vllm:kv_offload_cpu_cache_usage_perc` is `(allocated_chunks - free_chunks - evictable_cache_chunks) / capacity_chunks`, with zero for zero capacity. It measures the non-evictable fraction, not all resident cached bytes. A future input seam must name which definition it exposes, when it samples, and how unknown/zero-capacity states are represented.
 
 ## Integration work that needs a separate change
 
-Dynamo's inspected hint producer writes
-`sampling_params.extra_args['kv_transfer_params']['kv_hint']`; the inspected
-vLLM KVCR adapter reads `ReqContext.kv_hints`. Those fields remain separate on the
-examined request path. KVCR's hint parser retains source endpoint and block
-hashes. A compatible carrier must be verified before claiming Dynamo remote
-reuse. These missing integration seams are outside the instrumentation PRs,
-which preserve the public API and wire contract.
+Dynamo's inspected hint producer writes `sampling_params.extra_args['kv_transfer_params']['kv_hint']`; the inspected vLLM KVCR adapter reads `ReqContext.kv_hints`. Those fields remain separate on the examined request path. KVCR's hint parser retains source endpoint and block hashes. A compatible carrier must be verified before claiming Dynamo remote reuse. These missing integration seams are outside the instrumentation PRs, which preserve the public API and wire contract.
 
-The [two-process example](nvtx-walkthrough.md) proves the supplied request-to-hint
-and worker joins, not Dynamo propagation of these inputs.
+The [two-process example](nvtx-walkthrough.md) proves the supplied request-to-hint and worker joins, not Dynamo propagation of these inputs.
 
 ## Immutable source references
 

@@ -58,6 +58,9 @@ class _PayloadEmitter:
         self.category = domain.get_category_id("framework_pin")
         self.lifecycle_category = domain.get_category_id("remote_deliver")
         self._thread = _ThreadBuffers()
+        # Shared with target/caller tracing, which supplies local_fill and
+        # medium-detail requested_bytes and destination_memory. Session IDs and
+        # numeric native errors have no producer; their known flags stay zero.
         self.context_dtype = numpy.dtype(
             [
                 ("schema_version", "u2"),

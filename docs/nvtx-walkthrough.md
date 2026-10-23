@@ -5,11 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Read one remote-delivery capture
 
-The two-process example uses real KVCR/NIXL UCX with a synthetic framework
-binding and registered memory. Start with DRAM; `--memory vram` additionally
-requires compatible CUDA PyTorch and uses GPU 0. It does not run Dynamo or an
-inference model or validate hints in an LLM serving framework.
-Keep raw reports outside the checkout.
+The two-process example uses real KVCR/NIXL UCX with a synthetic framework binding and registered memory. Start with DRAM; `--memory vram` additionally requires compatible CUDA PyTorch and uses GPU 0. It does not run Dynamo or an inference model or validate hints in an LLM serving framework. Keep raw reports outside the checkout.
 
 ```bash
 uv sync --extra profiling
@@ -27,25 +23,13 @@ uv run python examples/nvtx_decode.py \
   /tmp/kvcr-nvtx-review/remote-delayed.sqlite --operations 3
 ```
 
-Open the `.nsys-rep` in Nsight Systems and expand both worker processes and their
-NVTX lanes. Select `hint.submitted` on the target, then follow its local
-`trace_id` through `hint.used` and `target.queued.hint_trace_id`. The caller and
-remote branch have separate trace IDs. Use the target agent/incarnation/handle
-tuple to find the source write, then source instance/operation ID to find its
-pin waiter and pin ID. The [event reference](nvtx-events.md) and
-[producer map](nvtx-context.md) define each join.
+Open the `.nsys-rep` in Nsight Systems and expand both worker processes and their NVTX lanes. Select `hint.submitted` on the target, then follow its local `trace_id` through `hint.used` and `target.queued.hint_trace_id`. The caller and remote branch have separate trace IDs. Use the target agent/incarnation/handle tuple to find the source write, then source instance/operation ID to find its pin waiter and pin ID. The [event reference](nvtx-events.md) and [producer map](nvtx-context.md) define each join.
 
-The decoder accepts schemas 1/2/3 and checks medium's bounded Unicode display.
-Off disables KVCR annotations; other libraries can still emit NVTX events.
+The decoder accepts schemas 1/2/3 and checks medium's bounded Unicode display. Off disables KVCR annotations; other libraries can still emit NVTX events.
 
 ## Worked operation
 
-A Linux capture with Python 3.12.12, NIXL 1.5.0, NVTX 0.2.16, NumPy 2.5.3 and
-Nsight Systems 2025.3.2 exported 90 KVCR payload events for three deliveries.
-Both worker processes were present; the harness verified transferred bytes.
-The following is the last measured operation. Times are milliseconds relative
-to its `hint.submitted` mark; instance UUIDs and handle are aliased.
-These times are observations from one run, not latency targets.
+A Linux capture with Python 3.12.12, NIXL 1.5.0, NVTX 0.2.16, NumPy 2.5.3 and Nsight Systems 2025.3.2 exported 90 KVCR payload events for three deliveries. Both worker processes were present; the harness verified transferred bytes. The following is the last measured operation. Times are milliseconds relative to its `hint.submitted` mark; instance UUIDs and handle are aliased. These times are observations from one run, not latency targets.
 
 | Time | Worker / event | Interpretation |
 | --- | --- | --- |
@@ -70,17 +54,11 @@ These times are observations from one run, not latency targets.
 | 51.031 | Target: `op.completion_queued`, trace 8 | All operation branches are joined. |
 | 51.085 | Target: `op.completion_returned`, trace 8 | Caller receives the result; caller range ends at 51.094 ms. |
 
-The pin wait range lasts 20.358 ms. It includes the callback, framework delay
-and polling delay. The later receipt-to-return gap of 27.019 ms shows delayed caller polling; it is
-not extra DMA time. Absolute clocks from separate machines would require clock
-alignment before using a similar cross-worker timing table.
+The pin wait range lasts 20.358 ms. It includes the callback, framework delay and polling delay. The later receipt-to-return gap of 27.019 ms shows delayed caller polling; it is not extra DMA time. Absolute clocks from separate machines would require clock alignment before using a similar cross-worker timing table.
 
 ## Other outcomes
 
-Use a different output name for each scenario and pass the matching scenario to
-the decoder. `--scenario partial` requires at least two blocks. `zero` returns
-an accepted pin with every block missing; `failure` returns no pin result.
-Timeout delays the framework result beyond the operation deadline.
+Use a different output name for each scenario and pass the matching scenario to the decoder. `--scenario partial` requires at least two blocks. `zero` returns an accepted pin with every block missing; `failure` returns no pin result. Timeout delays the framework result beyond the operation deadline.
 
 | Scenario | Deliveries / payload events in the checked capture | Expected result |
 | --- | --- | --- |
@@ -93,37 +71,12 @@ Timeout delays the framework result beyond the operation deadline.
 | delayed, low | 3 / 90 | Same successful join with visible pin/poll delays. |
 | delayed, medium | 3 / 90 | Same ranges plus optional request display and byte diagnostics. |
 
-The decoder checks hint submission/use/request/worker/handle identity, rejects a
-hint invalidated before use, and verifies source pin/write and completion joins.
-It also checks native range IDs, closure, release ordering, and the target
-range's cross-thread endpoint. All independent ranges in these eight captures
-were closed; unresolved native shutdown is a separate unit case.
-Replacing an older hint does not invalidate the newer submission. Removing hint
-or request-context rows from the checked captures makes validation fail.
-Native failure, ambiguous posting, retries and quarantine are controlled unit
-cases; these captures do not inject hardware faults.
+The decoder checks hint submission/use/request/worker/handle identity, rejects a hint invalidated before use, and verifies source pin/write and completion joins. It also checks native range IDs, closure, release ordering, and the target range's cross-thread endpoint. All independent ranges in these eight captures were closed; unresolved native shutdown is a separate unit case. Replacing an older hint does not invalidate the newer submission. Removing hint or request-context rows from the checked captures makes validation fail. Native failure, ambiguous posting, retries and quarantine are controlled unit cases; these captures do not inject hardware faults.
 
 ## Repeat the overhead comparison
 
-Compare an immutable pre-optimization checkout (`88f2918`) with the updated
-stack. For each of five repetitions, shuffle both variants' `off`, `low`,
-`medium` runs, plain and under the same Nsight command above; alternate which
-collection mode runs first. Use `--blocks 16 --block-bytes 4096 --warmup 30
---iterations 300 --pin-delay-ms 0 --poll-delay-ms 0` each time, with the same
-environment and no competing validation workloads.
-Save every per-operation JSON latency and report. That is 60 runs, 18,000
-measured deliveries and 1,800 warmups. Compare the median of five run means,
-the range of those means, and each level's delta against its own variant and
-collection mode's off baseline. Verify each run's bytes and 330 pin
-requests/releases with zero cancellations; preserve raw runs, versions and
-source hashes alongside the summary.
+Compare an immutable pre-optimization checkout (`88f2918`) with the updated stack. For each of five repetitions, shuffle both variants' `off`, `low`, `medium` runs, plain and under the same Nsight command above; alternate which collection mode runs first. Use `--blocks 16 --block-bytes 4096 --warmup 30 --iterations 300 --pin-delay-ms 0 --poll-delay-ms 0` each time, with the same environment and no competing validation workloads. Save every per-operation JSON latency and report. That is 60 runs, 18,000 measured deliveries and 1,800 warmups. Compare the median of five run means, the range of those means, and each level's delta against its own variant and collection mode's off baseline. Verify each run's bytes and 330 pin requests/releases with zero cancellations; preserve raw runs, versions and source hashes alongside the summary.
 
 Use the same capture harness for both variants, including destination resets.
 
-The JSON reports delivery latency and its reciprocal operation rate. Timing
-starts at `deliver()` and ends at caller completion; hint creation, byte
-verification, destination reset, startup and teardown are excluded. Report size
-includes warmups and other libraries. Successful runs exercise few medium-only
-events, and run-to-run variation can reverse low/medium ordering. These DRAM
-measurements do not establish model throughput or a production overhead budget;
-that budget is a separate reviewer decision.
+The JSON reports delivery latency and its reciprocal operation rate. Timing starts at `deliver()` and ends at caller completion; hint creation, byte verification, destination reset, startup and teardown are excluded. Report size includes warmups and other libraries. Successful runs exercise few medium-only events, and run-to-run variation can reverse low/medium ordering. These DRAM measurements do not establish model throughput or a production overhead budget; that budget is a separate reviewer decision.
