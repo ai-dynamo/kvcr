@@ -25,6 +25,7 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
+from kvcr.hints.results import HintResult
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
@@ -676,3 +677,17 @@ def _key_history(caplog) -> list[dict[str, str]]:
         for record in caplog.records
         if record.message.startswith("KVCR_KEY_HISTORY ")
     ]
+
+
+def _record_hint_results(monkeypatch, kvcr: KVCR) -> list[HintResult]:
+    """Capture every result the dispatcher reports (it retains none itself)."""
+    dispatcher = kvcr._core._hints_dispatcher
+    real_report = dispatcher.report
+    results: list[HintResult] = []
+
+    def report(result: HintResult) -> None:
+        results.append(result)
+        real_report(result)
+
+    monkeypatch.setattr(dispatcher, "report", report)
+    return results
