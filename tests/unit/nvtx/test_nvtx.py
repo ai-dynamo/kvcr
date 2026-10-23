@@ -252,11 +252,12 @@ def test_partial_result_counts_available_blocks_without_guessing_cause(recording
     agent.state = "DONE"
     pinning.complete(0, missing_indices=(1,))
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    event = payloads(recording, "source.pin.completed")[0]
-    assert int(event["requested_blocks"]) == 2
-    assert int(event["completed_blocks"]) == 1
-    assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
-    assert int(event["reason"]) == int(_nvtx.Reason.UNKNOWN)
+    for name in ("source.pin.completed", "source.write.completed"):
+        event = payloads(recording, name)[0]
+        assert int(event["requested_blocks"]) == 2
+        assert int(event["completed_blocks"]) == 1
+        assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
+        assert int(event["reason"]) == int(_nvtx.Reason.UNKNOWN)
 
 
 def test_invalid_result_has_bounded_reason_and_releases_handle(recording):
@@ -294,7 +295,15 @@ def test_off_loads_no_backend_and_records_no_pin_state_or_events(monkeypatch, le
     monkeypatch.setattr(
         _nvtx, "_load_backend", lambda: pytest.fail("off mode loaded optional backend")
     )
+    monkeypatch.setattr(
+        "kvcr.remote_fw_dram._NvtxState",
+        lambda **kwargs: pytest.fail("off mode allocated tracing state"),
+    )
     source, agent, pinning = make_source((9, 10))
+    assert all(
+        op.nvtx_state is None
+        for op in source._core._remote_fw_dram._source_pin_ops.values()
+    )
     wait = next(iter(source._core._remote_fw_dram._pending_pin_ops.values()))
     assert wait.trace is None
     assert wait.op_ids == set(source._core._remote_fw_dram._source_pin_ops)

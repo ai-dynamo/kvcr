@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Observe NIXL state and resource release without changing their ordering."""
 
+import threading
+
 import pytest
 from _kvcr_test_utils import _decode_notif, _poll_until
 from _nvtx_test_utils import make_source, payloads, spans, wait_for_payload
@@ -137,10 +139,15 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
 def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
     source, agent, pinning = make_source()
+    pending = next(iter(source._core._remote_fw_dram._source_pin_ops.values()))
+    state = pending.nvtx_state
     native_submit = agent.transfer
     open_at_submit = []
 
     def submit_with_started_ranges(handle):
+        op = source._core._progress._in_flight_ops[pending.op_id]
+        assert op.nvtx_state is state
+        assert state.trace_initialized and state.trace is not None
         open_at_submit.append({name for name, _ in recording.ranges.values()})
         return native_submit(handle)
 
@@ -217,6 +224,53 @@ def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypat
     assert int(payloads(recording, "source.write.completed")[0]["reason"]) == int(
         _nvtx.Reason.ROUTE_CHANGED
     )
+
+
+def test_failed_source_trace_initialization_is_not_retried(recording, monkeypatch):
+    source, agent, pinning = make_source()
+    calls, polls = [], []
+    tracer = source._core._remote_fw_dram._nvtx
+    monkeypatch.setattr(
+        tracer, "source", lambda *args: calls.append(threading.get_ident())
+    )
+    monkeypatch.setattr(
+        agent, "check_xfer_state", lambda handle: polls.append(handle) or agent.state
+    )
+    agent.state = "PROC"
+    pinning.complete(0)
+    _poll_until(source, lambda _: len(polls) >= 2)
+    agent.state = "DONE"
+    _poll_until(source, lambda _: pinning.unpins == ["pin"])
+    assert calls == [source._core._progress._thread.ident]
+    assert len(agent.released_xfers) == 1
+    assert not payloads(recording, "source.write.completed")
+
+
+@pytest.mark.parametrize("level", ["off", "low", "medium"])
+def test_local_source_reuses_nvtx_state_on_both_write_paths(
+    recording, monkeypatch, level
+):
+    from test_kvcr_remote_source import (
+        test_local_source_starts_inline_and_holds_its_slot,
+    )
+
+    from kvcr.remote_fw_dram import _SourcePinOp, _SourceWriteOp
+
+    monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
+    pins, writes = {}, {}
+    for cls, states in ((_SourcePinOp, pins), (_SourceWriteOp, writes)):
+        initialize = cls.__init__
+
+        def capture(op, *args, initialize=initialize, states=states, **kwargs):
+            initialize(op, *args, **kwargs)
+            states[op.op_id] = op.nvtx_state
+
+        monkeypatch.setattr(cls, "__init__", capture)
+    test_local_source_starts_inline_and_holds_its_slot("PROC", monkeypatch)
+    assert pins.keys() == writes.keys() and len(pins) == 2
+    for op_id, state in pins.items():
+        assert writes[op_id] is state
+        assert (state is None) == (level == "off")
 
 
 def setup_transfer():

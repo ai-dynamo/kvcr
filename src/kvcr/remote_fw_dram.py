@@ -328,6 +328,15 @@ class _TargetPullOp(_RemoteOp):
         return safe
 
 
+@dataclass(slots=True)
+class _NvtxState:
+    requested_blocks: int = -1
+    target_incarnation: str | None = None
+    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
+    trace_initialized: bool = False
+    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
+
+
 @dataclass
 class _SourcePinOp(_Op):
     """Main-thread source acquisition for a pending write."""
@@ -343,7 +352,7 @@ class _SourcePinOp(_Op):
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
-    target_incarnation: str | None = None
+    nvtx_state: _NvtxState | None = None
 
 
 @dataclass
@@ -370,21 +379,18 @@ class _SourceWriteOp(_RemoteOp):
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
-    requested_blocks: int = -1
-    target_incarnation: str | None = None
-    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
-    trace_initialized: bool = False
-    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
+    nvtx_state: _NvtxState | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
     ) -> tuple[bool, bool]:
         backend = self._backend
-        if not self.trace_initialized:
-            self.trace_initialized = True
+        nvtx_state = self.nvtx_state
+        if nvtx_state is not None and not nvtx_state.trace_initialized:
+            nvtx_state.trace_initialized = True
             if backend._nvtx is not None:
-                self.trace = backend._nvtx.source(self, backend._kvcr)
-        trace = self.trace
+                nvtx_state.trace = backend._nvtx.source(self, backend._kvcr)
+        trace = nvtx_state.trace if nvtx_state is not None else None
         observed_work = False
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
@@ -402,7 +408,7 @@ class _SourceWriteOp(_RemoteOp):
                     elif not source_responsive:
                         failure_reason = _nvtx.Reason.SOURCE_STALLED
                     elif self.state is _SourceWriteState.NOTIFY_FAILURE:
-                        failure_reason = self.failure_reason
+                        failure_reason = nvtx_state.failure_reason
                     else:
                         failure_reason = _nvtx.Reason.DEADLINE
                     if failure_reason is _nvtx.Reason.UNKNOWN:
@@ -557,25 +563,26 @@ class _SourceWriteOp(_RemoteOp):
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
+        trace = self.nvtx_state.trace if self.nvtx_state is not None else None
         if self.transfer_id is not None:
             if (
                 progress.poll_transfer(self.transfer_id, require_completion=True)
                 is None
             ):
-                if self.trace is not None:
-                    self.trace.shutdown_unresolved("source.write.shutdown_unresolved")
+                if trace is not None:
+                    trace.shutdown_unresolved("source.write.shutdown_unresolved")
                 return False
             self.transfer_id = None
         self._backend._send_write_done(
             progress, self.remote_agent, self.op_handle, False
         )
         self._backend._dangling_ops.finish_source(self)
-        if self.trace is not None:
-            self.trace.complete_source(
+        if trace is not None:
+            trace.complete_source(
                 False,
                 0,
-                reason=self.trace.failure_reason
-                if self.trace.failure_reason is not _nvtx.Reason.UNKNOWN
+                reason=trace.failure_reason
+                if trace.failure_reason is not _nvtx.Reason.UNKNOWN
                 else _nvtx.Reason.SHUTDOWN,
             )
         return True
@@ -1379,11 +1386,16 @@ class _RemoteFWDram:
             dst_descriptors=dst_descriptors,
             allow_layout_subset=allow_layout_subset,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
-            target_incarnation=(
-                payload.get("sender_incarnation")
-                if isinstance(payload.get("sender_incarnation"), str)
-                else None
-            ),
+            nvtx_state=_NvtxState(
+                requested_blocks=len(keys),
+                target_incarnation=(
+                    payload.get("sender_incarnation")
+                    if isinstance(payload.get("sender_incarnation"), str)
+                    else None
+                ),
+            )
+            if self._nvtx is not None
+            else None,
         )
         if not self._try_local_source_write(progress, source_pin):
             self._progress_outbound.append(source_pin)
@@ -1442,8 +1454,7 @@ class _RemoteFWDram:
             dst_descriptors=source_pin.dst_descriptors,
             completed_indices=tuple(range(len(source_pin.ordered_keys))),
             route=source_pin.route,
-            requested_blocks=len(source_pin.ordered_keys),
-            target_incarnation=source_pin.target_incarnation,
+            nvtx_state=source_pin.nvtx_state,
             _backend=self,
         )
         # Already on progress: retain cleanup ownership before starting the write.
@@ -1537,6 +1548,8 @@ class _RemoteFWDram:
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
 
+        if source_pin.nvtx_state is not None:
+            source_pin.nvtx_state.failure_reason = failure_reason
         source_write = _SourceWriteOp(
             state=(
                 _SourceWriteState.READY_TO_WRITE
@@ -1553,14 +1566,12 @@ class _RemoteFWDram:
                 source_pin.dst_descriptors[index] for index in completed_indices
             ),
             route=source_pin.route,
-            requested_blocks=len(source_pin.ordered_keys),
-            target_incarnation=source_pin.target_incarnation,
+            nvtx_state=source_pin.nvtx_state,
             _backend=self,
             framework_pins=framework_pins,
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
-            failure_reason=failure_reason,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
