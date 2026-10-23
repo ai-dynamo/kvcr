@@ -15,19 +15,14 @@ on:
       - pyproject.toml
       - src/**
       - tests/e2e/**
-  # Manual runs can override the base image, Dynamo version, and KVCR ref.
+  # Manual runs can select a Dynamo vLLM runtime image and KVCR ref.
   workflow_dispatch:
     inputs:
       base_image:
-        description: vLLM image reference (nightly or PR image)
+        description: Dynamo vLLM runtime image reference
         required: true
         type: string
-        default: vllm/vllm-openai:nightly
-      dynamo_version:
-        description: Dynamo wheel version, or nightly for the latest prerelease
-        required: true
-        type: string
-        default: nightly
+        default: nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest
       kvcr_ref:
         description: KVCR ref to test (optional; e.g. refs/pull/23/merge)
         required: false
@@ -94,7 +89,7 @@ jobs:
         id: source
         shell: bash
         env:
-          BASE_IMAGE: ${{ inputs.base_image || 'vllm/vllm-openai:nightly' }}
+          BASE_IMAGE: ${{ inputs.base_image || 'nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest' }}
         run: |
           set -euo pipefail
           kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
@@ -127,7 +122,6 @@ jobs:
           tags: ${{ steps.source.outputs.image_tag }}
           build-args: |
             VLLM_IMAGE=${{ steps.source.outputs.base_image }}
-            DYNAMO_VERSION=${{ inputs.dynamo_version || 'nightly' }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
 
       - name: Record published image
