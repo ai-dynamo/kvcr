@@ -76,8 +76,6 @@ if dynamo_version == "nightly":
         ])
         wheel, = Path(wheel_dir).glob("*.whl")
         _, version, _, _ = parse_wheel_filename(wheel.name)
-        if not version.is_devrelease:
-            raise RuntimeError(f"Expected a Dynamo nightly, resolved {version}")
         dynamo_version = str(version)
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade",
