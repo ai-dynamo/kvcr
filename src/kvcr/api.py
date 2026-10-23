@@ -133,10 +133,10 @@ class KVCR:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object] | msgspec.Struct,
+        hints: msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        """Submit a mapping or msgspec envelope conforming to the hint protocol."""
+        """Submit a msgspec envelope conforming to the hint protocol."""
         self._core.submit_hint(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
