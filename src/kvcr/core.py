@@ -23,7 +23,7 @@ from .config import (
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hint_parser import _KVFetchHint
+from .hints.parser import _KVFetchHint
 from .local_disk import _G3, _G3Residency
 from .local_dram import (
     _layout_indices,

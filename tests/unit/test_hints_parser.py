@@ -7,7 +7,7 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
-from kvcr.hint_parser import _LOGGED_HINT_ISSUES, _KVFetchHint
+from kvcr.hints.parser import _LOGGED_HINT_ISSUES, _KVFetchHint
 
 
 @pytest.mark.parametrize("as_mapping", [False, True])
