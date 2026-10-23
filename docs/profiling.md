@@ -3,9 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NVTX framework-pin tracing
+# NVTX remote-delivery tracing
 
-This checkpoint traces framework pins and source NIXL transfers on the remote memory path. See the [source lifecycle reference](nvtx-events.md) for submission, completion, release and cancellation. Target processing, router hints and caller polling remain separate work.
+Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The examples use synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics, the [capture walkthrough](nvtx-walkthrough.md) for two-worker captures and overhead comparisons, and the [producer map](nvtx-context.md) for the inspected Dynamo/vLLM identity inputs.
 
 ## Enable tracing
 
@@ -20,7 +20,7 @@ uv sync --extra profiling
 | Value | Behavior |
 | --- | --- |
 | `off` (default) | No optional NVTX backend loading, trace objects, or payload construction. |
-| `low` | Essential identities, pin/source lifetimes, transitions and outcomes. |
+| `low` | Essential identities, pin/transfer/target/caller lifetimes, hints, transitions and outcomes. |
 | `medium` | Low plus descriptor byte/tier/memory diagnostics, bounded request display labels, waiter detachment and native release retries. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for tracing with an unavailable backend warns once. An unsupported level warns once and disables tracing. There is no `high` level in this checkpoint.
@@ -71,7 +71,7 @@ All annotations use the `KVCR` domain: pin events use `framework_pin`, and lifec
 
 The wait range includes the callback and observed asynchronous wait, including delay until KVCR polls the framework. It is not the framework's internal execution time. A cancellation marker reports KVCR's decision; it does not establish native transfer quiescence or permission to reuse a buffer. Late results are still discarded/released by the existing lifecycle and do not emit a second completion.
 
-Schema version 3 emits context once. Join compact events to `source.pin.context` by `(instance_hi, instance_lo, trace_id)`; its `pin_id` equals the independent `trace_id`. Context can follow the callback's range start, so collect context before reconstructing events. Waiter association marks keep their own handles because one pin can serve several source operations. Attributes and arrays are reused per emitting thread, with separate storage for reentrant calls. NVTX consumes values synchronously; arrays are not shared between threads or reassigned through the attributes' payload setter.
+Pin events use the [schema 3 context join](nvtx-events.md#payloads-and-identities); `pin_id` equals the independent `trace_id`. Context can follow the callback's range start, so collect context before reconstructing events.
 
 | Field | Interpretation |
 | --- | --- |
@@ -83,7 +83,7 @@ Schema version 3 emits context once. Join compact events to `source.pin.context`
 | `status`, `reason` | Bounded codes below. |
 | `fw_dram_utilization_known` | Always zero in this checkpoint: no framework utilization source is exposed by the current bindings. |
 
-Join pin events by `(instance_hi, instance_lo, pin_id)`, not by framework request ID alone. Operation handles alone are not globally unique across target agents. This schema is a source-side pin checkpoint, not a cross-worker identity scheme. No request, session, or parent-session identity is inferred from those handles.
+Join pins by `(instance_hi, instance_lo, pin_id)`, not framework request ID alone. Handles are not globally unique across targets; no request, session or parent identity is inferred from them.
 
 Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`, `6=cancelled`. For a nonempty request, zero usable blocks is failed; a positive subset is partial. An empty request with zero completed blocks remains success. Counts describe the observed result without asserting why blocks were missing.
 
@@ -91,7 +91,7 @@ Reason codes: `0=unknown`, `1=none`, `2=callback_error`, `3=duplicate_request`, 
 
 ## Integration gaps on the reviewed baseline
 
-On `fb4f264`, `submit_hint()` accepts a `request_id`; the hint parser retains only source endpoint and block hashes. The target pull retains the request ID, but its `start_write` message does not transport request/session/parent-session context. `KVCRBindings` exposes pin callbacks, not framework-cache utilization. Capturing those inputs needs a verified integration source and potentially a separately scoped API or wire change. KVCR local-cache occupancy is not a substitute.
+The [producer map](nvtx-context.md) documents request/session propagation and framework-utilization gaps on the inspected baselines, with immutable sources and the input seams requiring separate integration work.
 
 The pin hooks can also be encountered by remote fetch. They do not provide full fetch fan-out correlation. No production-overhead acceptance threshold has been established by this example.
 

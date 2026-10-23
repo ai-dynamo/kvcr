@@ -40,6 +40,8 @@ class Reason(IntEnum):
     REMOTE_FAILURE = 16
     ROUTE_CHANGED = 17
     SOURCE_STALLED = 18
+    HINT_UNAVAILABLE = 19
+    HINT_CONFLICT = 20
 
 
 class _ThreadBuffers(local):
@@ -78,6 +80,10 @@ class _PayloadEmitter:
                 ("target_incarnation_lo", "u8"),
                 ("route_generation", "u8"),
                 ("transfer_id", "u8"),
+                ("hint_trace_id", "u8"),
+                ("local_blocks", "i8"),
+                ("remote_blocks", "i8"),
+                ("g3_blocks", "i8"),
                 ("requested_blocks", "i8"),
                 ("requested_bytes", "i8"),
                 ("selected_blocks", "i8"),
