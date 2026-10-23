@@ -3,11 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The CI workflow resolves the selected serving image to a digest.
-ARG VLLM_IMAGE=nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest
+ARG VLLM_IMAGE=vllm/vllm-openai:nightly
 FROM ${VLLM_IMAGE}
 
 USER root
 ARG VLLM_IMAGE
+ARG DYNAMO_VERSION=nightly
 ARG KVCR_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/kvcr" \
       org.opencontainers.image.revision="${KVCR_COMMIT}" \
@@ -24,11 +25,16 @@ from importlib import metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
-# Keep the selected Dynamo runtime's vLLM and torch stack while installing KVCR.
+from packaging.version import Version
+
+# Keep the selected vLLM and torch stack while installing Dynamo and KVCR.
 backend_versions = {}
+# grpcio-observability requires an exactly matching grpcio version. Preserve
+# the installed gRPC family so Dynamo's tooling dependencies cannot split it.
 for name in (
     "vllm", "torch", "torchvision", "torchaudio", "numpy", "protobuf",
     "grpcio", "grpcio-tools", "grpcio-observability",
@@ -48,13 +54,40 @@ base_conflicts = set(subprocess.run(
 ).stdout.splitlines())
 
 # Serving images can intentionally carry a newer NCCL than torch declares.
-# Installing KVCR must not silently undo that base-image pin.
+# Installing Dynamo or KVCR must not silently undo that base-image pin.
 nccl_versions = {}
 for name in ("nvidia-nccl-cu12", "nvidia-nccl-cu13"):
     try:
         nccl_versions[name] = metadata.version(name)
     except metadata.PackageNotFoundError:
         pass
+requested_dynamo_version = os.environ["DYNAMO_VERSION"]
+dynamo_version = requested_dynamo_version
+if dynamo_version == "nightly":
+    # --pre also admits stable releases. Select the newest compatible dev wheel.
+    available = subprocess.check_output([
+        sys.executable, "-m", "pip", "index", "versions", "ai-dynamo",
+        "--pre", "--only-binary=:all:",
+        "--extra-index-url", "https://pypi.nvidia.com/",
+    ], text=True)
+    match = re.search(r"^Available versions: (.+)$", available, re.MULTILINE)
+    if match is None:
+        raise RuntimeError("Could not list available ai-dynamo versions")
+    dev_versions = [
+        version for item in match.group(1).split(", ")
+        if (version := Version(item)).is_devrelease
+    ]
+    if not dev_versions:
+        raise RuntimeError("No ai-dynamo dev wheel is available")
+    dynamo_version = str(max(dev_versions))
+    print(f"Selected ai-dynamo nightly: {dynamo_version}", flush=True)
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade",
+    "--extra-index-url", "https://pypi.nvidia.com/",
+    "--constraint", str(constraints),
+    "--report", "/opt/kvcr-dynamo-install-report.json",
+    f"ai-dynamo=={dynamo_version}",
+])
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--no-cache-dir", "/opt/kvcr-src",
     "--constraint", str(constraints),
@@ -82,6 +115,7 @@ packages = {
 Path("/opt/kvcr-build-metadata.json").write_text(json.dumps({
     "kvcr_sha": os.environ.get("KVCR_COMMIT", ""),
     "base_image": os.environ["VLLM_IMAGE"],
+    "requested_dynamo_version": requested_dynamo_version,
     "packages": packages,
     "nccl_versions": nccl_versions,
 }, indent=2) + "\n")
