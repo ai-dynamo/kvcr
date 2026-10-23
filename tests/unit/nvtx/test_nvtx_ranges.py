@@ -4,6 +4,7 @@
 
 import threading
 
+import pytest
 from _nvtx_test_utils import make_source, spans, wait_for_payload
 
 from kvcr import _nvtx
@@ -61,3 +62,18 @@ def test_started_lifecycle_can_end_once_on_competing_threads(recording):
         != spans(recording, "source.write", "end")[0][3]
     )
     assert not recording.ranges
+
+
+@pytest.mark.parametrize("failure", [None, "mark", "end"])
+def test_source_completion_ends_once_despite_annotation_failure(recording, failure):
+    trace = _nvtx.create_tracer().lifecycle()
+    trace.start("source.write")
+    recording.fail = failure
+    trace.complete_source(True, 0)
+    recording.fail = None
+    trace.complete_source(True, 0)
+    assert recording.ended == [0]
+    assert not recording.ranges
+    assert len(spans(recording, "source.write.completed", "mark")) == (
+        failure != "mark"
+    )

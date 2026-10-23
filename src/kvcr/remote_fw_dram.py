@@ -335,15 +335,14 @@ class _SourceWriteOp(_RemoteOp):
                 or backend._kvcr._clock() >= self.deadline
             ):
                 if trace is not None:
-                    failure_reason = (
-                        _nvtx.Reason.CANCELLED
-                        if status.cancel_requested
-                        else _nvtx.Reason.SOURCE_STALLED
-                        if not source_responsive
-                        else self.failure_reason
-                        if self.state is _SourceWriteState.NOTIFY_FAILURE
-                        else _nvtx.Reason.DEADLINE
-                    )
+                    if status.cancel_requested:
+                        failure_reason = _nvtx.Reason.CANCELLED
+                    elif not source_responsive:
+                        failure_reason = _nvtx.Reason.SOURCE_STALLED
+                    elif self.state is _SourceWriteState.NOTIFY_FAILURE:
+                        failure_reason = self.failure_reason
+                    else:
+                        failure_reason = _nvtx.Reason.DEADLINE
                     if failure_reason is _nvtx.Reason.UNKNOWN:
                         failure_reason = trace.failure_reason
                 backend._send_write_done(
