@@ -86,10 +86,9 @@ def test_low_avoids_descriptor_diagnostics(recording, monkeypatch, level, scanne
         src_descriptors=((object(),),),
         dst_descriptors=((object(),),),
         route=("target", 1),
-        target_incarnation="inc",
         op_handle=41,
         op_id=("source", 9),
-        requested_blocks=1,
+        nvtx_state=SimpleNamespace(target_incarnation="inc", requested_blocks=1),
         source_keys=(b"key",),
     )
     trace = _nvtx.create_tracer().source(op, kvcr)

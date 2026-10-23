@@ -151,11 +151,11 @@ class _PinTracer(_PayloadEmitter):
                 )
             trace = self.lifecycle(
                 target_agent=op.route[0] or None,
-                target_incarnation=op.target_incarnation,
+                target_incarnation=op.nvtx_state.target_incarnation,
                 op_handle=op.op_handle,
                 source_op_id=op.op_id[1],
                 route_generation=op.route[1],
-                requested_blocks=op.requested_blocks,
+                requested_blocks=op.nvtx_state.requested_blocks,
                 selected_blocks=len(op.source_keys),
                 **detail,
             )
