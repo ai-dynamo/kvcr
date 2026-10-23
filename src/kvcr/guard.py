@@ -196,7 +196,7 @@ class _RecoveryState:
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
-        self.attachment = KVCRPoolAttachment.attach(self._spec)
+        self.attachment = KVCRPoolAttachment.attach(self._spec, collapse=True)
         self._journal = RecoveryJournal(self.attachment)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
