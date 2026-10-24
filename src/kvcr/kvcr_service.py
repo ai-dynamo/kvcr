@@ -79,6 +79,7 @@ class _PoolRegistry:
         journal_bytes: int,
         compatibility_digest: str,
         heartbeat_timeout_seconds: float | None = None,
+        startup_timeout_seconds: int | None = None,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -112,6 +113,7 @@ class _PoolRegistry:
                         owner=owner,
                         refusing=self._refusing.is_set,
                         heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                        startup_timeout_seconds=startup_timeout_seconds,
                     )
                 except BaseException:
                     # Nothing has recorded this pool group yet, so the sweep
@@ -492,6 +494,7 @@ class _KVCRService:
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
         heartbeat_timeout_seconds: float | None = None,
+        startup_timeout_seconds: int | None = None,
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -515,6 +518,7 @@ class _KVCRService:
             journal_bytes,
             compatibility_digest,
             heartbeat_timeout_seconds,
+            startup_timeout_seconds,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -659,6 +663,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="opt in to early Guard promotion (minimum 1000 ms; default: pidfd-only)",
     )
     parser.add_argument(
+        "--startup-timeout-seconds",
+        type=int,
+        help="Guard core preparation and startup budget (default: 30 s)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str.upper,
         choices=_LOG_LEVELS,
@@ -673,6 +682,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         < float("inf")
     ):
         parser.error("--heartbeat-timeout-ms must be at least 1000 and finite")
+    if args.startup_timeout_seconds is not None and args.startup_timeout_seconds <= 0:
+        parser.error("--startup-timeout-seconds must be positive")
     return args
 
 
@@ -698,6 +709,7 @@ def main() -> None:
                 if args.heartbeat_timeout_ms is not None
                 else None
             ),
+            startup_timeout_seconds=args.startup_timeout_seconds,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logger.info(
