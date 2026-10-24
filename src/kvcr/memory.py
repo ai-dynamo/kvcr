@@ -16,6 +16,9 @@ from typing import Annotated
 
 import msgspec
 
+from .config import MemoryMode, _validate_memory_mode
+from .hugepages import AlignedSharedMapping, thp_page_size
+
 _POOL_MODE = 0o600
 _POOL_PREFIX = "kvcr"
 
@@ -54,12 +57,15 @@ class KVCRPoolSpec(msgspec.Struct, frozen=True):
     mapping_bytes: Annotated[int, msgspec.Meta(gt=0)]
     journal_bytes: Annotated[int, msgspec.Meta(gt=0)]
 
+    memory_mode: MemoryMode = "default"
+
     @property
     def data_bytes(self) -> int:
         """How much of the mapping is cache rather than journal."""
         return self.mapping_bytes - self.journal_bytes
 
     def __post_init__(self) -> None:
+        _validate_memory_mode(self.memory_mode)
         if not Path(self.path).is_absolute():
             raise ValueError("KVCR pool path must be absolute")
         if Path(self.path).name != _pool_filename(self.pool_id, self.generation):
@@ -76,17 +82,17 @@ class KVCRPoolAttachment:
         self,
         *,
         _file_descriptor: int,
-        _mapping: mmap.mmap,
+        _mapping: mmap.mmap | AlignedSharedMapping,
         _spec: KVCRPoolSpec,
     ) -> None:
         self._file_descriptor = _file_descriptor
-        self._mapping: mmap.mmap | None = _mapping
+        self._mapping: mmap.mmap | AlignedSharedMapping | None = _mapping
         self._spec = _spec
 
     @classmethod
     def attach(cls, spec: KVCRPoolSpec) -> "KVCRPoolAttachment":
         file_descriptor = os.open(spec.path, _OPEN_FLAGS)
-        mapping: mmap.mmap | None = None
+        mapping: mmap.mmap | AlignedSharedMapping | None = None
         try:
             # Held for the mapping's lifetime: a worker can outlive its
             # daemon, and this stops a replacement reclaiming the pool.
@@ -108,11 +114,14 @@ class KVCRPoolAttachment:
                     "KVCR pool is smaller than the grant describes: "
                     f"{file_stat.st_size} < {spec.mapping_bytes}"
                 )
-            mapping = mmap.mmap(
-                file_descriptor,
-                spec.mapping_bytes,
-                access=mmap.ACCESS_WRITE,
-            )
+            if spec.memory_mode == "thp":
+                mapping = AlignedSharedMapping(file_descriptor, spec.mapping_bytes)
+            else:
+                mapping = mmap.mmap(
+                    file_descriptor,
+                    spec.mapping_bytes,
+                    access=mmap.ACCESS_WRITE,
+                )
             # A forked child is not the pidfd-bound claimant.
             mapping.madvise(mmap.MADV_DONTFORK)
             return cls(
@@ -193,7 +202,7 @@ class KVCRPoolAttachment:
             os.close(self._file_descriptor)
             self._file_descriptor = -1
 
-    def _require_mapping(self) -> mmap.mmap:
+    def _require_mapping(self) -> mmap.mmap | AlignedSharedMapping:
         if self._mapping is None:
             raise RuntimeError("KVCR pool attachment is closed")
         return self._mapping
@@ -220,6 +229,7 @@ class _KVCRPoolOwner:
         pool_size_bytes: int,
         journal_bytes: int,
         pool_dir: str | os.PathLike[str],
+        memory_mode: MemoryMode = "default",
     ) -> "_KVCRPoolOwner":
         """Create the file and reserve its data space.
 
@@ -227,6 +237,11 @@ class _KVCRPoolOwner:
         exclusively, so a pool under construction cannot be reclaimed.
         """
         _validate_pool_layout(pool_size_bytes, journal_bytes)
+        _validate_memory_mode(memory_mode)
+        if memory_mode == "thp" and pool_size_bytes % thp_page_size():
+            raise ValueError(
+                "THP pool length must be a multiple of the kernel PMD size"
+            )
         generation = uuid.uuid4().hex
         directory = Path(pool_dir).resolve()
         path = directory / _pool_filename(pool_id, generation)
@@ -244,6 +259,7 @@ class _KVCRPoolOwner:
                     inode=file_identity[1],
                     mapping_bytes=pool_size_bytes,
                     journal_bytes=journal_bytes,
+                    memory_mode=memory_mode,
                 )
                 # Dropped by the kernel on death, which is how another
                 # daemon tells a live pool from a crashed one's.
