@@ -179,9 +179,10 @@ The callback names above represent services implemented by the framework
 adapter; they are not provided by KVCR itself.
 
 `KVCRConfig.startup_timeout_seconds` accepts a positive integer to allow longer
-initialization waits. Omitting it or setting it to `None` uses 30 seconds.
+initialization waits. Omitting it or setting it to `None` uses 60 seconds.
 The timeout applies separately to the local preparation and startup waits;
-transfer deadlines are unchanged.
+transfer deadlines are unchanged. A Guard core uses the service's
+`--startup-timeout-seconds`.
 
 For `on_resilience_event` and optional framework-memory quarantine, see the
 [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
@@ -269,7 +270,8 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-All flags except `--log-level` and `--heartbeat-timeout-ms` are required.
+All flags except `--log-level`, `--heartbeat-timeout-ms` and
+`--startup-timeout-seconds` are required.
 
 | Flag | Meaning |
 | --- | --- |
@@ -279,6 +281,7 @@ All flags except `--log-level` and `--heartbeat-timeout-ms` are required.
 | `--pool-sizes-gb` | Comma-separated usable sizes of the ordered pools in every group |
 | `--compatibility-digest` | Exact digest every claimant must provide |
 | `--heartbeat-timeout-ms` | Opt in to Guard promotion after a missed heartbeat; omitted means pidfd-only detection. Workers send heartbeats every 50 ms; minimum timeout is 1000 ms. |
+| `--startup-timeout-seconds` | Guard core startup budget; defaults to 60 s. Raise it for large pools, whose registration takes longer. |
 | `--log-level` | Service and Guard logging threshold; defaults to `$KVCR_LOG_LEVEL` or `INFO` |
 
 Heartbeat promotion kills the worker it promotes over. On a missed deadline the
@@ -336,15 +339,10 @@ its recovered records; a claimant that cannot inherit the endpoint is refused.
 A clean release returns the Guard to standby and the group to claimable.
 Takeover and handback cost time linear in the number of recovered blocks.
 
-For large host pools, UCX on-demand paging (ODP) avoids synchronous page
-registration during Guard preparation. It needs host ODP in the NIC, driver and
-UCX backend, and shifts page faults to first access rather than speeding up
-backing-file allocation.
-
-- `UCX_REG_NONBLOCK_MEM_TYPES=host` and `UCX_IB_ODP_PREFETCH=n`: set by
-  `Dockerfile.quick-start`.
-- `UCX_REG_NONBLOCK_FALLBACK=n`: fails instead of silently reverting to blocking
-  registration. Use it to confirm ODP is the path actually taken.
+Registering a large host pool can take tens of seconds, so a Guard prepares
+its core in the background and a claim does not wait for it. A promotion waits
+for the preparation to finish, up to `--startup-timeout-seconds`; while it
+waits, the Guard processes no release, abort or close.
 
 `--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`) logs source transfer refusals
 with their reason, startup and Guard promotion/handback stage timings, and
