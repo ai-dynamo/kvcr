@@ -42,6 +42,7 @@ from .guard_protocol import (
     _Released,
     _TierConfig,
 )
+from .health import _serve_health
 from .memory import (
     _POOL_PREFIX,
     KVCRPoolSpec,
@@ -403,6 +404,7 @@ class _ThreadingUnixServer(
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
         self._fatal_error: BaseException | None = None
+        self._last_progress: float | None = None
         self._fatal_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
         self._connections_lock = threading.Lock()
@@ -417,6 +419,9 @@ class _ThreadingUnixServer(
         connection.settimeout(_CLIENT_IDLE_TIMEOUT_SECONDS)
         self.add_connection(connection)
         return connection, address
+
+    def service_actions(self) -> None:
+        self._last_progress = time.monotonic()
 
     def dispatch(
         self,
@@ -540,8 +545,43 @@ class _KVCRService:
         with contextlib.suppress(BufferError, OSError):
             self._registry.close()
 
-    def serve_forever(self) -> None:
-        self._server.serve_forever()
+    def _health_status(self, timeout: float) -> tuple[int, str]:
+        """Observe progress without claiming pools or entering Guard actor locks."""
+        if self._closed or self._registry._refusing.is_set():
+            return 503, "service stopping"
+        if self._server._fatal_error is not None:
+            return 503, "service failed"
+        now = time.monotonic()
+        progress = self._server._last_progress
+        if progress is None:
+            return 503, "service not serving"
+        if now - progress > timeout:
+            return 503, "service stalled"
+        guards = list(self._registry._guards.values())
+        if len(guards) != self._registry._guard_count:
+            return 503, "guards unavailable"
+        for guard in guards:
+            if guard._failure is not None or not guard._thread.is_alive():
+                return 503, "guard failed"
+            if now - guard._last_progress > timeout:
+                return 503, "guard stalled"
+        return 200, "ok"
+
+    def serve_forever(
+        self,
+        health_address: tuple[str, int] | None = None,
+        health_timeout_seconds: float = 30,
+        health_dependency_url: str | None = None,
+    ) -> None:
+        with _serve_health(
+            health_address,
+            functools.partial(self._health_status, health_timeout_seconds),
+            health_dependency_url,
+        ):
+            try:
+                self._server.serve_forever()
+            finally:
+                self._server._last_progress = None
         if self._server._fatal_error is not None:
             raise self._server._fatal_error
 
@@ -657,6 +697,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--compatibility-digest", required=True)
+    parser.add_argument("--health-host", default="127.0.0.1")
+    parser.add_argument(
+        "--health-port", type=int, help="enable /live and /ready HTTP probes"
+    )
+    parser.add_argument("--health-timeout-seconds", type=float, default=30)
+    parser.add_argument(
+        "--health-dependency-url",
+        help="optional HTTP health dependency; both probes require it to return 200",
+    )
     parser.add_argument(
         "--heartbeat-timeout-ms",
         type=float,
@@ -676,6 +725,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.guard_count < 1:
         parser.error("--guard-count must be at least 1")
+    if args.health_port is not None and not 1 <= args.health_port <= 65535:
+        parser.error("--health-port must be between 1 and 65535")
+    if not 1 < args.health_timeout_seconds < float("inf"):
+        parser.error("--health-timeout-seconds must be finite and greater than 1")
+    if args.health_dependency_url is not None and (
+        args.health_port is None
+        or not args.health_dependency_url.startswith(("http://", "https://"))
+    ):
+        parser.error(
+            "--health-dependency-url requires --health-port and an HTTP(S) URL"
+        )
     if args.heartbeat_timeout_ms is not None and not (
         _MIN_HEARTBEAT_TIMEOUT_SECONDS * 1000
         <= args.heartbeat_timeout_ms
@@ -720,7 +780,13 @@ def main() -> None:
             args.pool_sizes_bytes,
             _DEFAULT_JOURNAL_BYTES,
         )
-        server.serve_forever()
+        server.serve_forever(
+            health_address=(args.health_host, args.health_port)
+            if args.health_port is not None
+            else None,
+            health_timeout_seconds=args.health_timeout_seconds,
+            health_dependency_url=args.health_dependency_url,
+        )
     except _ShutdownRequested:
         pass
     finally:

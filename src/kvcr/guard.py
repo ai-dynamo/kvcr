@@ -428,6 +428,7 @@ class _Guard:
         # Identity of the lease whose fencing failure has been logged: the actor
         # retries every millisecond, and one warning per lease is enough.
         self._fence_failed: object | None = None
+        self._last_progress = time.monotonic()
 
     @property
     def heartbeat_enabled(self) -> bool:
@@ -615,6 +616,7 @@ class _Guard:
     def _serve_commands(self) -> None:
         draining = False
         while True:
+            self._last_progress = time.monotonic()
             try:
                 if draining:
                     # More was waiting last time round, so do not go back to
@@ -622,13 +624,13 @@ class _Guard:
                     command = self._commands.get_nowait()
                 else:
                     # Nothing publishes into a pool no primary holds, so an
-                    # unclaimed Guard waits rather than waking on an empty journal.
+                    # unclaimed Guard wakes at most once a second for health reporting.
                     busy = (
                         self._serving
                         or self._control is not None
                         or bool(self._orphans)
                     )
-                    timeout = _POLL_SECONDS if busy and not self._failure else None
+                    timeout = _POLL_SECONDS if busy and not self._failure else 1.0
                     command = self._commands.get(timeout=timeout)
             except queue.Empty:
                 self._observe_holder()
