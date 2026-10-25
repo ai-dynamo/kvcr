@@ -223,7 +223,15 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-All flags except `--log-level`, `--heartbeat-timeout-ms` and `--startup-timeout-seconds` are required.
+The five flags above are required. Logging, heartbeat fencing, Guard startup timeout, and HTTP health options are optional.
+
+Add `--health-port 9092` to enable read-only `GET /live` and `GET /ready` probes. The listener binds to `127.0.0.1` by default; use `--health-host 0.0.0.0` for a Kubernetes probe and restrict network access to the probe port. Both paths return 200 when the Unix accept loop and all Guard actor loops are progressing, or 503 on a known failure, shutdown, or stall. The progress deadline defaults to 30 seconds (`--health-timeout-seconds`, finite and greater than 1). An idle Guard wakes once a second. These checks do not claim a pool, change a lease, require an attached engine, or validate cached data and every native transport thread.
+
+Background Guard preparation does not block readiness. Promotion waits for any remaining preparation and can report a stalled Guard until that wait completes, even when its separate startup budget has not expired.
+
+For a supervised companion, optionally set `--health-dependency-url http://127.0.0.1:9091/live`. Both probes then also require that endpoint to return 200 (one-second socket timeout, no HTTP proxy). Before initialization or after shutdown, the listener may be unavailable instead of returning 503. Unknown paths return 404. Process logs remain on stderr; this listener does not expose Prometheus metrics.
+
+Use readiness probes for a Guard sidecar. Do not configure automatic sidecar-only restart probes while an engine still maps its pools. A failed Guard requires coordinated shutdown and replacement of the affected engines and service/pools according to the deployment's lifecycle policy.
 
 | Flag | Meaning |
 | --- | --- |
