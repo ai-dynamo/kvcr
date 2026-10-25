@@ -134,6 +134,28 @@ the image and runs the `dense` and `hybrid` configurations; evidence lands in
 reuses an image already on the node, `--extra "--harness-arg=..."` applies to
 every configuration, `--matrix dense` picks one.
 
+## Beyond Phase 1: hint dispatcher (kvcr#118, proposed)
+
+kvcr#118 turns a router hint into an envelope of independent actions, each with its
+own ACCEPTED / REJECTED result. Phase 1 only exercises one `kv.fetch` per envelope
+(TC-03). Candidate cases for the next phase, in priority order; none are
+implemented yet:
+
+| Case | Requirement | Check |
+| --- | --- | --- |
+| TC-07 Unknown action is isolated | an unsupported action type must not fail the request or the valid `kv.fetch` beside it | envelope with `kv.fetch` + `kv.future_action`: hinted hit as in TC-03; service log has one `unsupported_action_type` warning; no `failed` KVCR metric |
+| TC-08 Malformed hint does not raise | an invalid `kv.fetch` payload is rejected per hint, the request is served cold | `cached_tokens == 0`, tokens equal reference, one warning, no error in the worker log |
+| TC-09 Conflicting sources | two `kv.fetch` for one request from different sources mark the request failed for remote service | request served cold, no transfer, `hint_wait` absent |
+| TC-10 Hint-level telemetry | per-hint outcomes are observable | needs a KVCR metric (e.g. `kvcr_hints_total{type,status}`); until it exists the e2e harness can only read logs |
+| TC-11 Other action types | `kv.invalidate`, `kv.evict`, prefetch into KVCR DRAM | placeholder until the handlers land; each needs a residency check on the source and target pools |
+| TC-12 Per-engine TC-03 | the envelope format is shared with TensorRT-LLM (#18153) and SGLang (#36224) RFCs | run TC-03 per engine once their KVCR adapters exist |
+
+TC-07..09 need a way to inject an envelope from the harness. The Dynamo router
+always sends one `kv.fetch`, so either the harness talks to the worker's
+`submit_hint` path directly (requires a debug hook in the vLLM KVCR adapter) or
+the cases stay at the unit level, where kvcr#118 already covers parsing and
+dispatch (22 tests).
+
 ## Known limits
 
 - Aggregated only. A single node with two GPUs cannot form a disaggregated
