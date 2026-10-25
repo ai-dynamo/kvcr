@@ -151,6 +151,19 @@ class KVCR:
         """Return the best currently known status and tier for each key."""
         return self._core.query(keys, request_id)
 
+    def probe_remote_source(
+        self,
+        keys: Collection[BlockKey],
+        request_id: str,
+        expected_layout: list[str],
+    ) -> OpHandle:
+        """Check exact hinted peer residency; a positive result is not a claim.
+
+        Use ``fetch`` and retain its release handles before admitting reuse.
+        Old peers without the versioned inventory reply fail closed on timeout.
+        """
+        return self._core.probe_remote_source(keys, request_id, expected_layout)
+
     def align_sequence(
         self, ordered_keys: list[BlockKey], use_current_time: bool = False
     ) -> None:

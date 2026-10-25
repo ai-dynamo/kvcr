@@ -568,6 +568,65 @@ class _TargetMetadataRequest:
     endpoint: str
 
 
+@dataclass(frozen=True)
+class _SourceInventoryRequest:
+    """Control request passed from the progress thread to source main."""
+
+    endpoint: str
+    op_handle: int
+    keys: tuple[BlockKey, ...]
+    layout: tuple[str, ...]
+    source_incarnation: str | None
+
+
+@dataclass(frozen=True)
+class _SourceInventoryReply:
+    """A source-main residency snapshot returned to the progress thread."""
+
+    endpoint: str
+    op_handle: int
+    present_indices: tuple[int, ...]
+
+
+@dataclass
+class _TargetSourceInventoryOp(_RemoteOp):
+    """Bounded, advisory source check; never claims source or target memory."""
+
+    remote_ctrl_ep: str
+    ordered_keys: tuple[BlockKey, ...]
+    layout: tuple[str, ...]
+    _backend: "_RemoteFWDram" = field(repr=False, compare=False)
+    sent: bool = False
+    present_indices: tuple[int, ...] = ()
+
+    def progress(
+        self, progress: _KVCRProgress, event: object | None
+    ) -> tuple[bool, bool]:
+        if self._backend._kvcr._clock() >= self.deadline:
+            return True, True
+        if isinstance(event, Mapping):
+            indices = event.get("present_indices")
+            if isinstance(indices, tuple):
+                self.present_indices = indices
+            return True, True
+        if self.sent:
+            return False, False
+        self.sent = self._backend._send_control(
+            progress,
+            self.remote_ctrl_ep,
+            {
+                "type": "source_inventory_query_v1",
+                "op_handle": self.op_id[1],
+                "keys": list(self.ordered_keys),
+                "layout": self.layout,
+                "source_incarnation": self._backend._dangling_ops.sources.get(
+                    self.remote_ctrl_ep
+                ),
+            },
+        )
+        return not self.sent, True
+
+
 @dataclass
 class _ProgressUpdate:
     """Bounded progress-only telemetry and gauges returned to main."""
@@ -629,6 +688,7 @@ class _RemoteFWDram:
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
         self._refused_writes: dict[_OpId, dict[str, Any]] = {}
+        self._source_inventory_replies: dict[_OpId, dict[str, tuple[int, ...]]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
@@ -679,6 +739,42 @@ class _RemoteFWDram:
         ):
             return False
         return True
+
+    def probe_source_inventory(
+        self,
+        op_handle: OpHandle,
+        keys: tuple[BlockKey, ...],
+        request_id: str,
+        layout: tuple[str, ...],
+        deadline: float,
+    ) -> None:
+        """Check exact source pieces without allocating target DRAM.
+
+        A positive reply is only a snapshot. Callers must still use ``fetch``
+        and check its completion/claim before admitting a cache hit.
+        """
+        hint = self._request_hints.get(request_id)
+        if (
+            not keys
+            or len(keys) > 256
+            or hint is None
+            or hint.source is None
+            or any(not self.query(key, request_id) for key in keys)
+        ):
+            self._kvcr._complete(op_handle, dict.fromkeys(keys, _FAILED_RESULT))
+            return
+        self._kvcr._progress.submit(
+            _TargetSourceInventoryOp(
+                op_id=("source_inventory", op_handle),
+                keys=frozenset(keys),
+                started_at=self._kvcr._timer(),
+                deadline=deadline,
+                remote_ctrl_ep=hint.source,
+                ordered_keys=keys,
+                layout=layout,
+                _backend=self,
+            )
+        )
 
     def _start_target_pull(
         self,
@@ -834,6 +930,20 @@ class _RemoteFWDram:
                     )
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
+            elif isinstance(item, _SourceInventoryRequest):
+                self._answer_source_inventory(item)
+            elif isinstance(item, _TargetSourceInventoryOp):
+                self._kvcr._complete(
+                    cast(OpHandle, item.op_id[1]),
+                    {
+                        key: (
+                            _SUCCESS_RESULT
+                            if index in item.present_indices
+                            else _FAILED_RESULT
+                        )
+                        for index, key in enumerate(item.ordered_keys)
+                    },
+                )
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -960,6 +1070,16 @@ class _RemoteFWDram:
                 ):
                     continue
                 self._send_control(progress, item.endpoint, {"type": "target_metadata"})
+            elif isinstance(item, _SourceInventoryReply):
+                self._send_control(
+                    progress,
+                    item.endpoint,
+                    {
+                        "type": "source_inventory_reply_v1",
+                        "op_handle": item.op_handle,
+                        "present_indices": item.present_indices,
+                    },
+                )
             else:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
@@ -975,6 +1095,8 @@ class _RemoteFWDram:
             ):
                 events[op_id] = refusal
         self._refused_writes.clear()
+        events.update(self._source_inventory_replies)
+        self._source_inventory_replies.clear()
         observed_work |= bool(events)
         return events, observed_work
 
@@ -1036,6 +1158,10 @@ class _RemoteFWDram:
                 self._dangling_ops.handle_probe_ack(progress, payload)
             elif message_type == "start_write":
                 self._handle_start_write(progress, payload)
+            elif message_type == "source_inventory_query_v1":
+                self._handle_source_inventory_query(progress, payload)
+            elif message_type == "source_inventory_reply_v1":
+                self._handle_source_inventory_reply(progress, payload)
             else:
                 continue
             handled = True
@@ -1043,6 +1169,123 @@ class _RemoteFWDram:
                 f"control_{message_type}", handled_at, "handled"
             )
         return handled
+
+    def _handle_source_inventory_query(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        """Move source inspection to main, which owns the block map."""
+        endpoint = payload.get("sender_control_endpoint")
+        local_endpoint = getattr(self._control, "endpoint", None)
+        op_handle = payload.get("op_handle")
+        expected = payload.get("source_incarnation")
+        if (
+            not isinstance(endpoint, str)
+            or not endpoint
+            or payload.get("source_control_endpoint") != local_endpoint
+            or type(op_handle) is not int
+            or (expected is not None and not isinstance(expected, str))
+        ):
+            return
+        try:
+            keys = _message_keys(payload)
+            layout = msgspec.convert(payload["layout"], type=tuple[str, ...])
+        except (KeyError, TypeError, ValueError, msgspec.ValidationError):
+            return
+        if not layout or len(keys) > 256:
+            return
+        # A mismatched incarnation is a negative response, not permission to
+        # use the restarted source's logically matching keys.
+        if (
+            progress._stop_requested
+            or (expected is not None and expected != self._dangling_ops.incarnation)
+            or not self._dangling_ops.check_source_progress()
+        ):
+            self._send_control(
+                progress,
+                endpoint,
+                {
+                    "type": "source_inventory_reply_v1",
+                    "op_handle": op_handle,
+                    "present_indices": (),
+                },
+            )
+            return
+        self._progress_outbound.append(
+            _SourceInventoryRequest(endpoint, op_handle, keys, layout, expected)
+        )
+
+    def _answer_source_inventory(self, request: _SourceInventoryRequest) -> None:
+        kvcr = self._kvcr
+        # poll_main holds the core state lock. No pins are acquired by a probe.
+        try:
+            kvcr._validate_expected_layout(list(request.layout))
+        except ValueError:
+            present = ()
+        else:
+            present_indices = []
+            for index, key in enumerate(request.keys):
+                record = kvcr._block_record_map.get(key)
+                if record is None:
+                    continue
+                local = record.local_dram
+                if (
+                    local is not None
+                    and local.state is _LocalDramState.READY
+                    and local.ready_indices(list(request.layout)) is not None
+                ):
+                    present_indices.append(index)
+                    continue
+                fw = record.fw_mem
+                if (
+                    fw is not None
+                    and _layout_indices(
+                        [ref.label for ref in fw.descriptors], list(request.layout)
+                    )
+                    is not None
+                ):
+                    present_indices.append(index)
+            present = tuple(present_indices)
+        kvcr._progress.submit(
+            _SourceInventoryReply(request.endpoint, request.op_handle, present)
+        )
+
+    def _handle_source_inventory_reply(
+        self, progress: _KVCRProgress, payload: dict[str, Any]
+    ) -> None:
+        endpoint = payload.get("sender_control_endpoint")
+        op_handle = payload.get("op_handle")
+        incarnation = payload.get("sender_incarnation")
+        if (
+            not isinstance(endpoint, str)
+            or type(op_handle) is not int
+            or not isinstance(incarnation, str)
+            or not incarnation
+        ):
+            return
+        op_id = ("source_inventory", op_handle)
+        op = progress._in_flight_ops.get(op_id)
+        if (
+            not isinstance(op, _TargetSourceInventoryOp)
+            or op.remote_ctrl_ep != endpoint
+        ):
+            return
+        expected = self._dangling_ops.sources.get(endpoint)
+        if expected is not None and expected != incarnation:
+            # A peer restart invalidates this snapshot and any cached metadata.
+            self._invalidate_control_peer(endpoint)
+            self._source_inventory_replies[op_id] = {"present_indices": ()}
+            return
+        raw = payload.get("present_indices")
+        if (
+            not isinstance(raw, (list, tuple))
+            or len(raw) > len(op.ordered_keys)
+            or any(type(index) is not int for index in raw)
+            or tuple(sorted(set(raw))) != tuple(raw)
+            or any(index < 0 or index >= len(op.ordered_keys) for index in raw)
+        ):
+            return
+        self._dangling_ops.sources[endpoint] = incarnation
+        self._source_inventory_replies[op_id] = {"present_indices": tuple(raw)}
 
     def _send_control(
         self,

@@ -507,6 +507,32 @@ class _KVCRCore:
             self._log_query_diagnostics(statuses, request_id)
         return statuses
 
+    def probe_remote_source(
+        self,
+        keys: Collection[BlockKey],
+        request_id: str,
+        expected_layout: list[str],
+    ) -> OpHandle:
+        """Asynchronously check exact hinted source pieces without fetching them.
+
+        This result is an advisory snapshot; a successful ``fetch`` with a
+        retained release handle is still required before reusing a page.
+        """
+        layout = self._validate_expected_layout(expected_layout)
+        assert layout is not None
+        ordered_keys = tuple(dict.fromkeys(keys))
+        op_handle = self._next_op_handle
+        self._next_op_handle += 1
+        with self._state_lock:
+            self._remote_fw_dram.probe_source_inventory(
+                op_handle,
+                ordered_keys,
+                request_id,
+                layout,
+                self._operation_deadline(),
+            )
+        return op_handle
+
     def align_sequence(
         self, ordered_keys: list[BlockKey], use_current_time: bool = False
     ) -> None:
