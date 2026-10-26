@@ -40,8 +40,8 @@ from kvcr.remote_fw_dram import (
     _FwMemResidency,
     _RemoteFWDram,
     _SourcePinOp,
-    _SourceWriteOp,
 )
+from kvcr.remote_ops import _CONTROL_DECODER, _SourceWriteOp, _TargetMetadata
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
@@ -592,17 +592,26 @@ def test_kvcr_close_cleans_pending_pin_operations():
 
 
 @pytest.mark.parametrize(
-    "field",
+    "field,value",
     [
-        "remaining_timeout_ms",
-        "key_layout",
-        "keys",
-        "framework",
-        "label",
-        "end_point_name",
+        ("remaining_timeout_ms", msgspec.UNSET),
+        ("remaining_timeout_ms", True),
+        ("remaining_timeout_ms", 0),
+        ("remaining_timeout_ms", float("nan")),
+        ("remaining_timeout_ms", float("inf")),
+        ("key_layout", "yes"),
+        ("keys", [b"k0", b"k0"]),
+        ("keys", []),
+        ("keys", ["k0"]),
+        ("dst_descriptors", []),
+        ("dst_descriptors", "invalid"),
+        ("framework", 1),
+        ("label", 1),
+        ("element_index", -1),
+        ("end_point_name", "other"),
     ],
 )
-def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
+def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field, value):
     source_agent = FakeNixlAgent(metadata=b"source-md")
     control = FakeBytesControl()
     pinning = FakePrimaryPinning()
@@ -610,17 +619,15 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
     request = msgspec.msgpack.decode(
         _start_write_message(6, BlockKey(b"k0"), target_agent="target")
     )
-    if field == "remaining_timeout_ms":
+    if value is msgspec.UNSET:
         request.pop(field)
-    elif field == "keys":
-        request[field] *= 2
-        request["dst_descriptors"] *= 2
-    elif field in ("framework", "label", "end_point_name"):
+    elif field in ("framework", "label", "element_index", "end_point_name"):
         descriptors = request["dst_descriptors"][0]
-        value = "other" if field == "end_point_name" else 1
         descriptors.append({**descriptors[0], field: value})
     else:
-        request[field] = "yes"
+        request[field] = value
+        if field == "keys":
+            request["dst_descriptors"] *= len(value)
     control.incoming.append(msgspec.msgpack.encode(request))
     _wait_until(lambda: bool(source_agent.sent_notifs))
 
@@ -637,6 +644,61 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field):
         for record in kvcr_caplog.records
         if record.levelno == logging.WARNING
     )
+
+
+@pytest.mark.parametrize(
+    "field,cached,with_metadata",
+    [
+        ("sender_incarnation", False, False),
+        ("sender_incarnation", True, False),
+        ("target_regions", True, True),
+    ],
+)
+def test_malformed_peer_preserves_route(kvcr_caplog, field, cached, with_metadata):
+    agent, control, pinning = FakeNixlAgent(), FakeBytesControl(), FakePrimaryPinning()
+    source = _new_kvcr(agent, pinning, control, name="source")
+    tier = source._core._remote_fw_dram
+    request = msgspec.msgpack.decode(
+        _start_write_message(6, b"k0", target_agent="target")
+    )
+    if cached:
+        control.incoming.append(
+            msgspec.msgpack.encode({**request, "type": "target_metadata"})
+        )
+        _wait_until(lambda: "target" in tier._remote_agents_by_target)
+        cached_route = tier._remote_agents_by_target["target"]
+    request.update(
+        sender_control_endpoint="tcp://target:1",
+        source_control_endpoint="tcp://source:1",
+    )
+    request[field] = 1
+    if not with_metadata:
+        del request["target_agent_metadata"]
+    control.incoming.append(msgspec.msgpack.encode(request))
+    _wait_until(lambda: bool(agent.sent_notifs or control.sent))
+
+    assert not pinning.searches
+    assert not agent.xfers
+    if cached and not with_metadata:
+        assert not control.sent
+        assert _decode_notif(agent.sent_notifs[0][1]) == {
+            "type": "write_done",
+            "op_handle": 6,
+            "success": False,
+        }
+    else:
+        assert not agent.sent_notifs
+        endpoint, raw = control.sent[0]
+        reply = _decode_control_message(raw)
+        assert endpoint == "tcp://target:1"
+        assert reply["type"] == "write_refused"
+        assert reply["op_handle"] == 6
+        assert reply["sender_control_endpoint"] == "tcp://source:1"
+        assert reply.get("reason") == (None if with_metadata else "metadata_required")
+    if cached:
+        assert tier._remote_agents_by_target["target"] == cached_route
+        assert agent.remote_agents == [b"target-md"]
+    assert field in kvcr_caplog.text
 
 
 def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
@@ -731,9 +793,9 @@ def test_kvcr_source_ignores_malformed_control_messages():
     control.incoming.append(b"\xff\xff\xff not msgpack")
     control.incoming.append(msgspec.msgpack.encode(b"top-level-not-dict"))
     control.incoming.append(msgspec.msgpack.encode({"type": "unknown"}))
-    control.incoming.append(
-        msgspec.msgpack.encode({"type": "start_write", "op_handle": float("inf")})
-    )
+    control.incoming.append(_write_probe_message(True))
+    for op_handle in (float("inf"), True):
+        control.incoming.append(_start_write_message(op_handle, b"invalid"))
     key = BlockKey(b"valid")
     control.incoming.append(_start_write_message(1, key))
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
@@ -1323,14 +1385,12 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     try:
         progress = source._core._progress
         tier = source._core._remote_fw_dram
-        payload = msgspec.msgpack.decode(
+        payload = _CONTROL_DECODER.decode(
             _start_write_message(1, b"key", target_agent="worker-a")
         )
-        payload.update(
-            target_agent_metadata=b"gen-1",
-            sender_control_endpoint="tcp://target:1",
-            source_control_endpoint="tcp://source:1",
-        )
+        payload.target_agent_metadata = b"gen-1"
+        payload.sender_control_endpoint = "tcp://target:1"
+        payload.source_control_endpoint = "tcp://source:1"
         first = tier._remote_agent(progress, payload)
         assert first == ("worker-a", "remote-1")
         assert tier._remote_agent(progress, payload) == first
@@ -1338,12 +1398,13 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
 
         # Reject malformed replacement geometry or names before changing the route.
         for catalog in (
-            {"": {"addr": 128, "size": 0}},
-            {"wrong-name": {"addr": 128, "size": 16}},
+            {"": RegionDescriptor(addr=128, size=0)},
+            {"wrong-name": RegionDescriptor(addr=128, size=16)},
         ):
             with pytest.raises(ValueError):
                 tier._remote_agent(
-                    progress, {**payload, "target_regions": (catalog, {})}
+                    progress,
+                    msgspec.structs.replace(payload, target_regions=(catalog, {})),
                 )
         assert agent.remote_agents == [b"gen-1"]
         assert removed == []
@@ -1353,11 +1414,14 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         old_catalog = progress._catalogs[first[1]]
         old_prepared = progress._prepared[first[1]]
         old_transfers = progress._active_transfers.copy()
-        payload.update(op_handle=2, target_agent_metadata=b"gen-2")
+        payload.op_handle = 2
+        payload.target_agent_metadata = b"gen-2"
         control.sent.clear()
         control.incoming.extend(
             [
-                msgspec.msgpack.encode({**payload, "type": "target_metadata"}),
+                msgspec.msgpack.encode(
+                    {"type": "target_metadata", **msgspec.structs.asdict(payload)}
+                ),
                 msgspec.msgpack.encode(payload),
                 _write_probe_message(99),
             ]
@@ -1381,7 +1445,10 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         assert progress._active_transfers == old_transfers
         assert progress._catalogs[first[1]] is old_catalog
         assert progress._prepared[first[1]] is old_prepared
-        assert tier._remote_agent(progress, {"target_agent": "worker-a"}) == first
+        assert (
+            tier._remote_agent(progress, _TargetMetadata(target_agent="worker-a"))
+            == first
+        )
         assert tier._route_generation == {}
         assert agent.remote_agents == [b"gen-1"]
         assert removed == agent.released_xfers == []
@@ -1404,12 +1471,18 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         assert tier._route_generation == {"worker-a": 1}
 
         # Geometry can change without changing the allocation metadata.
-        payload["target_regions"] = ({"": {"addr": 128, "size": 16, "count": 2}}, {})
+        payload.target_regions = (
+            {"": RegionDescriptor(addr=128, size=16, count=2)},
+            {},
+        )
         replaced = tier._remote_agent(progress, payload)
         assert tier._route_generation == {"worker-a": 2}
         assert progress._catalogs[replaced[1]][1][0][""].count == 2
         # A payload carrying no metadata still reuses whatever route is cached.
-        assert tier._remote_agent(progress, {"target_agent": "worker-a"}) == replaced
+        assert (
+            tier._remote_agent(progress, _TargetMetadata(target_agent="worker-a"))
+            == replaced
+        )
         assert agent.remote_agents == [b"gen-1", b"gen-2", b"gen-2"]
     finally:
         agent.state = "DONE"
@@ -1438,10 +1511,10 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
     _RemoteFWDram._remote_agent(
         tier,
         progress,
-        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+        _TargetMetadata(target_agent="worker-a", target_agent_metadata=b"gen-1"),
     )
     progress.prepare_memory.side_effect = [RuntimeError("prep failed"), None]
-    payload = {"target_agent": "worker-b", "target_agent_metadata": b"gen-3"}
+    payload = _TargetMetadata(target_agent="worker-b", target_agent_metadata=b"gen-3")
     with pytest.raises(RuntimeError, match="prep failed"):
         _RemoteFWDram._remote_agent(tier, progress, payload)
     assert "worker-b" not in tier._remote_agents_by_target
@@ -1462,18 +1535,18 @@ def test_route_setup_cleans_failed_agents_and_preserves_existing_routes() -> Non
         _RemoteFWDram._remote_agent(
             tier,
             progress,
-            {"target_agent": "worker-c", "target_agent_metadata": b"gen-4"},
+            _TargetMetadata(target_agent="worker-c", target_agent_metadata=b"gen-4"),
         )
     assert "worker-c" not in tier._remote_agents_by_target
     progress.prepare_memory.assert_not_called()
     progress.release_prepared.assert_not_called()
     assert removed == ["remote-2"]
     assert _RemoteFWDram._remote_agent(
-        tier, progress, {"target_agent": "worker-a"}
+        tier, progress, _TargetMetadata(target_agent="worker-a")
     ) == ("worker-a", "remote-1")
 
     # After a typed disconnect, reload only if NIXL dropped native metadata.
-    payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
+    payload = _TargetMetadata(target_agent="worker-a", target_agent_metadata=b"gen-1")
     agent.add_remote_agent = Mock(return_value="remote-1")
     agent.check_remote_metadata = Mock(return_value=True)
     progress._disconnected_remote_agents.add("remote-1")
@@ -1516,7 +1589,7 @@ def test_route_setup_propagates_cleanup_errors(message_type) -> None:
     tier = source._core._remote_fw_dram
     tier._remote_agent(
         progress,
-        {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"},
+        _TargetMetadata(target_agent="worker-a", target_agent_metadata=b"gen-1"),
     )
     payload = msgspec.msgpack.decode(
         _start_write_message(1, b"key", target_agent="worker-a")
