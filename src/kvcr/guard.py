@@ -1091,7 +1091,6 @@ class _Guard:
                     # A takeover Guard has no framework sources. Recovered
                     # READY exports must not depend on its owner poll either.
                     guard_only_sources=True,
-                    guard_only_source_proof=True,
                 ),
             ),
         )

@@ -620,8 +620,6 @@ class _RemoteFWDram:
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
-        if options.guard_only_source_proof and not options.guard_only_sources:
-            raise ValueError("guard_only_source_proof requires guard_only_sources")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
         self._kvcr = kvcr
@@ -657,10 +655,7 @@ class _RemoteFWDram:
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
         if options.guard_only_sources:
-            logger.info(
-                "KVCR_EVENT guard_only_sources_enabled proof=%s",
-                options.guard_only_source_proof,
-            )
+            logger.info("KVCR_EVENT guard_only_sources_enabled")
             self._record_progress_counter(
                 "kvcr_guard_source_events", 0, ("source_callback_violation",)
             )
@@ -1495,8 +1490,6 @@ class _RemoteFWDram:
         logger.error(
             "KVCR_EVENT guard_only_source source_callback_violation stage=%s", stage
         )
-        if self._options.guard_only_source_proof:
-            raise RuntimeError(f"Guard-only source callback violation: {stage}")
         return True
 
     def _try_local_source_write(

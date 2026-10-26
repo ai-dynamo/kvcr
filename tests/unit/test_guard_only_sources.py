@@ -29,7 +29,7 @@ from kvcr.types import RegionDescriptor
 def _source(slots=3, *, recovered=False):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     agent, control, pinning = FakeNixlAgent(), FakeBytesControl(), FakePrimaryPinning()
-    options = RemoteFWDramOptions(guard_only_sources=True, guard_only_source_proof=True)
+    options = RemoteFWDramOptions(guard_only_sources=True)
     source = _new_kvcr(
         agent,
         pinning,
@@ -79,12 +79,9 @@ def _notifications(agent):
     return [_decode_notif(message) for _, message in agent.sent_notifs]
 
 
-def test_option_flags_are_explicit_and_default_off():
+def test_guard_only_sources_is_explicit_and_default_off():
     assert not RemoteFWDramOptions().guard_only_sources
-    assert not RemoteFWDramOptions().guard_only_source_proof
-    assert RemoteFWDramOptions(
-        guard_only_sources=True, guard_only_source_proof=True
-    ).guard_only_sources
+    assert RemoteFWDramOptions(guard_only_sources=True).guard_only_sources
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -300,11 +297,13 @@ def test_retirement_revokes_new_exports_and_defers_physical_reuse():
         source.close()
 
 
-def test_proof_flag_blocks_framework_source_callback():
+def test_guard_only_sources_skips_framework_source_callback():
     source, agent, control, pinning, _ = _source()
     try:
-        with pytest.raises(RuntimeError, match="Guard-only source callback violation"):
+        assert (
             source._core._remote_fw_dram._acquire_framework_sources((b"missing",))
+            is None
+        )
         assert pinning.searches == []
     finally:
         source.close()
