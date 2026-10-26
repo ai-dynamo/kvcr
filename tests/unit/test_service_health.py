@@ -10,7 +10,12 @@ from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import FakeNixlAgent, _use_nixl_agent, _wait_until
-from test_kvcr_service import _claim, _FakeLiveness, _running_server
+from test_kvcr_service import (
+    _claim,
+    _FakeLiveness,
+    _running_server,
+    _service_args,
+)
 
 from kvcr import kvcr_service
 from kvcr.health import _serve_health
@@ -36,21 +41,7 @@ def _get(server, path):
 )
 def test_invalid_health_options_fail_before_allocation(options):
     with pytest.raises(SystemExit) as error:
-        kvcr_service._parse_args(
-            [
-                "--socket-path",
-                "/unused/socket",
-                "--pool-dir",
-                "/unused/pools",
-                "--guard-count",
-                "1",
-                "--pool-sizes-gb",
-                "1",
-                "--compatibility-digest",
-                "test",
-                *options,
-            ]
-        )
+        kvcr_service._parse_args(_service_args("1") + options)
     assert error.value.code == 2
 
 
@@ -65,6 +56,9 @@ def test_health_http_routes_dependency_and_shutdown():
             assert _get(server, "/ready") == (503, "stopping\n")
             assert _get(server, "/missing")[0] == 404
         with _serve_health(("127.0.0.1", 0), lambda: (200, "ok"), peer_url) as server:
+            assert _get(server, "/ready") == (503, "dependency unavailable\n")
+            status.return_value = (200, "ok")
+            peer.RequestHandlerClass.protocol_version = "INVALID"
             assert _get(server, "/ready") == (503, "dependency unavailable\n")
     assert not any(t.name == "kvcr-health" for t in threading.enumerate())
 

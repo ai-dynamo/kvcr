@@ -3,8 +3,8 @@
 """Optional, read-only HTTP probes for the standalone service."""
 
 import contextlib
+import http.client
 import threading
-import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,7 +36,7 @@ def _serve_health(
                         with opener.open(dependency_url, timeout=1) as response:
                             if response.status != 200:
                                 code, reason = 503, "dependency unavailable"
-                    except (OSError, urllib.error.URLError):
+                    except (OSError, http.client.HTTPException):
                         code, reason = 503, "dependency unavailable"
             body = (reason + "\n").encode()
             self.send_response(code)
