@@ -21,16 +21,18 @@ from kvcr.types import BlockKey, MemoryRef, RegionDescriptor
 
 
 class Buffer:
-    def __init__(self, size, value, memory):
+    def __init__(self, data, memory):
         self.memory = memory
         if memory == "vram":
             import torch
 
-            self.data = torch.full((size,), value, dtype=torch.uint8, device="cuda:0")
+            self.data = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(
+                "cuda:0"
+            )
             torch.cuda.synchronize()
             self.address = self.data.data_ptr()
         else:
-            self.data = ctypes.create_string_buffer(bytes([value]) * size, size)
+            self.data = ctypes.create_string_buffer(data, len(data))
             self.address = ctypes.addressof(self.data)
 
     def read(self):
@@ -51,8 +53,13 @@ class Buffer:
 def worker(role, args, pipe, endpoint=None):
     name = "nvtx-" + role
     keys = tuple(BlockKey(f"block-{i}".encode()) for i in range(args.blocks))
-    size = args.blocks * args.block_bytes
-    memory = Buffer(size, 73 if role == "source" else 0, args.memory)
+    # shortcut: patterns repeat after 255 blocks; use wider IDs for larger swap tests.
+    expected_data = b"".join(
+        bytes([i % 255 + 1]) * args.block_bytes for i in range(args.blocks)
+    )
+    memory = Buffer(
+        expected_data if role == "source" else bytes(len(expected_data)), args.memory
+    )
     framework = Framework(
         name,
         keys,
@@ -95,6 +102,18 @@ def worker(role, args, pipe, endpoint=None):
                 if not framework.pending and not kvcr._core._framework_pin_keys:
                     break
                 time.sleep(0.0001)
+            operations = args.warmup + args.iterations
+            assert framework.requests == operations, "unexpected pin request count"
+            released = (
+                operations if args.scenario in ("success", "partial", "zero") else 0
+            )
+            assert sorted(framework.releases) == sorted(
+                f"pin-{i}" for i in range(released)
+            ), "unexpected pin releases"
+            cancelled = operations if args.scenario == "timeout" else 0
+            assert sorted(framework.cancelled) == list(range(cancelled)), (
+                "unexpected pin cancellations"
+            )
             pipe.send(
                 dict(
                     pin_requests=framework.requests,
@@ -137,7 +156,7 @@ def worker(role, args, pipe, endpoint=None):
             if expected:
                 assert (
                     memory.read()[: expected * args.block_bytes]
-                    == bytes([73]) * expected * args.block_bytes
+                    == expected_data[: expected * args.block_bytes]
                 )
                 # Failed/timed-out destinations may still have writes in flight.
                 memory.reset()

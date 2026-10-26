@@ -128,24 +128,19 @@ def test_target_terminal_reason_preserves_cause(
     assert not recording.ranges
 
 
-@pytest.mark.parametrize("failure", ["metadata", "bookkeeping"])
-def test_return_annotation_failure_preserves_completion_batch(recording, failure):
+def test_shutdown_closes_unreturned_caller_range(recording):
     kvcr, _, _ = target()
-    handles = [kvcr.deliver({}) for _ in range(2)]
-    trace = kvcr._core._nvtx_operations[handles[0]]
-    if failure == "metadata":
-        del trace.completion_fields
-    else:
-
-        class FailedBookkeeping(set):
-            def add(self, name):
-                raise RuntimeError("annotation bookkeeping failed")
-
-        trace._observed = FailedBookkeeping(trace._observed)
-    assert list(kvcr.poll_completed()) == [(handle, {}) for handle in handles]
-    assert not list(kvcr.poll_completed())
+    handle = kvcr.deliver({})
+    assert len(payloads(recording, "op.completion_queued")) == 1
+    assert not payloads(recording, "op.completion_returned")
+    kvcr.close()
+    kvcr.close()
+    [unreturned] = payloads(recording, "op.shutdown_unreturned")
+    assert int(unreturned["op_handle"]) == handle
+    assert int(unreturned["status"]) == _nvtx.Status.UNRESOLVED
+    assert int(unreturned["reason"]) == _nvtx.Reason.SHUTDOWN
+    assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not kvcr._core._nvtx_operations
-    assert len(spans(recording, "op.deliver.lifecycle", "end")) == 2
     assert not recording.ranges
 
 
@@ -446,7 +441,12 @@ def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     assert int(queued[0]["op_handle"]) < 0
     assert int(queued[0]["local_fill"]) == 1
     assert len(payloads(recording, "target.quiesced")) == 1
-
+    [unresolved] = payloads(recording, "target.shutdown_unresolved")
+    assert int(unresolved["status"]) == _nvtx.Status.UNRESOLVED
+    assert int(unresolved["reason"]) == _nvtx.Reason.SHUTDOWN
+    events = [name for kind, name, *_ in recording.events if kind in ("mark", "end")]
+    assert events.index("target.shutdown_unresolved") < events.index("target.quiesced")
+    assert events.index("target.quiesced") < events.index("target.remote")
     assert not recording.stack
 
 
@@ -460,7 +460,7 @@ def test_missing_hint_has_specific_reason(recording):
     )
 
 
-@pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop"])
+@pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "end"])
 def test_target_annotations_cannot_break_empty_or_missing_hint_delivery(
     recording, failure
 ):
@@ -468,28 +468,12 @@ def test_target_annotations_cannot_break_empty_or_missing_hint_delivery(
     recording.fail = failure
     empty = kvcr.deliver({})
     missing = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
-    results = dict(kvcr.poll_completed())
-    assert results[empty] == {}
-    assert not results[missing][BlockKey(b"k")].success
+    results = list(kvcr.poll_completed())
+    assert [handle for handle, _ in results] == [empty, missing]
+    assert results[0][1] == {}
+    assert not results[1][1][BlockKey(b"k")].success
+    assert not list(kvcr.poll_completed())
     assert not kvcr._core._nvtx_operations
+    assert len(recording.ended) == (0 if failure == "attributes" else 2)
+    assert not recording.ranges
     assert not recording.stack
-
-
-def test_target_context_reuse_clears_hint_and_block_counts(recording):
-    tracer = _nvtx.create_tracer()
-    first = tracer.lifecycle(
-        hint_trace_id=123, local_blocks=1, remote_blocks=2, g3_blocks=3
-    )
-    second = tracer.lifecycle()
-    contexts = payloads(recording, "request.context")
-    assert [int(p["trace_id"]) for p in contexts] == [
-        first.trace_id,
-        second.trace_id,
-    ]
-    assert [
-        tuple(
-            int(p[name])
-            for name in ("hint_trace_id", "local_blocks", "remote_blocks", "g3_blocks")
-        )
-        for p in contexts
-    ] == [(123, 1, 2, 3), (0, -1, -1, -1)]

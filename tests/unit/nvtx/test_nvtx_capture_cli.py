@@ -5,6 +5,7 @@
 import ctypes
 import subprocess
 import sys
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,14 +27,39 @@ def test_capture_hint_is_accepted_by_dispatcher(monkeypatch):
     assert hints[0].block_hashes == {0, 1, 2, 3}
 
 
-def run_target(monkeypatch, scenario, copy_calls):
+def run_target(monkeypatch, scenario, copy_calls, damage=None):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "examples"))
     import nvtx_remote_capture as capture
 
-    before_deliver, reports = [], []
+    before_deliver, reports, source_bytes = [], [], []
+    clock = SimpleNamespace(**vars(capture.time))
+    clock.monotonic = count().__next__
+    monkeypatch.setattr(capture, "time", clock)
 
     def create_worker(name, framework, control, region, **kwargs):
         results = {}
+        if name == "nvtx-source":
+            source_bytes.append(ctypes.string_at(region.addr, 16))
+            requests = [
+                framework.request_pin(framework.keys)
+                for _ in range(2 if damage == "missing_request" else 3)
+            ]
+            handles = (
+                requests
+                if scenario == "timeout"
+                else [pin[0] for _, pin in framework.poll_pin_results() if pin]
+            )
+            if damage == "missing_handle":
+                handles.pop()
+            elif damage == "duplicate_handle":
+                handles[-1] = handles[0]
+            callback = (
+                framework.cancel_pin_request
+                if scenario == "timeout"
+                else framework.release_pin
+            )
+            for handle in handles:
+                callback(handle)
 
         def deliver(descriptors, request):
             before_deliver.append(ctypes.string_at(region.addr, 16))
@@ -45,7 +71,11 @@ def run_target(monkeypatch, scenario, copy_calls):
             if handle in copy_calls:
                 for i, success in enumerate(entries.values()):
                     if success:
-                        ctypes.memset(region.addr + i * region.size, 73, region.size)
+                        block = 1 - i if damage == "swapped_blocks" else i
+                        data = source_bytes[0][
+                            block * region.size : (block + 1) * region.size
+                        ]
+                        ctypes.memmove(region.addr + i * region.size, data, region.size)
                 if not any(entries.values()):
                     # A failed completion need not prove destination quiescence.
                     ctypes.memset(region.addr, 91, 16)
@@ -58,9 +88,12 @@ def run_target(monkeypatch, scenario, copy_calls):
             poll_completed=lambda: results,
             discard_hint=lambda *args: None,
             close=lambda: None,
+            _core=SimpleNamespace(_framework_pin_keys={}),
         )
 
-    monkeypatch.setattr(capture, "control_channel", lambda: None)
+    monkeypatch.setattr(
+        capture, "control_channel", lambda: SimpleNamespace(endpoint="source")
+    )
     monkeypatch.setattr(capture, "create_worker", create_worker)
     args = SimpleNamespace(
         blocks=2,
@@ -71,6 +104,11 @@ def run_target(monkeypatch, scenario, copy_calls):
         scenario=scenario,
         warmup=1,
         iterations=2,
+    )
+    capture.worker(
+        "source",
+        args,
+        SimpleNamespace(send=lambda _: None, poll=lambda: True, recv=lambda: None),
     )
     capture.worker("target", args, SimpleNamespace(send=reports.append), "source")
     return before_deliver, reports
@@ -93,6 +131,20 @@ def test_capture_preserves_buffers_after_failed_results(monkeypatch, scenario):
     before_deliver, reports = run_target(monkeypatch, scenario, {1})
     assert before_deliver == [bytes(16), bytes([91]) * 16, bytes([91]) * 16]
     assert len(reports[0]["latency_ms"]) == 2
+
+
+def test_capture_rejects_swapped_blocks(monkeypatch):
+    with pytest.raises(AssertionError):
+        run_target(monkeypatch, "success", {1, 2, 3}, "swapped_blocks")
+
+
+@pytest.mark.parametrize("scenario", ["success", "partial", "zero", "timeout"])
+@pytest.mark.parametrize(
+    "damage", ["missing_handle", "duplicate_handle", "missing_request"]
+)
+def test_capture_checks_pin_lifecycle(monkeypatch, scenario, damage):
+    with pytest.raises(AssertionError):
+        run_target(monkeypatch, scenario, {1, 2, 3}, damage)
 
 
 def test_partial_capture_requires_two_blocks():

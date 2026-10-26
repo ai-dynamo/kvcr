@@ -182,6 +182,10 @@ def test_reused_context_clears_optional_values_without_rebinding(recording):
         dict(
             requested_blocks=16,
             requested_bytes=65536,
+            hint_trace_id=123,
+            local_blocks=1,
+            remote_blocks=2,
+            g3_blocks=3,
             completed_blocks=8,
             completed_bytes=32768,
             request_hi=12,
@@ -203,21 +207,25 @@ def test_reused_context_clears_optional_values_without_rebinding(recording):
     recording.fail = "attributes"
     tracer._emit("request.context", 12, {}, context=True, method=tracer.domain.mark)
     first, second = [e[2] for e in recording.events]
+    assert [int(p["trace_id"]) for p in (first, second)] == [11, 12]
+    assert tuple(
+        int(first[name])
+        for name in ("hint_trace_id", "local_blocks", "remote_blocks", "g3_blocks")
+    ) == (123, 1, 2, 3)
     assert int(first["requested_bytes"]) == 65536
     assert first["value_utf8"].tobytes() == b"c" * 256
     assert int(second["schema_version"]) == 3
     assert int(second["instance_hi"]) == tracer.instance_hi
     assert int(second["instance_lo"]) == tracer.instance_lo
-    assert int(second["trace_id"]) == 12
     for fields, expected in (
         (
             "requested_blocks requested_bytes selected_blocks selected_bytes "
-            "completed_blocks completed_bytes",
+            "completed_blocks completed_bytes local_blocks remote_blocks g3_blocks",
             -1,
         ),
         (
             "request_hi request_known pin_id pin_request_known pin_request_id "
-            "request_display_known length truncated",
+            "request_display_known length truncated hint_trace_id",
             0,
         ),
     ):

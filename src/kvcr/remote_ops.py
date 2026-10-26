@@ -220,20 +220,20 @@ class _TargetPullOp(_RemoteOp):
                 and self.state is _TargetPullState.WAITING_WRITE_DONE
                 and (not self.local_fill or now < self.deadline)
             )
-            reason = (
-                _nvtx.Reason.NONE
-                if success
-                else trace.failure_reason
-                if trace is not None
-                and trace.failure_reason is not _nvtx.Reason.UNKNOWN
-                else _nvtx.Reason.DEADLINE
-                if self.local_fill
-                and not cancelled
-                and self.state is _TargetPullState.WAITING_WRITE_DONE
-                and event.get("success") is True
-                and now >= self.deadline
-                else _nvtx.Reason.REMOTE_FAILURE
-            )
+            if trace is not None:
+                reason = (
+                    _nvtx.Reason.NONE
+                    if success
+                    else trace.failure_reason
+                    if trace.failure_reason is not _nvtx.Reason.UNKNOWN
+                    else _nvtx.Reason.DEADLINE
+                    if self.local_fill
+                    and not cancelled
+                    and self.state is _TargetPullState.WAITING_WRITE_DONE
+                    and event.get("success") is True
+                    and now >= self.deadline
+                    else _nvtx.Reason.REMOTE_FAILURE
+                )
             try:
                 if success:
                     completed_indices = _notification_completed_indices(
@@ -247,7 +247,8 @@ class _TargetPullOp(_RemoteOp):
             except TypeError:
                 success = False
                 completed_keys = set()
-                reason = _nvtx.Reason.INVALID_NOTIFICATION
+                if trace is not None:
+                    reason = _nvtx.Reason.INVALID_NOTIFICATION
             all_completed = success and completed_keys == self.keys
             self.success = success
             self.completed_keys = completed_keys

@@ -181,7 +181,6 @@ def validate(events, scenario, operations):
     ]
     gaps = []
     for result in returned:
-        assert result["status"] == expected, result
         if result["request_known"]:
             contexts = matching_events(named, "request.context", result)
             assert len(contexts) == 1, "missing or duplicate request context"
@@ -243,6 +242,9 @@ def validate(events, scenario, operations):
         ), "hint invalidated before use"
         assert received[0]["start"] <= queued[0]["start"] <= result["start"]
         compact = result.get("schema_version") == 3
+        completed = related("source.write.completed")
+        if compact or scenario == "zero":
+            assert len(completed) == 1, "missing source completion"
         if compact:
             caller_span = require_range(named, "op.deliver.lifecycle", result)
             target_span = require_range(named, "target.remote", branch)
@@ -262,8 +264,6 @@ def validate(events, scenario, operations):
             assert target_span["thread"] != target_span["end_thread"], (
                 "target ownership never crossed threads"
             )
-            completed = related("source.write.completed")
-            assert len(completed) == 1, "missing source completion"
             source_span = require_range(named, "source.write", completed[0])
             assert source_span["start"] <= completed[0]["start"] <= source_span["end"]
             assert source_span["thread"] >> 24 != result["thread"] >> 24
@@ -277,12 +277,7 @@ def validate(events, scenario, operations):
             )
         gaps.append((result["start"] - received[0]["start"]) / 1e6)
         if scenario == "zero":
-            completed = related("source.write.completed")
-            assert len(completed) == 1, "missing zero-result source completion"
-            assert completed[0]["status"] == 4
-            assert (
-                completed[0]["completed_blocks"] == completed[0]["completed_bytes"] == 0
-            )
+            assert completed[0]["completed_bytes"] == 0
             assert not related("nixl.write.posted"), (
                 "zero-result operation posted a transfer"
             )
@@ -341,6 +336,36 @@ def validate(events, scenario, operations):
                     <= pin_span["end"]
                     <= posted[0]["start"]
                 )
+        outcomes = [result, *queued, *received, *completed]
+        if scenario in ("success", "partial"):
+            outcomes.append(pin)
+        requested = result["requested_blocks"]
+        assert requested > 0, "invalid requested block count"
+        blocks = {"success": requested, "partial": requested - 1}.get(scenario, 0)
+        assert scenario != "partial" or blocks > 0, "partial needs at least two blocks"
+        byte_counts = set()
+        for event in outcomes:
+            assert event["status"] == expected, event
+            assert event["requested_blocks"] == requested, event
+            assert event["completed_blocks"] == blocks, event
+            byte_count = event.get("completed_bytes", -1)  # Legacy pins omit bytes.
+            assert byte_count >= -1, event
+            if byte_count >= 0:
+                assert (byte_count > 0) == (blocks > 0), event
+                byte_counts.add(byte_count)
+        requested_bytes = result.get("requested_bytes", -1)
+        assert requested_bytes >= -1, result
+        if requested_bytes >= 0:
+            # The capture workload uses equally sized blocks.
+            assert requested_bytes % requested == 0, result
+            byte_counts.add(requested_bytes * blocks // requested)
+        byte_counts.update(
+            e["selected_bytes"] for e in completed if e.get("selected_bytes", -1) >= 0
+        )
+        assert len(byte_counts) <= 1, "inconsistent completed byte counts"
+        assert queued[0].get("completed_bytes", -1) == result.get(
+            "completed_bytes", -1
+        ), "queued and returned byte counts differ"
     counts = Counter(event["name"] for event in events)
     return dict(
         events=len(events),

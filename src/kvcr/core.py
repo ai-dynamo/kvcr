@@ -778,10 +778,11 @@ class _KVCRCore:
                 self._remote_fw_dram.poll_main(progress_items)
         completed = self._completion_queue
         self._completion_queue = []
-        for handle, _ in completed:
-            trace = self._nvtx_operations.pop(handle, None)
-            if trace is not None:
-                trace.returned()
+        if self._nvtx_operations:
+            for handle, _ in completed:
+                trace = self._nvtx_operations.pop(handle, None)
+                if trace is not None:
+                    trace.returned()
         return completed
 
     def _notify_transfer_errors(self, progress_items: list[object]) -> None:
