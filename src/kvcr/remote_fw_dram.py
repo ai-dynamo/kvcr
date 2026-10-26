@@ -85,6 +85,7 @@ class _RequestHint:
     submitted_at: float | None
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
+    trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -202,7 +203,24 @@ class _RemoteFWDram:
             previous = self._request_hints.get(request_id)
             if previous is not None and previous.source != src:
                 self._request_hints[request_id] = replace(previous, failed=True)
+                if previous.trace is not None:
+                    previous.trace.mark(
+                        "hint.rejected",
+                        status=_nvtx.Status.REJECTED,
+                        reason=_nvtx.Reason.HINT_CONFLICT,
+                    )
                 return
+            trace = (
+                self._nvtx.lifecycle(
+                    request_id=request_id, requested_blocks=len(block_hashes)
+                )
+                if self._nvtx is not None
+                else None
+            )
+            if previous is not None and previous.trace is not None:
+                previous.trace.mark("hint.replaced", once=True)
+            if trace is not None:
+                trace.mark("hint.submitted")
             self._request_hints[request_id] = _RequestHint(
                 source=src,
                 block_hashes=block_hashes,
@@ -211,6 +229,7 @@ class _RemoteFWDram:
                     if previous is not None and previous.submitted_at is not None
                     else kvcr._timer()
                 ),
+                trace=trace,
             )
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
@@ -280,7 +299,24 @@ class _RemoteFWDram:
                 if local_fill
                 else ()
             ),
+            trace=self._nvtx.operation(
+                kvcr,
+                op_handle,
+                blocks,
+                request_id,
+                local_fill=local_fill,
+                hint_trace_id=current_hint.trace.trace_id
+                if current_hint.trace is not None
+                else 0,
+                range_name="target.remote",
+            )
+            if self._nvtx is not None
+            else None,
         )
+        if current_hint.trace is not None:
+            current_hint.trace.mark("hint.used", op_handle=op_handle)
+        if op.trace is not None:
+            op.trace.mark("target.queued")
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "
@@ -292,8 +328,18 @@ class _RemoteFWDram:
                 len(keys),
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
-        kvcr._add_block_dependencies(op, new_operation=True)
-        kvcr._progress.submit(op)
+        try:
+            kvcr._add_block_dependencies(op, new_operation=True)
+            kvcr._progress.submit(op)
+        except Exception:
+            if op.trace is not None:
+                op.trace.mark(
+                    "target.queued.rejected",
+                    status=_nvtx.Status.REJECTED,
+                    reason=_nvtx.Reason.SUBMIT_REJECTED,
+                )
+                op.trace.end("target.remote")
+            raise
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
         return True
@@ -318,6 +364,9 @@ class _RemoteFWDram:
             local_fill=False,
         ):
             return
+        trace = kvcr._nvtx_operations.get(op_handle)
+        if trace is not None:
+            trace.reject("target.hint_unavailable", _nvtx.Reason.HINT_UNAVAILABLE)
         kvcr._complete(
             op_handle,
             dict.fromkeys(blocks, _FAILED_RESULT),
@@ -401,7 +450,9 @@ class _RemoteFWDram:
                     self._resume_source_pin(op_id, op)
 
     def discard_hint(self, request_id: str) -> None:
-        self._request_hints.pop(request_id, None)
+        hint = self._request_hints.pop(request_id, None)
+        if hint is not None and hint.trace is not None:
+            hint.trace.mark("hint.discarded", once=True)
 
     def _fail_request_hint(self, request_id: str | None) -> None:
         if request_id is None:
@@ -414,6 +465,11 @@ class _RemoteFWDram:
         if self._closed:
             return
         self._closed = True
+        for hint in self._request_hints.values():
+            if hint.trace is not None:
+                hint.trace.mark(
+                    "hint.discarded", once=True, reason=_nvtx.Reason.SHUTDOWN
+                )
         self._request_hints.clear()
         for op_id, op in list(self._source_pin_ops.items()):
             self._remove_source_pin(op_id, op)
@@ -443,7 +499,19 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def _finish_target_pull(self, op: _TargetPullOp) -> None:
+        trace = op.trace
+        pushed = trace.push("target.main.consume") if trace is not None else False
+        try:
+            self._consume_target_pull(op)
+        finally:
+            if trace is not None:
+                trace.tracer.pop(pushed)
+
+    def _consume_target_pull(self, op: _TargetPullOp) -> None:
         kvcr = self._kvcr
+        caller_trace = kvcr._nvtx_operations.get(op.op_id[1])
+        if caller_trace is not None and op.trace is not None:
+            caller_trace.failure_reason = op.trace.failure_reason
         if op.state is not _TargetPullState.QUARANTINED:
             kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
@@ -1361,7 +1429,7 @@ class _RemoteFWDram:
         op = self._source_pin_ops.get(op_id)
         if op is not None:
             op.pending_pin_ids.add(request)
-            if new_waiter and wait.trace is not None:
+            if new_waiter:
                 wait.trace.waiter(op_id[1], op.op_handle)
 
     def _remove_pending_pin_state(

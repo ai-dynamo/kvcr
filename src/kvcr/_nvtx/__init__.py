@@ -165,6 +165,42 @@ class _PinTracer(_PayloadEmitter):
         except Exception:
             return None
 
+    def operation(
+        self,
+        kvcr,
+        handle,
+        blocks,
+        request_id,
+        *,
+        local_fill=False,
+        hint_trace_id=0,
+        range_name="op.deliver.lifecycle",
+    ):
+        try:
+            detail = {}
+            if self.level == "medium":
+                refs = tuple(ref for block in blocks.values() for ref in block)
+                detail = dict(
+                    requested_bytes=kvcr._descriptor_bytes(refs),
+                    destination_tier=tier(refs),
+                    destination_memory=memory_kind(refs, kvcr._memory_regions),
+                )
+            trace = self.lifecycle(
+                target_agent=kvcr.nixl_agent_name,
+                target_incarnation=kvcr._remote_fw_dram._dangling_ops.incarnation,
+                request_id=request_id,
+                op_handle=handle,
+                local_fill=local_fill,
+                hint_trace_id=hint_trace_id,
+                requested_blocks=len(blocks),
+                **detail,
+            )
+            if trace is not None:
+                trace.start(range_name)
+            return trace
+        except Exception:
+            return None
+
 
 def identity(value):
     """Stable 128-bit label identity; no Python hash randomization or truncation."""
@@ -200,8 +236,10 @@ class _LifecycleTrace:
         self.tracer, self.trace_id = tracer, trace_id
         self.requested_blocks = fields.get("requested_blocks", -1)
         self.selected_bytes = fields.get("selected_bytes", -1)
+        self.requested_bytes = fields.get("requested_bytes", -1)
         self._observed = set()
         self.failure_reason = Reason.UNKNOWN
+        self.completion_fields = {}
         self._ranges = {}
         self._range_lock = Lock()
         try:
@@ -254,8 +292,77 @@ class _LifecycleTrace:
             except Exception:
                 pass
 
+    def shutdown_unresolved(self, name):
+        self.mark(name, once=True, status=Status.UNRESOLVED, reason=Reason.SHUTDOWN)
+
     def reject(self, name, reason, *, status=Status.REJECTED):
         self.mark(name, once=True, status=status, reason=reason)
+
+    def cancel_requested(self, name, cancelled):
+        self.mark(
+            name,
+            once=True,
+            status=Status.CANCELLED if cancelled else Status.TIMEOUT,
+            reason=Reason.CANCELLED if cancelled else Reason.DEADLINE,
+        )
+
+    def completed(self, entries):
+        try:
+            completed = sum(entry.success for entry in entries.values())
+            all_completed = completed == len(entries)
+            self.completion_fields = dict(
+                status=Status.SUCCESS
+                if all_completed
+                else Status.PARTIAL
+                if completed
+                else Status.FAILED,
+                reason=Reason.NONE if all_completed else self.failure_reason,
+                completed_blocks=completed,
+                completed_bytes=self.requested_bytes
+                if all_completed
+                else -1
+                if completed
+                else 0,
+            )
+            self.mark("op.completion_queued", once=True, **self.completion_fields)
+        except Exception:
+            pass
+
+    def returned(self):
+        try:
+            self.mark("op.completion_returned", once=True, **self.completion_fields)
+        except Exception:
+            self.end("op.deliver.lifecycle")
+
+    def target_result(self, op, reason):
+        try:
+            complete = len(op.completed_keys)
+            byte_count = (
+                op._backend._kvcr._descriptor_bytes(
+                    ref
+                    for key, refs in zip(op.ordered_keys, op.dst_descriptors)
+                    if key in op.completed_keys
+                    for ref in refs
+                )
+                if self.tracer.level == "medium"
+                else -1
+                if complete
+                else 0
+            )
+            self.mark(
+                "target.write_done.received",
+                once=True,
+                status=Status.SUCCESS
+                if op.success and complete == len(op.keys)
+                else Status.PARTIAL
+                if complete
+                else Status.FAILED,
+                reason=reason,
+                completed_blocks=complete,
+                completed_bytes=byte_count,
+            )
+        except Exception:
+            pass
 
     def complete_source(self, success, blocks, *, reason=None):
         requested = self.requested_blocks
@@ -278,9 +385,9 @@ class _LifecycleTrace:
         finally:
             self.end("source.write")
 
-    def mark(self, name, *, once=False, detail=False, **fields):
+    def mark(self, name, *, once=False, detail=False, retain_cause=False, **fields):
         reason = fields.get("reason", Reason.NONE)
-        if reason not in _NON_FAILURE_REASONS:
+        if not retain_cause and reason not in _NON_FAILURE_REASONS:
             self.failure_reason = reason
         if detail and self.tracer.level != "medium":
             return
@@ -294,6 +401,13 @@ class _LifecycleTrace:
             )
         except Exception:
             pass
+        finally:
+            if name in (
+                "op.completion_returned",
+                "op.rejected",
+                "op.shutdown_unreturned",
+            ):
+                self.end("op.deliver.lifecycle")
 
     def push(self, name, **fields):
         try:
