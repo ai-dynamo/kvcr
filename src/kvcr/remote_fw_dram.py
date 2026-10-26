@@ -569,8 +569,8 @@ class _RemoteFWDram:
         for message in messages:
             try:
                 payload = _CONTROL_DECODER.decode(message)
-            except msgspec.ValidationError:
-                handled |= self._handle_malformed_start_write(progress, message)
+            except msgspec.ValidationError as error:
+                handled |= self._handle_malformed_start_write(progress, message, error)
                 continue
             except (TypeError, msgspec.DecodeError):
                 continue
@@ -1055,7 +1055,10 @@ class _RemoteFWDram:
         self._release_framework_pins(unused_pins)
 
     def _handle_malformed_start_write(
-        self, progress: _KVCRProgress, message: bytes
+        self,
+        progress: _KVCRProgress,
+        message: bytes,
+        error: msgspec.ValidationError,
     ) -> bool:
         # Recover routing fields even when the request body fails typed decoding.
         try:
@@ -1066,9 +1069,9 @@ class _RemoteFWDram:
             return False
         op_handle = payload.get("op_handle")
         if type(op_handle) is not int:
-            logger.warning("KVCR malformed start_write: invalid op_handle")
+            logger.warning("KVCR malformed start_write: invalid op_handle: %s", error)
             return True
-        logger.warning("KVCR malformed start_write op=%d", op_handle)
+        logger.warning("KVCR malformed start_write op=%d: %s", op_handle, error)
         try:
             peer = msgspec.convert(payload, type=_PeerMessage)
         except msgspec.ValidationError:
@@ -1077,6 +1080,11 @@ class _RemoteFWDram:
             peer = _PeerMessage(
                 target_agent_metadata=metadata if isinstance(metadata, bytes) else None
             )
+            # Reuse cached routes only when metadata is absent.
+            if peer.target_agent_metadata is None:
+                target_agent = payload.get("target_agent")
+                if isinstance(target_agent, str):
+                    peer.target_agent = target_agent
             for name in ("sender_control_endpoint", "source_control_endpoint"):
                 value = payload.get(name)
                 if isinstance(value, str):

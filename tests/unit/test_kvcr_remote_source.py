@@ -605,7 +605,6 @@ def test_kvcr_close_cleans_pending_pin_operations():
         ("keys", ["k0"]),
         ("dst_descriptors", []),
         ("dst_descriptors", "invalid"),
-        ("target_regions", "invalid"),
         ("framework", 1),
         ("label", 1),
         ("element_index", -1),
@@ -620,10 +619,6 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field, value):
     request = msgspec.msgpack.decode(
         _start_write_message(6, BlockKey(b"k0"), target_agent="target")
     )
-    request.update(
-        sender_control_endpoint="tcp://target:1",
-        source_control_endpoint="tcp://source:1",
-    )
     if value is msgspec.UNSET:
         request.pop(field)
     elif field in ("framework", "label", "element_index", "end_point_name"):
@@ -634,32 +629,76 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field, value):
         if field == "keys":
             request["dst_descriptors"] *= len(value)
     control.incoming.append(msgspec.msgpack.encode(request))
-    _wait_until(lambda: bool(source_agent.sent_notifs or control.sent))
+    _wait_until(lambda: bool(source_agent.sent_notifs))
 
     assert not pinning.searches
     assert not source_agent.xfers
-    if field == "target_regions":
-        # Bad metadata cannot establish a NIXL route, so refuse over control.
-        endpoint, raw = control.sent[0]
-        reply = _decode_control_message(raw)
-        assert endpoint == "tcp://target:1"
-        assert reply["type"] == "write_refused"
-        assert reply["op_handle"] == 6
-        assert reply["sender_control_endpoint"] == "tcp://source:1"
-        assert "reason" not in reply
-        assert not source_agent.sent_notifs
-    else:
-        assert _decode_notif(source_agent.sent_notifs[0][1]) == {
-            "type": "write_done",
-            "op_handle": 6,
-            "success": False,
-        }
+    assert _decode_notif(source_agent.sent_notifs[0][1]) == {
+        "type": "write_done",
+        "op_handle": 6,
+        "success": False,
+    }
     assert any(
         "malformed start_write" in record.getMessage()
         or "start_write setup failed" in record.getMessage()
         for record in kvcr_caplog.records
         if record.levelno == logging.WARNING
     )
+
+
+@pytest.mark.parametrize(
+    "field,cached,with_metadata",
+    [
+        ("sender_incarnation", False, False),
+        ("sender_incarnation", True, False),
+        ("target_regions", True, True),
+    ],
+)
+def test_malformed_peer_preserves_route(kvcr_caplog, field, cached, with_metadata):
+    agent, control, pinning = FakeNixlAgent(), FakeBytesControl(), FakePrimaryPinning()
+    source = _new_kvcr(agent, pinning, control, name="source")
+    tier = source._core._remote_fw_dram
+    request = msgspec.msgpack.decode(
+        _start_write_message(6, b"k0", target_agent="target")
+    )
+    if cached:
+        control.incoming.append(
+            msgspec.msgpack.encode({**request, "type": "target_metadata"})
+        )
+        _wait_until(lambda: "target" in tier._remote_agents_by_target)
+        cached_route = tier._remote_agents_by_target["target"]
+    request.update(
+        sender_control_endpoint="tcp://target:1",
+        source_control_endpoint="tcp://source:1",
+    )
+    request[field] = 1
+    if not with_metadata:
+        del request["target_agent_metadata"]
+    control.incoming.append(msgspec.msgpack.encode(request))
+    _wait_until(lambda: bool(agent.sent_notifs or control.sent))
+
+    assert not pinning.searches
+    assert not agent.xfers
+    if cached and not with_metadata:
+        assert not control.sent
+        assert _decode_notif(agent.sent_notifs[0][1]) == {
+            "type": "write_done",
+            "op_handle": 6,
+            "success": False,
+        }
+    else:
+        assert not agent.sent_notifs
+        endpoint, raw = control.sent[0]
+        reply = _decode_control_message(raw)
+        assert endpoint == "tcp://target:1"
+        assert reply["type"] == "write_refused"
+        assert reply["op_handle"] == 6
+        assert reply["sender_control_endpoint"] == "tcp://source:1"
+        assert reply.get("reason") == (None if with_metadata else "metadata_required")
+    if cached:
+        assert tier._remote_agents_by_target["target"] == cached_route
+        assert agent.remote_agents == [b"target-md"]
+    assert field in kvcr_caplog.text
 
 
 def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
