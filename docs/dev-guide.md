@@ -157,7 +157,7 @@ The callback names above represent services implemented by the framework adapter
 
 For `on_resilience_event` and optional framework-memory quarantine, see the [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 
-See the design doc's [Framework–KVCR API](design_overview.md#frameworkkvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router–KVCR API](design_overview.md#routerkvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
+See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
 ### Development loop
 
@@ -305,10 +305,10 @@ A practical workspace is:
 
 ```text
 integration-workspace/
-├── .venv/
-├── dynamo/
-├── vllm/
-└── kvcr/
+|-- .venv/
+|-- dynamo/
+|-- vllm/
+`-- kvcr/
 ```
 
 Build in this order:
@@ -420,10 +420,10 @@ The worker configuration enables its side of the contract. Dynamo must still run
 
 Use this progression so failures are localized:
 
-1. **vLLM configuration and adapter tests** — no live router or transfer.
-2. **Dynamo router-hint tests** — verify capability and endpoint publication.
-3. **Two-worker transfer correctness** — exercise router, workers, peer control, NIXL, and output correctness together.
-4. **Performance regression tests** — only after correctness is green.
+1. **vLLM configuration and adapter tests** - no live router or transfer.
+2. **Dynamo router-hint tests** - verify capability and endpoint publication.
+3. **Two-worker transfer correctness** - exercise router, workers, peer control, NIXL, and output correctness together.
+4. **Performance regression tests** - only after correctness is green.
 
 ---
 
@@ -445,7 +445,7 @@ Do not override the NIXL version declared by this checkout. If dependency metada
 
 Use the [shared-environment checks](#verify-a-shared-integration-environment) to print import paths.
 
-If vLLM resolves to an unintended released package, reinstall the selected vLLM checkout after Dynamo and its extras, then reinstall KVCR. This is why the integration build order is Dynamo → vLLM → KVCR.
+If vLLM resolves to an unintended released package, reinstall the selected vLLM checkout after Dynamo and its extras, then reinstall KVCR. This is why the integration build order is Dynamo -> vLLM -> KVCR.
 
 ### Native vLLM, PyTorch, CUDA, or FlashInfer mismatch
 

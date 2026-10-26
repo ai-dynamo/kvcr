@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/figures/kvcr-masthead.jpg" alt="KV Cache Runner — Data Plane Architecture" width="100%">
+  <img src="docs/figures/kvcr-masthead.jpg" alt="KV Cache Runner - Data Plane Architecture" width="100%">
 </p>
 
 > [!NOTE]
@@ -19,7 +19,7 @@ KVCR is agentic-native and built to accelerate AI workloads of every kind.
 
 KVCR is at its most powerful when working in tandem with a KV-aware request router. The router knows where the KV cache resides and can provide the selected worker with hints about where to retrieve it. The cache can be sourced locally or from remote peers, within or across memory and storage tiers, or from any combination of these sources.
 
-KVCR leaves local KV cache offloading to host memory under the engine's control. It focuses on system-level optimizations enabled by this architecture, including cross-node KV cache sharing, KV-aware request load balancing, and KV cache prefetching — all guided by the router’s system-wide view. By maximizing KV cache reuse and overlapping cache onboarding with computation, KVCR reduces redundant work and improves prefill efficiency.
+KVCR leaves local KV cache offloading to host memory under the engine's control. It focuses on system-level optimizations enabled by this architecture, including cross-node KV cache sharing, KV-aware request load balancing, and KV cache prefetching - all guided by the router's system-wide view. By maximizing KV cache reuse and overlapping cache onboarding with computation, KVCR reduces redundant work and improves prefill efficiency.
 
 KVCR is resilient by design. KVCR-Guard is a sidecar KVCR process operating in active-passive mode and can outlive an engine failure. In such an event, KVCR-Guard remains available as a remote source of KV cache, minimizing disruption to serving in the face of failures.
 
@@ -45,13 +45,13 @@ KVCR is vendor and framework agnostic, with no dependency on a specific request 
 - TRT-LLM
   - [[RFC] Versioned KV Hints Protocol for TRT-LLM #18153](https://github.com/NVIDIA/TensorRT-LLM/issues/18153)
 
-- vLLM — supported
+- vLLM - supported
   - Additional features tracked in [RFC #59708](https://github.com/vllm-project/vllm/issues/59708).
 
-- SGLang — supported
+- SGLang - supported
   - Additional features tracked in [RFC #36224](https://github.com/sgl-project/sglang/issues/36224).
 
-- Dynamo KV Router — supported
+- Dynamo KV Router - supported
 
 A hint envelope may carry several hints. KVCR parses and dispatches each one independently and records a per-hint outcome.
 
@@ -61,7 +61,7 @@ A hint envelope may carry several hints. KVCR parses and dispatches each one ind
   - [[RFC]: Router Hint initiated P2P KV Cache Transfer Between TRT-LLM Workers #18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)
   - [Router Hint initiated P2P KV Cache Transfer Between TRT-LLM Workers #18158](https://github.com/NVIDIA/TensorRT-LLM/pull/18158)
 
-- vLLM — supported
+- vLLM - supported
 
 - SGLang
   - [[RFC] KVCR as a HiCacheStorage backend for peer-to-peer KV reuse #32903](https://github.com/sgl-project/sglang/issues/32903)
@@ -101,4 +101,4 @@ This project accepts external contributions. See [CONTRIBUTING.md](CONTRIBUTING.
 
 Contributions require a Developer Certificate of Origin sign-off (`git commit -s`), whose full text is reproduced in that file and which is enforced on every pull request by the `dco` CI workflow. Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
-To report a security vulnerability, do not open a public issue — follow [SECURITY.md](SECURITY.md).
+To report a security vulnerability, do not open a public issue - follow [SECURITY.md](SECURITY.md).

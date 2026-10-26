@@ -8,8 +8,8 @@ Inference engines manage KV caches across GPU memory, host DRAM, local SSD, and 
 
 - [Goals and Design Principles](#goals-and-design-principles)
 - [Architecture](#architecture)
-- [Framework–KVCR API](#frameworkkvcr-api)
-- [Router–KVCR API](#routerkvcr-api)
+- [Framework-KVCR API](#framework-kvcr-api)
+- [Router-KVCR API](#router-kvcr-api)
 - [Policy API](#policy-api)
 - [Telemetry API](#telemetry-api)
 
@@ -21,37 +21,37 @@ Inference engines manage KV caches across GPU memory, host DRAM, local SSD, and 
 
 **Goal:** The KVCR must not put blocking work on the engine's hot path or interfere with memory the framework uses for execution. Cache data that the framework depends on must retain a local, fast-access guarantee, whether the framework holds the bytes directly or delegates that guarantee to the cache layer. Framework-facing calls either read local metadata, enqueue work, or complete asynchronously, while internal caching remains transparent to the engine.
 
-**Resulting principle — The framework owns and orchestrates GPU memory; it delegates transfer execution to purpose-built tools.**
+**Resulting principle - The framework owns and orchestrates GPU memory; it delegates transfer execution to purpose-built tools.**
 
 Adding GPU management to the KVCR introduces coordination on the hot path, shared GPU state between two entities, and the need to continuously synchronize scheduling context. The framework already has all the context needed: scheduling state, active requests, decode step count. Any external entity would need to be told this continuously.
 
-The framework's orchestration role extends across both caching and disaggregated serving. For prefill/decode (P/D) transfers, it delegates the physical DMA to NIXL. For KV caching, it delegates host-side movement and cross-node transfers to the KVCR — providing GPU pointers when needed so the KVCR can execute GPU↔host DMA via NIXL on its behalf. Framework-owned memory movement and GPU scheduling remain framework decisions; the KVCR decides KVCR-owned tier movement in response to framework calls, router hints, and policy. GPU-bound bandwidth is not exclusively local: in disaggregated serving, remote writes into GPU memory are already in the picture. The invariant that matters is GPU memory ownership and scheduling, not who physically issues the DMA.
+The framework's orchestration role extends across both caching and disaggregated serving. For prefill/decode (P/D) transfers, it delegates the physical DMA to NIXL. For KV caching, it delegates host-side movement and cross-node transfers to the KVCR - providing GPU pointers when needed so the KVCR can execute GPU<->host DMA via NIXL on its behalf. Framework-owned memory movement and GPU scheduling remain framework decisions; the KVCR decides KVCR-owned tier movement in response to framework calls, router hints, and policy. GPU-bound bandwidth is not exclusively local: in disaggregated serving, remote writes into GPU memory are already in the picture. The invariant that matters is GPU memory ownership and scheduling, not who physically issues the DMA.
 
 ### Scalability and Locality
 
-**Goal:** Only the KV router's global inventory should scale with the cluster. It receives partial, eventually-consistent information from each KVCR — enough to make good decisions without requiring a complete, strongly consistent global view. A KVCR's role and behavior are the same on a single node and in a thousand-node cluster; adding a node adds its inventory to the router without changing existing KVCR instances.
+**Goal:** Only the KV router's global inventory should scale with the cluster. It receives partial, eventually-consistent information from each KVCR - enough to make good decisions without requiring a complete, strongly consistent global view. A KVCR's role and behavior are the same on a single node and in a thousand-node cluster; adding a node adds its inventory to the router without changing existing KVCR instances.
 
-**Resulting principle — Separating cross-node coordination as a global inventory where KVCR instances have no peer block inventory; same-node and cross-node reuse use the same source model.**
+**Resulting principle - Separating cross-node coordination as a global inventory where KVCR instances have no peer block inventory; same-node and cross-node reuse use the same source model.**
 
-Each KVCR manages only its own local DRAM and SSD and has no knowledge of peer block inventories. The KV router holds the cross-node mapping — kept as minimal as possible, keyed by `BlockKey` and optional prefix-path metadata — and provides request-scoped source hints. KVCR instances execute transfers directly via NIXL.
+Each KVCR manages only its own local DRAM and SSD and has no knowledge of peer block inventories. The KV router holds the cross-node mapping - kept as minimal as possible, keyed by `BlockKey` and optional prefix-path metadata - and provides request-scoped source hints. KVCR instances execute transfers directly via NIXL.
 
-This design uses the same router-directed source model for same-node and cross-node reuse. A shared node-level pool would add another ownership, coherence, isolation, and recovery boundary. Instead, the router identifies the source and NIXL selects the appropriate transport—for example, directly from one process's host memory into another process's GPU. Colocation changes the transport, not the ownership or coordination model.
+This design uses the same router-directed source model for same-node and cross-node reuse. A shared node-level pool would add another ownership, coherence, isolation, and recovery boundary. Instead, the router identifies the source and NIXL selects the appropriate transport - for example, directly from one process's host memory into another process's GPU. Colocation changes the transport, not the ownership or coordination model.
 
 ### Extensibility and Adoptability
 
 **Goals:** Frameworks can plug in caching policies through the standard control-plane interface without knowing or modifying the underlying data-movement mechanism. Framework hints bridge the gap between scheduling context known to the engine and storage policy owned by the KVCR.
 
-Frameworks can adopt the KVCR incrementally, with each integration level delivering independent value. A framework can use the KVCR to offload cache data into KVCR-owned DRAM or storage, or pair it with a KV router to share framework-owned memory and KVCR-managed data across instances. These capabilities can be combined without replacing the framework’s routing or scheduling layers.
+Frameworks can adopt the KVCR incrementally, with each integration level delivering independent value. A framework can use the KVCR to offload cache data into KVCR-owned DRAM or storage, or pair it with a KV router to share framework-owned memory and KVCR-managed data across instances. These capabilities can be combined without replacing the framework's routing or scheduling layers.
 
-**Resulting principle — Separation of Control and Data Plane: Mechanism is stable, policy is pluggable.**
+**Resulting principle - Separation of Control and Data Plane: Mechanism is stable, policy is pluggable.**
 
-All host-side data movement — slot management, SSD writes, object-store operations, cross-node transfers — is the KVCR's data plane and does not change across deployments. The policy governing admission, eviction, placement, and hint-guided staging is the control plane and is fully replaceable.
+All host-side data movement - slot management, SSD writes, object-store operations, cross-node transfers - is the KVCR's data plane and does not change across deployments. The policy governing admission, eviction, placement, and hint-guided staging is the control plane and is fully replaceable.
 
 ### Resilience
 
 **Goal:** The normal KVCR remains in the inference-engine process for efficiency. Deployments may optionally preserve KVCR-owned memory across an engine or GPU failure; framework-owned GPU and host memory remain outside this guarantee.
 
-**Resulting principle — KVCR-owned memory can outlive the in-process KVCR without moving the normal path out of process.**
+**Resulting principle - KVCR-owned memory can outlive the in-process KVCR without moving the normal path out of process.**
 
 KVCR-Guard provides this resilience by owning the memory and hosting a backup KVCR without changing the normal cache-management interface. The active KVCR maps the pool directly. After fencing a failed owner, the backup can take ownership and serve committed KV data. A restarted in-process KVCR attaches, recovers the full committed state, and takes ownership back through a fenced handoff.
 
@@ -79,7 +79,7 @@ Figure 1 summarizes the component boundaries.
 **KV Router**
 - Maintains eventually-consistent global `BlockKey` inventory from all engine and KVCR instances, with tier labels
 - Makes cache-aware routing decisions based on KV overlap score and node load
-- Sends hints to destination KVCR instances — for cross-node retrieval with a source node and peer control endpoint, or optionally for same-node SSD or remote object-store retrieval
+- Sends hints to destination KVCR instances - for cross-node retrieval with a source node and peer control endpoint, or optionally for same-node SSD or remote object-store retrieval
 
 **KVCR**
 - Main runtime component linked directly into the engine as an in-process library
@@ -143,13 +143,13 @@ Some underlying failures may require restarting the affected process. KVCR makes
 
 ---
 
-## Framework–KVCR API
+## Framework-KVCR API
 
 The framework and KVCR interact through the following API.
 
 ```python
 # Python-style pseudocode
-# Framework → KVCR
+# Framework -> KVCR
 kvcr = KVCR(
     pool_layouts=[(pool_name, block_size_bytes), ...],
     compatibility_manifest=compatibility_manifest,
@@ -169,7 +169,7 @@ kvcr.poll_completed() -> list[Completion]                          # drain indiv
 kvcr.abort(operation_handle, block_key_list=None)                  # cancel this fetch/deliver operation, optionally for selected keys
 kvcr.close()                                                       # synchronous teardown after framework-submitted jobs are drained
 
-# KVCR → Framework
+# KVCR -> Framework
 framework.capacity_needed([(pool_name, num_slots), ...])           # last-resort capacity pressure signal
 
 framework.request_pin(block_key_list) -> PinRequestId                             # enqueue a framework-owned source pin request
@@ -186,25 +186,25 @@ Frameworks register named buffers through `framework_regions` using `RegionDescr
 
 **Using KVCR-owned DRAM**
 
-`deposit`/`deliver` — the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
+`deposit`/`deliver` - the framework initiates both; `deposit` pushes a block into the KVCR-owned pool and may retain an evictable copy, while `deliver` places a block into a framework-provided GPU or host-memory destination. Completion notifications or optional callbacks report the outcome. A successful deposit means the source memory is safe to reuse; a successful delivery means the destination is ready.
 
 Partial deposits use `expected_layout` to declare the full, fixed key layout. Immutable named pieces can be deposited across calls and delivered as they become ready. Incomplete keys remain non-evictable; only complete keys are recovered and advertised to the router.
 
-`fetch`/`release` — the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
+`fetch`/`release` - the framework asks KVCR to make a block resident in its DRAM pool and keep it pinned. After successful completion, the framework can use `deliver` to copy it into a framework-provided destination and call `release` when the pool claim is no longer needed.
 
 `align_sequence` lets the framework supply sequence order and align the recency of ready blocks in KVCR-managed storage. It uses the newest access time among those blocks, or the current time when `use_current_time=True`. Missing or non-ready blocks are ignored. Alignment does not increment access counts or reserve residency.
 
 `deposit` also accepts a `no_evict` flag (batch-level, applies to all entries): when set, the KVCR keeps every completed slot non-evictable and returns a release handle per entry. A framework that wants guaranteed local DRAM residency behavior for selected KV blocks can get that behavior through `no_evict`, while the KVCR still handles sharing, routing visibility, transfer setup, and tiering policy. The framework calls `release` with the corresponding handle to clear the no-evict claim.
 
-The tradeoff is backpressure: when policy cannot free enough capacity—for example, because `no_evict` claims occupy a pool or an attempted eviction does not free its source—KVCR may invoke `capacity_needed` as a last-resort pressure signal. Each `(pool_name, num_slots)` request identifies the pool-local release batch the framework should satisfy. Pressure and its configured low watermark are tracked independently per pool. If sufficient capacity remains unavailable, affected committed entries complete with errors. Pool size and the free-slot threshold that triggers `capacity_needed` are deployment knobs.
+The tradeoff is backpressure: when policy cannot free enough capacity - for example, because `no_evict` claims occupy a pool or an attempted eviction does not free its source - KVCR may invoke `capacity_needed` as a last-resort pressure signal. Each `(pool_name, num_slots)` request identifies the pool-local release batch the framework should satisfy. Pressure and its configured low watermark are tracked independently per pool. If sufficient capacity remains unavailable, affected committed entries complete with errors. Pool size and the free-slot threshold that triggers `capacity_needed` are deployment knobs.
 
 **Block availability query**
 
 When the framework asks the KVCR whether a block is available, the KVCR responds with one of:
-- `HIT(tier)` — locally available at the reported tier at the time of the query (with partial deposits, some pieces may still be pending)
-- `FETCHING(destination_tier)` — a fetch into the reported tier is in progress
-- `FETCHABLE(source_tier)` — not started, but the KVCR knows a source tier
-- `MISS(None)` — not found in any tier the KVCR currently knows about
+- `HIT(tier)` - locally available at the reported tier at the time of the query (with partial deposits, some pieces may still be pending)
+- `FETCHING(destination_tier)` - a fetch into the reported tier is in progress
+- `FETCHABLE(source_tier)` - not started, but the KVCR knows a source tier
+- `MISS(None)` - not found in any tier the KVCR currently knows about
 
 These statuses describe current KVCR knowledge, not a reservation or guarantee. A local DRAM `HIT` may be evicted before a later operation claims it, and a `FETCHABLE` result for peer DRAM means a request-scoped router hint identifies a peer KVCR that may source the block. The peer may ultimately serve it from KVCR-owned or pinned framework-owned DRAM; actual readability is confirmed only when the transfer and any required `request_pin` succeed. Framework-owned HBM can follow the same path if a deployment exposes GPU KV through the pin API. The framework may use the query result to decide whether to issue either call. To obtain the data, the framework calls `fetch` or `deliver` and waits for completion; either operation may return an error. A remote `FETCHABLE` result also records a source preference for later deliveries of that key within the request.
 
@@ -226,7 +226,7 @@ A deployment may choose to use only framework-owned memory. In that case, it use
 
 ---
 
-## Router–KVCR API
+## Router-KVCR API
 
 The router and KVCR interact through inventory events and request-scoped source hints.
 
@@ -237,10 +237,10 @@ class InventoryEvent:
     tier: CacheTier
     removed: bool
 
-# KVCR → integration
+# KVCR -> integration
 inventory_sink(event: InventoryEvent)
 
-# Router → KVCR, directly or through the framework
+# Router -> KVCR, directly or through the framework
 kvcr.submit_hint(hints, request_id=None) # hints must conform to the defined hint protocol
 kvcr.discard_hint(request_id) # request is over or its hints should be discarded early
 ```
@@ -315,11 +315,11 @@ Policy decides whether to stage, retain, move, or drop data within KVCR-owned DR
 
 The policy methods are invoked as follows:
 
-- **Admission — `decide_ingest`:** Called before KVCR creates a managed residency. `required_local` means the admission cannot be dropped, as required for a `no_evict` deposit or a fetch. `KEEP` admits it locally, while `DROP` declines optional admission and completes it as `DROPPED`. `COPY_TO` retains the local residency and also writes to the destination; `MOVE_TO` removes the local residency only after committing the destination. Framework hints and any policy-relevant router hints may inform this decision.
-- **Eviction — `eviction_score` and `decide_eviction`:** When a ready, unclaimed residency enters or re-enters the evictable queue, KVCR calls `eviction_score` and stores the result. When capacity is needed, candidates with lower finite scores are considered first and KVCR calls `decide_eviction`: `KEEP` declines that eviction, `DROP` removes the residency, and `MOVE_TO` removes it after committing the destination. `align_sequence` refreshes queued scores; broader dynamic reprioritization may be added if needed.
-- **Lifecycle — `on_ingest` and `on_remove`:** These optional hooks notify stateful policies when the first managed residency becomes ready and when the final managed residency disappears. Internal movement between managed tiers does not create another lifecycle event.
-- **Alignment — `on_align_sequence`:** When sequence alignment is requested, KVCR passes the affected blocks' updated metadata in caller order to this optional hook, allowing policies to update their own state before eviction scores are refreshed.
-- **Recovery — `decide_recovery`:** Called when a policy-requested copy or move fails. The default decision logs the failure and drops the source residency.
+- **Admission - `decide_ingest`:** Called before KVCR creates a managed residency. `required_local` means the admission cannot be dropped, as required for a `no_evict` deposit or a fetch. `KEEP` admits it locally, while `DROP` declines optional admission and completes it as `DROPPED`. `COPY_TO` retains the local residency and also writes to the destination; `MOVE_TO` removes the local residency only after committing the destination. Framework hints and any policy-relevant router hints may inform this decision.
+- **Eviction - `eviction_score` and `decide_eviction`:** When a ready, unclaimed residency enters or re-enters the evictable queue, KVCR calls `eviction_score` and stores the result. When capacity is needed, candidates with lower finite scores are considered first and KVCR calls `decide_eviction`: `KEEP` declines that eviction, `DROP` removes the residency, and `MOVE_TO` removes it after committing the destination. `align_sequence` refreshes queued scores; broader dynamic reprioritization may be added if needed.
+- **Lifecycle - `on_ingest` and `on_remove`:** These optional hooks notify stateful policies when the first managed residency becomes ready and when the final managed residency disappears. Internal movement between managed tiers does not create another lifecycle event.
+- **Alignment - `on_align_sequence`:** When sequence alignment is requested, KVCR passes the affected blocks' updated metadata in caller order to this optional hook, allowing policies to update their own state before eviction scores are refreshed.
+- **Recovery - `decide_recovery`:** Called when a policy-requested copy or move fails. The default decision logs the failure and drops the source residency.
 
 ---
 
