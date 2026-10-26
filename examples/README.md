@@ -147,12 +147,18 @@ from kvcr.config import G3Options
 g3 = G3Options(
     paths=(Path("/mnt/raid/kvcr-0.data"), Path("/mnt/raid/kvcr-1.data")),
     capacity_bytes_per_file=1024**3,
+    backend="POSIX",
+    backend_options={"use_uring": "true"},
 )
 ```
 
 Pass this object as `KVCRBackendConfigs.g3`. The integration also supplies
 `KVCRConfig.pool_layouts`, registered framework regions, `LocalDramOptions`,
 and framework bindings. The runnable example shows their construction.
+
+The backend default changes from `GDS_MT` to `POSIX` with io_uring in this
+change. Deployments relying on the previous default should explicitly set
+`backend="GDS_MT"` to retain their file backend.
 
 - Omitting `backend` selects `POSIX`; omitting POSIX engine options enables
   `use_uring="true"`. Values in `backend_options` are strings.
@@ -165,6 +171,26 @@ and framework bindings. The runnable example shows their construction.
   a small per-file budget sufficient for two complete keys across all files.
 - Each pool's block size must be memory-page aligned. The allocation unit is
   the greatest common divisor of those sizes; a piece can occupy several units.
+
+For example, 8 KiB `full` blocks and 4 KiB `swa` blocks use 4 KiB disk units.
+An entry with layout `["full", "swa:a", "swa:b"]` occupies four units: two for
+`full` and one for each `swa` piece. All pools share the configured files.
+
+### Layout and recovery compatibility
+
+The public `deposit`, `fetch`, and `deliver` signatures and configuration fields
+are unchanged. Incremental deposits declare the complete `expected_layout`
+before supplying pieces; without a declaration, the supplied pieces define a
+complete deposit. A deposit for an existing G3 key must match its stored layout.
+Multi-pool fetches supply the complete ordered `expected_layout`; deliveries
+can select unambiguous labeled pieces using their destination `MemoryRef`s.
+
+Recovery metadata now includes the ordered layout and all disk slots. New
+readers accept legacy single-slot records; older readers discard extended G3
+records instead of treating one piece as a complete entry. Recovery initially
+requires the same model and compatible pool/file configuration. This change
+does not add file-content validation or change existing native-error quiescence
+handling.
 
 ## Running in Docker
 
@@ -198,15 +224,25 @@ silently switch engines. GDS_MT additionally needs GPU/CUDA/cuFile setup.
 
 ## Scope and limitations
 
+Validation at runtime commit `d936f3f`, based on upstream `89413ba`: all 689
+collected pytest tests passed, as did lint and formatting. Native Kimi-derived
+round trips passed with POSIX/io_uring and GDS_MT across three files. A separate
+synthetic multi-pool round trip also passed across two filesystem mounts.
+
 - The probe checks cache bytes using synthetic data. Full hybrid-model serving
   still requires the vLLM adapter to export every required pool and piece.
 - Serving-group packing, cache dtype, tensor parallelism, and recurrent
   checkpoint eligibility can change the exported layout.
 - Some packed DeepSeek V4 layouts have non-page-aligned sizes and need an
   additional layout/padding solution before this G3 path can accept them.
-- File-I/O correctness, RAID failure recovery, and GPU-to-storage DMA
-  performance are separate validation workloads. Local multi-file runs were
-  performed on ext4 on a single NVMe partition, not on RAID.
+- The two tested ext4 mounts are partitions on the same NVMe device. RAID0,
+  NUMA locality, and GPU-to-storage DMA performance were not validated. GDS_MT
+  probes used DRAM buffers with cuFile compatibility mode allowed.
+- The separate vLLM serving E2E test requires two visible GPUs; it was not run
+  on the single-GPU validation node.
+- Descriptor and recovery-metadata costs grow with disk units per key. The
+  pinned Kimi-derived profile uses a 24 KiB unit and 268 descriptor pairs for
+  two pieces; serving performance needs separate measurement.
 
 For configuration, recovery behavior, and integration details, see the
 [developer guide](../docs/dev-guide.md). For allocator, layout, recovery,

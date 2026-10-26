@@ -437,6 +437,8 @@ for example, `{"use_aio": "true"}` selects Linux AIO instead. Set
 `backend="GDS_MT"` to use GDS explicitly; POSIX engine defaults are not passed
 to other backends. There is no automatic fallback if io_uring initialization
 fails.
+For deployments relying on the previous `GDS_MT` default, set `backend="GDS_MT"`
+explicitly to preserve the selected file backend.
 
 `g3.capacity_bytes_per_file` is rounded down to whole allocation units and must
 fit at least one. The unit is the greatest common divisor of the configured
