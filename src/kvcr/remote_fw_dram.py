@@ -288,6 +288,7 @@ class _RemoteFWDram:
                 if local_fill
                 else ()
             ),
+            key_dependencies=local_fill,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -300,7 +301,11 @@ class _RemoteFWDram:
                 len(keys),
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
-        kvcr._add_block_dependencies(op, new_operation=True)
+        if local_fill:
+            kvcr._add_block_dependencies(op, new_operation=True)
+        else:
+            # Nothing reads block records for keys only being delivered.
+            kvcr._outstanding_operations += 1
         kvcr._progress.submit(op)
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
@@ -361,10 +366,7 @@ class _RemoteFWDram:
                     # KVCR-owned contents stay claimed until native quiescence.
                     pins = self._fw_pins_by_op.pop(item.op_id, None)
                     if item.state is _SourceWriteState.FINISHED:
-                        if item.key_dependencies:
-                            self._kvcr._remove_block_dependencies(item)
-                        else:
-                            self._kvcr._outstanding_operations -= 1
+                        self._kvcr._release_op_dependencies(item)
                         if item.success:
                             self._kvcr._record_access(
                                 self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
@@ -387,7 +389,7 @@ class _RemoteFWDram:
                 elif item.state is _TargetPullState.QUARANTINED:
                     self._finish_target_pull(item)
                 elif item.state is _TargetPullState.FINISHED and item.uncertain:
-                    self._kvcr._remove_block_dependencies(item)
+                    self._kvcr._release_op_dependencies(item)
                     if item.local_fill:
                         self._kvcr._complete_local_dram_fill(item.keys, success=False)
                 elif item.state is _TargetPullState.FINISHED:
@@ -456,7 +458,7 @@ class _RemoteFWDram:
     def _finish_target_pull(self, op: _TargetPullOp) -> None:
         kvcr = self._kvcr
         if op.state is not _TargetPullState.QUARANTINED:
-            kvcr._remove_block_dependencies(op)
+            kvcr._release_op_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
         if kvcr._key_history_enabled:
             kvcr._log_key_history(

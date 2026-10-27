@@ -116,6 +116,8 @@ class _TargetPullOp(_RemoteOp):
     source_incarnation: str | None = None
     uncertain: bool = False
     retried: bool = False
+    # False for remote deliveries: counted once, no per-key block records.
+    key_dependencies: bool = True
 
     def progress(
         self, progress: _KVCRProgress, event: object | None

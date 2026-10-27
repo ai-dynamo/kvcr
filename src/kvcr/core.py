@@ -575,8 +575,9 @@ class _KVCRCore:
         self._next_op_handle += 1
         deadline = self._operation_deadline()
         local_dram = self._local_dram
+        validated: dict[tuple, RegionDescriptor] = {}
         normalized = {
-            key: self._normalize_descriptors(descriptors)
+            key: self._normalize_descriptors(descriptors, validated=validated)
             for key, descriptors in blocks.items()
         }
         with self._state_lock:
@@ -991,6 +992,13 @@ class _KVCRCore:
         for key in op.keys:
             self._block_record(key).add_in_flight_op(op.op_id)
 
+    def _release_op_dependencies(self, op: _Op) -> None:
+        """Undo ``_add_block_dependencies``, or the per-operation count that replaced it."""
+        if getattr(op, "key_dependencies", True):
+            self._remove_block_dependencies(op)
+        else:
+            self._outstanding_operations -= 1
+
     def _remove_block_dependencies(self, op: _Op) -> None:
         self._outstanding_operations -= 1
         for key in op.keys:
@@ -1078,7 +1086,10 @@ class _KVCRCore:
         return sum(self._block_sizes[ref.label.partition(":")[0]] for ref in refs)
 
     def _normalize_descriptors(
-        self, descriptors: list[MemoryRef]
+        self,
+        descriptors: list[MemoryRef],
+        *,
+        validated: dict[tuple, RegionDescriptor] | None = None,
     ) -> list[_TransferRef]:
         if not isinstance(descriptors, list):
             raise TypeError("block descriptors must be a list")
@@ -1093,7 +1104,7 @@ class _KVCRCore:
             normalized.append(
                 _TransferRef(ref.end_point_name, ref.element_index, ref.label)
             )
-        self._validate_descriptors(normalized)
+        self._validate_descriptors(normalized, validated=validated)
         return normalized
 
     def _validate_descriptors(
@@ -1102,9 +1113,27 @@ class _KVCRCore:
         *,
         regions=None,
         agent_name: str | None = None,
+        validated: dict[tuple, RegionDescriptor] | None = None,
     ) -> None:
+        """Check descriptors against registered regions.
+
+        ``validated`` caches single-descriptor checks by (endpoint, label, framework)
+        within one call site; a repeat only needs its element index bounds-checked.
+        """
         if not descriptors:
             raise ValueError("each block requires at least one _TransferRef")
+        cache_key = None
+        if validated is not None and len(descriptors) == 1:
+            ref = descriptors[0]
+            cache_key = (ref.end_point_name, ref.label, ref.framework)
+            region = validated.get(cache_key)
+            if region is not None:
+                index = ref.element_index
+                if type(index) is not int or not 0 <= index < region.count:
+                    raise ValueError(
+                        "memory reference element_index is outside its region"
+                    )
+                return
         labels = set()
         for ref in descriptors:
             region = self._region(ref, regions=regions, agent_name=agent_name)
@@ -1120,6 +1149,8 @@ class _KVCRCore:
                 labels.add(ref.label)
         if self._g3 is not None and (len(descriptors) != 1 or labels):
             raise ValueError("G3 does not support multi-block layouts or part labels")
+        if cache_key is not None:
+            validated[cache_key] = region
 
     def _validate_expected_layout(
         self, layout: list[str] | None
