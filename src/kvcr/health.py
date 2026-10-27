@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 @contextlib.contextmanager
 def _serve_health(
     address: tuple[str, int] | None,
-    status: Callable[[], tuple[int, str]],
+    status: Callable[[bool], tuple[int, str]],
     dependency_url: str | None = None,
 ) -> Iterator[ThreadingHTTPServer | None]:
     if address is None:
@@ -30,8 +30,9 @@ def _serve_health(
             if self.path not in ("/live", "/ready"):
                 code, reason = 404, "not found"
             else:
-                code, reason = status()
-                if code == 200 and dependency_url is not None:
+                ready = self.path == "/ready"
+                code, reason = status(ready)
+                if ready and code == 200 and dependency_url is not None:
                     try:
                         with opener.open(dependency_url, timeout=1) as response:
                             if response.status != 200:

@@ -28,7 +28,7 @@ from .control_channels import (
     KVCRMsgFramingError,
     KVCRServiceError,
 )
-from .guard import _Guard, _Lease
+from .guard import _Guard, _Lease, _Phase
 from .guard_protocol import (
     _CLAIM_DECODER,
     _HOLD_DECODER,
@@ -547,7 +547,7 @@ class _KVCRService:
         with contextlib.suppress(BufferError, OSError):
             self._registry.close()
 
-    def _health_status(self, timeout: float) -> tuple[int, str]:
+    def _health_status(self, timeout: float, *, ready: bool = True) -> tuple[int, str]:
         """Observe progress without claiming pools or entering Guard actor locks."""
         if self._closed or self._registry._refusing.is_set():
             return 503, "service stopping"
@@ -555,9 +555,7 @@ class _KVCRService:
             return 503, "service failed"
         now = time.monotonic()
         progress = self._server._last_progress
-        if progress is None:
-            return 503, "service not serving"
-        if now - progress > timeout:
+        if progress is not None and now - progress > timeout:
             return 503, "service stalled"
         guards = list(self._registry._guards.values())
         if len(guards) != self._registry._guard_count:
@@ -565,25 +563,19 @@ class _KVCRService:
         for guard in guards:
             if guard._failure is not None or not guard._thread.is_alive():
                 return 503, "guard failed"
-            if now - guard._last_progress > timeout:
+            if ready and guard._reserved is _Phase.PROMOTING:
+                return 503, "guard promoting"
+            if ready and now - guard._last_progress > timeout:
                 return 503, "guard stalled"
+        if progress is None:
+            return (503 if ready else 200), "service starting"
         return 200, "ok"
 
-    def serve_forever(
-        self,
-        health_address: tuple[str, int] | None = None,
-        health_timeout_seconds: float = 30,
-        health_dependency_url: str | None = None,
-    ) -> None:
-        with _serve_health(
-            health_address,
-            functools.partial(self._health_status, health_timeout_seconds),
-            health_dependency_url,
-        ):
-            try:
-                self._server.serve_forever()
-            finally:
-                self._server._last_progress = None
+    def serve_forever(self) -> None:
+        try:
+            self._server.serve_forever()
+        finally:
+            self._server._last_progress = None
         if self._server._fatal_error is not None:
             raise self._server._fatal_error
 
@@ -706,7 +698,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--health-timeout-seconds", type=float, default=30)
     parser.add_argument(
         "--health-dependency-url",
-        help="optional HTTP health dependency; both probes require it to return 200",
+        help="optional HTTP readiness dependency; /ready requires it to return 200",
     )
     parser.add_argument(
         "--heartbeat-timeout-ms",
@@ -767,47 +759,60 @@ def main() -> None:
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown_signal)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     server: _KVCRService | None = None
+    stopping = False
+
+    def health_status(ready: bool) -> tuple[int, str]:
+        if stopping:
+            return 503, "service stopping"
+        if server is None:
+            return (503 if ready else 200), "service starting"
+        return server._health_status(args.health_timeout_seconds, ready=ready)
+
     try:
-        server = _KVCRService(
-            args.socket_path,
-            args.pool_dir,
-            guard_count=args.guard_count,
-            pool_sizes_bytes=args.pool_sizes_bytes,
-            compatibility_digest=args.compatibility_digest,
-            heartbeat_timeout_seconds=(
-                args.heartbeat_timeout_ms / 1000
-                if args.heartbeat_timeout_ms is not None
-                else None
-            ),
-            startup_timeout_seconds=args.startup_timeout_seconds,
-        )
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        logger.info(
-            "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
-            "journal_bytes=%d",
-            args.socket_path,
-            args.guard_count,
-            args.pool_sizes_bytes,
-            _DEFAULT_JOURNAL_BYTES,
-        )
-        server.serve_forever(
-            health_address=(args.health_host, args.health_port)
+        # Bind before allocating pools. Health threads inherit the blocked signals;
+        # the main thread handles shutdown once construction can be cleaned up.
+        with _serve_health(
+            (args.health_host, args.health_port)
             if args.health_port is not None
             else None,
-            health_timeout_seconds=args.health_timeout_seconds,
-            health_dependency_url=args.health_dependency_url,
-        )
-    except _ShutdownRequested:
-        pass
+            health_status,
+            args.health_dependency_url,
+        ):
+            try:
+                server = _KVCRService(
+                    args.socket_path,
+                    args.pool_dir,
+                    guard_count=args.guard_count,
+                    pool_sizes_bytes=args.pool_sizes_bytes,
+                    compatibility_digest=args.compatibility_digest,
+                    heartbeat_timeout_seconds=(
+                        args.heartbeat_timeout_ms / 1000
+                        if args.heartbeat_timeout_ms is not None
+                        else None
+                    ),
+                    startup_timeout_seconds=args.startup_timeout_seconds,
+                )
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                logger.info(
+                    "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
+                    "journal_bytes=%d",
+                    args.socket_path,
+                    args.guard_count,
+                    args.pool_sizes_bytes,
+                    _DEFAULT_JOURNAL_BYTES,
+                )
+                server.serve_forever()
+            except _ShutdownRequested:
+                pass
+            finally:
+                stopping = True
+                signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
+                if server is not None:
+                    server.close()
     finally:
-        signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
-        try:
-            if server is not None:
-                server.close()
-        finally:
-            signal.signal(signal.SIGINT, old_sigint)
-            signal.signal(signal.SIGTERM, old_sigterm)
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 if __name__ == "__main__":

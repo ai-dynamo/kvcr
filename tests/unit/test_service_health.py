@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import http.client
+import select
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
-from contextlib import closing, contextmanager
+from contextlib import closing
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from _kvcr_test_utils import FakeNixlAgent, _use_nixl_agent, _wait_until
@@ -20,6 +27,7 @@ from test_kvcr_service import (
 from kvcr import kvcr_service
 from kvcr.health import _serve_health
 from kvcr.kvcr_service import _KVCRService
+from kvcr.memory import _KVCRPoolOwner
 
 
 def _get(server, path):
@@ -56,31 +64,15 @@ def test_health_http_routes_dependency_and_shutdown():
             status.return_value = (503, "stopping")
             assert _get(server, "/ready") == (503, "stopping\n")
             assert _get(server, "/missing")[0] == 404
-        with _serve_health(("127.0.0.1", 0), lambda: (200, "ok"), peer_url) as server:
+        with _serve_health(
+            ("127.0.0.1", 0), lambda _ready: (200, "ok"), peer_url
+        ) as server:
             assert _get(server, "/ready") == (503, "dependency unavailable\n")
+            assert _get(server, "/live") == (200, "ok\n")
             status.return_value = (200, "ok")
             peer.RequestHandlerClass.protocol_version = "INVALID"
             assert _get(server, "/ready") == (503, "dependency unavailable\n")
     assert not any(t.name == "kvcr-health" for t in threading.enumerate())
-
-
-def test_health_does_not_claim_or_release_attached_pool(tmp_path):
-    with (
-        _use_nixl_agent(FakeNixlAgent()),
-        _running_server(tmp_path, guard_count=1) as harness,
-    ):
-        service = harness.server
-        # The accept loop has not necessarily completed its first iteration yet.
-        service._server.service_actions()
-        assert service._health_status(30) == (200, "ok")
-        holder = _FakeLiveness()
-        _, lease = _claim(service._registry, 0, holder)
-        guard = service._registry._guards[0]
-        before = (guard._phase, guard._pool_lease.current, guard._configured)
-        for _ in range(3):
-            assert service._health_status(30) == (200, "ok")
-        assert (guard._phase, guard._pool_lease.current, guard._configured) == before
-        service._registry.release(0, lease)
 
 
 def test_health_tracks_progress_during_preparation_and_promotion(tmp_path):
@@ -98,7 +90,7 @@ def test_health_tracks_progress_during_preparation_and_promotion(tmp_path):
     ):
         service = harness.server
         with _serve_health(
-            ("127.0.0.1", 0), lambda: service._health_status(2)
+            ("127.0.0.1", 0), lambda ready: service._health_status(2, ready=ready)
         ) as health:
             try:
                 _wait_until(lambda: _get(health, "/ready")[0] == 200)
@@ -107,28 +99,46 @@ def test_health_tracks_progress_during_preparation_and_promotion(tmp_path):
                 assert entered.wait(1)
                 guard = service._registry._guards[0]
                 assert not guard._core._progress._prepare_ready.is_set()
+                before = (guard._phase, guard._pool_lease.current, guard._configured)
                 time.sleep(2.2)
-                assert _get(health, "/ready")[0] == 200
+                for _ in range(3):
+                    assert _get(health, "/live")[0] == 200
+                    assert _get(health, "/ready")[0] == 200
+                assert (
+                    guard._phase,
+                    guard._pool_lease.current,
+                    guard._configured,
+                ) == before
                 holder.kill()
                 _wait_until(
-                    lambda: _get(health, "/ready") == (503, "guard stalled\n"),
-                    timeout=5,
+                    lambda: _get(health, "/ready") == (503, "guard promoting\n"),
+                    timeout=1,
                 )
+                assert _get(health, "/live")[0] == 200
+                _wait_until(
+                    lambda: time.monotonic() - guard._last_progress > 2, timeout=3
+                )
+                assert _get(health, "/live")[0] == 200
+                assert _get(health, "/ready") == (503, "guard promoting\n")
                 assert not guard._serving
             finally:
                 finish.set()
             _wait_until(lambda: guard._serving, timeout=5)
             _wait_until(lambda: _get(health, "/ready")[0] == 200, timeout=5)
+            assert _get(health, "/live")[0] == 200
 
 
 @pytest.mark.parametrize(
-    "failure", ["accept_loop", "guard_loop", "guard_failure", "shutdown"]
+    "failure", ["accept_loop", "guard_loop", "guard_failure", "dead_guard", "shutdown"]
 )
 def test_health_fails_closed_without_waiting_on_guard(failure):
     # State snapshots, without racing the live loops that update progress clocks.
     now = time.monotonic()
     guard = SimpleNamespace(
-        _failure=None, _thread=Mock(is_alive=lambda: True), _last_progress=now
+        _failure=None,
+        _thread=Mock(is_alive=lambda: True),
+        _last_progress=now,
+        _reserved=None,
     )
     service = object.__new__(_KVCRService)
     service._closed = False
@@ -142,43 +152,128 @@ def test_health_fails_closed_without_waiting_on_guard(failure):
         guard._last_progress = now - 31
     elif failure == "guard_failure":
         guard._failure = RuntimeError("test")
+    elif failure == "dead_guard":
+        guard._thread.is_alive = lambda: False
     else:
         service._registry._refusing.set()
     assert service._health_status(30)[0] == 503
-
-
-def test_service_health_listener_tracks_startup_idle_progress_and_shutdown(
-    tmp_path, monkeypatch
-):
-    listening = threading.Event()
-    listeners = []
-
-    @contextmanager
-    def capture_listener(*args):
-        with _serve_health(*args) as listener:
-            listeners.append(listener)
-            listening.set()
-            yield listener
-
-    monkeypatch.setattr(kvcr_service, "_serve_health", capture_listener)
-    service = _KVCRService(
-        tmp_path / "service.sock", tmp_path, 1, (8192,), "test", journal_bytes=8192
+    assert service._health_status(30, ready=False)[0] == (
+        200 if failure == "guard_loop" else 503
     )
-    thread = threading.Thread(target=service.serve_forever, args=(("127.0.0.1", 0),))
-    try:
-        assert service._health_status(30) == (503, "service not serving")
-        thread.start()
-        assert listening.wait(2)
-        _wait_until(lambda: _get(listeners[0], "/ready")[0] == 200, timeout=2)
-        guard = service._registry._guards[0]
-        initial_progress = guard._last_progress
-        _wait_until(lambda: guard._last_progress > initial_progress, timeout=2)
-        assert _get(listeners[0], "/live") == (200, "ok\n")
-    finally:
-        if thread.is_alive():
-            service.shutdown()
-        thread.join(timeout=3)
-        service.close()
-    assert not thread.is_alive()
-    assert listeners[0].fileno() == -1
-    assert service._health_status(30)[0] == 503
+
+
+def _health_cli():
+    """Run the real CLI, with pipe-controlled allocation and cleanup boundaries."""
+    allocate_pool, close_service = _KVCRPoolOwner.allocate, _KVCRService.close
+
+    def allocate(**kwargs):
+        print("allocating", flush=True)
+        if sys.stdin.readline().strip() == "fail":
+            raise OSError("test allocation failed")
+        return allocate_pool(**kwargs)
+
+    def close(service):
+        print("stopping", flush=True)
+        assert sys.stdin.readline().strip() == "close"
+        close_service(service)
+
+    with (
+        patch.object(_KVCRPoolOwner, "allocate", side_effect=allocate),
+        patch.object(_KVCRService, "close", close),
+        patch.object(
+            kvcr_service,
+            "_KVCRService",
+            functools.partial(_KVCRService, journal_bytes=8192),
+        ),
+    ):
+        kvcr_service.main()
+    assert not any(t.name == "kvcr-health" for t in threading.enumerate())
+
+
+@pytest.mark.parametrize("outcome", ["ready", "allocation_failure", "bind_failure"])
+def test_service_health_startup_and_cleanup(tmp_path, outcome):
+    pool_dir = tmp_path / "pools"
+    pool_dir.mkdir()
+    socket_path = tmp_path / "service.sock"
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        health = SimpleNamespace(server_address=reservation.getsockname())
+        if outcome != "bind_failure":
+            reservation.close()
+        bootstrap = (
+            "import sys; sys.path.insert(0, sys.argv.pop(1)); "
+            "from test_service_health import _health_cli; _health_cli()"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", bootstrap, str(Path(__file__).parent)]
+            + _service_args(str(8192 / (1 << 30)))
+            + [
+                "--pool-dir",
+                str(pool_dir),
+                "--socket-path",
+                str(socket_path),
+                "--health-port",
+                str(health.server_address[1]),
+                "--health-timeout-seconds",
+                "2",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as child:
+
+            def expect(marker):
+                assert select.select([child.stdout], [], [], 5)[0], marker
+                assert child.stdout.readline().strip() == marker
+
+            def reply(command):
+                child.stdin.write(command + "\n")
+                child.stdin.flush()
+
+            try:
+                if outcome != "bind_failure":
+                    for rank in range(2):
+                        expect("allocating")
+                        assert _get(health, "/live") == (200, "service starting\n")
+                        assert _get(health, "/ready") == (503, "service starting\n")
+                        assert not socket_path.exists()
+                        assert len(list(pool_dir.iterdir())) == rank
+                        reply(
+                            "fail"
+                            if outcome == "allocation_failure" and rank == 1
+                            else "allocate"
+                        )
+                    if outcome == "ready":
+                        _wait_until(lambda: _get(health, "/ready")[0] == 200, timeout=5)
+                        # An unclaimed, idle Guard must remain ready past the deadline.
+                        time.sleep(2.2)
+                        assert _get(health, "/ready")[0] == 200
+                        assert _get(health, "/live")[0] == 200
+                        assert len(list(pool_dir.iterdir())) == 2
+                        child.send_signal(signal.SIGTERM)
+                        expect("stopping")
+                        for path in ("/live", "/ready"):
+                            assert _get(health, path) == (503, "service stopping\n")
+                        reply("close")
+                output, errors = child.communicate(timeout=5)
+                if outcome == "ready":
+                    assert child.returncode == 0, errors
+                else:
+                    assert child.returncode != 0
+                    assert (
+                        "test allocation failed" in errors
+                        if outcome == "allocation_failure"
+                        else "Address already in use" in errors
+                    )
+                    assert "allocating" not in output
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+        assert not list(pool_dir.iterdir())
+        assert not socket_path.exists()
+        if outcome != "bind_failure":
+            with pytest.raises(OSError):
+                with socket.create_connection(health.server_address, timeout=1):
+                    pass
