@@ -88,6 +88,10 @@ class _FakeLiveness:
         self._read, self._write = os.pipe()
         self.closed = False
         self.incarnation = None
+        self.mode = "so_peerpidfd"
+        self.verified = True
+        self.fenceable = True
+        self.peer_uid = None
 
     def fileno(self) -> int:
         if self.closed:
@@ -155,6 +159,7 @@ def _running_server(
     pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
     journal_bytes: int = _TEST_JOURNAL_BYTES,
     heartbeat_timeout_seconds: float | None = None,
+    peer_trust: str = "strict",
 ) -> Iterator[_ServerHarness]:
     socket_path = _test_socket_path()
     pool_dir = tmp_path / "pools"
@@ -167,6 +172,7 @@ def _running_server(
         compatibility_digest=_TEST_DIGEST,
         journal_bytes=journal_bytes,
         heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+        peer_trust=peer_trust,
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -356,11 +362,12 @@ def test_legacy_service_refuses_client_without_own_pidfd(
                 )
 
 
+@pytest.mark.parametrize("peer_trust", ["strict", "trusted-peer"])
 def test_legacy_claim_rejects_wrong_process_or_non_pidfd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer_trust: str
 ) -> None:
     monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
-    with _running_server(tmp_path, guard_count=1) as harness:
+    with _running_server(tmp_path, guard_count=1, peer_trust=peer_trust) as harness:
         open_fds = len(os.listdir("/proc/self/fd"))
         for descriptor_type in ("wrong-pid", "not-pidfd"):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -380,6 +387,29 @@ def test_legacy_claim_rejects_wrong_process_or_non_pidfd(
                 assert "does not match socket peer" in response.message
                 assert _holders_of(harness.server._registry) == {}
         _wait_until(lambda: len(os.listdir("/proc/self/fd")) <= open_fds, timeout=2)
+
+
+def test_trusted_peer_grants_a_peer_in_another_pid_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real thing needs a second PID namespace; see the unshare tests below.
+    monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    monkeypatch.setattr(
+        guard_protocol,
+        "_peer_pidfd_verdict",
+        lambda _connection, _fd: (guard_protocol._PeerVerdict.PEER_NOT_VISIBLE, 0),
+    )
+    with _running_server(tmp_path, guard_count=1, peer_trust="trusted-peer") as harness:
+        hold = harness.client.claim(
+            0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+        )
+        lease = harness.server._registry._guards[0]._pool_lease.current
+        assert (lease.mode, lease.verified, lease.fenceable) == (
+            "pidfd_trusted",
+            False,
+            False,
+        )
+        hold.release()
 
 
 def test_service_refuses_startup_without_pidfd_open(tmp_path: Path) -> None:
@@ -1184,6 +1214,7 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         def __init__(self) -> None:
             self.registry = registry
             self.compatibility_digest = _TEST_DIGEST
+            self.peer_trust = "strict"
 
         def dispatch(self, request, liveness):
             return _ThreadingUnixServer.dispatch(self, request, liveness)
@@ -1227,10 +1258,13 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     server = object.__new__(_ThreadingUnixServer)
     server.registry = registry
     server.compatibility_digest = _TEST_DIGEST
+    server.peer_trust = "strict"
     monkeypatch.setattr(
         PidfdLiveness,
         "from_peer_socket",
-        classmethod(lambda _cls, _sock, _fd: PidfdLiveness(os.pidfd_open(child.pid))),
+        classmethod(
+            lambda _cls, _sock, _fd, _trust: PidfdLiveness(os.pidfd_open(child.pid))
+        ),
     )
     handler = object.__new__(_RequestHandler)
     handler.request = Mock()
@@ -1866,3 +1900,194 @@ def test_a_plain_service_still_purges_true_orphans(tmp_path: Path) -> None:
         assert not orphan.exists()
     finally:
         registry.close()
+
+
+def _unshare_pid_namespace() -> list[str]:
+    """The argv prefix that runs a command as pid 1 of a fresh PID namespace.
+
+    Skips, with the probe's own error, when the host cannot: no unshare (macOS),
+    user namespaces disabled, or /proc cannot be remounted (AppArmor).
+    """
+    prefix = ["unshare", "--pid", "--fork", "--mount-proc"]
+    if os.geteuid() != 0:
+        prefix = ["unshare", "--user", "--map-root-user", *prefix[1:]]
+    try:
+        probe = subprocess.run(
+            [*prefix, "true"], capture_output=True, text=True, timeout=10
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        pytest.skip(f"SKIPPED, no PID namespace ({' '.join(prefix)}): {error}")
+    if probe.returncode != 0:
+        pytest.skip(
+            f"SKIPPED, no PID namespace ({' '.join(prefix)} true exited "
+            f"{probe.returncode}): {probe.stderr.strip()}"
+        )
+    return prefix
+
+
+def _read_line(process: subprocess.Popen, timeout: float) -> str:
+    assert process.stdout is not None
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    assert ready, "no output within the timeout"
+    return process.stdout.readline()
+
+
+_CLAIM_AND_WAIT = """
+import sys, time
+from kvcr.guard_protocol import KVCRClient
+hold = KVCRClient(sys.argv[1]).claim(0, {layouts!r}, {digest!r}, {bind!r})
+print("claimed", flush=True)
+time.sleep(60)
+"""
+
+
+def test_claimant_in_a_child_pid_namespace_is_visible_and_its_death_promotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The service is an ancestor of the claimant, so it can still verify it.
+
+    Only a peer outside the service's own PID subtree reads as pid 0.
+    """
+    prefix = _unshare_pid_namespace()
+    monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    with _running_server(tmp_path, guard_count=1, peer_trust="trusted-peer") as harness:
+        guard = harness.server._registry._guards[0]
+        guard._promote = Mock()
+        program = _CLAIM_AND_WAIT.format(
+            layouts=_TEST_POOL_LAYOUTS, digest=_TEST_DIGEST, bind=_control_bind(0)
+        )
+        child = subprocess.Popen(
+            [*prefix, sys.executable, "-c", program, str(harness.server.socket_path)],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+            text=True,
+        )
+        try:
+            assert _read_line(child, 20) == "claimed\n"
+            lease = guard._pool_lease.current
+            assert (lease.mode, lease.verified, lease.fenceable) == (
+                "pidfd_verified",
+                True,
+                True,
+            )
+            os.killpg(child.pid, signal.SIGKILL)
+            _wait_until(lambda: guard._phase is _Phase.STANDBY, timeout=5)
+            guard._promote.assert_called_once_with()
+        finally:
+            with suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+            if child.stdout is not None:
+                child.stdout.close()
+
+
+# The Guard side of the real topology: the service runs in its own PID
+# namespace, so a worker outside it reads as pid 0 on both sides of the check.
+# Stand-in pools and a recording promotion keep nixl out of it.
+_SERVICE_IN_PID_NAMESPACE = """
+import sys
+from unittest.mock import Mock, patch
+sys.path.insert(0, {tests!r})
+import test_kvcr_service as t
+from kvcr import guard, guard_protocol
+from kvcr.kvcr_service import _KVCRService
+
+guard_protocol._SO_PEERPIDFD = 0x7FFFFFFF
+channel = Mock(recv=Mock(return_value=[]))
+
+def take(duplicate):
+    duplicate.close()
+    return channel
+
+def promote_for(self, lease):
+    print("promoted", flush=True)
+
+socket_path, pool_dir, peer_trust = sys.argv[1:4]
+with (
+    t._guard_patches(),
+    patch("kvcr.guard.ZmqPeerControlChannel.from_shared_listener", side_effect=take),
+    patch.object(guard._Guard, "_promote_for", promote_for),
+):
+    service = _KVCRService(
+        socket_path,
+        pool_dir,
+        guard_count=1,
+        pool_sizes_bytes=t._TEST_POOL_SIZES_BYTES,
+        compatibility_digest=t._TEST_DIGEST,
+        journal_bytes=t._TEST_JOURNAL_BYTES,
+        peer_trust=peer_trust,
+    )
+    print("ready", flush=True)
+    service.serve_forever()
+"""
+
+
+@contextmanager
+def _service_in_pid_namespace(
+    tmp_path: Path, peer_trust: str
+) -> Iterator[tuple[subprocess.Popen, Path]]:
+    prefix = _unshare_pid_namespace()
+    socket_path = _test_socket_path()
+    pool_dir = tmp_path / "pools"
+    pool_dir.mkdir()
+    program = _SERVICE_IN_PID_NAMESPACE.format(tests=str(Path(__file__).parent))
+    service = subprocess.Popen(
+        [
+            *prefix,
+            sys.executable,
+            "-c",
+            program,
+            str(socket_path),
+            str(pool_dir),
+            peer_trust,
+        ],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+        text=True,
+    )
+    try:
+        assert _read_line(service, 30) == "ready\n"
+        yield service, socket_path
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(service.pid, signal.SIGKILL)
+        service.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+        if service.stdout is not None:
+            service.stdout.close()
+        with suppress(OSError):
+            socket_path.unlink()
+
+
+def test_service_in_its_own_pid_namespace_refuses_a_worker_it_cannot_see_when_strict(
+    tmp_path: Path,
+) -> None:
+    with _service_in_pid_namespace(tmp_path, "strict") as (_service, socket_path):
+        with pytest.raises(KVCRServiceError, match="does not match socket peer"):
+            KVCRClient(socket_path).claim(
+                0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+            )
+
+
+def test_service_in_its_own_pid_namespace_grants_a_worker_it_cannot_see_when_trusted(
+    tmp_path: Path,
+) -> None:
+    with _service_in_pid_namespace(tmp_path, "trusted-peer") as (service, socket_path):
+        program = _CLAIM_AND_WAIT.format(
+            layouts=_TEST_POOL_LAYOUTS, digest=_TEST_DIGEST, bind=_control_bind(0)
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", program, str(socket_path)],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+            text=True,
+        )
+        try:
+            assert _read_line(worker, 20) == "claimed\n"
+            # Death crosses the namespace through the pidfd and nothing else.
+            worker.kill()
+            assert _read_line(service, 10) == "promoted\n"
+        finally:
+            worker.kill()
+            worker.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
+            if worker.stdout is not None:
+                worker.stdout.close()

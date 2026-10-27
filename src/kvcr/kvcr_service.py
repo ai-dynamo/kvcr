@@ -35,6 +35,7 @@ from .guard_protocol import (
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
     _PROTOCOL_VERSION,
+    PeerTrust,
     PidfdLiveness,
     _Claim,
     _claim_fd_counts,
@@ -44,6 +45,7 @@ from .guard_protocol import (
     _PoolDescriptor,
     _Released,
     _TierConfig,
+    peer_liveness_mode,
 )
 from .memory import (
     _POOL_PREFIX,
@@ -436,7 +438,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         liveness: PidfdLiveness | None = None
         grant: "tuple[int, int, _Lease] | None" = None
         try:
-            liveness = PidfdLiveness.from_peer_socket(self.request, worker_pidfd)
+            liveness = PidfdLiveness.from_peer_socket(
+                self.request, worker_pidfd, self.server.peer_trust
+            )
             response, grant = self.server.dispatch(request, liveness)
         except KVCRServiceError as error:
             response = _Error(str(error), _PROTOCOL_VERSION)
@@ -547,8 +551,10 @@ class _ThreadingUnixServer(
         socket_path: str | os.PathLike[str],
         registry: _PoolRegistry,
         compatibility_digest: str,
+        peer_trust: PeerTrust = "strict",
     ) -> None:
         self.registry = registry
+        self.peer_trust = peer_trust
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
         self._fatal_error: BaseException | None = None
@@ -646,6 +652,7 @@ class _KVCRService:
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
         adopt_pools: bool = False,
+        peer_trust: PeerTrust = "strict",
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -674,7 +681,7 @@ class _KVCRService:
         )
         try:
             self._server = _ThreadingUnixServer(
-                self.socket_path, self._registry, compatibility_digest
+                self.socket_path, self._registry, compatibility_digest, peer_trust
             )
             socket_stat = self.socket_path.stat(follow_symlinks=False)
             self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
@@ -682,6 +689,7 @@ class _KVCRService:
             self._release_partial_construction()
             raise
         self._closed = False
+        logger.info("KVCR peer liveness mode: %s", peer_liveness_mode(peer_trust))
 
     def _release_partial_construction(self) -> None:
         """Release whatever __init__ managed to create before it failed."""
@@ -827,6 +835,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(default: unlink on exit, allocate fresh); never run adopting and "
         "non-adopting services on one pool directory",
     )
+    # The pidfd is a liveness handle, not authorization: who may claim is whoever
+    # can reach the socket. trusted-peer accepts a pidfd from a peer in another PID
+    # namespace, which cannot be matched to the connection, and never signals it. A
+    # buggy peer can then cause early or never promotion of its own pool only. An
+    # unfenceable lease whose worker hangs alive, or whose pidfd names a long-lived
+    # sibling, holds its guard_index until that process exits (POLLIN fires on
+    # thread-group exit); a pidfd naming a process outside the pod needs a restart.
+    parser.add_argument(
+        "--peer-trust",
+        choices=("strict", "trusted-peer"),
+        default="strict",
+        help="require a worker pidfd verified against the socket peer (strict), or "
+        "also accept one from another PID namespace (trusted-peer)",
+    )
     parser.add_argument(
         "--log-level",
         type=str.upper,
@@ -871,6 +893,7 @@ def main() -> None:
             ),
             startup_timeout_seconds=args.startup_timeout_seconds,
             adopt_pools=args.adopt_pools,
+            peer_trust=args.peer_trust,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logger.info(

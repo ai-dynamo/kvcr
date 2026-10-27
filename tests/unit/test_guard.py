@@ -219,6 +219,41 @@ def _stub_fence(monkeypatch) -> Mock:
     return fence
 
 
+def test_an_unfenceable_primary_is_never_signalled_and_only_its_death_promotes(
+    monkeypatch, caplog
+) -> None:
+    """A trusted-peer pidfd is a death signal only: no signal, no timeout promotion."""
+    fence = Mock(side_effect=AssertionError("signalled an unverified pidfd"))
+    monkeypatch.setattr("kvcr.guard.signal.pidfd_send_signal", fence, raising=False)
+    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
+    lease = Mock(incarnation="primary", fenceable=False, verified=False)
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    guard._promote = Mock()
+    guard._promote_for = Mock()
+    now = [10.0]
+    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
+
+    guard.heartbeat(lease)  # heartbeats are still accepted
+    now[0] += 5.0  # far past the timeout
+    with caplog.at_level(logging.WARNING, logger="kvcr.guard"):
+        for _ in range(3):
+            guard._observe_holder()
+    guard._promote.assert_not_called()
+    guard._promote_for.assert_not_called()
+    fence.assert_not_called()
+    assert guard._phase is _Phase.PRIMARY
+    assert guard._reserved is None
+    warnings = [r for r in caplog.records if "cannot fence" in r.getMessage()]
+    assert len(warnings) == 1
+
+    guard._pool_lease.poll_pidfd.return_value = select.POLLIN
+    guard._observe_holder()
+    guard._promote_for.assert_called_once_with(lease)
+    fence.assert_not_called()
+
+
 def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
     fence = _stub_fence(monkeypatch)
     guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
