@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX remote-delivery tracing
 
-Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The example uses synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and the [producer map](nvtx-context.md) for the inspected Dynamo/vLLM identity inputs.
+Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The example uses synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and identity availability.
 
 ## Enable tracing
 
@@ -37,7 +37,7 @@ KVCR_NVTX_LEVEL=low nsys profile \
   --output=/tmp/kvcr-application python app.py
 ```
 
-Set the level before constructing KVCR in each worker. Capture independently launched workers separately, using distinct report names. Open the `.nsys-rep` in Nsight Systems and follow the `KVCR` ranges using the [event reference](nvtx-events.md). Request/session propagation depends on the application's integration; the [producer map](nvtx-context.md) records the inspected input seams and gaps.
+Set the level before constructing KVCR in each worker. Capture independently launched workers separately, using distinct report names. Open the `.nsys-rep` in Nsight Systems and follow the `KVCR` ranges using the [event reference](nvtx-events.md).
 
 ## Capture a real pin and transfer
 
@@ -100,10 +100,6 @@ Join pins by `(instance_hi, instance_lo, pin_id)`, not framework request ID alon
 Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`, `6=cancelled`. For a nonempty request, zero usable blocks is failed; a positive subset is partial. An empty request with zero completed blocks remains success. Counts describe the observed result without asserting why blocks were missing.
 
 Reason codes: `0=unknown`, `1=none`, `2=callback_error`, `3=duplicate_request`, `4=invalid_result`, `5=deadline`, `6=cancelled`, `7=shutdown`, `8=no_waiters`. A framework result of `None` gives no failure cause: it is **not** evidence of cache pressure. Callback errors identify the stage, not an underlying diagnosis. Exception strings are not recorded.
-
-## Integration gaps on the reviewed baseline
-
-The [producer map](nvtx-context.md) documents request/session propagation and framework-utilization gaps on the inspected baselines, with immutable sources and the input seams requiring separate integration work.
 
 The pin hooks can also be encountered by remote fetch. They do not provide full fetch fan-out correlation. No production-overhead acceptance threshold has been established by this example.
 

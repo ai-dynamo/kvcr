@@ -221,19 +221,19 @@ class _TargetPullOp(_RemoteOp):
                 and (not self.local_fill or now < self.deadline)
             )
             if trace is not None:
-                reason = (
-                    _nvtx.Reason.NONE
-                    if success
-                    else trace.failure_reason
-                    if trace.failure_reason is not _nvtx.Reason.UNKNOWN
-                    else _nvtx.Reason.DEADLINE
-                    if self.local_fill
-                    and not cancelled
-                    and self.state is _TargetPullState.WAITING_WRITE_DONE
-                    and event.get("success") is True
-                    and now >= self.deadline
-                    else _nvtx.Reason.REMOTE_FAILURE
-                )
+                reason = _nvtx.Reason.NONE
+                if not success:
+                    reason = trace.failure_reason
+                    if reason is _nvtx.Reason.UNKNOWN:
+                        reason = _nvtx.Reason.REMOTE_FAILURE
+                        if (
+                            self.local_fill
+                            and not cancelled
+                            and self.state is _TargetPullState.WAITING_WRITE_DONE
+                            and event.get("success") is True
+                            and now >= self.deadline
+                        ):
+                            reason = _nvtx.Reason.DEADLINE
             try:
                 if success:
                     completed_indices = _notification_completed_indices(

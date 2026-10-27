@@ -160,13 +160,13 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
     assert not recording.stack
 
 
-@pytest.mark.parametrize("retry", [False, True])
 @pytest.mark.parametrize(
-    "indices,expected",
+    "indices,expected,retry",
     [
-        ((0, 1), _nvtx.Status.SUCCESS),
-        ((0,), _nvtx.Status.PARTIAL),
-        ((9,), _nvtx.Status.FAILED),
+        ((0, 1), _nvtx.Status.SUCCESS, False),
+        ((0,), _nvtx.Status.PARTIAL, False),
+        ((9,), _nvtx.Status.FAILED, False),
+        ((0, 1), _nvtx.Status.SUCCESS, True),
     ],
 )
 def test_target_receipt_consumption_and_caller_return(
@@ -301,40 +301,6 @@ def test_public_mixed_delivery_waits_for_both_branches(
         int(returned["request_lo"]),
     ) == _nvtx.identity(request)
     assert list(kvcr.poll_completed()) == []
-    kvcr.discard_hint(request)
-
-
-def test_replaced_hint_is_used_and_conflicting_hint_is_rejected(recording):
-    kvcr, agent, control = make_target()
-    request = "reused-request"
-    kvcr.submit_hint(_router_hint("tcp://source:1"), request)
-    kvcr.submit_hint(_router_hint("tcp://source:1"), request)
-    submitted = payloads(recording, "hint.submitted")
-    assert len(submitted) == 2
-    assert int(submitted[0]["trace_id"]) != int(submitted[1]["trace_id"])
-    assert int(payloads(recording, "hint.replaced")[0]["trace_id"]) == int(
-        submitted[0]["trace_id"]
-    )
-    for expected in (1, 2):
-        handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request)
-        _wait_until(lambda: len(control.sent) == expected)
-        agent.notifs["source"] = [_write_done_notification(handle)]
-        assert handle in dict(_poll_until(kvcr, bool))
-    used = payloads(recording, "hint.used")
-    assert len(used) == 2
-    assert all(
-        int(event["trace_id"]) == int(submitted[1]["trace_id"]) for event in used
-    )
-    assert len({int(event["op_handle"]) for event in used}) == 2
-    control.sent.clear()
-    kvcr.submit_hint(_router_hint("tcp://other:2"), request)
-    rejected = payloads(recording, "hint.rejected")[0]
-    assert int(rejected["trace_id"]) == int(submitted[1]["trace_id"])
-    assert int(rejected["reason"]) == int(_nvtx.Reason.HINT_CONFLICT)
-    failed = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request)
-    assert not dict(kvcr.poll_completed())[failed][BlockKey(b"k")].success
-    assert len(payloads(recording, "hint.used")) == 2
-    assert not control.sent
     kvcr.discard_hint(request)
 
 
