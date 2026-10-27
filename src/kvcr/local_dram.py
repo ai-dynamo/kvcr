@@ -78,13 +78,11 @@ class _LocalDramState(Enum):
 
 
 class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
-    """One block's local DRAM slots.
+    """Cycle-free per-block DRAM slots; skip cyclic GC to avoid full-GC stalls.
 
-    One exists per cached block, so the cyclic GC would scan every one on each
-    full pass. It is untracked (gc=False; it is never part of a reference cycle)
-    and keeps nothing tracked once its fill completes: slots, layout and pool
-    counts are tuples of atomics, pending_labels/writers are None, and refs holds
-    untracked _TransferRefs.
+    Reserved pieces become readable only after successful copies. Once all
+    pieces are readable, pending_labels is None; writers is also None when
+    no copies are in flight. refs caches committed physical-slot references.
     """
 
     slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
@@ -92,14 +90,11 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     claim_count: int = 0
     retire_on_release: bool = False
     key_layout: tuple[str, ...] | None = None
-    # Reserved pieces become readable only after a successful copy. None once
-    # every piece is readable; writers is None once no copy is in flight too.
     pending_labels: set[str] | None = None
     pending_deposits: int = 0
     writers: list[int] | None = None
     remote_indices: tuple[int, ...] | None = None
     remote_cancelled: bool = False
-    # Cached references name committed physical slots.
     refs: dict[int, _TransferRef] = msgspec.field(default_factory=dict)
     indices_by_label: dict[str, int | None] | None = None
     _layout: tuple[str, ...] | None = None
