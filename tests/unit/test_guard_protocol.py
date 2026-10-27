@@ -6,6 +6,7 @@ import mmap
 import os
 import select
 import socket
+from typing import Any
 from unittest.mock import MagicMock, Mock
 
 import msgspec
@@ -16,6 +17,7 @@ from kvcr import guard_protocol as protocol_module
 from kvcr.config import LocalDramOptions
 from kvcr.control_channels import (
     KVCRGuardProtocolError,
+    KVCRMsgFramingError,
     KVCRServiceError,
     KVCRSocketError,
 )
@@ -107,29 +109,43 @@ class _RecordingConnection:
         self,
         responses: list[object | BaseException],
         events: list[str] | None = None,
+        received_fd_count: int = 1,
     ) -> None:
         self.responses = responses
         self.events = events if events is not None else []
         self.sent: list[object] = []
         self.sent_fds: list[int] = []
         # A real descriptor, because the claim path closes what it is given.
-        self.received_fd: int | None = os.open(os.devnull, os.O_RDONLY)
-        self.handed_fd: int | None = None
+        self.received_fds = [
+            os.open(os.devnull, os.O_RDONLY) for _ in range(received_fd_count)
+        ]
+        self.handed_fds: list[int] = []
         self.closed = False
 
     def send(self, message: object) -> None:
         self.events.append("send")
         self.sent.append(message)
 
-    def send_with_fd(self, message: object, file_descriptor: int) -> None:
+    def send_with_fd(self, message: object, *file_descriptors: int) -> None:
         self.send(message)
-        self.sent_fds.append(file_descriptor)
+        self.sent_fds.extend(file_descriptors)
 
-    def receive_with_fd(self, decoder: object) -> tuple[object, int | None]:
-        # Handing it over transfers ownership, exactly as the real channel does.
+    def receive_with_fd(
+        self, decoder: object, expected_counts: Any
+    ) -> tuple[object, list[int]]:
         message = self.receive(decoder)
-        self.handed_fd, self.received_fd = self.received_fd, None
-        return message, self.handed_fd
+        if len(self.received_fds) not in expected_counts(message):
+            # Refused deliveries close what they received, as the real channel does.
+            self._close_received()
+            raise KVCRMsgFramingError("unexpected number of file descriptors")
+        # Handing them over transfers ownership, exactly as the real channel does.
+        self.handed_fds, self.received_fds = self.received_fds, []
+        return message, self.handed_fds
+
+    def _close_received(self) -> None:
+        for file_descriptor in self.received_fds:
+            os.close(file_descriptor)
+        self.received_fds = []
 
     def receive(self, _decoder: object) -> object:
         self.events.append("receive")
@@ -142,9 +158,7 @@ class _RecordingConnection:
         self.events.append("connection.close")
         self.closed = True
         # Whatever the claim never took off our hands, exactly like a real one.
-        if self.received_fd is not None:
-            os.close(self.received_fd)
-            self.received_fd = None
+        self._close_received()
 
 
 class _Attachment:
@@ -295,6 +309,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "control_port": 5555,
         "version": 1,
         "incarnation": hold._incarnation,
+        "attach_mode": "path",
     }
     grant_wire = msgspec.to_builtins(grant)
     assert grant_wire["dead_incarnations"] == ("dead-primary",)
@@ -310,7 +325,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     attach.assert_called_once_with(grant.spec)
     assert hold.local_dram == _local_dram()
     # The endpoint a Guard will answer on, handed over with the grant.
-    assert hold._control_listener_fd == connection.handed_fd
+    assert hold._control_listener_fd == connection.handed_fds[-1]
 
     hold.release()
 
@@ -485,3 +500,110 @@ def test_pool_hold_starts_heartbeat_only_when_granted(monkeypatch) -> None:
     thread.start.assert_not_called()
     KVCRPoolHold(**kwargs, _heartbeat_enabled=True)
     thread.start.assert_called_once_with()
+
+
+def _fd_claim(monkeypatch, response, fd_count):
+    """Claim in fd mode against a service that answers with `response`."""
+    connection = _RecordingConnection(
+        [response, _Released(1)], received_fd_count=fd_count
+    )
+    attach_fd = Mock(return_value=_Attachment())
+    attach = Mock(side_effect=AssertionError("fd mode must not attach by path"))
+    _connect_with(monkeypatch, connection)
+    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach_fd)
+    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
+    return connection, attach_fd
+
+
+def _fd_grant(**changes):
+    return msgspec.structs.replace(_grant(), attach_mode="fd", **changes)
+
+
+def test_fd_claim_round_trips_and_hands_both_descriptors_over(monkeypatch) -> None:
+    connection, attach_fd = _fd_claim(monkeypatch, _fd_grant(), fd_count=2)
+    pool_fd, listener_fd = connection.received_fds
+
+    hold = KVCRClient("/unused").claim(
+        _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555), attach_mode="fd"
+    )
+
+    assert connection.sent[0].attach_mode == "fd"
+    # The pool descriptor is the attachment's now; the listener stays the hold's.
+    attach_fd.assert_called_once_with(pool_fd, _grant().spec)
+    assert hold._control_listener_fd == listener_fd
+    hold.release()
+
+
+def test_each_response_states_the_descriptor_count_it_carries() -> None:
+    counts = protocol_module._response_fd_counts
+    assert counts(_Error("no", 1)) == (0,)
+    assert counts(_grant()) == (1,)
+    assert counts(_fd_grant()) == (2,)
+
+
+@pytest.mark.parametrize(
+    ("claim_mode", "grant", "fd_count", "error", "match"),
+    [
+        # A fd grant needs both descriptors.
+        ("fd", _fd_grant(), 0, KVCRMsgFramingError, "unexpected number"),
+        # A v1 service never heard of attach_mode: it echoes path with one fd.
+        ("fd", _grant(), 1, KVCRGuardProtocolError, "attach mode mismatch"),
+        # A fd grant answering a path claim.
+        ("path", _fd_grant(), 2, KVCRGuardProtocolError, "attach mode mismatch"),
+    ],
+)
+def test_a_grant_that_disagrees_with_the_claim_fails_closed(
+    monkeypatch, claim_mode, grant, fd_count, error, match
+) -> None:
+    connection, attach_fd = _fd_claim(monkeypatch, grant, fd_count)
+    received = list(connection.received_fds)
+
+    with pytest.raises(error, match=match):
+        KVCRClient("/unused").claim(
+            _GUARD_INDEX,
+            _POOL_LAYOUTS,
+            _DIGEST,
+            ("127.0.0.1", 5555),
+            attach_mode=claim_mode,
+        )
+
+    attach_fd.assert_not_called()
+    for file_descriptor in received:
+        with pytest.raises(OSError):
+            os.fstat(file_descriptor)
+
+
+def test_v1_messages_without_an_attach_mode_still_decode_as_path() -> None:
+    """A v1 peer omits the field; an unknown mode is refused, never guessed."""
+    claim = msgspec.to_builtins(
+        _Claim(
+            _GUARD_INDEX,
+            _DIGEST,
+            _TierConfig(_POOL_LAYOUTS, None),
+            "127.0.0.1",
+            5555,
+            1,
+        )
+    )
+    v1_claim = {k: v for k, v in claim.items() if k != "attach_mode"}
+    assert (
+        protocol_module._CLAIM_DECODER.decode(
+            msgspec.msgpack.encode(v1_claim)
+        ).attach_mode
+        == "path"
+    )
+
+    v1_grant = {
+        k: v for k, v in msgspec.to_builtins(_grant()).items() if k != "attach_mode"
+    }
+    assert (
+        protocol_module._CLAIM_RESPONSE_DECODER.decode(
+            msgspec.msgpack.encode(v1_grant)
+        ).attach_mode
+        == "path"
+    )
+
+    with pytest.raises(msgspec.ValidationError):
+        protocol_module._CLAIM_DECODER.decode(
+            msgspec.msgpack.encode({**claim, "attach_mode": "memfd"})
+        )

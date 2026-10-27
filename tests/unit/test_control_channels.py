@@ -121,33 +121,36 @@ def test_messages_keep_their_boundaries(pair: Pair) -> None:
     assert incoming.receive(_MESSAGE_DECODER) == _Message("ping")
 
 
-def test_a_frame_carries_at_most_one_descriptor(
+def test_a_frame_carries_the_descriptor_count_its_message_expects(
     pair: Pair,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A frame carries one cloexec fd; refused deliveries close every received fd."""
+    """Descriptors arrive cloexec, in order; an unexpected count is refused."""
     sender, receiver = pair
     receiver.settimeout(1)
     incoming = FramedConnection(receiver)
 
     # One descriptor accompanies its frame and arrives non-inheritable.
-    received_fd: int | None = None
-    with _pipe() as (read_fd, _write_fd):
+    received_fds: list[int] = []
+    with _pipe() as (read_fd, _write_fd), _pipe() as (other_fd, _other_peer):
         try:
             message = _Message("claim", {"guard_index": 3})
-            FramedConnection(sender).send_with_fd(message, read_fd)
+            FramedConnection(sender).send_with_fd(message, read_fd, other_fd)
 
-            received, received_fd = incoming.receive_with_fd(_MESSAGE_DECODER)
+            received, received_fds = incoming.receive_with_fd(
+                _MESSAGE_DECODER, lambda _m: (2,)
+            )
 
             assert received == message
-            assert received_fd is not None
-            assert os.get_inheritable(received_fd) is False
-            assert os.fstat(received_fd).st_ino == os.fstat(read_fd).st_ino
+            assert len(received_fds) == 2
+            assert all(os.get_inheritable(fd) is False for fd in received_fds)
+            assert os.fstat(received_fds[0]).st_ino == os.fstat(read_fd).st_ino
+            assert os.fstat(received_fds[1]).st_ino == os.fstat(other_fd).st_ino
         finally:
-            if received_fd is not None:
-                os.close(received_fd)
+            for fd in received_fds:
+                os.close(fd)
 
-    # More than one descriptor on a frame is refused, and every one is closed.
+    # A count the message did not expect is refused, and every one is closed.
     with _pipe() as (first, _first_peer), _pipe() as (second, _second_peer):
         payload = msgspec.msgpack.encode(_Message("claim"))
         frame = _FRAME_HEADER.pack(len(payload)) + payload
@@ -157,11 +160,19 @@ def test_a_frame_carries_at_most_one_descriptor(
         )
 
         with _recorded_closes(monkeypatch) as closed:
-            with pytest.raises(KVCRMsgFramingError, match="multiple"):
-                incoming.receive_with_fd(_MESSAGE_DECODER)
+            with pytest.raises(KVCRMsgFramingError, match="unexpected number"):
+                incoming.receive_with_fd(_MESSAGE_DECODER, lambda _m: (0, 1))
 
         assert len(closed) == 2
-        receiver.recv(len(payload))  # Drain the body of the refused frame.
+        # The body was consumed before the count was judged, so the stream is
+        # still on a frame boundary: the next frame reads cleanly.
+        FramedConnection(sender).send(_Message("ping"))
+        assert incoming.receive(_MESSAGE_DECODER) == _Message("ping")
+
+    # A frame with no descriptor is refused when one is expected.
+    FramedConnection(sender).send(_Message("claim"))
+    with pytest.raises(KVCRMsgFramingError, match="unexpected number"):
+        incoming.receive_with_fd(_MESSAGE_DECODER, lambda _m: (2,))
 
     # A frame header that stops early is a truncation; its descriptor is closed.
     with _pipe() as (late_fd, _late_peer):
@@ -173,7 +184,7 @@ def test_a_frame_carries_at_most_one_descriptor(
 
         with _recorded_closes(monkeypatch) as closed:
             with pytest.raises(KVCRMsgFramingError, match="truncated"):
-                incoming.receive_with_fd(_MESSAGE_DECODER)
+                incoming.receive_with_fd(_MESSAGE_DECODER, lambda _m: (1,))
 
         assert len(closed) == 1
 

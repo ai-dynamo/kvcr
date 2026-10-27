@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import msgspec
 
@@ -132,3 +132,6 @@ class KVCRGuardConfig(msgspec.Struct, frozen=True):
     kvcr_service_socket_path: str
     guard_index: int
     compatibility_digest: str
+    # "fd": receive the pool file from the service instead of opening its path,
+    # so the worker needs no pool-directory mount.
+    attach_mode: Literal["path", "fd"] = "path"

@@ -3,6 +3,7 @@
 
 import ctypes
 import errno
+import fcntl
 import mmap
 import os
 import stat
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
+from _kvcr_test_utils import manual_pool_spec
 
 from kvcr import memory as kvcr_memory
 from kvcr.memory import (
@@ -22,6 +24,7 @@ from kvcr.memory import (
     _compute_pool_geometry,
     _KVCRPoolOwner,
     _populate_pages,
+    _reclaim_pool_if_orphaned,
 )
 
 _TEST_GENERATION = "0123456789abcdef0123456789abcdef"
@@ -352,3 +355,107 @@ def test_a_snapshot_region_is_tail_only_and_a_failed_one_is_retired(
         assert ctypes.string_at(attachment.address + tail_offset, len(marker)) == marker
     finally:
         attachment.close()
+
+
+def _open_fresh(spec: KVCRPoolSpec) -> int:
+    """What the service sends a claimant: its own open-file-description."""
+    return os.open(spec.path, os.O_RDWR)
+
+
+def _lock_free(path: str) -> bool:
+    """Whether the pool's exclusive liveness probe succeeds, i.e. it is abandoned."""
+    probe = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    finally:
+        os.close(probe)
+    return True
+
+
+def test_attach_fd_maps_the_pool_without_its_path(
+    pool_owner: _KVCRPoolOwner,
+) -> None:
+    """The worker never needs spec.path: the pool stays reachable by descriptor."""
+    spec = pool_owner.spec
+    marker = b"seen through the descriptor"
+    with open(spec.path, "r+b") as pool_file:
+        pool_file.seek(spec.journal_bytes)
+        pool_file.write(marker)
+    file_descriptor = _open_fresh(spec)
+    # Stand in for a pool directory the worker cannot reach.
+    hidden = Path(spec.path).with_name("hidden")
+    os.rename(spec.path, hidden)
+    try:
+        with patch("kvcr.memory.os.open", side_effect=AssertionError("opened a path")):
+            attachment = KVCRPoolAttachment.attach_fd(file_descriptor, spec)
+        try:
+            assert ctypes.string_at(attachment.data_address, len(marker)) == marker
+        finally:
+            attachment.close()
+    finally:
+        os.rename(hidden, spec.path)
+
+
+def test_attach_fd_refuses_a_tampered_descriptor_and_closes_it(
+    pool_owner: _KVCRPoolOwner, tmp_path: Path
+) -> None:
+    """A descriptor for some other file fails the grant's identity check."""
+    spec = pool_owner.spec
+    impostor = tmp_path / "impostor"
+    impostor.write_bytes(bytes(spec.mapping_bytes))
+    impostor.chmod(0o600)
+    file_descriptor = os.open(impostor, os.O_RDWR)
+
+    with pytest.raises(ValueError, match="identity does not match"):
+        KVCRPoolAttachment.attach_fd(file_descriptor, spec)
+
+    with pytest.raises(OSError) as closed:
+        os.fstat(file_descriptor)
+    assert closed.value.errno == errno.EBADF
+
+
+def test_attach_fd_keeps_every_other_check(tmp_path: Path) -> None:
+    spec = manual_pool_spec(tmp_path)
+    os.chmod(spec.path, 0o644)
+    with pytest.raises(PermissionError, match="0600"):
+        KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
+    os.chmod(spec.path, 0o600)
+
+    holder = _open_fresh(spec)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(RuntimeError, match="exclusively locked"):
+            KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
+    finally:
+        os.close(holder)
+
+    bigger = msgspec.structs.replace(spec, mapping_bytes=spec.mapping_bytes * 2)
+    with pytest.raises(ValueError, match="smaller than the grant"):
+        KVCRPoolAttachment.attach_fd(_open_fresh(spec), bigger)
+
+
+def test_a_workers_lock_is_independent_of_the_guards(tmp_path: Path) -> None:
+    """Each holds its own open-file-description, so either can outlive the other."""
+    spec = manual_pool_spec(tmp_path)
+    path = Path(spec.path)
+    guard = KVCRPoolAttachment.attach(spec)
+    worker = KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
+
+    # Worker death releases its lock only; the Guard's still holds the pool.
+    worker.close()
+    assert not _lock_free(spec.path)
+    assert _reclaim_pool_if_orphaned(path) is False
+
+    # A worker that outlives the Guard keeps the pool from being reclaimed.
+    worker = KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
+    guard.close()
+    assert not _lock_free(spec.path)
+    assert _reclaim_pool_if_orphaned(path) is False
+    assert path.exists()
+
+    # With neither holding it the pool is orphaned.
+    worker.close()
+    assert _lock_free(spec.path)
+    assert _reclaim_pool_if_orphaned(path) is True

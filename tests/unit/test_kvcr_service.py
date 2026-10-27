@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import errno
+import fcntl
 import logging
 import os
 import select
@@ -17,11 +18,17 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
-from _kvcr_test_utils import _wait_until, free_port, listening_socket
+from _kvcr_test_utils import (
+    _wait_until,
+    free_port,
+    listening_socket,
+    manual_pool_spec,
+)
 
 from kvcr import KVCRClient, KVCRServiceError, guard_protocol
 from kvcr.config import G3Options
@@ -42,6 +49,7 @@ from kvcr.guard_protocol import (
 )
 from kvcr.kvcr_service import (
     _KVCRService,
+    _open_pool_fd,
     _parse_args,
     _PoolRegistry,
     _RequestHandler,
@@ -1126,14 +1134,15 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         def receive(self, _decoder: object):
             return self.messages.pop(0)
 
-        def receive_with_fd(self, _decoder: object):
-            return self.messages.pop(0), os.pidfd_open(os.getpid())
+        def receive_with_fd(self, _decoder: object, _expected_counts: object):
+            return self.messages.pop(0), [os.pidfd_open(os.getpid())]
 
         def send(self, response: object) -> None:
             self.sent.append(response)
 
-        def send_with_fd(self, response: object, listener_fd: int) -> None:
+        def send_with_fd(self, response: object, *descriptors: int) -> None:
             assert isinstance(response, _Granted)
+            (listener_fd,) = descriptors
             assert listener_fd >= 0
             self.granted_fd = listener_fd
             raise RuntimeError("grant could not be delivered")
@@ -1194,7 +1203,7 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     handler.request = Mock()
     handler.server = server
     handler.channel = Mock()
-    handler.channel.receive_with_fd.return_value = (_claim_request(), None)
+    handler.channel.receive_with_fd.return_value = (_claim_request(), [])
     handler.channel.receive.side_effect = [EOFError()]
     handler.channel.send_with_fd.side_effect = RuntimeError("undelivered")
     try:
@@ -1555,3 +1564,69 @@ def test_service_startup_timeout_defaults_to_sixty_seconds() -> None:
 def test_invalid_pool_size_items_are_rejected(value: str) -> None:
     with pytest.raises(SystemExit):
         _parse_args(_service_args(value))
+
+
+def test_fd_claim_maps_the_pool_without_opening_its_path(tmp_path: Path) -> None:
+    """Linux only: pidfd liveness. The worker gets the pool as a descriptor."""
+    with _running_server(tmp_path) as harness:
+        guard = harness.server._registry._guards[0]
+        with patch(
+            "kvcr.guard_protocol.KVCRPoolAttachment.attach",
+            side_effect=AssertionError("fd mode must not open the pool path"),
+        ):
+            hold = harness.client.claim(
+                0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0), attach_mode="fd"
+            )
+        try:
+            assert hold._attachment.address
+            assert hold._attachment._spec == guard._spec
+        finally:
+            hold.release()
+
+
+def test_each_grant_gets_a_fresh_open_file_description(tmp_path: Path) -> None:
+    """A dup would share the Guard's lock; a fresh description contends with it."""
+    spec = manual_pool_spec(tmp_path)
+    first, second = _open_pool_fd(spec), _open_pool_fd(spec)
+    try:
+        fcntl.flock(first, fcntl.LOCK_SH)
+        # On one shared description this would convert the lock and succeed.
+        with pytest.raises(OSError):
+            fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(first)
+        os.close(second)
+    tampered = msgspec.structs.replace(spec, inode=spec.inode + 1)
+    with pytest.raises(KVCRServiceError, match="does not match"):
+        _open_pool_fd(tampered)
+
+
+def test_a_pool_that_cannot_be_opened_is_reported_and_the_grant_aborted() -> None:
+    """Before anything is sent: the claimant gets an error, not a stalled grant."""
+    claimant, service_side = socket.socketpair()
+    listener_fd = os.dup(os.open(os.devnull, os.O_RDONLY))
+    lease = object()
+    server = Mock()
+    server.dispatch.return_value = (
+        SimpleNamespace(attach_mode="fd", spec=None),
+        (0, listener_fd, lease),
+    )
+    with claimant, service_side:
+        FramedConnection(claimant).send(
+            _Claim(0, _TEST_DIGEST, _TEST_TIER_CONFIG, "127.0.0.1", 5555, 1, "x", "fd")
+        )
+        with (
+            patch("kvcr.kvcr_service.PidfdLiveness"),
+            patch(
+                "kvcr.kvcr_service._open_pool_fd",
+                side_effect=OSError(errno.EMFILE, "too many open files"),
+            ),
+        ):
+            _RequestHandler(service_side, ("", 0), server)
+
+        response = FramedConnection(claimant).receive(_CLAIM_RESPONSE_DECODER)
+
+    assert isinstance(response, _Error)
+    server.registry.abort_grant.assert_called_once_with(0, lease)
+    with pytest.raises(OSError):
+        os.fstat(listener_fd)

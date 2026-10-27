@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 ProtocolVersion = Literal[1]
 _PROTOCOL_VERSION: ProtocolVersion = 1
 
+# How a claimant reaches the pool: "path" (default; all a v1 peer speaks) opens
+# spec.path, "fd" receives the pool file. Still version 1: each side checks the
+# echoed mode and fd count and fails closed on a mismatch.
+AttachMode = Literal["path", "fd"]
+
 # SO_PEERPIDFD requires Linux 6.5 or later.
 _SO_PEERPIDFD_FALLBACK = 77
 _SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", _SO_PEERPIDFD_FALLBACK)
@@ -95,6 +100,7 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim"):
     control_port: Annotated[int, msgspec.Meta(ge=1, le=65535)]
     version: ProtocolVersion
     incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+    attach_mode: AttachMode = "path"
 
     def __post_init__(self) -> None:
         # A literal address, because the service binds this holding the lock
@@ -128,6 +134,7 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     version: ProtocolVersion
     dead_incarnations: tuple[str, ...] = ()
     heartbeat_enabled: bool = False
+    attach_mode: AttachMode = "path"
 
 
 class _Released(msgspec.Struct, frozen=True, tag="released"):
@@ -137,6 +144,19 @@ class _Released(msgspec.Struct, frozen=True, tag="released"):
 class _Error(msgspec.Struct, frozen=True, tag="error"):
     message: str
     version: ProtocolVersion
+
+
+def _claim_fd_counts(_claim: _Claim) -> tuple[int, ...]:
+    # The worker's pidfd, when it has one to send.
+    return (0, 1)
+
+
+def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
+    """Descriptors a response must carry: an error none, a grant its mode's."""
+    if isinstance(response, _Error):
+        return (0,)
+    # Pool file (fd mode only), then the control listener.
+    return (2,) if response.attach_mode == "fd" else (1,)
 
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim)
@@ -305,6 +325,7 @@ class KVCRClient:
         control_bind: tuple[str, int],
         g3: G3Options | None = None,
         remote_fw_dram_backend: str = "UCX",
+        attach_mode: AttachMode = "path",
     ) -> KVCRPoolHold:
         """Claim and map one Guard-owned pool group."""
         g3_config = g3 and {
@@ -328,12 +349,14 @@ class KVCRClient:
                 "control_port": control_bind[1],
                 "version": _PROTOCOL_VERSION,
                 "incarnation": uuid.uuid4().hex,
+                "attach_mode": attach_mode,
             },
             type=_Claim,
         )
         connection = FramedConnection.connect(self._socket_path)
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
+        pool_fd: int | None = None
         grant_received = False
         try:
             try:
@@ -345,21 +368,23 @@ class KVCRClient:
                     connection.send_with_fd(request, worker_pidfd)
                 finally:
                     os.close(worker_pidfd)
-            response, listener_fd = connection.receive_with_fd(_CLAIM_RESPONSE_DECODER)
+            response, received_fds = connection.receive_with_fd(
+                _CLAIM_RESPONSE_DECODER, _response_fd_counts
+            )
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
+            *pool_fds, listener_fd = received_fds
+            pool_fd = pool_fds[0] if pool_fds else None
             grant_received = True
             spec, granted_pools = _grant_layout(
-                response, guard_index, request.tier_config
+                response, guard_index, request.tier_config, request.attach_mode
             )
-            if listener_fd is None:
-                # Every pool has a Guard, and a Guard answers on the endpoint
-                # this claimant named. A grant without it means the two sides
-                # disagree about who serves this pool group.
-                raise KVCRGuardProtocolError(
-                    "claim was granted without the endpoint it answers on"
-                )
-            attachment = KVCRPoolAttachment.attach(spec)
+            if pool_fd is None:
+                attachment = KVCRPoolAttachment.attach(spec)
+            else:
+                # Ownership passes to the attachment, which closes it on failure.
+                fd, pool_fd = pool_fd, None
+                attachment = KVCRPoolAttachment.attach_fd(fd, spec)
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
                     [
@@ -383,9 +408,10 @@ class KVCRClient:
         except BaseException as error:
             # Release the lease only after local access has stopped, or the
             # next claimant could map bytes this process can still reach.
-            if listener_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(listener_fd)
+            for leftover in (listener_fd, pool_fd):
+                if leftover is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(leftover)
             local_access_stopped = True
             if attachment is not None:
                 try:
@@ -409,8 +435,14 @@ def _grant_layout(
     response: _Granted,
     requested_guard_index: int,
     requested_tier_config: _TierConfig,
+    requested_attach_mode: AttachMode = "path",
 ) -> tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...]]:
     """Take the grant apart, refusing one that answers a different request."""
+    if response.attach_mode != requested_attach_mode:
+        raise KVCRGuardProtocolError(
+            "claim attach mode mismatch: "
+            f"requested {requested_attach_mode}, got {response.attach_mode}"
+        )
     if response.guard_index != requested_guard_index:
         raise KVCRGuardProtocolError(
             "claim Guard mismatch: "
