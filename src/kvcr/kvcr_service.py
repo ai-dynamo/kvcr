@@ -5,6 +5,7 @@
 import argparse
 import contextlib
 import functools
+import hashlib
 import logging
 import mmap
 import os
@@ -13,6 +14,7 @@ import signal
 import socket
 import socketserver
 import stat
+import struct
 import sys
 import threading
 import time
@@ -49,6 +51,7 @@ from .memory import (
     _KVCRPoolOwner,
     _pool_dir_guard,
     _reclaim_pool_if_orphaned,
+    _try_lock_adoption,
     _unlink_if_identity,
 )
 from .progress import _STARTUP_TIMEOUT_SECONDS
@@ -64,6 +67,23 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 # Matches names produced by memory._pool_filename: "kvcr-<pool_id>-<32 hex>".
 _ORPHANED_POOL_NAME = re.compile(rf"{re.escape(_POOL_PREFIX)}-.+-[0-9a-f]{{32}}")
 _GB = 1 << 30
+
+
+def _adoption_stamp(
+    compatibility_digest: str, pool_sizes_bytes: tuple[int, ...], journal_bytes: int
+) -> bytes:
+    """What a pool must have been built for to be adopted by this configuration."""
+    return hashlib.sha256(
+        b"kvcr-pool-adopt-v1\0"
+        + compatibility_digest.encode()
+        + b"\0"
+        + struct.pack(
+            f"<{len(pool_sizes_bytes) + 2}Q",
+            journal_bytes,
+            len(pool_sizes_bytes),
+            *pool_sizes_bytes,
+        )
+    ).digest()
 
 
 class _PoolRegistry:
@@ -82,6 +102,7 @@ class _PoolRegistry:
         compatibility_digest: str,
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
+        adopt_pools: bool = False,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -93,15 +114,47 @@ class _PoolRegistry:
         self.on_uncontained_failure = functools.partial(
             logger.critical, "Uncontained KVCR pool failure: %s"
         )
-        self._purge_orphaned_pools()
         mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
+        self._adoption_lock: int | None = None
+        stamp = None
+        adopted: dict[int, _KVCRPoolOwner] = {}
+        if adopt_pools:
+            stamp = _adoption_stamp(
+                compatibility_digest, pool_sizes_bytes, journal_bytes
+            )
+            adopted = self._adopt_pools(mapping_bytes, journal_bytes, stamp)
+            if self._adoption_lock is None:
+                stamp = None
+        try:
+            if adopt_pools and self._adoption_lock is None:
+                # The lock's holder may have adopted a pool its previous worker
+                # still maps; unlocked, that looks like an orphan to this purge.
+                logger.warning(
+                    "Leaving existing KVCR pool files in %s alone: adoption is "
+                    "held by another service",
+                    self._pool_dir,
+                )
+            else:
+                # By identity, not only by lock: a pool a previous worker still
+                # holds carries none of ours yet, and must survive its holder's exit.
+                self._purge_orphaned_pools(
+                    {
+                        (owner.spec.device, owner.spec.inode)
+                        for owner in adopted.values()
+                    }
+                )
+        except BaseException:
+            self._abandon_adoption(adopted)
+            raise
         for rank in range(guard_count):
             try:
-                owner = _KVCRPoolOwner.allocate(
+                owner = adopted.pop(rank, None) or _KVCRPoolOwner.allocate(
                     pool_id=f"pool_{rank}",
                     pool_size_bytes=mapping_bytes,
                     journal_bytes=journal_bytes,
                     pool_dir=self._pool_dir,
+                    stamp=stamp,
+                    keep=stamp is not None,
                 )
                 # Built with the group, not a claim: a Guard that cannot attach its
                 # allocation is better discovered at startup than when a worker dies.
@@ -128,7 +181,59 @@ class _PoolRegistry:
                 guard.start()
             except BaseException:
                 self._release_pools()
+                self._abandon_adoption(adopted)
                 raise
+
+    def _adopt_pools(
+        self, mapping_bytes: int, journal_bytes: int, stamp: bytes
+    ) -> "dict[int, _KVCRPoolOwner]":
+        """Take over each rank's pool from a previous run, where one is fit.
+
+        Under a lock held until close, so two services on one directory cannot
+        both adopt. Losing it is not an error: that service allocates and
+        unlinks as it always did.
+        """
+        try:
+            self._adoption_lock = _try_lock_adoption(self._pool_dir)
+        except OSError as error:
+            logger.warning(
+                "Cannot lock adoption in %s (%s); not adopting", self._pool_dir, error
+            )
+            return {}
+        if self._adoption_lock is None:
+            logger.warning(
+                "Another KVCR service holds the adoption lock in %s; not adopting",
+                self._pool_dir,
+            )
+            return {}
+        adopted: dict[int, _KVCRPoolOwner] = {}
+        try:
+            for rank in range(self._guard_count):
+                owner = _KVCRPoolOwner.adopt(
+                    pool_id=f"pool_{rank}",
+                    pool_size_bytes=mapping_bytes,
+                    journal_bytes=journal_bytes,
+                    pool_dir=self._pool_dir,
+                    stamp=stamp,
+                )
+                if owner is not None:
+                    adopted[rank] = owner
+        except BaseException:
+            self._abandon_adoption(adopted)
+            raise
+        return adopted
+
+    def _abandon_adoption(self, adopted: "dict[int, _KVCRPoolOwner]") -> None:
+        """Close adopted pools no Guard took; their files stay for a next start."""
+        for owner in adopted.values():
+            owner.close()
+        adopted.clear()
+        self._release_adoption_lock()
+
+    def _release_adoption_lock(self) -> None:
+        if self._adoption_lock is not None:
+            os.close(self._adoption_lock)
+            self._adoption_lock = None
 
     def _release_pools(self) -> None:
         """Give back every pool group built so far after a failed startup."""
@@ -149,8 +254,10 @@ class _PoolRegistry:
                 continue
             del self._guards[guard_index]
 
-    def _purge_orphaned_pools(self) -> None:
-        """Remove pool files no live daemon owns.
+    def _purge_orphaned_pools(
+        self, adopted: set[tuple[int, int]] = frozenset()
+    ) -> None:
+        """Remove pool files no live daemon owns, except those just adopted.
 
         Crash leftovers fill the fixed-size directory and fail the next eager
         allocation. Use is decided by the shared flock, never the filename.
@@ -161,7 +268,10 @@ class _PoolRegistry:
                 if not recognized or path.is_symlink():
                     continue
                 try:
-                    size = path.stat().st_size
+                    file_stat = path.stat()
+                    size = file_stat.st_size
+                    if (file_stat.st_dev, file_stat.st_ino) in adopted:
+                        continue
                     reclaimed = _reclaim_pool_if_orphaned(path)
                 except OSError:
                     logger.warning(
@@ -265,6 +375,8 @@ class _PoolRegistry:
                 kept.add(guard_index)
         for guard_index in [index for index in self._guards if index not in kept]:
             del self._guards[guard_index]
+        if not self._guards:
+            self._release_adoption_lock()
         if failure is not None:
             raise failure
         if wedged:
@@ -533,6 +645,7 @@ class _KVCRService:
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
+        adopt_pools: bool = False,
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -557,6 +670,7 @@ class _KVCRService:
             compatibility_digest,
             heartbeat_timeout_seconds,
             startup_timeout_seconds,
+            adopt_pools,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -707,6 +821,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Guard core preparation and startup budget (default: %(default)s s)",
     )
     parser.add_argument(
+        "--adopt-pools",
+        action="store_true",
+        help="keep pool files on exit and adopt a previous run's on start, cold "
+        "(default: unlink on exit, allocate fresh); never run adopting and "
+        "non-adopting services on one pool directory",
+    )
+    parser.add_argument(
         "--log-level",
         type=str.upper,
         choices=_LOG_LEVELS,
@@ -749,6 +870,7 @@ def main() -> None:
                 else None
             ),
             startup_timeout_seconds=args.startup_timeout_seconds,
+            adopt_pools=args.adopt_pools,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logger.info(

@@ -25,6 +25,7 @@ from kvcr.memory import (
     _KVCRPoolOwner,
     _populate_pages,
     _reclaim_pool_if_orphaned,
+    _try_lock_adoption,
 )
 
 _TEST_GENERATION = "0123456789abcdef0123456789abcdef"
@@ -459,3 +460,208 @@ def test_a_workers_lock_is_independent_of_the_guards(tmp_path: Path) -> None:
     worker.close()
     assert _lock_free(spec.path)
     assert _reclaim_pool_if_orphaned(path) is True
+
+
+_ADOPT_STAMP = bytes(range(32))
+_ADOPT_POOL_BYTES = 12288
+
+
+def _kept_pool(tmp_path: Path, stamp: bytes = _ADOPT_STAMP) -> _KVCRPoolOwner:
+    return _KVCRPoolOwner.allocate(
+        pool_id="pool_0",
+        pool_size_bytes=_ADOPT_POOL_BYTES,
+        journal_bytes=_TEST_JOURNAL_BYTES,
+        pool_dir=tmp_path,
+        stamp=stamp,
+        keep=True,
+    )
+
+
+def _adopt(tmp_path: Path, stamp: bytes = _ADOPT_STAMP) -> _KVCRPoolOwner | None:
+    return _KVCRPoolOwner.adopt(
+        pool_id="pool_0",
+        pool_size_bytes=_ADOPT_POOL_BYTES,
+        journal_bytes=_TEST_JOURNAL_BYTES,
+        pool_dir=tmp_path,
+        stamp=stamp,
+    )
+
+
+def test_a_kept_pool_is_adopted_with_its_bytes_and_identity(tmp_path: Path) -> None:
+    first = _kept_pool(tmp_path)
+    with open(first.spec.path, "r+b") as pool:
+        pool.seek(_TEST_JOURNAL_BYTES)
+        pool.write(b"cached")
+        # A handback region left past the pool is cut away: adoption is cold.
+        pool.truncate(_ADOPT_POOL_BYTES + 8192)
+    first.close()
+    assert Path(first.spec.path).exists()
+
+    second = _adopt(tmp_path)
+
+    assert second is not None
+    assert not second.held
+    assert second.spec == msgspec.structs.replace(first.spec, epoch=1)
+    assert [path.name for path in tmp_path.iterdir()] == [Path(first.spec.path).name]
+    with open(second.spec.path, "rb") as pool:
+        pool.seek(_TEST_JOURNAL_BYTES)
+        assert pool.read(6) == b"cached"
+    assert Path(second.spec.path).stat().st_size == _ADOPT_POOL_BYTES
+    # The adopter holds the pool shared, which is what keeps a purge off it.
+    assert not _reclaim_pool_if_orphaned(Path(second.spec.path))
+    second.close()
+    assert Path(second.spec.path).exists()
+
+
+def test_adoption_takes_the_newest_pool(tmp_path: Path) -> None:
+    older = _kept_pool(tmp_path)
+    older.close()
+    newer = _kept_pool(tmp_path)
+    newer.close()
+    os.utime(older.spec.path, ns=(1, 1))
+
+    adopted = _adopt(tmp_path)
+
+    assert adopted is not None
+    assert adopted.spec.generation == newer.spec.generation
+    adopted.close()
+
+
+def test_a_pool_without_a_keep_is_unlinked_and_nothing_is_adopted(
+    tmp_path: Path,
+) -> None:
+    owner = _KVCRPoolOwner.allocate(
+        pool_id="pool_0",
+        pool_size_bytes=_ADOPT_POOL_BYTES,
+        journal_bytes=_TEST_JOURNAL_BYTES,
+        pool_dir=tmp_path,
+        stamp=_ADOPT_STAMP,
+    )
+    owner.close()
+
+    assert _adopt(tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def _smaller(path: Path) -> None:
+    os.truncate(path, _ADOPT_POOL_BYTES - 4096)
+
+
+def _torn_stamp(path: Path) -> None:
+    with open(path, "r+b") as pool:
+        pool.seek(256)
+        pool.write(_ADOPT_STAMP[:16] + bytes(16))
+
+
+def _wrong_mode(path: Path) -> None:
+    path.chmod(0o644)
+
+
+def _symlink(path: Path) -> None:
+    target = path.with_name("elsewhere")
+    path.rename(target)
+    path.symlink_to(target)
+
+
+def _directory(path: Path) -> None:
+    path.unlink()
+    path.mkdir()
+
+
+@pytest.mark.parametrize(
+    "damage", [_smaller, _torn_stamp, _wrong_mode, _symlink, _directory]
+)
+def test_a_pool_that_is_not_what_was_built_is_refused(
+    tmp_path: Path, damage, caplog: pytest.LogCaptureFixture
+) -> None:
+    kept = _kept_pool(tmp_path)
+    kept.close()
+    damage(Path(kept.spec.path))
+
+    assert _adopt(tmp_path) is None
+    assert "Refusing to adopt KVCR pool" in caplog.text
+    # Refused, not repaired: the file is left for the purge.
+    assert os.path.lexists(kept.spec.path)
+
+
+def test_a_pool_built_for_other_terms_is_refused(tmp_path: Path) -> None:
+    kept = _kept_pool(tmp_path)
+    kept.close()
+
+    assert _adopt(tmp_path, stamp=bytes(32)) is None
+
+
+def test_adoption_is_held_by_one_service_at_a_time(tmp_path: Path) -> None:
+    first = _try_lock_adoption(tmp_path)
+    assert first is not None
+    assert _try_lock_adoption(tmp_path) is None
+    os.close(first)
+    second = _try_lock_adoption(tmp_path)
+    assert second is not None
+    os.close(second)
+
+
+def test_a_pool_a_previous_worker_holds_is_adopted_held_until_it_lets_go(
+    tmp_path: Path,
+) -> None:
+    kept = _kept_pool(tmp_path)
+    kept.close()
+    # A worker of the previous service: its own open file description.
+    worker = os.open(kept.spec.path, os.O_RDWR)
+    fcntl.flock(worker, fcntl.LOCK_SH)
+    os.truncate(kept.spec.path, _ADOPT_POOL_BYTES + 8192)
+
+    adopted = _adopt(tmp_path)
+
+    assert adopted is not None
+    assert adopted.held
+    assert not adopted.try_unhold()
+    # Nothing of ours is held yet, and the worker's pool is left as it was.
+    assert Path(adopted.spec.path).stat().st_size == _ADOPT_POOL_BYTES + 8192
+    os.close(worker)
+    assert adopted.try_unhold()
+    assert not adopted.held
+    assert Path(adopted.spec.path).stat().st_size == _ADOPT_POOL_BYTES
+    assert not _reclaim_pool_if_orphaned(Path(adopted.spec.path))
+    adopted.close()
+
+
+@pytest.fixture
+def _madv_dontfork(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Absent on macOS; the attach path only needs the call to succeed.
+    monkeypatch.setattr(mmap, "MADV_DONTFORK", mmap.MADV_NORMAL, raising=False)
+
+
+def _attach(spec: KVCRPoolSpec) -> KVCRPoolAttachment:
+    return KVCRPoolAttachment.attach_fd(os.open(spec.path, os.O_RDWR), spec)
+
+
+@pytest.mark.usefixtures("_madv_dontfork")
+def test_a_grant_from_before_an_adoption_cannot_attach_after_it(
+    tmp_path: Path,
+) -> None:
+    first = _kept_pool(tmp_path)
+    old_grant = first.spec
+    assert old_grant.epoch == 0
+    first.close()
+
+    adopted = _adopt(tmp_path)
+
+    assert adopted is not None
+    assert adopted.spec.epoch == 1
+    with pytest.raises(ValueError, match="adopted since this grant"):
+        _attach(old_grant)
+    _attach(adopted.spec).close()
+    adopted.close()
+
+
+@pytest.mark.usefixtures("_madv_dontfork")
+def test_a_fresh_pool_and_a_spec_without_an_epoch_are_epoch_zero(
+    pool_owner: _KVCRPoolOwner,
+) -> None:
+    assert pool_owner.spec.epoch == 0
+    wire = msgspec.json.decode(msgspec.json.encode(pool_owner.spec))
+    del wire["epoch"]
+    legacy = msgspec.convert(wire, KVCRPoolSpec)
+    assert legacy.epoch == 0
+    _attach(legacy).close()

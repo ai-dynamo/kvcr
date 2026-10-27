@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 # TODO: Wake the mirror on publication rather than polling. A standby still
 # drains at roughly a fifth of the rate a primary can publish.
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
+# How often an adopted pool a previous worker still holds is probed.
+_HELD_PROBE_SECONDS = 0.25
 _RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
@@ -393,6 +395,8 @@ class _Guard:
         # Owned here, not by the registry: one thread owns one pool group, so a
         # claim needs no lock -- the mailbox is the reservation.
         self._owner = owner
+        # Guarded by _phase_lock; cleared by the actor once the previous worker is gone.
+        self._held = owner is not None and owner.held
         self._refusing = refusing
         self._pool_lease = _PoolLease(guard_index)
         self._dead_incarnations: set[str] = set()
@@ -452,7 +456,10 @@ class _Guard:
         self._started = True
         # Attaching is not thread-affine; done here so a failure surfaces
         # directly, with nothing to tear down.
-        self._recovery.prepare()
+        # A held pool is attached once its previous worker is gone: attaching
+        # now would take a shared lock that blocks our own takeover probe.
+        if not self._held:
+            self._recovery.prepare()
         self._thread.start()
 
     def claim(
@@ -558,6 +565,11 @@ class _Guard:
                 raise KVCRServiceError("KVCR pool registry is closed")
             if self._failure is not None:
                 raise self._failure
+            if self._held:
+                raise KVCRServiceError(
+                    f"KVCR Guard {self._guard_index}: pool still attached by a "
+                    "previous worker"
+                )
             if self._reserved is not None:
                 raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             if self._phase is _Phase.PRIMARY:
@@ -629,8 +641,11 @@ class _Guard:
                         or bool(self._orphans)
                     )
                     timeout = _POLL_SECONDS if busy and not self._failure else None
+                    if timeout is None and self._held and not self._failure:
+                        timeout = _HELD_PROBE_SECONDS
                     command = self._commands.get(timeout=timeout)
             except queue.Empty:
+                self._probe_hold()
                 self._observe_holder()
                 draining = self._poll()
                 continue
@@ -677,6 +692,27 @@ class _Guard:
                 time.monotonic_ns(),
                 time.thread_time_ns(),
             )
+
+    def _probe_hold(self) -> None:
+        """Open an adopted pool to claims once its previous worker has let go."""
+        if not self._held or self._failure is not None:
+            return
+        try:
+            released = self._owner.try_unhold()
+            if released:
+                self._recovery.prepare()
+        except BaseException as error:  # noqa: BLE001 - the Guard cannot serve
+            logger.error(
+                "KVCR Guard %d cannot take over its adopted pool: %s",
+                self._guard_index,
+                error,
+            )
+            self._record_background_failure(error)
+            return
+        if released:
+            with self._phase_lock:
+                self._held = False
+            logger.info("KVCR Guard %d pool is now claimable", self._guard_index)
 
     def _observe_holder(self) -> None:
         """Notice the current primary dying. Polled between commands on the
