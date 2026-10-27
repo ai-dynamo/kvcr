@@ -120,6 +120,17 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
                 assert ctypes.string_at(data_address, len(data_marker)) == data_marker
             finally:
                 attachment.close()
+            # A descriptor from the service maps the same bytes without the path.
+            fd = os.open(path, os.O_RDWR)
+            with patch("kvcr.service.memory.os.open", side_effect=AssertionError):
+                fd_attachment = KVCRPoolAttachment.attach_fd(fd, spec)
+            try:
+                address = fd_attachment.address
+                assert ctypes.string_at(address, len(journal_marker)) == journal_marker
+            finally:
+                fd_attachment.close()
+            with pytest.raises(OSError):
+                os.fstat(fd)
             # Detaching unmaps but never unlinks the server-owned file.
             assert path.exists()
             with pytest.raises(RuntimeError, match="closed"):
@@ -198,8 +209,10 @@ def test_pool_spec_rejects_a_corrupted_grant(
         ),
     ],
 )
+@pytest.mark.parametrize("by_descriptor", [False, True], ids=["path", "descriptor"])
 def test_attachment_refuses_a_tampered_pool_without_mapping_it(
     pool_owner: _KVCRPoolOwner,
+    by_descriptor: bool,
     tamper: str,
     error: type[Exception],
     match: str,
@@ -222,13 +235,21 @@ def test_attachment_refuses_a_tampered_pool_without_mapping_it(
         assert replacement_stat.st_ino != spec.inode
         assert replacement_stat.st_size == original_stat.st_size
         assert stat.S_IMODE(replacement_stat.st_mode) == 0o600
+    fd = os.open(path, os.O_RDWR) if by_descriptor else None
     with (
         patch("mmap.mmap") as map_file,
         pytest.raises(error, match=match),
     ):
-        KVCRPoolAttachment.attach(spec)
+        if fd is None:
+            KVCRPoolAttachment.attach(spec)
+        else:
+            KVCRPoolAttachment.attach_fd(fd, spec)
     map_file.assert_not_called()
     assert path.exists()
+    if fd is not None:
+        # attach_fd owns the descriptor, so a refusal closes it.
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 @pytest.mark.parametrize(

@@ -82,7 +82,16 @@ class KVCRPoolAttachment:
     def attach(
         cls, spec: KVCRPoolSpec, *, collapse: bool = False
     ) -> "KVCRPoolAttachment":
-        file_descriptor = os.open(spec.path, _OPEN_FLAGS)
+        return cls.attach_fd(os.open(spec.path, _OPEN_FLAGS), spec, collapse=collapse)
+
+    @classmethod
+    def attach_fd(
+        cls, file_descriptor: int, spec: KVCRPoolSpec, *, collapse: bool = False
+    ) -> "KVCRPoolAttachment":
+        """Map a pool from a descriptor the service opened; spec.path is never used.
+
+        Takes ownership of the descriptor, closing it on failure.
+        """
         mapping: memmap.PoolMapping | None = None
         try:
             # Held for the mapping's lifetime: a worker can outlive its

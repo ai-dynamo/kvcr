@@ -139,6 +139,15 @@ class _Error(msgspec.Struct, frozen=True, tag="error"):
     version: ProtocolVersion
 
 
+def _claim_fd_counts(_claim: _Claim) -> tuple[int, ...]:
+    return (0, 1)  # the worker's pidfd, when it has one
+
+
+def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
+    """An error carries none; a grant the pool, then the control listener."""
+    return (0,) if isinstance(response, _Error) else (2,)
+
+
 _CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim)
 _HOLD_DECODER = msgspec.msgpack.Decoder(_Heartbeat | _Release)
 _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
@@ -334,6 +343,7 @@ class KVCRClient:
         connection = FramedConnection.connect(self._socket_path)
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
+        pool_fd: int | None = None
         grant_received = False
         try:
             try:
@@ -345,21 +355,18 @@ class KVCRClient:
                     connection.send_with_fd(request, worker_pidfd)
                 finally:
                     os.close(worker_pidfd)
-            response, listener_fd = connection.receive_with_fd(_CLAIM_RESPONSE_DECODER)
+            response, received_fds = connection.receive_with_fd(
+                _CLAIM_RESPONSE_DECODER, _response_fd_counts
+            )
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
+            pool_fd, listener_fd = received_fds
             grant_received = True
             spec, granted_pools = _grant_layout(
                 response, guard_index, request.tier_config
             )
-            if listener_fd is None:
-                # Every pool has a Guard, and a Guard answers on the endpoint
-                # this claimant named. A grant without it means the two sides
-                # disagree about who serves this pool group.
-                raise KVCRGuardProtocolError(
-                    "claim was granted without the endpoint it answers on"
-                )
-            attachment = KVCRPoolAttachment.attach(spec)
+            fd, pool_fd = pool_fd, None
+            attachment = KVCRPoolAttachment.attach_fd(fd, spec)
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
                     [
@@ -383,9 +390,10 @@ class KVCRClient:
         except BaseException as error:
             # Release the lease only after local access has stopped, or the
             # next claimant could map bytes this process can still reach.
-            if listener_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(listener_fd)
+            for leftover in (listener_fd, pool_fd):
+                if leftover is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(leftover)
             local_access_stopped = True
             if attachment is not None:
                 try:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import errno
+import fcntl
 import logging
 import os
 import select
@@ -17,6 +18,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
@@ -44,6 +46,7 @@ from kvcr.service.protocol import (
 )
 from kvcr.service.server import (
     _KVCRService,
+    _open_pool_fd,
     _parse_args,
     _PoolRegistry,
     _RequestHandler,
@@ -273,9 +276,14 @@ def test_client_claims_with_worker_pidfd_when_peer_option_is_unavailable(
     # An unknown option makes the host behave like Linux 5.15 for this claim.
     monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
     with _running_server(tmp_path) as harness:
-        hold = harness.client.claim(
-            0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
-        )
+        # The worker gets the pool as a descriptor, never by opening its path.
+        with patch(
+            "kvcr.service.protocol.KVCRPoolAttachment.attach",
+            side_effect=AssertionError("a worker must not open the pool path"),
+        ):
+            hold = harness.client.claim(
+                0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+            )
         assert harness.server._registry._guards[0]._pool_lease.current is not None
         hold.release()
 
@@ -1131,16 +1139,19 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         def receive(self, _decoder: object):
             return self.messages.pop(0)
 
-        def receive_with_fd(self, _decoder: object):
-            return self.messages.pop(0), os.pidfd_open(os.getpid())
+        def receive_with_fd(self, _decoder: object, _expected_counts: object):
+            return self.messages.pop(0), [os.pidfd_open(os.getpid())]
 
         def send(self, response: object) -> None:
             self.sent.append(response)
 
-        def send_with_fd(self, response: object, listener_fd: int) -> None:
+        def send_with_fd(
+            self, response: object, pool_fd: int, listener_fd: int
+        ) -> None:
             assert isinstance(response, _Granted)
+            assert pool_fd >= 0
             assert listener_fd >= 0
-            self.granted_fd = listener_fd
+            self.pool_fd, self.granted_fd = pool_fd, listener_fd
             raise RuntimeError("grant could not be delivered")
 
     class _Server:
@@ -1164,6 +1175,7 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         # The duplicated endpoint went back whatever the send did: one fd per
         # grant would otherwise leak until claims fail with EMFILE.
         os_close.assert_any_call(handler.channel.granted_fd)
+        os_close.assert_any_call(handler.channel.pool_fd)
         assert handler.channel.sent == [_Released(1)]
         # Routed as a retraction, not an ordinary release: the Guard is the
         # one that knows whether this grant stood a serving Guard down.
@@ -1199,7 +1211,7 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     handler.request = Mock()
     handler.server = server
     handler.channel = Mock()
-    handler.channel.receive_with_fd.return_value = (_claim_request(), None)
+    handler.channel.receive_with_fd.return_value = (_claim_request(), [])
     handler.channel.receive.side_effect = [EOFError()]
     handler.channel.send_with_fd.side_effect = RuntimeError("undelivered")
     try:
@@ -1560,3 +1572,75 @@ def test_service_startup_timeout_defaults_to_sixty_seconds() -> None:
 def test_invalid_pool_size_items_are_rejected(value: str) -> None:
     with pytest.raises(SystemExit):
         _parse_args(_service_args(value))
+
+
+def _manual_pool_spec(directory: Path, size: int = 12288, journal: int = 8192):
+    """A pool file made by hand, so no owner's own flock hides who holds it."""
+    from kvcr.service.memory import KVCRPoolSpec, _pool_filename
+
+    generation = "0123456789abcdef0123456789abcdef"
+    path = directory / _pool_filename("engine", generation)
+    path.write_bytes(bytes(size))
+    path.chmod(0o600)
+    file_stat = path.stat()
+    return KVCRPoolSpec(
+        pool_id="engine",
+        path=str(path),
+        generation=generation,
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        mapping_bytes=size,
+        journal_bytes=journal,
+    )
+
+
+def test_each_grant_gets_a_fresh_open_file_description(tmp_path: Path) -> None:
+    """A dup would share the Guard's lock; a fresh description contends with it."""
+    spec = _manual_pool_spec(tmp_path)
+    first, second = _open_pool_fd(spec), _open_pool_fd(spec)
+    try:
+        fcntl.flock(first, fcntl.LOCK_SH)
+        # On one shared description this would convert the lock and succeed.
+        with pytest.raises(OSError):
+            fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(first)
+        os.close(second)
+    tampered = msgspec.structs.replace(spec, inode=spec.inode + 1)
+    with pytest.raises(KVCRServiceError, match="does not match"):
+        _open_pool_fd(tampered)
+
+
+def test_a_pool_that_cannot_be_opened_is_reported_and_the_grant_aborted(
+    tmp_path: Path,
+) -> None:
+    """Before anything is sent: the claimant gets an error, not a stalled grant."""
+    claimant, service_side = socket.socketpair()
+    listener_fd = os.open(os.devnull, os.O_RDONLY)
+    lease = object()
+    server = Mock()
+    server.dispatch.return_value = (
+        # A real spec: a patch that does not take effect then opens the pool and
+        # grants it, instead of failing on a missing path inside the same handler.
+        SimpleNamespace(spec=_manual_pool_spec(tmp_path)),
+        (0, listener_fd, lease),
+    )
+    with claimant, service_side:
+        FramedConnection(claimant).send(
+            _Claim(0, _TEST_DIGEST, _TEST_TIER_CONFIG, "127.0.0.1", 5555, 1, "x")
+        )
+        with (
+            patch("kvcr.service.server.PidfdLiveness"),
+            patch(
+                "kvcr.service.server._open_pool_fd",
+                side_effect=OSError(errno.EMFILE, "too many open files"),
+            ),
+        ):
+            _RequestHandler(service_side, ("", 0), server)
+
+        response = FramedConnection(claimant).receive(_CLAIM_RESPONSE_DECODER)
+
+    assert isinstance(response, _Error)
+    server.registry.abort_grant.assert_called_once_with(0, lease)
+    with pytest.raises(OSError):
+        os.fstat(listener_fd)

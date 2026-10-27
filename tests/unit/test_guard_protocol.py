@@ -6,6 +6,7 @@ import mmap
 import os
 import select
 import socket
+from typing import Any
 from unittest.mock import MagicMock, Mock
 
 import msgspec
@@ -112,24 +113,31 @@ class _RecordingConnection:
         self.events = events if events is not None else []
         self.sent: list[object] = []
         self.sent_fds: list[int] = []
-        # A real descriptor, because the claim path closes what it is given.
-        self.received_fd: int | None = os.open(os.devnull, os.O_RDONLY)
-        self.handed_fd: int | None = None
+        # Real descriptors (pool, then listener), because the claim closes them.
+        self.received_fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2)]
+        self.handed_fds: list[int] = []
         self.closed = False
 
     def send(self, message: object) -> None:
         self.events.append("send")
         self.sent.append(message)
 
-    def send_with_fd(self, message: object, file_descriptor: int) -> None:
+    def send_with_fd(self, message: object, *file_descriptors: int) -> None:
         self.send(message)
-        self.sent_fds.append(file_descriptor)
+        self.sent_fds.extend(file_descriptors)
 
-    def receive_with_fd(self, decoder: object) -> tuple[object, int | None]:
-        # Handing it over transfers ownership, exactly as the real channel does.
+    def receive_with_fd(
+        self, decoder: object, expected_counts: Any
+    ) -> tuple[object, list[int]]:
         message = self.receive(decoder)
-        self.handed_fd, self.received_fd = self.received_fd, None
-        return message, self.handed_fd
+        # Handing them over transfers ownership, exactly as the real channel does.
+        self.handed_fds, self.received_fds = self.received_fds, []
+        return message, self.handed_fds
+
+    def _close_received(self) -> None:
+        for file_descriptor in self.received_fds:
+            os.close(file_descriptor)
+        self.received_fds = []
 
     def receive(self, _decoder: object) -> object:
         self.events.append("receive")
@@ -142,9 +150,7 @@ class _RecordingConnection:
         self.events.append("connection.close")
         self.closed = True
         # Whatever the claim never took off our hands, exactly like a real one.
-        if self.received_fd is not None:
-            os.close(self.received_fd)
-            self.received_fd = None
+        self._close_received()
 
 
 class _Attachment:
@@ -285,7 +291,9 @@ def test_g3_claim_normalizes_equivalent_backend_defaults(
     )
     _connect_with(monkeypatch, connection)
     monkeypatch.setattr(
-        protocol_module.KVCRPoolAttachment, "attach", Mock(return_value=_Attachment())
+        protocol_module.KVCRPoolAttachment,
+        "attach_fd",
+        Mock(return_value=_Attachment()),
     )
     hold = KVCRClient("/unused").claim(
         _GUARD_INDEX, layouts, _DIGEST, ("127.0.0.1", 5555), g3=g3
@@ -310,7 +318,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     attachment = _Attachment(events)
     attach = Mock(return_value=attachment)
     _connect_with(monkeypatch, connection)
-    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
+    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach)
 
     hold = KVCRClient("/unused").claim(
         _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
@@ -343,10 +351,11 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "remote_fw_dram_backend": "UCX",
     }
     assert grant_wire["pools"] == msgspec.to_builtins(_WIRE_POOLS)
-    attach.assert_called_once_with(grant.spec)
+    pool_fd = connection.handed_fds[0]
+    attach.assert_called_once_with(pool_fd, grant.spec)
     assert hold.local_dram == _local_dram()
     # The endpoint a Guard will answer on, handed over with the grant.
-    assert hold._control_listener_fd == connection.handed_fd
+    assert hold._control_listener_fd == connection.handed_fds[-1]
 
     hold.release()
 
@@ -422,7 +431,7 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     connection = _RecordingConnection([reply, rollback_reply])
     attach = Mock(side_effect=mapping_error)
     _connect_with(monkeypatch, connection)
-    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
+    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach)
 
     original = mapping_error or (reply if isinstance(reply, BaseException) else None)
     with pytest.raises(
