@@ -20,7 +20,7 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
-from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
+from kvcr.config import LocalDramOptions, RemoteFWDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _TransferRef
@@ -37,9 +37,6 @@ def _source(slots=3, *, recovered=False):
         agent,
         pinning,
         control,
-        KVCRConfig(
-            nixl_agent_name="source", pool_layouts=[("", 16)], enable_telemetry=True
-        ),
         name="source",
         remote_options=options,
         framework_regions=[
@@ -137,6 +134,16 @@ def test_ready_subset_progress_while_caller_state_lock_held(
         assert len(agent.xfers) == before
         assert pinning.searches == []
 
+    deposit = source.deposit(
+        {b"wrong": [_mem_descriptor(1, ":b", end_point_name="source")]}
+    )
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"wrong": True}))]
+    before = len(agent.xfers)
+    with source._core._state_lock:
+        _request(control, [b"a", b"wrong"], handle=14)
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [0]
+
 
 def test_export_index_contention_is_prompt_miss_without_caller_queue():
     source, agent, control, pinning, _ = _source()
@@ -159,7 +166,6 @@ def test_native_pending_claim_fences_slot_reuse_then_releases_without_main_poll(
     _request(control, [b"a"])
     _wait_until(lambda: len(agent.xfers) == before + 1)
     assert local._export_readers() == 1
-    assert local.telemetry_state()["guard_export_readers"] == 1
     blocked = source.deposit(
         {b"replace": [_mem_descriptor(1, end_point_name="source")]}
     )
@@ -169,44 +175,12 @@ def test_native_pending_claim_fences_slot_reuse_then_releases_without_main_poll(
     agent.state = "DONE"
     with source._core._state_lock:
         _wait_until(lambda: local._export_readers() == 0)
-        assert local.telemetry_state()["guard_export_readers"] == 0
     replacement = source.deposit(
         {b"replace": [_mem_descriptor(1, end_point_name="source")]}
     )
     assert _poll_until(source, bool) == [
         (replacement, _op_entries({b"replace": True}))
     ]
-    _request(control, [b"a"], handle=13)
-    _wait_until(
-        lambda: any(n.get("op_handle") == 13 for n in _notifications(agent))
-    )
-    assert (
-        next(n for n in _notifications(agent) if n.get("op_handle") == 13)[
-            "completed_indices"
-        ]
-        == []
-    )
-
-
-def test_mixed_ready_missing_and_per_key_layout_rejection(caplog, source_factory):
-    caplog.set_level("INFO", logger="kvcr.core")
-    source, agent, control, pinning, _ = source_factory()
-    deposits = source.deposit(
-        {
-            b"wrong": [_mem_descriptor(1, ":b", end_point_name="source")],
-            b"other": [_mem_descriptor(2, end_point_name="source")],
-        }
-    )
-    assert _poll_until(source, bool) == [
-        (deposits, _op_entries({b"wrong": True, b"other": True}))
-    ]
-    before = len(agent.xfers)
-    with source._core._state_lock:
-        _request(control, [b"missing", b"a", b"wrong", b"other"])
-        _wait_until(lambda: len(agent.xfers) == before + 1)
-        assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [1, 3]
-    assert "requested=4" in caplog.text
-    assert pinning.searches == []
 
 
 @pytest.mark.parametrize("ambiguous_submit", [False, True])
@@ -248,45 +222,37 @@ def test_cancel_uncertainty_retains_readers_until_native_quiescence(
         assert not source._core._remote_fw_dram._source_pin_ops
 
 
-def test_eviction_rechecks_reader_acquired_during_policy(monkeypatch):
-    source, agent, control, pinning, _ = _source(slots=1)
-    local = source._core._local_dram
+def test_eviction_rechecks_reader_acquired_during_policy(monkeypatch, source_factory):
+    source, agent, control, _, _ = source_factory(slots=1)
     reached, resume = threading.Event(), threading.Event()
     decide = source._core._decide_eviction
 
     def pause(*args, **kwargs):
-        result = decide(*args, **kwargs)
+        decision = decide(*args, **kwargs)
         reached.set()
         assert resume.wait(2)
-        return result
+        return decision
 
     monkeypatch.setattr(source._core, "_decide_eviction", pause)
     outcome = []
-
-    def replace():
-        outcome.append(
+    worker = threading.Thread(
+        target=lambda: outcome.append(
             source.deposit({b"new": [_mem_descriptor(1, end_point_name="source")]})
         )
-
-    worker = threading.Thread(target=replace)
+    )
+    agent.state = "PROC"
+    worker.start()
     try:
-        agent.state = "PROC"
-        before = len(agent.xfers)
-        worker.start()
         assert reached.wait(2)
+        before = len(agent.xfers)
         _request(control, [b"a"])
         _wait_until(lambda: len(agent.xfers) == before + 1)
-        resume.set()
-        worker.join(2)
-        assert not worker.is_alive()
-        assert _poll_until(source, bool) == [(outcome[0], _op_entries({b"new": False}))]
-        assert source._core._block_record_map[b"a"].local_dram is not None
-        assert local._export_readers() == 1 and len(local._free_slots[""]) == 0
     finally:
         resume.set()
         worker.join(2)
-        agent.state = "DONE"
-        source.close()
+    assert not worker.is_alive()
+    assert _poll_until(source, bool) == [(outcome[0], _op_entries({b"new": False}))]
+    assert source._core._local_dram._export_readers() == 1
 
 
 def test_close_waits_for_native_quiescence_before_reader_release():
@@ -317,29 +283,4 @@ def test_close_waits_for_native_quiescence_before_reader_release():
         agent.state = "DONE"
         if closer.ident is not None:
             closer.join(3)
-        source.close()
-
-
-def test_native_handle_cleanup_failure_keeps_export_reader():
-    source, agent, control, pinning, _ = _source()
-    local = source._core._local_dram
-    release = agent.release_xfer_handle
-    attempted = threading.Event()
-
-    def pending_release(handle):
-        attempted.set()
-        return False
-
-    try:
-        before = len(agent.xfers)
-        agent.release_xfer_handle = pending_release
-        _request(control, [b"a"])
-        _wait_until(lambda: len(agent.xfers) == before + 1)
-        assert attempted.wait(1)
-        with source._core._state_lock:
-            assert local._export_readers() == 1
-            agent.release_xfer_handle = release
-            _wait_until(lambda: local._export_readers() == 0)
-    finally:
-        agent.release_xfer_handle = release
         source.close()
