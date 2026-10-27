@@ -4,7 +4,7 @@
 import ctypes
 import logging
 import os
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from _kvcr_test_utils import (
@@ -38,7 +38,7 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
-from kvcr.local_disk import _G3Residency
+from kvcr.local_disk import _G3, _G3Residency
 from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
 from kvcr.recovery_journal import install_recovery_records
@@ -437,17 +437,19 @@ def _metric_totals(stats):
 @pytest.mark.parametrize(
     ("settings", "expected"),
     [
-        ({}, {"use_uring": "true"}),
+        ({}, {"use_aio": "true"}),
         ({"backend": "GDS_MT"}, {}),
         ({"backend_options": {"use_aio": "true"}}, {"use_aio": "true"}),
+        ({"backend_options": {"use_uring": "true"}}, {"use_uring": "true"}),
         ({"backend_options": {"use_uring": "false"}}, {"use_uring": "false"}),
         (
             {"backend_options": {"kernel_queue_size": "32"}},
-            {"use_uring": "true", "kernel_queue_size": "32"},
+            {"use_aio": "true", "kernel_queue_size": "32"},
         ),
     ],
 )
-def test_g3_backend_defaults_and_overrides(tmp_path, settings, expected):
+@pytest.mark.parametrize("existing", [False, True])
+def test_g3_backend_defaults_and_overrides(tmp_path, settings, expected, existing):
     original = dict(settings.get("backend_options", {}))
     config = G3Options(
         paths=(tmp_path / "g3.data",),
@@ -455,7 +457,28 @@ def test_g3_backend_defaults_and_overrides(tmp_path, settings, expected):
         **settings,
     )
     assert config.backend == settings.get("backend", "POSIX")
-    assert dict(config.backend_options) == expected
+    assert dict(config.backend_options) == original
+    agent = Mock(
+        backends={config.backend: expected} if existing else {},
+        get_plugin_list=Mock(return_value=[config.backend]),
+        get_backend_params=Mock(return_value=expected),
+    )
+    g3 = _G3(Mock(), config, os.sysconf("SC_PAGE_SIZE"))
+    try:
+        g3.initialize_progress(Mock(nixl_agent=agent))
+        if existing:
+            agent.create_backend.assert_not_called()
+        else:
+            agent.create_backend.assert_called_once_with(config.backend, expected)
+        g3.close_progress()
+        if existing and expected:
+            agent.get_backend_params.return_value = {}
+            with pytest.raises(ValueError, match="incompatible options"):
+                g3.initialize_progress(Mock(nixl_agent=agent))
+        assert dict(config.backend_options) == original
+    finally:
+        g3.close_progress()
+        g3.close_main()
     assert settings.get("backend_options", {}) == original
 
 
@@ -774,7 +797,7 @@ def test_g3_recovery_accepts_multi_block_local_residency(tmp_path, slots) -> Non
     key = BlockKey(b"multi")
     install_recovery_records(kvcr._core, {key: _recovered_record(g2=slots)})
     assert kvcr.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
-    assert kvcr._core._block_record_map[key].local_dram.slots == slots
+    assert kvcr._core._block_record_map[key].local_dram.slots == tuple(slots)
 
 
 def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:

@@ -42,6 +42,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_g3_backend_options(config: G3Options) -> dict[str, str]:
+    options = dict(config.backend_options)
+    if config.backend == "POSIX" and not any(
+        name in options for name in ("use_uring", "use_aio", "use_posix_aio")
+    ):
+        options["use_aio"] = "true"
+    return options
+
+
 @dataclass(slots=True)
 class _G3Residency:
     layout: tuple[str, ...]
@@ -290,7 +299,7 @@ class _G3:
         backend = self._config.backend
         if backend not in agent.get_plugin_list():
             raise RuntimeError(f"NIXL {backend} plugin is not available")
-        configured = dict(self._config.backend_options)
+        configured = _normalize_g3_backend_options(self._config)
         if backend not in getattr(agent, "backends", {}):
             agent.create_backend(backend, configured)
         elif configured and any(
