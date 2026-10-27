@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX remote-delivery tracing
 
-Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The examples use synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics, the [capture walkthrough](nvtx-walkthrough.md) for two-worker captures and overhead comparisons, and the [producer map](nvtx-context.md) for the inspected Dynamo/vLLM identity inputs.
+Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The example uses synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and the [producer map](nvtx-context.md) for the inspected Dynamo/vLLM identity inputs.
 
 ## Enable tracing
 
@@ -26,6 +26,18 @@ uv sync --extra profiling
 Without the optional dependencies, tracing is a no-op. An explicit request for tracing with an unavailable backend warns once. An unsupported level warns once and disables tracing. There is no `high` level in this checkpoint.
 
 Tracing is independent of KVCR telemetry and is not gated on profiler attachment. Consequently, low/medium payload construction also costs work outside a profiler. Use `off` as the baseline when measuring overhead. Annotation failures are kept out of KVCR's result and resource-ownership paths.
+
+## Capture an application run
+
+Launch the application that already uses KVCR under Nsight Systems, replacing `python app.py` below with its normal command:
+
+```bash
+KVCR_NVTX_LEVEL=low nsys profile \
+  --trace=nvtx,cuda --sample=none --cpuctxsw=none \
+  --output=/tmp/kvcr-application python app.py
+```
+
+Set the level before constructing KVCR in each worker. Capture independently launched workers separately, using distinct report names. Open the `.nsys-rep` in Nsight Systems and follow the `KVCR` ranges using the [event reference](nvtx-events.md). Request/session propagation depends on the application's integration; the [producer map](nvtx-context.md) records the inspected input seams and gaps.
 
 ## Capture a real pin and transfer
 

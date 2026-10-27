@@ -24,8 +24,6 @@ The inspected CPU metric `vllm:kv_offload_cpu_cache_usage_perc` is `(allocated_c
 
 Dynamo's inspected hint producer writes `sampling_params.extra_args['kv_transfer_params']['kv_hint']`; the inspected vLLM KVCR adapter reads `ReqContext.kv_hints`. Those fields remain separate on the examined request path. KVCR's hint parser retains source endpoint and block hashes. A compatible carrier must be verified before claiming Dynamo remote reuse. These missing integration seams are outside the instrumentation PRs, which preserve the public API and wire contract.
 
-The [two-process example](nvtx-walkthrough.md) proves the supplied request-to-hint and worker joins, not Dynamo propagation of these inputs.
-
 ## Immutable source references
 
 - [Dynamo hint producer, def3b79](https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/components/src/dynamo/vllm/kv_hints.py#L34-L52).
