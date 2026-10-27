@@ -37,6 +37,7 @@ def _get(server, path):
         ["--health-port", "0"],
         ["--health-timeout-seconds", "nan"],
         ["--health-dependency-url", "http://127.0.0.1:9091/live"],
+        ["--health-port", "9092", "--health-dependency-url", "http://["],
     ],
 )
 def test_invalid_health_options_fail_before_allocation(options):

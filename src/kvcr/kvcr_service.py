@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import FrameType
 from typing import Any
+from urllib.parse import urlsplit
 
 from .control_channels import (
     FramedConnection,
@@ -731,13 +732,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--health-port must be between 1 and 65535")
     if not 1 < args.health_timeout_seconds < float("inf"):
         parser.error("--health-timeout-seconds must be finite and greater than 1")
-    if args.health_dependency_url is not None and (
-        args.health_port is None
-        or not args.health_dependency_url.startswith(("http://", "https://"))
-    ):
-        parser.error(
-            "--health-dependency-url requires --health-port and an HTTP(S) URL"
-        )
+    if args.health_dependency_url is not None:
+        try:
+            dependency = urlsplit(args.health_dependency_url)
+            valid_dependency = (
+                dependency.scheme in ("http", "https")
+                and bool(dependency.hostname)
+                and (dependency.port is None or dependency.port > 0)
+            )
+        except ValueError:
+            valid_dependency = False
+        if args.health_port is None or not valid_dependency:
+            parser.error(
+                "--health-dependency-url requires --health-port and a valid HTTP(S) URL"
+            )
     if args.heartbeat_timeout_ms is not None and not (
         _MIN_HEARTBEAT_TIMEOUT_SECONDS * 1000
         <= args.heartbeat_timeout_ms
