@@ -31,7 +31,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.config import KVCRConfig, LocalDramOptions
+from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _STOP, _TransferRef
@@ -87,6 +87,53 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
             "source_control_endpoint": "tcp://source:1",
         }
     )
+
+
+@pytest.mark.parametrize("with_callbacks", [False, True])
+@pytest.mark.parametrize(
+    "keys,completed_indices",
+    [([b"local"], [0]), ([b"missing", b"local"], [1]), ([b"missing"], [])],
+)
+def test_framework_pinning_disabled(keys, completed_indices, with_callbacks):
+    callback = Mock(return_value=())
+    pin = callback if with_callbacks else None
+    pinning = SimpleNamespace(
+        request_pin=pin, poll_pin_results=pin, release_pin=pin, cancel_pin_request=pin
+    )
+    memory = ctypes.create_string_buffer(b"a" * 16, 16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        remote_options=RemoteFWDramOptions(framework_pinning=False),
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+    )
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+        assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+        request = msgspec.msgpack.decode(_start_write_message(12, b"local"))
+        request.update(
+            keys=keys,
+            dst_descriptors=[[_TransferRef("target", i)] for i in range(len(keys))],
+        )
+        control.incoming.append(msgspec.msgpack.encode(request))
+        _poll_until(source, lambda _: len(agent.xfers) == 2 or bool(agent.sent_notifs))
+        notification = (
+            agent.xfers[-1][5] if completed_indices else agent.sent_notifs[0][1]
+        )
+        assert _decode_notif(notification) == {
+            "type": "write_done",
+            "op_handle": 12,
+            "success": True,
+            "completed_indices": completed_indices,
+        }
+    finally:
+        source.close()
+    callback.assert_not_called()
 
 
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])

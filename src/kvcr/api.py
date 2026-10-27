@@ -57,10 +57,12 @@ _NONQUIESCENT_STARTUP_RESOURCES: list[tuple[_KVCRCore, KVCRPoolHold | None]] = [
 class KVCRBindings(msgspec.Struct, frozen=True):
     """Framework services and integration callbacks used by KVCR."""
 
-    # Framework-owned source pinning.
-    request_pin: Callable[[Collection[BlockKey]], PinRequestId]
-    poll_pin_results: Callable[[], Iterable[tuple[PinRequestId, PinResult]]]
-    release_pin: Callable[[PinHandle], bool]
+    # Required when RemoteFWDramOptions.framework_pinning is enabled.
+    request_pin: Callable[[Collection[BlockKey]], PinRequestId] | None = None
+    poll_pin_results: Callable[[], Iterable[tuple[PinRequestId, PinResult]]] | None = (
+        None
+    )
+    release_pin: Callable[[PinHandle], bool] | None = None
     cancel_pin_request: Callable[[PinRequestId], None] | None = None
 
     # Control, key translation, and inventory reporting.

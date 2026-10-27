@@ -153,6 +153,15 @@ class _RemoteFWDram:
             raise ValueError("metadata_retry_interval_ms must be positive")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
+        if options.framework_pinning and (
+            kvcr._request_pin_callback is None
+            or kvcr._poll_pin_results_callback is None
+            or kvcr._release_pin_callback is None
+        ):
+            raise ValueError(
+                "framework_pinning requires request_pin, poll_pin_results, "
+                "and release_pin"
+            )
         self._kvcr = kvcr
         self._options = options
         self._key_adapter = key_adapter
@@ -1145,6 +1154,8 @@ class _RemoteFWDram:
     # Shared framework-pin coordination.
 
     def _poll_framework_pin_results(self) -> Iterator[tuple[PinRequestId, PinResult]]:
+        if not self._options.framework_pinning:
+            return
         try:
             yield from self._kvcr._poll_pin_results_callback()
         except Exception:
@@ -1540,6 +1551,8 @@ class _RemoteFWDram:
         | _PendingFrameworkSources
         | None
     ):
+        if not self._options.framework_pinning:
+            return None
         kvcr = self._kvcr
         started_at = kvcr._timer()
         keys_to_pin: list[BlockKey] = []

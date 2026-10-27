@@ -1057,9 +1057,6 @@ class _Guard:
     def _prepare_core(self) -> None:
         """Register the Guard's pool without accepting control traffic."""
 
-        def reject_pin(keys: object) -> int:
-            raise RuntimeError("Guard has no framework-owned memory")
-
         dram = LocalDramOptions(
             [
                 (
@@ -1079,17 +1076,13 @@ class _Guard:
                 nixl_listen_port=0,
                 startup_timeout_seconds=self._startup_timeout,
             ),
-            KVCRBindings(
-                reject_pin,
-                lambda: (),
-                lambda _handle: False,
-                framework_control=self._control,
-            ),
+            KVCRBindings(framework_control=self._control),
             KVCRBackendConfigs(
                 local_dram=dram,
                 g3=None,
                 remote_fw_dram=RemoteFWDramOptions(
-                    backend=self._configured.remote_fw_dram_backend
+                    backend=self._configured.remote_fw_dram_backend,
+                    framework_pinning=False,
                 ),
             ),
         )

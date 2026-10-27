@@ -55,6 +55,18 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
     return hold
 
 
+@pytest.mark.parametrize("missing", ["request_pin", "poll_pin_results", "release_pin"])
+def test_framework_pinning_requires_callbacks(missing):
+    callbacks = dict(request_pin=Mock(), poll_pin_results=Mock(), release_pin=Mock())
+    callbacks[missing] = None
+    with pytest.raises(ValueError, match="framework_pinning requires"):
+        KVCR(
+            KVCRConfig("source", [("", 16)]),
+            KVCRBindings(**callbacks),
+            KVCRBackendConfigs(),
+        )
+
+
 @pytest.mark.parametrize("budget", [0, True, 1.5])
 def test_invalid_startup_budget_is_rejected(budget):
     with pytest.raises(ValueError, match="startup_timeout_seconds"):
