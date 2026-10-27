@@ -868,20 +868,29 @@ class _RemoteFWDram:
         kvcr = self._kvcr
         if kvcr._local_dram is None:
             return False
+        ordered_keys = source_pin.ordered_keys
+        dst_descriptors = source_pin.dst_descriptors
         layouts = [
             [descriptor.label for descriptor in destination]
-            for destination in source_pin.dst_descriptors
+            for destination in dst_descriptors
         ]
         if not kvcr._state_lock.acquire(blocking=False):
             # Use the caller queue on contention; add a progress-side
             # second attempt if contention makes this fallback too frequent.
             return False
         selected = []
+        missing = False
         try:
-            for key, layout in zip(source_pin.ordered_keys, layouts):
+            for key, layout in zip(ordered_keys, layouts):
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
-                if residency is None or residency.state is not _LocalDramState.READY:
+                if residency is None:
+                    if self._options.framework_pinning:
+                        return False
+                    selected.append(None)
+                    missing = True
+                    continue
+                if residency.state is not _LocalDramState.READY:
                     return False
                 if (
                     source_pin.key_layout
@@ -892,17 +901,27 @@ class _RemoteFWDram:
                 if indices is None:
                     return False
                 selected.append(indices)
+            if missing:
+                completed_indices = tuple(
+                    i for i, indices in enumerate(selected) if indices is not None
+                )
+                ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
+                dst_descriptors = tuple(dst_descriptors[i] for i in completed_indices)
+                selected = [selected[i] for i in completed_indices]
+                source_pin.keys = frozenset(ordered_keys)
             sources = kvcr._claim_local_dram_sources(
-                source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
+                source_pin.op_id, ordered_keys, notify_capacity=False
             )
             source_refs = tuple(
                 kvcr._local_dram.source_refs(sources[key], indices)
-                for key, indices in zip(source_pin.ordered_keys, selected)
+                for key, indices in zip(ordered_keys, selected)
             )
             kvcr._add_block_dependencies(source_pin, new_operation=True)
         finally:
             kvcr._state_lock.release()
         # Claims keep the sources stable while the write is assembled unlocked.
+        if not missing:
+            completed_indices = tuple(range(len(ordered_keys)))
         source_write = _SourceWriteOp(
             state=_SourceWriteState.READY_TO_WRITE,
             op_id=source_pin.op_id,
@@ -911,10 +930,10 @@ class _RemoteFWDram:
             deadline=source_pin.deadline,
             remote_agent=source_pin.remote_agent,
             op_handle=source_pin.op_handle,
-            source_keys=source_pin.ordered_keys,
+            source_keys=ordered_keys,
             src_descriptors=source_refs,
-            dst_descriptors=source_pin.dst_descriptors,
-            completed_indices=tuple(range(len(source_pin.ordered_keys))),
+            dst_descriptors=dst_descriptors,
+            completed_indices=completed_indices,
             route=source_pin.route,
             nvtx_state=source_pin.nvtx_state,
             _backend=self,

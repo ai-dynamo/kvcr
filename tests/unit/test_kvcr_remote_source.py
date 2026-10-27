@@ -92,7 +92,7 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 @pytest.mark.parametrize("with_callbacks", [False, True])
 @pytest.mark.parametrize(
     "keys,completed_indices",
-    [([b"local"], [0]), ([b"missing", b"local"], [1]), ([b"missing"], [])],
+    [([b"local"], [0]), ([b"missing", b"local", b"absent"], [1]), ([b"missing"], [])],
 )
 def test_framework_pinning_disabled(keys, completed_indices, with_callbacks):
     callback = Mock(return_value=())
@@ -121,7 +121,8 @@ def test_framework_pinning_disabled(keys, completed_indices, with_callbacks):
             dst_descriptors=[[_TransferRef("target", i)] for i in range(len(keys))],
         )
         control.incoming.append(msgspec.msgpack.encode(request))
-        _poll_until(source, lambda _: len(agent.xfers) == 2 or bool(agent.sent_notifs))
+        # Source preparation must not need a caller-side poll, even on misses.
+        _wait_until(lambda: len(agent.xfers) == 2 or bool(agent.sent_notifs))
         notification = (
             agent.xfers[-1][5] if completed_indices else agent.sent_notifs[0][1]
         )
@@ -131,6 +132,9 @@ def test_framework_pinning_disabled(keys, completed_indices, with_callbacks):
             "success": True,
             "completed_indices": completed_indices,
         }
+        if completed_indices:
+            assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
     finally:
         source.close()
     callback.assert_not_called()
@@ -287,11 +291,12 @@ def test_local_source_starts_inline_and_holds_its_slot(
 
 
 @pytest.mark.parametrize(
-    "first_piece_ready,mixed", [(False, False), (True, False), (True, True)]
+    "first_piece_ready,mixed,framework_pinning",
+    [(False, False, False), (True, False, False), (True, True, True)],
 )
 @pytest.mark.parametrize("timeout", [False, True])
 def test_local_source_waits_for_declared_pieces(
-    first_piece_ready, timeout, mixed, caplog, request
+    first_piece_ready, timeout, mixed, framework_pinning, caplog, request
 ) -> None:
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     local = ctypes.create_string_buffer(32)
@@ -302,6 +307,7 @@ def test_local_source_waits_for_declared_pieces(
         pinning,
         control,
         name="source",
+        remote_options=RemoteFWDramOptions(framework_pinning=framework_pinning),
         framework_regions=[
             _buffer_region(primary, 16),
             _buffer_region(primary, 16, ":*"),
