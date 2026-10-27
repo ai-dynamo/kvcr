@@ -28,6 +28,49 @@ from kvcr.types import BlockKey, RegionDescriptor
 
 
 @pytest.mark.parametrize(
+    "factory,range_name",
+    [("lifecycle", None), ("operation", None), ("operation", "target.remote")],
+)
+def test_trace_factory_failure_preserves_transfer(
+    recording, monkeypatch, factory, range_name
+):
+    kvcr, agent, control = make_target()
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="request")
+    [submitted] = payloads(recording, "hint.submitted")
+    tracer = kvcr._core._nvtx
+    original = getattr(tracer, factory)
+    monkeypatch.setattr(
+        tracer,
+        factory,
+        lambda *args, **kwargs: (
+            None
+            if kwargs.get("range_name") == range_name
+            else original(*args, **kwargs)
+        ),
+    )
+    if factory == "lifecycle":
+        kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="request")
+        [replaced] = payloads(recording, "hint.replaced")
+        assert int(replaced["trace_id"]) == int(submitted["trace_id"])
+        assert len(payloads(recording, "hint.submitted")) == 1
+    handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request_id="request")
+    caller_traced = bool(kvcr._core._nvtx_operations)
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [_write_done_notification(handle)]
+    [(completed_handle, result)] = _poll_until(kvcr, bool)
+    assert completed_handle == handle
+    assert result[BlockKey(b"k")].success
+    assert caller_traced == (range_name == "target.remote")
+    assert [int(event["trace_id"]) for event in payloads(recording, "hint.used")] == (
+        [] if factory == "lifecycle" else [int(submitted["trace_id"])]
+    )
+    assert not list(kvcr.poll_completed())
+    assert not kvcr._core._nvtx_operations
+    assert not recording.ranges
+    assert not recording.stack
+
+
+@pytest.mark.parametrize(
     "local_fill,results,prior,reason",
     [
         (True, (True,), _nvtx.Reason.UNKNOWN, _nvtx.Reason.DEADLINE),

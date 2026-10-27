@@ -210,17 +210,15 @@ class _RemoteFWDram:
                         reason=_nvtx.Reason.HINT_CONFLICT,
                     )
                 return
-            trace = (
-                self._nvtx.lifecycle(
+            trace = None
+            if self._nvtx is not None:
+                trace = self._nvtx.lifecycle(
                     request_id=request_id, requested_blocks=len(block_hashes)
                 )
-                if self._nvtx is not None
-                else None
-            )
-            if previous is not None and previous.trace is not None:
-                previous.trace.mark("hint.replaced", once=True)
-            if trace is not None:
-                trace.mark("hint.submitted")
+                if previous is not None and previous.trace is not None:
+                    previous.trace.mark("hint.replaced", once=True)
+                if trace is not None:
+                    trace.mark("hint.submitted")
             self._request_hints[request_id] = _RequestHint(
                 source=src,
                 block_hashes=block_hashes,
@@ -299,7 +297,9 @@ class _RemoteFWDram:
                 if local_fill
                 else ()
             ),
-            trace=self._nvtx.operation(
+        )
+        if self._nvtx is not None:
+            op.trace = self._nvtx.operation(
                 kvcr,
                 op_handle,
                 blocks,
@@ -310,13 +310,10 @@ class _RemoteFWDram:
                 else 0,
                 range_name="target.remote",
             )
-            if self._nvtx is not None
-            else None,
-        )
-        if current_hint.trace is not None:
-            current_hint.trace.mark("hint.used", op_handle=op_handle)
-        if op.trace is not None:
-            op.trace.mark("target.queued")
+            if current_hint.trace is not None:
+                current_hint.trace.mark("hint.used", op_handle=op_handle)
+            if op.trace is not None:
+                op.trace.mark("target.queued")
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "

@@ -581,14 +581,13 @@ class _KVCRCore:
             key: self._normalize_descriptors(descriptors)
             for key, descriptors in blocks.items()
         }
-        trace = (
-            self._nvtx.operation(self, op_handle, normalized, request_id)
-            if self._nvtx is not None
-            else None
-        )
-        if trace is not None:
-            self._nvtx_operations[op_handle] = trace
-        pushed = trace.push("op.deliver") if trace is not None else False
+        trace = None
+        pushed = False
+        if self._nvtx is not None:
+            trace = self._nvtx.operation(self, op_handle, normalized, request_id)
+            if trace is not None:
+                self._nvtx_operations[op_handle] = trace
+                pushed = trace.push("op.deliver")
         try:
             with self._state_lock:
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
