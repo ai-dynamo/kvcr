@@ -76,7 +76,7 @@ def _two_pool_kvcr(
     return _new_kvcr(
         agent,
         FakePrimaryPinning(),
-        FakeBytesControl(),
+        None,
         config,
         local_dram=LocalDramOptions(
             [

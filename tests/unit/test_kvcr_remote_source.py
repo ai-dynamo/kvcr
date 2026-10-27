@@ -212,7 +212,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
                 )
             )
         assert source.poll_completed() == []
-        assert make_ref.call_count == 2
+        make_ref.assert_not_called()
         assert pinning.searches == []
         admitted = source.deposit({replacement: descriptors})
         assert _poll_until(source, bool) == [

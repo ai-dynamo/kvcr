@@ -83,8 +83,8 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
 
     Reserved pieces become readable only after successful copies. Once all
     pieces are readable, pending_labels is None; writers is also None when
-    no copies are in flight. refs starts sparse and becomes an ordered tuple
-    on the first full-layout read.
+    no copies are in flight. refs stays sparse until a full-layout read or
+    preparation for remote serving.
     """
 
     slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
@@ -559,6 +559,8 @@ class _LocalDram:
             # Byte counts depend on the receiving core's pool geometry.
             residency._cached_size = None
             residency.prepare_label_index()
+            if self._kvcr.framework_control is not None:
+                self._source_refs(residency, None)
         self._free_slots = {
             pool_name: deque(
                 slot
@@ -1147,6 +1149,8 @@ class _LocalDram:
                     if newly_ready:
                         residency.state = _LocalDramState.READY
                         residency.prepare_label_index()
+                        if not pending and self._kvcr.framework_control is not None:
+                            self._source_refs(residency, None)
                 residency.settle()
             if newly_ready:
                 record.last_access = now
