@@ -111,6 +111,9 @@ def capture_events():
     encoded = "capture-α-😀-0".encode()
     digest = blake2b(encoded, digest_size=16).digest()
     common = dict(
+        schema_version=3,
+        request_display_known=1,
+        selected_bytes=-1,
         instance_hi=1,
         instance_lo=2,
         trace_id=3,
@@ -158,16 +161,66 @@ def capture_events():
             dict(hint, name="hint.used", start=20),
         ]
     )
-    events.append(
+    result = next(e for e in events if e["name"] == "op.completion_returned")
+    branch = next(e for e in events if e["name"] == "target.queued")
+    source = dict(
+        result,
+        instance_hi=11,
+        instance_lo=12,
+        trace_id=30,
+        source_op_id=2,
+        request_known=0,
+        request_display_known=0,
+        thread=2 << 24,
+    )
+    pin = dict(source, trace_id=50, pin_id=50)
+    events.extend(
+        [
+            dict(source, name="source.write.completed", start=35),
+            dict(pin, name="source.pin.waiter", start=31),
+            dict(pin, name="source.pin.completed", start=32),
+        ]
+    )
+    for name, reference, start, end, end_thread in (
+        ("op.deliver.lifecycle", result, 25, 65, result["thread"]),
+        ("target.remote", branch, 28, 45, branch["thread"] + 1),
+        ("source.write", source, 33, 36, source["thread"]),
+        ("source.pin.wait", pin, 29, 33, pin["thread"]),
+    ):
+        events.append(
+            dict(
+                reference,
+                name=name,
+                start=start,
+                end=end,
+                end_thread=end_thread,
+                event_type=60,
+                range_id=0,
+            )
+        )
+    contexts = {}
+    mark = dict(end=None, end_thread=None, event_type=34, range_id=None)
+    for event in events:
+        for field, value in mark.items():
+            event.setdefault(field, value)
+        contexts.setdefault(
+            (event["instance_hi"], event["instance_lo"], event["trace_id"]), event
+        )
+    events.extend(
         dict(
-            common,
-            name="request.context",
+            context,
             value_utf8=list(encoded),
             length=len(encoded),
             truncated=0,
+            name="source.pin.context"
+            if context["trace_id"] == 50
+            else "request.context",
+            start=0,
+            **mark,
         )
+        for context in contexts.values()
     )
-    return events
+    return reconstruct_context(events)
 
 
 @pytest.mark.parametrize(
@@ -211,10 +264,17 @@ def test_decoder_rejects_broken_hint_association(damage):
         validate(events, "failure", 1)
 
 
-def test_decoder_rejects_incomplete_legacy_hint_identity():
+@pytest.mark.parametrize("schema", [None, 1, 2, 4])
+def test_decoder_rejects_unsupported_schema(schema):
     events = capture_events()
     for event in events:
-        event["schema_version"] = 2
+        event["schema_version"] = schema
+    with pytest.raises(AssertionError, match="unsupported payload schema"):
+        reconstruct_context(events)
+
+
+def test_decoder_rejects_incomplete_hint_identity():
+    events = capture_events()
     submitted = next(event for event in events if event["name"] == "hint.submitted")
     malformed = dict(submitted, instance_hi=999, instance_lo=999)
     del malformed["trace_id"]
@@ -237,81 +297,18 @@ def test_decoder_accepts_associated_unicode_context(replacement):
     validate(events, "failure", 1)
 
 
-def compact_failed_events():
-    events = [e for e in capture_events() if e["name"] != "request.context"]
-    result = next(e for e in events if e["name"] == "op.completion_returned")
-    branch = next(e for e in events if e["name"] == "target.queued")
-    source = dict(
-        result,
-        instance_hi=11,
-        instance_lo=12,
-        trace_id=30,
-        source_op_id=2,
-        request_known=0,
-        thread=2 << 24,
-    )
-    pin = dict(source, trace_id=50, pin_id=50)
-    events.extend(
-        [
-            dict(source, name="source.write.completed", start=35),
-            dict(pin, name="source.pin.waiter", start=31),
-            dict(pin, name="source.pin.completed", start=32),
-        ]
-    )
-    for name, reference, start, end, end_thread in (
-        ("op.deliver.lifecycle", result, 25, 65, result["thread"]),
-        ("target.remote", branch, 28, 45, branch["thread"] + 1),
-        ("source.write", source, 33, 36, source["thread"]),
-        ("source.pin.wait", pin, 29, 33, pin["thread"]),
-    ):
-        events.append(
-            dict(
-                reference,
-                name=name,
-                start=start,
-                end=end,
-                end_thread=end_thread,
-                event_type=60,
-                range_id=0,
-            )
-        )
-    contexts = {}
-    mark = dict(end=None, end_thread=None, event_type=34, range_id=None)
-    for event in events:
-        event.update(schema_version=3, request_display_known=0)
-        for field, value in mark.items():
-            event.setdefault(field, value)
-        contexts.setdefault(
-            (event["instance_hi"], event["instance_lo"], event["trace_id"]), event
-        )
-    events.extend(
-        dict(
-            context,
-            name="source.pin.context"
-            if context["trace_id"] == 50
-            else "request.context",
-            start=0,
-            **mark,
-        )
-        for context in contexts.values()
-    )
-    return reconstruct_context(events)
-
-
 @pytest.mark.parametrize("scenario", ["zero", "failure", "timeout"])
-def test_decoder_accepts_closed_source_ranges_on_failed_results(scenario):
-    events = compact_failed_events()
+@pytest.mark.parametrize("count", [-1, 0])
+def test_decoder_accepts_closed_source_ranges_on_failed_results(scenario, count):
+    events = capture_events()
     pin = next(e for e in events if e["name"] == "source.pin.completed")
     pin["status"] = 5 if scenario == "timeout" else 4
-    pin.update(completed_blocks=-1, completed_bytes=-1)
+    pin.update(completed_blocks=count, completed_bytes=count)
     validate(events, scenario, 1)
 
 
-@pytest.mark.parametrize("schema", [1, 2, 3])
-def test_decoder_rejects_duplicate_returned_operation(schema):
-    events = compact_failed_events()
-    for event in events:
-        event["schema_version"] = schema
+def test_decoder_rejects_duplicate_returned_operation():
+    events = capture_events()
     validate(events, "failure", 1)
     result = next(e for e in events if e["name"] == "op.completion_returned")
     events.append(dict(result))
@@ -319,10 +316,9 @@ def test_decoder_rejects_duplicate_returned_operation(schema):
         validate(events, "failure", 2)
 
 
-@pytest.mark.parametrize("schema", [1, 2, 3])
 @pytest.mark.parametrize("identity", ["trace", "instance", "duplicate"])
-def test_decoder_requires_distinct_caller_lifecycles(schema, identity):
-    events, second = compact_failed_events(), compact_failed_events()
+def test_decoder_requires_distinct_caller_lifecycles(identity):
+    events, second = capture_events(), capture_events()
     fields = ("source_op_id", "pin_id")
     fields += (
         ("instance_lo", "target_incarnation_lo")
@@ -336,8 +332,6 @@ def test_decoder_requires_distinct_caller_lifecycles(schema, identity):
     if identity == "duplicate":
         next(e for e in second if e["name"] == "op.completion_returned")["trace_id"] = 3
     events.extend(second)
-    for event in events:
-        event["schema_version"] = schema
     if identity == "duplicate":
         with pytest.raises(AssertionError, match="duplicate caller lifecycle"):
             validate(events, "failure", 2)
@@ -348,20 +342,19 @@ def test_decoder_requires_distinct_caller_lifecycles(schema, identity):
 @pytest.mark.parametrize("scenario", ["zero", "failure", "timeout"])
 @pytest.mark.parametrize("name", ["source.write", "source.pin.wait"])
 def test_decoder_rejects_missing_source_ranges_on_failed_results(scenario, name):
-    events = [e for e in compact_failed_events() if e["name"] != name]
+    events = [e for e in capture_events() if e["name"] != name]
     with pytest.raises(AssertionError, match=name):
         validate(events, scenario, 1)
 
 
-def successful_events(compact=False, scenario="success"):
-    events = compact_failed_events()
+def successful_events(scenario="success"):
+    events = capture_events()
     completed = 2 if scenario == "success" else 1
     for event in events:
         event.update(
             status=2 if scenario == "success" else 3,
             completed_blocks=completed,
             completed_bytes=16 * completed,
-            schema_version=3 if compact else 2,
         )
     source = next(e for e in events if e["name"] == "source.write.completed")
     source.update(transfer_id=40, selected_bytes=16 * completed)
@@ -381,7 +374,7 @@ def successful_events(compact=False, scenario="success"):
     "field", [None, "instance_hi", "instance_lo", "trace_id", "source_op_id"]
 )
 def test_decoder_matches_compact_native_and_logical_source(scenario, field):
-    events = successful_events(compact=True, scenario=scenario)
+    events = successful_events(scenario=scenario)
     if field is None:
         validate(reconstruct_context(events), scenario, 1)
         return
@@ -407,7 +400,7 @@ def test_decoder_matches_compact_native_and_logical_source(scenario, field):
 
 @pytest.mark.parametrize("name", ["source.write", "nixl.write"])
 def test_decoder_rejects_compact_range_with_wrong_source_operation(name):
-    events = successful_events(compact=True)
+    events = successful_events()
     next(e for e in events if e["name"] == name)["source_op_id"] += 1
     with pytest.raises(AssertionError, match="mismatched source lifecycle"):
         validate(events, "success", 1)
@@ -435,29 +428,29 @@ def test_decoder_accepts_distinct_source_uuid_with_matching_high_half():
 @pytest.mark.parametrize("damage", ["removed", "wrong_trace", "wrong_instance"])
 def test_decoder_rejects_missing_context_association(damage):
     events = capture_events()
+    context = next(
+        e for e in events if e["name"] == "request.context" and e["trace_id"] == 3
+    )
     if damage == "removed":
-        events.pop()
+        events.remove(context)
     elif damage == "wrong_trace":
-        events[-1]["trace_id"] += 1
+        context["trace_id"] += 1
     else:
-        events[-1]["instance_lo"] += 1
+        context["instance_lo"] += 1
     with pytest.raises(AssertionError, match="request context"):
         validate(events, "failure", 1)
 
 
-@pytest.mark.parametrize("schema", [1, 2, 3])
 @pytest.mark.parametrize("name", ["op.completion_queued", "target.write_done.received"])
 @pytest.mark.parametrize("field", ["instance_hi", "instance_lo", "trace_id"])
-def test_decoder_rejects_mismatched_target_lifecycle(schema, name, field):
-    events = compact_failed_events()
-    for event in events:
-        event["schema_version"] = schema
+def test_decoder_rejects_mismatched_target_lifecycle(name, field):
+    events = capture_events()
     next(e for e in events if e["name"] == name)[field] += 1
     with pytest.raises(AssertionError, match="mismatched target lifecycle"):
         validate(events, "failure", 1)
 
 
-@pytest.mark.parametrize("scenario", ["success", "partial"])
+@pytest.mark.parametrize("scenario", ["success", "partial", "zero"])
 @pytest.mark.parametrize(
     "name",
     [
@@ -470,23 +463,28 @@ def test_decoder_rejects_mismatched_target_lifecycle(schema, name, field):
 )
 @pytest.mark.parametrize("field", ["status", "completed_blocks", "completed_bytes"])
 def test_decoder_rejects_contradictory_completion(scenario, name, field):
-    events = successful_events(compact=True, scenario=scenario)
-    next(e for e in events if e["name"] == name)[field] = 4 if field == "status" else 0
+    events = (
+        capture_events() if scenario == "zero" else successful_events(scenario=scenario)
+    )
+    next(e for e in events if e["name"] == name)[field] = (
+        2 if scenario == "zero" else 4 if field == "status" else 0
+    )
     with pytest.raises(AssertionError):
         validate(events, scenario, 1)
 
 
 @pytest.mark.parametrize("scenario", ["success", "partial"])
-@pytest.mark.parametrize("detail", ["low", "medium", "legacy"])
+@pytest.mark.parametrize("detail", ["low", "medium"])
 def test_decoder_accepts_unknown_byte_counts(scenario, detail):
-    events = successful_events(compact=detail != "legacy", scenario=scenario)
+    events = successful_events(scenario=scenario)
     for event in events:
         if detail == "low":
-            event.update(requested_bytes=-1, selected_bytes=-1, completed_bytes=-1)
+            event.update(
+                requested_bytes=-1,
+                selected_bytes=-1,
+                completed_bytes=-1,
+                request_display_known=0,
+            )
         elif event["trace_id"] in (3, 50):
             event["completed_bytes"] = -1  # Caller/pin bytes may be unknown.
-        if detail == "legacy" and event["name"].startswith("source.pin."):
-            event["schema_version"] = 1
-            for field in ("trace_id", "requested_bytes", "completed_bytes"):
-                event.pop(field, None)
     validate(events, scenario, 1)

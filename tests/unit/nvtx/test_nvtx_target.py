@@ -27,41 +27,6 @@ from kvcr.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
 from kvcr.types import BlockKey, RegionDescriptor
 
 
-@pytest.mark.parametrize("level", ["low", "medium"])
-def test_target_low_avoids_descriptor_scans_but_preserves_result(
-    recording, monkeypatch, level
-):
-    monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
-    calls = []
-    monkeypatch.setattr(_nvtx, "tier", lambda refs: calls.append("tier") or 1)
-    monkeypatch.setattr(
-        _nvtx, "memory_kind", lambda refs, regions: calls.append("memory") or 1
-    )
-    kvcr = SimpleNamespace(
-        nixl_agent_name="target",
-        _memory_regions=({}, {}),
-        _remote_fw_dram=SimpleNamespace(
-            _dangling_ops=SimpleNamespace(incarnation="inc")
-        ),
-        _descriptor_bytes=lambda refs: calls.append("bytes") or 16,
-    )
-    trace = _nvtx.create_tracer().operation(kvcr, 41, {b"key": (object(),)}, "request")
-    assert trace is not None
-    op = SimpleNamespace(
-        completed_keys={b"key"},
-        keys={b"key"},
-        success=True,
-        ordered_keys=(b"key",),
-        dst_descriptors=((object(),),),
-        _backend=SimpleNamespace(_kvcr=kvcr),
-    )
-    trace.target_result(op, _nvtx.Reason.NONE)
-    assert bool(calls) == (level == "medium")
-    event = payloads(recording, "target.write_done.received")[0]
-    assert int(event["completed_blocks"]) == 1
-    assert int(event["completed_bytes"]) == (16 if level == "medium" else -1)
-
-
 def target(*, eager=False):
     agent, control = FakeNixlAgent(), FakeBytesControl()
     kvcr = _new_kvcr(
@@ -477,3 +442,43 @@ def test_target_annotations_cannot_break_empty_or_missing_hint_delivery(
     assert len(recording.ended) == (0 if failure == "attributes" else 2)
     assert not recording.ranges
     assert not recording.stack
+
+
+@pytest.mark.parametrize(
+    "success,indices,expected",
+    [(True, (0,), True), (False, (), False), (True, (9,), False)],
+)
+def test_off_skips_annotation_work_but_preserves_results(
+    recording, monkeypatch, success, indices, expected
+):
+    accesses, reasons = [], _nvtx.Reason
+
+    class Traces(dict):
+        def pop(self, *args):
+            accesses.append("completion lookup")
+            return super().pop(*args)
+
+    class Reasons:
+        def __getattr__(self, name):
+            accesses.append(name)
+            return getattr(reasons, name)
+
+    monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")
+    kvcr, agent, control = target()
+    kvcr._core._nvtx_operations = Traces()
+    empty = kvcr.deliver({})
+    kvcr.submit_hint(_router_hint("tcp://source:1"), "req")
+    key = BlockKey(b"k")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    _wait_until(lambda: bool(control.sent))
+    monkeypatch.setattr(_nvtx, "Reason", Reasons())
+    agent.notifs["source"] = [
+        _write_done_notification(handle, success=success, completed_indices=indices)
+    ]
+    results = _poll_until(kvcr, lambda done: len(done) == 2)
+    assert [h for h, _ in results] == [empty, handle]
+    assert results[0][1] == {}
+    assert results[1][1][key].success is expected
+    assert not list(kvcr.poll_completed())
+    assert accesses == []
+    assert not recording.events

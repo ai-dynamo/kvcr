@@ -21,7 +21,9 @@ def reconstruct_context(events):
     """Two passes allow a pin context to follow its callback's range start."""
     contexts = {}
     for event in events:
-        if event.get("schema_version") == 3 and event["name"] in (
+        version = event.get("schema_version")
+        assert version == 3, f"unsupported payload schema {version}"
+        if event["name"] in (
             "request.context",
             "source.pin.context",
         ):
@@ -32,11 +34,6 @@ def reconstruct_context(events):
             }
     result = []
     for event in events:
-        version = event.get("schema_version")
-        assert version in (None, 1, 2, 3), f"unsupported payload schema {version}"
-        if version != 3:
-            result.append(event)
-            continue
         key = tuple(event[field] for field in _IDENTITY)
         assert key in contexts, "missing lifecycle context"
         result.append(dict(contexts[key], **event))
@@ -153,7 +150,7 @@ def validate(events, scenario, operations):
         if (
             event["name"] == "request.context"
             and event["request_known"]
-            and event.get("request_display_known", 1)
+            and event["request_display_known"]
         ):
             values = event["value_utf8"]
             while values and isinstance(values[0], list):
@@ -241,42 +238,39 @@ def validate(events, scenario, operations):
             for event in hint_events(name)
         ), "hint invalidated before use"
         assert received[0]["start"] <= queued[0]["start"] <= result["start"]
-        compact = result.get("schema_version") == 3
         completed = related("source.write.completed")
-        if compact or scenario == "zero":
-            assert len(completed) == 1, "missing source completion"
-        if compact:
-            caller_span = require_range(named, "op.deliver.lifecycle", result)
-            target_span = require_range(named, "target.remote", branch)
-            assert (
-                caller_span["start"]
-                <= branch["start"]
-                <= result["start"]
-                <= caller_span["end"]
-            )
-            assert (
-                target_span["start"]
-                <= branch["start"]
-                <= received[0]["start"]
-                <= target_span["end"]
-            )
-            assert caller_span["thread"] == caller_span["end_thread"]
-            assert target_span["thread"] != target_span["end_thread"], (
-                "target ownership never crossed threads"
-            )
-            source_span = require_range(named, "source.write", completed[0])
-            assert source_span["start"] <= completed[0]["start"] <= source_span["end"]
-            assert source_span["thread"] >> 24 != result["thread"] >> 24
-            pin = require_pin_completion(named, completed[0])
-            pin_span = require_range(named, "source.pin.wait", pin)
-            assert (
-                pin_span["start"]
-                <= pin["start"]
-                <= pin_span["end"]
-                <= source_span["start"]
-            )
+        assert len(completed) == 1, "missing source completion"
+        caller_span = require_range(named, "op.deliver.lifecycle", result)
+        target_span = require_range(named, "target.remote", branch)
+        assert (
+            caller_span["start"]
+            <= branch["start"]
+            <= result["start"]
+            <= caller_span["end"]
+        )
+        assert (
+            target_span["start"]
+            <= branch["start"]
+            <= received[0]["start"]
+            <= target_span["end"]
+        )
+        assert caller_span["thread"] == caller_span["end_thread"]
+        assert target_span["thread"] != target_span["end_thread"], (
+            "target ownership never crossed threads"
+        )
+        source_span = require_range(named, "source.write", completed[0])
+        assert source_span["start"] <= completed[0]["start"] <= source_span["end"]
+        assert source_span["thread"] >> 24 != result["thread"] >> 24
+        pin = require_pin_completion(named, completed[0])
+        pin_span = require_range(named, "source.pin.wait", pin)
+        assert (
+            pin_span["start"] <= pin["start"] <= pin_span["end"] <= source_span["start"]
+        )
         gaps.append((result["start"] - received[0]["start"]) / 1e6)
         if scenario == "zero":
+            assert pin["status"] == expected, pin
+            assert pin["completed_blocks"] in (-1, 0), pin
+            assert pin["completed_bytes"] in (-1, 0), pin
             assert completed[0]["completed_bytes"] == 0
             assert not related("nixl.write.posted"), (
                 "zero-result operation posted a transfer"
@@ -308,34 +302,25 @@ def validate(events, scenario, operations):
                 result["instance_lo"],
             ), "source and target share a tracer instance"
             assert posted[0]["thread"] >> 24 != result["thread"] >> 24
-            pin = require_pin_completion(named, posted[0])
-            assert pin["start"] <= posted[0]["start"]
-            if compact:
-                native_span = require_range(named, "nixl.write", posted[0])
-                assert all(
-                    event[field] == completed[0][field]
-                    for event in (source_span, posted[0], native_span)
-                    for field in (*_IDENTITY, "source_op_id")
-                ), "mismatched source lifecycle"
-                assert native_span["transfer_id"] == posted[0]["transfer_id"]
-                assert (
-                    native_span["start"]
-                    <= posted[0]["start"]
-                    <= released[0]["start"]
-                    <= native_span["end"]
-                )
-                assert (
-                    source_span["start"]
-                    <= native_span["start"]
-                    <= native_span["end"]
-                    <= source_span["end"]
-                )
-                assert (
-                    pin_span["start"]
-                    <= pin["start"]
-                    <= pin_span["end"]
-                    <= posted[0]["start"]
-                )
+            native_span = require_range(named, "nixl.write", posted[0])
+            assert all(
+                event[field] == completed[0][field]
+                for event in (source_span, posted[0], native_span)
+                for field in (*_IDENTITY, "source_op_id")
+            ), "mismatched source lifecycle"
+            assert native_span["transfer_id"] == posted[0]["transfer_id"]
+            assert (
+                native_span["start"]
+                <= posted[0]["start"]
+                <= released[0]["start"]
+                <= native_span["end"]
+            )
+            assert (
+                source_span["start"]
+                <= native_span["start"]
+                <= native_span["end"]
+                <= source_span["end"]
+            )
         outcomes = [result, *queued, *received, *completed]
         if scenario in ("success", "partial"):
             outcomes.append(pin)
@@ -348,24 +333,24 @@ def validate(events, scenario, operations):
             assert event["status"] == expected, event
             assert event["requested_blocks"] == requested, event
             assert event["completed_blocks"] == blocks, event
-            byte_count = event.get("completed_bytes", -1)  # Legacy pins omit bytes.
+            byte_count = event["completed_bytes"]
             assert byte_count >= -1, event
             if byte_count >= 0:
                 assert (byte_count > 0) == (blocks > 0), event
                 byte_counts.add(byte_count)
-        requested_bytes = result.get("requested_bytes", -1)
+        requested_bytes = result["requested_bytes"]
         assert requested_bytes >= -1, result
         if requested_bytes >= 0:
             # The capture workload uses equally sized blocks.
             assert requested_bytes % requested == 0, result
             byte_counts.add(requested_bytes * blocks // requested)
         byte_counts.update(
-            e["selected_bytes"] for e in completed if e.get("selected_bytes", -1) >= 0
+            e["selected_bytes"] for e in completed if e["selected_bytes"] >= 0
         )
         assert len(byte_counts) <= 1, "inconsistent completed byte counts"
-        assert queued[0].get("completed_bytes", -1) == result.get(
-            "completed_bytes", -1
-        ), "queued and returned byte counts differ"
+        assert queued[0]["completed_bytes"] == result["completed_bytes"], (
+            "queued and returned byte counts differ"
+        )
     counts = Counter(event["name"] for event in events)
     return dict(
         events=len(events),

@@ -25,7 +25,7 @@ uv run python examples/nvtx_decode.py \
 
 Open the `.nsys-rep` in Nsight Systems and expand both worker processes and their NVTX lanes. Select `hint.submitted` on the target, then follow its local `trace_id` through `hint.used` and `target.queued.hint_trace_id`. The caller and remote branch have separate trace IDs. Use the target agent/incarnation/handle tuple to find the source write, then source instance/operation ID to find its pin waiter and pin ID. The [event reference](nvtx-events.md) and [producer map](nvtx-context.md) define each join.
 
-The decoder accepts schemas 1/2/3 and checks medium's bounded Unicode display. Off disables KVCR annotations; other libraries can still emit NVTX events.
+The decoder accepts schema 3 and checks medium's bounded Unicode display. Off disables KVCR annotations; other libraries can still emit NVTX events.
 
 ## Worked operation
 
