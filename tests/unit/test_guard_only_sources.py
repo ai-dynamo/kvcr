@@ -25,6 +25,7 @@ from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.progress import _TransferRef
 from kvcr.recovery_journal import install_recovery_records
+from kvcr.remote_fw_dram import _SourcePinOp
 from kvcr.types import RegionDescriptor
 
 
@@ -102,8 +103,17 @@ def test_guard_only_sources_is_explicit_and_default_off():
 
 
 @pytest.mark.parametrize("recovered", [False, True])
-def test_ready_subset_progress_while_caller_state_lock_held(recovered, source_factory):
+def test_ready_subset_progress_while_caller_state_lock_held(
+    recovered, source_factory, monkeypatch
+):
     source, agent, control, pinning, memory = source_factory(recovered=recovered)
+    record = source._core._block_record_map[b"a"]
+    before_access = record.access_count
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("SourcePinOp created")
+
+    monkeypatch.setattr(_SourcePinOp, "__init__", forbidden)
     before = len(agent.xfers)
     with source._core._state_lock:
         _request(control, [b"missing", b"a", b"other"])
@@ -113,26 +123,16 @@ def test_ready_subset_progress_while_caller_state_lock_held(recovered, source_fa
         assert notice["completed_indices"] == [1]
         assert pinning.searches == []
         assert not source._core._remote_fw_dram._source_pin_ops
+        assert record.access_count == before_access
     assert source._core._local_dram._export_readers() == 0
-
-
-def test_zero_hit_and_layout_mismatch_never_create_source_pin(
-    monkeypatch, source_factory
-):
-    source, agent, control, pinning, _ = source_factory()
-    from kvcr.remote_fw_dram import _SourcePinOp
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("SourcePinOp created")
-
-    monkeypatch.setattr(_SourcePinOp, "__init__", forbidden)
+    _poll_until(source, lambda _: record.access_count == before_access + 1)
     before = len(agent.xfers)
     with source._core._state_lock:
-        _request(control, [b"a", b"missing"], key_layout=["different"])
+        _request(control, [b"a", b"missing"], handle=13, key_layout=["different"])
         _wait_until(
-            lambda: any(n.get("op_handle") == 12 for n in _notifications(agent))
+            lambda: any(n.get("op_handle") == 13 for n in _notifications(agent))
         )
-        notice = next(n for n in _notifications(agent) if n.get("op_handle") == 12)
+        notice = next(n for n in _notifications(agent) if n.get("op_handle") == 13)
         assert notice["completed_indices"] == []
         assert len(agent.xfers) == before
         assert pinning.searches == []
@@ -343,17 +343,3 @@ def test_native_handle_cleanup_failure_keeps_export_reader():
     finally:
         agent.release_xfer_handle = release
         source.close()
-
-
-def test_source_access_accounting_is_deferred_without_holding_reader(source_factory):
-    source, agent, control, pinning, _ = source_factory()
-    local = source._core._local_dram
-    record = source._core._block_record_map[b"a"]
-    before_access = record.access_count
-    before = len(agent.xfers)
-    with source._core._state_lock:
-        _request(control, [b"a", b"missing"])
-        _wait_until(lambda: len(agent.xfers) == before + 1)
-        _wait_until(lambda: local._export_readers() == 0)
-        assert record.access_count == before_access
-    _poll_until(source, lambda _: record.access_count == before_access + 1)
