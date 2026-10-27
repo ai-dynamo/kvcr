@@ -55,6 +55,7 @@ class Prompts:
     """Deterministic prompt texts derived from one recorded run tag."""
 
     tag: str
+    perf_count: int = 5
     # TC-02 prompt geometry in sections (~17 tokens each): the shared prefix P1
     # must hold at least two complete hit blocks and the full prompt at least
     # one more, so hybrid models whose attention block is 576 tokens need
@@ -139,10 +140,36 @@ class Prompts:
     def tc04_second(self) -> str:
         return self.prefix(self.tag + "j", 0, 80) + self.tail
 
+    # -- performance prompts (TC-05 / TC-06) --------------------------------
+    # Each perf sample needs its own never-seen prefix so the cold arm is
+    # really cold; the same prompt is then reused for the local and remote
+    # hit arms. Names are stable so reference tokens exist for every one.
+
+    def perf(self, index: int) -> str:
+        return self.prefix(f"{self.tag}p{index}", 0, 80) + self.tail
+
+    def perf_names(self) -> list[str]:
+        return [f"perf_{i}" for i in range(self.perf_count)]
+
+    def tc06(self, index: int) -> str:
+        return self.prefix(f"{self.tag}r{index}", 0, 80) + self.tail
+
+    # Fillers push the perf prompts out of vLLM's GPU prefix cache so the next
+    # local request must read them back from the KVCR DRAM pool.
+    def filler(self, index: int) -> str:
+        return self.prefix(f"{self.tag}x{index}", 0, 80) + self.tail
+
     def short_filler(self, index: int) -> str:
         """~80 tokens: exactly one full 64-token block (cached, hence evicting)
         plus a tail. Sub-block prompts are freed, not cached, and evict nothing."""
         return self.prefix(f"{self.tag}y{index}", 0, 4) + self.tail
+
+    # One never-seen prompt per in-flight request of a concurrency level.
+    def sweep(self, level: int, index: int) -> str:
+        return self.prefix(f"{self.tag}k{level}_{index}", 0, 80) + self.tail
+
+    def tc06_names(self) -> list[str]:
+        return [f"tc06_{i}" for i in range(self.perf_count)]
 
     def all(self) -> dict[str, str]:
         prompts = {
@@ -160,6 +187,9 @@ class Prompts:
                 "tc04_second",
             )
         }
+        for index in range(self.perf_count):
+            prompts[f"perf_{index}"] = self.perf(index)
+            prompts[f"tc06_{index}"] = self.tc06(index)
         return prompts
 
 
@@ -180,7 +210,12 @@ class Context:
         index_wait: float,
         telemetry_timeout: float,
         recovery_timeout: float,
+        perf_max_tokens: int = 128,
+        perf_concurrency: int = 1,
+        perf_evict_filler: int = 0,
+        perf_concurrency_levels: list[int] | None = None,
         hit_block_tokens: int = BLOCK_SIZE,
+        baseline_timings: dict[str, Any] | None = None,
         engine_cached: dict[str, list[int | None]] | None = None,
         tc02_seed_prefix: bool = False,
         tc02_evict_target: int = 0,
@@ -194,6 +229,10 @@ class Context:
         self.index_wait = index_wait
         self.telemetry_timeout = telemetry_timeout
         self.recovery_timeout = recovery_timeout
+        self.perf_max_tokens = perf_max_tokens
+        self.perf_concurrency = perf_concurrency
+        self.perf_evict_filler = perf_evict_filler
+        self.perf_concurrency_levels = perf_concurrency_levels or []
         # Tokens per prefix-cache hit block. 64 (vLLM --block-size) for dense
         # models; hybrid models (Qwen3.5) raise the attention block to 576 so
         # cached_tokens is a multiple of that, and every KVCR transfer carries
@@ -208,6 +247,9 @@ class Context:
         self.engine_cached = engine_cached or {}
         self.tc02_seed_prefix = tc02_seed_prefix
         self.tc02_evict_target = tc02_evict_target
+        # KVCR-disabled timings recorded during the reference phase, keyed by
+        # prompt name -> {"cold": StreamResponse.metrics(), "warm": ...}
+        self.baseline_timings = baseline_timings or {}
 
     @property
     def engine_partial_prefix_reuse(self) -> bool | None:
