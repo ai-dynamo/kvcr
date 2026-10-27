@@ -250,11 +250,7 @@ Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the l
 
 A worker calls `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)` with its Guard's control address and each ordered pool's name and block size. The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block sizes may differ. The pre-release wire protocol remains version 1.
 
-`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and
-`KVCRGuardConfig`-driven construction. Remote peers must match pool names,
-block sizes, and order. G3 supports multiple pools and multiple pieces per key,
-including repeated pool names and concrete part labels. Each pool's block size
-must be a multiple of the native memory-page size.
+`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and `KVCRGuardConfig`-driven construction. Remote peers must match pool names, block sizes, and order. G3 supports multiple pools and pieces per key; each pool block size must be page aligned. All pools share the configured G3 files.
 
 The compatibility digest must match the service and change whenever the KV layout changes. A group's first claim fixes its ordered pool layout and, when G3 is configured, its ordered paths, per-file capacity, backend and options, and remote framework DRAM backend. Later mismatches are refused; changing the layout requires restarting the service, which recreates the groups.
 
@@ -426,98 +422,7 @@ The important fields are:
 
 For several local DP ranks, provide one `control_ports` entry per local rank in local-rank order. Every worker must advertise an address reachable from its peers, and every port must be unique on that host.
 
-The secondary tier can optionally own local G2 capacity through
-`secondary_g2_slots`, attach to a service-owned pool through
-`kvcr_service_socket_path` together with `compatibility_digest`, or configure
-file-backed storage through `g3`.
-G3 defaults to NIXL `POSIX` with `backend_options={"use_uring": "true"}`.
-Additional POSIX tuning options preserve this engine default. Explicit
-`use_uring`, `use_aio`, or `use_posix_aio` settings override the engine default;
-for example, `{"use_aio": "true"}` selects Linux AIO instead. Set
-`backend="GDS_MT"` to use GDS explicitly; POSIX engine defaults are not passed
-to other backends. There is no automatic fallback if io_uring initialization
-fails.
-For deployments relying on the previous `GDS_MT` default, set `backend="GDS_MT"`
-explicitly to preserve the selected file backend.
-
-`g3.capacity_bytes_per_file` is rounded down to whole allocation units and must
-fit at least one. The unit is the greatest common divisor of the configured
-pool block sizes; a larger piece uses multiple units. Existing nonempty files
-must match the rounded capacity. A key must fit in the combined file capacity
-to spill; G3 reserves and evicts complete keys, and publishes a key only after
-all its pieces have been written successfully. Fetches retain the key's ordered
-layout; deliveries may select unambiguous labeled pieces in a different order.
-G3 recovery records retain the layout and every allocated unit. Legacy
-single-pool records remain readable; older readers discard multi-piece disk
-records rather than exposing an incomplete key. Changing pool geometry still
-requires a new compatibility digest and service restart. This does not add
-file-content validation during recovery or change native-error quiescence.
-
-Small common units increase descriptor and metadata counts when pool block
-sizes differ greatly. Measure this overhead before choosing production layouts.
-Multi-pool DRAM support works with one or more G3 files. Pieces from all DRAM
-pools use the configured files, and KVCR retains their pool labels for
-restoration. These files can all live on one filesystem, including a mounted
-RAID volume. KVCR uses its existing slot-to-file mapping; the filesystem and
-RAID/block layer handle placement on physical drives. The changes for
-multi-pool keys do not add SSD placement or sharding.
-
-For a rebuildable cache across SSDs, we recommend one RAID0 volume and mount, or
-one RAID0 volume per NUMA domain with separate mounts. For best-effort NUMA
-locality, select an instance's G3 paths from its local mount and align CPU,
-buffer-allocation, and GPU affinity where applicable. Configuring paths from
-several NUMA domains does not make KVCR's allocator NUMA-aware. See the
-[storage deployment guidance](../examples/README.md#recommended-storage-deployment)
-for placement responsibilities and RAID0's lack of redundancy.
-
-The standalone native probe in `examples/g3_multi_pool.py` exercises unequal
-pool sizes, spill, direct delivery, and DRAM refill without a model:
-
-See the [G3 example README](../examples/README.md) for prerequisites, a complete
-walkthrough, expected output, and Docker setup.
-
-```bash
-PYTHONPATH=src python3 examples/g3_multi_pool.py --directory /path/to/local/ssd
-# Explicitly opt into GDS_MT:
-PYTHONPATH=src python3 examples/g3_multi_pool.py --backend GDS_MT --directory /path/to/local/ssd
-# Requires vLLM and Torch; computes cache shapes without loading model weights:
-PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --directory /path/to/local/ssd
-# Three files on the same mounted filesystem, for example a RAID volume:
-PYTHONPATH=src python3 examples/g3_multi_pool.py --profile kimi-k3 --files 3 --directory /mnt/raid
-```
-
-The probe uses fresh temporary files, checks that payload reaches the expected
-files, and checks every returned byte. `--files` defaults to one; all files
-are created below the specified directory. Per-file capacity is rounded up to
-an allocation unit so the combined budget fits two complete keys. It requires
-NIXL's UCX and selected file plugin; GDS_MT also requires working cuFile/CUDA
-initialization even though the buffers in this probe are DRAM.
-The default POSIX path requires NIXL to be built with liburing and the runtime
-to allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`. Docker's
-default seccomp profile blocks these calls; use a profile that permits them
-for io_uring deployments. See the
-[NIXL POSIX guide](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/posix/README.md).
-
-The `kimi-k3` profile uses cache parameters from the
-[Kimi K3 configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)
-and the installed vLLM `MLAAttentionSpec`, `MambaSpec`, and KDA shape/dtype
-calculators. With TP=1, 64-token BF16 MLA blocks, BF16 convolution state,
-FP32 recurrent state, and no speculative decoding or RecoverSSM, the per-layer
-pieces are 73,728 bytes for MLA and 6,512,640 bytes for a KDA snapshot. This is
-a cache-byte round trip, not an end-to-end model or vLLM adapter test. Group
-packing, checkpoint eligibility, tensor parallelism, and cache dtype can change
-the pieces a serving adapter must export.
-
-Some DeepSeek V4 packed layouts do not satisfy the page-alignment requirement.
-For example, a 256-token CSA block with compression ratio 4, 584 bytes per
-state, and 576-byte layout alignment occupies 37,440 bytes. Such pieces need
-an additional layout/padding solution before this G3 path can accept them.
-
-The vLLM adapter uses one unnamed pool per Guard, so start the guard service with
-one pool size, for example `--pool-sizes-gb 48`.
-Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes
-precedence over an in-process `secondary_g2_slots` allocation. Policy names and
-diagnostic options must match the KVCR and vLLM revisions being tested.
+The secondary tier can optionally own local G2 capacity through `secondary_g2_slots`, attach to a service-owned pool through `kvcr_service_socket_path` together with `compatibility_digest`, or configure file-backed storage through `g3`. `g3.capacity_bytes_per_file` is rounded down to allocation units (the greatest common divisor of the pool block sizes) and must fit at least one unit. Existing nonempty files must match the rounded capacity. The vLLM adapter uses one unnamed pool per Guard, so start the guard service with one pool size, for example `--pool-sizes-gb 48`. Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes precedence over an in-process `secondary_g2_slots` allocation. Policy names and diagnostic options must match the KVCR and vLLM revisions being tested.
 
 The worker configuration enables its side of the contract. Dynamo must still run a KV-aware router that consumes KV events, selects a source and destination, and places the resulting plan in the request metadata. A plain round-robin router does not create KVCR source hints.
 

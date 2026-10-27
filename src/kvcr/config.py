@@ -54,26 +54,12 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     """Bounded file-backed cache storage owned by this KVCR process.
 
     Per-file capacity is rounded down to complete slots and must fit at least one.
-    Slot size is the greatest common divisor of the pool block sizes, which must
-    each be page aligned. A key may occupy multiple slots.
-    POSIX uses io_uring unless backend_options explicitly selects an I/O engine.
     """
 
     paths: tuple[Path, ...]
     capacity_bytes_per_file: int
-    backend: str = "POSIX"
+    backend: str = "GDS_MT"
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        engine_options = ("use_uring", "use_aio", "use_posix_aio")
-        if self.backend == "POSIX" and not any(
-            name in self.backend_options for name in engine_options
-        ):
-            msgspec.structs.force_setattr(
-                self,
-                "backend_options",
-                {"use_uring": "true", **self.backend_options},
-            )
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):
