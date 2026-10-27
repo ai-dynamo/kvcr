@@ -84,7 +84,7 @@ class _RemoteSources:
             _SourceWriteState.FINISHED,
             _SourceWriteState.CANCEL_PENDING,
         ):
-            if item.local_sources:
+            if item.local_sources is not None:
                 # local.poll_main drains reader releases with their access
                 # accounting and reclamation.
                 # TODO: Skip queued local handoffs if useful; keep TransferError events.
@@ -267,13 +267,12 @@ class _RemoteSources:
             route=source_pin.route,
             nvtx_state=source_pin.nvtx_state,
             _backend=self._backend,
-            framework_pins=framework_pins,
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
-        self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
+        self._fw_pins_by_op[source_write.op_id] = framework_pins
         kvcr._progress.submit(source_write)
         self._release_framework_pins(unused_pins)
 

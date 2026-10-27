@@ -87,10 +87,18 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "keys,completed_indices",
-    [([b"local"], [0]), ([b"missing", b"local"], [1]), ([b"missing"], [])],
+    "keys,completed_indices,source_case",
+    [
+        ([b"local"], [0], "ready"),
+        ([b"missing", b"local", b"absent"], [1], "ready"),
+        ([b"missing"], [], "ready"),
+        ([b"local"], [], "no_local"),
+        ([b"local"], [], "key_layout"),
+        ([b"local"], [], "requested_labels"),
+    ],
 )
-def test_framework_pinning_disabled(keys, completed_indices, kvcr_caplog):
+def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_caplog):
+    kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram_pools")
     pinning = SimpleNamespace(
         request_pin=None,
         poll_pin_results=None,
@@ -104,18 +112,38 @@ def test_framework_pinning_disabled(keys, completed_indices, kvcr_caplog):
         control,
         name="source",
         framework_regions=[_buffer_region(memory, 16)],
-        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+        local_dram=(
+            None
+            if source_case == "no_local"
+            else LocalDramOptions([("", ctypes.addressof(memory), 16)])
+        ),
     )
     agent.state = "DONE"
-    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
-    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    if source_case != "no_local":
+        with patch.object(
+            agent, "make_prepped_xfer", side_effect=RuntimeError("failed")
+        ):
+            failed = source.deposit(
+                {b"missing": [_mem_descriptor(end_point_name="source")]}
+            )
+            assert _poll_until(source, bool) == [
+                (failed, _op_entries({b"missing": False}))
+            ]
+        deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+        assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
     request = msgspec.msgpack.decode(_start_write_message(12, b"local"))
     request.update(
         keys=keys,
         dst_descriptors=[[_TransferRef("target", i)] for i in range(len(keys))],
     )
-    control.incoming.append(msgspec.msgpack.encode(request))
-    _poll_until(source, lambda _: len(agent.xfers) == 2 or bool(agent.sent_notifs))
+    if source_case == "key_layout":
+        request["key_layout"] = ["", ":other"]
+    elif source_case == "requested_labels":
+        request["target_regions"] = ({":*": _buffer_region(memory, 16, ":*")}, {})
+        request["dst_descriptors"] = [[_TransferRef("target", 0, ":other")]]
+    with source._core._state_lock:
+        control.incoming.append(msgspec.msgpack.encode(request))
+        _wait_until(lambda: len(agent.xfers) == 2 or bool(agent.sent_notifs))
     notification = agent.xfers[-1][5] if completed_indices else agent.sent_notifs[0][1]
     assert _decode_notif(notification) == {
         "type": "write_done",
@@ -123,8 +151,14 @@ def test_framework_pinning_disabled(keys, completed_indices, kvcr_caplog):
         "success": True,
         "completed_indices": completed_indices,
     }
+    if completed_indices:
+        assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
+    assert ("start_write layout mismatch" in kvcr_caplog.text) == (
+        source_case in ("key_layout", "requested_labels")
+    )
 
 
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
@@ -282,15 +316,19 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
 
 
 @pytest.mark.parametrize(
-    "first_piece_ready,mixed", [(False, False), (True, False), (True, True)]
+    "first_piece_ready,mixed,framework_pinning",
+    [(False, False, False), (True, False, False), (True, True, True)],
 )
 @pytest.mark.parametrize("timeout", [False, True])
 def test_local_source_waits_for_declared_pieces(
-    first_piece_ready, timeout, mixed, caplog, request
+    first_piece_ready, timeout, mixed, framework_pinning, caplog, request
 ) -> None:
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     local = ctypes.create_string_buffer(32)
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    if not framework_pinning:
+        pinning.request_pin = pinning.poll_pin_results = None
+        pinning.release_pin = pinning.cancel_pin_request = None
     request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
     source = _new_kvcr(
         agent,
@@ -391,6 +429,9 @@ def test_local_source_retries_after_reader_contention(outcome):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    if outcome != "framework":
+        pinning.request_pin = pinning.poll_pin_results = None
+        pinning.release_pin = pinning.cancel_pin_request = None
     source = _new_kvcr(
         agent,
         pinning,
@@ -1496,7 +1537,6 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     assert submitted.dst_descriptors == ((destinations,) if selected else ())
     assert submitted.completed_indices == ((0,) if selected else ())
     expected_pins = {borrowed} if selected else set()
-    assert submitted.framework_pins == expected_pins
     assert backend._sources._fw_pins_by_op[submitted.op_id] == expected_pins
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
