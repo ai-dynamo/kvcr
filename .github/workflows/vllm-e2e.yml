@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Show NVIDIA devices
         run: nvidia-smi
-      - name: Run Phase 1 (TC-01,TC-02,TC-03) in Guard mode
+      - name: Run Phase 1 (TC-01,TC-02,TC-03,TC-04) in Guard mode
         shell: bash
         env:
           MODEL: ${{ inputs.model }}
@@ -87,7 +87,7 @@ jobs:
           set -euo pipefail
           python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1/run \
             --model "$MODEL" --mode guard --batch-invariant --timeout 2400 \
-            --cases TC-01,TC-02,TC-03
+            --cases TC-01,TC-02,TC-03,TC-04
       - name: Save Phase 1 evidence
         if: always()
         uses: actions/upload-artifact@v4
