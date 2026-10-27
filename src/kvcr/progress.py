@@ -28,7 +28,8 @@ _DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
-_STARTUP_TIMEOUT_SECONDS = 30.0
+_STARTUP_TIMEOUT_SECONDS = 60.0
+_PREPARE_LOG_INTERVAL_SECONDS = 10.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
 _OpId = tuple[str, Any]
@@ -525,12 +526,15 @@ class _KVCRProgress:
         return True
 
     def start(self) -> None:
-        self._activate.set()
-        if not self._thread.is_alive():
+        # A failed preparer is not restarted; its error is raised below.
+        if self._thread.ident is None or not (self._thread.is_alive() or self._failure):
+            self._activate.set()
             self._thread.start()
-        timeout = self._startup_timeout_seconds
-        if timeout is None:
-            timeout = _STARTUP_TIMEOUT_SECONDS
+        else:
+            # Wait out a background preparation, then activate on its own budget.
+            self._wait_prepared()
+            self._activate.set()
+        timeout = self._startup_budget()
         if not self._ready.wait(timeout=timeout):
             raise RuntimeError(
                 "KVCR progress initialization timed out after "
@@ -538,18 +542,31 @@ class _KVCRProgress:
             )
         self.raise_if_failed()
 
-    def prepare(self) -> None:
+    def prepare(self, wait: bool = True) -> None:
         """Create the agent and register memory without starting backends."""
         self._thread.start()
-        timeout = self._startup_timeout_seconds
-        if timeout is None:
-            timeout = _STARTUP_TIMEOUT_SECONDS
-        if not self._prepare_ready.wait(timeout=timeout):
-            raise RuntimeError(
-                "KVCR progress preparation timed out after "
-                f"{timeout:g}s (stage: {self._startup_stage})"
-            )
+        if not wait:
+            return
+        self._wait_prepared()
         self.raise_if_failed()
+
+    def _wait_prepared(self) -> None:
+        timeout = self._startup_budget()
+        deadline = time.monotonic() + timeout
+        while not self._prepare_ready.wait(
+            min(_PREPARE_LOG_INTERVAL_SECONDS, deadline - time.monotonic())
+        ):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "KVCR progress preparation timed out after "
+                    f"{timeout:g}s (stage: {self._startup_stage})"
+                )
+            logger.info("KVCR waiting for preparation: %s", self._startup_stage)
+
+    def _startup_budget(self) -> float:
+        if self._startup_timeout_seconds is not None:
+            return self._startup_timeout_seconds
+        return _STARTUP_TIMEOUT_SECONDS
 
     def submit(self, item: object) -> None:
         self.raise_if_failed()

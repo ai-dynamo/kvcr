@@ -1528,6 +1528,18 @@ def test_service_heartbeat_timeout_is_opt_in() -> None:
     )
 
 
+def test_service_startup_timeout_defaults_to_sixty_seconds() -> None:
+    assert _parse_args(_service_args("1")).startup_timeout_seconds == 60
+    with pytest.raises(SystemExit):
+        _parse_args(_service_args("1") + ["--startup-timeout-seconds", "0"])
+    assert (
+        _parse_args(
+            _service_args("1") + ["--startup-timeout-seconds", "600"]
+        ).startup_timeout_seconds
+        == 600
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     [

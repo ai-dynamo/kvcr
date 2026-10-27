@@ -127,8 +127,10 @@ def run(blocks, delay_ms, scenario):
         target.submit_hint(
             {
                 "protocol_version": "0.1",
+                "message_id": "nvtx-pin-example",
                 "actions": [
                     {
+                        "action_id": "a1",
                         "action_type": "kv.fetch",
                         "action_version": "1.0",
                         "payload": {

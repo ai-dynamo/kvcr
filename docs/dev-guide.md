@@ -1,12 +1,8 @@
 # KVCR Developer Guide
 
-This guide is for developers who are comfortable with Python, Linux, and
-inference engines such as vLLM, but are new to KV Cache Runner (KVCR).
-It covers the local development path from environment setup through
-standalone validation.
+This guide is for developers who are comfortable with Python, Linux, and inference engines such as vLLM, but are new to KV Cache Runner (KVCR). It covers the local development path from environment setup through standalone validation.
 
-To try the integrated stack without modifying source, follow the
-[quick start](quick-start.md).
+To try the integrated stack without modifying source, follow the [quick start](quick-start.md).
 
 ---
 
@@ -18,18 +14,11 @@ Use a Linux development environment with:
 - [`uv`](https://docs.astral.sh/uv/);
 - a C/C++ runtime compatible with the NIXL wheel selected by the project;
 - enough local memory and disk space for the tests you intend to run; and
-- for service-backed recovery, in the guard service and every claimant: Linux 5.3
-  or newer for `pidfd_open` (before 6.5 the worker supplies its own pidfd, as
-  described under Guard pools below), and the system libatomic runtime
-  (`libatomic1` on Debian and Ubuntu). Importing `kvcr` needs neither.
+- for service-backed recovery, in the guard service and every claimant: Linux 5.3 or newer for `pidfd_open` (before 6.5 the worker supplies its own pidfd, as described under Guard pools below), and the system libatomic runtime (`libatomic1` on Debian and Ubuntu). Importing `kvcr` needs neither.
 
-KVCR declares its Python dependencies in `pyproject.toml`. In particular, it
-pins a compatible NIXL version. Let `uv` resolve that dependency instead of
-installing a different NIXL release manually.
+KVCR declares its Python dependencies in `pyproject.toml`. In particular, it pins a compatible NIXL version. Let `uv` resolve that dependency instead of installing a different NIXL release manually.
 
-The framework-neutral unit suite does not require a GPU. Tests for a concrete
-framework adapter, CUDA-aware NIXL transport, or cross-worker KV transfer may
-require GPUs and the native dependencies of that framework.
+The framework-neutral unit suite does not require a GPU. Tests for a concrete framework adapter, CUDA-aware NIXL transport, or cross-worker KV transfer may require GPUs and the native dependencies of that framework.
 
 ---
 
@@ -37,9 +26,7 @@ require GPUs and the native dependencies of that framework.
 
 ### Prepare the standalone workspace
 
-Run the standalone workflow from the root of an existing KVCR source checkout.
-Before installing anything, confirm that the shell points to the intended
-checkout and tools:
+Run the standalone workflow from the root of an existing KVCR source checkout. Before installing anything, confirm that the shell points to the intended checkout and tools:
 
 ```bash
 test -f pyproject.toml
@@ -47,12 +34,9 @@ uv --version
 python3 --version
 ```
 
-If `VIRTUAL_ENV` refers to an unrelated project, deactivate it before
-continuing. KVCR uses its own `.venv`; later commands use `uv run` or name that
-interpreter explicitly so packages are not installed into an outer environment.
+If `VIRTUAL_ENV` refers to an unrelated project, deactivate it before continuing. KVCR uses its own `.venv`; later commands use `uv run` or name that interpreter explicitly so packages are not installed into an outer environment.
 
-The distribution name is `kvcr`, the Python import is `kvcr`, and source
-code lives under `src/kvcr`.
+The distribution name is `kvcr`, the Python import is `kvcr`, and source code lives under `src/kvcr`.
 
 ---
 
@@ -66,14 +50,11 @@ The normal development installation is created by:
 uv sync
 ```
 
-Use this for standalone development. It preserves fast iteration and keeps the
-dependency set described by `pyproject.toml`.
+Use this for standalone development. It preserves fast iteration and keeps the dependency set described by `pyproject.toml`.
 
 ### KVCR wheel (optional)
 
-Build a wheel when changing package metadata or validating the distributable
-artifact. After `uv sync` has installed the declared dependencies, build into a
-fresh temporary directory and replace the editable install with that wheel:
+Build a wheel when changing package metadata or validating the distributable artifact. After `uv sync` has installed the declared dependencies, build into a fresh temporary directory and replace the editable install with that wheel:
 
 ```bash
 KVCR_WHEEL_DIR=$(mktemp -d)
@@ -85,9 +66,7 @@ uv pip install \
   "$KVCR_WHEEL_DIR"/kvcr-*.whl
 ```
 
-Use `--no-deps` only after `uv sync` has installed the declared dependencies.
-Next, [verify the installed wheel](#verify-an-installed-wheel) before restoring
-editable development mode.
+Use `--no-deps` only after `uv sync` has installed the declared dependencies. Next, [verify the installed wheel](#verify-an-installed-wheel) before restoring editable development mode.
 
 ---
 
@@ -122,9 +101,7 @@ uv tree
 
 ### Verify an installed wheel
 
-After installing the wheel, skip the editable provenance check above and use
-the environment Python directly so `uv run` does not restore the editable
-project first:
+After installing the wheel, skip the editable provenance check above and use the environment Python directly so `uv run` does not restore the editable project first:
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -154,8 +131,7 @@ uv sync
 
 ### API lifecycle
 
-KVCR is constructed by a framework adapter, which supplies runtime
-configuration, backend memory descriptions, and callbacks:
+KVCR is constructed by a framework adapter, which supplies runtime configuration, backend memory descriptions, and callbacks:
 
 ```python
 from kvcr import KVCR, KVCRBindings
@@ -175,32 +151,19 @@ runner = KVCR(
 )
 ```
 
-The callback names above represent services implemented by the framework
-adapter; they are not provided by KVCR itself.
+The callback names above represent services implemented by the framework adapter; they are not provided by KVCR itself.
 
-`KVCRConfig.startup_timeout_seconds` accepts a positive integer to allow longer
-initialization waits. Omitting it or setting it to `None` uses 30 seconds.
-The timeout applies separately to the local preparation and startup waits;
-transfer deadlines are unchanged.
+`KVCRConfig.startup_timeout_seconds` accepts a positive integer to allow longer initialization waits. Omitting it or setting it to `None` uses 60 seconds. The timeout applies separately to the local preparation and startup waits; transfer deadlines are unchanged. A Guard core uses the service's `--startup-timeout-seconds`.
 
-For `on_resilience_event` and optional framework-memory quarantine, see the
-[resilience contract](design_overview.md#failed-peers-and-dangling-operations).
+For `on_resilience_event` and optional framework-memory quarantine, see the [resilience contract](design_overview.md#failed-peers-and-dangling-operations).
 
-See the design doc's [Framework–KVCR API](design_overview.md#frameworkkvcr-api)
-and [operating flow](design_overview.md#operating-flow) for query, transfer,
-completion, and release semantics, and the
-[Router–KVCR API](design_overview.md#routerkvcr-api) for request-scoped hints.
-`abort()` is currently unimplemented as it cannot be used by the frameworks.
+See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
 ### Development loop
 
-Run a focused test while iterating, then the complete standalone validation
-before finishing. If an adapter or router contract changed, run the optional
-integration validation separately.
+Run a focused test while iterating, then the complete standalone validation before finishing. If an adapter or router contract changed, run the optional integration validation separately.
 
-Keep policy decisions separate from transfer and resource management; see the
-[Policy API](design_overview.md#policy-api). Policy calls and event-loop code
-must remain non-blocking.
+Keep policy decisions separate from transfer and resource management; see the [Policy API](design_overview.md#policy-api). Policy calls and event-loop code must remain non-blocking.
 
 ---
 
@@ -222,8 +185,7 @@ uv run pytest -k transfer -q
 uv run pytest -x -vv
 ```
 
-Run the complete framework-neutral suite before considering a KVCR-only change
-validated:
+Run the complete framework-neutral suite before considering a KVCR-only change validated:
 
 ```bash
 uv run pytest -q
@@ -244,21 +206,13 @@ Apply formatting when needed:
 uv run ruff format .
 ```
 
-Keep public APIs typed and small. Prefer explicit configuration over hidden
-process state. Errors should identify the operation and resource involved.
-Telemetry labels must use bounded categories rather than block keys, request
-IDs, or raw endpoints.
+Keep public APIs typed and small. Prefer explicit configuration over hidden process state. Errors should identify the operation and resource involved. Telemetry labels must use bounded categories rather than block keys, request IDs, or raw endpoints.
 
 ### KVCR guard service
 
-The KVCR guard service owns pool lifecycle. It pre-allocates
-`--guard-count` Guard-owned pool groups before exposing its socket. Every
-group has the same ordered set of usable pool sizes from `--pool-sizes-gb`.
-A worker claims a whole group by Guard index; its pools outlive that worker
-but not the service.
+The KVCR guard service owns pool lifecycle. It pre-allocates `--guard-count` Guard-owned pool groups before exposing its socket. Every group has the same ordered set of usable pool sizes from `--pool-sizes-gb`. A worker claims a whole group by Guard index; its pools outlive that worker but not the service.
 
-Before starting, ensure `/run/kvcr` and `/dev/shm/kvcr` exist and are writable
-by the user running the service:
+Before starting, ensure `/run/kvcr` and `/dev/shm/kvcr` exist and are writable by the user running the service:
 
 ```bash
 uv run python -m kvcr.kvcr_service \
@@ -269,7 +223,7 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-All flags except `--log-level` and `--heartbeat-timeout-ms` are required.
+All flags except `--log-level`, `--heartbeat-timeout-ms` and `--startup-timeout-seconds` are required.
 
 | Flag | Meaning |
 | --- | --- |
@@ -279,105 +233,43 @@ All flags except `--log-level` and `--heartbeat-timeout-ms` are required.
 | `--pool-sizes-gb` | Comma-separated usable sizes of the ordered pools in every group |
 | `--compatibility-digest` | Exact digest every claimant must provide |
 | `--heartbeat-timeout-ms` | Opt in to Guard promotion after a missed heartbeat; omitted means pidfd-only detection. Workers send heartbeats every 50 ms; minimum timeout is 1000 ms. |
+| `--startup-timeout-seconds` | Guard core startup budget; defaults to 60 s. Raise it for large pools, whose registration takes longer. |
 | `--log-level` | Service and Guard logging threshold; defaults to `$KVCR_LOG_LEVEL` or `INFO` |
 
-Heartbeat promotion kills the worker it promotes over. On a missed deadline the
-Guard sends SIGKILL through the lease pidfd and then promotes without waiting
-for the exit to be confirmed, so a worker that merely stalled past the timeout
-is terminated, not resumed. That makes the fence best-effort: the signal is
-queued, but a primary in uninterruptible sleep finishes its kernel operation
-first. The 1000 ms minimum timeout reduces false positives from short pauses
-such as GC and page-cache stalls. Pidfd-only detection promotes solely on
-confirmed exit and remains the default.
+Heartbeat promotion kills the worker it promotes over. On a missed deadline the Guard sends SIGKILL through the lease pidfd and then promotes without waiting for the exit to be confirmed, so a worker that merely stalled past the timeout is terminated, not resumed. That makes the fence best-effort: the signal is queued, but a primary in uninterruptible sleep finishes its kernel operation first. The 1000 ms minimum timeout reduces false positives from short pauses such as GC and page-cache stalls. Pidfd-only detection promotes solely on confirmed exit and remains the default.
 
-Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the
-listed usable sizes. The example therefore creates one mapping of 64 GiB plus
-100 MiB, laid out as `[journal header + journal payload][pool 0][pool 1]`.
-Pool sizes are rounded down to the native memory-page boundary.
+Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the listed usable sizes. The example therefore creates one mapping of 64 GiB plus 100 MiB, laid out as `[journal header + journal payload][pool 0][pool 1]`. Pool sizes are rounded down to the native memory-page boundary.
 
-A worker calls
-`KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)`
-with its Guard's control address and each ordered pool's name and block size.
-The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped
-pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block
-sizes may differ. The pre-release wire protocol remains version 1.
+A worker calls `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)` with its Guard's control address and each ordered pool's name and block size. The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block sizes may differ. The pre-release wire protocol remains version 1.
 
-`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and
-`KVCRGuardConfig`-driven construction. Remote peers must match pool names,
-block sizes, and order. G3 currently supports one pool and one block per key.
+`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and `KVCRGuardConfig`-driven construction. Remote peers must match pool names, block sizes, and order. G3 currently supports one pool and one block per key.
 
-The compatibility digest must match the service and change whenever the KV
-layout changes. A group's first claim fixes its ordered pool layout and, when
-G3 is configured, its ordered paths, per-file capacity, backend and options,
-and remote framework DRAM backend. Later mismatches are refused; changing the
-layout requires restarting the service, which recreates the groups.
+The compatibility digest must match the service and change whenever the KV layout changes. A group's first claim fixes its ordered pool layout and, when G3 is configured, its ordered paths, per-file capacity, backend and options, and remote framework DRAM backend. Later mismatches are refused; changing the layout requires restarting the service, which recreates the groups.
 
-Pool mappings and the `KVCRPoolHold` must not be used by forked children;
-create the shareable framework-control listener after the final fork.
-The service requires `pidfd_open` (Linux 5.3+). On kernels without
-`SO_PEERPIDFD`, the worker passes its own pidfd over the claim socket.
-The service fences each group by the claimant's pidfd until process exit.
-Closing the claim socket, including across exec, does not release a live
-claimant's lease. `KVCRPoolHold.release()` unmaps the group locally, explicitly
-releases the lease, and waits for acknowledgement.
+Pool mappings and the `KVCRPoolHold` must not be used by forked children; create the shareable framework-control listener after the final fork. The service requires `pidfd_open` (Linux 5.3+). On kernels without `SO_PEERPIDFD`, the worker passes its own pidfd over the claim socket. The service fences each group by the claimant's pidfd until process exit. Closing the claim socket, including across exec, does not release a live claimant's lease. `KVCRPoolHold.release()` unmaps the group locally, explicitly releases the lease, and waits for acknowledgement.
 
 #### Crash recovery
 
-A `KVCRGuardConfig` opts into a service pool group and its Guard together;
-the framework control must support a shared listener or startup is refused.
-Without this configuration, KVCR neither contacts the service nor builds a
-Guard. Make the configured NIXL backends available in each process that uses
-them; availability is not checked across processes.
+A `KVCRGuardConfig` opts into a service pool group and its Guard together; the framework control must support a shared listener or startup is refused. Without this configuration, KVCR neither contacts the service nor builds a Guard. Make the configured NIXL backends available in each process that uses them; availability is not checked across processes.
 
-The service binds the control endpoint and gives the claimant a duplicate.
-After a worker dies, its Guard serves recovered G2 data from the whole pool
-group at that same endpoint. A replacement primary takes back the group and
-its recovered records; a claimant that cannot inherit the endpoint is refused.
-A clean release returns the Guard to standby and the group to claimable.
-Takeover and handback cost time linear in the number of recovered blocks.
+The service binds the control endpoint and gives the claimant a duplicate. After a worker dies, its Guard serves recovered G2 data from the whole pool group at that same endpoint. A replacement primary takes back the group and its recovered records; a claimant that cannot inherit the endpoint is refused. A clean release returns the Guard to standby and the group to claimable. Takeover and handback cost time linear in the number of recovered blocks.
 
-For large host pools, UCX on-demand paging (ODP) avoids synchronous page
-registration during Guard preparation. It needs host ODP in the NIC, driver and
-UCX backend, and shifts page faults to first access rather than speeding up
-backing-file allocation.
+Registering a large host pool can take tens of seconds, so a Guard prepares its core in the background and a claim does not wait for it. A promotion waits for the preparation to finish, up to `--startup-timeout-seconds`; while it waits, the Guard processes no release, abort or close.
 
-- `UCX_REG_NONBLOCK_MEM_TYPES=host` and `UCX_IB_ODP_PREFETCH=n`: set by
-  `Dockerfile.quick-start`.
-- `UCX_REG_NONBLOCK_FALLBACK=n`: fails instead of silently reverting to blocking
-  registration. Use it to confirm ODP is the path actually taken.
+`--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`) logs source transfer refusals with their reason, startup and Guard promotion/handback stage timings, and recovery snapshot sizes. With DEBUG set before the KVCR instance is created:
 
-`--log-level DEBUG` (or `KVCR_LOG_LEVEL=DEBUG`) logs source transfer refusals
-with their reason, startup and Guard promotion/handback stage timings, and
-recovery snapshot sizes. With DEBUG set before the KVCR instance is created:
+- `KVCR_DIAGNOSTICS=1`: sampled query decisions, up to four per recent request. A zero remote-fetchable count is advisory, not a transfer failure.
+- `KVCR_KEY_HISTORY=1`: SHA-256 key fingerprints for local G2 lifetime events and completed remote transfers.
 
-- `KVCR_DIAGNOSTICS=1`: sampled query decisions, up to four per recent request.
-  A zero remote-fetchable count is advisory, not a transfer failure.
-- `KVCR_KEY_HISTORY=1`: SHA-256 key fingerprints for local G2 lifetime events
-  and completed remote transfers.
+Both are off by default and uncapped in volume. Fingerprints are unsalted and request IDs are logged in clear, so restrict access to these logs.
 
-Both are off by default and uncapped in volume. Fingerprints are unsalted and
-request IDs are logged in clear, so restrict access to these logs.
-
-Recovered blocks have no claims or old access timestamps and enter the
-eviction list. Reuse gives them a new timestamp under the configured policy.
-Recovery covers new requests; in-flight operations need caller-level retries.
-The promoted Guard answers stale requests, even when it has no data to serve.
+Recovered blocks have no claims or old access timestamps and enter the eviction list. Reuse gives them a new timestamp under the configured policy. Recovery covers new requests; in-flight operations need caller-level retries. The promoted Guard answers stale requests, even when it has no data to serve.
 
 - Any Guard failure stops the service.
-- Journal overflow disables warm recovery for that group. Watch for
-  `KVCR pool recovery disabled`. The primary stops publishing and the Guard
-  drops its mirrored state; the service continues. The journal is fixed at
-  100 MiB, so larger blocks, shorter pool names, or fewer pool locations per
-  key can reduce pressure.
-- Currently, Guards do not serve G3. A replacement primary reopens it, but
-  inherited G3 records are not verified against the files, which remain unlocked
-  while the Guard serves. Sharing G3 paths is unsupported and undetected. Missing
-  files are recreated with zeros, so deleting them can silently produce zero-filled
-  cache hits. To discard a disk cache, restart the service.
+- Journal overflow disables warm recovery for that group. Watch for `KVCR pool recovery disabled`. The primary stops publishing and the Guard drops its mirrored state; the service continues. The journal is fixed at 100 MiB, so larger blocks, shorter pool names, or fewer pool locations per key can reduce pressure.
+- Currently, Guards do not serve G3. A replacement primary reopens it, but inherited G3 records are not verified against the files, which remain unlocked while the Guard serves. Sharing G3 paths is unsupported and undetected. Missing files are recreated with zeros, so deleting them can silently produce zero-filled cache hits. To discard a disk cache, restart the service.
 
-Service shutdown closes and removes its pool files. Startup reclaims files
-orphaned by a crashed service; file locks protect pools still used by a live
-service or attached worker.
+Service shutdown closes and removes its pool files. Startup reclaims files orphaned by a crashed service; file locks protect pools still used by a live service or attached worker.
 
 Run the focused service tests after changing this subsystem:
 
@@ -391,64 +283,40 @@ uv run pytest \
 
 ### Telemetry validation
 
-Enable telemetry in `KVCRConfig` and provide a framework-specific
-`stats_factory` through `KVCRBindings`. `get_stats()` should then expose
-bounded counters, gauges, and duration observations.
-Each call returns the current interval snapshot and starts a fresh one.
+Enable telemetry in `KVCRConfig` and provide a framework-specific `stats_factory` through `KVCRBindings`. `get_stats()` should then expose bounded counters, gauges, and duration observations. Each call returns the current interval snapshot and starts a fresh one.
 
-The package exports metric definitions including `DURATION_METRIC`,
-`TRANSFER_BLOCKS_METRIC`, `TRANSFER_BYTES_METRIC`, and `STATE_METRIC`.
-Framework wrappers decide how those snapshots are mapped into their metrics
-system.
+The package exports metric definitions including `DURATION_METRIC`, `TRANSFER_BLOCKS_METRIC`, `TRANSFER_BYTES_METRIC`, and `STATE_METRIC`. Framework wrappers decide how those snapshots are mapped into their metrics system.
 
-Validate that counters increase on both success and failure paths, byte counts
-agree with block geometry, timers use seconds consistently, and disabling
-telemetry leaves the runtime behavior unchanged.
+Validate that counters increase on both success and failure paths, byte counts agree with block geometry, timers use seconds consistently, and disabling telemetry leaves the runtime behavior unchanged.
 
 ---
 
 ## Integrate with vLLM and Dynamo (optional)
 
-Complete standalone setup and validation first. Use a separate shared environment
-for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone
-development loop.
+Complete standalone setup and validation first. Use a separate shared environment for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone development loop.
 
-Select a vLLM revision that includes the merged KVCR secondary-tier adapter
-(`"type": "kvcr"`), starting with
-[`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827)
-on `main`.
-Pair it with a landed Dynamo revision such as
-[`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0),
-which supports the versioned KV hint contract and one KVCR control port per
-local data-parallel rank. The
-[quick start](quick-start.md) records a pinned combination for its container.
+Select a vLLM revision that includes the merged KVCR secondary-tier adapter (`"type": "kvcr"`), starting with [`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [quick start](quick-start.md) records a pinned combination for its container.
 
 ### Build the integration environment
 
-For details on Dynamo's Rust/Python build, see
-[Building from source](https://github.com/ai-dynamo/dynamo#building-from-source).
+For details on Dynamo's Rust/Python build, see [Building from source](https://github.com/ai-dynamo/dynamo#building-from-source).
 
 A practical workspace is:
 
 ```text
 integration-workspace/
-├── .venv/
-├── dynamo/
-├── vllm/
-└── kvcr/
+|-- .venv/
+|-- dynamo/
+|-- vllm/
+`-- kvcr/
 ```
 
 Build in this order:
 
-1. **Dynamo first.** Build its Rust bindings and install its Python package and
-   required backend extras.
-2. **vLLM second.** Install the compatible vLLM checkout in editable
-   mode. This restores the intended source tree if a Dynamo extra installed a
-   released vLLM package.
-3. **KVCR last.** Install the current checkout in editable mode into the same
-   interpreter used by vLLM workers.
-4. **Reconcile native packages.** Verify PyTorch/CUDA, FlashInfer, vLLM native
-   extensions, and NIXL after all resolver operations have completed.
+1. **Dynamo first.** Build its Rust bindings and install its Python package and required backend extras.
+2. **vLLM second.** Install the compatible vLLM checkout in editable mode. This restores the intended source tree if a Dynamo extra installed a released vLLM package.
+3. **KVCR last.** Install the current checkout in editable mode into the same interpreter used by vLLM workers.
+4. **Reconcile native packages.** Verify PyTorch/CUDA, FlashInfer, vLLM native extensions, and NIXL after all resolver operations have completed.
 
 Example commands, run from the integration workspace:
 
@@ -471,16 +339,11 @@ VLLM_USE_PRECOMPILED=1 \
 uv pip install --editable ./kvcr
 ```
 
-Precompiled vLLM artifacts must be compatible with the checkout. A customized
-branch may require an explicit wheel commit/variant or its documented native
-build. The quick start's CUDA, PyTorch, FlashInfer, and vLLM versions describe
-that validated environment rather than universal KVCR requirements.
+Precompiled vLLM artifacts must be compatible with the checkout. A customized branch may require an explicit wheel commit/variant or its documented native build. The quick start's CUDA, PyTorch, FlashInfer, and vLLM versions describe that validated environment rather than universal KVCR requirements.
 
 ### Verify a shared integration environment
 
-Run the following after Dynamo, vLLM, and KVCR are all installed. The first
-command should print frontend help and exit successfully; the remaining
-checks record import paths and native-package versions:
+Run the following after Dynamo, vLLM, and KVCR are all installed. The first command should print frontend help and exit successfully; the remaining checks record import paths and native-package versions:
 
 ```bash
 python -m dynamo.frontend --help
@@ -519,27 +382,17 @@ PY
 uv pip check --python "$VIRTUAL_ENV/bin/python"
 ```
 
-Confirm that `dynamo.vllm`, `vllm`, and `kvcr` resolve to the intended source
-checkouts. A successful import from an unintended `site-packages` copy is a
-provenance failure, even if its version string looks plausible.
+Confirm that `dynamo.vllm`, `vllm`, and `kvcr` resolve to the intended source checkouts. A successful import from an unintended `site-packages` copy is a provenance failure, even if its version string looks plausible.
 
-If the selected vLLM build provides a native extension, import that extension
-before running an end-to-end test. The extension name varies across vLLM
-revisions; use the name expected by that checkout's own verification or tests.
+If the selected vLLM build provides a native extension, import that extension before running an end-to-end test. The extension name varies across vLLM revisions; use the name expected by that checkout's own verification or tests.
 
 ### Configure and validate the integration
 
-Run integration validation when changing public KVCR contracts, the vLLM tier
-adapter, router hints, control endpoints, block-key translation, framework
-pinning, or remote transfers.
+Run integration validation when changing public KVCR contracts, the vLLM tier adapter, router hints, control endpoints, block-key translation, framework pinning, or remote transfers.
 
 #### Minimal vLLM configuration
 
-On a compatible vLLM revision, KVCR is a secondary tier behind
-`OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's
-[worker configuration](quick-start.md#4-start-a-kvcr-enabled-worker) for the
-`--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities,
-ports, and local DP ranks for your environment.
+On a compatible vLLM revision, KVCR is a secondary tier behind `OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's [worker configuration](quick-start.md#4-start-a-kvcr-enabled-worker) for the `--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities, ports, and local DP ranks for your environment.
 
 The important fields are:
 
@@ -559,35 +412,18 @@ The important fields are:
 | `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `5000`, at least twice `operation_timeout_ms` |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 
-For several local DP ranks, provide one `control_ports` entry per local rank in
-local-rank order. Every worker must advertise an address reachable from its
-peers, and every port must be unique on that host.
+For several local DP ranks, provide one `control_ports` entry per local rank in local-rank order. Every worker must advertise an address reachable from its peers, and every port must be unique on that host.
 
-The secondary tier can optionally own local G2 capacity through
-`secondary_g2_slots`, attach to a service-owned pool through
-`kvcr_service_socket_path` together with `compatibility_digest`, or configure
-file-backed storage through `g3`.
-`g3.capacity_bytes_per_file` is rounded down to whole blocks and must fit
-at least one. Blocks must be page aligned; existing nonempty files must
-match the rounded capacity.
-The vLLM adapter uses one unnamed pool per Guard, so start the guard service with
-one pool size, for example `--pool-sizes-gb 48`.
-Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes
-precedence over an in-process `secondary_g2_slots` allocation. Policy names and
-diagnostic options must match the KVCR and vLLM revisions being tested.
+The secondary tier can optionally own local G2 capacity through `secondary_g2_slots`, attach to a service-owned pool through `kvcr_service_socket_path` together with `compatibility_digest`, or configure file-backed storage through `g3`. `g3.capacity_bytes_per_file` is rounded down to whole blocks and must fit at least one. Blocks must be page aligned; existing nonempty files must match the rounded capacity. The vLLM adapter uses one unnamed pool per Guard, so start the guard service with one pool size, for example `--pool-sizes-gb 48`. Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes precedence over an in-process `secondary_g2_slots` allocation. Policy names and diagnostic options must match the KVCR and vLLM revisions being tested.
 
-The worker configuration enables its side of the contract. Dynamo must still run a
-KV-aware router that consumes KV events, selects a source and destination, and
-places the resulting plan in the request metadata. A plain round-robin router
-does not create KVCR source hints.
+The worker configuration enables its side of the contract. Dynamo must still run a KV-aware router that consumes KV events, selects a source and destination, and places the resulting plan in the request metadata. A plain round-robin router does not create KVCR source hints.
 
 Use this progression so failures are localized:
 
-1. **vLLM configuration and adapter tests** — no live router or transfer.
-2. **Dynamo router-hint tests** — verify capability and endpoint publication.
-3. **Two-worker transfer correctness** — exercise router, workers, peer
-   control, NIXL, and output correctness together.
-4. **Performance regression tests** — only after correctness is green.
+1. **vLLM configuration and adapter tests** - no live router or transfer.
+2. **Dynamo router-hint tests** - verify capability and endpoint publication.
+3. **Two-worker transfer correctness** - exercise router, workers, peer control, NIXL, and output correctness together.
+4. **Performance regression tests** - only after correctness is green.
 
 ---
 
@@ -595,40 +431,27 @@ Use this progression so failures are localized:
 
 ### KVCR cannot be imported
 
-Use the [installation checks](#verify-the-installation) to confirm the
-interpreter and import path.
+Use the [installation checks](#verify-the-installation) to confirm the interpreter and import path.
 
-If import fails, rerun `uv sync`. Confirm that the command uses the intended
-`.venv`. The import is `kvcr`, and the distribution queried through package
-metadata is `kvcr`.
+If import fails, rerun `uv sync`. Confirm that the command uses the intended `.venv`. The import is `kvcr`, and the distribution queried through package metadata is `kvcr`.
 
 ### Dependency or NIXL conflict
 
 Run the dependency checks under [Verify the installation](#verify-the-installation).
 
-Do not override the NIXL version declared by this checkout. If dependency
-metadata changed, rerun `uv sync` rather than mutating individual packages
-until the environment happens to import.
+Do not override the NIXL version declared by this checkout. If dependency metadata changed, rerun `uv sync` rather than mutating individual packages until the environment happens to import.
 
 ### The shared integration environment imports the wrong vLLM
 
-Use the [shared-environment checks](#verify-a-shared-integration-environment)
-to print import paths.
+Use the [shared-environment checks](#verify-a-shared-integration-environment) to print import paths.
 
-If vLLM resolves to an unintended released package, reinstall the selected
-vLLM checkout after Dynamo and its extras, then reinstall KVCR. This is why the
-integration build order is Dynamo → vLLM → KVCR.
+If vLLM resolves to an unintended released package, reinstall the selected vLLM checkout after Dynamo and its extras, then reinstall KVCR. This is why the integration build order is Dynamo -> vLLM -> KVCR.
 
 ### Native vLLM, PyTorch, CUDA, or FlashInfer mismatch
 
-Record versions with the
-[shared-environment checks](#verify-a-shared-integration-environment) before
-changing packages.
+Record versions with the [shared-environment checks](#verify-a-shared-integration-environment) before changing packages.
 
-Do not repair only the package named in the first import error. Reconcile the
-entire native matrix, including the vLLM source revision and its precompiled
-artifact, PyTorch's CUDA build, FlashInfer Python/cubin/JIT packages, and the
-host driver.
+Do not repair only the package named in the first import error. Reconcile the entire native matrix, including the vLLM source revision and its precompiled artifact, PyTorch's CUDA build, FlashInfer Python/cubin/JIT packages, and the host driver.
 
 ### Dynamo does not produce router hints
 
@@ -638,19 +461,14 @@ Check the contract in this order:
 2. Exactly one secondary tier advertises `router_hint` capability.
 3. `control_advertise_host` is present and reachable from other workers.
 4. `control_ports` contains one valid port per local DP rank.
-5. The worker registration visible to Dynamo includes the capability, role,
-   and global-rank-to-endpoint mapping.
-6. KV events reach the router and the source worker has overlap for the exact
-   block-key namespace used by the request.
+5. The worker registration visible to Dynamo includes the capability, role, and global-rank-to-endpoint mapping.
+6. KV events reach the router and the source worker has overlap for the exact block-key namespace used by the request.
 
-Do not infer hint delivery solely from a high router overlap score. Record the
-hint payload at the framework boundary and verify that `submit_hint()` receives
-a protocol-conforming hint and the expected request ID.
+Do not infer hint delivery solely from a high router overlap score. Record the hint payload at the framework boundary and verify that `submit_hint()` receives a protocol-conforming hint and the expected request ID.
 
 ### Peer control connection fails
 
-Distinguish bind and advertised endpoints. Binding to `0.0.0.0` does not make
-`0.0.0.0` a usable peer destination. Confirm that:
+Distinguish bind and advertised endpoints. Binding to `0.0.0.0` does not make `0.0.0.0` a usable peer destination. Confirm that:
 
 - the source listens on the configured control port;
 - the advertised address resolves from the destination process;
@@ -658,9 +476,7 @@ Distinguish bind and advertised endpoints. Binding to `0.0.0.0` does not make
 - endpoint metadata uses the expected `tcp://host:port` form; and
 - source and destination use compatible control-protocol metadata.
 
-Enable eager control connection when isolating startup/handshake failures. Test
-lazy connection separately because its cost and failures occur on the request
-path.
+Enable eager control connection when isolating startup/handshake failures. Test lazy connection separately because its cost and failures occur on the request path.
 
 ### NIXL transfer fails or delivers incorrect data
 
@@ -673,17 +489,11 @@ Capture, for each operation:
 - framework pin acquisition and release; and
 - source and destination checksums in a test environment.
 
-A successful control acknowledgement does not prove payload correctness. A
-successful NIXL submission does not prove completion. Wait for the terminal
-completion and verify the destination before exposing it to the framework.
+A successful control acknowledgement does not prove payload correctness. A successful NIXL submission does not prove completion. Wait for the terminal completion and verify the destination before exposing it to the framework.
 
 ### Remote delivery is partial
 
-Partial delivery is expected when only part of a prefix remains readable. The
-integration should consume the longest valid delivered prefix, recompute the
-missing suffix, and preserve output correctness. Diagnose reductions at each
-stage: router-planned blocks, source-resident blocks, pinned blocks, submitted
-blocks, completed blocks, and destination-published blocks.
+Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks.
 
 ### Operations time out or fail slowly
 
@@ -697,10 +507,7 @@ Use telemetry to separate:
 - active transfer; and
 - post-transfer notification.
 
-These timers can overlap and should not be summed blindly. A long source-write
-lifecycle with a short active-transfer timer usually indicates control,
-pinning, scheduling, or stale-work overhead rather than insufficient transport
-bandwidth.
+These timers can overlap and should not be summed blindly. A long source-write lifecycle with a short active-transfer timer usually indicates control, pinning, scheduling, or stale-work overhead rather than insufficient transport bandwidth.
 
 ### A test hangs or leaks resources
 
@@ -710,28 +517,19 @@ Run the smallest reproducer with detailed output:
 uv run pytest path/to/test_file.py::test_name -vv -s
 ```
 
-Check that every operation reaches a terminal state and that threads, sockets,
-mapped memory, descriptors, claims, pins, temporary files, and child processes
-are released on success, failure, timeout, and cancellation. Physical memory
-release may need to wait for NIXL quiescence even after caller-visible timeout.
+Check that every operation reaches a terminal state and that threads, sockets, mapped memory, descriptors, claims, pins, temporary files, and child processes are released on success, failure, timeout, and cancellation. Physical memory release may need to wait for NIXL quiescence even after caller-visible timeout.
 
 ### The KVCR guard service does not start
 
 Verify that:
 
 - the socket parent and pool directory exist and are writable;
-- the pool directory has capacity for every Guard's full allocation: the sum
-  of `--pool-sizes-gb` plus one 100 MiB journal. A group changing hands briefly
-  appends its handback snapshot past that size;
-  where there is no room for it, that handover comes back cold and the
-  service carries on;
+- the pool directory has capacity for every Guard's full allocation: the sum of `--pool-sizes-gb` plus one 100 MiB journal. A group changing hands briefly appends its handback snapshot past that size; where there is no room for it, that handover comes back cold and the service carries on;
 - another process is not listening on the socket;
 - `--guard-count` is at least one; and
-- every `--pool-sizes-gb` item is positive, finite, and at least one memory
-  page.
+- every `--pool-sizes-gb` item is positive, finite, and at least one memory page.
 
-The service removes a stale socket only after confirming no live service is
-listening. It refuses to replace a socket owned by another live service.
+The service removes a stale socket only after confirming no live service is listening. It refuses to replace a socket owned by another live service.
 
 ### Minimum diagnostic record
 
@@ -744,9 +542,6 @@ When asking another developer to reproduce a failure, include:
 - the focused command that reproduces the issue;
 - source, destination, router, and test logs with aligned timestamps;
 - operation outcome and duration telemetry; and
-- whether failure occurs in standalone tests, adapter tests, router tests, or
-  only the full transfer path.
+- whether failure occurs in standalone tests, adapter tests, router tests, or only the full transfer path.
 
-This information normally identifies whether the fault is packaging,
-configuration, routing, peer control, pinning, data transfer, policy, or
-cleanup before a full serving stack is involved.
+This information normally identifies whether the fault is packaging, configuration, routing, peer control, pinning, data transfer, policy, or cleanup before a full serving stack is involved.

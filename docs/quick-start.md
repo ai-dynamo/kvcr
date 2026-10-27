@@ -1,20 +1,13 @@
 # KVCR Quick Start
 
-This guide builds and runs a container containing KV Cache Runner (KVCR),
-Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack
-without editing source code in any of those projects.
+This guide builds and runs a container containing KV Cache Runner (KVCR), Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack without editing source code in any of those projects.
 
 > [!IMPORTANT]
-> This is a public preview using vLLM's supported KVCR secondary-tier adapter.
-> The container recipe pins the exact adapter, vLLM base image, and landed
-> Dynamo revision validated together for this guide.
+> This is a public preview using vLLM's supported KVCR secondary-tier adapter. The container recipe pins the exact adapter, vLLM base image, and landed Dynamo revision validated together for this guide.
 
-For source builds, editable installs, API development, or test workflows, use
-the [developer guide](dev-guide.md).
+For source builds, editable installs, API development, or test workflows, use the [developer guide](dev-guide.md).
 
-For a proposed Kubernetes deployment with an optional KVCR guard service sidecar, see
-[Dynamo PR #14695](https://github.com/ai-dynamo/dynamo/pull/14695).
-That example requires a compatible prebuilt Dynamo vLLM runtime image.
+For a proposed Kubernetes deployment with an optional KVCR guard service sidecar, see [Dynamo PR #14695](https://github.com/ai-dynamo/dynamo/pull/14695). That example requires a compatible prebuilt Dynamo vLLM runtime image.
 
 ---
 
@@ -22,18 +15,12 @@ That example requires a compatible prebuilt Dynamo vLLM runtime image.
 
 - A Linux x86-64 host with at least two supported NVIDIA GPUs;
 - NVIDIA driver 580.126.20 or newer for the pinned CUDA 13.0.3 runtime;
-- Docker Engine with the
-  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
+- Docker Engine with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
 - Git, curl, and Python 3 for the build and verification commands;
-- network access to GitHub, PyPI, Docker Hub, crates.io, Debian package mirrors,
-  and the model source; and
-- enough free disk space for the multi-gigabyte Dynamo/vLLM image and its build
-  layers.
+- network access to GitHub, PyPI, Docker Hub, crates.io, Debian package mirrors, and the model source; and
+- enough free disk space for the multi-gigabyte Dynamo/vLLM image and its build layers.
 
-The example below runs two data-parallel ranks on one host, so it requires two
-visible GPUs. It uses loopback addresses, a 2 GB host tier per rank, and an 8 GB
-shared-memory allocation for both ranks' host allocations plus vLLM IPC.
-Adjust the model, memory, and network addresses for the target system.
+The example below runs two data-parallel ranks on one host, so it requires two visible GPUs. It uses loopback addresses, a 2 GB host tier per rank, and an 8 GB shared-memory allocation for both ranks' host allocations plus vLLM IPC. Adjust the model, memory, and network addresses for the target system.
 
 Run the commands below from the KVCR repository root.
 
@@ -41,9 +28,7 @@ Run the commands below from the KVCR repository root.
 
 ## 1. Build the integration image
 
-The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start).
-The build fetches pinned adapter source and applies it to the base image.
-Pass the public repository and exact revision explicitly:
+The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start). The build fetches pinned adapter source and applies it to the base image. Pass the public repository and exact revision explicitly:
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
@@ -57,17 +42,13 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-No private-repository credentials are required. The first build uses pinned,
-tested vLLM and Dynamo revisions and may take several minutes. Continue only if
-its final compatibility checks pass.
+No private-repository credentials are required. The first build uses pinned, tested vLLM and Dynamo revisions and may take several minutes. Continue only if its final compatibility checks pass.
 
 ---
 
 ## 2. Start the container
 
-Create a persistent model-cache volume, then start one container with host
-networking, all GPUs visible, and enough shared memory for both ranks' host
-allocations:
+Create a persistent model-cache volume, then start one container with host networking, all GPUs visible, and enough shared memory for both ranks' host allocations:
 
 ```bash
 docker volume create kvcr-hf-cache
@@ -84,13 +65,9 @@ docker run --detach \
   kvcr-quick-start:local infinity
 ```
 
-For a gated model, export `HF_TOKEN` on the host and add `--env HF_TOKEN` to
-the `docker run` command. The image defaults to TCP requests, ZMQ events, and
-file discovery at `/tmp/dynamo-kvcr-quick-start`; every `docker exec` shell
-inherits those settings.
+For a gated model, export `HF_TOKEN` on the host and add `--env HF_TOKEN` to the `docker run` command. The image defaults to TCP requests, ZMQ events, and file discovery at `/tmp/dynamo-kvcr-quick-start`; every `docker exec` shell inherits those settings.
 
-The rest of this guide uses three terminals: one container shell for the
-frontend, one for the worker, and one host shell for requests.
+The rest of this guide uses three terminals: one container shell for the frontend, one for the worker, and one host shell for requests.
 
 ---
 
@@ -110,9 +87,7 @@ env -u NATS_SERVER python3 -m dynamo.frontend \
   --http-port 8000
 ```
 
-This quick-start integration requires Dynamo's KV-aware router because it
-supplies the request-scoped source hints used for remote reuse. A round-robin
-router or vLLM's `consistent_hash` router does not produce those hints.
+This quick-start integration requires Dynamo's KV-aware router because it supplies the request-scoped source hints used for remote reuse. A round-robin router or vLLM's `consistent_hash` router does not produce those hints.
 
 ---
 
@@ -124,9 +99,7 @@ Open the worker terminal and enter the same container:
 docker exec -it kvcr-quick-start bash
 ```
 
-Define the model and the two vLLM configurations. This example downloads a
-small model into the persistent cache on first use; `MODEL` may instead name a
-compatible local path mounted into the container.
+Define the model and the two vLLM configurations. This example downloads a small model into the persistent cache on first use; `MODEL` may instead name a compatible local path mounted into the container.
 
 ```bash
 export MODEL=Qwen/Qwen3-0.6B
@@ -161,8 +134,7 @@ export KV_EVENTS_CONFIG='{
 }'
 ```
 
-Launch two data-parallel ranks with DEBUG logging to show transfer metrics even
-when the source rank is idle:
+Launch two data-parallel ranks with DEBUG logging to show transfer metrics even when the source rank is idle:
 
 ```bash
 env -u NATS_SERVER CUDA_VISIBLE_DEVICES=0,1 VLLM_LOGGING_LEVEL=DEBUG \
@@ -191,17 +163,13 @@ The important relationships are:
 | `control_advertise_host` | Is reachable by peer workers; loopback is valid only on one host |
 | KV events endpoint | Does not overlap the control-port range |
 
-This configuration intentionally omits `secondary_g2_slots` and `g3`. It tests
-KVCR peer transfer between the ranks' vLLM-owned host tiers, not KVCR-owned
-local persistence.
+This configuration intentionally omits `secondary_g2_slots` and `g3`. It tests KVCR peer transfer between the ranks' vLLM-owned host tiers, not KVCR-owned local persistence.
 
 ---
 
 ## 5. Verify a KVCR peer to peer transfer
 
-In the host request terminal, set `MODEL` to the same value used in Step 4;
-replace the example below if you chose a different model. Then make an inference
-request to read the registered worker ID shared by both DP ranks:
+In the host request terminal, set `MODEL` to the same value used in Step 4; replace the example below if you chose a different model. Then make an inference request to read the registered worker ID shared by both DP ranks:
 
 ```bash
 export MODEL=Qwen/Qwen3-0.6B
@@ -216,8 +184,7 @@ WORKER_ID=$(
 export WORKER_ID
 ```
 
-Use a fresh prefix spanning several complete blocks. Send it first to DP rank 0,
-then send the shared prefix to DP rank 1:
+Use a fresh prefix spanning several complete blocks. Send it first to DP rank 0, then send the shared prefix to DP rank 1:
 
 ```bash
 PREFIX=$(python3 -c 'import uuid; tag = uuid.uuid4().hex; print(" ".join(f"{tag} section{i} cache routing data" for i in range(80)))')
@@ -240,8 +207,7 @@ curl --fail --silent --show-error \
   -d "{\"model\":\"$MODEL\",\"prompt\":\"$PREFIX retrieve on target\",\"max_tokens\":8,\"temperature\":0,\"nvext\":{\"extra_fields\":[\"worker_id\"]}}"
 ```
 
-A successful run prints two JSON responses. The generated text, IDs, and exact
-token counts vary. These are the relevant fields from one validated run:
+A successful run prints two JSON responses. The generated text, IDs, and exact token counts vary. These are the relevant fields from one validated run:
 
 Rank 0 seed:
 
@@ -271,20 +237,9 @@ Rank 1 retrieval:
 }
 ```
 
-The unchanged `decode_worker_id` is expected because both DP ranks belong to
-the same worker endpoint. The change from `decode_dp_rank: 0` to
-`decode_dp_rank: 1` confirms that the headers selected the requested ranks.
-The seed has zero cached tokens because its prefix is fresh. In the retrieval,
-2,624 cached tokens means rank 1 accepted 41 complete 64-token blocks. The
-exact value may differ, but it must be positive and block-aligned. If the
-retrieval reports zero cached tokens, rank selection worked but this test did
-not demonstrate KVCR reuse. Generate a new `PREFIX` before retrying so rank 1
-cannot satisfy the retry from KV it computed locally.
+The unchanged `decode_worker_id` is expected because both DP ranks belong to the same worker endpoint. The change from `decode_dp_rank: 0` to `decode_dp_rank: 1` confirms that the headers selected the requested ranks. The seed has zero cached tokens because its prefix is fresh. In the retrieval, 2,624 cached tokens means rank 1 accepted 41 complete 64-token blocks. The exact value may differ, but it must be positive and block-aligned. If the retrieval reports zero cached tokens, rank selection worked but this test did not demonstrate KVCR reuse. Generate a new `PREFIX` before retrying so rank 1 cannot satisfy the retry from KV it computed locally.
 
-These headers constrain the KV router; they do not bypass it. For the retrieval,
-the router can still identify rank 0 as the source and provide its source hint
-to rank 1. The response is useful evidence, but terminal telemetry is the final
-proof. The relevant post-request `KV Transfer metrics` from that run contained:
+These headers constrain the KV router; they do not bypass it. For the retrieval, the router can still identify rank 0 as the source and provide its source hint to rank 1. The response is useful evidence, but terminal telemetry is the final proof. The relevant post-request `KV Transfer metrics` from that run contained:
 
 ```text
 source rank 0:
@@ -299,22 +254,11 @@ destination rank 1:
   vllm:kv_offload_tiering_read_bytes:('1:kvcr',)=300941312
 ```
 
-The exact counts may differ, but the source and destination block counts must
-match, as must the source-write and destination-read byte counts. There must be
-no positive `remote_deliver` `partial` or `failed` count. These values reset
-after each reporting interval, so inspect the interval or intervals covering
-the retrieval instead of subtracting two log lines.
+The exact counts may differ, but the source and destination block counts must match, as must the source-write and destination-read byte counts. There must be no positive `remote_deliver` `partial` or `failed` count. These values reset after each reporting interval, so inspect the interval or intervals covering the retrieval instead of subtracting two log lines.
 
-Because this peer-only configuration has no KVCR-owned local tier, the same log
-can contain `kv_offload_tiering_cascade_job_failures` for the unused local
-deposit path. That counter is separate from peer delivery and does not
-invalidate the matching successful transfer above.
+Because this peer-only configuration has no KVCR-owned local tier, the same log can contain `kv_offload_tiering_cascade_job_failures` for the unused local deposit path. That counter is separate from peer delivery and does not invalidate the matching successful transfer above.
 
-The explicit rank selection is only for this deterministic mechanism test. In
-a normal deployment, omit the two routing headers. KVCR transfers can occur
-when load, availability, or routing constraints cause the KV router to select a
-target other than the cache-owning worker. Verify transfers using the same
-telemetry criteria above.
+The explicit rank selection is only for this deterministic mechanism test. In a normal deployment, omit the two routing headers. KVCR transfers can occur when load, availability, or routing constraints cause the KV router to select a target other than the cache-owning worker. Verify transfers using the same telemetry criteria above.
 
 ---
 
@@ -322,51 +266,35 @@ telemetry criteria above.
 
 ### The image does not build
 
-- Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach
-  the public vLLM source, Dynamo's GitHub repository, and PyPI.
-- Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and
-  `KVCR_VLLM_REF` is the pinned adapter commit SHA in the build step above.
-- Read the final compatibility-check output. It identifies whether the Dynamo
-  router build, the vLLM adapter, or KVCR failed.
-- Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together. Overriding
-  only one can produce an importable but incorrect runtime path.
-- Do not bypass the import and compatibility canary. A successfully created
-  layer is not sufficient if the assembled serving path is inconsistent.
+- Confirm that the host can pull the pinned `vllm/vllm-openai` image and reach the public vLLM source, Dynamo's GitHub repository, and PyPI.
+- Confirm that `KVCR_VLLM_REPO` is the public vLLM repository and `KVCR_VLLM_REF` is the pinned adapter commit SHA in the build step above.
+- Read the final compatibility-check output. It identifies whether the Dynamo router build, the vLLM adapter, or KVCR failed.
+- Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together. Overriding only one can produce an importable but incorrect runtime path.
+- Do not bypass the import and compatibility canary. A successfully created layer is not sufficient if the assembled serving path is inconsistent.
 
 ### The KVCR tier does not initialize
 
 - Verify that the package imports as `kvcr`.
-- Verify that vLLM registers the `"kvcr"` secondary tier; installing
-  `kvcr` alone does not add the adapter to vLLM.
-- Ensure shared memory covers every per-rank `cpu_bytes_to_use` allocation plus
-  vLLM IPC; this two-rank example provisions 8 GB.
+- Verify that vLLM registers the `"kvcr"` secondary tier; installing `kvcr` alone does not add the adapter to vLLM.
+- Ensure shared memory covers every per-rank `cpu_bytes_to_use` allocation plus vLLM IPC; this two-rank example provisions 8 GB.
 - Make `control_ports` a list with exactly one entry per local DP rank.
 - Check that every control and KV-events port is unique and available.
 - Confirm that the installed NIXL version matches the `kvcr` pin.
 
 ### Dynamo does not produce router hints
 
-- Use `--router-mode kv`; round-robin and `vllm-router` do not create KVCR
-  source hints.
+- Use `--router-mode kv`; round-robin and `vllm-router` do not create KVCR source hints.
 - Keep `self_describing_kv_events` and KV event publication enabled.
-- Confirm that the registered worker advertises `router_hint` and its control
-  endpoints.
+- Confirm that the registered worker advertises `router_hint` and its control endpoints.
 - Use a shared prefix longer than one full vLLM block.
 - Confirm that the source still owns or can pin the exact hinted block keys.
 
-A high overlap score alone does not prove hint delivery. Check that the vLLM
-adapter passes the source endpoint, request ID, mode, and keys into KVCR.
+A high overlap score alone does not prove hint delivery. Check that the vLLM adapter passes the source endpoint, request ID, mode, and keys into KVCR.
 
 ### Peer control connects but transfer fails
 
-Binding to `0.0.0.0` does not make it a usable destination. Peers must connect
-to `control_advertise_host`, and that address must resolve and route from the
-destination process.
+Binding to `0.0.0.0` does not make it a usable destination. Peers must connect to `control_advertise_host`, and that address must resolve and route from the destination process.
 
-A successful control acknowledgement does not prove payload correctness, and
-a successful NIXL submission does not prove completion. Check the source pin,
-memory descriptors, NIXL terminal status, and destination data before exposing
-the block to vLLM.
+A successful control acknowledgement does not prove payload correctness, and a successful NIXL submission does not prove completion. Check the source pin, memory descriptors, NIXL terminal status, and destination data before exposing the block to vLLM.
 
-For the full diagnostic checklist, see the
-[developer guide](dev-guide.md#troubleshooting).
+For the full diagnostic checklist, see the [developer guide](dev-guide.md#troubleshooting).
