@@ -2,7 +2,7 @@
 
 This guide is for developers who are comfortable with Python, Linux, and inference engines such as vLLM, but are new to KV Cache Runner (KVCR). It covers the local development path from environment setup through standalone validation.
 
-To try the integrated stack without modifying source, follow the [quick start](quick-start.md).
+To try the integrated stack without modifying source, follow the [vLLM quick start](quick-start-vllm.md).
 
 ---
 
@@ -295,7 +295,7 @@ Validate that counters increase on both success and failure paths, byte counts a
 
 Complete standalone setup and validation first. Use a separate shared environment for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone development loop.
 
-Select a vLLM revision that includes the merged KVCR secondary-tier adapter (`"type": "kvcr"`), starting with [`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [quick start](quick-start.md) records a pinned combination for its container.
+Select a vLLM revision that includes the merged KVCR secondary-tier adapter (`"type": "kvcr"`), starting with [`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
 
 ### Build the integration environment
 
@@ -392,7 +392,7 @@ Run integration validation when changing public KVCR contracts, the vLLM tier ad
 
 #### Minimal vLLM configuration
 
-On a compatible vLLM revision, KVCR is a secondary tier behind `OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's [worker configuration](quick-start.md#4-start-a-kvcr-enabled-worker) for the `--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities, ports, and local DP ranks for your environment.
+On a compatible vLLM revision, KVCR is a secondary tier behind `OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's [worker configuration](quick-start-vllm.md#4-start-a-kvcr-enabled-worker) for the `--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities, ports, and local DP ranks for your environment.
 
 The important fields are:
 
