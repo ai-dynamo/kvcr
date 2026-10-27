@@ -44,36 +44,23 @@ _GENERATION = "a" * 32
 _TEST_DIGEST = "Opaque-Digest"
 
 
-def test_multi_piece_g3_recovery_round_trip_and_legacy_reader():
+def test_multi_piece_g3_recovery_round_trip():
     record = _BlockRecord(
-        g3=_G3Residency(1, layout=("full", "swa:a", "swa:b"), extra_slots=(3, 5, 7)),
+        g3=_G3Residency(("full", "swa:a", "swa:b"), (1, 3, 5, 7)),
         position=12,
     )
     payload = msgspec.msgpack.encode(_project_recovery_record(record))
     assert _decode_recovery_record(payload, ("full", "swa")) == record
 
-    class LegacyRecord(msgspec.Struct, array_like=True):
-        g2: list[tuple[str, int]] | None = None
-        g3: int | None = None
-        position: int = -1
-
-    # An older process must drop the new disk entry, never read a partial key.
-    assert msgspec.msgpack.decode(payload, type=LegacyRecord).g3 is None
-    legacy = _recovered_record(g3=2)
-    assert (
-        _decode_recovery_record(msgspec.msgpack.encode([None, 2, -1]), ("full",))
-        == legacy
-    )
-
 
 @pytest.mark.parametrize(
     "wire",
     [
-        [None, None, -1, ["full"], None],
-        [None, None, -1, None, [0]],
-        [None, 0, -1, ["full"], [0]],
-        [None, None, -1, ["missing"], [0]],
-        [None, None, -1, ["swa:a", "swa:a"], [0, 1]],
+        [None, 0, -1],
+        [None, [["full"], []], -1],
+        [None, [[], [0]], -1],
+        [None, [["missing"], [0]], -1],
+        [None, [["swa:a", "swa:a"], [0, 1]], -1],
     ],
 )
 def test_multi_piece_g3_recovery_rejects_incomplete_or_invalid_metadata(wire):
@@ -184,8 +171,8 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     caplog.set_level("WARNING", logger="kvcr.recovery_journal")
 
     local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]))
-    g3.emit(key, _recovered_record(g2=[("pool0", 2)], g3=7))
-    local_dram.emit(key, _recovered_record(g3=7))
+    g3.emit(key, _recovered_record(g2=[("pool0", 2)], g3=7, g3_pool="pool0"))
+    local_dram.emit(key, _recovered_record(g3=7, g3_pool="pool0"))
     g3.emit(key, _BlockRecord())
     frames = [journal.read_next() for _ in range(4)]
     assert journal.read_next() is None
@@ -193,8 +180,8 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
         _decode_recovery_record(payload, ("pool0",)) for _, _, payload in frames
     ] == [
         _recovered_record(g2=[("pool0", 2)]),
-        _recovered_record(g2=[("pool0", 2)], g3=7),
-        _recovered_record(g3=7),
+        _recovered_record(g2=[("pool0", 2)], g3=7, g3_pool="pool0"),
+        _recovered_record(g3=7, g3_pool="pool0"),
         _BlockRecord(),
     ]
     assert caplog.messages == []
@@ -352,8 +339,10 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
         records = {
             BlockKey(b"a" * 32): _recovered_record(g2=[("pool0", 3)]),
             # One with both halves, one only on disk.
-            BlockKey(b"b" * 32): _recovered_record(g2=[("pool0", 4)], g3=9),
-            BlockKey(b"c" * 32): _recovered_record(g3=2),
+            BlockKey(b"b" * 32): _recovered_record(
+                g2=[("pool0", 4)], g3=9, g3_pool="pool0"
+            ),
+            BlockKey(b"c" * 32): _recovered_record(g3=2, g3_pool="pool0"),
         }
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
         written = [r for r in caplog.records if "snapshot_written " in r.message]

@@ -929,7 +929,7 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
     for residency in (
         _BlockRecord(),
         _LocalDramResidency([("", 0)], _LocalDramState.READY),
-        _G3Residency(0),
+        _G3Residency(("",), (0,)),
         _FwMemResidency([_mem_descriptor()], object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__

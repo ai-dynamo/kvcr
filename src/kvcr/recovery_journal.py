@@ -74,9 +74,8 @@ _RECORD_BLOCK = 1
 _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 
 
-# Arrays avoid repeating field names in the bounded ring. Field order is the
-# format: append only, never reorder or remove. G2 cost grows with its location
-# count and pool-name lengths.
+# Arrays avoid repeating field names in the bounded ring. G3 stores its complete
+# layout and slots; recovery records from the old single-slot format are rejected.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     # Ordered (full descriptor label, slot) pairs, or nothing. Pools may repeat.
     g2: (
@@ -86,17 +85,17 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
         ]
         | None
     ) = None
-    g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
-    position: Annotated[int, msgspec.Meta(ge=-1)] = -1
-    # Multi-piece records leave legacy g3 unset, so older readers drop the disk
-    # residency instead of treating its first unit as a complete block.
-    g3_layout: Annotated[tuple[str, ...], msgspec.Meta(min_length=1)] | None = None
-    g3_slots: (
-        Annotated[
-            tuple[Annotated[int, msgspec.Meta(ge=0)], ...], msgspec.Meta(min_length=1)
+    g3: (
+        tuple[
+            Annotated[tuple[str, ...], msgspec.Meta(min_length=1)],
+            Annotated[
+                tuple[Annotated[int, msgspec.Meta(ge=0)], ...],
+                msgspec.Meta(min_length=1),
+            ],
         ]
         | None
     ) = None
+    position: Annotated[int, msgspec.Meta(ge=-1)] = -1
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
@@ -124,7 +123,6 @@ def _is_recoverable(record: _BlockRecord) -> bool:
 
 def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
     disk = record.g3
-    extended = disk is not None and bool(disk.layout or disk.extra_slots)
     local_dram = record.local_dram
     complete = (
         local_dram is not None
@@ -133,10 +131,8 @@ def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
     )
     return _RecoveryBlock(
         g2=local_dram.slots if complete else None,
-        g3=disk.slot if disk is not None and not extended else None,
+        g3=(disk.layout, disk.slots) if disk is not None else None,
         position=record.position,
-        g3_layout=disk.layout if extended else None,
-        g3_slots=disk.slots if extended else None,
     )
 
 
@@ -144,17 +140,8 @@ def _decode_recovery_record(
     payload: bytes, pool_names: tuple[str, ...]
 ) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
-    if (recovered.g3_layout is None) != (recovered.g3_slots is None):
-        raise ValueError("incomplete G3 recovery layout")
-    if recovered.g3 is not None and recovered.g3_slots is not None:
-        raise ValueError("ambiguous G3 recovery layout")
-    disk = _G3Residency(recovered.g3) if recovered.g3 is not None else None
-    if recovered.g3_slots is not None:
-        disk = _G3Residency(
-            recovered.g3_slots[0],
-            layout=recovered.g3_layout,
-            extra_slots=recovered.g3_slots[1:],
-        )
+    disk = _G3Residency(*recovered.g3) if recovered.g3 is not None else None
+    if disk is not None:
         labels = set()
         for label in disk.layout:
             pool, separator, part = label.partition(":")

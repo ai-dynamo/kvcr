@@ -44,14 +44,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class _G3Residency:
-    slot: int
+    layout: tuple[str, ...]
+    slots: tuple[int, ...]
     claim_count: int = 0
-    layout: tuple[str, ...] = ()
-    extra_slots: tuple[int, ...] = ()
-
-    @property
-    def slots(self) -> tuple[int, ...]:
-        return (self.slot, *self.extra_slots)
 
 
 @dataclass(frozen=True)
@@ -229,56 +224,43 @@ class _G3:
 
     def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Validate complete per-key layouts before adopting their disk units."""
+        total_slots = self._total_slots
         occupied: set[int] = set()
         for record in records.values():
             residency = record.g3
             if residency is None:
                 continue
-            layout = self._layout(residency)
+            layout = list(residency.layout)
             self._kvcr._validate_expected_layout(layout)
-            slots = residency.slots
-            required = (
-                sum(
-                    self._kvcr._block_sizes[label.partition(":")[0]] for label in layout
-                )
-                // self._slot_size
-            )
-            if (
-                len(slots) != required
-                or any(
-                    type(slot) is not int
-                    or not 0 <= slot < self._total_slots
-                    or slot in occupied
-                    for slot in slots
-                )
-                or len(set(slots)) != len(slots)
+            if self._size_bytes(residency) != sum(
+                self._kvcr._block_sizes[label.partition(":")[0]] for label in layout
             ):
                 raise ValueError("invalid G3 recovery slots")
+            for slot in residency.slots:
+                if (
+                    type(slot) is not int
+                    or not 0 <= slot < total_slots
+                    or slot in occupied
+                ):
+                    raise ValueError("invalid G3 recovery slots")
+                occupied.add(slot)
             if (
                 record.local_dram is not None
-                and tuple(layout) != record.local_dram.key_layout
+                and residency.layout != record.local_dram.key_layout
             ):
                 raise ValueError("G3 recovery layout does not match local DRAM")
-            occupied.update(slots)
         self._free_slots = deque(
-            slot for slot in range(self._total_slots) if slot not in occupied
+            slot for slot in range(total_slots) if slot not in occupied
         )
 
-    def _layout(self, residency: _G3Residency) -> list[str]:
-        if residency.layout:
-            return list(residency.layout)
-        if len(self._kvcr._block_sizes) != 1:
-            raise ValueError("multi-pool G3 recovery requires an explicit layout")
-        return list(self._kvcr._block_sizes)
-
     def _size_bytes(self, residency: _G3Residency) -> int:
-        return (1 + len(residency.extra_slots)) * self._slot_size
+        return len(residency.slots) * self._slot_size
 
     def _piece_slots(self, residency: _G3Residency) -> list[tuple[int, ...]]:
         slots = residency.slots
         pieces = []
         offset = 0
-        for label in self._layout(residency):
+        for label in residency.layout:
             count = self._kvcr._block_sizes[label.partition(":")[0]] // self._slot_size
             pieces.append(slots[offset : offset + count])
             offset += count
@@ -364,7 +346,7 @@ class _G3:
         return (
             record is not None
             and record.g3 is not None
-            and (layout is None or tuple(self._layout(record.g3)) == layout)
+            and (layout is None or record.g3.layout == layout)
         )
 
     def telemetry_state(self) -> dict[str, int]:
@@ -499,30 +481,36 @@ class _G3:
         deadline: float,
     ) -> bool:
         claims, rejected = self._claim(tuple(blocks))
+        accepted = []
         memory_descriptors = []
         file_descriptors = []
         for claim in claims:
             refs = blocks[claim.key]
             indices = _layout_indices(
-                self._layout(claim.residency), [ref.label for ref in refs]
+                list(claim.residency.layout), [ref.label for ref in refs]
             )
             if indices is None:
+                self._release_claims((claim,))
                 rejected += (claim.key,)
                 continue
+            accepted.append(claim)
             pieces = self._piece_slots(claim.residency)
             for ref, index in zip(refs, indices, strict=True):
                 memory_descriptors.extend(self._memory_chunks(ref))
                 file_descriptors.extend(
                     self._descriptor(slot) for slot in pieces[index]
                 )
-        # A native transfer has one destination memory type. Preserve the existing
-        # rejection of mixed DRAM/VRAM batches before exposing any destination.
-        if (
-            rejected
-            or not claims
-            or not memory_descriptors
-            or len({descriptor.mem_type for descriptor in memory_descriptors}) != 1
-        ):
+        claims = tuple(accepted)
+        if rejected:
+            if kind == "fill":
+                self._release_claims(claims)
+                return False
+            self._kvcr._joined_completions.setdefault(op_handle, (set(blocks), {}))
+            self._kvcr._complete(op_handle, dict.fromkeys(rejected, _FAILED_RESULT))
+        if not claims:
+            return True
+        # A native transfer requires a single destination memory type.
+        if len({descriptor.mem_type for descriptor in memory_descriptors}) != 1:
             self._release_claims(claims)
             return False
         lifecycle_handle = None
@@ -537,7 +525,7 @@ class _G3:
             )
         op = _G3TransferOp(
             op_id=(f"g3_{kind}", op_handle),
-            keys=frozenset(blocks),
+            keys=frozenset(item.key for item in claims),
             kind=kind,
             ordered_keys=tuple(item.key for item in claims),
             memory_descriptors=tuple(memory_descriptors),
@@ -670,29 +658,21 @@ class _G3:
             if record is None or record.g3 is not None or key in self._pending_keys:
                 continue
             required = self._kvcr._descriptor_bytes(refs) // self._slot_size
-            if required > self._total_slots:
+            if required > len(self._free_slots):
+                self._retry_unscored()
+            if required > len(self._free_slots) + self._evictable_slots:
                 continue
             slots = []
             for _ in range(required):
-                slot = self._allocate_slot(protected)
-                if slot is None:
+                if (slot := self._allocate_slot(protected)) is None:
                     break
                 slots.append(slot)
             if len(slots) != required:
                 self._free_slots.extend(slots)
                 continue
             layout = tuple(ref.label for ref in refs)
-            if len(self._kvcr._block_sizes) == 1 and layout == tuple(
-                self._kvcr._block_sizes
-            ):
-                layout = ()  # Preserve legacy single-slot recovery records.
             self._pending_keys.add(key)
-            reservations.append(
-                _Reservation(
-                    key,
-                    _G3Residency(slots[0], layout=layout, extra_slots=tuple(slots[1:])),
-                )
-            )
+            reservations.append(_Reservation(key, _G3Residency(layout, tuple(slots))))
         return tuple(reservations)
 
     def _allocate_slot(self, protected: frozenset[BlockKey]) -> int | None:
@@ -721,8 +701,8 @@ class _G3:
                 )
                 self._kvcr._publish_inventory((key,), CacheTier.G3, removed=True)
                 self._kvcr._prune_block_record(key)
-                self._free_slots.extend(residency.extra_slots)
-                return residency.slot
+                self._free_slots.extend(residency.slots)
+                return self._free_slots.popleft()
         return None
 
     def _commit(self, reservation: _Reservation) -> None:
@@ -783,13 +763,13 @@ class _G3:
             return
         self._unscored.discard(key)
         if self._evictable.insert(key, score):
-            self._evictable_slots += 1 + len(residency.extra_slots)
+            self._evictable_slots += len(residency.slots)
 
     def _remove_evictable(self, key: BlockKey) -> None:
         self._unscored.discard(key)
         if self._evictable.remove(key):
             residency = self._kvcr._block_record_map[key].g3
-            self._evictable_slots -= 1 + len(residency.extra_slots)
+            self._evictable_slots -= len(residency.slots)
 
     def _retry_unscored(self) -> None:
         for key in tuple(self._unscored):

@@ -718,7 +718,11 @@ class _KVCRCore:
                     and residency.ready_indices(requested) is not None
                 ):
                     continue
-                if self._g3 is not None and self._g3.is_ready(key, declaration):
+                if self._g3 is not None and self._g3.is_ready(key):
+                    if not self._g3.is_ready(key, declaration):
+                        raise ValueError(
+                            "fetch layout must match existing G3 key layout"
+                        )
                     sources[key] = CacheTier.G3
                 elif request_id is not None and self._remote_fw_dram.query(
                     key, request_id
