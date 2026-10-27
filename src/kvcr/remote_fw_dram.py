@@ -185,8 +185,8 @@ class _RemoteFWDram:
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
-        if options.pinless_guard_sources:
-            logger.info("KVCR_EVENT pinless_guard_sources_enabled")
+        if options.no_pinning_mode:
+            logger.info("KVCR_EVENT no_pinning_mode_enabled")
             self._record_progress_counter(
                 "kvcr_guard_source_events", 0, ("source_callback_violation",)
             )
@@ -853,7 +853,7 @@ class _RemoteFWDram:
                 self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
-        if self._options.pinless_guard_sources:
+        if self._options.no_pinning_mode:
             self._start_guard_source_write(
                 progress,
                 op_id,
@@ -888,7 +888,7 @@ class _RemoteFWDram:
     def _guard_event(self, event: str, op: _SourceWriteOp, count: int = 1) -> None:
         self._record_progress_counter("kvcr_guard_source_events", count, (event,))
         logger.info(
-            "KVCR_EVENT pinless_guard_source event=%s source_op=%d target_op=%d "
+            "KVCR_EVENT no_pinning_mode event=%s source_op=%d target_op=%d "
             "count=%d requested=%d completed_indices=%s",
             event,
             op.op_id[1],
@@ -984,13 +984,13 @@ class _RemoteFWDram:
         self._guard_event("native_cleanup", op, len(claims))
 
     def _guard_source_callback(self, stage: str) -> bool:
-        if not self._options.pinless_guard_sources:
+        if not self._options.no_pinning_mode:
             return False
         self._record_progress_counter(
             "kvcr_guard_source_events", 1, ("source_callback_violation",)
         )
         logger.error(
-            "KVCR_EVENT pinless_guard_source source_callback_violation stage=%s", stage
+            "KVCR_EVENT no_pinning_mode source_callback_violation stage=%s", stage
         )
         return True
 

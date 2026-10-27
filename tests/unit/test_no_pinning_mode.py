@@ -44,7 +44,7 @@ def source_factory():
             pinning,
             control,
             name="source",
-            remote_options=RemoteFWDramOptions(pinless_guard_sources=True),
+            remote_options=RemoteFWDramOptions(no_pinning_mode=True),
             framework_regions=[RegionDescriptor(addr=address, size=16, count=2)],
             local_dram=LocalDramOptions([("", address, 16)]),
         )
@@ -84,7 +84,7 @@ def _request(control, keys, *, handle=12, **extra):
 
 @pytest.mark.parametrize("recovered", [False, True])
 def test_ready_subset_serves_without_framework_handoff(source_factory, recovered):
-    assert not RemoteFWDramOptions().pinless_guard_sources
+    assert not RemoteFWDramOptions().no_pinning_mode
     source, agent, control, pinning, address = source_factory(recovered)
     before = len(agent.xfers)
     with source._core._state_lock:
