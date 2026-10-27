@@ -361,7 +361,10 @@ class _RemoteFWDram:
                     # KVCR-owned contents stay claimed until native quiescence.
                     pins = self._fw_pins_by_op.pop(item.op_id, None)
                     if item.state is _SourceWriteState.FINISHED:
-                        self._kvcr._remove_block_dependencies(item)
+                        if item.key_dependencies:
+                            self._kvcr._remove_block_dependencies(item)
+                        else:
+                            self._kvcr._outstanding_operations -= 1
                         if item.success:
                             self._kvcr._record_access(
                                 self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
@@ -910,13 +913,14 @@ class _RemoteFWDram:
                 selected = [selected[i] for i in completed_indices]
                 source_pin.keys = frozenset(ordered_keys)
             sources = kvcr._claim_local_dram_sources(
-                source_pin.op_id, ordered_keys, notify_capacity=False
+                source_pin.op_id, ordered_keys, notify_capacity=False, keep_queued=True
             )
             source_refs = tuple(
                 kvcr._local_dram.source_refs(sources[key], indices)
                 for key, indices in zip(ordered_keys, selected)
             )
-            kvcr._add_block_dependencies(source_pin, new_operation=True)
+            # The claims pin every key until release; count the operation once.
+            kvcr._outstanding_operations += 1
         finally:
             kvcr._state_lock.release()
         # Claims keep the sources stable while the write is assembled unlocked.
@@ -936,6 +940,7 @@ class _RemoteFWDram:
             completed_indices=completed_indices,
             route=source_pin.route,
             nvtx_state=source_pin.nvtx_state,
+            key_dependencies=False,
             _backend=self,
         )
         # Already on progress: retain cleanup ownership before starting the write.
@@ -966,7 +971,7 @@ class _RemoteFWDram:
             if failure_reason is _nvtx.Reason.UNKNOWN:
                 failure_reason = _nvtx.Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
-            source_pin.op_id, source_pin.keys
+            source_pin.op_id, source_pin.keys, keep_queued=True
         )
         framework_sources = {
             key: record.fw_mem.descriptors
@@ -1294,7 +1299,7 @@ class _RemoteFWDram:
             return
 
         local_sources = kvcr._claim_local_dram_sources(
-            op.op_id, op.keys, allow_filling=True
+            op.op_id, op.keys, allow_filling=True, keep_queued=True
         )
         unresolved_keys = tuple(
             key

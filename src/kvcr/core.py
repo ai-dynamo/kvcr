@@ -253,6 +253,7 @@ class _KVCRCore:
         self._closed = False
         self._outstanding_operations = 0
         self._framework_pin_keys: dict[PinHandle, set[BlockKey]] = {}
+        self._queued_claim_ops: set[_OpId] = set()
         self._local_dram_sources_by_op: dict[
             _OpId, dict[BlockKey, _LocalDramResidency]
         ] = {}
@@ -1033,17 +1034,26 @@ class _KVCRCore:
         *,
         notify_capacity: bool = True,
         allow_filling: bool = False,
+        keep_queued: bool = False,
     ) -> Mapping[BlockKey, _LocalDramResidency]:
+        """Claim local DRAM sources for an operation.
+
+        ``keep_queued`` leaves the claimed entries in the eviction queue (eviction
+        skips claimed entries) and releases them lazily, without re-scoring.
+        """
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram.acquire_sources(
                 tuple(key for key in keys if key not in sources),
                 notify_capacity=notify_capacity,
                 allow_filling=allow_filling,
+                keep_queued=keep_queued,
             )
             if claimed:
                 sources.update(claimed)
                 self._local_dram_sources_by_op[op_id] = sources
+                if keep_queued:
+                    self._queued_claim_ops.add(op_id)
         return sources
 
     def _region(
@@ -1143,14 +1153,22 @@ class _KVCRCore:
         sources = self._local_dram_sources_by_op.get(op_id)
         if not sources:
             return
-        released = set(sources) if keys is None else set(keys) & sources.keys()
         if self._local_dram is None:
             raise RuntimeError("controller source exists without local DRAM")
-        self._local_dram.release_sources(released)
+        lazy = op_id in self._queued_claim_ops
+        if keys is None:
+            # Whole operation: hand every claim back in one pass.
+            self._local_dram_sources_by_op.pop(op_id)
+            self._queued_claim_ops.discard(op_id)
+            self._local_dram.release_sources(sources.keys(), lazy=lazy)
+            return
+        released = set(keys) & sources.keys()
+        self._local_dram.release_sources(released, lazy=lazy)
         for key in released:
             sources.pop(key)
         if not sources:
             self._local_dram_sources_by_op.pop(op_id)
+            self._queued_claim_ops.discard(op_id)
 
     def _complete_local_dram_fill(
         self, keys: Collection[BlockKey], *, success: bool

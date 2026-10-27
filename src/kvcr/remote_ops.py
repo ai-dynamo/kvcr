@@ -311,6 +311,9 @@ class _SourceWriteOp(_RemoteOp):
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
+    # False when the progress fast path counted the operation once instead of
+    # per key; its keys are held by local DRAM claims for its whole lifetime.
+    key_dependencies: bool = True
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None

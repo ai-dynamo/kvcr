@@ -378,6 +378,8 @@ class _LocalDram:
         ):
             raise ValueError("local DRAM pools must not overlap")
         self._evictable = _EvictionQueue()
+        # Queued keys released without a re-score; eviction re-scores them first.
+        self._lazily_released: set[BlockKey] = set()
         self._evictable_slots: Counter[str] = Counter()
         self._unscored: set[BlockKey] = set()
         self._pending_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -793,6 +795,7 @@ class _LocalDram:
         *,
         notify_capacity: bool = True,
         allow_filling: bool = False,
+        keep_queued: bool = False,
     ) -> dict[BlockKey, _LocalDramResidency]:
         sources: dict[BlockKey, _LocalDramResidency] = {}
         for key in keys:
@@ -805,7 +808,7 @@ class _LocalDram:
                 and not (allow_filling and residency.state is _LocalDramState.FILLING)
             ):
                 continue
-            self._acquire_claim(key, residency)
+            self._acquire_claim(key, residency, keep_queued=keep_queued)
             sources[key] = residency
         if notify_capacity:
             self._update_capacity_pressure()
@@ -822,12 +825,30 @@ class _LocalDram:
             refs.append(ref)
         return tuple(refs)
 
-    def release_sources(self, keys: Collection[BlockKey]) -> None:
+    def release_sources(self, keys: Collection[BlockKey], *, lazy: bool = False) -> None:
+        """Release source claims. ``lazy`` claims never left the eviction queue."""
+        record_map = self._kvcr._block_record_map
+        evictable = self._evictable
         for key in keys:
-            record = self._kvcr._block_record_map.get(key)
+            record = record_map.get(key)
             residency = record.local_dram if record is not None else None
             if residency is None:
                 raise RuntimeError(f"local DRAM source state lost for {key!r}")
+            if (
+                lazy
+                and residency.claim_count == 1
+                and residency.state is _LocalDramState.READY
+                and not residency.retire_on_release
+                and not residency.pending_labels
+                and evictable.score(key) is not None
+            ):
+                # Still queued from claim time; eviction re-scores it when reached.
+                residency.claim_count = 0
+                self._lazily_released.add(key)
+                evictable_slots = self._evictable_slots
+                for pool, count in residency.pool_counts:
+                    evictable_slots[pool] += count
+                continue
             self._release_claim(key, residency)
         self._update_capacity_pressure()
 
@@ -1359,10 +1380,18 @@ class _LocalDram:
             handle,
         )
 
-    def _acquire_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
+    def _acquire_claim(
+        self, key: BlockKey, residency: _LocalDramResidency, *, keep_queued: bool = False
+    ) -> None:
         if residency.state is _LocalDramState.DISCARDING:
             raise RuntimeError(f"cannot claim discarded local DRAM entry {key!r}")
-        self._remove_evictable(key, residency)
+        if not keep_queued:
+            self._remove_evictable(key, residency)
+        elif not residency.claim_count and self._evictable.score(key) is not None:
+            # Still queued but no longer evictable while claimed.
+            evictable_slots = self._evictable_slots
+            for pool, count in residency.pool_counts:
+                evictable_slots[pool] -= count
         residency.claim_count += 1
 
     def _release_claim(self, key: BlockKey, residency: _LocalDramResidency) -> None:
@@ -1431,40 +1460,64 @@ class _LocalDram:
             }
 
         deficient = short()
-        with closing(self._evictable.candidates(protected)) as candidates:
-            while deficient:
-                key = next(candidates, None)
-                if key is None:
-                    return None, [], False
-                record = self._kvcr._block_record_map.get(key)
-                residency = record.local_dram if record is not None else None
-                if (
-                    record is None
-                    or residency is None
-                    or residency.state is not _LocalDramState.READY
-                    or residency.claim_count
-                ):
-                    raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-                if deficient.isdisjoint(pool for pool, _ in residency.pool_counts):
-                    continue
-                size_bytes = self._size_bytes(residency)
-                decision, eviction_pending = self._kvcr._decide_eviction(
-                    self._kvcr._block_meta(key, record, size_bytes),
-                    CacheTier.LOCAL_G2,
-                    deadline,
-                )
-                deficient = short()
-                if not deficient:
-                    break
-                if eviction_pending:
-                    self._capacity_eviction_key = key
-                    return None, [], True
-                if decision[0] is PlacementAction.KEEP:
-                    continue
-                victims.append((key, record, residency, size_bytes))
-                for pool, count in residency.pool_counts:
-                    freed[pool] += count
-                deficient = short()
+        chosen: set[BlockKey] = set()
+        requeued = True
+        while deficient and requeued:
+            # Requeued (lazily released) keys are visited again at their new rank.
+            requeued = False
+            with closing(self._evictable.candidates(protected)) as candidates:
+                while deficient:
+                    key = next(candidates, None)
+                    if key is None:
+                        break
+                    if key in chosen:
+                        continue
+                    record = self._kvcr._block_record_map.get(key)
+                    residency = record.local_dram if record is not None else None
+                    if (
+                        record is None
+                        or residency is None
+                        or residency.state is not _LocalDramState.READY
+                    ):
+                        raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
+                    if residency.claim_count:
+                        # A source write claimed it without dequeuing it.
+                        continue
+                    if deficient.isdisjoint(pool for pool, _ in residency.pool_counts):
+                        continue
+                    size_bytes = self._size_bytes(residency)
+                    meta = self._kvcr._block_meta(key, record, size_bytes)
+                    if key in self._lazily_released:
+                        self._lazily_released.discard(key)
+                        queued = self._evictable.score(key)
+                        score = self._kvcr._policy.eviction_score(
+                            meta, CacheTier.LOCAL_G2, previous_score=queued
+                        )
+                        if score is not None and score != queued:
+                            # Served since it was queued: requeue at its current rank.
+                            self._evictable.insert(key, score)
+                            requeued = True
+                            continue
+                    decision, eviction_pending = self._kvcr._decide_eviction(
+                        meta,
+                        CacheTier.LOCAL_G2,
+                        deadline,
+                    )
+                    deficient = short()
+                    if not deficient:
+                        break
+                    if eviction_pending:
+                        self._capacity_eviction_key = key
+                        return None, [], True
+                    if decision[0] is PlacementAction.KEEP:
+                        continue
+                    victims.append((key, record, residency, size_bytes))
+                    chosen.add(key)
+                    for pool, count in residency.pool_counts:
+                        freed[pool] += count
+                    deficient = short()
+        if deficient:
+            return None, [], False
 
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
@@ -1514,7 +1567,9 @@ class _LocalDram:
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)
-        if self._evictable.remove(key):
+        self._lazily_released.discard(key)
+        # A queued entry under a keep-queued claim already left the evictable count.
+        if self._evictable.remove(key) and not residency.claim_count:
             evictable_slots = self._evictable_slots
             for pool, count in residency.pool_counts:
                 evictable_slots[pool] -= count
