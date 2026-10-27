@@ -19,23 +19,12 @@ from _kvcr_test_utils import (
     _wait_until,
     _write_done_notification,
 )
-from _nvtx_test_utils import payloads, spans, wait_for_payload
+from _nvtx_test_utils import make_target, payloads, spans, wait_for_payload
 
 from kvcr import _nvtx
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
 from kvcr.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
 from kvcr.types import BlockKey, RegionDescriptor
-
-
-def target(*, eager=False):
-    agent, control = FakeNixlAgent(), FakeBytesControl()
-    kvcr = _new_kvcr(
-        agent,
-        FakePrimaryPinning(),
-        control,
-        remote_options=RemoteFWDramOptions(eager_ctrl_connect=eager),
-    )
-    return kvcr, agent, control
 
 
 @pytest.mark.parametrize(
@@ -94,7 +83,7 @@ def test_target_terminal_reason_preserves_cause(
 
 
 def test_shutdown_closes_unreturned_caller_range(recording):
-    kvcr, _, _ = target()
+    kvcr, _, _ = make_target()
     handle = kvcr.deliver({})
     assert len(payloads(recording, "op.completion_queued")) == 1
     assert not payloads(recording, "op.completion_returned")
@@ -112,7 +101,7 @@ def test_shutdown_closes_unreturned_caller_range(recording):
 def test_rejected_progress_submission_closes_unaccepted_target_range(
     recording, monkeypatch
 ):
-    kvcr, _, _ = target()
+    kvcr, _, _ = make_target()
     request = "submission-failure"
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id=request)
 
@@ -128,9 +117,8 @@ def test_rejected_progress_submission_closes_unaccepted_target_range(
     assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert len(spans(recording, "target.remote")) == 1
     assert len(spans(recording, "target.remote", "end")) == 1
-    rejected = payloads(recording, "target.queued.rejected")
-    assert len(rejected) == 1
-    assert int(rejected[0]["status"]) == int(_nvtx.Status.REJECTED)
+    [rejected] = payloads(recording, "target.queued.rejected")
+    assert int(rejected["status"]) == int(_nvtx.Status.REJECTED)
     assert not payloads(recording, "target.start_write.enqueued")
     assert not kvcr._core._nvtx_operations
     assert not recording.stack
@@ -138,7 +126,7 @@ def test_rejected_progress_submission_closes_unaccepted_target_range(
 
 @pytest.mark.parametrize("failure", ["expired", "false", "exception"])
 def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure):
-    kvcr, _, control = target()
+    kvcr, _, control = make_target()
     control.send_result = False
     if failure == "expired":
         submit = kvcr._core._progress.submit
@@ -159,12 +147,11 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
     handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, request_id="req")
     result = dict(_poll_until(kvcr, lambda entries: handle in dict(entries)))
     assert not result[handle][BlockKey(b"k")].success
-    rejected = payloads(recording, "target.start_write.rejected")
-    assert len(rejected) == 1
-    assert int(rejected[0]["status"]) == int(
+    [rejected] = payloads(recording, "target.start_write.rejected")
+    assert int(rejected["status"]) == int(
         _nvtx.Status.TIMEOUT if failure == "expired" else _nvtx.Status.REJECTED
     )
-    assert int(rejected[0]["reason"]) == int(
+    assert int(rejected["reason"]) == int(
         _nvtx.Reason.DEADLINE if failure == "expired" else _nvtx.Reason.CONTROL_ERROR
     )
     assert len(control.sent) == (failure != "expired")
@@ -185,7 +172,7 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
 def test_target_receipt_consumption_and_caller_return(
     recording, indices, expected, retry
 ):
-    kvcr, agent, control = target()
+    kvcr, agent, control = make_target()
     request = "real-request-α"
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id=request)
     handle = kvcr.deliver(
@@ -206,8 +193,7 @@ def test_target_receipt_consumption_and_caller_return(
         _write_done_notification(handle, completed_indices=indices)
     ]
     _wait_until(lambda: ("target", handle) not in kvcr._core._progress._in_flight_ops)
-    received = payloads(recording, "target.write_done.received")
-    assert len(received) == 1
+    [received] = payloads(recording, "target.write_done.received")
     assert not payloads(recording, "op.completion_returned")
     assert len(spans(recording, "op.deliver.lifecycle")) == 1
     assert not spans(recording, "op.deliver.lifecycle", "end")
@@ -220,15 +206,14 @@ def test_target_receipt_consumption_and_caller_return(
         "op.completion_queued",
         "op.completion_returned",
     ):
-        events = payloads(recording, name)
-        assert len(events) == 1
-        assert int(events[0]["op_handle"]) == handle
+        [event] = payloads(recording, name)
+        assert int(event["op_handle"]) == handle
     returned = payloads(recording, "op.completion_returned")[0]
     assert int(returned["status"]) == int(expected)
     assert (int(returned["request_hi"]), int(returned["request_lo"])) == _nvtx.identity(
         request
     )
-    assert int(received[0]["target_incarnation_hi"]) != 0
+    assert int(received["target_incarnation_hi"]) != 0
     assert not kvcr._core._nvtx_operations
     assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not recording.stack
@@ -303,25 +288,24 @@ def test_public_mixed_delivery_waits_for_both_branches(
     assert result[handle][remote_key].success == remote_success
     assert set(result[handle]) == {local_key, remote_key}
     assert len(payloads(recording, "op.completion_queued")) == 1
-    returned = payloads(recording, "op.completion_returned")
-    assert len(returned) == 1
-    assert int(returned[0]["completed_blocks"]) == 1 + remote_success
-    assert int(returned[0]["status"]) == int(
+    [returned] = payloads(recording, "op.completion_returned")
+    assert int(returned["completed_blocks"]) == 1 + remote_success
+    assert int(returned["status"]) == int(
         _nvtx.Status.SUCCESS if remote_success else _nvtx.Status.PARTIAL
     )
-    assert int(returned[0]["reason"]) == (
+    assert int(returned["reason"]) == (
         _nvtx.Reason.NONE if remote_success else _nvtx.Reason.REMOTE_FAILURE
     )
     assert (
-        int(returned[0]["request_hi"]),
-        int(returned[0]["request_lo"]),
+        int(returned["request_hi"]),
+        int(returned["request_lo"]),
     ) == _nvtx.identity(request)
     assert list(kvcr.poll_completed()) == []
     kvcr.discard_hint(request)
 
 
 def test_replaced_hint_is_used_and_conflicting_hint_is_rejected(recording):
-    kvcr, agent, control = target()
+    kvcr, agent, control = make_target()
     request = "reused-request"
     kvcr.submit_hint(_router_hint("tcp://source:1"), request)
     kvcr.submit_hint(_router_hint("tcp://source:1"), request)
@@ -361,18 +345,17 @@ def test_timeout_quarantine_and_late_quiescence_have_distinct_events(recording):
     for name in ("target.cancel_requested", "target.quarantined", "target.quiesced"):
         assert len(payloads(recording, name)) == 1
     handle = int(payloads(recording, "target.quarantined")[0]["op_handle"])
-    returned = [
+    [returned] = [
         p
         for p in payloads(recording, "op.completion_returned")
         if int(p["op_handle"]) == handle
     ]
-    assert len(returned) == 1
-    assert int(returned[0]["status"]) == int(_nvtx.Status.FAILED)
-    assert int(returned[0]["reason"]) == int(_nvtx.Reason.DEADLINE)
+    assert int(returned["status"]) == int(_nvtx.Status.FAILED)
+    assert int(returned["reason"]) == int(_nvtx.Reason.DEADLINE)
 
 
 def test_cancellation_cause_survives_grace_deadline(recording):
-    kvcr, agent, control = target(eager=True)
+    kvcr, agent, control = make_target(eager=True)
     now = 0.0
     kvcr._core._clock = lambda: now
     handle, _ = test_kvcr_remote_target._acked_deliver(
@@ -401,10 +384,9 @@ def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     test_kvcr_remote_target.test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         "guard"
     )
-    queued = payloads(recording, "target.queued")
-    assert len(queued) == 1
-    assert int(queued[0]["op_handle"]) < 0
-    assert int(queued[0]["local_fill"]) == 1
+    [queued] = payloads(recording, "target.queued")
+    assert int(queued["op_handle"]) < 0
+    assert int(queued["local_fill"]) == 1
     assert len(payloads(recording, "target.quiesced")) == 1
     [unresolved] = payloads(recording, "target.shutdown_unresolved")
     assert int(unresolved["status"]) == _nvtx.Status.UNRESOLVED
@@ -416,7 +398,7 @@ def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
 
 
 def test_missing_hint_has_specific_reason(recording):
-    kvcr, _, _ = target()
+    kvcr, _, _ = make_target()
     handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
     result = dict(kvcr.poll_completed())
     assert not result[handle][BlockKey(b"k")].success
@@ -429,7 +411,7 @@ def test_missing_hint_has_specific_reason(recording):
 def test_target_annotations_cannot_break_empty_or_missing_hint_delivery(
     recording, failure
 ):
-    kvcr, _, _ = target()
+    kvcr, _, _ = make_target()
     recording.fail = failure
     empty = kvcr.deliver({})
     missing = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
@@ -464,7 +446,7 @@ def test_off_skips_annotation_work_but_preserves_results(
             return getattr(reasons, name)
 
     monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")
-    kvcr, agent, control = target()
+    kvcr, agent, control = make_target()
     kvcr._core._nvtx_operations = Traces()
     empty = kvcr.deliver({})
     kvcr.submit_hint(_router_hint("tcp://source:1"), "req")

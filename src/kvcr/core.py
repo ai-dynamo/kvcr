@@ -636,11 +636,7 @@ class _KVCRCore:
         except Exception:
             self._nvtx_operations.pop(op_handle, None)
             if trace is not None:
-                trace.mark(
-                    "op.rejected",
-                    status=_nvtx.Status.REJECTED,
-                    reason=_nvtx.Reason.UNKNOWN,
-                )
+                trace.reject("op.rejected", _nvtx.Reason.UNKNOWN)
             raise
         finally:
             if trace is not None:

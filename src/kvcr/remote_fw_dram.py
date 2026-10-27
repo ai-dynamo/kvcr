@@ -333,11 +333,7 @@ class _RemoteFWDram:
             kvcr._progress.submit(op)
         except Exception:
             if op.trace is not None:
-                op.trace.mark(
-                    "target.queued.rejected",
-                    status=_nvtx.Status.REJECTED,
-                    reason=_nvtx.Reason.SUBMIT_REJECTED,
-                )
+                op.trace.reject("target.queued.rejected", _nvtx.Reason.SUBMIT_REJECTED)
                 op.trace.end("target.remote")
             raise
         if not local_fill and request_id is not None:
@@ -502,60 +498,58 @@ class _RemoteFWDram:
         trace = op.trace
         pushed = trace.push("target.main.consume") if trace is not None else False
         try:
-            self._consume_target_pull(op)
+            kvcr = self._kvcr
+            caller_trace = kvcr._nvtx_operations.get(op.op_id[1])
+            if caller_trace is not None and op.trace is not None:
+                caller_trace.failure_reason = op.trace.failure_reason
+            if op.state is not _TargetPullState.QUARANTINED:
+                kvcr._remove_block_dependencies(op)
+            completed_keys = op.completed_keys if op.success else set()
+            if kvcr._key_history_enabled:
+                kvcr._log_key_history(
+                    "remote_fetch_completed"
+                    if op.local_fill
+                    else "remote_deliver_completed",
+                    (key for key in op.ordered_keys if key in completed_keys),
+                    CacheTier.REMOTE_G2,
+                    request_id=op.request_id,
+                    op_handle=cast(OpHandle, op.op_id[1]),
+                )
+            if not op.success:
+                self._fail_request_hint(op.request_id)
+            elif (
+                op.request_id is not None
+                and (hint := self._request_hints.get(op.request_id)) is not None
+            ):
+                self._request_hints[op.request_id] = replace(
+                    hint,
+                    missing_keys=(hint.missing_keys | op.keys) - completed_keys,
+                )
+            if op.local_fill:
+                if op.state is _TargetPullState.QUARANTINED:
+                    # DISCARDING already failed callers, but still owns the slots.
+                    return
+                if completed_keys:
+                    kvcr._complete_local_dram_fill(
+                        tuple(key for key in op.ordered_keys if key in completed_keys),
+                        success=True,
+                    )
+                if completed_keys != op.keys:
+                    kvcr._complete_local_dram_fill(
+                        op.keys - completed_keys,
+                        success=False,
+                    )
+                return
+            kvcr._complete(
+                cast(OpHandle, op.op_id[1]),
+                {
+                    key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
+                    for key in op.keys
+                },
+            )
         finally:
             if trace is not None:
                 trace.tracer.pop(pushed)
-
-    def _consume_target_pull(self, op: _TargetPullOp) -> None:
-        kvcr = self._kvcr
-        caller_trace = kvcr._nvtx_operations.get(op.op_id[1])
-        if caller_trace is not None and op.trace is not None:
-            caller_trace.failure_reason = op.trace.failure_reason
-        if op.state is not _TargetPullState.QUARANTINED:
-            kvcr._remove_block_dependencies(op)
-        completed_keys = op.completed_keys if op.success else set()
-        if kvcr._key_history_enabled:
-            kvcr._log_key_history(
-                "remote_fetch_completed"
-                if op.local_fill
-                else "remote_deliver_completed",
-                (key for key in op.ordered_keys if key in completed_keys),
-                CacheTier.REMOTE_G2,
-                request_id=op.request_id,
-                op_handle=cast(OpHandle, op.op_id[1]),
-            )
-        if not op.success:
-            self._fail_request_hint(op.request_id)
-        elif (
-            op.request_id is not None
-            and (hint := self._request_hints.get(op.request_id)) is not None
-        ):
-            self._request_hints[op.request_id] = replace(
-                hint,
-                missing_keys=(hint.missing_keys | op.keys) - completed_keys,
-            )
-        if op.local_fill:
-            if op.state is _TargetPullState.QUARANTINED:
-                return  # DISCARDING already failed callers, but still owns the slots.
-            if completed_keys:
-                kvcr._complete_local_dram_fill(
-                    tuple(key for key in op.ordered_keys if key in completed_keys),
-                    success=True,
-                )
-            if completed_keys != op.keys:
-                kvcr._complete_local_dram_fill(
-                    op.keys - completed_keys,
-                    success=False,
-                )
-            return
-        kvcr._complete(
-            cast(OpHandle, op.op_id[1]),
-            {
-                key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
-                for key in op.keys
-            },
-        )
 
     # -------------------------------------------------------------------------
     # Progress-thread lifecycle and control transport.

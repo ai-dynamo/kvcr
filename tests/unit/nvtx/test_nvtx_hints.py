@@ -4,18 +4,10 @@
 
 import msgspec
 import pytest
-from _kvcr_test_utils import (
-    FakeBytesControl,
-    FakeNixlAgent,
-    FakePrimaryPinning,
-    _new_kvcr,
-    _record_hint_results,
-    _router_hint,
-)
-from _nvtx_test_utils import payloads
+from _kvcr_test_utils import _record_hint_results, _router_hint
+from _nvtx_test_utils import make_target, payloads
 
 from kvcr import _nvtx
-from kvcr.config import RemoteFWDramOptions
 from kvcr.hints.results import HintStatus
 
 
@@ -25,12 +17,7 @@ from kvcr.hints.results import HintStatus
 )
 def test_batch_hint_traces(recording, monkeypatch, level, scenario):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
-    kvcr = _new_kvcr(
-        FakeNixlAgent(),
-        FakePrimaryPinning(),
-        FakeBytesControl(),
-        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-    )
+    kvcr, _, _ = make_target()
     results = _record_hint_results(monkeypatch, kvcr)
     hint = _router_hint("tcp://source:1", [1])
     source = "tcp://other:2" if scenario == "conflict" else "tcp://source:1"
@@ -69,10 +56,9 @@ def test_batch_hint_traces(recording, monkeypatch, level, scenario):
     if rejected:
         assert int(rejected[0]["reason"]) == _nvtx.Reason.HINT_CONFLICT
         assert int(rejected[0]["status"]) == _nvtx.Status.REJECTED
-    discarded = payloads(recording, "hint.discarded")
-    assert len(discarded) == 1
+    [discarded] = payloads(recording, "hint.discarded")
     assert (
-        int(discarded[0]["trace_id"])
+        int(discarded["trace_id"])
         == int(submitted[-1]["trace_id"])
         == stored.trace.trace_id
     )
