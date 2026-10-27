@@ -170,6 +170,7 @@ class _RemoteFWDram:
         self._releasing_framework_pins: set[PinHandle] = set()
 
         # Progress-thread state: G2 control and outbound events.
+        self._pending_local_sources: list[_SourcePinOp] = []
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
@@ -519,6 +520,8 @@ class _RemoteFWDram:
         # Warning suppression can be added if persistent backend faults
         # cause excessive polling logs.
         observed_work |= self._process_control_messages(progress)
+        if self._pending_local_sources and not progress._stop_requested:
+            observed_work |= self._retry_local_sources(progress)
         # Only terminal notifications outrank a refusal for the same operation.
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
@@ -553,6 +556,7 @@ class _RemoteFWDram:
             cached = self._remote_agents_by_target.get(target)
             if not status.submitted and cached is not None:
                 self._send_write_done(self._kvcr._progress, cached[1], handle, False)
+        self._pending_local_sources.clear()
         close_control = getattr(self._control, "close", None)
         if close_control is not None:
             close_control()
@@ -850,26 +854,70 @@ class _RemoteFWDram:
             if self._nvtx is not None
             else None,
         )
-        if not self._try_local_source_write(progress, source_pin):
+        prepared = self._try_local_source_write(progress, source_pin)
+        if prepared is None:
+            self._pending_local_sources.append(source_pin)
+        elif not prepared:
             self._progress_outbound.append(source_pin)
+
+    def _retry_local_sources(self, progress: _KVCRProgress) -> bool:
+        pending, self._pending_local_sources = self._pending_local_sources, []
+        observed_work = False
+        for op in pending:
+            status = self._dangling_ops.source_writes[(op.route[0], op.op_handle)]
+            if (
+                self._kvcr._clock() >= op.deadline
+                or status.cancel_requested
+                or not self._dangling_ops.check_source_progress()
+                or self._route_generation.get(op.route[0], 0) != op.route[1]
+            ):
+                # No claims were acquired, so there is no caller-side cleanup.
+                failure = _SourceWriteOp(
+                    state=_SourceWriteState.NOTIFY_FAILURE,
+                    op_id=op.op_id,
+                    keys=op.keys,
+                    started_at=op.started_at,
+                    deadline=op.deadline,
+                    remote_agent=op.remote_agent,
+                    op_handle=op.op_handle,
+                    source_keys=(),
+                    dst_descriptors=(),
+                    route=op.route,
+                    nvtx_state=op.nvtx_state,
+                    _backend=self,
+                )
+                if op.nvtx_state is not None:
+                    op.nvtx_state.failure_reason = (
+                        _nvtx.Reason.DEADLINE
+                        if self._kvcr._clock() >= op.deadline
+                        else _nvtx.Reason.ROUTE_CHANGED
+                    )
+                failure.progress(progress, None)
+                observed_work = True
+                continue
+            prepared = self._try_local_source_write(progress, op)
+            if prepared is None:
+                self._pending_local_sources.append(op)
+            else:
+                observed_work = True
+                if not prepared:
+                    self._progress_outbound.append(op)
+        return observed_work
 
     def _try_local_source_write(
         self, progress: _KVCRProgress, source_pin: _SourcePinOp
-    ) -> bool:
+    ) -> bool | None:
+        """Return None to retry contention, False when caller work is needed."""
         kvcr = self._kvcr
         if kvcr._local_dram is None:
             return False
-        layouts = [
-            [descriptor.label for descriptor in destination]
-            for destination in source_pin.dst_descriptors
-        ]
         if not kvcr._state_lock.acquire(blocking=False):
-            # Use the caller queue on contention; add a progress-side
-            # second attempt if contention makes this fallback too frequent.
-            return False
+            return None
         selected = []
         try:
-            for key, layout in zip(source_pin.ordered_keys, layouts):
+            for key, destination in zip(
+                source_pin.ordered_keys, source_pin.dst_descriptors
+            ):
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
                 if residency is None or residency.state is not _LocalDramState.READY:
@@ -879,7 +927,7 @@ class _RemoteFWDram:
                     and source_pin.key_layout != residency.key_layout
                 ):
                     return False
-                indices = residency.ready_indices(layout)
+                indices = residency.ready_indices([ref.label for ref in destination])
                 if indices is None:
                     return False
                 selected.append(indices)

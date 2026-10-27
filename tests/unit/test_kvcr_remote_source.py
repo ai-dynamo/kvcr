@@ -342,7 +342,10 @@ def test_local_source_waits_for_declared_pieces(
     ] == list(rejected)
 
 
-def test_local_source_falls_back_during_fill_publication_without_blocking_progress():
+@pytest.mark.parametrize(
+    "outcome", ["write", "framework", "deadline", "cancel", "route", "shutdown"]
+)
+def test_local_source_retries_after_fill_publication(outcome):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
@@ -354,8 +357,12 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
     )
+    now = 0.0
+    source._core._clock = lambda: now
     local = source._core._local_dram
+    backend = source._core._remote_fw_dram
     key = BlockKey(b"local")
+    requested_key = BlockKey(b"framework-only") if outcome == "framework" else key
     publishing, resume = threading.Event(), threading.Event()
     make_evictable = local._make_evictable
 
@@ -379,7 +386,7 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
                 agent.state = "PROC"
                 control.incoming.extend(
                     [
-                        _start_write_message(12, key, target_agent="target"),
+                        _start_write_message(12, requested_key, target_agent="target"),
                         _write_probe_message(99),
                     ]
                 )
@@ -389,22 +396,55 @@ def test_local_source_falls_back_during_fill_publication_without_blocking_progre
                         for _, raw in control.sent
                     )
                 )
+                _wait_until(lambda: bool(backend._pending_local_sources))
                 assert len(agent.xfers) == 1
                 assert source._core._block_record_map[key].local_dram.claim_count == 0
+                if outcome == "deadline":
+                    now = 2.0
+                elif outcome == "cancel":
+                    control.incoming.append(_write_probe_message(12))
+                elif outcome == "route":
+                    backend._route_generation["target"] = 1
+                elif outcome == "shutdown":
+                    source._core._progress._submissions.put(_STOP)
+                if outcome not in ("write", "framework"):
+                    _wait_until(lambda: bool(agent.sent_notifs))
+                    assert _decode_notif(agent.sent_notifs[0][1]) == {
+                        "type": "write_done",
+                        "op_handle": 12,
+                        "success": False,
+                    }
+                    assert len(agent.xfers) == 1
             finally:
                 resume.set()
             assert completion.result(timeout=1) == [(deposit, _op_entries({key: True}))]
 
-        # Unlocking alone does not retry: this request is owned by the caller queue.
-        assert len(agent.xfers) == 1
-        assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
-        assert source._core._block_record_map[key].local_dram.claim_count == 1
-        assert local.telemetry_state()["local_g2_evictable_slots"] == 0
-        assert pinning.searches == []
+        # Ready local sources retry without another caller-side poll.
+        if outcome == "write":
+            _wait_until(lambda: len(agent.xfers) == 2)
+            assert source._core._block_record_map[key].local_dram.claim_count == 1
+            assert local.telemetry_state()["local_g2_evictable_slots"] == 0
+        elif outcome == "framework":
+            assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
+        assert pinning.searches == (
+            [(requested_key,)] if outcome == "framework" else []
+        )
+        agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        assert len(agent.xfers) == (2 if outcome in ("write", "framework") else 1)
+        assert pinning.unpins == (["pin"] if outcome == "framework" else [])
+        assert source._core._outstanding_operations == 0
+        assert source._core._block_record_map[key].local_dram.claim_count == 0
     finally:
         resume.set()
         agent.state = "DONE"
         source.close()
+    assert not backend._pending_local_sources
+    if outcome not in ("write", "framework"):
+        assert (
+            sum(_decode_notif(raw)["op_handle"] == 12 for _, raw in agent.sent_notifs)
+            == 1
+        )
 
 
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
