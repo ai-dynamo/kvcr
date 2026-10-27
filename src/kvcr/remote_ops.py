@@ -13,6 +13,7 @@ import msgspec
 
 from . import _nvtx
 from .core import TRANSFER_BLOCKS_METRIC, logger
+from .local_dram import _GuardExportClaim
 from .progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
 from .types import BlockKey, OpHandle, PinHandle
 
@@ -311,6 +312,11 @@ class _SourceWriteOp(_RemoteOp):
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
+    guard_only: bool = False
+    guard_claims: tuple[_GuardExportClaim, ...] = ()
+    guard_accounting: tuple[_GuardExportClaim, ...] = ()
+    guard_requested_count: int = 0
+    guard_claim_started_at: float | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -384,6 +390,7 @@ class _SourceWriteOp(_RemoteOp):
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
+            previous_transfer_id = progress._next_transfer_id
             status.submitted = True
             try:
                 transfer_id, submitted = progress.submit_transfer(
@@ -417,6 +424,17 @@ class _SourceWriteOp(_RemoteOp):
                     )
                 observed_work = True
             except Exception:
+                if (
+                    self.guard_only
+                    and progress._next_transfer_id > previous_transfer_id
+                ):
+                    # Preserve a tracked transfer until native completion is observed.
+                    self.transfer_id = progress._next_transfer_id
+                    self.state = _SourceWriteState.CANCEL_PENDING
+                    backend._guard_event(
+                        "submit_uncertain", self, len(self.guard_claims)
+                    )
+                    return False, True
                 logger.warning(
                     "KVCR start_write failed for op=%d",
                     self.op_handle,

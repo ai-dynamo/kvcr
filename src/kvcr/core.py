@@ -222,6 +222,7 @@ class _KVCRCore:
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
+        self._no_pinning_mode = backend_configs.remote_fw_dram.no_pinning_mode
         g3_config = backend_configs.g3
         if g3_config is not None and len(self.pool_layouts) != 1:
             raise ValueError("G3 does not support multiple pools")
