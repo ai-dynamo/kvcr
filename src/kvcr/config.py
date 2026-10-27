@@ -58,8 +58,19 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
 
     paths: tuple[Path, ...]
     capacity_bytes_per_file: int
-    backend: str = "GDS_MT"
+    backend: str = "POSIX"
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.backend == "POSIX" and not any(
+            name in self.backend_options
+            for name in ("use_uring", "use_aio", "use_posix_aio")
+        ):
+            msgspec.structs.force_setattr(
+                self,
+                "backend_options",
+                {"use_uring": "true", **self.backend_options},
+            )
 
 
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):

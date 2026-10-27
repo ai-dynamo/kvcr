@@ -435,6 +435,31 @@ def _metric_totals(stats):
 
 
 @pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({}, {"use_uring": "true"}),
+        ({"backend": "GDS_MT"}, {}),
+        ({"backend_options": {"use_aio": "true"}}, {"use_aio": "true"}),
+        ({"backend_options": {"use_uring": "false"}}, {"use_uring": "false"}),
+        (
+            {"backend_options": {"kernel_queue_size": "32"}},
+            {"use_uring": "true", "kernel_queue_size": "32"},
+        ),
+    ],
+)
+def test_g3_backend_defaults_and_overrides(tmp_path, settings, expected):
+    original = dict(settings.get("backend_options", {}))
+    config = G3Options(
+        paths=(tmp_path / "g3.data",),
+        capacity_bytes_per_file=os.sysconf("SC_PAGE_SIZE"),
+        **settings,
+    )
+    assert config.backend == settings.get("backend", "POSIX")
+    assert dict(config.backend_options) == expected
+    assert settings.get("backend_options", {}) == original
+
+
+@pytest.mark.parametrize(
     ("policy", "moved_index"),
     [(G3FIFOPolicy(), 1), (G3LRUPolicy(), 0), (None, 0)],
     ids=["fifo", "lru", "default-lru"],
