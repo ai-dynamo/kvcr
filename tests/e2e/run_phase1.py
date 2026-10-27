@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Run KVCR test plan v7 Phase 1 on one node with two GPUs.
+"""Run KVCR test plan v7 Phase 1 (TC-01 -> TC-06) on one node with two GPUs.
 
 Sequence:
   1. preflight        GPUs, shared memory, kernel (Guard), ports
-  2. reference        KVCR disabled worker; every prompt generated twice
+  2. reference        KVCR disabled worker; every prompt generated twice;
+                      perf prompts are also streamed cold + warm for the
+                      KVCR-disabled TTFT/TPOT baseline (TC-05)
   3. stack            per-worker kvcr_service (Guard) + KV router + 2 workers
   4. cases            TC-01, TC-02, TC-03 same-node, TC-04 (Guard only),
+                      TC-05 perf (cold/local/remote), TC-06 Guard recovery timing
   5. evidence         result.json, junit.xml, all requests/responses/logs
 
 Exit status is 0 only when every selected case is PASS. BLOCKED cases are
@@ -48,7 +51,11 @@ from phase1.common import (  # noqa: E402
     utc_now,
     write_junit,
 )
+from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
 from phase1.stack import GUARD, MODES, Settings, Stack  # noqa: E402
+
+CASES.update(PERF_CASES)
+PERF_CASE_NAMES = set(PERF_CASES)
 
 
 def provenance(args: argparse.Namespace) -> dict[str, Any]:
@@ -126,15 +133,18 @@ class Runner:
         self.tag = args.prompt_tag or uuid.uuid4().hex[:12]
         self.prompts = Prompts(
             self.tag,
+            perf_count=args.perf_repeats,
             tc02_shared=args.tc02_shared_sections,
             tc02_sections=args.tc02_sections,
             seed_prefix=args.tc02_seed_prefix,
             tc02_extra_shared=args.tc02_extra_shared_sections,
         )
         self.references: dict[str, TokenSample] = {}
+        self.baseline_timings: dict[str, Any] = {}
         # cached_tokens the KVCR-disabled engine reported per reference request,
         # in order; tells a case what the engine alone can reuse.
         self.reference_cached: dict[str, list[int | None]] = {}
+        self.wants_perf = bool(PERF_CASE_NAMES & set(args.cases))
         self.result: dict[str, Any] = {
             "plan": "KVCR Test Plan v7, Phase 1 (Guard-mode critical path)",
             "started_at": utc_now(),
@@ -144,11 +154,18 @@ class Runner:
             "model": args.model,
             "prompt_tag": self.tag,
             "max_tokens": args.max_tokens,
-            "hit_block_tokens": args.hit_block_tokens,
-            "ssm_groups": args.ssm_groups,
-            "page_bytes": args.page_bytes,
-            "tc02_sections": [args.tc02_shared_sections, args.tc02_sections],
-            "tc02_seed_prefix": args.tc02_seed_prefix,
+            "perf": {
+                "repeats": args.perf_repeats,
+                "max_tokens": args.perf_max_tokens,
+                "concurrency": args.perf_concurrency,
+                "evict_filler": args.perf_evict_filler,
+                "concurrency_levels": args.perf_concurrency_levels,
+                "hit_block_tokens": args.hit_block_tokens,
+                "ssm_groups": args.ssm_groups,
+                "page_bytes": args.page_bytes,
+                "tc02_sections": [args.tc02_shared_sections, args.tc02_sections],
+                "tc02_seed_prefix": args.tc02_seed_prefix,
+            },
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
@@ -202,6 +219,12 @@ class Runner:
         samples: dict[str, list[TokenSample]] = {}
         unstable = []
         unstable_detail: dict[str, Any] = {}
+        perf_names = set(self.prompts.perf_names()) if self.wants_perf else set()
+        # TC-06 prompts are generated with the perf token budget too, but need no
+        # KVCR-disabled timing baseline.
+        long_names = perf_names | (
+            set(self.prompts.tc06_names()) if self.wants_perf else set()
+        )
         # Only the prompts the requested cases use: a long prompt of a case not
         # being run must not block the run when the bare engine is unstable on it.
         case_prompts = {
@@ -209,6 +232,8 @@ class Runner:
             "TC-02": {"tc02_p1", "tc02_full", "tc02_partial", "tc02_absent"},
             "TC-03": {"tc03", "tc03_isolated"},
             "TC-04": {"tc04", "tc04_fresh", "tc04_second"},
+            "TC-05": set(perf_names),
+            "TC-06": set(self.prompts.tc06_names()) | set(perf_names),
         }
         wanted: set[str] = set()
         for case in self.args.cases:
@@ -220,9 +245,34 @@ class Runner:
         }
         for name, prompt in selected.items():
             runs = []
+            if name in perf_names:
+                # First contact with this prompt: KVCR-disabled cold TTFT/TPOT.
+                # Second stream: vLLM's own prefix-cache hit, the natural
+                # comparison for KVCR's local hit. Both must reproduce tokens.
+                timings: dict[str, Any] = {}
+                for kind in ("cold", "warm"):
+                    streamed = client.stream_completion(
+                        f"ref-{name}-{kind}",
+                        prompt,
+                        **stack.pin(0),
+                        max_tokens=self.args.perf_max_tokens,
+                        extra_fields=STREAM_FIELDS,
+                    )
+                    if not streamed.ok:
+                        raise ValidationError(
+                            f"reference stream {name} ({kind}) failed: {streamed.error}"
+                        )
+                    timings[kind] = streamed.metrics()
+                    runs.append(streamed.sample())
+                self.baseline_timings[name] = timings
             for repeat in (1, 2):
                 response = client.completion(
-                    f"ref-{name}-{repeat}", prompt, **stack.pin(0)
+                    f"ref-{name}-{repeat}",
+                    prompt,
+                    **stack.pin(0),
+                    max_tokens=self.args.perf_max_tokens
+                    if name in long_names
+                    else None,
                 )
                 if not response.ok or response.body is None:
                     raise ValidationError(
@@ -239,7 +289,7 @@ class Runner:
             samples[name] = runs
             # The non-streaming runs carry prompt IDs; streamed runs may not.
             canonical = runs[-1]
-            labels = ["1", "2"]
+            labels = (["cold", "warm"] if name in perf_names else []) + ["1", "2"]
             divergence = {}
             for label, run in zip(labels, runs):
                 problems = [
@@ -308,6 +358,9 @@ class Runner:
             evidence / "reference-tokens.json",
             {name: sample.__dict__ for name, sample in self.references.items()},
         )
+        if self.baseline_timings:
+            self.result["reference"]["kvcr_disabled_timings"] = self.baseline_timings
+            save_json(evidence / "baseline-timings.json", self.baseline_timings)
         self.save()
         stack.stop(*[c for c in (worker, stack.frontend) if c is not None])  # type: ignore[arg-type]
         # Forget the reference handles so the cases phase does not see the
@@ -357,7 +410,12 @@ class Runner:
             index_wait=self.args.index_wait,
             telemetry_timeout=self.args.telemetry_timeout,
             recovery_timeout=self.args.recovery_timeout,
+            perf_max_tokens=self.args.perf_max_tokens,
+            perf_concurrency=self.args.perf_concurrency,
+            perf_evict_filler=self.args.perf_evict_filler,
+            perf_concurrency_levels=self.args.perf_concurrency_levels,
             hit_block_tokens=self.args.hit_block_tokens,
+            baseline_timings=self.baseline_timings,
             engine_cached=self.reference_cached,
             tc02_seed_prefix=self.args.tc02_seed_prefix,
             tc02_evict_target=self.args.tc02_evict_target,
@@ -464,7 +522,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default="0,1",
         help="two CUDA device indices, e.g. 0,1",
     )
-    parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04")
+    parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04,TC-05,TC-06")
     parser.add_argument("--http-port", type=int, default=8000)
     parser.add_argument("--reference-http-port", type=int, default=8001)
     parser.add_argument(
@@ -479,6 +537,35 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "one GPU)",
     )
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument(
+        "--perf-repeats", type=int, default=5, help="perf prompts per arm (TC-05/06)"
+    )
+    parser.add_argument(
+        "--perf-max-tokens",
+        type=int,
+        default=128,
+        help="output tokens per perf request",
+    )
+    parser.add_argument(
+        "--perf-concurrency", type=int, default=1, help="parallel perf requests per arm"
+    )
+    parser.add_argument(
+        "--perf-evict-filler",
+        type=int,
+        default=0,
+        help="TC-05: after the local-hit arm send this many never-seen prompts to "
+        "worker 0 to evict its GPU prefix cache, then re-request the perf prompts "
+        "so the hit must come from the KVCR DRAM pool (local_deliver); 0 = skip. "
+        "Size it above the GPU KV capacity (see "
+        "--worker-arg=--num-gpu-blocks-override)",
+    )
+    parser.add_argument(
+        "--perf-concurrency-levels",
+        default="",
+        help="TC-05: comma-separated extra concurrency levels, e.g. 4,8; each level "
+        "sends that many fresh prompts in parallel (cold on worker 0, remote hit on "
+        "worker 1) and records TTFT/TPOT; tokens are not reference-checked",
+    )
     parser.add_argument(
         "--hit-block-tokens",
         type=int,
@@ -630,6 +717,18 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--index-wait must be between 0 and 300 seconds")
     if not 1 <= args.max_tokens <= 512 or not 1 <= args.pool_gb <= 64:
         parser.error("--max-tokens must be 1..512 and --pool-gb 1..64")
+    if not 1 <= args.perf_repeats <= 32 or not 1 <= args.perf_max_tokens <= 2048:
+        parser.error("--perf-repeats must be 1..32 and --perf-max-tokens 1..2048")
+    try:
+        args.perf_concurrency_levels = [
+            int(item)
+            for item in args.perf_concurrency_levels.split(",")
+            if item.strip()
+        ]
+    except ValueError:
+        parser.error("--perf-concurrency-levels expects integers like 4,8")
+    if any(not 2 <= level <= 64 for level in args.perf_concurrency_levels):
+        parser.error("--perf-concurrency-levels entries must be 2..64")
     if args.hit_block_tokens < 1 or args.hit_block_tokens % 64:
         parser.error("--hit-block-tokens must be a positive multiple of 64")
     if args.ssm_groups < 0 or args.page_bytes < 0:
@@ -638,6 +737,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--ssm-groups needs the hybrid --hit-block-tokens")
     if not 2 <= args.tc02_shared_sections < args.tc02_sections <= 1000:
         parser.error("--tc02-shared-sections must be < --tc02-sections (<= 1000)")
+    if not 0 <= args.perf_evict_filler <= 512:
+        parser.error("--perf-evict-filler must be 0..512")
+    if not 1 <= args.perf_concurrency <= 64:
+        parser.error("--perf-concurrency must be 1..64")
     if args.http_port == args.reference_http_port:
         parser.error("--http-port and --reference-http-port must differ")
     return args
