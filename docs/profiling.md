@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX remote-delivery tracing
 
-Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The example uses synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and identity availability.
+Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The examples use synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and identity availability, and the [capture walkthrough](nvtx-walkthrough.md) for two-worker captures and overhead comparisons.
 
 ## Enable tracing
 

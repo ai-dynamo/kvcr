@@ -27,9 +27,28 @@ def control_channel():
     return ZmqPeerControlChannel("127.0.0.1", port, "127.0.0.1")
 
 
+def remote_hint(endpoint, blocks):
+    return {
+        "protocol_version": "0.1",
+        "message_id": "nvtx-pin-example",
+        "actions": [
+            {
+                "action_id": "a1",
+                "action_type": "kv.fetch",
+                "action_version": "1.0",
+                "payload": {
+                    "source_control_endpoint": endpoint,
+                    "block_hashes": list(range(blocks)),
+                },
+            }
+        ],
+    }
+
+
 class Framework:
-    def __init__(self, name, keys, delay, fail):
+    def __init__(self, name, keys, delay, fail, *, missing_keys=()):
         self.name, self.keys, self.delay, self.fail = name, keys, delay, fail
+        self.missing_keys = frozenset(missing_keys)
         self.pending = {}
         self.requests, self.releases, self.cancelled = 0, [], []
 
@@ -51,7 +70,9 @@ class Framework:
                 else (
                     f"pin-{request}",
                     {
-                        key: [
+                        key: None
+                        if key in self.missing_keys
+                        else [
                             MemoryRef(
                                 end_point_name=self.name,
                                 element_index=self.keys.index(key),
@@ -71,6 +92,29 @@ class Framework:
     def cancel_pin_request(self, request):
         self.cancelled.append(request)
         self.pending.pop(request, None)
+
+
+def create_worker(name, framework, control, region, *, short_timeout=False):
+    return KVCR(
+        KVCRConfig(
+            nixl_agent_name=name,
+            nixl_listen_port=0,
+            pool_layouts=[("", region.size)],
+            operation_timeout_ms=1000 if short_timeout else 10_000,
+            abandon_timeout_ms=5000 if short_timeout else 20_000,
+        ),
+        KVCRBindings(
+            framework.request_pin,
+            framework.poll_pin_results,
+            framework.release_pin,
+            cancel_pin_request=framework.cancel_pin_request,
+            framework_control=control,
+        ),
+        KVCRBackendConfigs(
+            framework_regions=[region],
+            remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+        ),
+    )
 
 
 def run(blocks, delay_ms, scenario):
@@ -95,51 +139,19 @@ def run(blocks, delay_ms, scenario):
             (source_framework, target_framework),
             channels,
         ):
-            worker = KVCR(
-                KVCRConfig(
-                    nixl_agent_name=name,
-                    nixl_listen_port=0,
-                    pool_layouts=[("", size)],
-                    operation_timeout_ms=10_000,
-                    abandon_timeout_ms=20_000,
-                ),
-                KVCRBindings(
-                    framework.request_pin,
-                    framework.poll_pin_results,
-                    framework.release_pin,
-                    cancel_pin_request=framework.cancel_pin_request,
-                    framework_control=control,
-                ),
-                KVCRBackendConfigs(
-                    framework_regions=[
-                        RegionDescriptor(
-                            addr=ctypes.addressof(memory),
-                            size=size,
-                            count=blocks,
-                        )
-                    ],
-                    remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
+            worker = create_worker(
+                name,
+                framework,
+                control,
+                RegionDescriptor(
+                    addr=ctypes.addressof(memory), size=size, count=blocks
                 ),
             )
             stack.callback(worker.close)
             workers.append(worker)
         source, target = workers
         target.submit_hint(
-            {
-                "protocol_version": "0.1",
-                "message_id": "nvtx-pin-example",
-                "actions": [
-                    {
-                        "action_id": "a1",
-                        "action_type": "kv.fetch",
-                        "action_version": "1.0",
-                        "payload": {
-                            "source_control_endpoint": channels[0].endpoint,
-                            "block_hashes": list(range(blocks)),
-                        },
-                    }
-                ],
-            },
+            remote_hint(channels[0].endpoint, blocks),
             request_id="nvtx-pin-example",
         )
         operation = target.deliver(
