@@ -37,7 +37,7 @@ def _serve_health(
                         with opener.open(dependency_url, timeout=1) as response:
                             if response.status != 200:
                                 code, reason = 503, "dependency unavailable"
-                    except (OSError, http.client.HTTPException):
+                    except (OSError, http.client.HTTPException, ValueError):
                         code, reason = 503, "dependency unavailable"
             body = (reason + "\n").encode()
             self.send_response(code)

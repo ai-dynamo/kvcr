@@ -72,6 +72,24 @@ def test_health_http_routes_dependency_and_shutdown():
             status.return_value = (200, "ok")
             peer.RequestHandlerClass.protocol_version = "INVALID"
             assert _get(server, "/ready") == (503, "dependency unavailable\n")
+        peer.RequestHandlerClass.protocol_version = "HTTP/1.0"
+
+        def redirect(handler):
+            handler.send_response(302)
+            handler.send_header("Location", "http://[invalid/")
+            handler.end_headers()
+
+        peer.RequestHandlerClass.do_GET = redirect
+        dependency_urls = {
+            "malformed redirect": peer_url,
+            "non-ASCII request path": peer_url + "/non-ascii-\u00e9",
+        }
+        for case, url in dependency_urls.items():
+            with _serve_health(
+                ("127.0.0.1", 0), lambda _ready: (200, "ok"), url
+            ) as server:
+                assert _get(server, "/ready") == (503, "dependency unavailable\n"), case
+                assert _get(server, "/live") == (200, "ok\n"), case
     assert not any(t.name == "kvcr-health" for t in threading.enumerate())
 
 
