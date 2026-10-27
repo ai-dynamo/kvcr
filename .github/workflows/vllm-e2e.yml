@@ -95,3 +95,56 @@ jobs:
           name: kvcr-phase1-${{ github.run_attempt }}
           path: artifacts/phase1/
           retention-days: 14
+
+  phase1-2p1d:
+    # 2P+1D on the two-GPU runner: prefill workers 0 and 1 share GPU 0 at
+    # --gpu-memory-utilization 0.35, the decode worker has GPU 1. Functional
+    # verdicts only (Guard takeover, hinted delivery, recovery); latencies are
+    # not comparable with a dedicated-GPU layout. kvcr-service sidecars run as
+    # background processes of this step, as the harness requires for disagg.
+    # Runs after phase1: both jobs share the runner host's Hugging Face cache,
+    # and two engines fetching the same model at once fail on its blob lock.
+    needs: [peer-transfer, phase1]
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: ${{ inputs.image }}
+    timeout-minutes: 60
+    env:
+      HF_HOME: /scratch/huggingface
+      VLLM_CACHE_ROOT: /scratch/vllm
+      XDG_CACHE_HOME: /scratch/cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show NVIDIA devices
+        run: nvidia-smi
+      - name: Run Phase 1 2P+1D (TC-01,TC-02,TC-03,TC-04,TC-06) with shared prefill GPU
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+          DIGEST: phase1-2p1d-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          SVC=/tmp/kvcr-svc; mkdir -p "$SVC" /dev/shm/kvcr-2p1d/0 /dev/shm/kvcr-2p1d/1
+          # KVCR 0.2.0 moved the service module to kvcr.service.server; older
+          # releases expose kvcr.kvcr_service. Pick by what the image provides.
+          SERVICE_PY="import importlib.util as u, runpy; runpy.run_module('kvcr.service.server' if u.find_spec('kvcr.service') else 'kvcr.kvcr_service', run_name='__main__')"
+          for i in 0 1; do
+            python3 -c "$SERVICE_PY" --socket-path "$SVC/memory-$i.sock" \
+              --pool-dir /dev/shm/kvcr-2p1d/$i --guard-count 1 --pool-sizes-gb 2 \
+              --compatibility-digest "$DIGEST" --log-level DEBUG \
+              > "$SVC/kvcr-service-$i.log" 2>&1 &
+          done
+          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1-2p1d/run \
+            --model "$MODEL" --mode guard --batch-invariant --timeout 2400 \
+            --topology disagg --gpus 0,0,1 --gpu-memory-utilization 0.35 \
+            --external-services "$SVC" --compatibility-digest "$DIGEST" \
+            --cases TC-01,TC-02,TC-03,TC-04,TC-06
+      - name: Save 2P+1D evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcr-phase1-2p1d-${{ github.run_attempt }}
+          path: |
+            artifacts/phase1-2p1d/
+            /tmp/kvcr-svc/*.log
+          retention-days: 14
