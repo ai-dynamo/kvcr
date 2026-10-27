@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 
 from . import _nvtx
-from .core import TRANSFER_BLOCKS_METRIC, logger
+from .core import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC, logger
 from .progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
 from .types import BlockKey, OpHandle, PinHandle
 
@@ -211,12 +211,29 @@ class _TargetPullOp(_RemoteOp):
             self.success = success
             self.completed_keys = completed_keys
             self.state = _TargetPullState.FINISHED
+            debug = logger.isEnabledFor(logging.DEBUG)
+            completed_bytes = 0
             if completed_keys:
                 backend._record_progress_counter(
                     TRANSFER_BLOCKS_METRIC,
                     len(completed_keys),
                     (scope,),
                 )
+                # One scan serves the byte counter and the DEBUG event below.
+                if backend._telemetry_enabled or debug:
+                    completed_bytes = backend._kvcr._descriptor_bytes(
+                        descriptor
+                        for key, descriptors in zip(
+                            self.ordered_keys, self.dst_descriptors
+                        )
+                        if key in completed_keys
+                        for descriptor in descriptors
+                    )
+                    backend._record_progress_counter(
+                        TRANSFER_BYTES_METRIC,
+                        completed_bytes,
+                        (scope,),
+                    )
             result = (
                 "success"
                 if all_completed
@@ -225,7 +242,7 @@ class _TargetPullOp(_RemoteOp):
                 else "failed"
             )
             backend._record_progress_duration(scope, self.started_at, result)
-            if logger.isEnabledFor(logging.DEBUG):
+            if debug:
                 logger.debug(
                     "KVCR_EVENT target_transfer_completed scope=%s request_id=%s "
                     "op=%d source=%s blocks=%d bytes=%d result=%s",
@@ -234,14 +251,7 @@ class _TargetPullOp(_RemoteOp):
                     self.op_id[1],
                     self.remote_ctrl_ep,
                     len(completed_keys),
-                    backend._kvcr._descriptor_bytes(
-                        descriptor
-                        for key, descriptors in zip(
-                            self.ordered_keys, self.dst_descriptors
-                        )
-                        if key in completed_keys
-                        for descriptor in descriptors
-                    ),
+                    completed_bytes,
                     result,
                 )
             return True, True
