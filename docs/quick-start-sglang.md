@@ -39,8 +39,8 @@ The per-run image tag avoids overwriting an existing local build. This recipe bu
 
 | Component | Revision |
 | --- | --- |
-| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `0d8db33e19b2ee112b938c74388fd790822fe6fe` |
-| Dynamo router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) | `10f2c7bc04db8fbf39eb96c81d00b854797f10cc` |
+| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `e3e927225dd93fcf8b21760c217debfe1a29a10e` |
+| Dynamo router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) | `cfb35b169fb7b49350e95d22a609e49d8381928b` |
 | KVCR main | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
 
 The SGLang revisions are draft public PR heads, not released packages. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
@@ -123,6 +123,16 @@ env -u NATS_SERVER CUDA_VISIBLE_DEVICES="$RANK" DYN_SYSTEM_PORT="$((24001 + RANK
 
 Control, NIXL, metrics and event ports must be distinct. Loopback works because both workers share a container. KV events bind `*` inside that private network namespace so Dynamo can subscribe through the container address.
 
+SGLang reports the storage backend's resolved `kv_hint_sources` in its scheduler
+initialization metadata. Dynamo validates the complete rank map and publishes it
+without reconstructing KVCR's default ports or rank offsets. The same SGLang
+resolver supplies the channel's startup address. An explicit
+`control_advertise_host` and enabled remote hints are required to advertise a
+source; an older SGLang build without this metadata does not advertise transfer
+capability. These are configured coordinates, not proof of a listening socket or
+resident KV: the KVCR runtime remains lazy and transfer success must still be
+verified below.
+
 ## 5. Verify peer reuse
 
 Wait for successful LLM registration in both worker logs and `Adding worker` for both IDs in the frontend log. Allow up to 20 minutes per worker for first-use compilation. Then, in the request terminal, require `ready: true`:
@@ -196,13 +206,14 @@ PY
 Also inspect `KVCR L3 native stats` and `KVCR L3 operation` in both worker logs:
 
 - Destination: successful peer `deliver` from `tcp://127.0.0.1:24100`, **31 blocks**, **62 spans**, and no failed keys; native `remote_deliver` reports success.
-- Source: terminal source-write totals **31 blocks / 227,540,992 bytes**.
+- Source: terminal peer-send (`source_write`) totals **31 blocks / 227,540,992 bytes**. Do not confuse this with initial local deposition (`local_fill`), which may include 32 prompt pages; the destination recomputes the final page for logits.
 - No failed transfers or dropped observations. Sum each relevant drained reporting interval once; do not subtract two snapshots.
 - Destination metrics: **1984** completed HiCache prefetched tokens.
 
-Read those logs and the destination's isolated metrics in the request terminal:
+Allow the five-second native telemetry reporting interval to drain, then read those logs and the destination's isolated metrics in the request terminal:
 
 ```bash
+sleep 6
 grep -E 'KVCR L3 (native stats|operation)' /tmp/worker-{0,1}.log
 python3 - <<'PY'
 from prometheus_client import CollectorRegistry, generate_latest
