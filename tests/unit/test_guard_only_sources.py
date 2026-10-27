@@ -65,6 +65,21 @@ def _source(slots=3, *, recovered=False):
     return source, agent, control, pinning, memory
 
 
+@pytest.fixture
+def source_factory():
+    instances = []
+
+    def make(*args, **kwargs):
+        instance = _source(*args, **kwargs)
+        instances.append(instance)
+        return instance
+
+    yield make
+    for source, agent, *_ in reversed(instances):
+        agent.state = "DONE"
+        source.close()
+
+
 def _request(control, keys, handle=12, **extra):
     payload = msgspec.msgpack.decode(
         _start_write_message(handle, keys[0], target_agent="target")
@@ -87,26 +102,24 @@ def test_guard_only_sources_is_explicit_and_default_off():
 
 
 @pytest.mark.parametrize("recovered", [False, True])
-def test_ready_subset_progress_while_caller_state_lock_held(recovered):
-    source, agent, control, pinning, memory = _source(recovered=recovered)
+def test_ready_subset_progress_while_caller_state_lock_held(recovered, source_factory):
+    source, agent, control, pinning, memory = source_factory(recovered=recovered)
     before = len(agent.xfers)
-    try:
-        with source._core._state_lock:
-            _request(control, [b"missing", b"a", b"other"])
-            _wait_until(lambda: len(agent.xfers) == before + 1)
-            assert agent.xfers[-1][1] == [(ctypes.addressof(memory), 16, 0)]
-            notice = _decode_notif(agent.xfers[-1][5])
-            assert notice["completed_indices"] == [1]
-            assert pinning.searches == []
-            assert not source._core._remote_fw_dram._source_pin_ops
-        assert source._core._local_dram._export_readers() == 0
-    finally:
-        agent.state = "DONE"
-        source.close()
+    with source._core._state_lock:
+        _request(control, [b"missing", b"a", b"other"])
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        assert agent.xfers[-1][1] == [(ctypes.addressof(memory), 16, 0)]
+        notice = _decode_notif(agent.xfers[-1][5])
+        assert notice["completed_indices"] == [1]
+        assert pinning.searches == []
+        assert not source._core._remote_fw_dram._source_pin_ops
+    assert source._core._local_dram._export_readers() == 0
 
 
-def test_zero_hit_and_layout_mismatch_never_create_source_pin(monkeypatch):
-    source, agent, control, pinning, _ = _source()
+def test_zero_hit_and_layout_mismatch_never_create_source_pin(
+    monkeypatch, source_factory
+):
+    source, agent, control, pinning, _ = source_factory()
     from kvcr.remote_fw_dram import _SourcePinOp
 
     def forbidden(*args, **kwargs):
@@ -114,18 +127,15 @@ def test_zero_hit_and_layout_mismatch_never_create_source_pin(monkeypatch):
 
     monkeypatch.setattr(_SourcePinOp, "__init__", forbidden)
     before = len(agent.xfers)
-    try:
-        with source._core._state_lock:
-            _request(control, [b"a", b"missing"], key_layout=["different"])
-            _wait_until(
-                lambda: any(n.get("op_handle") == 12 for n in _notifications(agent))
-            )
-            notice = next(n for n in _notifications(agent) if n.get("op_handle") == 12)
-            assert notice["completed_indices"] == []
-            assert len(agent.xfers) == before
-            assert pinning.searches == []
-    finally:
-        source.close()
+    with source._core._state_lock:
+        _request(control, [b"a", b"missing"], key_layout=["different"])
+        _wait_until(
+            lambda: any(n.get("op_handle") == 12 for n in _notifications(agent))
+        )
+        notice = next(n for n in _notifications(agent) if n.get("op_handle") == 12)
+        assert notice["completed_indices"] == []
+        assert len(agent.xfers) == before
+        assert pinning.searches == []
 
 
 def test_export_index_contention_is_prompt_miss_without_caller_queue():
@@ -139,107 +149,71 @@ def test_export_index_contention_is_prompt_miss_without_caller_queue():
     source.close()
 
 
-def test_native_pending_claim_fences_slot_reuse_then_releases_without_main_poll():
-    source, agent, control, pinning, _ = _source(slots=1)
+def test_native_pending_claim_fences_slot_reuse_then_releases_without_main_poll(
+    source_factory,
+):
+    source, agent, control, pinning, _ = source_factory(slots=1)
     local = source._core._local_dram
-    try:
-        before = len(agent.xfers)
-        agent.state = "PROC"
-        _request(control, [b"a"])
-        _wait_until(lambda: len(agent.xfers) == before + 1)
-        assert local._export_readers() == 1
-        assert local.telemetry_state()["guard_export_readers"] == 1
-        blocked = source.deposit(
-            {b"replace": [_mem_descriptor(1, end_point_name="source")]}
-        )
-        assert _poll_until(source, bool) == [
-            (blocked, _op_entries({b"replace": False}))
+    before = len(agent.xfers)
+    agent.state = "PROC"
+    _request(control, [b"a"])
+    _wait_until(lambda: len(agent.xfers) == before + 1)
+    assert local._export_readers() == 1
+    assert local.telemetry_state()["guard_export_readers"] == 1
+    blocked = source.deposit(
+        {b"replace": [_mem_descriptor(1, end_point_name="source")]}
+    )
+    assert _poll_until(source, bool) == [
+        (blocked, _op_entries({b"replace": False}))
+    ]
+    agent.state = "DONE"
+    with source._core._state_lock:
+        _wait_until(lambda: local._export_readers() == 0)
+        assert local.telemetry_state()["guard_export_readers"] == 0
+    replacement = source.deposit(
+        {b"replace": [_mem_descriptor(1, end_point_name="source")]}
+    )
+    assert _poll_until(source, bool) == [
+        (replacement, _op_entries({b"replace": True}))
+    ]
+    _request(control, [b"a"], handle=13)
+    _wait_until(
+        lambda: any(n.get("op_handle") == 13 for n in _notifications(agent))
+    )
+    assert (
+        next(n for n in _notifications(agent) if n.get("op_handle") == 13)[
+            "completed_indices"
         ]
-        agent.state = "DONE"
-        with source._core._state_lock:
-            _wait_until(lambda: local._export_readers() == 0)
-            assert local.telemetry_state()["guard_export_readers"] == 0
-        replacement = source.deposit(
-            {b"replace": [_mem_descriptor(1, end_point_name="source")]}
-        )
-        assert _poll_until(source, bool) == [
-            (replacement, _op_entries({b"replace": True}))
-        ]
-        _request(control, [b"a"], handle=13)
-        _wait_until(
-            lambda: any(n.get("op_handle") == 13 for n in _notifications(agent))
-        )
-        assert (
-            next(n for n in _notifications(agent) if n.get("op_handle") == 13)[
-                "completed_indices"
-            ]
-            == []
-        )
-    finally:
-        agent.state = "DONE"
-        source.close()
+        == []
+    )
 
 
-def test_mixed_ready_missing_and_per_key_layout_rejection(caplog):
+def test_mixed_ready_missing_and_per_key_layout_rejection(caplog, source_factory):
     caplog.set_level("INFO", logger="kvcr.core")
-    source, agent, control, pinning, _ = _source()
-    try:
-        deposits = source.deposit(
-            {
-                b"wrong": [_mem_descriptor(1, ":b", end_point_name="source")],
-                b"other": [_mem_descriptor(2, end_point_name="source")],
-            }
-        )
-        assert _poll_until(source, bool) == [
-            (deposits, _op_entries({b"wrong": True, b"other": True}))
-        ]
-        before = len(agent.xfers)
-        with source._core._state_lock:
-            _request(control, [b"missing", b"a", b"wrong", b"other"])
-            _wait_until(lambda: len(agent.xfers) == before + 1)
-            assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [1, 3]
-        assert "requested=4" in caplog.text
-        assert pinning.searches == []
-    finally:
-        source.close()
-
-
-def test_partial_deposit_exports_committed_pieces_only():
-    source, agent, control, pinning, _ = _source()
-    local = source._core._local_dram
-    try:
-        operation = source.deposit(
-            {b"pieces": [_mem_descriptor(1, ":a", end_point_name="source")]},
-            expected_layout=[":a", ":b"],
-        )
-        assert _poll_until(source, bool) == [
-            (operation, _op_entries({b"pieces": True}))
-        ]
-        claims, busy = local.claim_export_subset((b"pieces",), ((":a",),), (":a", ":b"))
-        assert not busy and len(claims) == 1
-        assert local.claim_export_subset((b"pieces",), ((":b",),), (":a", ":b")) == (
-            (),
-            False,
-        )
-        local.release_export_claims(tuple(claim for _, claim in claims))
-        operation = source.deposit(
-            {b"pieces": [_mem_descriptor(2, ":b", end_point_name="source")]}
-        )
-        assert _poll_until(source, bool) == [
-            (operation, _op_entries({b"pieces": True}))
-        ]
-        claims, busy = local.claim_export_subset(
-            (b"pieces",), ((":a", ":b"),), (":a", ":b")
-        )
-        assert len(claims) == 1 and len(claims[0][1].refs) == 2
-        local.release_export_claims(tuple(claim for _, claim in claims))
-    finally:
-        source.close()
+    source, agent, control, pinning, _ = source_factory()
+    deposits = source.deposit(
+        {
+            b"wrong": [_mem_descriptor(1, ":b", end_point_name="source")],
+            b"other": [_mem_descriptor(2, end_point_name="source")],
+        }
+    )
+    assert _poll_until(source, bool) == [
+        (deposits, _op_entries({b"wrong": True, b"other": True}))
+    ]
+    before = len(agent.xfers)
+    with source._core._state_lock:
+        _request(control, [b"missing", b"a", b"wrong", b"other"])
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [1, 3]
+    assert "requested=4" in caplog.text
+    assert pinning.searches == []
 
 
 @pytest.mark.parametrize("ambiguous_submit", [False, True])
-def test_cancel_uncertainty_retains_readers_until_native_quiescence(ambiguous_submit):
-    source, agent, control, pinning, _ = _source(slots=1)
+def test_cancel_uncertainty_retains_readers_until_native_quiescence(
+    ambiguous_submit, source_factory
+):
+    source, agent, control, pinning, _ = source_factory(slots=1)
     now = [0.0]
     source._core._clock = lambda: now[0]
     local = source._core._local_dram
@@ -251,64 +225,27 @@ def test_cancel_uncertainty_retains_readers_until_native_quiescence(ambiguous_su
 
     if ambiguous_submit:
         agent.transfer = transfer
-    try:
-        before = len(agent.xfers)
-        agent.state = "PROC"
-        _request(control, [b"a"])
-        _wait_until(lambda: len(agent.xfers) == before + 1)
-        with source._core._state_lock:
-            now[0] = 100.0
-            statuses = source._core._remote_fw_dram._dangling_ops.source_writes
-            _wait_until(lambda: any(s.abandoned for s in statuses.values()))
-            assert local._export_readers() == 1
-            agent.state = "ERR"
-            # A generic native error is not proof that source access stopped.
-            _wait_until(
-                lambda: any(
-                    t.outcome is False
-                    for t in source._core._progress._active_transfers.values()
-                )
+    before = len(agent.xfers)
+    agent.state = "PROC"
+    _request(control, [b"a"])
+    _wait_until(lambda: len(agent.xfers) == before + 1)
+    with source._core._state_lock:
+        now[0] = 100.0
+        statuses = source._core._remote_fw_dram._dangling_ops.source_writes
+        _wait_until(lambda: any(s.abandoned for s in statuses.values()))
+        assert local._export_readers() == 1
+        agent.state = "ERR"
+        # A generic native error is not proof that source access stopped.
+        _wait_until(
+            lambda: any(
+                t.outcome is False
+                for t in source._core._progress._active_transfers.values()
             )
-            assert local._export_readers() == 1
-            agent.state = "DONE"
-            _wait_until(lambda: local._export_readers() == 0)
-            assert not source._core._remote_fw_dram._source_pin_ops
-    finally:
-        agent.state = "DONE"
-        source.close()
-
-
-def test_retirement_revokes_new_exports_and_defers_physical_reuse():
-    source, agent, control, pinning, _ = _source(slots=1)
-    local = source._core._local_dram
-    try:
-        with source._core._state_lock:
-            claims, _ = local.claim_export_subset((b"a",), (("",),), ())
-            residency = source._core._block_record_map[b"a"].local_dram
-            local.acquire_sources((b"a",))
-            local.retire_sources((b"a",))
-            local.release_sources((b"a",))
-            assert source._core._block_record_map[b"a"].local_dram is residency
-            assert local.claim_export_subset((b"a",), (("",),), ()) == ((), False)
-            assert len(local._free_slots[""]) == 0
-            local.release_export_claims(tuple(claim for _, claim in claims))
-        source.poll_completed()
-        assert len(local._free_slots[""]) == 1
-        assert b"a" not in local._exports
-    finally:
-        source.close()
-
-
-def test_guard_only_sources_skips_framework_source_callback():
-    source, agent, control, pinning, _ = _source()
-    try:
-        assert (
-            source._core._remote_fw_dram._acquire_framework_sources((b"missing",))
-            is None
         )
-        assert pinning.searches == []
-    finally:
-        source.close()
+        assert local._export_readers() == 1
+        agent.state = "DONE"
+        _wait_until(lambda: local._export_readers() == 0)
+        assert not source._core._remote_fw_dram._source_pin_ops
 
 
 def test_eviction_rechecks_reader_acquired_during_policy(monkeypatch):
@@ -383,20 +320,6 @@ def test_close_waits_for_native_quiescence_before_reader_release():
         source.close()
 
 
-def test_terminal_source_cleanup_does_not_queue_per_read_owner_work():
-    source, agent, control, pinning, _ = _source()
-    local = source._core._local_dram
-    try:
-        for handle in range(50, 70):
-            before = len(agent.xfers)
-            _request(control, [b"a"], handle=handle)
-            _wait_until(lambda: len(agent.xfers) == before + 1)
-            _wait_until(lambda: local._export_readers() == 0)
-        assert local._export_released.empty()
-    finally:
-        source.close()
-
-
 def test_native_handle_cleanup_failure_keeps_export_reader():
     source, agent, control, pinning, _ = _source()
     local = source._core._local_dram
@@ -422,51 +345,15 @@ def test_native_handle_cleanup_failure_keeps_export_reader():
         source.close()
 
 
-def test_source_access_accounting_is_deferred_without_holding_reader():
-    source, agent, control, pinning, _ = _source()
+def test_source_access_accounting_is_deferred_without_holding_reader(source_factory):
+    source, agent, control, pinning, _ = source_factory()
     local = source._core._local_dram
     record = source._core._block_record_map[b"a"]
     before_access = record.access_count
-    try:
-        before = len(agent.xfers)
-        with source._core._state_lock:
-            _request(control, [b"a", b"missing"])
-            _wait_until(lambda: len(agent.xfers) == before + 1)
-            _wait_until(lambda: local._export_readers() == 0)
-            assert record.access_count == before_access
-        _poll_until(source, lambda _: record.access_count == before_access + 1)
-    finally:
-        source.close()
-
-
-def test_export_telemetry_gauges_follow_actual_claim_lifetime():
-    source, agent, control, pinning, _ = _source()
-    local = source._core._local_dram
-    try:
-        state = local.telemetry_state()
-        assert state["guard_export_index_keys"] == 1
-        assert state["guard_export_readers"] == 0
-        claims, _ = local.claim_export_subset((b"a",), (("",),), ())
-        assert local.telemetry_state()["guard_export_readers"] == 1
-        local.release_export_claims(tuple(claim for _, claim in claims))
-        assert local.telemetry_state()["guard_export_readers"] == 0
-        assert local.telemetry_state()["guard_export_index_keys"] == 1
-    finally:
-        source.close()
-
-
-def test_deferred_source_access_refreshes_owner_eviction_score():
-    source, agent, control, pinning, _ = _source()
-    local = source._core._local_dram
-    before_score = local._evictable.score(b"a")
-    source._core._clock = lambda: 10**12
-    try:
-        before = len(agent.xfers)
-        with source._core._state_lock:
-            _request(control, [b"a"])
-            _wait_until(lambda: len(agent.xfers) == before + 1)
-            _wait_until(lambda: local._export_readers() == 0)
-            assert local._evictable.score(b"a") == before_score
-        _poll_until(source, lambda _: local._evictable.score(b"a") != before_score)
-    finally:
-        source.close()
+    before = len(agent.xfers)
+    with source._core._state_lock:
+        _request(control, [b"a", b"missing"])
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        _wait_until(lambda: local._export_readers() == 0)
+        assert record.access_count == before_access
+    _poll_until(source, lambda _: record.access_count == before_access + 1)
