@@ -635,13 +635,12 @@ class _KVCRCore:
                 for key, descriptors in blocks.items()
             }
             if declaration is not None:
-                local_layout = list(declaration)
                 indices = {}
-                for index, label in enumerate(local_layout):
+                for index, label in enumerate(declaration):
                     indices[label] = None if label in indices else index
                 if any(
                     _layout_indices(
-                        local_layout,
+                        declaration,
                         [ref.label for ref in refs],
                         indices_by_label=indices,
                     )

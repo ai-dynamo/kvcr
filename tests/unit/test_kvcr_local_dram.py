@@ -516,6 +516,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     assert dict(_poll_until(kvcr, bool))[matching][first].success
     assert source.raw == payload
     assert make_ref.call_count == 3  # The full copy reuses those earlier parts.
+    assert not gc.is_tracked(residency.refs)
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert kvcr.query((first, second)) == [
@@ -541,7 +542,7 @@ def test_layout_matching_with_and_without_index(requested, expected):
     for index in (None, {"": 0, "swa:a": 1, "swa": None}):
         assert (
             _layout_indices(
-                ["", "swa:a", "swa", "swa"],
+                ("", "swa:a", "swa", "swa"),
                 requested,
                 indices_by_label=index,
             )

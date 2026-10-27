@@ -82,8 +82,9 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
 
     One exists per cached block, so the cyclic GC would scan every one on each
     full pass. It is untracked (gc=False; it is never part of a reference cycle)
-    and keeps no per-block container once its fill completes: slots, layout and
-    pool counts are tuples of atomics, and pending_labels/writers are None.
+    and keeps nothing tracked once its fill completes: slots, layout and pool
+    counts are tuples of atomics, pending_labels/writers are None, and refs holds
+    untracked _TransferRefs.
     """
 
     slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
@@ -106,17 +107,11 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     _cached_size: int | None = None
 
     def __post_init__(self) -> None:
-        if type(self.slots) is not tuple:
-            self.slots = tuple(tuple(location) for location in self.slots)
+        self.slots = tuple(self.slots)
         if self.key_layout is None:
             self.key_layout = tuple(label for label, _ in self.slots)
         if self.state is _LocalDramState.FILLING:
-            pending = {label for label, _ in self.slots}
-            if self.pending_labels:
-                pending |= self.pending_labels
-            self.pending_labels = pending
-        elif not self.pending_labels:
-            self.pending_labels = None
+            self.pending_labels = {label for label, _ in self.slots}
         if self.pending_labels and not self.writers:
             self.writers = [0] * len(self.slots)
 
@@ -130,18 +125,22 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
             and self.claim_count == other.claim_count
             and self.retire_on_release == other.retire_on_release
             and self.key_layout == other.key_layout
-            and (self.pending_labels or None) == (other.pending_labels or None)
+            and self.pending_labels == other.pending_labels
             and self.pending_deposits == other.pending_deposits
-            and (self.writers or None) == (other.writers or None)
+            and self.writers == other.writers
             and self.remote_indices == other.remote_indices
             and self.remote_cancelled == other.remote_cancelled
         )
+
+    # The Struct's own __ne__ compares identity (eq=False); derive it from __eq__.
+    __ne__ = object.__ne__
 
     def settle(self) -> None:
         """Drop the fill bookkeeping once nothing is pending or in flight."""
         if not self.pending_labels:
             self.pending_labels = None
-            if self.writers is not None and not any(self.writers):
+            # Writer counts are held only by pending deposits and a remote fill.
+            if not self.pending_deposits and self.remote_indices is None:
                 self.writers = None
 
     @property
@@ -1003,17 +1002,16 @@ class _LocalDram:
             else:
                 residency.remote_indices = None
                 residency.remote_cancelled = False
-            if key_success:
-                pending = residency.pending_labels
-                pending_count = len(pending) if pending else 0
-                if pending:
-                    if len(indices) == len(residency.slots):
-                        pending.clear()
-                    else:
-                        pending.difference_update(
-                            residency.slots[index][0] for index in indices
-                        )
-                if pending is not None and len(pending) < pending_count:
+            pending = residency.pending_labels
+            if key_success and pending:
+                pending_count = len(pending)
+                if len(indices) == len(residency.slots):
+                    pending.clear()
+                else:
+                    pending.difference_update(
+                        residency.slots[index][0] for index in indices
+                    )
+                if len(pending) < pending_count:
                     residency.state = _LocalDramState.READY
                     residency.prepare_label_index()
                     record.last_access = now

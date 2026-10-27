@@ -962,9 +962,9 @@ class _RemoteFWDram:
             layout = (
                 residency.key_layout
                 if residency is not None
-                else [descriptor.label for descriptor in source]
+                else tuple(descriptor.label for descriptor in source)
             )
-            if source_pin.key_layout and source_pin.key_layout != tuple(layout):
+            if source_pin.key_layout and source_pin.key_layout != layout:
                 indices = None
             elif residency is not None:
                 indices = (
