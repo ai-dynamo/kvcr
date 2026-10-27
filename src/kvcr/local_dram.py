@@ -402,7 +402,7 @@ class _LocalDram:
         )
 
     def _publish_export(self, key: BlockKey, residency: _LocalDramResidency) -> None:
-        if not self._kvcr._guard_only_sources:
+        if not self._kvcr._pinless_guard_sources:
             return
         # Prepare immutable refs outside the short index lock, on the owner.
         refs = tuple(
@@ -545,7 +545,7 @@ class _LocalDram:
             "local_g2_allocated_slots": total_slots - free_slots,
             "local_g2_evictable_slots": sum(self._evictable_slots.values()),
         }
-        if self._kvcr._guard_only_sources:
+        if self._kvcr._pinless_guard_sources:
             with self._export_lock:
                 state["guard_export_index_keys"] = len(self._exports)
                 state["guard_export_readers"] = self._export_held

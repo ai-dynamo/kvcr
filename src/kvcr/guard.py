@@ -1090,7 +1090,7 @@ class _Guard:
                     backend=self._configured.remote_fw_dram_backend,
                     # A takeover Guard has no framework sources. Recovered
                     # READY exports must not depend on its owner poll either.
-                    guard_only_sources=True,
+                    pinless_guard_sources=True,
                 ),
             ),
         )
