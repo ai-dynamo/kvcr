@@ -172,7 +172,11 @@ def _poll_until(
 
 
 def _has_outstanding_operations(kvcr: KVCR) -> bool:
-    return kvcr._core._outstanding_operations > 0
+    local = kvcr._core._local_dram
+    return kvcr._core._outstanding_operations > 0 or bool(
+        local is not None
+        and (local.source_operations or not local._source_completions.empty())
+    )
 
 
 def _wait_until(predicate, *, timeout: float = 1) -> None:

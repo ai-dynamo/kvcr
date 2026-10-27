@@ -90,7 +90,7 @@ class _RequestHint:
 
 @dataclass
 class _SourcePinOp(_Op):
-    """Main-thread source acquisition for a pending write."""
+    """Source acquisition for a pending write."""
 
     started_at: float | None
     deadline: float
@@ -391,6 +391,10 @@ class _RemoteFWDram:
                     _SourceWriteState.FINISHED,
                     _SourceWriteState.CANCEL_PENDING,
                 ):
+                    if item.local_sources:
+                        # Native ownership ends on progress; local.poll_main
+                        # handles deferred access accounting and retirement.
+                        continue
                     # Framework ownership can be handed back after uncertainty;
                     # KVCR-owned contents stay claimed until native quiescence.
                     pins = self._fw_pins_by_op.pop(item.op_id, None)
@@ -967,58 +971,45 @@ class _RemoteFWDram:
         self, progress: _KVCRProgress, source_pin: _SourcePinOp
     ) -> bool | None:
         """Return None to retry contention, False when caller work is needed."""
-        kvcr = self._kvcr
-        if kvcr._local_dram is None:
+        local = self._kvcr._local_dram
+        if local is None:
             return False
-        if not kvcr._state_lock.acquire(blocking=False):
-            return None
-        selected = []
-        try:
-            for key, destination in zip(
-                source_pin.ordered_keys, source_pin.dst_descriptors
-            ):
-                record = kvcr._block_record_map.get(key)
-                residency = record.local_dram if record is not None else None
-                if residency is None or residency.state is not _LocalDramState.READY:
-                    return False
-                if (
-                    source_pin.key_layout
-                    and source_pin.key_layout != residency.key_layout
-                ):
-                    return False
-                indices = residency.ready_indices([ref.label for ref in destination])
-                if indices is None:
-                    return False
-                selected.append(indices)
-            sources = kvcr._claim_local_dram_sources(
-                source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
-            )
-            source_refs = tuple(
-                kvcr._local_dram.source_refs(sources[key], indices)
-                for key, indices in zip(source_pin.ordered_keys, selected)
-            )
-            kvcr._add_block_dependencies(source_pin, new_operation=True)
-        finally:
-            kvcr._state_lock.release()
-        # Claims keep the sources stable while the write is assembled unlocked.
-        source_write = _SourceWriteOp(
-            state=_SourceWriteState.READY_TO_WRITE,
-            op_id=source_pin.op_id,
-            keys=source_pin.keys,
-            started_at=source_pin.started_at,
-            deadline=source_pin.deadline,
-            remote_agent=source_pin.remote_agent,
-            op_handle=source_pin.op_handle,
-            source_keys=source_pin.ordered_keys,
-            src_descriptors=source_refs,
-            dst_descriptors=source_pin.dst_descriptors,
-            completed_indices=tuple(range(len(source_pin.ordered_keys))),
-            route=source_pin.route,
-            nvtx_state=source_pin.nvtx_state,
-            _backend=self,
+        selected = local.acquire_source_request(
+            source_pin,
+            source_pin.ordered_keys,
+            source_pin.dst_descriptors,
+            source_pin.key_layout,
         )
-        # Already on progress: retain cleanup ownership before starting the write.
-        progress._in_flight_ops[source_write.op_id] = source_write
+        if selected is None:
+            return None
+        if not selected:
+            return False
+        sources = tuple(residency for residency, _ in selected)
+        try:
+            source_write = _SourceWriteOp(
+                state=_SourceWriteState.READY_TO_WRITE,
+                op_id=source_pin.op_id,
+                keys=source_pin.keys,
+                started_at=source_pin.started_at,
+                deadline=source_pin.deadline,
+                remote_agent=source_pin.remote_agent,
+                op_handle=source_pin.op_handle,
+                source_keys=source_pin.ordered_keys,
+                src_descriptors=tuple(refs for _, refs in selected),
+                dst_descriptors=source_pin.dst_descriptors,
+                completed_indices=tuple(range(len(source_pin.ordered_keys))),
+                route=source_pin.route,
+                nvtx_state=source_pin.nvtx_state,
+                local_sources=sources,
+                _backend=self,
+            )
+            # Retain cleanup ownership before native submission can start.
+            progress._in_flight_ops[source_write.op_id] = source_write
+        except BaseException:
+            local.release_source_request(
+                source_pin.op_id, source_pin.ordered_keys, sources, success=False
+            )
+            raise
         done, _ = source_write.progress(progress, None)
         if done:
             progress._in_flight_ops.pop(source_write.op_id)

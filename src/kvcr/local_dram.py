@@ -3,6 +3,7 @@
 """KVCR-owned local DRAM slots, claims, and transfers."""
 
 import logging
+import queue
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
@@ -82,7 +83,8 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
 
     Reserved pieces become readable only after successful copies. Once all
     pieces are readable, pending_labels is None; writers is also None when
-    no copies are in flight. refs caches committed physical-slot references.
+    no copies are in flight. refs starts sparse and becomes an ordered tuple
+    on the first full-layout read.
     """
 
     slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
@@ -95,7 +97,9 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     writers: list[int] | None = None
     remote_indices: tuple[int, ...] | None = None
     remote_cancelled: bool = False
-    refs: dict[int, _TransferRef] = msgspec.field(default_factory=dict)
+    refs: dict[int, _TransferRef] | tuple[_TransferRef, ...] = msgspec.field(
+        default_factory=dict
+    )
     indices_by_label: dict[str, int | None] | None = None
     _layout: tuple[str, ...] | None = None
     _pool_counts: tuple[tuple[str, int], ...] | None = None
@@ -354,6 +358,11 @@ class _LocalDram:
             raise ValueError("local DRAM NIXL backend must be non-empty")
 
         self._kvcr = kvcr
+        self._source_requests: dict[_OpId, frozenset[BlockKey]] = {}
+        self._source_completions: queue.SimpleQueue[
+            tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool]
+        ] = queue.SimpleQueue()
+        self._draining_sources = False
         self._backend = region.backend
         self._pools: dict[str, tuple[int, int, int]] = {}
         self._free_slots: dict[str, deque[int]] = {}
@@ -404,6 +413,106 @@ class _LocalDram:
             RegionDescriptor(addr=address, count=length // size, size=size, label=name)
             for name, (address, length, size) in self._pools.items()
         )
+
+    @property
+    def source_operations(self) -> int:
+        with self._kvcr._source_lock:
+            return len(self._source_requests)
+
+    def acquire_source_request(
+        self,
+        op: _Op,
+        keys: tuple[BlockKey, ...],
+        destinations: tuple[tuple[_TransferRef, ...], ...],
+        key_layout: tuple[str, ...],
+    ) -> tuple[tuple[_LocalDramResidency, tuple[_TransferRef, ...]], ...] | None:
+        """Protect one ready request; None retries contention, () uses the caller."""
+        if not self._kvcr._source_lock.acquire(blocking=False):
+            return None
+        try:
+            selected = []
+            for key, destination in zip(keys, destinations):
+                record = self._kvcr._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if (
+                    residency is None
+                    or residency.state is not _LocalDramState.READY
+                    or residency.retire_on_release
+                    or key_layout
+                    and key_layout != residency.key_layout
+                ):
+                    return ()
+                requested = [ref.label for ref in destination]
+                if not residency.pending_labels and residency.layout == tuple(
+                    requested
+                ):
+                    refs = self._source_refs(residency, None)
+                else:
+                    indices = residency.ready_indices(requested)
+                    if indices is None:
+                        return ()
+                    refs = self._source_refs(residency, indices)
+                selected.append((residency, refs))
+            result = tuple(selected)
+            self._source_requests[op.op_id] = op.keys
+            return result
+        finally:
+            self._kvcr._source_lock.release()
+
+    def release_source_request(
+        self,
+        op_id: _OpId,
+        keys: tuple[BlockKey, ...],
+        sources: tuple[_LocalDramResidency, ...],
+        *,
+        success: bool,
+    ) -> None:
+        with self._kvcr._source_lock:
+            del self._source_requests[op_id]
+            self._source_completions.put((keys, sources, success))
+
+    def _drain_sources(self) -> None:
+        if self._draining_sources:
+            return
+        self._draining_sources = True
+        freed = False
+        try:
+            while True:
+                try:
+                    keys, sources, success = self._source_completions.get_nowait()
+                except queue.Empty:
+                    break
+                if success:
+                    now = self._kvcr._clock()
+                    for key, residency in zip(keys, sources):
+                        record = self._kvcr._block_record_map.get(key)
+                        if record is not None and record.local_dram is residency:
+                            record.access_count += 1
+                            record.last_access = now
+                for key, residency in zip(keys, sources):
+                    record = self._kvcr._block_record_map.get(key)
+                    if record is None or record.local_dram is not residency:
+                        continue
+                    if not residency.claim_count:
+                        freed |= self._after_last_claim(key, residency)
+        finally:
+            self._draining_sources = False
+        if freed and not self._kvcr._closed:
+            self._resume_capacity_waiters()
+
+    def _reclaimable_slots(self) -> dict[str, int]:
+        slots = {
+            name: len(free) + self._evictable_slots[name]
+            for name, free in self._free_slots.items()
+        }
+        with self._kvcr._source_lock:
+            requests = tuple(self._source_requests.values())
+        for key in set().union(*requests):
+            if self._evictable.score(key) is not None:
+                residency = self._kvcr._block_record_map[key].local_dram
+                for pool, count in residency.pool_counts:
+                    slots[pool] -= count
+        return slots
 
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
@@ -480,7 +589,8 @@ class _LocalDram:
             "local_g2_total_slots": total_slots,
             "local_g2_free_slots": free_slots,
             "local_g2_allocated_slots": total_slots - free_slots,
-            "local_g2_evictable_slots": sum(self._evictable_slots.values()),
+            "local_g2_evictable_slots": sum(self._reclaimable_slots().values())
+            - free_slots,
         }
 
     def deposit(
@@ -568,12 +678,14 @@ class _LocalDram:
                         op.results[key] = _FAILED_RESULT
                     continue
                 full_deposit = layout == local_layout
-                residency = record.local_dram = _LocalDramResidency(
+                residency = _LocalDramResidency(
                     locations,
                     _LocalDramState.FILLING,
                     key_layout=declaration,
                     writers=[1 if full_deposit else 0] * len(locations),
                 )
+                with self._kvcr._source_lock:
+                    record.local_dram = residency
             if full_deposit:
                 selected_slots = residency.slots
                 selected_indices = tuple(range(len(selected_slots)))
@@ -814,13 +926,32 @@ class _LocalDram:
     def source_refs(
         self, residency: _LocalDramResidency, indices: list[int]
     ) -> tuple[_TransferRef, ...]:
+        with self._kvcr._source_lock:
+            return self._source_refs(residency, indices)
+
+    def _source_refs(
+        self, residency: _LocalDramResidency, indices: list[int] | None
+    ) -> tuple[_TransferRef, ...]:
+        """None selects a full layout whose readiness the caller has checked."""
+        full = indices is None or (
+            len(indices) == len(residency.slots)
+            and indices == list(range(len(residency.slots)))
+        )
+        cached = residency.refs
+        if isinstance(cached, tuple):
+            return cached if full else tuple(cached[index] for index in indices)
         refs = []
-        for index in indices:
-            ref = residency.refs.get(index)
+        for index in range(len(residency.slots)) if full else indices:
+            ref = cached.get(index)
             if ref is None:
-                ref = residency.refs[index] = self._descriptor(*residency.slots[index])
+                ref = self._descriptor(*residency.slots[index])
+                if not full:
+                    cached[index] = ref
             refs.append(ref)
-        return tuple(refs)
+        result = tuple(refs)
+        if full:
+            residency.refs = result
+        return result
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
         for key in keys:
@@ -842,7 +973,8 @@ class _LocalDram:
                 or residency.claim_count <= 0
             ):
                 raise RuntimeError(f"local DRAM source cannot retire {key!r}")
-            residency.retire_on_release = True
+            with self._kvcr._source_lock:
+                residency.retire_on_release = True
 
     def abandon_capacity_eviction(self, key: BlockKey) -> None:
         """Stop blocking local admission on an eviction that will not land.
@@ -874,7 +1006,8 @@ class _LocalDram:
                 residency.state is _LocalDramState.FILLING
                 and not residency.pending_deposits
             ):
-                residency.state = _LocalDramState.DISCARDING
+                with self._kvcr._source_lock:
+                    residency.state = _LocalDramState.DISCARDING
             if residency.remote_indices is not None:
                 residency.remote_cancelled = True
             for op_id in record.active_op_ids:
@@ -910,9 +1043,11 @@ class _LocalDram:
 
     def close(self) -> None:
         # Policy state ends with KVCR; teardown emits no per-block removals.
+        self._drain_sources()
         self._public_claims.clear()
 
     def poll_main(self, items: Collection[object]) -> list[object]:
+        self._drain_sources()
         # Progress-side source claims defer framework callbacks to the caller.
         self._update_capacity_pressure()
         unhandled: list[object] = []
@@ -998,29 +1133,33 @@ class _LocalDram:
                 residency.remote_indices = None
                 residency.remote_cancelled = False
             pending = residency.pending_labels
-            if key_success and pending:
-                pending_count = len(pending)
-                if len(indices) == len(residency.slots):
-                    pending.clear()
-                else:
-                    pending.difference_update(
-                        residency.slots[index][0] for index in indices
-                    )
-                if len(pending) < pending_count:
-                    residency.state = _LocalDramState.READY
-                    residency.prepare_label_index()
-                    record.last_access = now
-                    if not was_ready:
-                        self._kvcr._on_ingest(
-                            self._kvcr._block_meta(
-                                key, record, self._size_bytes(residency)
-                            ),
-                            source,
+            newly_ready = False
+            with self._kvcr._source_lock:
+                if key_success and pending:
+                    pending_count = len(pending)
+                    if len(indices) == len(residency.slots):
+                        pending.clear()
+                    else:
+                        pending.difference_update(
+                            residency.slots[index][0] for index in indices
                         )
-                    if not pending:
-                        self._residency_observer(key, record)
-                        committed.append(key)
-            residency.settle()
+                    newly_ready = len(pending) < pending_count
+                    if newly_ready:
+                        residency.state = _LocalDramState.READY
+                        residency.prepare_label_index()
+                residency.settle()
+            if newly_ready:
+                record.last_access = now
+                if not was_ready:
+                    self._kvcr._on_ingest(
+                        self._kvcr._block_meta(
+                            key, record, self._size_bytes(residency)
+                        ),
+                        source,
+                    )
+                if not pending:
+                    self._residency_observer(key, record)
+                    committed.append(key)
             if writer is not None:
                 if key not in writer.results:
                     writer.results[key] = (
@@ -1125,9 +1264,11 @@ class _LocalDram:
             return False, False
         locations, evicted, waiting = self._allocate_slots(layout, op.keys, op.deadline)
         if locations is not None:
-            record.local_dram = _LocalDramResidency(
+            residency = _LocalDramResidency(
                 locations, _LocalDramState.FILLING, key_layout=op.key_layout
             )
+            with self._kvcr._source_lock:
+                record.local_dram = residency
         self._update_capacity_pressure()
         self._kvcr._publish_inventory(evicted, CacheTier.LOCAL_G2, removed=True)
         return locations is not None, waiting
@@ -1375,32 +1516,36 @@ class _LocalDram:
             raise RuntimeError(f"invalid local DRAM claim for {key!r}")
         residency.claim_count -= 1
         if residency.claim_count == 0:
-            if residency.state is not _LocalDramState.READY:
-                record.local_dram = None
-                self._free(residency.slots)
-                self._kvcr._prune_block_record(key)
-                self._resume_capacity_waiters()
-                return
-            if residency.retire_on_release:
-                if self._kvcr._key_history_enabled:
-                    self._kvcr._log_key_history(
-                        "remove", (key,), CacheTier.LOCAL_G2, "retire_on_release"
-                    )
-                record.local_dram = None
-                self._residency_observer(key, record)
-                self._free(residency.slots)
-                self.abandon_capacity_eviction(key)
-                self._kvcr._on_remove(
-                    self._kvcr._block_meta(key, record, self._size_bytes(residency))
+            self._after_last_claim(key, residency)
+
+    def _after_last_claim(self, key: BlockKey, residency: _LocalDramResidency) -> bool:
+        if residency.state is _LocalDramState.READY and not residency.retire_on_release:
+            self._make_evictable(key)
+            return False
+        record = self._kvcr._block_record_map[key]
+        with self._kvcr._source_lock:
+            if any(key in keys for keys in self._source_requests.values()):
+                return False
+            record.local_dram = None
+        if residency.state is _LocalDramState.READY:
+            if self._kvcr._key_history_enabled:
+                self._kvcr._log_key_history(
+                    "remove", (key,), CacheTier.LOCAL_G2, "retire_on_release"
                 )
-                if not residency.pending_labels:
-                    self._kvcr._publish_inventory(
-                        (key,), CacheTier.LOCAL_G2, removed=True
-                    )
-                self._kvcr._prune_block_record(key)
-                self._resume_capacity_waiters()
-            else:
-                self._make_evictable(key)
+            self._residency_observer(key, record)
+            self._free(residency.slots)
+            self.abandon_capacity_eviction(key)
+            self._kvcr._on_remove(
+                self._kvcr._block_meta(key, record, self._size_bytes(residency))
+            )
+            if not residency.pending_labels:
+                self._kvcr._publish_inventory((key,), CacheTier.LOCAL_G2, removed=True)
+        else:
+            self._free(residency.slots)
+        self._kvcr._prune_block_record(key)
+        if not self._kvcr._closed and not self._draining_sources:
+            self._resume_capacity_waiters()
+        return True
 
     def _allocate_slots(
         self, layout: list[str], protected: frozenset[BlockKey], deadline: float
@@ -1417,9 +1562,12 @@ class _LocalDram:
                 [],
                 False,
             )
+        self._drain_sources()
         if self._capacity_eviction_key is not None:
             return None, [], True
         self._retry_unscored()
+        with self._kvcr._source_lock:
+            source_requests = tuple(self._source_requests.values())
         victims: list[tuple[BlockKey, "_BlockRecord", _LocalDramResidency, int]] = []
         freed: Counter[str] = Counter()
 
@@ -1447,6 +1595,8 @@ class _LocalDram:
                     raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
                 if deficient.isdisjoint(pool for pool, _ in residency.pool_counts):
                     continue
+                if any(key in keys for keys in source_requests):
+                    continue
                 size_bytes = self._size_bytes(residency)
                 decision, eviction_pending = self._kvcr._decide_eviction(
                     self._kvcr._block_meta(key, record, size_bytes),
@@ -1466,13 +1616,22 @@ class _LocalDram:
                     freed[pool] += count
                 deficient = short()
 
+        with self._kvcr._source_lock:
+            # Readers can arrive while policy evaluates the selected victims.
+            if any(
+                key in keys
+                for keys in self._source_requests.values()
+                for key, _, _, _ in victims
+            ):
+                return None, [], False
+            for _, record, _, _ in victims:
+                record.local_dram = None
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
             if self._kvcr._key_history_enabled:
                 self._kvcr._log_key_history(
                     "remove", (key,), CacheTier.LOCAL_G2, "capacity_eviction"
                 )
-            record.local_dram = None
             self._residency_observer(key, record)
             self._kvcr._on_remove(self._kvcr._block_meta(key, record, size_bytes))
             self._kvcr._prune_block_record(key)
@@ -1550,9 +1709,4 @@ class _LocalDram:
     def _update_capacity_pressure(self) -> None:
         if self._kvcr._capacity_needed_callback is None:
             return
-        self._kvcr._update_capacity_pressure(
-            {
-                name: len(slots) + self._evictable_slots[name]
-                for name, slots in self._free_slots.items()
-            }
-        )
+        self._kvcr._update_capacity_pressure(self._reclaimable_slots())

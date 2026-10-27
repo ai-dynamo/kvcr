@@ -245,8 +245,10 @@ class _KVCRCore:
         # Common KVCR state tables.
         if g3_config is not None and local_dram_config is None:
             raise ValueError("G3 requires configured local DRAM")
-        # Serialize caller metadata transactions with progress-side source claims.
+        # Serialize caller metadata transactions.
         self._state_lock = threading.RLock()
+        # Caller paths take state before source; progress takes only source.
+        self._source_lock = threading.Lock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         # Preserve remote selections until a successful fetch or discard_hint().
         self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
@@ -814,6 +816,7 @@ class _KVCRCore:
                 "completed": len(self._completion_queue),
             }
             if self._local_dram is not None:
+                resources["in_flight_ops"] += self._local_dram.source_operations
                 resources.update(self._local_dram.telemetry_state())
             if self._g3 is not None:
                 resources.update(self._g3.telemetry_state())
@@ -1201,7 +1204,9 @@ class _KVCRCore:
     def _block_record(self, key: BlockKey) -> _BlockRecord:
         record = self._block_record_map.get(key)
         if record is None:
-            record = self._block_record_map[key] = _BlockRecord()
+            record = _BlockRecord()
+            with self._source_lock:
+                self._block_record_map[key] = record
         return record
 
     def _is_local_resident(self, key: BlockKey) -> bool:
@@ -1273,7 +1278,8 @@ class _KVCRCore:
             and record.g3 is None
             and not record.in_flight_ops
         ):
-            self._block_record_map.pop(key)
+            with self._source_lock:
+                self._block_record_map.pop(key)
 
     def _complete(
         self,

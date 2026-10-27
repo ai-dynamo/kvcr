@@ -369,7 +369,7 @@ class _RecoveryMirror:
                     local_dram.claim_count = 0
                     local_dram.retire_on_release = False
                     # References name the previous agent, unlike the slot layout.
-                    local_dram.refs.clear()
+                    local_dram.refs = {}
             if record.g3 is not None:
                 record.g3.claim_count = 0
             record.fw_mem = None
