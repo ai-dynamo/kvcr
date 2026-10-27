@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libprotobuf-dev libssl-dev libudev-dev \
     pkg-config protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
-ARG SGLANG_DYNAMO_REF=f3d3648fcaf7f293e93057f1a3103df9094fef3a
+ARG SGLANG_DYNAMO_REF=10f2c7bc04db8fbf39eb96c81d00b854797f10cc
 RUN git init /src/dynamo \
  && git -C /src/dynamo remote add origin https://github.com/ai-dynamo/dynamo.git \
  && git -C /src/dynamo fetch --depth 1 origin "${SGLANG_DYNAMO_REF}" \

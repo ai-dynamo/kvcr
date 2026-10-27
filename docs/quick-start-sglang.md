@@ -40,7 +40,7 @@ The per-run image tag avoids overwriting an existing local build. This recipe bu
 | Component | Revision |
 | --- | --- |
 | SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `0d8db33e19b2ee112b938c74388fd790822fe6fe` |
-| Dynamo router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) | `f3d3648fcaf7f293e93057f1a3103df9094fef3a` |
+| Dynamo router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) | `10f2c7bc04db8fbf39eb96c81d00b854797f10cc` |
 | KVCR main | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
 
 The SGLang revisions are draft public PR heads, not released packages. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
