@@ -2,7 +2,7 @@
 
 This guide is for developers who are comfortable with Python, Linux, and inference engines such as vLLM, but are new to KV Cache Runner (KVCR). It covers the local development path from environment setup through standalone validation.
 
-To try the integrated stack without modifying source, follow the [vLLM quick start](quick-start-vllm.md).
+To try the integrated stack without modifying source, follow the [vLLM quick start](quick-start-vllm.md) or [SGLang HiCache quick start](quick-start-sglang.md).
 
 ---
 

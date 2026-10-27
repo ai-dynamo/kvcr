@@ -79,6 +79,8 @@ A hint envelope may carry several hints. KVCR parses and dispatches each one ind
 
 The [vLLM quick start](docs/quick-start-vllm.md) is a public preview that builds and runs KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible base image. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
 
+The [SGLang HiCache quick start](docs/quick-start-sglang.md) has its own Dockerfile and inline build, launch, and peer-transfer checks. It is a draft preview; read its validation status before use.
+
 ### Development
 
 For local development, API lifecycle guidance, validation, integration, and KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
