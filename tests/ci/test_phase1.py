@@ -329,7 +329,7 @@ def test_state_agent_config_only_in_guard_mode(tmp_path, monkeypatch):
     )
 
 
-# -- verdicts -------------------------------------------------------------------
+# -- negative verdicts (review of #103) ----------------------------------------
 
 
 def _ctx(**geometry):
