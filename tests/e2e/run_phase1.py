@@ -6,7 +6,7 @@ Sequence:
   1. preflight        GPUs, shared memory, kernel (Guard), ports
   2. reference        KVCR disabled worker; every prompt generated twice
   3. stack            per-worker kvcr_service (Guard) + KV router + 2 workers
-  4. cases            the selected TC-* cases (TC-01 in this revision)
+  4. cases            TC-01, TC-02, TC-03 same-node
   5. evidence         result.json, junit.xml, all requests/responses/logs
 
 Exit status is 0 only when every selected case is PASS. BLOCKED cases are
@@ -124,7 +124,13 @@ class Runner:
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
         self.tag = args.prompt_tag or uuid.uuid4().hex[:12]
-        self.prompts = Prompts(self.tag)
+        self.prompts = Prompts(
+            self.tag,
+            tc02_shared=args.tc02_shared_sections,
+            tc02_sections=args.tc02_sections,
+            seed_prefix=args.tc02_seed_prefix,
+            tc02_extra_shared=args.tc02_extra_shared_sections,
+        )
         self.references: dict[str, TokenSample] = {}
         # cached_tokens the KVCR-disabled engine reported per reference request,
         # in order; tells a case what the engine alone can reuse.
@@ -139,6 +145,10 @@ class Runner:
             "prompt_tag": self.tag,
             "max_tokens": args.max_tokens,
             "hit_block_tokens": args.hit_block_tokens,
+            "ssm_groups": args.ssm_groups,
+            "page_bytes": args.page_bytes,
+            "tc02_sections": [args.tc02_shared_sections, args.tc02_sections],
+            "tc02_seed_prefix": args.tc02_seed_prefix,
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
@@ -150,7 +160,9 @@ class Runner:
             "limitations": [
                 "Single node, two GPUs, aggregated deployment only.",
                 "Local-hit path evidence is the KVCR commit (local_fill) after the "
-                "cold request plus the reuse hit count.",
+                "cold "
+                "request plus the reuse hit count; remote and Guard paths have "
+                "transfer telemetry as direct evidence.",
             ],
         }
         self.save()
@@ -192,7 +204,11 @@ class Runner:
         unstable_detail: dict[str, Any] = {}
         # Only the prompts the requested cases use: a long prompt of a case not
         # being run must not block the run when the bare engine is unstable on it.
-        case_prompts = {"TC-01": {"tc01"}}
+        case_prompts = {
+            "TC-01": {"tc01"},
+            "TC-02": {"tc02_p1", "tc02_full", "tc02_partial", "tc02_absent"},
+            "TC-03": {"tc03", "tc03_isolated"},
+        }
         wanted: set[str] = set()
         for case in self.args.cases:
             wanted |= case_prompts.get(case, set())
@@ -340,6 +356,11 @@ class Runner:
             index_wait=self.args.index_wait,
             telemetry_timeout=self.args.telemetry_timeout,
             hit_block_tokens=self.args.hit_block_tokens,
+            engine_cached=self.reference_cached,
+            tc02_seed_prefix=self.args.tc02_seed_prefix,
+            tc02_evict_target=self.args.tc02_evict_target,
+            ssm_groups=self.args.ssm_groups,
+            page_bytes=self.args.page_bytes,
         )
         for name in self.args.cases:
             self.check_deadline()
@@ -441,7 +462,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default="0,1",
         help="two CUDA device indices, e.g. 0,1",
     )
-    parser.add_argument("--cases", default="TC-01")
+    parser.add_argument("--cases", default="TC-01,TC-02,TC-03")
     parser.add_argument("--http-port", type=int, default=8000)
     parser.add_argument("--reference-http-port", type=int, default=8001)
     parser.add_argument(
@@ -463,6 +484,59 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="tokens per prefix-cache hit block: 64 for dense models, 576 for Qwen3.5 "
         "hybrid models (vLLM raises the attention block); hit alignment and the "
         "delivered-pages checks use it",
+    )
+    parser.add_argument(
+        "--ssm-groups",
+        type=int,
+        default=0,
+        help="hybrid models: SSM/linear-attention KV cache groups (Qwen3.5-4B: 3); "
+        "with it every transfer must deliver exactly hit blocks + groups pages "
+        "per hit, instead of only >= hit blocks",
+    )
+    parser.add_argument(
+        "--page-bytes",
+        type=int,
+        default=0,
+        help="KVCR page size in bytes when known; transfer bytes must equal "
+        "pages * page bytes (0 = skip)",
+    )
+    parser.add_argument(
+        "--tc02-shared-sections",
+        type=int,
+        default=40,
+        help="TC-02 shared prefix P1 length in ~17-token sections (hybrid: 140)",
+    )
+    parser.add_argument(
+        "--tc02-sections",
+        type=int,
+        default=80,
+        help="TC-02 full/partial prompt length in sections (hybrid: 200)",
+    )
+    parser.add_argument(
+        "--tc02-extra-shared-sections",
+        type=int,
+        default=0,
+        help="TC-02: sections shared by full and partial prompts after P1 (never "
+        "served "
+        "alone); with --tc02-seed-prefix the shared prefix then exceeds the last "
+        "SSM checkpoint",
+    )
+    parser.add_argument(
+        "--tc02-evict-target",
+        type=int,
+        default=0,
+        help="TC-02: after the partial delivery, send this many sub-block prompts to "
+        "worker 1 to evict its GPU prefix cache, then re-request the partial "
+        "prompt and "
+        "record where the delivered prefix is served from (0 = skip)",
+    )
+    parser.add_argument(
+        "--tc02-seed-prefix",
+        action="store_true",
+        help="TC-02: serve the shared prefix P1 alone on worker 0 before the full "
+        "prompt (hybrid models: vLLM mamba_cache_mode=align keeps SSM state only at "
+        "a request's last aligned boundary, so the P1/P2 junction needs its own "
+        "request)",
     )
     parser.add_argument(
         "--frontend-env",
@@ -554,6 +628,12 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-tokens must be 1..512 and --pool-gb 1..64")
     if args.hit_block_tokens < 1 or args.hit_block_tokens % 64:
         parser.error("--hit-block-tokens must be a positive multiple of 64")
+    if args.ssm_groups < 0 or args.page_bytes < 0:
+        parser.error("--ssm-groups and --page-bytes must be >= 0")
+    if args.ssm_groups and args.hit_block_tokens == 64:
+        parser.error("--ssm-groups needs the hybrid --hit-block-tokens")
+    if not 2 <= args.tc02_shared_sections < args.tc02_sections <= 1000:
+        parser.error("--tc02-shared-sections must be < --tc02-sections (<= 1000)")
     if args.http_port == args.reference_http_port:
         parser.error("--http-port and --reference-http-port must differ")
     return args
