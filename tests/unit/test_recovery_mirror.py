@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import replace
-
 import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record
+from msgspec.structs import replace
 
 from kvcr.core import _BlockRecord
 from kvcr.local_disk import _G3Residency

@@ -10,7 +10,6 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass
 from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
@@ -128,8 +127,10 @@ def _noop_record_transfer(
     return None
 
 
-@dataclass(slots=True)
-class _BlockRecord:
+class _BlockRecord(msgspec.Struct, gc=False):
+    # One per cached block, so it is untracked by the cyclic GC (gc=False): it
+    # is never part of a reference cycle, and scanning it on every full pass
+    # stalled the framework thread for hundreds of milliseconds.
     # Locally pinned framework-owned G2 memory. This is never remote
     # KVCR residency and exists only while KVCR controls the pin.
     fw_mem: "_FwMemResidency | None" = None

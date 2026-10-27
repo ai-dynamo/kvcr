@@ -363,7 +363,7 @@ class _RecoveryMirror:
                     record.local_dram = None
                 else:
                     local_dram.pending_deposits = 0
-                    local_dram.writers.clear()
+                    local_dram.writers = None
                     local_dram.remote_indices = None
                     local_dram.remote_cancelled = False
                     local_dram.claim_count = 0

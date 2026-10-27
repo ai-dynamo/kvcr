@@ -104,7 +104,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
         else:
             assert residency.state is _LocalDramState.READY
             assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
-        observed.append((key, None if residency is None else residency.slots))
+        observed.append((key, None if residency is None else list(residency.slots)))
 
     backend.observe_residency(observe)
     first = kvcr.deposit({keys[0]: [_mem_descriptor(0)]})
