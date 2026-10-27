@@ -260,8 +260,8 @@ def test_kernel_release_parsing(monkeypatch):
 
 
 def test_arguments_validate_gpus_and_cases(tmp_path):
-    args = runner.arguments(["--output-dir", str(tmp_path), "--cases", "tc-01, TC-03"])
-    assert args.gpus == [0, 1] and args.cases == ["TC-01", "TC-03"]
+    args = runner.arguments(["--output-dir", str(tmp_path), "--cases", "tc-01, TC-04"])
+    assert args.gpus == [0, 1] and args.cases == ["TC-01", "TC-04"]
     for bad in (
         ["--gpus", "0"],
         ["--gpus", "1,1"],
@@ -340,6 +340,7 @@ def _ctx(**geometry):
         {},
         index_wait=0,
         telemetry_timeout=0,
+        recovery_timeout=0,
         **geometry,
     )
 

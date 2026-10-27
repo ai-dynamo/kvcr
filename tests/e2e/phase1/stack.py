@@ -605,6 +605,41 @@ class Stack:
             f"{sorted(self.discovery_instance_ids() - known)})"
         )
 
+    def kill_worker(self, index: int) -> dict[str, Any]:
+        worker = self.workers.pop(index)
+        killed_at = utc_now()
+        worker.stopped = True
+        worker.signal_group(signal.SIGKILL)
+        try:
+            worker.process.wait(timeout=30)
+        except subprocess.TimeoutExpired as error:
+            raise ValidationError(f"worker {index} survived SIGKILL") from error
+        retired = self.worker_ids.pop(index, None)
+        if retired is not None:
+            self.retired_ids.add(retired)
+        return {
+            "worker": worker.name,
+            "pid": worker.pid,
+            "killed_at": killed_at,
+            "instance_id": retired,
+        }
+
+    def wait_log(
+        self, child: Managed, needle: str, timeout: float, count: int = 1
+    ) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.deadline_check()
+            text = child.log_text()
+            if text.count(needle) >= count:
+                return text
+            if not child.alive():
+                raise ValidationError(
+                    f"{child.name} exited while waiting for {needle!r}"
+                )
+            time.sleep(1)
+        raise ValidationError(f"{child.name} did not log {needle!r} within {timeout}s")
+
     # -- teardown ----------------------------------------------------------
 
     def stop(self, *children: Managed) -> list[dict[str, Any]]:

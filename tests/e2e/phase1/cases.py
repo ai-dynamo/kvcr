@@ -9,10 +9,12 @@ BlockedError marks the combination BLOCKED with the missing condition.
 
 from __future__ import annotations
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from .client import Client, Response
 from .common import (
@@ -25,9 +27,10 @@ from .common import (
     compare_tokens,
     expected_hit_blocks,
     extract_sample,
+    save_json,
     utc_now,
 )
-from .stack import Stack
+from .stack import GUARD, GUARD_PROMOTED, RECOVERY_DISABLED, Stack
 from .telemetry import (
     LOCAL_DELIVER,
     LOCAL_FILL,
@@ -40,6 +43,10 @@ from .telemetry import (
     duration_count,
     latest_gauge,
     read_window,
+)
+
+PROMOTED = re.compile(
+    r"KVCR_EVENT guard_promoted guard=(\d+) pool=(\S+) recovered_blocks=(\d+)"
 )
 
 
@@ -120,6 +127,18 @@ class Prompts:
     def tc03_isolated(self) -> str:
         return self.prefix(self.tag + "g", 0, 80) + self.tail
 
+    @property
+    def tc04(self) -> str:
+        return self.prefix(self.tag + "h", 0, 80) + self.tail
+
+    @property
+    def tc04_fresh(self) -> str:
+        return self.prefix(self.tag + "i", 0, 80) + self.tail
+
+    @property
+    def tc04_second(self) -> str:
+        return self.prefix(self.tag + "j", 0, 80) + self.tail
+
     def short_filler(self, index: int) -> str:
         """~80 tokens: exactly one full 64-token block (cached, hence evicting)
         plus a tail. Sub-block prompts are freed, not cached, and evict nothing."""
@@ -136,6 +155,9 @@ class Prompts:
                 "tc02_absent",
                 "tc03",
                 "tc03_isolated",
+                "tc04",
+                "tc04_fresh",
+                "tc04_second",
             )
         }
         return prompts
@@ -157,6 +179,7 @@ class Context:
         *,
         index_wait: float,
         telemetry_timeout: float,
+        recovery_timeout: float,
         hit_block_tokens: int = BLOCK_SIZE,
         engine_cached: dict[str, list[int | None]] | None = None,
         tc02_seed_prefix: bool = False,
@@ -170,6 +193,7 @@ class Context:
         self.references = references
         self.index_wait = index_wait
         self.telemetry_timeout = telemetry_timeout
+        self.recovery_timeout = recovery_timeout
         # Tokens per prefix-cache hit block. 64 (vLLM --block-size) for dense
         # models; hybrid models (Qwen3.5) raise the attention block to 576 so
         # cached_tokens is a multiple of that, and every KVCR transfer carries
@@ -448,6 +472,11 @@ class Context:
         )
         result.measurements[label] = window.totals
         return window
+
+    def save(self, result: CaseResult, name: str, value: Any) -> None:
+        path = self.client.evidence / f"{result.case}.{name}.json"
+        save_json(path, value)
+        result.evidence.append(path.name)
 
 
 def hit_verdict(
@@ -783,7 +812,158 @@ def tc03(ctx: Context) -> CaseResult:
     return result
 
 
-CASES = {"TC-01": tc01, "TC-02": tc02, "TC-03": tc03}
+def tc04(ctx: Context) -> CaseResult:
+    result = CaseResult("TC-04", "Guard protection, takeover, re-attach", "R3")
+    if ctx.stack.settings.mode != GUARD:
+        raise BlockedError("TC-04 runs only in Guard mode")
+    p = ctx.prompts
+    service = ctx.stack.services[0]
+    seed = ctx.request("tc04-protect-w0", p.tc04, 0)
+    result.evidence += [seed.request_file, seed.response_file]
+    if not ctx.require_ok(result, seed, 0):
+        result.finish()
+        return result
+    ctx.compare(result, seed, "tc04")
+    ctx.check_cold(result, seed)
+    committed = ctx.local_commit_checks(
+        result, 0, seed.started_at, "tc04 protected commit"
+    )
+    committed_blocks = committed.blocks(LOCAL_FILL)
+    second_seed = ctx.request("tc04-protect-second-w0", p.tc04_second, 0)
+    result.evidence += [second_seed.request_file, second_seed.response_file]
+    if ctx.require_ok(result, second_seed, 0):
+        ctx.compare(result, second_seed, "tc04_second")
+        ctx.check_cold(result, second_seed)
+        second = ctx.local_commit_checks(
+            result, 0, second_seed.started_at, "tc04 protected commit (second prompt)"
+        )
+        committed_blocks += second.blocks(LOCAL_FILL)
+    result.check(
+        "tc04: warm recovery still enabled before failure",
+        RECOVERY_DISABLED not in service.log_text()
+        and RECOVERY_DISABLED not in ctx.stack.workers[0].log_text(),
+        "no 'KVCR pool recovery disabled' in service or worker log",
+    )
+    time.sleep(ctx.index_wait)
+
+    # Engine failure: the whole worker process group dies; its service survives.
+    promotions_before = service.log_text().count(GUARD_PROMOTED)
+    kill = ctx.stack.kill_worker(0)
+    ctx.save(result, "kill", kill)
+    killed = time.monotonic()
+    text = ctx.stack.wait_log(
+        service, GUARD_PROMOTED, ctx.recovery_timeout, promotions_before + 1
+    )
+    promoted_after = time.monotonic() - killed
+    match = PROMOTED.findall(text)[-1] if PROMOTED.findall(text) else None
+    recovered = int(match[2]) if match else -1
+    result.measurements["guard_promotion_seconds_after_kill"] = round(promoted_after, 3)
+    result.measurements["guard_recovered_blocks"] = recovered
+    result.measurements["committed_blocks_before_failure"] = committed_blocks
+    result.check(
+        "tc04: service kept running and promoted its Guard after engine death",
+        service.alive() and match is not None,
+        f"guard_promoted after {promoted_after:.1f}s: {match}",
+    )
+    result.check(
+        "tc04: Guard recovered the committed blocks",
+        recovered >= committed_blocks > 0,
+        f"recovered_blocks={recovered}, committed local_fill blocks={committed_blocks}",
+    )
+
+    # Takeover: worker 1 reads preserved prefixes from the Guard. Worker 1 had
+    # already exchanged NIXL metadata with the dead primary at this endpoint, so
+    # the first and second requests are checked separately.
+    for attempt, (stage, key) in enumerate(
+        (
+            ("tc04-guard-served-w1", "tc04"),
+            ("tc04-guard-served-second-w1", "tc04_second"),
+        ),
+        start=1,
+    ):
+        served = ctx.request(stage, getattr(p, key), 1)
+        result.evidence += [served.request_file, served.response_file]
+        result.measurements[f"guard_served_request_{attempt}_latency_seconds"] = round(
+            served.latency_seconds, 3
+        )
+        if not ctx.require_ok(result, served, 1):
+            continue
+        ctx.compare(result, served, key)
+        blocks = ctx.check_hit(result, served)
+        window = ctx.wait_window(
+            1,
+            served.started_at,
+            lambda w, b=blocks: w.blocks(REMOTE_DELIVER) >= b and b > 0,
+        )
+        result.check(
+            f"{stage}: Guard-served blocks delivered to worker 1 (remote_deliver)",
+            ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
+            and window.successes(REMOTE_DELIVER) >= 1,
+            f"remote_deliver blocks={window.blocks(REMOTE_DELIVER)}, "
+            f"hit blocks={blocks}, expected pages={ctx.expected_pages(blocks)}, "
+            f"tier read bytes={window.get(TIER_READ_BYTES)}",
+        )
+        ctx.bytes_match_pages(
+            result, stage, window.get(TIER_READ_BYTES), window.blocks(REMOTE_DELIVER)
+        )
+        result.check(
+            f"{stage}: no positive KVCR failed/partial metrics while Guard served",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
+        result.measurements[f"guard_served_window_{attempt}"] = window.totals
+        result.measurements[f"guard_service_log_after_request_{attempt}"] = [
+            line[:300]
+            for line in service.log_text().splitlines()
+            if "WARNING" in line or "Error" in line
+        ][-6:]
+
+    # Re-attach: a replacement worker claims the pool group back.
+    ctx.stack.start_worker(0, tag="-replacement")
+    reattached = time.monotonic()
+    ctx.stack.wait_model(ctx.client)
+    ctx.stack.discover_worker(ctx.client, 0)
+    result.measurements["replacement_ready_seconds"] = round(
+        time.monotonic() - reattached, 3
+    )
+    replacement = ctx.stack.workers[0]
+    result.check(
+        "tc04: replacement attached without a second promotion (single owner)",
+        service.alive()
+        and service.log_text().count(GUARD_PROMOTED) == promotions_before + 1
+        and RECOVERY_DISABLED not in replacement.log_text(),
+        f"guard_promoted events={service.log_text().count(GUARD_PROMOTED)}",
+    )
+    fresh = ctx.request("tc04-fresh-w0-replacement", p.tc04_fresh, 0)
+    result.evidence += [fresh.request_file, fresh.response_file]
+    if ctx.require_ok(result, fresh, 0):
+        ctx.compare(result, fresh, "tc04_fresh")
+        ctx.check_cold(result, fresh)
+        ctx.local_commit_checks(
+            result, 0, fresh.started_at, "tc04 replacement commits new data"
+        )
+    again = ctx.request("tc04-preserved-w0-replacement", p.tc04, 0)
+    result.evidence += [again.request_file, again.response_file]
+    if ctx.require_ok(result, again, 0):
+        ctx.compare(result, again, "tc04")
+        # The preserved prefix must be served from the reclaimed pool, not
+        # recomputed: a positive, block-aligned hit with no KVCR failures.
+        ctx.check_hit(result, again)
+        window = ctx.settle(0, again.started_at)
+        result.check(
+            "tc04-preserved-w0-replacement: no positive KVCR failed/partial metrics",
+            not window.peer_failures,
+            str(window.peer_failures),
+        )
+        result.measurements["replacement_preserved_prefix_cached_tokens"] = ctx.cached(
+            again
+        )
+        result.measurements["replacement_preserved_prefix_window"] = window.totals
+    result.finish()
+    return result
+
+
+CASES = {"TC-01": tc01, "TC-02": tc02, "TC-03": tc03, "TC-04": tc04}
 
 
 def run_case(name: str, ctx: Context) -> CaseResult:
