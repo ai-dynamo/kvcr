@@ -57,3 +57,39 @@ jobs:
           name: kvcr-vllm-e2e-${{ github.run_attempt }}
           path: e2e-artifacts/
           retention-days: 7
+
+  phase1:
+    # KVCR test plan Phase 1 functional gate (TC-01..04) in Guard mode on the
+    # same image and runner, after the peer-transfer smoke test. Guard mode
+    # needs a runner kernel of 6.5 or newer; otherwise the harness reports
+    # BLOCKED and the job fails. TC-05/06 (performance, recovery timing) stay
+    # manual until a nightly lane exists.
+    needs: peer-transfer
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: ${{ inputs.image }}
+    timeout-minutes: 60
+    env:
+      HF_HOME: /scratch/huggingface
+      VLLM_CACHE_ROOT: /scratch/vllm
+      XDG_CACHE_HOME: /scratch/cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show NVIDIA devices
+        run: nvidia-smi
+      - name: Run Phase 1 TC-01..04 in Guard mode
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1/run \
+            --model "$MODEL" --mode guard --timeout 2400 \
+            --cases TC-01,TC-02,TC-03,TC-04
+      - name: Save Phase 1 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcr-phase1-${{ github.run_attempt }}
+          path: artifacts/phase1/
+          retention-days: 14
