@@ -278,6 +278,8 @@ class _RemoteSources:
         self._release_framework_pins(unused_pins)
 
     def _poll_framework_pin_results(self) -> Iterator[tuple[PinRequestId, PinResult]]:
+        if not self._backend._framework_pinning:
+            return
         try:
             yield from self._kvcr._poll_pin_results_callback()
         except Exception:
@@ -671,6 +673,8 @@ class _RemoteSources:
         | _PendingFrameworkSources
         | None
     ):
+        if not self._backend._framework_pinning:
+            return None
         kvcr = self._kvcr
         started_at = kvcr._timer()
         keys_to_pin: list[BlockKey] = []

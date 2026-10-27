@@ -105,6 +105,25 @@ class _RemoteFWDram:
             raise ValueError("metadata_retry_interval_ms must be positive")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
+        self._framework_pinning = kvcr._request_pin_callback is not None
+        if (
+            self._framework_pinning
+            and (
+                kvcr._poll_pin_results_callback is None
+                or kvcr._release_pin_callback is None
+            )
+        ) or (
+            not self._framework_pinning
+            and (
+                kvcr._poll_pin_results_callback is not None
+                or kvcr._release_pin_callback is not None
+                or kvcr._cancel_pin_request_callback is not None
+            )
+        ):
+            raise ValueError(
+                "framework pinning requires request_pin, poll_pin_results, "
+                "and release_pin"
+            )
         self._kvcr = kvcr
         self._options = options
         self._key_adapter = key_adapter
