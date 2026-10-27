@@ -857,13 +857,10 @@ class _RemoteFWDram:
             self._start_guard_source_write(
                 progress,
                 op_id,
-                keys,
-                dst_descriptors,
-                payload.key_layout,
+                payload,
                 started_at,
                 deadline,
                 remote_agent,
-                op_handle,
                 (target_agent, self._route_generation.get(target_agent, 0)),
             )
             return
@@ -905,22 +902,22 @@ class _RemoteFWDram:
         self,
         progress: _KVCRProgress,
         op_id: _OpId,
-        keys: tuple[BlockKey, ...],
-        destinations: tuple[tuple[_TransferRef, ...], ...],
-        key_layout: tuple[str, ...],
+        payload: _StartWrite,
         started_at: float | None,
         deadline: float,
         remote_agent: str,
-        op_handle: int,
         route: tuple[str, int],
     ) -> None:
         local = self._kvcr._local_dram
         claim_started = self._kvcr._timer()
         selected, busy = (
             local.claim_export_subset(
-                keys,
-                tuple(tuple(ref.label for ref in dest) for dest in destinations),
-                key_layout,
+                payload.keys,
+                tuple(
+                    tuple(ref.label for ref in dest)
+                    for dest in payload.dst_descriptors
+                ),
+                payload.key_layout,
             )
             if local is not None
             else ((), False)
@@ -935,17 +932,19 @@ class _RemoteFWDram:
                 started_at=started_at,
                 deadline=deadline,
                 remote_agent=remote_agent,
-                op_handle=op_handle,
+                op_handle=payload.op_handle,
                 source_keys=tuple(claim.key for claim in claims),
                 src_descriptors=tuple(claim.refs for claim in claims),
-                dst_descriptors=tuple(destinations[index] for index, _ in selected),
+                dst_descriptors=tuple(
+                    payload.dst_descriptors[index] for index, _ in selected
+                ),
                 completed_indices=tuple(index for index, _ in selected),
                 route=route,
                 _backend=self,
                 guard_only=True,
                 guard_claims=claims,
                 guard_accounting=claims,
-                guard_requested_count=len(keys),
+                guard_requested_count=len(payload.keys),
                 guard_claim_started_at=claim_started,
             )
             progress._in_flight_ops[op_id] = op
@@ -954,19 +953,17 @@ class _RemoteFWDram:
                 local.release_export_claims(claims)
             raise
         if self._telemetry_enabled and claim_started is not None:
+            claim_result = "busy" if busy else "ready" if claims else "miss"
             self._progress_metrics.append(
                 (
                     "histogram",
                     DURATION_METRIC,
                     claim_finished - claim_started,
-                    (
-                        "guard_ready_claim",
-                        "busy" if busy else "ready" if claims else "miss",
-                    ),
+                    ("guard_ready_claim", claim_result),
                 )
             )
         self._guard_event("ready", op, len(claims))
-        self._guard_event("miss", op, len(keys) - len(claims))
+        self._guard_event("miss", op, len(payload.keys) - len(claims))
         if busy:
             self._guard_event("contention", op)
         self._guard_event("held", op, len(claims))

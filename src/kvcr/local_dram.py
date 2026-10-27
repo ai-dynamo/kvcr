@@ -1476,12 +1476,10 @@ class _LocalDram:
             if retiring:
                 # No new exports can race this detach/physical reuse boundary.
                 record.local_dram = None
-        if residency.state is not _LocalDramState.READY:
-            self._free(residency.slots)
-            self._kvcr._prune_block_record(key)
-            self._resume_capacity_waiters()
+        if not retiring:
+            self._make_evictable(key)
             return
-        if residency.retire_on_release:
+        if residency.state is _LocalDramState.READY:
             if self._kvcr._key_history_enabled:
                 self._kvcr._log_key_history(
                     "remove", (key,), CacheTier.LOCAL_G2, "retire_on_release"
@@ -1494,10 +1492,10 @@ class _LocalDram:
             )
             if not residency.pending_labels:
                 self._kvcr._publish_inventory((key,), CacheTier.LOCAL_G2, removed=True)
-            self._kvcr._prune_block_record(key)
-            self._resume_capacity_waiters()
         else:
-            self._make_evictable(key)
+            self._free(residency.slots)
+        self._kvcr._prune_block_record(key)
+        self._resume_capacity_waiters()
 
     def _allocate_slots(
         self, layout: list[str], protected: frozenset[BlockKey], deadline: float
