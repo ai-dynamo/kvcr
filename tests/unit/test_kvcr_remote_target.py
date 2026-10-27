@@ -1648,6 +1648,12 @@ def test_remote_framework_dram_transfers_available_keys(
         len(completed_indices),
         ("remote_deliver",),
     ) in target_stats.records
+    assert (
+        "counter",
+        TRANSFER_BYTES_METRIC,
+        16 * len(completed_indices),
+        ("remote_deliver",),
+    ) in target_stats.records
     events = [
         record.getMessage()
         for record in caplog.records
@@ -1673,4 +1679,71 @@ def test_remote_framework_dram_transfers_available_keys(
     )
     assert any(
         "target_transfer_completed" in event and completed in event for event in events
+    )
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("telemetry", [False, True])
+@pytest.mark.parametrize("local_fill", [False, True])
+def test_remote_transfer_bytes_count_every_completed_span(
+    local_fill: bool,
+    telemetry: bool,
+    debug: bool,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.DEBUG if debug else logging.INFO, logger="kvcr.core")
+    local = ctypes.create_string_buffer(16 * 6)
+    agent = FakeNixlAgent()
+    control = FakeBytesControl()
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", 16)],
+            enable_telemetry=telemetry,
+        ),
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+    )
+    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    # Every block has two 16-byte spans.
+    if local_fill:
+        handle = target.fetch(keys, "req", expected_layout=["", ""])
+    else:
+        handle = target.deliver(
+            {
+                key: [_mem_descriptor(2 * index), _mem_descriptor(2 * index + 1)]
+                for index, key in enumerate(keys)
+            },
+            request_id="req",
+        )
+    _wait_until(lambda: bool(control.sent))
+    descriptor_bytes = Mock(wraps=target._core._descriptor_bytes)
+    monkeypatch.setattr(target._core, "_descriptor_bytes", descriptor_bytes)
+    wire_handle = _decode_control_message(control.sent[0][1])["op_handle"]
+    agent.notifs["source"] = [
+        _write_done_notification(wire_handle, completed_indices=(0, 2))
+    ]
+    results = dict(_poll_until(target, bool))[handle]
+    assert [results[key].success for key in keys] == [True, False, True]
+
+    # Four completed spans, summed at most once and only for telemetry or DEBUG.
+    assert descriptor_bytes.call_count == int(telemetry or debug)
+    scope = "remote_fetch" if local_fill else "remote_deliver"
+    stats = target.get_stats()
+    if telemetry:
+        assert [record for record in stats.records if record[0] == "counter"] == [
+            ("counter", TRANSFER_BLOCKS_METRIC, 2, (scope,)),
+            ("counter", TRANSFER_BYTES_METRIC, 64, (scope,)),
+        ]
+    else:
+        assert stats is None
+    assert debug == any(
+        "target_transfer_completed" in message and "blocks=2 bytes=64" in message
+        for message in caplog.messages
     )
