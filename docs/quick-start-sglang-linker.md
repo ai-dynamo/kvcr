@@ -18,7 +18,7 @@ For the HiCache storage route, use the [SGLang HiCache quick start](quick-start-
 ## Prerequisites
 
 - A Linux x86-64 host with two available NVIDIA GPUs (Hopper or newer, 80 GB or more each) compatible with the pinned SGLang/CUDA 13 image.
-- NVIDIA driver 580.126.20 or newer for the pinned CUDA 13 runtime.
+- NVIDIA driver 580.95.05 or newer for the pinned CUDA 13 runtime.
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), Git, and public access to Docker Hub, GitHub, PyPI, `pypi.nvidia.com`, `flashinfer.ai`, crates.io and Hugging Face. These public indexes need no login.
 - Allow 64 GiB host RAM and 250 GiB disk for this build and model cache.
 
@@ -32,7 +32,7 @@ Until this PR merges, fetch its public recipe and build the image from [Dockerfi
 set -euo pipefail
 git clone https://github.com/ai-dynamo/kvcr.git kvcr-sgl-linker-quick-start
 cd kvcr-sgl-linker-quick-start
-git fetch origin pull/<PR>/head
+git fetch origin pull/129/head
 git checkout --detach FETCH_HEAD
 git rev-parse HEAD
 DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
@@ -122,7 +122,7 @@ Linker options are strict; HiCache option names such as `local_dram_bytes`, `con
 
 ## 5. Verify peer reuse
 
-Wait for successful LLM registration in both worker logs and `Adding worker` for both IDs in the frontend log. Allow up to 20 minutes per worker for first-use compilation. Then require `ready: true`:
+Wait for successful LLM registration in both worker logs and `Adding worker` for both IDs in the frontend log. Then require `ready: true`:
 
 ```bash
 python3 - <<'PY'
@@ -135,7 +135,7 @@ print(status)
 PY
 ```
 
-This check sends a fresh prompt of about 2,000 tokens with a random code in the middle to worker 0, then the identical prompt to worker 1. It pins only the destination; Dynamo still supplies the source hint. Worker 1 must reuse every complete page except the last, and both outputs must match and contain the code. Do not probe this prompt before the test.
+This check sends a fresh prompt of about 4,300 tokens with a random code in the middle to worker 0, then the identical prompt to worker 1, then again to worker 0. It pins only the destination; Dynamo still supplies the source hint. Worker 1 must reuse every complete page before the last prompt token, every output must contain the code, and worker 1's output must match worker 0's warm replay, which uses the same cached prefix (a cold prefill can differ in later greedy tokens). The first request on each worker JIT-compiles kernels and can take several minutes. Do not probe this prompt before the test.
 
 ```bash
 python3 - <<'PY'
@@ -160,7 +160,7 @@ prompt = (f'Document {uuid.uuid4().hex}. {filler}The access code for vault 7 is 
 tokens = tokenizer.encode(prompt, add_special_tokens=False)
 expected = (len(tokens) - 1) // 64 * 64
 outputs = []
-for rank, worker in enumerate(workers):
+for rank, worker in enumerate(workers + workers[:1]):
     if rank:
         time.sleep(15)  # Deposit, KV events and router indexing are asynchronous.
     payload = dict(model=os.environ['MODEL'], prompt=tokens, temperature=0,
@@ -169,7 +169,7 @@ for rank, worker in enumerate(workers):
                           'extra_fields': ['worker_id', 'engine_data', 'completion_token_ids']})
     request = urllib.request.Request('http://127.0.0.1:24000/v1/completions',
         data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(request, timeout=300) as response:
+    with urllib.request.urlopen(request, timeout=900) as response:
         raw = response.read().decode()
     Path(f'/tmp/response-{rank}.sse').write_text(raw)
     events = [json.loads(line[5:]) for line in raw.splitlines()
@@ -185,8 +185,8 @@ for rank, worker in enumerate(workers):
     text = tokenizer.decode(ids)
     assert code in text, (rank, code, text)
     outputs.append(ids)
-    print(f'worker {rank}: cached_tokens={max(hits)}/{len(tokens)}, output={text!r}')
-assert outputs[0] == outputs[1], 'Cold/restored output token IDs differ'
+    print(f'request {rank} (worker {rank % 2}): cached_tokens={max(hits)}/{len(tokens)}, output={text!r}')
+assert outputs[1] == outputs[2], 'Restored output differs from the warm replay on worker 0'
 print('Response checks passed; verify transfer telemetry below before declaring success.')
 PY
 ```
@@ -208,7 +208,7 @@ for rank in (0, 1):
 PY
 ```
 
-- Destination (worker 1): `kvcr_transfer_blocks[remote_deliver].counter` equals reused pages (`cached_tokens / 64` for this model) and there is no `failed` entry.
+- Destination (worker 1): `kvcr_transfer_blocks[remote_deliver].counter` equals reused pages times layers (`cached_tokens / 64 * 64` for this 64-layer model, so it equals `cached_tokens`) and there is no `failed` entry.
 - Source (worker 0): nonzero `kvcr_transfer_bytes[source_write].counter` and no `failed` entry.
 
 A cache-hit counter alone is not proof of transfer. If any check fails, preserve the logs; retry with fresh workers and a new prompt, not a warm destination. This smoke test does not qualify accuracy, performance, cross-host RDMA, TP>1 or hybrid pools.
@@ -236,13 +236,15 @@ export QS_EVIDENCE="$(mktemp -d /tmp/kvcr-sgl-linker-evidence.XXXXXX)"
 for log in frontend worker-0 worker-1; do
   docker cp "$QS_CID:/tmp/$log.log" "$QS_EVIDENCE/"
 done
-for rank in 0 1; do
+for rank in 0 1 2; do
   docker cp "$QS_CID:/tmp/response-$rank.sse" "$QS_EVIDENCE/"
 done
 docker cp "$QS_CID:/opt/sglang-installed-packages.txt" "$QS_EVIDENCE/"
 docker stop --time 90 "$QS_CID"
 docker rm "$QS_CID"
 ```
+
+The model volume is kept for reuse; remove it with `docker volume rm "$QS_NAME-models"` when done.
 
 - **Build/import failure:** keep source and kernel pins together; do not skip the canary.
 - **Startup failure:** check worker logs, GPU memory, unique ports and `startup_timeout_seconds`; on multi-NIC hosts, pin NICs per rank.

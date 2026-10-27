@@ -83,7 +83,7 @@ ENV DYN_REQUEST_PLANE=tcp DYN_EVENT_PLANE=zmq DYN_DISCOVERY_BACKEND=file \
     DYN_FILE_KV=/tmp/dynamo-sglang-linker-quick-start DYN_SYSTEM_HOST=127.0.0.1 \
     DYN_RUNTIME_NUM_WORKER_THREADS=4 DYN_RUNTIME_MAX_BLOCKING_THREADS=8 \
     TOKENIZERS_PARALLELISM=false PYTHONHASHSEED=0 RUST_LOG=info \
-    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4
+    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 # Import/version canary only; model/peer-transfer acceptance is in the guide.
 RUN python3 - <<'PY'
 from importlib import metadata
