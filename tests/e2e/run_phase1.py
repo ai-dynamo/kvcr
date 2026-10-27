@@ -98,7 +98,17 @@ class Runner:
         self.args = args
         self.output = args.output_dir.resolve()
         if self.output.exists():
-            stray = [p for p in self.output.rglob("*") if p.is_file()]
+            # A remote kvcr_service sidecar (two-node run) logs into
+            # <output>/stack before the harness starts; anything else is stale.
+            stray = [
+                p
+                for p in self.output.rglob("*")
+                if p.is_file()
+                and not (
+                    p.parent == self.output / "stack"
+                    and re.fullmatch(r"kvcr-service-\d\.log", p.name)
+                )
+            ]
             if stray:
                 raise ValidationError(
                     f"output directory must be empty: {self.output} (found {stray[0]})"
@@ -109,6 +119,7 @@ class Runner:
             model=args.model,
             output=self.output,
             mode=args.mode,
+            topology=args.topology,
             gpus=tuple(args.gpus),
             http_port=args.http_port,
             reference_http_port=args.reference_http_port,
@@ -127,6 +138,9 @@ class Runner:
             ),
             disable_hybrid_kv_cache_manager=not args.keep_hybrid_kv_cache_manager,
             enforce_eager=not args.no_enforce_eager,
+            external_services=args.external_services,
+            remote_workers=args.remote_workers or None,
+            etcd_endpoints=args.etcd,
         )
         self.stack = Stack(self.settings, self.output / "stack")
         self.stack.deadline_check = self.check_deadline
@@ -169,13 +183,26 @@ class Runner:
             "worker_args": list(args.worker_arg),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
+            "topology": (
+                "two-node"
+                if args.remote_workers
+                else "sidecar"
+                if args.external_services
+                else "single-container"
+            ),
+            "remote_workers": args.remote_workers or None,
+            "discovery": "etcd" if args.etcd else "file",
+            "external_services": str(args.external_services)
+            if args.external_services
+            else None,
             "batch_invariant": args.batch_invariant,
             "state_agent": not args.no_state_agent,
             "selected_cases": list(args.cases),
             "cases": [],
             "reference": {},
             "limitations": [
-                "Single node, two GPUs, aggregated deployment only.",
+                "Single node, two GPUs, aggregated deployment only; disaggregated "
+                "1P+1D has no valid KVCR source/target here and is not run.",
                 "Local-hit path evidence is the KVCR commit (local_fill) after the "
                 "cold "
                 "request plus the reuse hit count; remote and Guard paths have "
@@ -202,6 +229,11 @@ class Runner:
             self.settings.reference_http_port, name="reference-frontend"
         )
         worker = stack.start_worker(0, kvcr=False, tag="-reference")
+        decode_ref = (
+            stack.start_worker(2, kvcr=False, tag="-reference")
+            if stack.disagg
+            else None
+        )
         client = Client(
             f"http://127.0.0.1:{self.settings.reference_http_port}",
             self.args.model,
@@ -210,6 +242,8 @@ class Runner:
             request_timeout=self.args.request_timeout,
         )
         stack.wait_model(client)
+        if stack.disagg:
+            stack.discover_worker(client, 2)
         stack.discover_worker(client, 0)
         launch = json.loads((stack.evidence / f"{worker.name}.launch.json").read_text())
         bypass = not any(
@@ -327,6 +361,8 @@ class Runner:
             str(self.output),
             os.environ.get("HF_HOME", ""),
             socket.gethostname(),
+            self.settings.etcd_endpoints or "",
+            *(self.settings.remote_workers or {}).values(),
         ]
         scrubbed = worker.log_text()
         for name in sorted(
@@ -362,11 +398,12 @@ class Runner:
             self.result["reference"]["kvcr_disabled_timings"] = self.baseline_timings
             save_json(evidence / "baseline-timings.json", self.baseline_timings)
         self.save()
-        stack.stop(*[c for c in (worker, stack.frontend) if c is not None])  # type: ignore[arg-type]
-        # Forget the reference handles so the cases phase does not see the
-        # stopped reference worker.
-        stack.workers.pop(0, None)
-        stack.worker_ids.pop(0, None)
+        stack.stop(*[c for c in (worker, decode_ref, stack.frontend) if c is not None])  # type: ignore[arg-type]
+        # Forget the reference handles: the cases phase may start the decode
+        # worker before worker 0 and must not see the stopped reference worker.
+        for index in (0, 2):
+            stack.workers.pop(index, None)
+            stack.worker_ids.pop(index, None)
         stack.reset_discovery()
         if not bypass or kvcr_mentions:
             raise ValidationError("reference engine was not verified KVCR-free")
@@ -389,7 +426,19 @@ class Runner:
             if stack.uses_state_agent():
                 stack.start_state_agent()
         stack.start_frontend(self.settings.http_port)
-        for index in (0, 1):
+        if stack.disagg:
+            # The frontend lists the model only once a prefill worker is
+            # registered, so bring up prefill 0 and the decode worker together
+            # and identify the decode worker first.
+            stack.start_worker(0)
+            stack.start_worker(2)
+            stack.wait_model(client)
+            stack.discover_worker(client, 2)
+            stack.discover_worker(client, 0)
+            remaining = (1,)
+        else:
+            remaining = (0, 1)
+        for index in remaining:
             stack.start_worker(index)
             stack.wait_model(client)
             stack.discover_worker(client, index)
@@ -398,6 +447,7 @@ class Runner:
             for index, wid in stack.worker_ids.items()
         }
         self.result["compatibility_digest"] = self.settings.compatibility_digest
+        self.result["topology"] = self.settings.topology
         self.save()
         return client
 
@@ -520,7 +570,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gpus",
         default="0,1",
-        help="two CUDA device indices, e.g. 0,1",
+        help="CUDA device indices: two for --topology agg (0,1), three for disagg "
+        "(0,1,2; "
+        "two-node disagg: 0,0,1 = P0 on GPU0 of node a, P1 on GPU0 of node b, D0 "
+        "on GPU1 of node a)",
     )
     parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04,TC-05,TC-06")
     parser.add_argument("--http-port", type=int, default=8000)
@@ -628,6 +681,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "request)",
     )
     parser.add_argument(
+        "--topology",
+        choices=("agg", "disagg"),
+        default="agg",
+        help="agg: two decode workers (default). disagg: 2P+1D, workers 0/1 are "
+        "prefill workers (KVCR source/target) and worker 2 the shared decode worker; "
+        "needs three GPUs",
+    )
+    parser.add_argument(
         "--frontend-env",
         action="append",
         default=[],
@@ -661,6 +722,31 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="let vLLM use CUDA graphs (much faster decode for GDN/Mamba hybrids)",
     )
     parser.add_argument(
+        "--external-services",
+        type=Path,
+        default=None,
+        help="sidecar topology: directory shared with kvcr_service containers holding "
+        "memory-<i>.sock and kvcr-service-<i>.log; the harness attaches instead of "
+        "launching the services (Guard mode only)",
+    )
+    parser.add_argument(
+        "--remote-worker",
+        action="append",
+        default=[],
+        metavar="INDEX=URL",
+        help="two-node topology: run worker INDEX (and expect its kvcr_service "
+        "sidecar) on "
+        "the node whose phase1.node_agent listens at URL; repeatable; requires "
+        "--external-services and --etcd",
+    )
+    parser.add_argument(
+        "--etcd",
+        default=None,
+        metavar="ENDPOINTS",
+        help="use Dynamo etcd discovery at these endpoints instead of the file store "
+        "(required across nodes: the file store's inotify watch is node-local)",
+    )
+    parser.add_argument(
         "--worker-arg",
         action="append",
         default=[],
@@ -692,10 +778,23 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     gpus = [part.strip() for part in args.gpus.split(",")]
-    if len(gpus) != 2 or not all(part.isdecimal() for part in gpus):
-        parser.error("--gpus needs two CUDA device indices, e.g. 0,1")
+    wanted_gpus = 3 if args.topology == "disagg" else 2
+    if len(gpus) != wanted_gpus or not all(part.isdecimal() for part in gpus):
+        parser.error(
+            f"--gpus needs {wanted_gpus} CUDA device indices for --topology "
+            f"{args.topology}"
+        )
     args.gpus = [int(part) for part in gpus]
-    if args.gpus[0] == args.gpus[1] and args.gpu_memory_utilization > 0.45:
+    if args.topology == "disagg" and args.external_services is None:
+        parser.error(
+            "--topology disagg needs --external-services (kvcr_service sidecars)"
+        )
+    # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
+    if (
+        args.gpus[0] == args.gpus[1]
+        and not args.remote_worker
+        and args.gpu_memory_utilization > 0.45
+    ):
         parser.error("two workers on one GPU need --gpu-memory-utilization <= 0.45")
     if not 0.05 <= args.gpu_memory_utilization <= 0.95:
         parser.error("--gpu-memory-utilization must be within 0.05..0.95")
@@ -743,6 +842,35 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--perf-concurrency must be 1..64")
     if args.http_port == args.reference_http_port:
         parser.error("--http-port and --reference-http-port must differ")
+    if args.external_services is not None:
+        if args.mode != GUARD:
+            parser.error("--external-services requires --mode guard")
+        if not args.compatibility_digest:
+            parser.error(
+                "--external-services needs --compatibility-digest matching the sidecars"
+            )
+    remote: dict[int, str] = {}
+    for item in args.remote_worker:
+        index, sep, url = item.partition("=")
+        if not sep or index not in ("0", "1") or not url.startswith("http"):
+            parser.error(
+                f"--remote-worker expects 0=http://host:port or "
+                f"1=http://host:port, got {item!r}"
+            )
+        remote[int(index)] = url
+    args.remote_workers = remote
+    if remote:
+        if args.external_services is None:
+            parser.error(
+                "--remote-worker needs --external-services (the remote "
+                "kvcr_service is a sidecar)"
+            )
+        if not args.etcd:
+            parser.error(
+                "--remote-worker needs --etcd (file discovery does not cross nodes)"
+            )
+        if len(remote) == 2:
+            parser.error("at least one worker must run on the harness node")
     return args
 
 

@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,18 +86,29 @@ class Settings:
     model: str
     output: Path
     mode: str = GUARD
-    # Two decode workers: worker 0 is the KVCR source, worker 1 the target.
+    # "agg": two decode workers, worker 0 KVCR source, worker 1 target.
+    # "disagg": 2P+1D on three GPUs: workers 0/1 are prefill workers (KVCR
+    # source/target, the P->D hop uses NixlConnector), worker 2 is the single
+    # decode worker. Requests pin the prefill worker; the decode is shared.
+    topology: str = "agg"
     gpus: tuple[int, ...] = (0, 1)
     http_port: int = 8000
     reference_http_port: int = 8001
-    control_ports: tuple[int, ...] = (17771, 17772)
-    event_ports: tuple[int, ...] = (20081, 20082)
-    system_ports: tuple[int, ...] = (9091, 9092)
+    control_ports: tuple[int, ...] = (17771, 17772, 17773)
+    event_ports: tuple[int, ...] = (20081, 20082, 20083)
+    system_ports: tuple[int, ...] = (9091, 9092, 9093)
+    nixl_side_channel_ports: tuple[int, ...] = (5601, 5602, 5603)
     pool_gb: int = 2
     g2_slots: int = 256
     cpu_bytes_to_use: int = 2_000_000_000
     max_model_len: int = 32000
     gpu_memory_utilization: float = 0.8
+    # Two-node run: worker index -> node-agent URL on the other node
+    # (tests/e2e/phase1/node_agent.py); that node also hosts the worker's
+    # kvcr_service sidecar. Needs etcd_endpoints: Dynamo's file discovery
+    # watches with inotify, which does not cross nodes.
+    remote_workers: dict[int, str] | None = None
+    etcd_endpoints: str | None = None
     compatibility_digest: str = ""
     batch_invariant: bool = False
     state_agent: bool = True
@@ -106,6 +119,10 @@ class Settings:
     # Eager mode keeps the stack simple, but GDN/Mamba layers without CUDA
     # graphs decode very slowly (Qwen3.5 reference phase took ~40 min).
     enforce_eager: bool = True
+    # Sidecar topology: kvcr_service instances run in their own containers and
+    # share this directory (sockets + logs) with the vLLM container. None means
+    # the harness launches the services itself in-process.
+    external_services: Path | None = None
     readiness_timeout: float = 600
     request_timeout: float = 120
     extra_worker_args: list[str] = field(default_factory=list)
@@ -178,6 +195,183 @@ class Managed:
         return self.log_path.read_text(errors="replace")
 
 
+class _RemoteProcess:
+    """The subset of subprocess.Popen the harness touches, backed by a node agent."""
+
+    def __init__(self, owner: "RemoteManaged") -> None:
+        self._owner = owner
+        self.pid = owner.pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        status = self._owner.agent("GET", f"/status/{self._owner.name}")
+        self.returncode = status.get("returncode")
+        return None if status.get("alive") else self.returncode
+
+    def wait(self, timeout: float = 30) -> int | None:
+        outcome = self._owner.agent(
+            "POST", f"/wait/{self._owner.name}", {"timeout": timeout}
+        )
+        if not outcome.get("exited"):
+            raise subprocess.TimeoutExpired(self._owner.command, timeout)
+        self.returncode = outcome.get("returncode")
+        return self.returncode
+
+
+class RemoteManaged:
+    """A child process on another node, driven through node_agent.py.
+
+    Same surface as Managed; the log lives on a volume both nodes mount, so
+    the checks read it like a local file.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str],
+        log: Path,
+        agent_url: str,
+    ) -> None:
+        self.name = name
+        self.command = command
+        self.log_path = log
+        self.agent_url = agent_url.rstrip("/")
+        self.started_at = utc_now()
+        self.stopped = False
+        reply = self.agent(
+            "POST",
+            "/spawn",
+            {"name": name, "command": command, "env": env, "log": str(log)},
+        )
+        self.pid = int(reply["pid"])
+        self.process = _RemoteProcess(self)
+
+    def agent(
+        self, method: str, route: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return node_agent_call(self.agent_url, method, route, body)
+
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
+    def signal_group(self, number: int) -> bool:
+        return bool(
+            self.agent("POST", f"/signal/{self.name}", {"signal": int(number)}).get(
+                "ok"
+            )
+        )
+
+    def stop(self, grace: float = 20) -> dict[str, Any]:
+        outcome: dict[str, Any] = {
+            "name": self.name,
+            "pid": self.pid,
+            "remote": self.agent_url,
+        }
+        self.stopped = True
+        self.signal_group(signal.SIGTERM)
+        try:
+            self.process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            outcome["sigkill"] = True
+        self.signal_group(signal.SIGKILL)
+        try:
+            outcome["exit_code"] = self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            outcome["error"] = "process did not exit"
+        return outcome
+
+    def log_text(self) -> str:
+        try:
+            return self.log_path.read_text(errors="replace")
+        except OSError:
+            pass
+        try:
+            return node_agent_text(self.agent_url, f"/log/{self.name}")
+        except (OSError, ValueError):
+            return ""
+
+
+def node_agent_call(
+    base: str,
+    method: str,
+    route: str,
+    body: dict[str, Any] | None = None,
+    timeout: float = 60,
+) -> dict[str, Any]:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(
+        base.rstrip("/") + route,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise ValidationError(
+            f"node agent {base}{route} -> {error.code}: {detail}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise ValidationError(
+            f"node agent {base}{route} unreachable: {error.reason}"
+        ) from error
+
+
+def node_agent_text(base: str, route: str, timeout: float = 60) -> str:
+    with urllib.request.urlopen(base.rstrip("/") + route, timeout=timeout) as response:
+        return response.read().decode(errors="replace")
+
+
+class ExternalService:
+    """A kvcr_service that lives in another container; observed, not owned.
+
+    Liveness is a connect() to its Unix socket; its log is a file the sidecar
+    writes into the shared directory. stop() is a no-op: the sidecar's lifetime
+    belongs to the orchestrator, which is exactly what TC-04 relies on.
+    """
+
+    def __init__(
+        self, name: str, socket_path: Path, log_path: Path, agent_url: str | None = None
+    ) -> None:
+        self.name = name
+        self.socket_path = socket_path
+        self.log_path = log_path
+        self.agent_url = agent_url  # socket lives on another node: probe via its agent
+        self.stopped = False
+        self.started_at = utc_now()
+
+    def alive(self) -> bool:
+        if self.agent_url is not None:
+            try:
+                return bool(
+                    node_agent_call(
+                        self.agent_url, "GET", f"/socket?path={self.socket_path}"
+                    ).get("alive")
+                )
+            except ValidationError:
+                return False
+        try:
+            probe = socket.socket(socket.AF_UNIX)
+            probe.settimeout(1)
+            probe.connect(str(self.socket_path))
+            probe.close()
+            return True
+        except OSError:
+            return False
+
+    def log_text(self) -> str:
+        try:
+            return self.log_path.read_text(errors="replace")
+        except OSError:
+            return ""
+
+    def stop(self, grace: float = 0) -> dict[str, Any]:
+        return {"name": self.name, "external": True}
+
+
 class Stack:
     def __init__(self, settings: Settings, evidence: Path) -> None:
         self.settings = settings
@@ -194,6 +388,7 @@ class Stack:
         self.kvcr_run_dir = Path(tempfile.mkdtemp(prefix="phase1-run-"))
         self.pool_dir = Path("/dev/shm/phase1-pool-" + uuid.uuid4().hex[:8])
         self.deadline_check: Callable[[], None] = lambda: None
+        self._remote_info: dict[int, dict[str, Any]] = {}
 
     # -- preflight ---------------------------------------------------------
 
@@ -232,10 +427,35 @@ class Stack:
                     f"{MIN_GUARD_KERNEL[0]}.{MIN_GUARD_KERNEL[1]}+ "
                     f"(SO_PEERPIDFD); this node runs {platform.release()}"
                 )
+            for index, agent in sorted((self.settings.remote_workers or {}).items()):
+                # The other node's pod may still be pulling its image.
+                deadline = time.monotonic() + self.settings.readiness_timeout
+                while True:
+                    try:
+                        info = node_agent_call(agent, "GET", "/info", timeout=10)
+                        break
+                    except ValidationError as error:
+                        if time.monotonic() > deadline:
+                            raise BlockedError(
+                                f"node agent for worker {index} never answered: {error}"
+                            ) from error
+                        time.sleep(5)
+                self._remote_info[index] = info
+                data.setdefault("remote_nodes", {})[str(index)] = info
+                found = re.match(r"(\d+)\.(\d+)", str(info.get("kernel", "")))
+                if found is None or (int(found[1]), int(found[2])) < MIN_GUARD_KERNEL:
+                    raise BlockedError(
+                        f"remote node for worker {index} ({info.get('hostname')}) runs "
+                        f"{info.get('kernel')}; Guard needs Linux "
+                        f"{MIN_GUARD_KERNEL[0]}.{MIN_GUARD_KERNEL[1]}+"
+                    )
             if data["libatomic"] is None:
                 raise BlockedError("Guard mode needs the system libatomic runtime")
             needed = 2 * (self.settings.pool_gb * 1024**3 + 128 * 1024**2)
-            if data["shm_available_bytes"] < needed:
+            if (
+                self.settings.external_services is None
+                and data["shm_available_bytes"] < needed
+            ):
                 raise BlockedError(
                     f"/dev/shm has {data['shm_available_bytes']} bytes free; two Guard "
                     f"pools need at least {needed}"
@@ -264,8 +484,17 @@ class Stack:
             PYTHONHASHSEED="0",
             VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES="1",
         )
-        env["DYN_DISCOVERY_BACKEND"] = "file"
-        env["DYN_FILE_KV"] = self.discovery.name
+        if self.settings.etcd_endpoints:
+            env["DYN_DISCOVERY_BACKEND"] = "etcd"
+            env["ETCD_ENDPOINTS"] = self.settings.etcd_endpoints
+        else:
+            env["DYN_DISCOVERY_BACKEND"] = "file"
+            env["DYN_FILE_KV"] = self.discovery.name
+        if self.settings.remote_workers:
+            # Peers on other nodes must reach this process: advertise a real
+            # address (Dynamo's event plane defaults to 127.0.0.1).
+            env["DYN_EVENT_PLANE_HOST"] = self.advertise_host()
+            env["DYN_TCP_RPC_HOST"] = self.advertise_host()
         if self.settings.batch_invariant:
             env["VLLM_BATCH_INVARIANT"] = "1"
         return env
@@ -283,7 +512,7 @@ class Stack:
             "router_capabilities": ["router_hint"],
             "control_host": "0.0.0.0",
             "control_ports": [self.settings.control_ports[index]],
-            "control_advertise_host": "127.0.0.1",
+            "control_advertise_host": self.worker_host(index),
             "operation_timeout_ms": 5000,
             "abandon_timeout_ms": 10000,
             "enable_telemetry": True,
@@ -310,6 +539,20 @@ class Stack:
                 host = probe.getsockname()[0]
         return host
 
+    def remote_agent(self, index: int) -> str | None:
+        return (self.settings.remote_workers or {}).get(index)
+
+    def worker_host(self, index: int) -> str:
+        """Address peers use for worker[index]'s KVCR control endpoint."""
+        if not self.settings.remote_workers:
+            return "127.0.0.1"
+        agent = self.remote_agent(index)
+        if agent is None:
+            return self.advertise_host()
+        if index not in self._remote_info:
+            self._remote_info[index] = node_agent_call(agent, "GET", "/info")
+        return str(self._remote_info[index]["ip"])
+
     def uses_state_agent(self) -> bool:
         return self.settings.mode == GUARD and self.settings.state_agent
 
@@ -331,12 +574,70 @@ class Stack:
             "kv_connector_extra_config": extra,
         }
 
+    # -- topology helpers --------------------------------------------------
+
+    @property
+    def disagg(self) -> bool:
+        return self.settings.topology == "disagg"
+
+    @property
+    def decode_index(self) -> int | None:
+        return 2 if self.disagg else None
+
+    @property
+    def served_role(self) -> str:
+        """Which worker id identifies the KVCR-relevant worker of a response."""
+        return "prefill" if self.disagg else "decode"
+
     def identity(self, body: dict[str, Any]) -> str | None:
-        return worker_identity(body, "decode")[0]
+        return worker_identity(body, self.served_role)[0]
+
+    def served(self, stream: Any) -> str | None:
+        return stream.prefill_worker if self.disagg else stream.worker
 
     def pin(self, index: int) -> dict[str, str | None]:
         """Request kwargs that route a request through worker[index]."""
-        return {"worker": self.worker_ids.get(index)}
+        if not self.disagg:
+            return {"worker": self.worker_ids.get(index)}
+        return {
+            "prefill": self.worker_ids.get(index),
+            "worker": self.worker_ids.get(2),
+        }
+
+    def disaggregation_mode(self, index: int) -> str | None:
+        if not self.disagg:
+            return None
+        return "decode" if index == 2 else "prefill"
+
+    def kv_transfer_config(self, index: int, *, kvcr: bool) -> dict[str, Any] | None:
+        mode = self.disaggregation_mode(index)
+        if mode is None:
+            return self.transfer_config(index) if kvcr else None
+        if mode == "decode":
+            return {"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}
+        nixl = {"kv_connector": "NixlConnector", "kv_role": "kv_producer"}
+        if not kvcr:
+            return nixl
+        kvcr_cfg = self.transfer_config(index)
+        extra: dict[str, Any] = {"connectors": [kvcr_cfg, nixl]}
+        # Dynamo (ea23e51) reads the KVCR tier list, the state-agent settings
+        # and the self-describing-events flag from the TOP-LEVEL
+        # kv_connector_extra_config to advertise router-hint capability and
+        # attach the KV state agent; nested inside MultiConnector they are
+        # invisible, so no hints reach a prefill worker. Mirror them at the top
+        # level (vLLM's MultiConnector ignores keys other than "connectors").
+        for key in (
+            "secondary_tiers",
+            "dynamo_state_agent",
+            "self_describing_kv_events",
+        ):
+            if key in kvcr_cfg["kv_connector_extra_config"]:
+                extra[key] = kvcr_cfg["kv_connector_extra_config"][key]
+        return {
+            "kv_connector": "MultiConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": extra,
+        }
 
     def events_config(self, index: int) -> dict[str, Any]:
         return {
@@ -372,29 +673,76 @@ class Stack:
             str(self.settings.gpu_memory_utilization),
             *self.settings.extra_worker_args,
         ]
-        if kvcr:
-            command += [
-                "--kv-transfer-config",
-                json.dumps(self.transfer_config(index)),
-                "--kv-events-config",
-                json.dumps(self.events_config(index)),
-            ]
+        mode = self.disaggregation_mode(index)
+        if mode is not None:
+            command += ["--disaggregation-mode", mode]
+        transfer = self.kv_transfer_config(index, kvcr=kvcr)
+        if transfer is not None:
+            command += ["--kv-transfer-config", json.dumps(transfer)]
+        if kvcr or (mode is not None):
+            command += ["--kv-events-config", json.dumps(self.events_config(index))]
         return command
 
     def service_socket(self, index: int) -> Path:
+        if self.settings.external_services is not None:
+            return self.settings.external_services / f"memory-{index}.sock"
         return self.kvcr_run_dir / f"memory-{index}.sock"
+
+    def attach_service(self, index: int) -> ExternalService:
+        """Sidecar topology: wait for the shared socket instead of launching."""
+        assert self.settings.external_services is not None
+        agent = self.remote_agent(index)
+        service = ExternalService(
+            f"kvcr-service-{index}",
+            self.service_socket(index),
+            # A remote sidecar writes its log into the shared evidence tree.
+            (self.evidence if agent else self.settings.external_services)
+            / f"kvcr-service-{index}.log",
+            agent_url=agent,
+        )
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if service.alive():
+                self.services[index] = service  # type: ignore[assignment]
+                save_json(
+                    self.evidence / f"{service.name}.launch.json",
+                    {
+                        "external": True,
+                        "socket": str(service.socket_path),
+                        "log": str(service.log_path),
+                        "attached_at": utc_now(),
+                    },
+                )
+                return service
+            time.sleep(1)
+        raise ValidationError(
+            f"external kvcr_service {index} socket {service.socket_path} not reachable"
+        )
 
     # -- launching ---------------------------------------------------------
 
-    def _spawn(self, name: str, command: list[str], env: dict[str, str]) -> Managed:
+    def _spawn(
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str],
+        agent_url: str | None = None,
+    ) -> Managed:
         log = self.evidence / f"{name}.log"
-        child = Managed(name, command, env, log)
+        if agent_url is not None:
+            # Only pass what differs from the agent's own environment: the
+            # other node keeps its HF cache path, PATH and CUDA setup.
+            overrides = {k: v for k, v in env.items() if os.environ.get(k) != v}
+            child: Managed = RemoteManaged(name, command, overrides, log, agent_url)  # type: ignore[assignment]
+        else:
+            child = Managed(name, command, env, log)
         self.children.append(child)
         save_json(
             self.evidence / f"{name}.launch.json",
             {
                 "command": command,
                 "pid": child.pid,
+                "remote": agent_url,
                 "started_at": child.started_at,
                 "environment_overrides": {
                     key: env[key]
@@ -445,6 +793,8 @@ class Stack:
     def start_service(self, index: int) -> Managed:
         if self.settings.mode != GUARD:
             raise ValidationError("KVCR services are only launched in Guard mode")
+        if self.settings.external_services is not None:
+            return self.attach_service(index)  # type: ignore[return-value]
         pool_dir = self.pool_dir / str(index)
         pool_dir.mkdir(parents=True, exist_ok=True)
         command = [
@@ -487,12 +837,28 @@ class Stack:
         env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpus[index])
         env["VLLM_LOGGING_LEVEL"] = "DEBUG"
         env["DYN_SYSTEM_PORT"] = str(self.settings.system_ports[index])
+        if self.disagg:
+            # Three NIXL side channels on one host; Dynamo only sets the host
+            # when it recognises a top-level NixlConnector.
+            env.setdefault("VLLM_NIXL_SIDE_CHANNEL_HOST", self.worker_host(index))
+            env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(
+                self.settings.nixl_side_channel_ports[index]
+            )
         name = f"worker-{index}{tag}"
         save_json(
             self.evidence / f"{name}.kv-transfer-config.json",
             self.transfer_config(index) if kvcr else None,
         )
-        worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env)
+        agent = self.remote_agent(index)
+        if agent is not None:
+            host = self.worker_host(index)
+            env["DYN_EVENT_PLANE_HOST"] = host
+            env["DYN_TCP_RPC_HOST"] = host
+            worker = self._spawn(
+                name, self.worker_command(index, kvcr=kvcr), env, agent_url=agent
+            )
+        else:
+            worker = self._spawn(name, self.worker_command(index, kvcr=kvcr), env)
         self.workers[index] = worker
         previous = self.worker_ids.pop(index, None)
         if previous is not None:
@@ -584,15 +950,25 @@ class Stack:
                 wid for wid in self.discovery_instance_ids() if wid not in known
             ]
             pinned = candidates[0] if attempt % 2 and len(candidates) == 1 else None
+            role = "decode" if (not self.disagg or index == 2) else "prefill"
+            pin: dict[str, str | None] = {"worker": pinned}
+            if self.disagg and index != 2:
+                # The prefill router rejects a request that pins only the decode
+                # worker, so pin both or neither.
+                pin = (
+                    {"prefill": pinned, "worker": self.worker_ids.get(2)}
+                    if pinned is not None
+                    else {}
+                )
             probe = client.completion(
                 f"probe-w{index}-{attempt:02d}",
                 f"identity probe {uuid.uuid4().hex}",
                 max_tokens=1,
                 extra_fields=["worker_id"],
-                worker=pinned,
+                **pin,
             )
             if probe.ok and probe.body is not None:
-                worker, _ = worker_identity(probe.body, "decode")
+                worker, _ = worker_identity(probe.body, role)
                 if worker is not None and worker not in known:
                     self.worker_ids[index] = worker
                     return worker
@@ -604,6 +980,8 @@ class Stack:
             f"({errors} probe errors; discovery candidates "
             f"{sorted(self.discovery_instance_ids() - known)})"
         )
+
+    # -- failure injection -------------------------------------------------
 
     def kill_worker(self, index: int) -> dict[str, Any]:
         worker = self.workers.pop(index)

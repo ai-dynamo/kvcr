@@ -67,6 +67,7 @@ class StreamResponse:
     finish_reason: str | None = None
     cached_tokens: int | None = None
     worker: str | None = None
+    prefill_worker: str | None = None
     usage: dict[str, Any] | None = None
     timing: dict[str, Any] | None = None
 
@@ -122,6 +123,7 @@ class StreamResponse:
             "cached_tokens": self.cached_tokens,
             "finish_reason": self.finish_reason,
             "worker": self.worker,
+            "prefill_worker": self.prefill_worker,
         }
 
 
@@ -165,12 +167,15 @@ class Client:
         *,
         worker: str | None = None,
         rank: int | None = None,
+        prefill: str | None = None,
         max_tokens: int | None = None,
         extra_fields: list[str] | None = None,
     ) -> Response:
         headers = {"Content-Type": "application/json"}
         if worker is not None:
             headers["x-dynamo-worker-instance-id"] = str(worker)
+        if prefill is not None:
+            headers["x-dynamo-prefill-instance-id"] = str(prefill)
         if rank is not None:
             headers["x-dynamo-dp-rank"] = str(rank)
         body = {
@@ -257,11 +262,14 @@ class Client:
         worker: str | None = None,
         max_tokens: int | None = None,
         extra_fields: list[str] | None = None,
+        prefill: str | None = None,
     ) -> StreamResponse:
         """Stream one completion and time every chunk on the client side."""
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if worker is not None:
             headers["x-dynamo-worker-instance-id"] = str(worker)
+        if prefill is not None:
+            headers["x-dynamo-prefill-instance-id"] = str(prefill)
         body = {
             "model": self.model,
             "prompt": prompt,
@@ -345,6 +353,10 @@ class Client:
                             "decode_worker_id"
                         ):
                             result.worker = str(identity["decode_worker_id"])
+                        if isinstance(identity, dict) and identity.get(
+                            "prefill_worker_id"
+                        ):
+                            result.prefill_worker = str(identity["prefill_worker_id"])
                         if isinstance(nvext.get("timing"), dict):
                             result.timing = nvext["timing"]
                         for choice in chunk.get("choices") or []:
