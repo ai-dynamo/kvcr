@@ -139,7 +139,25 @@ def test_missing_token_ids_is_blocked_not_failed():
         )
 
 
+def test_expected_hit_blocks_excludes_last_block_and_caps_by_shared_prefix():
+    assert common.expected_hit_blocks(64 * 10, 64 * 10) == 9
+    assert common.expected_hit_blocks(64 * 10 + 1, 64 * 10) == 10
+    assert common.expected_hit_blocks(64 * 40, 64 * 20 + 5) == 20
+    assert common.expected_hit_blocks(0, 100) == 0
+
+
 # -- prompts -----------------------------------------------------------------
+
+
+def test_prompts_share_only_the_intended_prefix():
+    prompts = cases.Prompts("abc")
+    texts = prompts.all()
+    assert len(set(texts.values())) == len(texts)
+    p1 = prompts.tc02_p1
+    assert texts["tc02_full"].startswith(p1) and texts["tc02_partial"].startswith(p1)
+    assert texts["tc02_full"][len(p1) :] != texts["tc02_partial"][len(p1) :]
+    assert not texts["tc02_absent"].startswith(p1[:20])
+    assert all(text.endswith(prompts.tail) for text in texts.values())
 
 
 # -- case results, BLOCKED handling, JUnit -----------------------------------
@@ -242,8 +260,8 @@ def test_kernel_release_parsing(monkeypatch):
 
 
 def test_arguments_validate_gpus_and_cases(tmp_path):
-    args = runner.arguments(["--output-dir", str(tmp_path), "--cases", "tc-01"])
-    assert args.gpus == [0, 1] and args.cases == ["TC-01"]
+    args = runner.arguments(["--output-dir", str(tmp_path), "--cases", "tc-01, TC-03"])
+    assert args.gpus == [0, 1] and args.cases == ["TC-01", "TC-03"]
     for bad in (
         ["--gpus", "0"],
         ["--gpus", "1,1"],
@@ -314,6 +332,18 @@ def test_state_agent_config_only_in_guard_mode(tmp_path, monkeypatch):
 # -- verdicts -------------------------------------------------------------------
 
 
+def _ctx(**geometry):
+    return cases.Context(
+        None,
+        None,
+        None,
+        {},
+        index_wait=0,
+        telemetry_timeout=0,
+        **geometry,
+    )
+
+
 def test_zero_hit_replacement_recovery_fails():
     # A replacement that answers correctly but recomputed the prefix is not a recovery.
     assert cases.hit_verdict(0, 64) == (False, "cached_tokens=0 (block 64)")
@@ -322,3 +352,24 @@ def test_zero_hit_replacement_recovery_fails():
     assert not cases.hit_verdict(1472, 64, max_blocks=10)[0], (
         "above the shared-prefix bound"
     )
+
+
+def test_missing_ssm_pages_fail_hybrid_delivery():
+    page = 18874368  # Qwen3.5-4B KVCR page: 94371840 bytes / 5 pages
+    strict = _ctx(hit_block_tokens=576, ssm_groups=3, page_bytes=page)
+    assert strict.delivery_covers(5, 2), "2 attention + 3 SSM pages"
+    assert not strict.delivery_covers(2, 2), "attention pages only: SSM state missing"
+    assert not strict.delivery_covers(4, 2), "one SSM group missing"
+    assert not strict.delivery_covers(6, 2), "an extra page is also wrong"
+    assert strict.expected_pages(2) == "2+3*1"
+    result = common.CaseResult("TC-05", "x", "perf")
+    strict.bytes_match_pages(result, "short", 4 * page, 5)
+    strict.bytes_match_pages(result, "exact", 5 * page, 5)
+    assert [check.passed for check in result.checks] == [False, True]
+
+    # Without the geometry the check is only a lower bound; that is why the
+    # hybrid job must pass --ssm-groups and --page-bytes.
+    lenient = _ctx(hit_block_tokens=576)
+    assert lenient.delivery_covers(2, 2)
+    lenient.bytes_match_pages(result, "skipped", 1, 5)
+    assert len(result.checks) == 2
