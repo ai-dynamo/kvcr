@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
@@ -1062,6 +1062,22 @@ class _KVCRCore:
                 self._local_dram_sources_by_op[op_id] = sources
                 if keep_queued:
                     self._queued_claim_ops.add(op_id)
+        return sources
+
+    def _claim_ready_local_sources(
+        self,
+        op_id: _OpId,
+        keys: Sequence[BlockKey],
+        residencies: Sequence[_LocalDramResidency],
+    ) -> dict[BlockKey, _LocalDramResidency]:
+        """Keep-queued claims on residencies the caller just found READY under the lock."""
+        sources = dict(zip(keys, residencies))
+        if sources:
+            acquire = self._local_dram._acquire_claim
+            for key, residency in sources.items():
+                acquire(key, residency, keep_queued=True)
+            self._local_dram_sources_by_op[op_id] = sources
+            self._queued_claim_ops.add(op_id)
         return sources
 
     def _region(

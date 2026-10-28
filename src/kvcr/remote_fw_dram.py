@@ -30,7 +30,7 @@ from .core import (
     logger,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
-from .local_dram import _layout_indices, _LocalDramState
+from .local_dram import _layout_indices, _LocalDramResidency, _LocalDramState
 from .progress import (
     _FAILED_RESULT,
     _SUCCESS_RESULT,
@@ -138,6 +138,10 @@ class _PendingPinWait:
     started_at: float | None
     op_ids: set[_OpId] = field(default_factory=set)
     trace: _nvtx._PinTrace | None = None
+
+
+def _label_list(labels: str | tuple[str, ...]) -> list[str]:
+    return [labels] if isinstance(labels, str) else list(labels)
 
 
 class _RemoteFWDram:
@@ -789,11 +793,14 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
+            regions = self._remote_agents_by_target[target_agent][2]
+            validated: dict = {}
             for descriptors in dst_descriptors:
                 self._kvcr._validate_descriptors(
                     descriptors,
-                    regions=self._remote_agents_by_target[target_agent][2],
+                    regions=regions,
                     agent_name=target_agent,
+                    validated=validated,
                 )
             self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
@@ -875,25 +882,29 @@ class _RemoteFWDram:
             return False
         ordered_keys = source_pin.ordered_keys
         dst_descriptors = source_pin.dst_descriptors
-        layouts = [
-            [descriptor.label for descriptor in destination]
+        # A single-piece destination is keyed by its label alone (no list per key).
+        requested = [
+            destination[0].label
+            if len(destination) == 1
+            else tuple(descriptor.label for descriptor in destination)
             for destination in dst_descriptors
         ]
         if not kvcr._state_lock.acquire(blocking=False):
             # Use the caller queue on contention; add a progress-side
             # second attempt if contention makes this fallback too frequent.
             return False
-        selected = []
-        missing = False
+        present: list[int] = []
+        residencies: list[_LocalDramResidency] = []
+        selected: list[list[int]] = []
+        # Without pending pieces, ready indices depend only on (layout, request).
+        ready_by_layout: dict[tuple, list[int] | None] = {}
         try:
-            for key, layout in zip(ordered_keys, layouts):
+            for position, (key, labels) in enumerate(zip(ordered_keys, requested)):
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
                 if residency is None:
                     if self._options.framework_pinning:
                         return False
-                    selected.append(None)
-                    missing = True
                     continue
                 if residency.state is not _LocalDramState.READY:
                     return False
@@ -902,24 +913,30 @@ class _RemoteFWDram:
                     and source_pin.key_layout != residency.key_layout
                 ):
                     return False
-                indices = residency.ready_indices(layout)
+                if residency.pending_labels:
+                    indices = residency.ready_indices(_label_list(labels))
+                else:
+                    memo_key = (residency.layout, labels)
+                    if memo_key in ready_by_layout:
+                        indices = ready_by_layout[memo_key]
+                    else:
+                        indices = ready_by_layout[memo_key] = residency.ready_indices(
+                            _label_list(labels)
+                        )
                 if indices is None:
                     return False
+                present.append(position)
+                residencies.append(residency)
                 selected.append(indices)
+            missing = len(present) != len(ordered_keys)
             if missing:
-                completed_indices = tuple(
-                    i for i, indices in enumerate(selected) if indices is not None
-                )
+                completed_indices = tuple(present)
                 ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
                 dst_descriptors = tuple(dst_descriptors[i] for i in completed_indices)
-                selected = [selected[i] for i in completed_indices]
                 source_pin.keys = frozenset(ordered_keys)
-            sources = kvcr._claim_local_dram_sources(
-                source_pin.op_id, ordered_keys, notify_capacity=False, keep_queued=True
-            )
+            kvcr._claim_ready_local_sources(source_pin.op_id, ordered_keys, residencies)
             source_refs = tuple(
-                kvcr._local_dram.source_refs(sources[key], indices)
-                for key, indices in zip(ordered_keys, selected)
+                map(kvcr._local_dram.source_refs, residencies, selected)
             )
             # The claims pin every key until release; count the operation once.
             kvcr._outstanding_operations += 1
