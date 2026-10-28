@@ -206,13 +206,17 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     source_now = 0.25
     source_agent.state = "DONE"
     assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
-    assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
+    record = source._core._block_record_map[keys[0]]
+    assert record.local_dram.claim_count == 0
     assert source_pinning.unpins == ["pin"]
+    # The serve is recorded now; eviction refreshes the score when it gets there.
+    assert (record.access_count, record.last_access) == (1, 0.25)
     assert [
         (meta.access_count, meta.last_access)
         for meta, _ in source_policy.scored
         if meta.block_key == keys[0]
-    ] == [(0, 0.0), (1, 0.25)]
+    ] == [(0, 0.0)]
+    assert keys[0] in source._core._local_dram._lazily_released
 
     target_agent.notifs["source"] = [notification]
     completed = dict(_poll_until(target, lambda results: bool(results)))
@@ -1461,7 +1465,10 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
             "tcp://source-A:1",
             "tcp://source-B:1",
         ]
-        assert {("target", handle) for handle in handles} <= _block_op_ids(kvcr)
+        # Remote deliveries are held per operation, not on block records.
+        in_flight = {("target", handle) for handle in handles}
+        assert in_flight <= set(kvcr._core._progress._in_flight_ops)
+        assert in_flight.isdisjoint(_block_op_ids(kvcr))
         agent.notifs["source"] = [
             _write_done_notification(handle) for handle in handles
         ]

@@ -825,7 +825,9 @@ class _LocalDram:
             refs.append(ref)
         return tuple(refs)
 
-    def release_sources(self, keys: Collection[BlockKey], *, lazy: bool = False) -> None:
+    def release_sources(
+        self, keys: Collection[BlockKey], *, lazy: bool = False
+    ) -> None:
         """Release source claims. ``lazy`` claims never left the eviction queue."""
         record_map = self._kvcr._block_record_map
         evictable = self._evictable
@@ -1381,7 +1383,11 @@ class _LocalDram:
         )
 
     def _acquire_claim(
-        self, key: BlockKey, residency: _LocalDramResidency, *, keep_queued: bool = False
+        self,
+        key: BlockKey,
+        residency: _LocalDramResidency,
+        *,
+        keep_queued: bool = False,
     ) -> None:
         if residency.state is _LocalDramState.DISCARDING:
             raise RuntimeError(f"cannot claim discarded local DRAM entry {key!r}")
@@ -1479,7 +1485,9 @@ class _LocalDram:
                         or residency is None
                         or residency.state is not _LocalDramState.READY
                     ):
-                        raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
+                        raise RuntimeError(
+                            f"invalid evictable local DRAM entry {key!r}"
+                        )
                     if residency.claim_count:
                         # A source write claimed it without dequeuing it.
                         continue

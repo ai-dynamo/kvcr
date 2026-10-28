@@ -759,6 +759,74 @@ def test_builtin_policy_eviction_order(
         kvcr.release((second_claim,))
 
 
+def test_source_claims_stay_queued_and_rescore_at_eviction() -> None:
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 4)
+    local = ctypes.create_string_buffer(block_size * 2)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(
+        agent, local, 2, framework_regions=[_buffer_region(primary, block_size)]
+    )
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    core, local_dram = kvcr._core, kvcr._core._local_dram
+    keys = [BlockKey(f"k{index}".encode()) for index in range(4)]
+    kvcr.deposit({key: [_mem_descriptor(index)] for index, key in enumerate(keys[:2])})
+    _poll_until(kvcr, bool)
+
+    # A source-write claim keeps the oldest key queued but takes it out of capacity.
+    op_id = ("source", 1)
+    with core._state_lock:
+        core._claim_local_dram_sources(op_id, (keys[0],), keep_queued=True)
+    assert local_dram._evictable.score(keys[0]) is not None
+    assert local_dram.telemetry_state()["local_g2_evictable_slots"] == 1
+    now = 1.0
+    kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
+    _poll_until(kvcr, bool)
+    assert [status for status, _ in kvcr.query(keys[:3])] == [
+        QueryStatus.HIT,
+        QueryStatus.MISS,
+        QueryStatus.HIT,
+    ]
+
+    # Released after the serve without a re-score; eviction ranks it by that serve.
+    now = 2.0
+    with core._state_lock:
+        core._record_access((keys[0],))
+        core._release_local_dram_sources(op_id)
+    assert keys[0] in local_dram._lazily_released
+    assert local_dram.telemetry_state()["local_g2_evictable_slots"] == 2
+    now = 3.0
+    kvcr.deposit({keys[3]: [_mem_descriptor(3)]})
+    _poll_until(kvcr, bool)
+    assert [status for status, _ in kvcr.query(keys)] == [
+        QueryStatus.HIT,
+        QueryStatus.MISS,
+        QueryStatus.MISS,
+        QueryStatus.HIT,
+    ]
+
+
+def test_deliver_bounds_checks_every_repeated_destination() -> None:
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 2)
+    local = ctypes.create_string_buffer(block_size)
+    kvcr = _new_local_kvcr(
+        FakeNixlAgent(),
+        local,
+        1,
+        framework_regions=[_buffer_region(primary, block_size)],
+    )
+    with pytest.raises(ValueError, match="element_index"):
+        kvcr.deliver(
+            {
+                BlockKey(b"k0"): [_mem_descriptor(1)],
+                BlockKey(b"k1"): [_mem_descriptor(2)],
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("access_first", "use_current_time", "expected_time"),
     [(False, False, None), (True, False, 3.0), (False, True, 5.0), (True, True, 5.0)],

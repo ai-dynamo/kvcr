@@ -993,7 +993,7 @@ class _KVCRCore:
             self._block_record(key).add_in_flight_op(op.op_id)
 
     def _release_op_dependencies(self, op: _Op) -> None:
-        """Undo ``_add_block_dependencies``, or the per-operation count that replaced it."""
+        """Undo ``_add_block_dependencies`` or the per-operation count used instead."""
         if getattr(op, "key_dependencies", True):
             self._remove_block_dependencies(op)
         else:
@@ -1070,7 +1070,7 @@ class _KVCRCore:
         keys: Sequence[BlockKey],
         residencies: Sequence[_LocalDramResidency],
     ) -> dict[BlockKey, _LocalDramResidency]:
-        """Keep-queued claims on residencies the caller just found READY under the lock."""
+        """Keep-queued claims on residencies the caller found READY under the lock."""
         sources = dict(zip(keys, residencies))
         if sources:
             acquire = self._local_dram._acquire_claim

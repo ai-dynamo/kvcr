@@ -233,13 +233,13 @@ def test_local_source_starts_inline_and_holds_its_slot(
             control.incoming.append(msgspec.msgpack.encode(request))
             try:
                 assert preparing.wait(timeout=1)
-                # Claims and dependencies protect the source while P builds the
-                # write, but M must be able to acquire the metadata lock already.
+                # The claim and the operation count protect the source while P
+                # builds the write, but M must be able to acquire the metadata lock.
                 assert source._core._state_lock.acquire(blocking=False)
                 try:
                     record = source._core._block_record_map[key]
                     assert record.local_dram.claim_count == 1
-                    assert record.in_flight_ops
+                    assert _has_outstanding_operations(source)
                 finally:
                     source._core._state_lock.release()
             finally:

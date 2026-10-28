@@ -590,9 +590,9 @@ def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> 
     }[method]
     original = getattr(owner, boundary)
 
-    def prepare(*args):
+    def prepare(*args, **kwargs):
         _assert_state_lock_available(core)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(owner, boundary, prepare)
     if method == "poll_completed":
