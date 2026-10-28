@@ -48,6 +48,8 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
+    guard_only_sources: bool = False
+    guard_only_source_proof: bool = False
 
 
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):

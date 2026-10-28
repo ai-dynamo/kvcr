@@ -431,6 +431,8 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
             "REMOTE",
         )
         assert backends.remote_fw_dram.backend == "REMOTE"
+        assert backends.remote_fw_dram.guard_only_sources is True
+        assert backends.remote_fw_dram.guard_only_source_proof is True
         # A Guard serves G2 and holds G3 records for the returning primary.
         assert backends.g3 is None
         core = Mock(_local_dram=Mock(), _g3=None, _block_record_map={})

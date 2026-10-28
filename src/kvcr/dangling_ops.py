@@ -72,6 +72,8 @@ class _DanglingOps:
     ) -> tuple[bool, Any | None] | None:
         status = self.source_writes[(op.route[0], op.op_handle)]
         if cancelling and status.cancel_deadline is None:
+            if op.guard_only:
+                self._backend._guard_event("cancel_pending", op, len(op.guard_claims))
             config = self._backend._kvcr.config
             status.cancel_deadline = (
                 op.deadline
@@ -90,11 +92,14 @@ class _DanglingOps:
             and self._backend._kvcr._clock() >= cast(float, status.cancel_deadline)
         ):
             status.abandoned = True
+            if op.guard_only:
+                self._backend._guard_event("uncertain", op, len(op.guard_claims))
             self.report_source(op, "uncertain")
             self._backend._progress_outbound.append(replace(op))
         return result
 
     def finish_source(self, op: "_SourceWriteOp") -> None:
+        self._backend._release_guard_claims(op)
         status = self.source_writes.pop((op.route[0], op.op_handle), None)
         if status is not None and status.abandoned:
             self.report_source(op, "quiesced")

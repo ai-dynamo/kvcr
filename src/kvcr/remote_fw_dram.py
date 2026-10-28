@@ -32,7 +32,7 @@ from .core import (
     logger,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
-from .local_dram import _layout_indices, _LocalDramState
+from .local_dram import _GuardExportClaim, _layout_indices, _LocalDramState
 from .progress import (
     _FAILED_RESULT,
     _SUCCESS_RESULT,
@@ -341,6 +341,11 @@ class _SourceWriteOp(_RemoteOp):
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
+    guard_only: bool = False
+    guard_claims: tuple[_GuardExportClaim, ...] = ()
+    guard_accounting: tuple[_GuardExportClaim, ...] = ()
+    guard_requested_count: int = 0
+    guard_claim_started_at: float | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -402,7 +407,11 @@ class _SourceWriteOp(_RemoteOp):
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, True
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    True,
+                    completed_indices=self.completed_indices,
                 )
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
@@ -414,6 +423,7 @@ class _SourceWriteOp(_RemoteOp):
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
+            previous_transfer_id = progress._next_transfer_id
             status.submitted = True
             try:
                 transfer_id, submitted = progress.submit_transfer(
@@ -447,6 +457,18 @@ class _SourceWriteOp(_RemoteOp):
                     )
                 observed_work = True
             except Exception:
+                if (
+                    self.guard_only
+                    and progress._next_transfer_id > previous_transfer_id
+                ):
+                    # A tracked native handle exists: an exception cannot prove
+                    # quiescence. Recover ownership and poll with cancellation.
+                    self.transfer_id = progress._next_transfer_id
+                    self.state = _SourceWriteState.CANCEL_PENDING
+                    backend._guard_event(
+                        "submit_uncertain", self, len(self.guard_claims)
+                    )
+                    return False, True
                 logger.warning(
                     "KVCR start_write failed for op=%d",
                     self.op_handle,
@@ -598,6 +620,8 @@ class _RemoteFWDram:
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
+        if options.guard_only_source_proof and not options.guard_only_sources:
+            raise ValueError("guard_only_source_proof requires guard_only_sources")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
         self._kvcr = kvcr
@@ -632,6 +656,14 @@ class _RemoteFWDram:
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
+        if options.guard_only_sources:
+            logger.info(
+                "KVCR_EVENT guard_only_sources_enabled proof=%s",
+                options.guard_only_source_proof,
+            )
+            self._record_progress_counter(
+                "kvcr_guard_source_events", 0, ("source_callback_violation",)
+            )
 
     # -------------------------------------------------------------------------
     # Backend interface used by KVCR.
@@ -791,6 +823,22 @@ class _RemoteFWDram:
             if isinstance(item, _SourcePinOp):
                 self._start_source_pin(item)
             elif isinstance(item, _SourceWriteOp):
+                if item.guard_only:
+                    # Reader cleanup already occurred on native terminal in P;
+                    # caller-side policy/access accounting is not a lifetime fence.
+                    if item.state is _SourceWriteState.FINISHED and item.success:
+                        accessed = tuple(
+                            claim.key
+                            for claim in item.guard_accounting
+                            if (record := self._kvcr._block_record_map.get(claim.key))
+                            is not None
+                            and record.local_dram is claim.residency
+                        )
+                        self._kvcr._record_access(accessed)
+                        for key in accessed:
+                            self._kvcr._local_dram._make_evictable(key)
+                    item.guard_accounting = ()
+                    continue
                 if item.state in (
                     _SourceWriteState.FINISHED,
                     _SourceWriteState.CANCEL_PENDING,
@@ -1301,6 +1349,20 @@ class _RemoteFWDram:
                 self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
+        if self._options.guard_only_sources:
+            self._start_guard_source_write(
+                progress,
+                op_id,
+                keys,
+                dst_descriptors,
+                key_layout,
+                started_at,
+                deadline,
+                remote_agent,
+                op_handle,
+                (target_agent, self._route_generation.get(target_agent, 0)),
+            )
+            return
         source_pin = _SourcePinOp(
             op_id=op_id,
             keys=frozenset(keys),
@@ -1325,6 +1387,117 @@ class _RemoteFWDram:
         )
         if not self._try_local_source_write(progress, source_pin):
             self._progress_outbound.append(source_pin)
+
+    def _guard_event(self, event: str, op: _SourceWriteOp, count: int = 1) -> None:
+        self._record_progress_counter("kvcr_guard_source_events", count, (event,))
+        logger.info(
+            "KVCR_EVENT guard_only_source event=%s source_op=%d target_op=%d "
+            "count=%d requested=%d completed_indices=%s",
+            event,
+            op.op_id[1],
+            op.op_handle,
+            count,
+            op.guard_requested_count,
+            op.completed_indices,
+        )
+
+    def _start_guard_source_write(
+        self,
+        progress: _KVCRProgress,
+        op_id: _OpId,
+        keys: tuple[BlockKey, ...],
+        destinations: _MEMORY_REF_LISTS_TYPE,
+        key_layout: tuple[str, ...],
+        started_at: float | None,
+        deadline: float,
+        remote_agent: str,
+        op_handle: int,
+        route: tuple[str, int],
+    ) -> None:
+        local = self._kvcr._local_dram
+        claim_started = self._kvcr._timer()
+        selected, busy = (
+            local.claim_export_subset(
+                keys,
+                tuple(tuple(ref.label for ref in dest) for dest in destinations),
+                key_layout,
+            )
+            if local is not None
+            else ((), False)
+        )
+        claim_finished = time.monotonic()
+        claims = tuple(claim for _, claim in selected)
+        try:
+            op = _SourceWriteOp(
+                state=_SourceWriteState.READY_TO_WRITE,
+                op_id=op_id,
+                keys=frozenset(claim.key for claim in claims),
+                started_at=started_at,
+                deadline=deadline,
+                remote_agent=remote_agent,
+                op_handle=op_handle,
+                source_keys=tuple(claim.key for claim in claims),
+                src_descriptors=tuple(claim.refs for claim in claims),
+                dst_descriptors=tuple(destinations[index] for index, _ in selected),
+                completed_indices=tuple(index for index, _ in selected),
+                route=route,
+                _backend=self,
+                guard_only=True,
+                guard_claims=claims,
+                guard_accounting=claims,
+                guard_requested_count=len(keys),
+                guard_claim_started_at=claim_started,
+            )
+            progress._in_flight_ops[op_id] = op
+        except BaseException:
+            if claims:
+                local.release_export_claims(claims)
+            raise
+        if self._telemetry_enabled and claim_started is not None:
+            self._progress_metrics.append(
+                (
+                    "histogram",
+                    DURATION_METRIC,
+                    claim_finished - claim_started,
+                    (
+                        "guard_ready_claim",
+                        "busy" if busy else "ready" if claims else "miss",
+                    ),
+                )
+            )
+        self._guard_event("ready", op, len(claims))
+        self._guard_event("miss", op, len(keys) - len(claims))
+        if busy:
+            self._guard_event("contention", op)
+        self._guard_event("held", op, len(claims))
+        done, _ = op.progress(progress, None)
+        if done:
+            progress._in_flight_ops.pop(op_id)
+            self._progress_outbound.append(op)
+
+    def _release_guard_claims(self, op: _SourceWriteOp) -> None:
+        if not op.guard_claims:
+            return
+        claims = op.guard_claims
+        self._kvcr._local_dram.release_export_claims(claims)
+        op.guard_claims = ()
+        self._record_progress_duration(
+            "guard_claim_hold", op.guard_claim_started_at, "quiesced"
+        )
+        self._guard_event("native_cleanup", op, len(claims))
+
+    def _guard_source_callback(self, stage: str) -> bool:
+        if not self._options.guard_only_sources:
+            return False
+        self._record_progress_counter(
+            "kvcr_guard_source_events", 1, ("source_callback_violation",)
+        )
+        logger.error(
+            "KVCR_EVENT guard_only_source source_callback_violation stage=%s", stage
+        )
+        if self._options.guard_only_source_proof:
+            raise RuntimeError(f"Guard-only source callback violation: {stage}")
+        return True
 
     def _try_local_source_write(
         self, progress: _KVCRProgress, source_pin: _SourcePinOp
@@ -1681,6 +1854,8 @@ class _RemoteFWDram:
         )
 
     def _start_source_pin(self, op: _SourcePinOp) -> None:
+        if self._guard_source_callback("source_pin"):
+            raise RuntimeError("Guard-only source pin operation must never be queued")
         kvcr = self._kvcr
         kvcr._add_block_dependencies(op, new_operation=True)
         self._source_pin_ops[op.op_id] = op
@@ -1855,6 +2030,8 @@ class _RemoteFWDram:
         *,
         op: _SourcePinOp | None = None,
     ) -> PinRequestId | None:
+        if self._guard_source_callback("request_pin"):
+            return None
         kvcr = self._kvcr
         if not keys:
             return None
@@ -1957,6 +2134,8 @@ class _RemoteFWDram:
         | _PendingFrameworkSources
         | None
     ):
+        if self._guard_source_callback("acquire_framework_sources"):
+            return None
         kvcr = self._kvcr
         started_at = kvcr._timer()
         keys_to_pin: list[BlockKey] = []
@@ -2242,6 +2421,7 @@ class _RemoteFWDram:
         success: bool,
         *,
         terminal: bool = True,
+        completed_indices: tuple[int, ...] = (),
     ) -> None:
         agent = progress.nixl_agent
         send_notif = getattr(agent, "send_notif", None)
@@ -2253,7 +2433,13 @@ class _RemoteFWDram:
             return
         try:
             result = send_notif(
-                remote_agent, _write_done_notif(op_handle, success, terminal=terminal)
+                remote_agent,
+                _write_done_notif(
+                    op_handle,
+                    success,
+                    terminal=terminal,
+                    completed_indices=completed_indices,
+                ),
             )
         except Exception:
             logger.warning(

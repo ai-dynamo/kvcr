@@ -1066,7 +1066,11 @@ class _Guard:
                 local_dram=dram,
                 g3=None,
                 remote_fw_dram=RemoteFWDramOptions(
-                    backend=self._configured.remote_fw_dram_backend
+                    backend=self._configured.remote_fw_dram_backend,
+                    # A takeover Guard has no framework sources. Recovered
+                    # READY exports must not depend on its owner poll either.
+                    guard_only_sources=True,
+                    guard_only_source_proof=True,
                 ),
             ),
         )
