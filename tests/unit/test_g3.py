@@ -4,6 +4,7 @@
 import ctypes
 import logging
 import os
+from unittest.mock import Mock, patch
 
 import pytest
 from _kvcr_test_utils import (
@@ -37,7 +38,7 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.core import _BlockRecord
-from kvcr.local_disk import _G3Residency
+from kvcr.local_disk import _G3, _G3Residency
 from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
 from kvcr.recovery_journal import install_recovery_records
@@ -47,7 +48,6 @@ from kvcr.types import (
     InventoryEvent,
     PlacementAction,
     QueryStatus,
-    RecoveryMirrorError,
     RegionDescriptor,
 )
 
@@ -204,12 +204,293 @@ def _deposit(kvcr, key, index):
     return dict(_poll_until(kvcr, bool))[handle][key]
 
 
+def _multi_pool_g3(
+    tmp_path,
+    *,
+    layout=("full", "swa:a", "swa:b"),
+    disk_units=8,
+    agent=None,
+    policy=None,
+    file_count=1,
+    deposits=2,
+):
+    page = os.sysconf("SC_PAGE_SIZE")
+    primary = {name: ctypes.create_string_buffer(6 * page) for name in ("full", "swa")}
+    local = {name: ctypes.create_string_buffer(2 * page) for name in primary}
+    primary["full"].raw = b"f" * page + b"g" * page + b"F" * page + b"G" * page
+    primary["swa"].raw = b"a" * page + b"b" * page + b"A" * page + b"B" * page
+    kvcr = _new_kvcr(
+        agent or _FakeG3Agent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        config=KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("full", 2 * page), ("swa", page)],
+        ),
+        policy=policy,
+        framework_regions=[
+            _buffer_region(primary["full"], 2 * page, "full"),
+            _buffer_region(
+                primary["swa"], page, "swa:*" if ":" in layout[1] else "swa"
+            ),
+        ],
+        local_dram=LocalDramOptions(
+            [(name, ctypes.addressof(buf), len(buf)) for name, buf in local.items()]
+        ),
+        g3=G3Options(
+            paths=tuple(
+                tmp_path / f"hybrid-{index}.data" for index in range(file_count)
+            ),
+            capacity_bytes_per_file=((disk_units + file_count - 1) // file_count)
+            * page,
+            backend="MOCK",
+        ),
+    )
+    keys = [BlockKey(f"key-{index}".encode()) for index in range(3)]
+    for index, key in enumerate(keys[:deposits]):
+        handle = kvcr.deposit({key: _hybrid_refs(index, layout)})
+        assert dict(_poll_until(kvcr, bool))[handle][key].success
+    return kvcr, primary, local, keys
+
+
+def _hybrid_refs(index, layout=("full", "swa:a", "swa:b")):
+    return [
+        _mem_descriptor(index, layout[0]),
+        _mem_descriptor(2 * index, layout[1]),
+        _mem_descriptor(2 * index + 1, layout[2]),
+    ]
+
+
+@pytest.mark.parametrize("layout", [("full", "swa:a", "swa:b"), ("full", "swa", "swa")])
+@pytest.mark.parametrize("file_count", [1, 3])
+def test_g3_multi_pool_round_trip_and_eviction(tmp_path, layout, file_count):
+    page = os.sysconf("SC_PAGE_SIZE")
+    kvcr, primary, local, keys = _multi_pool_g3(
+        tmp_path,
+        layout=layout,
+        disk_units=4,
+        file_count=file_count,
+    )
+    assert kvcr.query(keys[:1]) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
+    handle = kvcr.deliver({keys[0]: _hybrid_refs(2, layout)})
+    assert dict(_poll_until(kvcr, bool))[handle][keys[0]].success
+    assert primary["full"].raw[4 * page :] == b"f" * page + b"g" * page
+    assert primary["swa"].raw[4 * page :] == b"a" * page + b"b" * page
+
+    handle = kvcr.fetch(keys[:1], expected_layout=list(layout))
+    result = dict(_poll_until(kvcr, bool))[handle][keys[0]]
+    assert result.success and result.release_handle is not None
+    assert local["full"].raw == b"f" * page + b"g" * page
+    assert local["swa"].raw == b"a" * page + b"b" * page
+    kvcr.release((result.release_handle,))
+
+    # Replace the disk entry and verify that all of its units can be reused.
+    for index in (1, 2):
+        handle = kvcr.deposit({keys[index]: _hybrid_refs(index, layout)})
+        assert dict(_poll_until(kvcr, bool))[handle][keys[index]].success
+    assert kvcr.query(keys[:2]) == [
+        (QueryStatus.MISS, None),
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+    ]
+    handle = kvcr.deliver({keys[1]: _hybrid_refs(2, layout)})
+    assert dict(_poll_until(kvcr, bool))[handle][keys[1]].success
+    assert primary["full"].raw[4 * page :] == b"F" * page + b"G" * page
+    assert primary["swa"].raw[4 * page :] == b"A" * page + b"B" * page
+    g3 = kvcr._core._g3
+    assert len(g3._free_slots) == g3._total_slots - 4
+
+
+def test_g3_multi_pool_partial_reservation_rolls_back(tmp_path):
+    policy = _MoveLocalToG3Policy()
+    policy.keep_g3 = True
+    kvcr, primary, local, keys = _multi_pool_g3(
+        tmp_path,
+        disk_units=6,
+        policy=policy,
+        file_count=3,
+        deposits=3,
+    )
+    assert kvcr.query(keys[:2]) == [
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+        (QueryStatus.MISS, None),
+    ]
+    g3 = kvcr._core._g3
+    assert sorted(g3._free_slots) == [4, 5]
+    assert not g3._pending_keys
+    assert g3.telemetry_state()["g3_evictable_slots"] == 4
+
+
+def test_g3_multi_pool_partial_read_and_layout_mismatch(tmp_path):
+    page = os.sysconf("SC_PAGE_SIZE")
+    kvcr, primary, local, keys = _multi_pool_g3(tmp_path, disk_units=12, deposits=3)
+    first = keys[0]
+    handle = kvcr.deliver(
+        {
+            first: [_mem_descriptor(4, "swa:b"), _mem_descriptor(5, "swa:a")],
+            keys[1]: [_mem_descriptor(0, "swa:missing")],
+        }
+    )
+    result = dict(_poll_until(kvcr, bool))[handle]
+    assert result[first].success and not result[keys[1]].success
+    assert kvcr._core._block_record_map[keys[1]].g3.claim_count == 0
+    assert primary["swa"].raw[4 * page :] == b"b" * page + b"a" * page
+    handle = kvcr.deliver({first: [_mem_descriptor(4, "swa:missing")]})
+    assert not dict(_poll_until(kvcr, bool))[handle][first].success
+    assert kvcr._core._block_record_map[first].g3.claim_count == 0
+    assert primary["swa"].raw[4 * page :] == b"b" * page + b"a" * page
+    with patch.object(kvcr._core._remote_fw_dram, "query", return_value=True) as query:
+        for request_id in (None, "peer"):
+            with pytest.raises(ValueError, match="existing G3 key layout"):
+                kvcr.fetch((first,), request_id=request_id, expected_layout=["swa:b"])
+        query.assert_not_called()
+    with pytest.raises(ValueError, match="existing G3 key layout"):
+        kvcr.deposit({first: [_mem_descriptor(0, "swa:b")]})
+
+    # G3 fills the missing pieces of an incrementally deposited key.
+    layout = ["full", "swa:a", "swa:b"]
+    handle = kvcr.deposit({first: [_mem_descriptor(0, "full")]}, expected_layout=layout)
+    assert dict(_poll_until(kvcr, bool))[handle][first].success
+    handle = kvcr.deposit({first: [_mem_descriptor(0, "swa:a")]})
+    assert dict(_poll_until(kvcr, bool))[handle][first].success
+    handle = kvcr.fetch((first,), expected_layout=layout)
+    result = dict(_poll_until(kvcr, bool))[handle][first]
+    assert result.success and result.release_handle is not None
+    assert local["swa"].raw == b"a" * page + b"b" * page
+    assert local["full"].raw == b"f" * page + b"g" * page
+    kvcr.release((result.release_handle,))
+
+
+def test_g3_multi_pool_impossible_spill_preserves_disk_entries(tmp_path):
+    kvcr, primary, local, keys = _multi_pool_g3(tmp_path, disk_units=6, deposits=0)
+    small, pinned = BlockKey(b"small"), BlockKey(b"pinned")
+    install_recovery_records(
+        kvcr._core,
+        {
+            small: _BlockRecord(g3=_G3Residency(("full",), (0, 1))),
+            pinned: _BlockRecord(
+                g3=_G3Residency(("full", "swa:a", "swa:b"), (2, 3, 4, 5))
+            ),
+        },
+    )
+    g3 = kvcr._core._g3
+    claims, rejected = g3._claim((pinned,))
+    assert not rejected
+    for index, key in enumerate(keys[:2]):
+        handle = kvcr.deposit({key: _hybrid_refs(index)})
+        assert dict(_poll_until(kvcr, bool))[handle][key].success
+    assert kvcr.query((small, pinned)) == [(QueryStatus.FETCHABLE, CacheTier.G3)] * 2
+    assert not g3._free_slots and not g3._pending_keys
+    g3._release_claims(claims)
+
+
+@pytest.mark.parametrize("failure", ["capacity", "submission"])
+def test_g3_multi_pool_failed_spill_does_not_publish_partial_key(tmp_path, failure):
+    agent = _FakeG3Agent()
+    kvcr, primary, local, keys = _multi_pool_g3(
+        tmp_path,
+        disk_units=3 if failure == "capacity" else 8,
+        agent=agent,
+        deposits=1,
+    )
+    if failure == "submission":
+        original = agent.initialize_xfer
+
+        def reject_write(*args, **kwargs):
+            if args[0] == "WRITE" and kwargs.get("backends") == ["MOCK"]:
+                raise RuntimeError("injected submission failure")
+            return original(*args, **kwargs)
+
+        agent.initialize_xfer = reject_write
+    handle = kvcr.deposit({keys[1]: _hybrid_refs(1)})
+    assert dict(_poll_until(kvcr, bool))[handle][keys[1]].success
+    assert kvcr.query(keys[:1]) == [(QueryStatus.MISS, None)]
+    g3 = kvcr._core._g3
+    assert not g3._pending_keys and not g3._active
+    assert sorted(g3._free_slots) == list(range(g3._total_slots))
+
+
+def test_g3_multi_pool_recovery_adopts_all_units_and_validates_layout(tmp_path):
+    kvcr, primary, local, keys = _multi_pool_g3(tmp_path, file_count=2, deposits=0)
+    g3 = kvcr._core._g3
+    disk = _G3Residency(("full", "swa:a", "swa:b"), (1, 3, 5, 7))
+    install_recovery_records(kvcr._core, {keys[0]: _BlockRecord(g3=disk)})
+    assert kvcr.query(keys[:1]) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
+    assert tuple(g3._free_slots) == (0, 2, 4, 6)
+    for bad in (
+        _G3Residency((), (0,)),
+        _G3Residency(("full",), (0, 0)),
+        _G3Residency(("full",), (0,)),
+        _G3Residency(("full",), (0, 8)),
+        _G3Residency(("missing",), (0,)),
+    ):
+        with pytest.raises(ValueError):
+            g3.adopt_recovery_slots({keys[0]: _BlockRecord(g3=bad)})
+        assert tuple(g3._free_slots) == (0, 2, 4, 6)
+
+
 def _metric_totals(stats):
     totals = {}
     for kind, name, value, labels in stats.records:
         key = (kind, name, *labels)
         totals[key] = totals.get(key, 0) + value
     return totals
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({}, {}),
+        ({"backend": "POSIX"}, {"use_aio": "true"}),
+        (
+            {"backend": "POSIX", "backend_options": {"use_aio": "true"}},
+            {"use_aio": "true"},
+        ),
+        (
+            {"backend": "POSIX", "backend_options": {"use_uring": "true"}},
+            {"use_uring": "true"},
+        ),
+        (
+            {"backend": "POSIX", "backend_options": {"use_uring": "false"}},
+            {"use_uring": "false"},
+        ),
+        (
+            {"backend": "POSIX", "backend_options": {"kernel_queue_size": "32"}},
+            {"use_aio": "true", "kernel_queue_size": "32"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("existing", [False, True])
+def test_g3_backend_defaults_and_overrides(tmp_path, settings, expected, existing):
+    original = dict(settings.get("backend_options", {}))
+    config = G3Options(
+        paths=(tmp_path / "g3.data",),
+        capacity_bytes_per_file=os.sysconf("SC_PAGE_SIZE"),
+        **settings,
+    )
+    assert config.backend == settings.get("backend", "GDS_MT")
+    assert dict(config.backend_options) == original
+    agent = Mock(
+        backends={config.backend: expected} if existing else {},
+        get_plugin_list=Mock(return_value=[config.backend]),
+        get_backend_params=Mock(return_value=expected),
+    )
+    g3 = _G3(Mock(), config, os.sysconf("SC_PAGE_SIZE"))
+    try:
+        g3.initialize_progress(Mock(nixl_agent=agent))
+        if existing:
+            agent.create_backend.assert_not_called()
+        else:
+            agent.create_backend.assert_called_once_with(config.backend, expected)
+        g3.close_progress()
+        if existing and expected:
+            agent.get_backend_params.return_value = {}
+            with pytest.raises(ValueError, match="incompatible options"):
+                g3.initialize_progress(Mock(nixl_agent=agent))
+        assert dict(config.backend_options) == original
+    finally:
+        g3.close_progress()
+        g3.close_main()
+    assert settings.get("backend_options", {}) == original
 
 
 @pytest.mark.parametrize(
@@ -365,7 +646,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
     for key in keys[:4]:
         residency = kvcr._core._block_record_map[key].g3
         assert residency is not None
-        descriptor = g3._descriptor(residency.slot)
+        descriptor = g3._descriptor(residency.slots[0])
         locations.append((descriptor.device_Id, descriptor.addr))
     assert locations == [
         (first_fd, 0),
@@ -385,7 +666,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
 
     evicted = kvcr._core._block_record_map[keys[1]].g3
     assert evicted is not None
-    evicted_slot = evicted.slot
+    evicted_slot = evicted.slots[0]
     fetch = kvcr.fetch((keys[0],))
     fetch_result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))[fetch][
         keys[0]
@@ -397,7 +678,7 @@ def test_g3_stripes_slots_across_files_and_reuses_an_evicted_slot(
         (QueryStatus.FETCHABLE, CacheTier.G3),
     ]
     replacement = kvcr._core._block_record_map[keys[4]].g3
-    assert replacement is not None and replacement.slot == evicted_slot
+    assert replacement is not None and replacement.slots[0] == evicted_slot
     replacement_deliver = kvcr.deliver({keys[4]: [_mem_descriptor(9)]})
     replacement_result = dict(
         _poll_until(kvcr, lambda done: replacement_deliver in dict(done))
@@ -443,15 +724,15 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     install_recovery_records(
         kvcr._core,
         {
-            first: _BlockRecord(g3=_G3Residency(0), last_access=3.0),
-            second: _BlockRecord(g3=_G3Residency(2), last_access=1.0),
+            first: _BlockRecord(g3=_G3Residency(("",), (0,)), last_access=3.0),
+            second: _BlockRecord(g3=_G3Residency(("",), (2,)), last_access=1.0),
         },
     )
     # _free_slots is the allocator's free list: recovery must rebuild it as the
     # complement of the adopted slots, excluding the unused tails in each file.
     assert tuple(g3._free_slots) == (1,)
-    assert kvcr._core._block_record_map[first].g3 == _G3Residency(0)
-    assert kvcr._core._block_record_map[second].g3 == _G3Residency(2)
+    assert kvcr._core._block_record_map[first].g3 == _G3Residency(("",), (0,))
+    assert kvcr._core._block_record_map[second].g3 == _G3Residency(("",), (2,))
     kvcr._core._clock = lambda: 5.0
     survivor = g3._descriptor(2)
     agent._file_data[(survivor.device_Id, survivor.addr)] = b"s" * page_size
@@ -459,7 +740,7 @@ def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     observed: list[tuple[BlockKey, int | None]] = []
 
     def observe(key: BlockKey, record: _BlockRecord) -> None:
-        observed.append((key, None if record.g3 is None else record.g3.slot))
+        observed.append((key, None if record.g3 is None else record.g3.slots[0]))
 
     g3.observe_residency(observe)
     # Alignment publishes positions and refreshes LRU scores, preserving FIFO.
@@ -509,8 +790,8 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
     with pytest.raises(ValueError, match="invalid G3 recovery slots"):
         g3.adopt_recovery_slots(
             {
-                BlockKey(b"first"): _BlockRecord(g3=_G3Residency(slots[0])),
-                BlockKey(b"second"): _BlockRecord(g3=_G3Residency(slots[1])),
+                BlockKey(b"first"): _BlockRecord(g3=_G3Residency(("",), (slots[0],))),
+                BlockKey(b"second"): _BlockRecord(g3=_G3Residency(("",), (slots[1],))),
             }
         )
 
@@ -519,16 +800,15 @@ def test_g3_recovery_rejects_invalid_slots(tmp_path, slots: tuple[int, int]) -> 
 
 
 @pytest.mark.parametrize("slots", [[("", 0), ("", 1)], [(":part", 0)]])
-def test_g3_recovery_rejects_multi_block_local_residency(tmp_path, slots) -> None:
+def test_g3_recovery_accepts_multi_block_local_residency(tmp_path, slots) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     local = ctypes.create_string_buffer(2 * page_size)
     kvcr = _new_g3_kvcr(tmp_path, local, slot_count=2)
 
-    with pytest.raises(RecoveryMirrorError, match="one local DRAM slot"):
-        install_recovery_records(
-            kvcr._core,
-            {BlockKey(b"multi"): _recovered_record(g2=slots)},
-        )
+    key = BlockKey(b"multi")
+    install_recovery_records(kvcr._core, {key: _recovered_record(g2=slots)})
+    assert kvcr.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    assert kvcr._core._block_record_map[key].local_dram.slots == tuple(slots)
 
 
 def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
@@ -579,11 +859,6 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
     now = 2.0
-    with pytest.raises(ValueError, match="G3 does not support"):
-        kvcr.deposit({first: [_mem_descriptor(0), _mem_descriptor(1)]})
-    for layout in (["", ""], [":part"]):
-        with pytest.raises(ValueError, match="G3 does not support"):
-            kvcr.fetch((first,), expected_layout=layout)
     fetch = kvcr.fetch((first,))
     fetch_result = dict(_poll_until(kvcr, bool))[fetch][first]
     assert fetch_result.success and fetch_result.release_handle is not None

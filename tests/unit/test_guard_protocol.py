@@ -13,7 +13,7 @@ import pytest
 from _kvcr_test_utils import _wait_until
 
 from kvcr import guard_protocol as protocol_module
-from kvcr.config import LocalDramOptions
+from kvcr.config import G3Options, LocalDramOptions
 from kvcr.control_channels import (
     KVCRGuardProtocolError,
     KVCRServiceError,
@@ -236,7 +236,7 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
     with pytest.raises(ValueError, match="unique"):
         _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")})
 
-    with pytest.raises(ValueError, match="does not support multiple pools"):
+    with pytest.raises(ValueError, match="page-aligned"):
         _TierConfig(
             _POOL_LAYOUTS,
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
@@ -253,12 +253,48 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
         )
 
     tier = _TierConfig(
-        [("pool", mmap.PAGESIZE)],
+        [("full", 2 * mmap.PAGESIZE), ("swa", mmap.PAGESIZE)],
         _G3Config(**{**good, "capacity_bytes_per_file": 2 * mmap.PAGESIZE - 1}),
     )
     assert (
         msgspec.msgpack.decode(msgspec.msgpack.encode(tier), type=_TierConfig) == tier
     )
+
+
+@pytest.mark.parametrize("options", [{}, {"use_aio": "true"}])
+def test_g3_claim_normalizes_equivalent_backend_defaults(
+    monkeypatch, tmp_path, options
+):
+    g3 = G3Options(
+        paths=(tmp_path / "g3.data",),
+        capacity_bytes_per_file=mmap.PAGESIZE,
+        backend="POSIX",
+        backend_options=options,
+    )
+    layouts = [(pool.name, mmap.PAGESIZE) for pool in _WIRE_POOLS]
+    tier = _TierConfig(
+        layouts,
+        _G3Config((str(g3.paths[0]),), mmap.PAGESIZE, "POSIX", {"use_aio": "true"}),
+    )
+    pools = tuple(
+        msgspec.structs.replace(pool, block_size_bytes=mmap.PAGESIZE)
+        for pool in _WIRE_POOLS
+    )
+    connection = _RecordingConnection(
+        [_grant(tier_config=tier, pools=pools), _Released(1)]
+    )
+    _connect_with(monkeypatch, connection)
+    monkeypatch.setattr(
+        protocol_module.KVCRPoolAttachment, "attach", Mock(return_value=_Attachment())
+    )
+    hold = KVCRClient("/unused").claim(
+        _GUARD_INDEX, layouts, _DIGEST, ("127.0.0.1", 5555), g3=g3
+    )
+    try:
+        assert connection.sent[0].tier_config == tier
+        assert dict(g3.backend_options) == options
+    finally:
+        hold.release()
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(

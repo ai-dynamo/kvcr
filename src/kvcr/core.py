@@ -11,7 +11,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from itertools import islice
-from math import ceil
+from math import ceil, gcd
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -223,8 +223,6 @@ class _KVCRCore:
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
-        if g3_config is not None and len(self.pool_layouts) != 1:
-            raise ValueError("G3 does not support multiple pools")
         policy = bindings.policy
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
@@ -322,7 +320,7 @@ class _KVCRCore:
             _G3(
                 self,
                 g3_config,
-                self.pool_layouts[0][1],
+                gcd(*(size for _, size in self.pool_layouts)),
             )
             if g3_config is not None and local_dram_config is not None
             else None
@@ -388,17 +386,6 @@ class _KVCRCore:
         g3 = self._g3
         if g3 is None and any(record.g3 is not None for record in records.values()):
             raise RecoveryMirrorError("recovered G3 residency has no configured G3")
-        if g3 is not None and any(
-            record.local_dram is not None
-            and (
-                len(record.local_dram.slots) != 1
-                or any(":" in label for label in record.local_dram.layout)
-            )
-            for record in records.values()
-        ):
-            raise RecoveryMirrorError(
-                "G3 recovery requires one local DRAM slot without a part label"
-            )
         if self._block_record_map:
             raise RecoveryMirrorError("recovered records need a core that holds none")
 
@@ -416,7 +403,7 @@ class _KVCRCore:
                 source = CacheTier.LOCAL_G2
                 slot_size = local_dram._size_bytes(record.local_dram)
             else:
-                source, slot_size = CacheTier.G3, g3._slot_size
+                source, slot_size = CacheTier.G3, g3._size_bytes(record.g3)
             self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
 
         # After every admission: a block resident in both tiers must not be
@@ -555,7 +542,7 @@ class _KVCRCore:
                 size_bytes = (
                     local_dram._size_bytes(record.local_dram)
                     if record.local_dram is not None
-                    else g3._slot_size
+                    else g3._size_bytes(record.g3)
                 )
                 blocks.append(self._block_meta(key, record, size_bytes))
             self._policy.on_align_sequence(blocks, use_current_time)
@@ -591,7 +578,7 @@ class _KVCRCore:
         try:
             with self._state_lock:
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
-                g3_blocks: dict[BlockKey, _TransferRef] = {}
+                g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_keys = self._remote_delivery_keys.get(request_id, ())
                 for key, destination in normalized.items():
@@ -603,7 +590,7 @@ class _KVCRCore:
                     elif self._is_local_resident(key):
                         local_blocks[key] = destination
                     elif self._g3 is not None and self._g3.is_ready(key):
-                        g3_blocks[key] = destination[0]
+                        g3_blocks[key] = destination
                     else:
                         remote_blocks[key] = destination
 
@@ -681,6 +668,19 @@ class _KVCRCore:
                     dict.fromkeys(blocks, _FAILED_RESULT),
                 )
             else:
+                if self._g3 is not None:
+                    for key, refs in blocks.items():
+                        if self._g3.is_ready(key):
+                            record = self._block_record_map[key]
+                            layout = declaration or (
+                                record.local_dram.key_layout
+                                if record.local_dram is not None
+                                else tuple(ref.label for ref in refs)
+                            )
+                            if not self._g3.is_ready(key, layout):
+                                raise ValueError(
+                                    "deposit layout must match existing G3 key layout"
+                                )
                 self._local_dram.deposit(
                     op_handle,
                     blocks,
@@ -723,6 +723,10 @@ class _KVCRCore:
                 ):
                     continue
                 if self._g3 is not None and self._g3.is_ready(key):
+                    if not self._g3.is_ready(key, declaration):
+                        raise ValueError(
+                            "fetch layout must match existing G3 key layout"
+                        )
                     sources[key] = CacheTier.G3
                 elif request_id is not None and self._remote_fw_dram.query(
                     key, request_id
@@ -1048,7 +1052,7 @@ class _KVCRCore:
         if source is CacheTier.G3:
             started = self._g3 is not None and self._g3.start_fill(
                 fill_handle,
-                {key: descriptors[0] for key, descriptors in blocks.items()},
+                blocks,
                 deadline,
             )
         elif source is CacheTier.REMOTE_G2:
@@ -1142,8 +1146,6 @@ class _KVCRCore:
                 if ref.label in labels:
                     raise ValueError("block part labels must be unique")
                 labels.add(ref.label)
-        if self._g3 is not None and (len(descriptors) != 1 or labels):
-            raise ValueError("G3 does not support multi-block layouts or part labels")
 
     def _validate_expected_layout(
         self, layout: list[str] | None
@@ -1164,8 +1166,6 @@ class _KVCRCore:
                 if label in labels:
                     raise ValueError("block part labels must be unique")
                 labels.add(label)
-        if self._g3 is not None and (len(layout) != 1 or labels):
-            raise ValueError("G3 does not support multi-block layouts or part labels")
 
         return tuple(layout)
 

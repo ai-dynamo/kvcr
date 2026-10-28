@@ -74,9 +74,8 @@ _RECORD_BLOCK = 1
 _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 
 
-# Arrays avoid repeating field names in the bounded ring. Field order is the
-# format: append only, never reorder or remove. G2 cost grows with its location
-# count and pool-name lengths.
+# Arrays avoid repeating field names in the bounded ring. G3 stores its complete
+# layout and slots; recovery records from the old single-slot format are rejected.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     # Ordered (full descriptor label, slot) pairs, or nothing. Pools may repeat.
     g2: (
@@ -86,7 +85,16 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
         ]
         | None
     ) = None
-    g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    g3: (
+        tuple[
+            Annotated[tuple[str, ...], msgspec.Meta(min_length=1)],
+            Annotated[
+                tuple[Annotated[int, msgspec.Meta(ge=0)], ...],
+                msgspec.Meta(min_length=1),
+            ],
+        ]
+        | None
+    ) = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
 
 
@@ -114,21 +122,34 @@ def _is_recoverable(record: _BlockRecord) -> bool:
 
 
 def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
-    g3 = record.g3.slot if record.g3 is not None else None
+    disk = record.g3
     local_dram = record.local_dram
-    if (
-        local_dram is None
-        or local_dram.state is not _LocalDramState.READY
-        or local_dram.pending_labels
-    ):
-        return _RecoveryBlock(g3=g3, position=record.position)
-    return _RecoveryBlock(g2=local_dram.slots, g3=g3, position=record.position)
+    complete = (
+        local_dram is not None
+        and local_dram.state is _LocalDramState.READY
+        and not local_dram.pending_labels
+    )
+    return _RecoveryBlock(
+        g2=local_dram.slots if complete else None,
+        g3=(disk.layout, disk.slots) if disk is not None else None,
+        position=record.position,
+    )
 
 
 def _decode_recovery_record(
     payload: bytes, pool_names: tuple[str, ...]
 ) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
+    disk = _G3Residency(*recovered.g3) if recovered.g3 is not None else None
+    if disk is not None:
+        labels = set()
+        for label in disk.layout:
+            pool, separator, part = label.partition(":")
+            if pool not in pool_names or (
+                separator and (part in ("", "*") or label in labels)
+            ):
+                raise ValueError("G3 recovery layout does not match the pool group")
+            labels.add(label)
     labels: set[str] = set()
     for label, _ in recovered.g2 or ():
         pool, separator, part = label.partition(":")
@@ -143,7 +164,7 @@ def _decode_recovery_record(
             if recovered.g2 is not None
             else None
         ),
-        g3=_G3Residency(recovered.g3) if recovered.g3 is not None else None,
+        g3=disk,
         position=recovered.position,
     )
 
@@ -417,7 +438,17 @@ def _attach_journal(
                 journal.invalidate()
 
     if g3 is not None:
-        g3.observe_residency(publish)
+
+        def preflight(key: BlockKey, record: _BlockRecord, disk: _G3Residency) -> bool:
+            candidate = msgspec.structs.replace(record, g3=disk)
+            payload = _RECOVERY_ENCODER.encode(_project_recovery_record(candidate))
+            size = _FRAME_HEADER.size + len(key) + len(payload)
+            return (
+                size <= _MAX_FRAME_SIZE
+                and size + (-size % _ALIGNMENT) <= journal._capacity
+            )
+
+        g3.observe_residency(publish, recovery_preflight=preflight)
     local_dram.observe_residency(publish)
 
 

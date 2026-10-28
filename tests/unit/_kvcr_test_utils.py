@@ -659,14 +659,14 @@ class _ConstantHashAdapter:
 
 
 def _recovered_record(
-    *, g2: list[tuple[str, int]] | None = None, g3: int | None = None
+    *, g2: list[tuple[str, int]] | None = None, g3: int | None = None, g3_pool: str = ""
 ) -> _BlockRecord:
     """A block record as recovery rebuilds one: settled residencies, nothing live."""
     return _BlockRecord(
         local_dram=(
             None if g2 is None else _LocalDramResidency(g2, _LocalDramState.READY)
         ),
-        g3=None if g3 is None else _G3Residency(g3),
+        g3=None if g3 is None else _G3Residency((g3_pool,), (g3,)),
     )
 
 
