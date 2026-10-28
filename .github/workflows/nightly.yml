@@ -9,6 +9,9 @@ run-name: >-
 on:
   schedule:
     - cron: "0 8 * * *"
+  # TEMP: end-to-end dry run from the PR's copy-pr-bot branch; remove before merge.
+  push:
+    branches: [pull-request/66]
   # Pull requests that change packaging get the build, compliance, and wheel tests only.
   pull_request:
     paths:
@@ -48,6 +51,6 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       mode: nightly
-      stage: ${{ github.event_name == 'schedule' || inputs.release == true }}
-      run_e2e: ${{ github.event_name != 'pull_request' }}
+      stage: ${{ github.event_name == 'schedule' || github.event_name == 'push' || inputs.release == true }}
+      run_e2e: ${{ github.event_name != 'pull_request' && github.event_name != 'push' }}
       skip_gitlab_pipeline: ${{ inputs.skip_gitlab_pipeline == true }}

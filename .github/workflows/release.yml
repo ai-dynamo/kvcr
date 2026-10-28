@@ -90,7 +90,9 @@ jobs:
           [ -n "${base}" ] || fail "pyproject.toml [project].version must be a plain X.Y.Z release"
           case "${MODE}" in
             nightly)
-              if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+              # TEMP: pull-request/66 is allowed for the dry run; remove before merge.
+              if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ "${GITHUB_REF}" != "refs/heads/main" ] \
+                && [ "${GITHUB_REF}" != "refs/heads/pull-request/66" ]; then
                 fail "nightlies run only on main"
               fi
               date="$(date -u +%Y%m%d)"
@@ -103,7 +105,7 @@ jobs:
                 stage=true
               fi
               publish=false
-              if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ]; then
+              if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
                 publish=true
               fi
               ;;
@@ -490,10 +492,8 @@ jobs:
       RC: ${{ inputs.rc }}
       STAGED_WHEELS: ${{ needs.stage.outputs.staged_wheels }}
       SLACK_THREAD_TS: ${{ needs.slack-start.outputs.thread_ts }}
-      # Live only when the build also ran the strict checks and nightly publishing is still on.
-      DRY_RUN: >-
-        ${{ needs.prepare.outputs.publish == 'true' &&
-        (needs.prepare.outputs.mode == 'release' || vars.KVCR_NIGHTLY_PUBLISH == 'true') && 'false' || 'true' }}
+      # TEMP: always a dry run during PR verification; restore the expression before merge.
+      DRY_RUN: "true"
     steps:
       - name: Trigger the release pipeline
         env:
@@ -553,7 +553,7 @@ jobs:
           for kv in "${variables[@]}"; do
             form+=(--form-string "variables[${kv%%=*}]=${kv#*=}")
           done
-          curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=main \
+          curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=pvijayakrish/onboard-kvcr \
             "${form[@]}" "${GITLAB_PIPELINE_URL}"
           # The response names an internal pipeline, so only its id is checked, never printed.
           jq -e '.id | numbers' "${response}" > /dev/null || fail "the release pipeline was not created"
