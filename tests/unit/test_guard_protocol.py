@@ -161,6 +161,7 @@ class _Attachment:
     ) -> None:
         self._events = events
         self._close_error = close_error
+        self.fd: int | None = None  # The pool descriptor it owns once attached.
 
     @property
     def address(self) -> int:
@@ -171,6 +172,31 @@ class _Attachment:
             self._events.append("attachment.close")
         if self._close_error is not None:
             raise self._close_error
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def _attach_fd_owning(
+    attachment: _Attachment | None = None, error: BaseException | None = None
+) -> Mock:
+    """An attach_fd that takes ownership of the descriptor, as the real one does."""
+
+    def attach_fd(file_descriptor: int, _spec: object, **_: object) -> _Attachment:
+        if error is not None:
+            os.close(file_descriptor)
+            raise error
+        assert attachment is not None
+        attachment.fd = file_descriptor
+        return attachment
+
+    return Mock(side_effect=attach_fd)
+
+
+def _assert_closed(*file_descriptors: int) -> None:
+    for file_descriptor in file_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(file_descriptor)
 
 
 def _grant(
@@ -293,7 +319,7 @@ def test_g3_claim_normalizes_equivalent_backend_defaults(
     monkeypatch.setattr(
         protocol_module.KVCRPoolAttachment,
         "attach_fd",
-        Mock(return_value=_Attachment()),
+        _attach_fd_owning(_Attachment()),
     )
     hold = KVCRClient("/unused").claim(
         _GUARD_INDEX, layouts, _DIGEST, ("127.0.0.1", 5555), g3=g3
@@ -303,6 +329,7 @@ def test_g3_claim_normalizes_equivalent_backend_defaults(
         assert dict(g3.backend_options) == options
     finally:
         hold.release()
+    _assert_closed(*connection.handed_fds)
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
@@ -316,7 +343,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     )
     connection = _RecordingConnection([decoded, _Released(1)], events)
     attachment = _Attachment(events)
-    attach = Mock(return_value=attachment)
+    attach = _attach_fd_owning(attachment)
     _connect_with(monkeypatch, connection)
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach)
 
@@ -360,6 +387,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     hold.release()
 
     # Released rather than disowned, so the hold closes what it was given.
+    _assert_closed(*connection.handed_fds)
     assert len(connection.sent_fds) == 1  # The claim carried the worker pidfd.
     assert msgspec.to_builtins(connection.sent[-1]) == {
         "type": "release",
@@ -429,7 +457,7 @@ def test_a_failed_claim_is_released_without_masking_the_original(
         ConnectionResetError("rollback failed") if mapping_error else _Released(1)
     )
     connection = _RecordingConnection([reply, rollback_reply])
-    attach = Mock(side_effect=mapping_error)
+    attach = _attach_fd_owning(error=mapping_error)
     _connect_with(monkeypatch, connection)
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach)
 
@@ -450,6 +478,8 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     # Unactivated: this claim never served, so the Guard may resume.
     assert release == _Release(1, activated=False)
     assert connection.closed is True
+    # Whichever way it failed, no descriptor the claim was handed is left open.
+    _assert_closed(*connection.handed_fds)
 
 
 def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> None:
