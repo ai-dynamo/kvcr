@@ -274,13 +274,15 @@ class _G3:
         return len(residency.slots) * self._slot_size
 
     def _piece_slots(self, residency: _G3Residency) -> list[tuple[int, ...]]:
+        """Group disk allocation slots by logical piece, in layout order."""
         slots = residency.slots
         pieces = []
         offset = 0
         for label in residency.layout:
-            count = self._kvcr._block_sizes[label.partition(":")[0]] // self._slot_size
-            pieces.append(slots[offset : offset + count])
-            offset += count
+            pool_name = label.partition(":")[0]
+            slots_per_piece = self._kvcr._block_sizes[pool_name] // self._slot_size
+            pieces.append(slots[offset : offset + slots_per_piece])
+            offset += slots_per_piece
         return pieces
 
     def _memory_chunks(self, ref: _TransferRef) -> tuple[_MemDescriptor, ...]:
@@ -462,17 +464,17 @@ class _G3:
     ) -> bool:
         keys = frozenset(blocks)
         reservations = self._reserve(blocks, keys)
+        if len(reservations) != len(blocks):
+            self._rollback(reservations)
+            return False
         preflight = self._recovery_preflight
-        if len(reservations) != len(blocks) or (
-            preflight is not None
-            and any(
-                not preflight(
-                    item.key,
-                    self._kvcr._block_record_map[item.key],
-                    item.residency,
-                )
-                for item in reservations
+        if preflight is not None and any(
+            not preflight(
+                item.key,
+                self._kvcr._block_record_map[item.key],
+                item.residency,
             )
+            for item in reservations
         ):
             self._rollback(reservations)
             return False

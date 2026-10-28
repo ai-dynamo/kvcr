@@ -672,11 +672,12 @@ class _KVCRCore:
                     for key, refs in blocks.items():
                         if self._g3.is_ready(key):
                             record = self._block_record_map[key]
-                            layout = declaration or (
-                                record.local_dram.key_layout
-                                if record.local_dram is not None
-                                else tuple(ref.label for ref in refs)
-                            )
+                            if declaration is not None:
+                                layout = declaration
+                            elif record.local_dram is not None:
+                                layout = record.local_dram.key_layout
+                            else:
+                                layout = tuple(ref.label for ref in refs)
                             if not self._g3.is_ready(key, layout):
                                 raise ValueError(
                                     "deposit layout must match existing G3 key layout"
