@@ -17,7 +17,7 @@ import msgspec
 
 from kvcr import KVCR, KVCRBindings
 from kvcr.backends.local_disk import _G3Residency
-from kvcr.backends.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,

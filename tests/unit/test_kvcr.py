@@ -28,8 +28,8 @@ from _kvcr_test_utils import (
 from kvcr import KVCR, KVCRBindings
 from kvcr import api as kvcr_api
 from kvcr.backends.local_disk import _G3Residency
-from kvcr.backends.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.backends.remote_fw_dram import _FwMemResidency
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
+from kvcr.backends.remote_sources import _FwMemResidency
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -100,13 +100,13 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     def observe(key: BlockKey, record: _BlockRecord) -> None:
         residency = record.local_dram
         if residency is None:
-            assert 0 not in backend._free_slots
+            assert 0 not in backend._pools._free_slots
         else:
             assert residency.state is _LocalDramState.READY
             assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
         observed.append((key, None if residency is None else list(residency.slots)))
 
-    backend.observe_residency(observe)
+    backend._pools.observe_residency(observe)
     first = kvcr.deposit({keys[0]: [_mem_descriptor(0)]})
     _poll_until(kvcr, lambda done: first in dict(done))
     assert observed == [(keys[0], [("", 0)])]
@@ -126,10 +126,10 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
 
     third = kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
     _poll_until(kvcr, lambda done: third in dict(done))
-    backend.acquire_sources((keys[2],))
-    backend.retire_sources((keys[2],))
+    backend._pools.acquire_sources((keys[2],))
+    backend._pools.retire_sources((keys[2],))
     assert len(observed) == 3
-    backend.release_sources((keys[2],))
+    backend._pools.release_sources((keys[2],))
     assert observed[2:] == [
         (keys[2], [("", 0)]),
         (keys[2], None),
@@ -389,7 +389,7 @@ def test_service_journal_is_attached_before_primary_start(
         release=lambda **_kwargs: events.append("hold.release"),
     )
     claim = Mock(return_value=hold)
-    local_dram = object()
+    local_dram = SimpleNamespace(_pools=object())
     g3 = object()
     core = Mock(_local_dram=local_dram, _g3=g3)
     core.start.side_effect = lambda: events.append("core.start")
@@ -403,7 +403,7 @@ def test_service_journal_is_attached_before_primary_start(
         return journal
 
     def attach_journal(local, configured_journal, disk) -> None:
-        assert (local, configured_journal, disk) == (local_dram, journal, g3)
+        assert (local, configured_journal, disk) == (local_dram._pools, journal, g3)
         events.append("attach")
 
     monkeypatch.setattr(

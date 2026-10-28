@@ -23,7 +23,7 @@ from _kvcr_test_utils import _recovered_record, _wait_until
 
 from kvcr.backends.dangling_ops import _DanglingOps
 from kvcr.backends.local_disk import _G3Residency
-from kvcr.backends.local_dram import _LocalDramState
+from kvcr.backends.local_dram_pools import _LocalDramState
 from kvcr.backends.remote_ops import _WriteProbe
 from kvcr.config import LocalDramOptions
 from kvcr.runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel

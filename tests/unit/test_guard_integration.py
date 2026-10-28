@@ -31,7 +31,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import KVCR, KVCRBindings, KVCRClient
-from kvcr.backends.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -499,7 +499,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     assert record.local_dram == _LocalDramResidency(
         [("pool0", 0), ("pool1", 0)], _LocalDramState.READY
     )
-    assert guard._core._local_dram.memory_regions == (
+    assert guard._core._local_dram._pools.memory_regions == (
         RegionDescriptor(
             addr=guard._recovery.attachment.address + pools[0].offset_bytes,
             size=page_size + page_size // 2,
@@ -513,7 +513,7 @@ def test_two_pool_group_survives_guard_failover_and_reclaim(
     )
     assert [
         ctypes.string_at(descriptor.addr, descriptor.size)
-        for descriptor in guard._core._local_dram.memory_regions
+        for descriptor in guard._core._local_dram._pools.memory_regions
     ] == payloads
 
     replacement = KVCRClient(service.socket_path).claim(
