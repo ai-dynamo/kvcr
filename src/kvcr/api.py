@@ -151,6 +151,25 @@ class KVCR:
         """Return the best currently known status and tier for each key."""
         return self._core.query(keys, request_id)
 
+    def query_ready(
+        self, keys: Collection[BlockKey], request_id: str, *, timeout_ms: int = 5000,
+    ) -> list[tuple[QueryStatus, CacheTier | None]]:
+        """Nonblocking full-pool Guard READY observation, not a residency lease.
+
+        FETCHING means pending; remote FETCHABLE requires source confirmation.
+        Legacy query() remains advisory. Poll again for completion; use
+        query_ready_observations() to expire external status caches.
+        """
+        return self._core.query_ready(keys, request_id, timeout_ms=timeout_ms)
+
+    def query_ready_observations(self, keys: Collection[BlockKey], request_id: str) -> list[dict | None]:
+        """Target-clock validity/identity for remote observations, in key order.
+
+        None means no current observation. valid_until_monotonic bounds external
+        caches; a positive snapshot never guarantees the later GET claim.
+        """
+        return self._core.query_ready_observations(keys, request_id)
+
     def align_sequence(
         self, ordered_keys: list[BlockKey], use_current_time: bool = False
     ) -> None:

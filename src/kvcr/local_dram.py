@@ -449,6 +449,30 @@ class _LocalDram:
             residency, sequence, stamp = withdrawal
             self._journal('withdraw', key, residency, reason, sequence, stamp)
 
+    def probe_export_subset(self, keys, key_layout):
+        """Observe full configured pools under index lock; never take readers.
+
+        None means BUSY. This immutable snapshot can be withdrawn immediately;
+        callers must still make the normal fresh GET claim.
+        """
+        if not self._export_lock.acquire(blocking=False):
+            return None
+        try:
+            ready, generations = [], []
+            for key in keys:
+                entry = self._exports.get(key)
+                indices = (_layout_indices(list(entry.layout), list(key_layout))
+                           if entry is not None else None)
+                compatible = bool(entry is not None
+                    and entry.residency.state is _LocalDramState.READY
+                    and not entry.residency.retire_on_release
+                    and entry.key_layout == key_layout and indices is not None
+                    and all(entry.refs[i] is not None for i in indices))
+                ready.append(compatible)
+                generations.append(entry.residency.telemetry_generation if compatible else None)
+            return ready, generations, self._export_sequence
+        finally:
+            self._export_lock.release()
 
     def claim_export_subset(
         self,

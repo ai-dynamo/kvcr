@@ -24,6 +24,7 @@ import msgspec
 
 from . import operation_capture as capture
 from . import _nvtx
+from .ready_query import ReadyQueries
 from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
     DURATION_METRIC,
@@ -682,6 +683,7 @@ class _RemoteFWDram:
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
+        self._ready_queries = ReadyQueries(self)
         if options.guard_only_sources:
             logger.info(
                 "KVCR_EVENT guard_only_sources_enabled proof=%s",
@@ -704,6 +706,8 @@ class _RemoteFWDram:
         kvcr = self._kvcr
         if request_id is not None:
             previous = self._request_hints.get(request_id)
+            if previous is not None and (previous.source != src or previous.block_hashes != block_hashes or previous.failed):
+                self._ready_queries.discard(request_id)
             if previous is not None and previous.source != src:
                 self._request_hints[request_id] = replace(previous, failed=True)
                 return
@@ -719,6 +723,20 @@ class _RemoteFWDram:
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
 
+    def query_ready(self, keys, request_id, timeout_ms):
+        hint = self._request_hints.get(request_id)
+        # Confirmation always requires exact membership, including when legacy
+        # opportunistic_query is enabled. Hashes authorize full qualified keys.
+        authorized = tuple(k for k in keys if hint is not None and hint.source is not None
+            and not hint.failed and k not in hint.missing_keys and self._key_adapter is not None
+            and self._key_adapter.decode(k) in hint.block_hashes)
+        if not authorized:
+            from .types import QueryStatus
+            return [(QueryStatus.MISS, None)] * len(keys)
+        statuses = iter(self._ready_queries.query(authorized, request_id, hint.source, timeout_ms))
+        allowed = set(authorized)
+        from .types import QueryStatus
+        return [next(statuses) if k in allowed else (QueryStatus.MISS, None) for k in keys]
 
     def query(self, key: BlockKey, request_id: str) -> bool:
         """Return whether ``key`` matches the request's remote hint."""
@@ -924,9 +942,11 @@ class _RemoteFWDram:
                     self._resume_source_pin(op_id, op)
 
     def discard_hint(self, request_id: str) -> None:
+        self._ready_queries.discard(request_id)
         self._request_hints.pop(request_id, None)
 
     def _fail_request_hint(self, request_id: str | None) -> None:
+        self._ready_queries.discard(request_id)
         if request_id is None:
             return
         request_hint = self._request_hints.get(request_id)
@@ -937,6 +957,7 @@ class _RemoteFWDram:
         if self._closed:
             return
         self._closed = True
+        self._ready_queries.close()
         self._request_hints.clear()
         for op_id, op in list(self._source_pin_ops.items()):
             self._remove_source_pin(op_id, op)
@@ -1043,6 +1064,7 @@ class _RemoteFWDram:
         # Warning suppression can be added if persistent backend faults
         # cause excessive polling logs.
         observed_work |= self._process_control_messages(progress)
+        observed_work |= self._ready_queries.poll(progress)
         # Only terminal notifications outrank a refusal for the same operation.
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
@@ -1072,6 +1094,7 @@ class _RemoteFWDram:
         return outbound
 
     def close_progress(self) -> None:
+        self._ready_queries.close()
         # Accepted writes may still be waiting for main-thread pin acquisition.
         for (target, handle), status in self._dangling_ops.source_writes.items():
             cached = self._remote_agents_by_target.get(target)
@@ -1101,7 +1124,9 @@ class _RemoteFWDram:
             if not isinstance(message_type, str):
                 continue
             handled_at = self._kvcr._timer()
-            if message_type == "target_metadata":
+            if message_type in ("ready_probe", "ready_probe_reply"):
+                self._ready_queries.receive(payload)
+            elif message_type == "target_metadata":
                 self._handle_target_metadata(progress, payload)
             elif message_type == "target_metadata_ack":
                 self._handle_target_metadata_ack(progress, payload)

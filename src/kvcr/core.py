@@ -455,7 +455,41 @@ class _KVCRCore:
 
     # TODO(kvcr-g3): Prefer REMOTE_G2 over G3 in query/fetch/deliver once one
     # operation can fall back between both sources.
+    def query_ready(self, keys, request_id, *, timeout_ms=5000):
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError('query_ready requires a nonempty request_id')
+        if type(timeout_ms) is not int or not 0 < timeout_ms <= 5000:
+            raise ValueError('query_ready timeout_ms must be an integer in [1, 5000]')
+        keys = tuple(keys)
+        if len(keys) > 65536 or any(not isinstance(k, bytes) or not 0 < len(k) <= 4096 for k in keys):
+            raise ValueError('query_ready keys exceed bounded byte-key contract')
+        with self._state_lock:
+            # Never report framework or G3 residency from this opt-in API.
+            layout = tuple(name for name, _ in self.pool_layouts)
+            local, filling = set(), set()
+            for key in keys:
+                record = self._block_record_map.get(key)
+                residency = record.local_dram if record is not None else None
+                if residency is None or residency.retire_on_release:
+                    continue
+                if self._has_complete_local(key) and residency.key_layout == layout:
+                    local.add(key)
+                elif residency.state is _LocalDramState.FILLING:
+                    filling.add(key)
+            remote = tuple(k for k in keys if k not in local and k not in filling)
+            statuses = iter(self._remote_fw_dram.query_ready(remote, request_id, timeout_ms))
+            result = [(QueryStatus.HIT, CacheTier.LOCAL_G2) if k in local else
+                      (QueryStatus.FETCHING, CacheTier.LOCAL_G2) if k in filling else next(statuses)
+                      for k in keys]
+            # No legacy query() call: count only actual returned observations,
+            # including distinct FETCHING pending results, once per invocation.
+            if self._compact_capture:
+                self._compact_capture.query_counts(self.nixl_agent_name, result)
+            return result
 
+    def query_ready_observations(self, keys, request_id):
+        with self._state_lock:
+            return self._remote_fw_dram._ready_queries.observations(tuple(keys), request_id)
 
     def query(
         self,
