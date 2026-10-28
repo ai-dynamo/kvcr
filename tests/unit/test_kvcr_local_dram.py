@@ -76,7 +76,7 @@ def _two_pool_kvcr(
     return _new_kvcr(
         agent,
         FakePrimaryPinning(),
-        FakeBytesControl(),
+        None,
         config,
         local_dram=LocalDramOptions(
             [
@@ -761,6 +761,98 @@ def test_builtin_policy_eviction_order(
     assert statuses == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 3
     if keep_claim:
         kvcr.release((second_claim,))
+
+
+def test_eviction_preserves_reader_claimed_during_policy_decision(monkeypatch):
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    memory = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    local = kvcr._core._local_dram._pools
+    resident, incoming = BlockKey(b"resident"), BlockKey(b"incoming")
+    deposit = kvcr.deposit({resident: [_mem_descriptor()]})
+    assert _poll_until(kvcr, bool) == [(deposit, _op_entries({resident: True}))]
+    claimed = []
+
+    def claim_selected_victim(meta, source):
+        destination = ((progress_module._TransferRef("target", 0),),)
+        claimed.extend(local.acquire_readers((meta.block_key,), destination, ()))
+        return PlacementAction.DROP, None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kvcr._core._policy, "decide_eviction", claim_selected_victim)
+        rejected = kvcr.deposit({incoming: [_mem_descriptor(1)]})
+    try:
+        assert _poll_until(kvcr, bool) == [(rejected, _op_entries({incoming: False}))]
+        assert len(agent.transfers) == 1
+        assert claimed[0][0].source_readers == 1
+        assert memory.raw == b"a" * 16
+        assert kvcr.query((resident,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+    finally:
+        local.release_readers((resident,), (claimed[0][0],), success=True)
+
+    replacement = kvcr.deposit({incoming: [_mem_descriptor(1)]})
+    assert _poll_until(kvcr, bool) == [(replacement, _op_entries({incoming: True}))]
+    assert memory.raw == b"b" * 16
+
+
+def test_source_completions_refresh_lru_before_resuming_capacity_waiters():
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
+    memory = ctypes.create_string_buffer(48)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        policy=LRUPolicy(),
+    )
+    local = kvcr._core._local_dram._pools
+    retiring, recent, cold, incoming = map(
+        BlockKey, (b"retiring", b"recent", b"cold", b"incoming")
+    )
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    for index, key in enumerate((retiring, recent, cold)):
+        now = index / 10
+        deposit = kvcr.deposit({key: [_mem_descriptor(index)]})
+        assert _poll_until(kvcr, bool) == [(deposit, _op_entries({key: True}))]
+
+    destination = ((progress_module._TransferRef("target", 0),),)
+    retiring_source = local.acquire_readers((retiring,), destination, ())
+    recent_source = local.acquire_readers((recent,), destination, ())
+    assert retiring_source and recent_source
+    # A pending spill holds the retirement and queues a two-slot deposit.
+    local.acquire_sources((retiring,))
+    local._capacity_eviction_key = retiring
+    blocks = {incoming: [_mem_descriptor(0), _mem_descriptor(1)]}
+    deposit = kvcr.deposit(blocks)
+    assert list(kvcr.poll_completed()) == []
+    local.retire_sources((retiring,))
+    local.release_sources((retiring,))
+
+    now = 0.3
+    local.release_readers((retiring,), (retiring_source[0][0],), success=False)
+    local.release_readers((recent,), (recent_source[0][0],), success=True)
+    duplicate = kvcr.deposit(blocks)
+    completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
+    assert completed == dict.fromkeys(
+        (deposit, duplicate), _op_entries({incoming: True})
+    )
+    assert kvcr.query((recent, cold, incoming)) == [
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.MISS, None),
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
 
 
 @pytest.mark.parametrize(

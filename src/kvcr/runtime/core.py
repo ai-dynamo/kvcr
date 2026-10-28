@@ -670,6 +670,7 @@ class _KVCRCore:
                     dict.fromkeys(blocks, _FAILED_RESULT),
                 )
             else:
+                self._local_dram._pools._drain_sources()
                 if self._g3 is not None:
                     for key, refs in blocks.items():
                         if self._g3.is_ready(key):
@@ -716,6 +717,7 @@ class _KVCRCore:
                 )
                 return op_handle
 
+            local_dram._pools._drain_sources()
             sources = {}
             for key in ordered_keys:
                 record = self._block_record_map.get(key)
@@ -821,6 +823,7 @@ class _KVCRCore:
                 "completed": len(self._completion_queue),
             }
             if self._local_dram is not None:
+                resources["in_flight_ops"] += self._local_dram._pools.source_operations
                 resources.update(self._local_dram._pools.telemetry_state())
             if self._g3 is not None:
                 resources.update(self._g3.telemetry_state())

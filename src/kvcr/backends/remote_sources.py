@@ -27,7 +27,7 @@ class _FwMemResidency:
 
 @dataclass
 class _SourcePinOp(_Op):
-    """Main-thread source acquisition for a pending write."""
+    """Source acquisition for a pending write."""
 
     started_at: float | None
     deadline: float
@@ -84,6 +84,10 @@ class _RemoteSources:
             _SourceWriteState.FINISHED,
             _SourceWriteState.CANCEL_PENDING,
         ):
+            if item.local_sources:
+                # Local readers release on progress; local.poll_main owns
+                # their deferred access accounting and reclamation.
+                return
             # Framework ownership can be handed back after uncertainty;
             # KVCR-owned contents stay claimed until native quiescence.
             pins = self._fw_pins_by_op.pop(item.op_id, None)

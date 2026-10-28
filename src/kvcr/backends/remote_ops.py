@@ -17,6 +17,7 @@ from ..runtime.progress import _KVCRProgress, _ProgressOp, _RegionMaps, _Transfe
 from ..types import BlockKey, OpHandle, PinHandle
 
 if TYPE_CHECKING:
+    from .local_dram_pools import _LocalDramResidency
     from .remote_fw_dram import _RemoteFWDram
 
 
@@ -373,6 +374,7 @@ class _SourceWriteOp(_RemoteOp):
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
+    local_sources: tuple["_LocalDramResidency", ...] = ()
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
