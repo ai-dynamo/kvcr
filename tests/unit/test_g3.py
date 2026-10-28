@@ -31,17 +31,17 @@ from kvcr import (
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
 )
+from kvcr.backends.local_disk import _G3, _G3Residency
+from kvcr.backends.local_dram import _LocalDramState
 from kvcr.config import (
     G3Options,
     KVCRConfig,
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from kvcr.core import _BlockRecord
-from kvcr.local_disk import _G3, _G3Residency
-from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
-from kvcr.recovery_journal import install_recovery_records
+from kvcr.runtime.core import _BlockRecord
+from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
     CacheTier,

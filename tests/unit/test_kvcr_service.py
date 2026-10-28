@@ -23,11 +23,13 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _wait_until, free_port, listening_socket
 
-from kvcr import KVCRClient, KVCRServiceError, guard_protocol
+from kvcr import KVCRClient, KVCRServiceError
 from kvcr.config import G3Options
-from kvcr.control_channels import FramedConnection
-from kvcr.guard import _Command, _Phase
-from kvcr.guard_protocol import (
+from kvcr.runtime.control_channels import FramedConnection
+from kvcr.service import protocol as guard_protocol
+from kvcr.service.guard import _Command, _Phase
+from kvcr.service.memory import _KVCRPoolOwner
+from kvcr.service.protocol import (
     _CLAIM_RESPONSE_DECODER,
     _RELEASE_RESPONSE_DECODER,
     PidfdLiveness,
@@ -40,14 +42,13 @@ from kvcr.guard_protocol import (
     _Released,
     _TierConfig,
 )
-from kvcr.kvcr_service import (
+from kvcr.service.server import (
     _KVCRService,
     _parse_args,
     _PoolRegistry,
     _RequestHandler,
     _ThreadingUnixServer,
 )
-from kvcr.memory import _KVCRPoolOwner
 
 
 def _holders_of(registry) -> dict[int, object]:
@@ -211,7 +212,7 @@ def _channels_are_taken():
         return channel
 
     with patch(
-        "kvcr.guard.ZmqPeerControlChannel.from_shared_listener",
+        "kvcr.service.guard.ZmqPeerControlChannel.from_shared_listener",
         side_effect=_take,
     ):
         yield
@@ -230,8 +231,10 @@ def _new_registry(tmp_path: Path, guard_count: int = 1) -> _PoolRegistry:
     journal = Mock()
     journal.read_next.return_value = None
     with (
-        patch("kvcr.guard.KVCRPoolAttachment.attach", side_effect=_stand_in_pool),
-        patch("kvcr.guard.RecoveryJournal", Mock(return_value=journal)),
+        patch(
+            "kvcr.service.guard.KVCRPoolAttachment.attach", side_effect=_stand_in_pool
+        ),
+        patch("kvcr.service.guard.RecoveryJournal", Mock(return_value=journal)),
     ):
         registry = _PoolRegistry(
             tmp_path,
@@ -291,7 +294,7 @@ def test_client_claims_without_own_pidfd_when_server_has_peer_pidfd(
         peer.close()
     with _running_server(tmp_path) as harness:
         with patch(
-            "kvcr.guard_protocol.os.pidfd_open",
+            "kvcr.service.protocol.os.pidfd_open",
             side_effect=OSError(errno.EPERM, "blocked"),
         ):
             hold = harness.client.claim(
@@ -306,7 +309,7 @@ def test_legacy_service_refuses_client_without_own_pidfd(
     monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
     with _running_server(tmp_path) as harness:
         with patch(
-            "kvcr.guard_protocol.os.pidfd_open",
+            "kvcr.service.protocol.os.pidfd_open",
             side_effect=OSError(errno.EPERM, "blocked"),
         ):
             with pytest.raises(KVCRServiceError, match="worker pidfd is required"):
@@ -346,7 +349,7 @@ def test_service_refuses_startup_without_pidfd_open(tmp_path: Path) -> None:
     pool_dir = tmp_path / "pools"
     pool_dir.mkdir()
     with patch(
-        "kvcr.kvcr_service.os.pidfd_open",
+        "kvcr.service.server.os.pidfd_open",
         side_effect=OSError(errno.ENOSYS, "not implemented"),
     ):
         with pytest.raises(KVCRServiceError, match="pidfd_open"):
@@ -428,7 +431,7 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     tmp_path: Path, caplog
 ) -> None:
     """Pools lease independently; close keeps, names, and can retry a wedged one."""
-    caplog.set_level(logging.DEBUG, logger="kvcr.guard")
+    caplog.set_level(logging.DEBUG, logger="kvcr.service.guard")
     registry = _new_registry(tmp_path, guard_count=2)
     guard = registry._guards[0]
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
@@ -614,7 +617,7 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
     )
     with (
         patch(
-            "kvcr.guard.ZmqPeerControlChannel.from_shared_listener",
+            "kvcr.service.guard.ZmqPeerControlChannel.from_shared_listener",
             side_effect=_take_and_record,
         ),
         _running_server(tmp_path) as harness,
@@ -658,7 +661,7 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
     bound: list[socket.socket] = []
     try:
         # Everything fallible runs before the lease exists.
-        with patch("kvcr.guard.os.dup", side_effect=OSError("dup failed")):
+        with patch("kvcr.service.guard.os.dup", side_effect=OSError("dup failed")):
             with pytest.raises(OSError, match="dup failed"):
                 registry.claim(0, _TEST_TIER_CONFIG, _FakeLiveness(), _control_bind(0))
         assert guard._pool_lease.listener is None and guard._pool_lease.current is None
@@ -745,7 +748,7 @@ def test_a_standby_survives_failed_claims_and_hands_over_to_a_replacement(
 
         # Only a hand-over that actually began costs the standby its endpoint.
         with patch(
-            "kvcr.guard.ZmqPeerControlChannel.from_shared_listener",
+            "kvcr.service.guard.ZmqPeerControlChannel.from_shared_listener",
             side_effect=ValueError("cannot share this listener"),
         ):
             with pytest.raises(KVCRServiceError, match="cannot share this listener"):
@@ -801,7 +804,7 @@ def test_slow_promotion_does_not_block_other_pools_or_shutdown(
 
         # Small but not zero: the healthy pool finishes well inside the deadline.
         monkeypatch.setattr(
-            "kvcr.kvcr_service._REGISTRY_TRANSITION_TIMEOUT_SECONDS", 1.0
+            "kvcr.service.server._REGISTRY_TRANSITION_TIMEOUT_SECONDS", 1.0
         )
         with pytest.raises(TimeoutError, match="Guard transitions"):
             registry.close()
@@ -922,7 +925,7 @@ def test_fork_and_exec_do_not_preserve_claimant_access(
                 "import os",
                 "import sys",
                 "import time",
-                "from kvcr.guard_protocol import KVCRClient",
+                "from kvcr.service.protocol import KVCRClient",
                 f"hold = KVCRClient({str(harness.server.socket_path)!r}).claim("
                 f"0, {_TEST_POOL_LAYOUTS!r}, {_TEST_DIGEST!r}, "
                 f"{_control_bind()!r})",
@@ -999,8 +1002,8 @@ def test_startup_rollback_gives_back_every_pool_but_a_wedged_one(
     journal = Mock()
     journal.read_next.return_value = None
     with (
-        patch("kvcr.guard.KVCRPoolAttachment.attach", side_effect=attach),
-        patch("kvcr.guard.RecoveryJournal", Mock(return_value=journal)),
+        patch("kvcr.service.guard.KVCRPoolAttachment.attach", side_effect=attach),
+        patch("kvcr.service.guard.RecoveryJournal", Mock(return_value=journal)),
         pytest.raises(RuntimeError, match="attach failed"),
     ):
         _PoolRegistry(
@@ -1029,10 +1032,12 @@ def test_startup_allocation_failure_rolls_back_before_listener(
     journal = Mock()
     journal.read_next.return_value = None
     with (
-        patch("kvcr.guard.KVCRPoolAttachment.attach", side_effect=_stand_in_pool),
-        patch("kvcr.guard.RecoveryJournal", Mock(return_value=journal)),
+        patch(
+            "kvcr.service.guard.KVCRPoolAttachment.attach", side_effect=_stand_in_pool
+        ),
+        patch("kvcr.service.guard.RecoveryJournal", Mock(return_value=journal)),
         patch.object(_KVCRPoolOwner, "allocate", classmethod(allocate)),
-        patch("kvcr.kvcr_service._ThreadingUnixServer") as listener,
+        patch("kvcr.service.server._ThreadingUnixServer") as listener,
         pytest.raises(OSError) as raised,
     ):
         _KVCRService(
@@ -1154,7 +1159,7 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
     guard.abort_grant = Mock(wraps=guard.abort_grant)
     guard.release = Mock(wraps=guard.release)
     try:
-        with patch("kvcr.kvcr_service.os.close", wraps=os.close) as os_close:
+        with patch("kvcr.service.server.os.close", wraps=os.close) as os_close:
             handler.handle()
         # The duplicated endpoint went back whatever the send did: one fd per
         # grant would otherwise leak until claims fail with EMFILE.
@@ -1260,7 +1265,7 @@ def test_one_uninspectable_pool_file_does_not_stop_the_service(
     stale = tmp_path / ("kvcr-stale-" + "a" * 32)
     stale.write_bytes(b"")
     with patch(
-        "kvcr.kvcr_service._reclaim_pool_if_orphaned",
+        "kvcr.service.server._reclaim_pool_if_orphaned",
         side_effect=OSError("uninspectable"),
     ):
         registry = _new_registry(tmp_path)
@@ -1296,7 +1301,7 @@ def test_a_lease_older_than_the_idle_timeout_still_releases_cleanly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The accept-time idle timeout must not sever a held connection."""
-    monkeypatch.setattr("kvcr.kvcr_service._CLIENT_IDLE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("kvcr.service.server._CLIENT_IDLE_TIMEOUT_SECONDS", 0.2)
     with _running_server(tmp_path) as harness:
         hold = harness.client.claim(
             0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind()
@@ -1411,7 +1416,7 @@ def test_a_pidfd_that_breaks_while_its_process_lives_is_service_fatal(
         _claim(registry, 0, liveness)
         poller = Mock()
         poller.poll.return_value = [(liveness.fileno(), select.POLLNVAL)]
-        with patch("kvcr.guard.select.poll", return_value=poller):
+        with patch("kvcr.service.guard.select.poll", return_value=poller):
             _wait_until(
                 lambda: guard._phase is _Phase.FAILED and bool(uncontained), timeout=5
             )

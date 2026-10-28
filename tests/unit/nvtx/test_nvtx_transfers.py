@@ -218,7 +218,7 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
 
 
 def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypatch):
-    from kvcr.remote_fw_dram import _SourceWriteOp
+    from kvcr.backends.remote_fw_dram import _SourceWriteOp
 
     source, agent, pinning = make_source()
     backend = source._core._remote_fw_dram
@@ -264,7 +264,7 @@ def test_failed_source_trace_initialization_is_not_retried(recording, monkeypatc
 def test_local_source_reuses_nvtx_state_on_both_write_paths(
     recording, monkeypatch, level
 ):
-    from kvcr.remote_fw_dram import _SourcePinOp, _SourceWriteOp
+    from kvcr.backends.remote_fw_dram import _SourcePinOp, _SourceWriteOp
 
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
     pins, writes = {}, {}

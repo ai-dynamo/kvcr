@@ -22,8 +22,8 @@ from _kvcr_test_utils import (
 from _nvtx_test_utils import make_target, payloads, spans, wait_for_payload
 
 from kvcr import _nvtx
+from kvcr.backends.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
-from kvcr.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
 from kvcr.types import BlockKey, RegionDescriptor
 
 

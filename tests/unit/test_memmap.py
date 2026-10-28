@@ -12,10 +12,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from kvcr import memmap
-from kvcr.memmap import AlignedSharedMapping, thp_page_size
-from kvcr.memory import KVCRPoolAttachment, _KVCRPoolOwner
-from kvcr.recovery_journal import RecoveryJournal
+from kvcr.service import memmap
+from kvcr.service.memmap import AlignedSharedMapping, thp_page_size
+from kvcr.service.memory import KVCRPoolAttachment, _KVCRPoolOwner
+from kvcr.service.recovery_journal import RecoveryJournal
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux" or sys.version_info < (3, 12),
@@ -151,7 +151,7 @@ def test_failed_overlay_uses_base_pages(thp_owner, monkeypatch, failure):
             return super().madvise(option, *args)
 
     monkeypatch.setattr(mmap, "mmap", Reservation)
-    with patch("kvcr.memmap.ctypes.CDLL", wraps=ctypes.CDLL) as library:
+    with patch("kvcr.service.memmap.ctypes.CDLL", wraps=ctypes.CDLL) as library:
         if failure == "overlay":
             native = Mock()
             native.mmap.return_value = ctypes.c_void_p(-1).value

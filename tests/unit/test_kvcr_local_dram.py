@@ -28,19 +28,19 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
-from kvcr import core as core_module
-from kvcr import progress as progress_module
-from kvcr.config import KVCRConfig, LocalDramOptions
-from kvcr.core import _BlockRecord
-from kvcr.local_dram import (
+from kvcr.backends.local_dram import (
     _layout_indices,
     _LocalCopyOp,
     _LocalDramResidency,
     _LocalDramState,
 )
+from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.policy import FIFOPolicy, LRUPolicy
-from kvcr.policy_runtime import _EvictionQueue, _PolicyInvoker
-from kvcr.recovery_journal import (
+from kvcr.runtime import core as core_module
+from kvcr.runtime import progress as progress_module
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.policy_runtime import _EvictionQueue, _PolicyInvoker
+from kvcr.service.recovery_journal import (
     RecoveryMirrorError,
     _attach_journal,
     _RecoveryMirror,
@@ -59,7 +59,7 @@ from kvcr.types import (
 
 
 def test_expired_copy_logs_without_submitting(caplog):
-    caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+    caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram")
     copy = SimpleNamespace(transfer_id=None, clock=lambda: 1, deadline=1, op_id=7)
     progress = Mock()
     assert _LocalCopyOp.progress(copy, progress, None) == (True, True)
@@ -105,7 +105,7 @@ def _two_pool_kvcr(
 @pytest.mark.parametrize("history", [False, True])
 def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history):
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1" if history else "0")
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     block_size = 16
     primary = ctypes.create_string_buffer(block_size * 3)
     local = ctypes.create_string_buffer(block_size * 2)
@@ -902,7 +902,7 @@ def test_policy_lifecycle_hook_failures_are_logged(caplog) -> None:
     )
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
 
-    with caplog.at_level(logging.WARNING, logger="kvcr.policy_runtime"):
+    with caplog.at_level(logging.WARNING, logger="kvcr.runtime.policy_runtime"):
         for index, key in enumerate(keys):
             op_handle = kvcr.deposit({key: [_mem_descriptor(index)]})
             assert _poll_until(kvcr, lambda results: bool(results)) == [
@@ -1081,7 +1081,7 @@ def test_capacity_pressure_is_pool_local() -> None:
 def test_local_copy_timeout_retains_memory_until_completion(
     kind: str, failure: str, abandon: bool, duplicate: bool, caplog, request
 ) -> None:
-    caplog.set_level(logging.DEBUG, logger="kvcr.local_dram")
+    caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram")
     states = {}
 
     class PendingAgent(FakeNixlAgent):
@@ -1429,7 +1429,7 @@ def test_recovered_history_bounds_records_and_reports_callback_failure(
     monkeypatch, caplog
 ):
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     local = ctypes.create_string_buffer(16 * 33)
     kvcr = _new_local_kvcr(FakeNixlAgent(), local, 33)
     records = {

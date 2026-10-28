@@ -18,16 +18,16 @@ from typing import Annotated, Literal
 
 import msgspec
 
-from .config import G3Options, LocalDramOptions, _validate_pool_layouts
-from .control_channels import (
+from ..backends.local_disk import _normalize_g3_backend_options
+from ..config import G3Options, LocalDramOptions, _validate_pool_layouts
+from ..runtime.control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
     KVCRServiceError,
     KVCRSocketError,
 )
-from .local_disk import _normalize_g3_backend_options
+from ..types import PoolBlockLayouts
 from .memory import KVCRPoolAttachment, KVCRPoolSpec, _compute_pool_geometry
-from .types import PoolBlockLayouts
 
 logger = logging.getLogger(__name__)
 

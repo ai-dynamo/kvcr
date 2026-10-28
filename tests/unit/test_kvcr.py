@@ -27,8 +27,9 @@ from _kvcr_test_utils import (
 
 from kvcr import KVCR, KVCRBindings
 from kvcr import api as kvcr_api
-from kvcr import progress as kvcr_progress
-from kvcr import recovery_journal as kvcr_recovery
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.backends.remote_fw_dram import _FwMemResidency
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -37,13 +38,12 @@ from kvcr.config import (
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from kvcr.core import _BlockRecord
-from kvcr.guard_protocol import KVCRPoolHold
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.memory import KVCRPoolSpec
-from kvcr.progress import _TransferRef
-from kvcr.remote_fw_dram import _FwMemResidency
+from kvcr.runtime import progress as kvcr_progress
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _TransferRef
+from kvcr.service import recovery_journal as kvcr_recovery
+from kvcr.service.memory import KVCRPoolSpec
+from kvcr.service.protocol import KVCRPoolHold
 from kvcr.types import BlockKey, KVCRStartupError, MemoryRef, RegionDescriptor
 
 

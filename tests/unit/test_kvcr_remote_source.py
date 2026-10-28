@@ -31,17 +31,17 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.config import KVCRConfig, LocalDramOptions
-from kvcr.core import _BlockRecord, _KVCRCore
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.progress import _STOP, _TransferRef
-from kvcr.recovery_journal import install_recovery_records
-from kvcr.remote_fw_dram import (
+from kvcr.backends.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.backends.remote_fw_dram import (
     _FwMemResidency,
     _RemoteFWDram,
     _SourcePinOp,
 )
-from kvcr.remote_ops import _CONTROL_DECODER, _SourceWriteOp, _TargetMetadata
+from kvcr.backends.remote_ops import _CONTROL_DECODER, _SourceWriteOp, _TargetMetadata
+from kvcr.config import KVCRConfig, LocalDramOptions
+from kvcr.runtime.core import _BlockRecord, _KVCRCore
+from kvcr.runtime.progress import _STOP, _TransferRef
+from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
@@ -59,7 +59,7 @@ from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 def test_framework_pin_rejection_diagnostic(
     result, reason, level, custom_argument, caplog
 ):
-    caplog.set_level(level, logger="kvcr.core")
+    caplog.set_level(level, logger="kvcr.runtime.core")
     remote = Mock()
     argument = "private callback data"
     if custom_argument:
@@ -453,7 +453,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
     caplog,
 ) -> None:
     """Source writes must not start after their framework-pin deadline."""
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     now = 0.0
     deadline_captured = threading.Event()
 
@@ -550,7 +550,7 @@ def test_write_probe_fences_write_waiting_on_framework_pin(
 
 @pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
 def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> None:
-    caplog.set_level(log_level, logger="kvcr.core")
+    caplog.set_level(log_level, logger="kvcr.runtime.core")
     errors = []
 
     def on_resilience_event(error):
@@ -566,7 +566,7 @@ def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> N
 
     stalled_for = 0.0
     with patch(
-        "kvcr.dangling_ops.time",
+        "kvcr.backends.dangling_ops.time",
         SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
     ):
         for handle in (1, 2):

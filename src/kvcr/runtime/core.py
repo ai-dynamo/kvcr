@@ -16,33 +16,23 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from . import _nvtx
-from .config import (
-    KVCRBackendConfigs,
-    KVCRConfig,
-    TelemetryStats,
-    _validate_pool_layouts,
-)
-from .hints.dispatcher import HintDispatcher
-from .local_disk import _G3, _G3Residency
-from .local_dram import (
+from .. import _nvtx
+from ..backends.local_disk import _G3, _G3Residency
+from ..backends.local_dram import (
     _layout_indices,
     _LocalDram,
     _LocalDramResidency,
     _LocalDramState,
 )
-from .policy import G3LRUPolicy, LRUPolicy
-from .policy_runtime import _PolicyInvoker
-from .progress import (
-    _FAILED_RESULT,
-    _KVCRProgress,
-    _MemDescriptor,
-    _Op,
-    _OpId,
-    _resolve_region,
-    _TransferRef,
+from ..config import (
+    KVCRBackendConfigs,
+    KVCRConfig,
+    TelemetryStats,
+    _validate_pool_layouts,
 )
-from .types import (
+from ..hints.dispatcher import HintDispatcher
+from ..policy import G3LRUPolicy, LRUPolicy
+from ..types import (
     BlockKey,
     BlockMeta,
     CacheTier,
@@ -59,10 +49,20 @@ from .types import (
     ReleaseHandle,
     ReleaseResult,
 )
+from .policy_runtime import _PolicyInvoker
+from .progress import (
+    _FAILED_RESULT,
+    _KVCRProgress,
+    _MemDescriptor,
+    _Op,
+    _OpId,
+    _resolve_region,
+    _TransferRef,
+)
 
 if TYPE_CHECKING:
-    from .api import KVCRBindings
-    from .remote_fw_dram import _FwMemResidency
+    from ..api import KVCRBindings
+    from ..backends.remote_fw_dram import _FwMemResidency
 
 logger = logging.getLogger(__name__)
 
@@ -286,8 +286,8 @@ class _KVCRCore:
         )
 
         # Import lazily to keep the concrete backend private to KVCR setup.
-        from .dangling_ops import _log_resilience_event
-        from .remote_fw_dram import _RemoteFWDram
+        from ..backends.dangling_ops import _log_resilience_event
+        from ..backends.remote_fw_dram import _RemoteFWDram
 
         self._on_resilience_event_callback = (
             _log_resilience_event

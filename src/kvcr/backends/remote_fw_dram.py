@@ -21,17 +21,15 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
-from . import _nvtx
-from .config import KeyAdapter, RemoteFWDramOptions
-from .core import (
+from .. import _nvtx
+from ..config import KeyAdapter, RemoteFWDramOptions
+from ..runtime.core import (
     DURATION_METRIC,
     TRANSFER_BYTES_METRIC,
     _validate_memory_regions,
     logger,
 )
-from .dangling_ops import _DanglingOps, _SourceWriteStatus
-from .local_dram import _layout_indices, _LocalDramState
-from .progress import (
+from ..runtime.progress import (
     _FAILED_RESULT,
     _SUCCESS_RESULT,
     _KVCRProgress,
@@ -40,6 +38,17 @@ from .progress import (
     _RegionMaps,
     _TransferRef,
 )
+from ..types import (
+    BlockKey,
+    CacheTier,
+    MemoryRef,
+    OpHandle,
+    PinHandle,
+    PinRequestId,
+    PinResult,
+)
+from .dangling_ops import _DanglingOps, _SourceWriteStatus
+from .local_dram import _layout_indices, _LocalDramState
 from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
@@ -58,18 +67,9 @@ from .remote_ops import (
     _WriteProbeAck,
     _WriteRefused,
 )
-from .types import (
-    BlockKey,
-    CacheTier,
-    MemoryRef,
-    OpHandle,
-    PinHandle,
-    PinRequestId,
-    PinResult,
-)
 
 if TYPE_CHECKING:
-    from .core import _KVCRCore
+    from ..runtime.core import _KVCRCore
 
 
 @dataclass(slots=True)

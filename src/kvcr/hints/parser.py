@@ -22,7 +22,7 @@ import msgspec
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
-    from ..core import _KVCRCore
+    from ..runtime.core import _KVCRCore
     from .dispatcher import HintDispatcher, _HintHandler
 
 # Public integration constants exported by kvcr.__init__.

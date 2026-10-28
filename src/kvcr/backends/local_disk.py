@@ -12,10 +12,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .config import G3Options
-from .local_dram import _layout_indices
-from .policy_runtime import _EvictionQueue
-from .progress import (
+from ..config import G3Options
+from ..runtime.policy_runtime import _EvictionQueue
+from ..runtime.progress import (
     _FAILED_RESULT,
     _SUCCESS_RESULT,
     _KVCRProgress,
@@ -24,7 +23,7 @@ from .progress import (
     _ProgressOp,
     _TransferRef,
 )
-from .types import (
+from ..types import (
     BlockKey,
     BlockMeta,
     CacheTier,
@@ -35,9 +34,10 @@ from .types import (
     PlacementFailure,
     TransferError,
 )
+from .local_dram import _layout_indices
 
 if TYPE_CHECKING:
-    from .core import _BlockRecord, _KVCRCore
+    from ..runtime.core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
 

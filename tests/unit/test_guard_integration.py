@@ -31,7 +31,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import KVCR, KVCRBindings, KVCRClient
-from kvcr import progress as kvcr_progress
+from kvcr.backends.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -39,11 +39,15 @@ from kvcr.config import (
     KVCRGuardConfig,
     RemoteFWDramOptions,
 )
-from kvcr.control_channels import ZmqPeerControlChannel
-from kvcr.guard import _Guard
-from kvcr.kvcr_service import _KVCRService
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.recovery_journal import RecoveryJournal, _recovery_frames, read_handback
+from kvcr.runtime import progress as kvcr_progress
+from kvcr.runtime.control_channels import ZmqPeerControlChannel
+from kvcr.service.guard import _Guard
+from kvcr.service.recovery_journal import (
+    RecoveryJournal,
+    _recovery_frames,
+    read_handback,
+)
+from kvcr.service.server import _KVCRService
 from kvcr.types import BlockKey, CacheTier, QueryStatus, RegionDescriptor
 
 _TIMEOUT_SECONDS = 5

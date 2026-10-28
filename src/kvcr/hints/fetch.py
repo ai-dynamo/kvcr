@@ -18,7 +18,7 @@ from .parser import HintType, _Hint
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
-    from ..core import _KVCRCore
+    from ..runtime.core import _KVCRCore
     from .dispatcher import HintDispatcher
 
 _KV_FETCH_ACTION_TYPE = "kv.fetch"

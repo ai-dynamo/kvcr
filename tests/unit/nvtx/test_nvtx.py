@@ -296,7 +296,7 @@ def test_off_loads_no_backend_and_records_no_pin_state_or_events(monkeypatch, le
         _nvtx, "_load_backend", lambda: pytest.fail("off mode loaded optional backend")
     )
     monkeypatch.setattr(
-        "kvcr.remote_fw_dram._NvtxState",
+        "kvcr.backends.remote_fw_dram._NvtxState",
         lambda **kwargs: pytest.fail("off mode allocated tracing state"),
     )
     source, agent, pinning = make_source((9, 10))

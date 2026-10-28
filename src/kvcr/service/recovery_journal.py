@@ -17,16 +17,16 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
-from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
-from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
-from .local_disk import _G3, _G3Residency
-from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
+from ..backends.local_disk import _G3, _G3Residency
+from ..backends.local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
+from ..config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
+from ..runtime.core import _BlockRecord, _KVCRCore
+from ..types import BlockKey, RecoveryMirrorError
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, RecoveryMirrorError
+from .protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
 
 if TYPE_CHECKING:
-    from .api import KVCRBindings
+    from ..api import KVCRBindings
 
 logger = logging.getLogger(__name__)
 

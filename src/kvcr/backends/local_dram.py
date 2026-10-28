@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import msgspec
 
-from .config import LocalDramOptions
-from .policy_runtime import _EvictionQueue
-from .progress import (
+from ..config import LocalDramOptions
+from ..runtime.policy_runtime import _EvictionQueue
+from ..runtime.progress import (
     _DROPPED_RESULT,
     _FAILED_RESULT,
     _SUCCESS_RESULT,
@@ -25,7 +25,7 @@ from .progress import (
     _ProgressOp,
     _TransferRef,
 )
-from .types import (
+from ..types import (
     BlockKey,
     CacheTier,
     MemoryRef,
@@ -40,7 +40,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .core import _BlockRecord, _KVCRCore
+    from ..runtime.core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
 
