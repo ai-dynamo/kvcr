@@ -544,7 +544,7 @@ class _LocalDramPools:
             self._capacity_eviction_key = None
 
     def close(self) -> None:
-        # Policy state ends with KVCR; teardown emits no per-block removals.
+        # Drain pending source cleanup before dropping public claims.
         self._drain_sources()
         self._public_claims.clear()
 
@@ -700,6 +700,7 @@ class _LocalDramPools:
         with state.lock:
             # Policy runs unlocked; a source can claim a selected victim meanwhile.
             if any(residency.source_readers for _, _, residency, _ in victims):
+                # Accept transient admission failure to avoid another policy scan.
                 return None, [], False
             for key, _, _, _ in victims:
                 state.ready.pop(key, None)
@@ -732,6 +733,7 @@ class _LocalDramPools:
             residency is None
             or residency.state is not _LocalDramState.READY
             or residency.claim_count
+            or residency.retire_on_release
             or residency.pending_labels
         ):
             return

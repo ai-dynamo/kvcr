@@ -87,6 +87,7 @@ class _RemoteSources:
             if item.local_sources:
                 # Local readers release on progress; local.poll_main owns
                 # their deferred access accounting and reclamation.
+                # TODO: Skip queued local handoffs if useful; keep TransferError events.
                 return
             # Framework ownership can be handed back after uncertainty;
             # KVCR-owned contents stay claimed until native quiescence.

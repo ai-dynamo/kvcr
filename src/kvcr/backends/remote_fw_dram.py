@@ -904,7 +904,6 @@ class _RemoteFWDram:
         done, _ = source_write.progress(progress, None)
         if done:
             progress._in_flight_ops.pop(source_write.op_id)
-            self._progress_outbound.append(source_write)
         return True
 
     def _handle_malformed_start_write(

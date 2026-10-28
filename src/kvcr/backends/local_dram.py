@@ -954,6 +954,7 @@ class _LocalDram:
             return
         self._resuming_capacity_waiters = True
         try:
+            self._pools._drain_sources()
             # One pass lets other waiters run while discarded fills retain slots.
             for _ in range(len(self._capacity_waiters)):
                 waiter = self._capacity_waiters[0]

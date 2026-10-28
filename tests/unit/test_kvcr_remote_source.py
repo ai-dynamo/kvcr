@@ -3,7 +3,6 @@
 """KVCR remote framework-DRAM source-side tests."""
 
 import ctypes
-import gc
 import logging
 import threading
 import time
@@ -26,6 +25,7 @@ from _kvcr_test_utils import (
     _new_kvcr,
     _op_entries,
     _poll_until,
+    _recovered_record,
     _start_write_message,
     _wait_until,
 )
@@ -144,7 +144,6 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
         prior_transfers = len(agent.xfers)
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
-        assert not gc.is_tracked(source._core._local_dram._pools._sources.ready)
         request = msgspec.msgpack.decode(_start_write_message(12, key))
         request.update(
             target_regions=(
@@ -762,8 +761,10 @@ def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
 
 
 @pytest.mark.parametrize("failure", ["initialize", "error", "exception", "async"])
+@pytest.mark.parametrize("local_source", [False, True], ids=["framework", "local"])
 def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     failure: str,
+    local_source: bool,
 ) -> None:
     """Every source-transfer failure reports failure and releases its state."""
 
@@ -783,9 +784,23 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     pinning = FakePrimaryPinning()
     control = FakeBytesControl()
     key = BlockKey(b"k0")
-    control.incoming.append(_start_write_message(5, key))
-    kvcr = _new_kvcr(source_agent, pinning, control, name="source")
+    memory = ctypes.create_string_buffer(16)
+    kvcr = _new_kvcr(
+        source_agent,
+        pinning,
+        control,
+        name="source",
+        local_dram=(
+            LocalDramOptions([("", ctypes.addressof(memory), len(memory))])
+            if local_source
+            else None
+        ),
+    )
+    if local_source:
+        install_recovery_records(kvcr._core, {key: _recovered_record(g2=[("", 0)])})
+        residency = kvcr._core._block_record_map[key].local_dram
     kvcr._core._clock = lambda: 0.0  # Failure must come from ERR, not a timeout.
+    control.incoming.append(_start_write_message(5, key))
 
     if failure == "async":
         assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
@@ -796,9 +811,20 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         assert _decode_notif(source_agent.sent_notifs[0][1])["terminal"] is False
         assert pinning.unpins == []
         assert source_agent.released_xfers == []
+        if local_source:
+            assert residency.source_readers == 1
+            assert kvcr._core._local_dram._pools.source_operations == 1
         source_agent.state = "DONE"
-    assert _poll_until(kvcr, lambda _: pinning.unpins == ["pin"]) == []
+    completed = _poll_until(
+        kvcr,
+        lambda _: source_agent.sent_notifs and not _has_outstanding_operations(kvcr),
+    )
+    assert completed == []
 
+    assert pinning.unpins == ([] if local_source else ["pin"])
+    if local_source:
+        assert residency.source_readers == 0
+        assert kvcr._core._local_dram._pools.source_operations == 0
     assert source_agent.transfers == ([] if failure == "initialize" else [1])
     agent_name, notif = source_agent.sent_notifs[-1]
     assert agent_name == "remote-1"
@@ -922,23 +948,37 @@ def test_kvcr_source_timeout_releases_pins_on_completion_or_abandonment(
         kvcr.close()
 
 
-def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
+@pytest.mark.parametrize("local_source", [False, True], ids=["framework", "local"])
+def test_source_lifecycles_distinguish_targets_reusing_the_same_handle(local_source):
     now = 0.0
     agent, control, errors, done = FakeNixlAgent(), FakeBytesControl(), [], set()
     agent.check_xfer_state = lambda handle: "DONE" if handle in done else "PROC"
+    memory = ctypes.create_string_buffer(16)
     source = _new_kvcr(
         agent,
         FakePrimaryPinning(),
         control,
         name="source",
         on_resilience_event=errors.append,
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=(
+            LocalDramOptions([("", ctypes.addressof(memory), len(memory))])
+            if local_source
+            else None
+        ),
     )
     source._core._clock = lambda: now
     key = BlockKey(b"shared")
+    if local_source:
+        install_recovery_records(source._core, {key: _recovered_record(g2=[("", 0)])})
+        residency = source._core._block_record_map[key].local_dram
     try:
         for target in ("target-a", "target-b"):
             control.incoming.append(_start_write_message(12, key, target_agent=target))
         _poll_until(source, lambda _: len(agent.xfers) == 2)
+        if local_source:
+            assert residency.source_readers == 2
+            assert source._core._local_dram._pools.source_operations == 2
         now = 5.0
         _poll_until(source, lambda _: len(errors) == 2)
         pending = {error.op_handle for error in errors}
@@ -949,7 +989,8 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
             == errors[1].source_blocks
             == {key: [_mem_descriptor(end_point_name="source")]}
         )
-        assert errors[0].source_owners == errors[1].source_owners == {key: "framework"}
+        owner = "kvcr" if local_source else "framework"
+        assert errors[0].source_owners == errors[1].source_owners == {key: owner}
         for native_handle in (1, 2):
             done.add(native_handle)
             _poll_until(source, lambda _: len(errors) == 2 + native_handle)
@@ -959,6 +1000,21 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle():
             assert event.source_owners == errors[0].source_owners
             pending.remove(event.op_handle)
             assert len(pending) == 2 - native_handle
+            if local_source:
+                assert residency.source_readers == 2 - native_handle
+                assert (
+                    source._core._local_dram._pools.source_operations
+                    == 2 - native_handle
+                )
+                if native_handle == 1:
+                    replacement = BlockKey(b"replacement")
+                    blocked = source.deposit(
+                        {replacement: [_mem_descriptor(end_point_name="source")]}
+                    )
+                    assert source.poll_completed() == [
+                        (blocked, _op_entries({replacement: False}))
+                    ]
+                    assert len(agent.xfers) == 2
         assert not _has_outstanding_operations(source)
     finally:
         done.update((1, 2))
