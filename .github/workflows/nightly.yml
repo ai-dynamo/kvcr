@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Nightly
+run-name: >-
+  ${{ github.event_name == 'pull_request' && format('Wheel check (PR #{0})', github.event.pull_request.number)
+  || format('Nightly ({0} by @{1})', github.event_name, github.actor) }}
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  # Pull requests that change packaging get the build, compliance, and wheel tests only.
+  pull_request:
+    paths:
+      - .github/scripts/wheel_compliance.py
+      - .github/workflows/nightly.yml
+      - .github/workflows/release.yml
+      - LICENSE
+      - pyproject.toml
+      - uv.lock
+      - src/**
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Stage the wheel and trigger the release pipeline. Scheduled runs always release.
+        required: false
+        type: boolean
+        default: false
+      skip_gitlab_pipeline:
+        description: Stage the wheel but skip the release pipeline trigger.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push cancels a pull request's check; nightlies never wait on each other, as in Dynamo.
+  group: nightly-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  wheel:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/release.yml
+    with:
+      mode: nightly
+      stage: ${{ github.event_name == 'schedule' || inputs.release == true }}
+      run_e2e: ${{ github.event_name != 'pull_request' }}
+      skip_gitlab_pipeline: ${{ inputs.skip_gitlab_pipeline == true }}
