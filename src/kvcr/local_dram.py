@@ -11,10 +11,11 @@ from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from itertools import islice
+from itertools import count, islice
 from typing import TYPE_CHECKING, Literal, cast
 
 from .config import LocalDramOptions
+from . import compact_telemetry, operation_capture
 from .policy_runtime import _EvictionQueue
 from .progress import (
     _DROPPED_RESULT,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _Clock = Callable[[], float]
+_RESIDENCY_GENERATIONS = count(1)
 
 
 def _layout_indices(
@@ -105,6 +107,7 @@ class _LocalDramResidency:
     # mutate caller-owned claim_count or invoke caller policy/capacity hooks.
     export_readers: int = 0
     export_cleanup_pending: bool = False
+    telemetry_generation: int = field(default_factory=lambda: next(_RESIDENCY_GENERATIONS), repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.key_layout is None:
@@ -347,6 +350,8 @@ class _LocalDram:
         self._export_lock = threading.Lock()
         self._exports: dict[BlockKey, _GuardExport] = {}
         self._export_held = 0
+        self._capture_writer = compact_telemetry.writer()
+        self._export_sequence = 0
         self._export_released: queue.SimpleQueue[
             tuple[BlockKey, _LocalDramResidency]
         ] = queue.SimpleQueue()
@@ -412,12 +417,38 @@ class _LocalDram:
         entry = _GuardExport(
             residency, tuple(residency.layout), tuple(residency.key_layout), refs
         )
+        published = None
         with self._export_lock:
             if (
                 residency.state is _LocalDramState.READY
                 and not residency.retire_on_release
             ):
                 self._exports[key] = entry
+                self._export_sequence += 1
+                published = (self._export_sequence, time.monotonic_ns())
+        if published:
+            self._journal('ready', key, residency, 'ready_publication', *published)
+
+    def _journal(self, event, key, residency, reason, export_sequence=None, transition_ns=None):
+        if self._capture_writer:
+            self._capture_writer.journal(dict(event=event, agent=self._kvcr.nixl_agent_name,
+                incarnation=self._kvcr._remote_fw_dram._dangling_ops.incarnation,
+                key=key, generation=residency.telemetry_generation, reason=reason,
+                export_sequence=export_sequence, transition_ns=transition_ns or time.monotonic_ns(),
+                ownership='kvcr', export_readers=residency.export_readers))
+
+    def _withdraw_locked(self, key):
+        entry = self._exports.pop(key, None)
+        if entry is None:
+            return None
+        self._export_sequence += 1
+        return entry.residency, self._export_sequence, time.monotonic_ns()
+
+    def _journal_withdrawal(self, key, withdrawal, reason):
+        if withdrawal:
+            residency, sequence, stamp = withdrawal
+            self._journal('withdraw', key, residency, reason, sequence, stamp)
+
 
     def claim_export_subset(
         self,
@@ -426,27 +457,60 @@ class _LocalDram:
         key_layout: tuple[str, ...],
     ) -> tuple[tuple[tuple[int, _GuardExportClaim], ...], bool]:
         # Contention is a prompt explicit miss, never a framework handoff.
+        reasons = ['absent'] * len(keys) if self._capture_writer else None
+        generations = [None] * len(keys) if reasons is not None else None
+        context = operation_capture.current()
+        def observed(result, busy, sequence):
+            if self._capture_writer:
+                self._capture_writer.journal(dict(event='source_get', agent=self._kvcr.nixl_agent_name,
+                    incarnation=self._kvcr._remote_fw_dram._dangling_ops.incarnation,
+                    operation_key=context.operation_key if context else None,
+                    request_id=context.request_id if context else None,
+                    request_correlation=context.correlation if context else None,
+                    keys=keys, ready_indices=[position for position, _ in result], generations=generations,
+                    miss_reasons=['index_busy'] * len(keys) if busy else reasons,
+                    export_sequence=sequence, ownership='kvcr'))
         if not self._export_lock.acquire(blocking=False):
+            observed((), True, None)
             return (), True
         claims: list[tuple[int, _GuardExportClaim]] = []
+        layout_indices = {}
         try:
             for position, (key, requested) in enumerate(zip(keys, layouts)):
                 entry = self._exports.get(key)
-                if entry is None or (key_layout and key_layout != entry.key_layout):
+                if entry is None:
                     continue
-                indices = _layout_indices(list(entry.layout), list(requested))
-                if indices is None or any(entry.refs[i] is None for i in indices):
+                if generations is not None:
+                    generations[position] = entry.residency.telemetry_generation
+                if entry.residency.retire_on_release:
+                    if reasons is not None: reasons[position] = 'retired'
+                    continue
+                if key_layout and key_layout != entry.key_layout:
+                    if reasons is not None: reasons[position] = 'key_layout_mismatch'
+                    continue
+                layout_pair = (entry.layout, tuple(requested))
+                if layout_pair not in layout_indices:
+                    layout_indices[layout_pair] = _layout_indices(list(entry.layout), list(requested))
+                indices = layout_indices[layout_pair]
+                if indices is None:
+                    if reasons is not None: reasons[position] = 'missing_label_layout'
+                    continue
+                if any(entry.refs[i] is None for i in indices):
+                    if reasons is not None: reasons[position] = 'incomplete_label'
                     continue
                 refs = tuple(cast(_TransferRef, entry.refs[i]) for i in indices)
                 claims.append((position, _GuardExportClaim(key, entry.residency, refs)))
+                if reasons is not None: reasons[position] = 'ready'
             # Allocate all claim records before changing any reader ownership.
             result = tuple(claims)
             for _, claim in result:
                 claim.residency.export_readers += 1
                 self._export_held += 1
-            return result, False
+            sequence = self._export_sequence
         finally:
             self._export_lock.release()
+        observed(result, False, sequence)
+        return result, False
 
     def release_export_claims(self, claims: tuple[_GuardExportClaim, ...]) -> None:
         with self._export_lock:
@@ -642,6 +706,7 @@ class _LocalDram:
                     key_layout=declaration,
                     writers=[1 if full_deposit else 0] * len(locations),
                 )
+                self._journal('admitted', key, residency, 'local_deposit')
             if full_deposit:
                 selected_slots = residency.slots
                 selected_indices = tuple(range(len(selected_slots)))
@@ -911,7 +976,8 @@ class _LocalDram:
                 raise RuntimeError(f"local DRAM source cannot retire {key!r}")
             with self._export_lock:
                 residency.retire_on_release = True
-                self._exports.pop(key, None)
+                withdrawal = self._withdraw_locked(key)
+            self._journal_withdrawal(key, withdrawal, 'policy_retirement')
 
     def abandon_capacity_eviction(self, key: BlockKey) -> None:
         """Stop blocking local admission on an eviction that will not land.
@@ -944,8 +1010,9 @@ class _LocalDram:
                 and not residency.pending_deposits
             ):
                 with self._export_lock:
-                    self._exports.pop(key, None)
+                    withdrawal = self._withdraw_locked(key)
                     residency.state = _LocalDramState.DISCARDING
+                self._journal_withdrawal(key, withdrawal, 'fill_discarded')
             if residency.remote_indices is not None:
                 residency.remote_cancelled = True
             for op_id in record.active_op_ids:
@@ -981,6 +1048,10 @@ class _LocalDram:
 
     def close(self) -> None:
         # Policy state ends with KVCR; teardown emits no per-block removals.
+        with self._export_lock:
+            withdrawn = [(key, self._withdraw_locked(key)) for key in tuple(self._exports)]
+        for key, withdrawal in withdrawn:
+            self._journal_withdrawal(key, withdrawal, 'shutdown')
         self._public_claims.clear()
 
     def poll_main(self, items: Collection[object]) -> list[object]:
@@ -1213,6 +1284,7 @@ class _LocalDram:
             record.local_dram = _LocalDramResidency(
                 locations, _LocalDramState.FILLING, key_layout=op.key_layout
             )
+            self._journal('admitted', key, record.local_dram, 'local_fill')
         self._update_capacity_pressure()
         self._kvcr._publish_inventory(evicted, CacheTier.LOCAL_G2, removed=True)
         return locations is not None, waiting
@@ -1467,15 +1539,20 @@ class _LocalDram:
         retiring = (
             residency.state is not _LocalDramState.READY or residency.retire_on_release
         )
+        withdrawal = None
+        held = False
         with self._export_lock:
             if retiring:
-                self._exports.pop(key, None)
+                withdrawal = self._withdraw_locked(key)
             if residency.export_readers:
                 residency.export_cleanup_pending = True
-                return
-            if retiring:
+                held = True
+            elif retiring:
                 # No new exports can race this detach/physical reuse boundary.
                 record.local_dram = None
+        self._journal_withdrawal(key, withdrawal, 'discarded' if residency.state is not _LocalDramState.READY else 'policy_retirement')
+        if held:
+            return
         if residency.state is not _LocalDramState.READY:
             self._free(residency.slots)
             self._kvcr._prune_block_record(key)
@@ -1565,13 +1642,16 @@ class _LocalDram:
                 freed.update(residency.pool_counts)
                 deficient = short()
 
+        withdrawn = []
         with self._export_lock:
             # Policy ran without this lock. A new reader can have arrived since
             # victim selection; recheck the whole set before revoking any entry.
             if any(residency.export_readers for _, _, residency, _ in victims):
                 return None, [], False
             for key, _, _, _ in victims:
-                self._exports.pop(key, None)
+                withdrawn.append((key, self._withdraw_locked(key)))
+        for key, withdrawal in withdrawn:
+            self._journal_withdrawal(key, withdrawal, 'capacity_eviction')
         for key, record, residency, size_bytes in victims:
             self._remove_evictable(key, residency)
             if self._kvcr._key_history_enabled:

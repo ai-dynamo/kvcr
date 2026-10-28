@@ -783,7 +783,8 @@ def _acked_deliver(control, kvcr, source, key, destination=None):
     return op_handle, sent["op_handle"]
 
 
-def test_only_a_refusal_from_this_operation_s_source_finishes_it():
+@pytest.mark.parametrize("reason", ["metadata_required", "source_progress_gap"])
+def test_only_a_refusal_from_this_operation_s_source_finishes_it(reason):
     """A deliver has no other way out, and no other sender may take it."""
     control = FakeBytesControl()
     kvcr = _new_kvcr(
@@ -828,13 +829,17 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     op = kvcr._core._progress._in_flight_ops[("target", op_handle)]
     deadline = op.deadline
     control.sent.clear()
-    refuse(source, **_metadata_refusal(source, op_handle))
+    now[0] = 0.25
+    refuse(source, **_metadata_refusal(source, op_handle, reason=reason),
+           sender_progress_epoch=7)
     _wait_until(lambda: bool(control.sent))
     retry = _decode_control_message(control.sent[-1][1])
     assert (retry["type"], retry["op_handle"]) == ("start_write", op_handle)
     assert retry["source_incarnation"] == "guard"
     assert retry["target_agent_metadata"] == b"target-md"
     assert op.deadline == deadline
+    assert retry["remaining_timeout_ms"] == pytest.approx(750)
+    assert retry["source_progress_epoch"] == 7
     assert list(kvcr.poll_completed()) == []
     assert source not in kvcr._core._remote_fw_dram._metadata_acked_sources
 
@@ -975,12 +980,14 @@ def test_retries_keep_metadata_despite_a_stale_ack_in_the_same_batch():
     batch = [
         msgspec.msgpack.encode(message)
         for message in (
-            _metadata_refusal(endpoint, wire),
-            _metadata_refusal(endpoint, second, reason="source_restarted"),
+            _metadata_refusal(endpoint, wire, sender_progress_epoch=7),
+            _metadata_refusal(endpoint, second, reason="source_progress_gap",
+                              sender_progress_epoch=7),
             {
                 "type": "target_metadata_ack",
                 "sender_control_endpoint": endpoint,
-                "sender_incarnation": "source",
+                "sender_incarnation": "guard",
+                "sender_progress_epoch": 1,
             },
         )
     ]
@@ -1001,6 +1008,7 @@ def test_retries_keep_metadata_despite_a_stale_ack_in_the_same_batch():
         == ("start_write", "guard", b"target-md")
         for r in retries
     )
+    assert all(r["source_progress_epoch"] == 7 for r in retries)
     assert _block_op_ids(target) == active
     assert list(target.poll_completed()) == []
     agent.notifs["guard"] = [_write_done_notification(h) for h in (wire, second)]
@@ -1022,7 +1030,8 @@ def test_retries_keep_metadata_despite_a_stale_ack_in_the_same_batch():
         ("shutdown", False),
     ],
 )
-def test_refusal_resends_only_with_reason(case, retries):
+@pytest.mark.parametrize("reason", ["metadata_required", "source_progress_gap"])
+def test_refusal_resends_only_with_reason(case, retries, reason):
     """A reasoned refusal from whichever process now answers the endpoint
     resends once; a refusal without a reason, or one that lands past the
     deadline or during shutdown, is terminal."""
@@ -1033,7 +1042,9 @@ def test_refusal_resends_only_with_reason(case, retries):
     handle, wire_handle = _acked_deliver(control, target, endpoint, key)
     backend = target._core._remote_fw_dram
     op = target._core._progress._in_flight_ops[("target", wire_handle)]
-    payload = _metadata_refusal(endpoint, wire_handle)
+    payload = _metadata_refusal(
+        endpoint, wire_handle, reason=reason, sender_progress_epoch=3
+    )
     if case == "matching_incarnation":
         payload["sender_incarnation"] = "source"
     elif case == "no_prior_incarnation":
@@ -1072,6 +1083,7 @@ def test_refusal_resends_only_with_reason(case, retries):
         assert resent["type"] == "start_write"
         assert resent["target_agent_metadata"] == b"target-md"
         assert resent["source_incarnation"] == payload["sender_incarnation"]
+        assert resent["source_progress_epoch"] == 3
         assert list(target.poll_completed()) == []
         agent.notifs[payload["sender_incarnation"]] = [
             _write_done_notification(wire_handle)
@@ -1674,3 +1686,34 @@ def test_remote_framework_dram_transfers_available_keys(
     assert any(
         "target_transfer_completed" in event and completed in event for event in events
     )
+
+
+def test_compact_target_mapping_preserves_exact_keys_and_partial_denominator(tmp_path, monkeypatch):
+    import json
+    from kvcr import compact_telemetry as telemetry
+    output = telemetry.BufferedWriter(tmp_path, source_archive_sha256='test', start_thread=False)
+    monkeypatch.setattr(telemetry, 'writer', lambda: output)
+    agent, control = FakeNixlAgent(), FakeBytesControl('tcp://target:1')
+    target = _new_kvcr(agent, FakePrimaryPinning(), control, key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False))
+    keys = (BlockKey(b'exact-target-key-0'), BlockKey(b'exact-target-key-1'))
+    try:
+        target.submit_hint(_router_hint('tcp://source:1'), request_id='req')
+        assert target.query(keys, 'req') == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)] * 2
+        handle = target.deliver({key: [_mem_descriptor(index)] for index, key in enumerate(keys)}, request_id='req')
+        _wait_until(lambda: bool(control.sent))
+        message = _decode_control_message(control.sent[0][1])
+        assert message['keys'] == list(keys)
+        agent.notifs['source'] = [_write_done_notification(handle, completed_indices=(0,))]
+        assert _poll_until(target, bool) == [(handle, _op_entries({keys[0]: True, keys[1]: False}))]
+    finally:
+        target.close()
+        output.close()
+    rows = [json.loads(line) for line in output.path.read_text().splitlines()]
+    terminal = next(row for row in rows if row['event'] == 'target_terminal')
+    assert terminal['requested_blocks'] == 2 and terminal['blocks'] == 1
+    assert terminal['status'] == 'partial' and terminal['bytes'] == 16
+    journal = list(telemetry.iter_key_journal(output.key_path))
+    get = next(row for row in journal if row['event'] == 'target_get')
+    assert get['keys'] == list(keys) and get['operation_key'] == terminal['operation_key']
+    assert telemetry.validate_capture(tmp_path, ['target'])['valid']

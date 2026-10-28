@@ -508,6 +508,133 @@ def test_write_probe_fences_write_waiting_on_framework_pin(
     assert len(agent.xfers) == (1 if incarnation == "other" else 0)
 
 
+@pytest.mark.parametrize("probe_fence", [False, True])
+def test_idle_source_progress_gap_does_not_poison_future_writes(probe_fence):
+    errors = []
+    agent = FakeNixlAgent(metadata=b"source-md")
+    agent.state = "DONE"
+    pinning = FakePrimaryPinning()
+    control = FakeBytesControl("tcp://source:1")
+    source = _new_kvcr(
+        agent, pinning, control, name="source", on_resilience_event=errors.append
+    )
+    watchdog = source._core._remote_fw_dram._dangling_ops
+    if probe_fence:
+        control.incoming.append(_write_probe_message(99, None))
+        _wait_until(lambda: bool(control.sent))
+        assert watchdog.source_writes[("target", 99)].cancel_requested
+
+    paused, resume, resumed = threading.Event(), threading.Event(), threading.Event()
+    begin_poll = watchdog.begin_poll
+    stalled_for = 0.0
+
+    def pause_once():
+        if not paused.is_set():
+            paused.set()
+            assert resume.wait(timeout=2)
+        begin_poll()
+        resumed.set()
+
+    with (
+        patch("kvcr.dangling_ops.time", SimpleNamespace(
+            monotonic=lambda: time.monotonic() + stalled_for
+        )),
+        patch.object(watchdog, "begin_poll", pause_once),
+    ):
+        try:
+            assert paused.wait(timeout=1)
+            stalled_for = 2.0
+        finally:
+            resume.set()
+        assert resumed.wait(timeout=1)
+        assert not watchdog._source_stalled
+        # A newly negotiated epoch is required after the idle gap.
+        request = msgspec.msgpack.decode(_start_write_message(1, BlockKey(b"k0")))
+        request["source_progress_epoch"] = watchdog.source_progress_epoch
+        control.incoming.append(msgspec.msgpack.encode(request))
+        assert _poll_until(source, lambda _: bool(agent.released_xfers)) == []
+        assert _decode_notif(agent.xfers[-1][5])["success"]
+        assert agent.sent_notifs == []
+        assert len(agent.xfers) == 1
+        assert errors == []
+
+
+@pytest.mark.parametrize("receive_error", [False, True])
+def test_idle_gap_refuses_all_stale_queued_batches_then_recovers(receive_error):
+    errors = []
+    agent = FakeNixlAgent(metadata=b"source-md")
+    agent.state = "DONE"
+    pinning = FakePrimaryPinning()
+    control = FakeBytesControl()
+    source = _new_kvcr(
+        agent, pinning, control, name="source", on_resilience_event=errors.append
+    )
+    watchdog = source._core._remote_fw_dram._dangling_ops
+    paused, resume, drained = threading.Event(), threading.Event(), threading.Event()
+    begin_poll = watchdog.begin_poll
+    stalled_for = 0.0
+    received = []
+
+    def pause_once():
+        if not paused.is_set():
+            paused.set()
+            assert resume.wait(timeout=2)
+        begin_poll()
+
+    def recv_one():
+        nonlocal receive_error
+        if stalled_for and receive_error:
+            receive_error = False
+            raise RuntimeError("injected receive failure during idle recovery")
+        if control.incoming:
+            received.append(control.incoming.pop(0))
+            return [received[-1]]
+        if received:
+            drained.set()
+        return []
+
+    with (
+        patch("kvcr.dangling_ops.time", SimpleNamespace(
+            monotonic=lambda: time.monotonic() + stalled_for
+        )),
+        patch.object(watchdog, "begin_poll", pause_once),
+        patch.object(control, "recv", recv_one),
+    ):
+        try:
+            assert paused.wait(timeout=1)
+            # Relative wire budgets predate the gap. None may be rebased at recv.
+            control.incoming.extend(
+                _start_write_message(handle, BlockKey(b"k0"), remaining_timeout_ms=100)
+                for handle in (1, 2, 3)
+            )
+            stalled_for = 2.0
+        finally:
+            resume.set()
+        assert drained.wait(timeout=1)
+        assert [
+            (_decode_notif(raw)["op_handle"], _decode_notif(raw)["success"])
+            for _, raw in agent.sent_notifs
+        ] == [(1, False), (2, False), (3, False)]
+        assert pinning.searches == []
+        assert agent.xfers == []
+        assert not watchdog.source_writes
+        # A pre-gap message may arrive AFTER a successful empty receive.
+        control.incoming.append(_start_write_message(4, BlockKey(b"late-stale")))
+        assert _poll_until(source, lambda _: len(agent.sent_notifs) == 4) == []
+        assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+        assert pinning.searches == []
+        assert agent.xfers == []
+        request = msgspec.msgpack.decode(_start_write_message(5, BlockKey(b"fresh")))
+        request["source_progress_epoch"] = watchdog.source_progress_epoch
+        control.incoming.append(msgspec.msgpack.encode(request))
+        assert _poll_until(source, lambda _: bool(agent.released_xfers)) == []
+        assert _decode_notif(agent.xfers[-1][5])["success"]
+        assert len(agent.sent_notifs) == 4
+        assert pinning.searches == [(BlockKey(b"fresh"),)]
+        assert len(agent.xfers) == 1
+        assert errors == []
+
+
 @pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
 def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> None:
     caplog.set_level(log_level, logger="kvcr.core")

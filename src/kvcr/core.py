@@ -200,6 +200,8 @@ class _KVCRCore:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")
 
         self.nixl_agent_name = self.config.nixl_agent_name
+        from .compact_telemetry import writer
+        self._compact_capture = writer()
         self._key_history_enabled = os.getenv(
             "KVCR_KEY_HISTORY"
         ) == "1" and logger.isEnabledFor(logging.DEBUG)
@@ -453,6 +455,8 @@ class _KVCRCore:
 
     # TODO(kvcr-g3): Prefer REMOTE_G2 over G3 in query/fetch/deliver once one
     # operation can fall back between both sources.
+
+
     def query(
         self,
         keys: Collection[BlockKey],
@@ -506,6 +510,8 @@ class _KVCRCore:
                 statuses.append((QueryStatus.MISS, None))
         if self._query_diagnostics is not None:
             self._log_query_diagnostics(statuses, request_id)
+        if self._compact_capture:
+            self._compact_capture.query_counts(self.nixl_agent_name, statuses)
         return statuses
 
     def align_sequence(

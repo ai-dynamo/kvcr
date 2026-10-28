@@ -27,6 +27,7 @@ def _log_resilience_event(error: Exception) -> None:
 
 @dataclass
 class _SourceWriteStatus:
+    accepted: bool = False
     submitted: bool = False
     cancel_requested: bool = False
     cancel_deadline: float | None = None
@@ -44,6 +45,8 @@ class _DanglingOps:
         self.source_writes: dict[tuple[str, OpHandle], _SourceWriteStatus] = {}
         self._last_progress_at: float | None = None
         self._source_stalled = False
+        self.source_progress_epoch = 0
+        self.source_progress_epochs: dict[tuple[str, str], int] = {}
 
     def begin_poll(self) -> None:
         polled_at = time.monotonic()
@@ -56,7 +59,14 @@ class _DanglingOps:
         gap_ms = (time.monotonic() - self._last_progress_at) * 1000
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:
-            # Require restart so queued pre-stall requests cannot get fresh deadlines.
+            if not any(status.accepted for status in self.source_writes.values()):
+                # Relative wire budgets cannot date queued requests. Fence the
+                # old epoch, including messages still in transit, but let targets
+                # retry against this epoch on their ORIGINAL operation deadline.
+                # Probe-only cancellation fences are not accepted work.
+                self.source_progress_epoch += 1
+                return True
+            # Accepted work still requires restart after a progress stall.
             self._source_stalled = True
             self._backend._progress_outbound.append(
                 RuntimeError(
@@ -66,6 +76,16 @@ class _DanglingOps:
                 )
             )
         return not self._source_stalled
+
+    def remember_source_progress(self, endpoint: str, payload: dict[str, Any]) -> None:
+        incarnation = payload.get("sender_incarnation")
+        epoch = payload.get("sender_progress_epoch")
+        if isinstance(incarnation, str) and type(epoch) is int and epoch >= 0:
+            key = (endpoint, incarnation)
+            # A delayed ACK must not roll back an epoch learned from a refusal.
+            self.source_progress_epochs[key] = max(
+                epoch, self.source_progress_epochs.get(key, 0)
+            )
 
     def poll_source(
         self, progress: "_KVCRProgress", op: "_SourceWriteOp", *, cancelling: bool

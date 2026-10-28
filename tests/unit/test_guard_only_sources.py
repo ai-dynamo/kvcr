@@ -14,6 +14,7 @@ from _kvcr_test_utils import (
     _new_kvcr,
     _op_entries,
     _poll_until,
+    _router_hint,
     _start_write_message,
     _wait_until,
 )
@@ -85,6 +86,179 @@ def test_option_flags_are_explicit_and_default_off():
     assert RemoteFWDramOptions(
         guard_only_sources=True, guard_only_source_proof=True
     ).guard_only_sources
+
+
+def test_guard_validates_only_claimed_subset_after_claim(monkeypatch):
+    source, agent, control, pinning, _ = _source()
+    core = source._core
+    validate = core._validate_descriptors
+    seen = []
+
+    def checked(descriptors, **kwargs):
+        seen.append((core._local_dram._export_readers(), tuple(descriptors)))
+        return validate(descriptors, **kwargs)
+
+    monkeypatch.setattr(core, '_validate_descriptors', checked)
+    payload = msgspec.msgpack.decode(_start_write_message(901, b'a', target_agent='target'))
+    payload.update(keys=[b'missing', b'a'], dst_descriptors=[[_TransferRef('target', 1000)], [_TransferRef('target', 1)]])
+    before = len(agent.xfers)
+    try:
+        control.incoming.append(msgspec.msgpack.encode(payload))
+        _wait_until(lambda: bool(seen))
+        assert seen == [(1, (_TransferRef('target', 1),))]
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        assert _decode_notif(agent.xfers[-1][5])['completed_indices'] == [1]
+        assert not pinning.searches
+    finally:
+        source.close()
+
+
+def test_selected_descriptor_failure_releases_claim_before_submission(monkeypatch):
+    source, agent, control, pinning, _ = _source(slots=1)
+    core = source._core
+    observed = []
+
+    def invalid(*args, **kwargs):
+        observed.append(core._local_dram._export_readers())
+        raise ValueError('selected destination rejected')
+
+    monkeypatch.setattr(core, '_validate_descriptors', invalid)
+    before = len(agent.xfers)
+    try:
+        _request(control, [b'a'], handle=902)
+        _wait_until(lambda: bool(observed))
+        assert observed == [1]
+        _wait_until(lambda: core._local_dram._export_readers() == 0)
+        assert len(agent.xfers) == before
+        assert not core._remote_fw_dram._dangling_ops.source_writes
+        assert not pinning.searches
+    finally:
+        source.close()
+
+
+def test_compact_source_timing_and_exact_lineage_without_ast(tmp_path, monkeypatch, caplog):
+    import time
+    from kvcr import compact_telemetry as telemetry
+    from kvcr.remote_fw_dram import logger
+    caplog.set_level('INFO', logger=logger.name)
+    output = telemetry.BufferedWriter(tmp_path, source_archive_sha256='test', start_thread=False)
+    monkeypatch.setattr(telemetry, 'writer', lambda: output)
+    source, agent, control, pinning, _ = _source(slots=1)
+    get_telemetry = agent.get_xfer_telemetry
+    def measured(handle):
+        sample = get_telemetry(handle)
+        sample.totalBytes = 16
+        return sample
+    agent.get_xfer_telemetry = measured
+    try:
+        before = len(agent.xfers)
+        agent.state = 'PROC'
+        _request(control, [b'missing', b'a'], handle=903)
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        time.sleep(.03)
+        agent.state = 'DONE'
+        _wait_until(lambda: source._core._local_dram._export_readers() == 0)
+    finally:
+        agent.state = 'DONE'
+        source.close()
+        output.close()
+    import json
+    rows = [json.loads(line) for line in output.path.read_text().splitlines()]
+    terminal = next(r for r in rows if r['event'] == 'source_nixl_terminal')
+    assert terminal['blocks'] == 1 and terminal['bytes'] == 16
+    assert terminal['completed_indices'] == [1]
+    assert terminal['guard_only_sources'] and not terminal['has_framework_pins']
+    assert terminal['source_handling_cpu_ns'] < terminal['source_operation_seconds'] * 1e9
+    clock = terminal['timing_ns']
+    assert clock['source_receive_ns'] <= clock['claim_begin_ns'] <= clock['claim_end_ns']
+    assert clock['submit_begin_ns'] <= clock['submit_end_ns'] <= clock['first_observed_done_ns']
+    assert clock['first_observed_done_ns'] <= clock['core_source_write_ns'] <= clock['cleanup_done_ns']
+    assert clock['first_observed_done_ns'] <= clock['native_handle_released_ns'] <= clock['core_source_write_ns']
+    assert clock['first_observed_done_ns'] <= clock['cleanup_done_ns'] <= clock['source_end_ns'] <= clock['telemetry_enqueue_ns']
+    keys = list(telemetry.iter_key_journal(output.key_path))
+    get = next(r for r in keys if r['event'] == 'source_get')
+    assert get['keys'] == [b'missing', b'a']
+    assert get['ready_indices'] == [1]
+    assert get['miss_reasons'] == ['absent', 'ready']
+    assert any(r['event'] == 'ready' and r['key'] == b'a' for r in keys)
+    assert telemetry.validate_capture(tmp_path, ['source'])['valid']
+    assert not pinning.searches
+    assert not [r for r in caplog.records if r.levelno >= 20 and 'guard_only_source event=' in r.getMessage()]
+
+
+@pytest.mark.parametrize('failure,expected', [('malformed', 'malformed_start_write'), ('peer', 'peer_metadata_validation_failed'), ('native', 'native_state:ERR'), ('deadline', 'source_deadline_expired')])
+def test_compact_source_failure_reason_is_explicit(tmp_path, monkeypatch, failure, expected):
+    import json
+    from kvcr import compact_telemetry as telemetry
+    output = telemetry.BufferedWriter(tmp_path, source_archive_sha256='test', start_thread=False)
+    monkeypatch.setattr(telemetry, 'writer', lambda: output)
+    source, agent, control, _, _ = _source()
+    backend = source._core._remote_fw_dram
+    now = [0.]
+    source._core._clock = lambda: now[0]
+    try:
+        if failure == 'peer':
+            def bad_peer(*args, **kwargs):
+                raise ValueError('bad peer')
+            monkeypatch.setattr(backend, '_remote_agent', bad_peer)
+        before = len(agent.xfers)
+        if failure in ('native', 'deadline'):
+            agent.state = 'PROC'
+        if failure == 'malformed':
+            _request(control, [b'a'], handle=904, remaining_timeout_ms=-1)
+        else:
+            _request(control, [b'a'], handle=904)
+        _wait_until(lambda: not control.incoming)
+        if failure in ('native', 'deadline'):
+            _wait_until(lambda: len(agent.xfers) == before + 1)
+            if failure == 'native':
+                agent.state = 'ERR'
+                _wait_until(lambda: any(state.outcome is False for state in source._core._progress._active_transfers.values()))
+            else:
+                now[0] = 100.
+                _wait_until(lambda: any(status.abandoned for status in backend._dangling_ops.source_writes.values()))
+            assert source._core._local_dram._export_readers() == 1
+            agent.state = 'DONE'
+            _wait_until(lambda: source._core._local_dram._export_readers() == 0)
+    finally:
+        agent.state = 'DONE'
+        source.close()
+        output.close()
+    terminal = next(row for row in map(json.loads, output.path.read_text().splitlines()) if row['event'] == 'source_nixl_terminal')
+    assert terminal['result'] == 'failed'
+    assert any(expected in reason for reason in terminal['reasons'])
+    assert telemetry.validate_capture(tmp_path, ['source'])['valid']
+
+
+def test_compact_eviction_retirement_and_shutdown_are_journaled(tmp_path, monkeypatch):
+    from kvcr import compact_telemetry as telemetry
+    output = telemetry.BufferedWriter(tmp_path, source_archive_sha256='test', start_thread=False)
+    monkeypatch.setattr(telemetry, 'writer', lambda: output)
+    source, _, _, _, _ = _source(slots=1)
+    local = source._core._local_dram
+    journal = output.journal
+    def unlocked(record):
+        assert not local._export_lock.locked()
+        return journal(record)
+    monkeypatch.setattr(output, 'journal', unlocked)
+    try:
+        op = source.deposit({b'b': [_mem_descriptor(1, end_point_name='source')]})
+        assert _poll_until(source, bool) == [(op, _op_entries({b'b': True}))]
+        with source._core._state_lock:
+            local.acquire_sources((b'b',))
+            local.retire_sources((b'b',))
+            local.release_sources((b'b',))
+        op = source.deposit({b'a': [_mem_descriptor(0, end_point_name='source')]})
+        assert _poll_until(source, bool) == [(op, _op_entries({b'a': True}))]
+    finally:
+        source.close()
+        output.close()
+    records = list(telemetry.iter_key_journal(output.key_path))
+    withdrawals = [r for r in records if r['event'] == 'withdraw']
+    assert {r['reason'] for r in withdrawals} == {'capacity_eviction', 'policy_retirement', 'shutdown'}
+    generations = [r['generation'] for r in records if r['event'] == 'ready' and r['key'] == b'a']
+    assert len(set(generations)) == 2
+    assert telemetry.validate_capture(tmp_path, ['source'])['valid']
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -181,8 +355,12 @@ def test_native_pending_claim_fences_slot_reuse_then_releases_without_main_poll(
         source.close()
 
 
-def test_mixed_ready_missing_and_per_key_layout_rejection(caplog):
+def test_mixed_ready_missing_and_per_key_layout_rejection(caplog, tmp_path, monkeypatch):
+    import json
+    from kvcr import compact_telemetry as telemetry
     caplog.set_level("INFO", logger="kvcr.core")
+    output = telemetry.BufferedWriter(tmp_path, source_archive_sha256='test', start_thread=False)
+    monkeypatch.setattr(telemetry, 'writer', lambda: output)
     source, agent, control, pinning, _ = _source()
     try:
         deposits = source.deposit(
@@ -199,10 +377,16 @@ def test_mixed_ready_missing_and_per_key_layout_rejection(caplog):
             _request(control, [b"missing", b"a", b"wrong", b"other"])
             _wait_until(lambda: len(agent.xfers) == before + 1)
             assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [1, 3]
-        assert "requested=4" in caplog.text
+        _wait_until(lambda: source._core._local_dram._export_readers() == 0)
+        assert "guard_only_source event=" not in caplog.text
         assert pinning.searches == []
     finally:
         source.close()
+        output.close()
+    rows = [json.loads(line) for line in output.path.read_text().splitlines()]
+    terminal = next(row for row in rows if row['event'] == 'source_nixl_terminal')
+    assert terminal['requested_blocks'] == 4 and terminal['completed_indices'] == [1, 3]
+    assert telemetry.validate_capture(tmp_path, ['source'])['valid']
 
 
 def test_partial_deposit_exports_committed_pieces_only():
@@ -469,3 +653,137 @@ def test_deferred_source_access_refreshes_owner_eviction_score():
         _poll_until(source, lambda _: local._evictable.score(b"a") != before_score)
     finally:
         source.close()
+
+
+@pytest.mark.parametrize('bad_keys', [None, 17, [None], b'bytes-not-key-list'])
+def test_compact_malformed_keys_preserve_failure_notification(tmp_path, monkeypatch, bad_keys):
+    import json
+    from kvcr import compact_telemetry as telemetry
+    output = telemetry.BufferedWriter(tmp_path, source_archive_sha256='test', start_thread=False)
+    monkeypatch.setattr(telemetry, 'writer', lambda: output)
+    source, agent, control, _, _ = _source()
+    backend = source._core._remote_fw_dram
+    notifications = []
+    monkeypatch.setattr(backend, '_notify_start_write_failure', lambda progress, payload, handle: notifications.append(handle))
+    try:
+        before = len(agent.xfers)
+        backend._handle_start_write(source._core._progress, dict(op_handle=999, keys=bad_keys, remaining_timeout_ms=1000))
+        assert notifications == [999]
+        assert len(agent.xfers) == before
+    finally:
+        source.close()
+        output.close()
+    rows = [json.loads(line) for line in output.path.read_text().splitlines()]
+    terminal = next(r for r in rows if r['event'] == 'source_nixl_terminal')
+    assert terminal['reason'] == 'malformed_start_write'
+    assert terminal['result'] == 'failed'
+    assert telemetry.validate_capture(tmp_path, ['source'])['valid']
+
+
+def test_active_progress_stall_retains_guard_claim_until_native_quiescence(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    source, agent, control, pinning, _ = _source(slots=1)
+    core = source._core
+    watchdog = core._remote_fw_dram._dangling_ops
+    errors = []
+    monkeypatch.setattr(core, "_on_resilience_event_callback", errors.append)
+    before = len(agent.xfers)
+    released = len(agent.released_xfers)
+    try:
+        agent.state = "PROC"
+        _request(control, [b"a"], handle=980)
+        _wait_until(lambda: len(agent.xfers) == before + 1)
+        assert core._local_dram._export_readers() == 1
+        with monkeypatch.context() as patcher:
+            patcher.setattr("kvcr.dangling_ops.time", SimpleNamespace(
+                monotonic=lambda: time.monotonic() + 2.0
+            ))
+            assert _poll_until(source, lambda _: bool(errors)) == []
+            assert watchdog._source_stalled
+            assert watchdog.source_progress_epoch == 0
+            assert "source progress stalled" in str(errors[0])
+            _request(control, [b"a"], handle=981)
+            _wait_until(lambda: bool(agent.sent_notifs))
+            assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+            assert len(agent.xfers) == before + 1
+            agent.state = "ERR"
+            _wait_until(lambda: any(
+                transfer.outcome is False
+                for transfer in core._progress._active_transfers.values()
+            ))
+            assert core._local_dram._export_readers() == 1
+            assert len(agent.released_xfers) == released
+            agent.state = "DONE"
+            _wait_until(lambda: core._local_dram._export_readers() == 0)
+            assert len(agent.released_xfers) == released + 1
+            assert watchdog._source_stalled
+            assert pinning.searches == []
+    finally:
+        agent.state = "DONE"
+        source.close()
+
+
+def test_idle_epoch_refusal_retries_end_to_end_with_original_target_deadline(
+    monkeypatch,
+):
+    import time
+
+    source, agent, control, pinning, _ = _source(slots=1)
+    target_control = FakeBytesControl("tcp://target:1")
+    target_agent = FakeNixlAgent(metadata=b"target-md")
+    target = _new_kvcr(
+        target_agent, FakePrimaryPinning(), target_control,
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    now = [0.0]
+    target._core._clock = lambda: now[0]
+    watchdog = source._core._remote_fw_dram._dangling_ops
+    begin_poll = watchdog.begin_poll
+    injected = []
+
+    def idle_once():
+        if not injected:
+            injected.append(True)
+            watchdog._last_progress_at = time.monotonic() - 2.0
+        begin_poll()
+
+    monkeypatch.setattr(watchdog, "begin_poll", idle_once)
+    _wait_until(lambda: watchdog.source_progress_epoch == 1)
+    before = len(agent.xfers)
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="epoch")
+    handle = target.deliver({b"a": [_mem_descriptor()]}, request_id="epoch")
+    _wait_until(lambda: bool(target_control.sent))
+    source_op = target._core._progress._in_flight_ops[("target", handle)]
+    deadline = source_op.deadline
+    control.incoming.extend(raw for _, raw in target_control.sent)
+    target_control.sent.clear()
+    _wait_until(lambda: any(
+        msgspec.msgpack.decode(raw)["type"] == "write_refused"
+        for _, raw in control.sent
+    ))
+    refusals = [msgspec.msgpack.decode(raw) for _, raw in control.sent]
+    refusal = next(row for row in refusals if row["type"] == "write_refused")
+    assert refusal["reason"] == "source_progress_gap"
+    assert refusal["sender_progress_epoch"] == 1
+    assert not watchdog._source_stalled
+    assert source._core._local_dram._export_readers() == 0
+    assert len(agent.xfers) == before
+    assert pinning.searches == []
+
+    now[0] = 0.25
+    target_control.incoming.extend(raw for _, raw in control.sent)
+    control.sent.clear()
+    _wait_until(lambda: bool(target_control.sent))
+    retry = msgspec.msgpack.decode(target_control.sent[-1][1])
+    assert retry["source_progress_epoch"] == 1
+    assert retry["op_handle"] == handle
+    assert retry["remaining_timeout_ms"] == pytest.approx(750)
+    assert source_op.deadline == deadline
+    control.incoming.extend(raw for _, raw in target_control.sent)
+    _wait_until(lambda: len(agent.xfers) == before + 1)
+    _wait_until(lambda: source._core._local_dram._export_readers() == 0)
+    target_agent.notifs["source"] = [agent.xfers[-1][5]]
+    assert _poll_until(target, bool) == [(handle, _op_entries({b"a": True}))]
+    assert pinning.searches == []

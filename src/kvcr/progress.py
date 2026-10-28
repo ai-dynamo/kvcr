@@ -18,7 +18,7 @@ import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
-from . import _nvtx
+from . import _nvtx, compact_telemetry, operation_capture
 from .types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,8 @@ class _TransferState:
     outcome: bool | None = None
     telemetry: Any | None = None
     next_release_log_at: float = 0.0
+    capture_context: Any = None
+    native_capture: dict[str, Any] | None = None
     trace: _nvtx._LifecycleTrace | None = None
 
 
@@ -174,6 +176,7 @@ class _KVCRProgress:
         )
         self._failure: BaseException | None = None
         self._stop_requested = False
+        self._capture_writer = compact_telemetry.writer()
         self._startup_stage = "thread startup"
         self._startup_timeout_seconds = startup_timeout_seconds
 
@@ -210,7 +213,19 @@ class _KVCRProgress:
         if outcome is None or (require_completion and not outcome):
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
+                if state.native_capture is not None:
+                    state.native_capture['native_state'] = xfer_state
+                    if xfer_state not in ('PROC', 'PEND', 'DONE'):
+                        self._native_capture_reason(state, 'native_state:' + str(xfer_state))
+                if state.capture_context:
+                    state.capture_context.native_state = xfer_state
+                    if xfer_state not in ('PROC', 'PEND', 'DONE'):
+                        operation_capture.reason('native_state:' + str(xfer_state))
+                if xfer_state == 'DONE' and state.capture_context:
+                    state.capture_context.timings.setdefault('first_observed_done_ns', time.monotonic_ns())
             except Exception as error:
+                self._native_capture_reason(state, f'native_poll_exception:{type(error).__name__}')
+                operation_capture.reason(f'native_poll_exception:{type(error).__name__}')
                 if isinstance(error, nixlRemoteDisconnectError):
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                     # NIXL keeps this as the handle's final status; releasing it
@@ -248,18 +263,24 @@ class _KVCRProgress:
                 return None
             outcome = xfer_state == "DONE" and state.outcome is not False
             state.outcome = outcome
+        if state.capture_context:
+            if outcome:
+                state.capture_context.timings.setdefault('first_observed_done_ns', time.monotonic_ns())
+            state.capture_context.native_state = state.capture_context.native_state or ('DONE' if outcome else 'ERR')
         if outcome and state.capture_telemetry:
             get_telemetry = getattr(agent, "get_xfer_telemetry", None)
             if get_telemetry is not None:
                 try:
                     state.telemetry = get_telemetry(state.handle)
                 except Exception:
+                    self._native_capture_reason(state, 'native_telemetry_unavailable')
                     logger.debug("NIXL telemetry failed", exc_info=True)
             state.capture_telemetry = False
         if not self._release_transfer(transfer_id, state):
             return None
         return bool(outcome), state.telemetry
 
+    @operation_capture.native_submit
     def submit_transfer(
         self,
         operation: str,
@@ -280,6 +301,17 @@ class _KVCRProgress:
             if not isinstance(remote_side_agent, str) or not remote_side_agent:
                 raise ValueError("NIXL remote-side agent must be non-empty")
             agent = self.nixl_agent
+            native_capture = None
+            if self._capture_writer is not None and operation_capture.current() is None:
+                # Descriptors were validated before ingress. Observation failure
+                # invalidates evidence, never ownership of an eventual handle.
+                try:
+                    native_capture = self._native_capture_metadata(
+                        operation, local_descriptors, remote_descriptors,
+                        remote_side_agent, backend,
+                    )
+                except Exception as error:
+                    self._capture_writer.invalidate(f'native metadata: {type(error).__name__}')
             if any(
                 isinstance(descriptors[0], _MemDescriptor)
                 and descriptors[0].mem_type == "FILE"
@@ -314,12 +346,25 @@ class _KVCRProgress:
             state = _TransferState(
                 handle, remote_side_agent, capture_telemetry, trace=trace
             )
+            state.capture_context = operation_capture.current()
+            state.native_capture = native_capture
+            if native_capture is not None:
+                state.capture_telemetry = True
+                native_capture['submit_begin_ns'] = time.monotonic_ns()
             self._active_transfers[transfer_id] = state
             if trace is not None:
                 trace.start("nixl.write", transfer_id=transfer_id)
             submitted = True
             try:
                 post_state = agent.transfer(handle)
+                if native_capture is not None:
+                    native_capture['native_state'] = post_state
+                    if post_state not in ('PROC', 'PEND', 'DONE'):
+                        self._native_capture_reason(state, 'native_state:' + str(post_state))
+                if state.capture_context:
+                    state.capture_context.native_state = post_state
+                    if post_state == "DONE":
+                        state.capture_context.timings.setdefault('first_observed_done_ns', time.monotonic_ns())
                 if post_state == "DONE":
                     state.outcome = True
                 elif post_state == "ERR":
@@ -331,6 +376,7 @@ class _KVCRProgress:
                         "NIXL transfer returned unexpected state %r", post_state
                     )
             except Exception as error:
+                self._native_capture_reason(state, f'submit_exception:{type(error).__name__}')
                 if isinstance(error, nixlRemoteDisconnectError):
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                 submitted = False
@@ -503,6 +549,7 @@ class _KVCRProgress:
                 )
                 state.next_release_log_at = now + _RELEASE_LOG_INTERVAL_SECONDS
         if not released:
+            self._native_capture_reason(state, 'release_retry')
             if state.trace is not None:
                 state.trace.mark(
                     "nixl.write.release_retry",
@@ -512,7 +559,30 @@ class _KVCRProgress:
                     reason=_nvtx.Reason.RELEASE_ERROR,
                 )
             return False
+        if state.capture_context:
+            state.capture_context.timings['native_handle_released_ns'] = time.monotonic_ns()
         self._active_transfers.pop(transfer_id, None)
+        if state.native_capture is not None:
+            # Enqueue only after successful SDK release. No producer file I/O,
+            # and no duplicate of an existing remote operation context.
+            try:
+                row = dict(state.native_capture)
+                released_ns = time.monotonic_ns()
+                native_bytes = getattr(state.telemetry, 'totalBytes', None)
+                duration = getattr(state.telemetry, 'xferDuration', None)
+                row.update(
+                    event='native_transfer_terminal', transfer_id=transfer_id,
+                    identity=self._nixl_agent_name, native_handle_released=True,
+                    release_ns=released_ns,
+                    host_submit_to_release_seconds=(released_ns - row['submit_begin_ns']) / 1e9,
+                    status='success' if state.outcome else 'failed',
+                    bytes=(native_bytes if native_bytes is not None else row['descriptor_bytes']) if state.outcome else None,
+                    bytes_source='native_telemetry' if native_bytes is not None else 'validated_descriptors',
+                    native_seconds=duration / 1e6 if duration is not None else None,
+                )
+                self._capture_writer.emit(row)
+            except Exception as error:
+                self._capture_writer.invalidate(f'native terminal: {type(error).__name__}')
         if state.trace is not None:
             state.trace.mark(
                 "nixl.write.released",
@@ -523,6 +593,37 @@ class _KVCRProgress:
             )
             state.trace.end("nixl.write")
         return True
+
+    @staticmethod
+    def _native_capture_reason(state: _TransferState, reason: str) -> None:
+        row = state.native_capture
+        if row is not None and reason not in row['reasons']:
+            row['reasons'].append(reason)
+
+    def _native_capture_metadata(self, operation, local, remote, remote_agent, backend):
+        def side(refs, catalog_name):
+            if isinstance(refs[0], _MemDescriptor):
+                return refs[0].mem_type, sum(ref.size for ref in refs), 'raw'
+            owner, regions = self._catalogs[catalog_name]
+            resolved = [_resolve_region(ref, regions, owner) for ref in refs]
+            owners = {'framework' if ref.framework else 'kvcr' for ref in refs}
+            return resolved[0].mem_type, sum(region.size for region in resolved), '/'.join(sorted(owners))
+
+        local_type, local_bytes, local_owner = side(local, '')
+        remote_type, remote_bytes, remote_owner = side(remote, remote_agent)
+        read = operation == 'READ'
+        return dict(
+            operation=operation, backend=backend,
+            source_agent=remote_agent if read else self._nixl_agent_name,
+            target_agent=self._nixl_agent_name if read else remote_agent,
+            source_mem_type=remote_type if read else local_type,
+            destination_mem_type=local_type if read else remote_type,
+            source_owner=remote_owner if read else local_owner,
+            destination_owner=local_owner if read else remote_owner,
+            descriptor_bytes=remote_bytes if read else local_bytes,
+            destination_descriptor_bytes=local_bytes if read else remote_bytes,
+            reasons=[],
+        )
 
     def start(self) -> None:
         self._activate.set()
@@ -678,6 +779,7 @@ class _KVCRProgress:
                 raise RuntimeError("KVCR progress operations did not close")
             time.sleep(_IDLE_WAIT_SECONDS)
 
+    @operation_capture.progress_turn
     def _run_one_iteration(self) -> bool:
         published = self._publish_completed(self._batch_size)
         submissions: list[object] = []
@@ -755,6 +857,8 @@ class _KVCRProgress:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)
         if get_agent_metadata is not None:
             self._nixl_agent_metadata = get_agent_metadata()
+        if self._capture_writer and self._nixl_agent_metadata is not None:
+            self._capture_writer.identity_ready(self.nixl_agent_name)
 
     def _close_nixl(self) -> None:
         if self._active_transfers:

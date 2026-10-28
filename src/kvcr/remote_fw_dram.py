@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
+from . import operation_capture as capture
 from . import _nvtx
 from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
@@ -118,13 +119,17 @@ class _TargetPullOp(_RemoteOp):
     source_incarnation: str | None = None
     uncertain: bool = False
     retried: bool = False
+    _capture: Any = field(default=None, repr=False, compare=False)
 
+    @capture.operation
     def progress(
         self, progress: _KVCRProgress, event: object | None
     ) -> tuple[bool, bool]:
         backend = self._backend
         now = backend._kvcr._clock()
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
+        if cancelled:
+            capture.reason('target_cancelled')
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
         if (
             self.state is _TargetPullState.WAITING_WRITE_DONE
@@ -151,6 +156,7 @@ class _TargetPullOp(_RemoteOp):
                 # A stale ACK from the dead peer may have re-acked the endpoint.
                 backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
             if now >= self.deadline:
+                capture.reason('target_deadline_expired')
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -163,12 +169,20 @@ class _TargetPullOp(_RemoteOp):
                     "op_handle": self.op_id[1],
                     "remaining_timeout_ms": (self.deadline - now) * 1000,
                     "source_incarnation": self.source_incarnation,
+                    "source_progress_epoch": (
+                        backend._dangling_ops.source_progress_epochs.get(
+                            (self.remote_ctrl_ep, self.source_incarnation), 0
+                        )
+                    ),
+                    "request_id": self.request_id,
+                    "telemetry_request_key": self._capture.operation_key if self._capture else None,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
                     **({"key_layout": self.key_layout} if self.local_fill else {}),
                 },
             )
             if not sent:
+                capture.reason('control_enqueue_failed')
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -283,6 +297,7 @@ class _TargetPullOp(_RemoteOp):
             return False, self.probe_sent
         return False, False
 
+    @capture.operation
     def close(self, progress: _KVCRProgress) -> bool:
         # Shutdown must not release destinations still awaiting a remote write.
         return self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
@@ -346,7 +361,9 @@ class _SourceWriteOp(_RemoteOp):
     guard_accounting: tuple[_GuardExportClaim, ...] = ()
     guard_requested_count: int = 0
     guard_claim_started_at: float | None = None
+    _capture: Any = field(default=None, repr=False, compare=False)
 
+    @capture.operation
     def progress(
         self, progress: _KVCRProgress, _event: object | None
     ) -> tuple[bool, bool]:
@@ -368,6 +385,8 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
+                capture.reason('source_deadline_expired' if self.state is not _SourceWriteState.NOTIFY_FAILURE
+                               else 'source_cancelled' if status.cancel_requested else 'source_stalled')
                 if trace is not None:
                     if status.cancel_requested:
                         failure_reason = _nvtx.Reason.CANCELLED
@@ -397,6 +416,7 @@ class _SourceWriteOp(_RemoteOp):
             if route_name and (
                 backend._route_generation.get(route_name, 0) != route_generation
             ):
+                capture.reason('route_generation_changed')
                 # Re-checked here, on the thread that submits: the route can be
                 # replaced between queueing and this write, and NIXL hands the
                 # same handle back for a reused name. The target hears a
@@ -406,6 +426,7 @@ class _SourceWriteOp(_RemoteOp):
                     trace.reject("source.write.refused", _nvtx.Reason.ROUTE_CHANGED)
                 return False, True
             if not self.src_descriptors:
+                capture.reason('guard_ready_miss')
                 backend._send_write_done(
                     progress,
                     self.remote_agent,
@@ -451,6 +472,7 @@ class _SourceWriteOp(_RemoteOp):
                     "transfer_submit", submit_started_at, result
                 )
                 if not submitted:
+                    capture.reason('native_submission_failed')
                     logger.warning(
                         "KVCR start_write submission failed for op=%d",
                         self.op_handle,
@@ -496,6 +518,7 @@ class _SourceWriteOp(_RemoteOp):
         if self.state is not _SourceWriteState.CANCEL_PENDING and (
             status.cancel_requested or backend._kvcr._clock() >= self.deadline
         ):
+            capture.reason('source_cancelled' if status.cancel_requested else 'source_deadline_expired')
             self.state = _SourceWriteState.CANCEL_PENDING
             if trace is not None:
                 trace.mark(
@@ -519,6 +542,8 @@ class _SourceWriteOp(_RemoteOp):
             return False, observed_work
         self.transfer_id = None
         success, telemetry = transfer_result
+        if self._capture:
+            self._capture.native = telemetry
         self.success = success and not cancelling
         if self.success:
             backend._record_transfer_telemetry(telemetry)
@@ -552,6 +577,7 @@ class _SourceWriteOp(_RemoteOp):
             trace.complete_source(self.success, len(self.source_keys))
         return True, True
 
+    @capture.operation
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
         if self.transfer_id is not None:
@@ -693,6 +719,7 @@ class _RemoteFWDram:
         if src is not None and self._options.eager_ctrl_connect:
             kvcr._progress.submit(_TargetMetadataRequest(src))
 
+
     def query(self, key: BlockKey, request_id: str) -> bool:
         """Return whether ``key`` matches the request's remote hint."""
         request_hint = self._request_hints.get(request_id)
@@ -712,6 +739,7 @@ class _RemoteFWDram:
             return False
         return True
 
+    @capture.request('target')
     def _start_target_pull(
         self,
         blocks: Mapping[BlockKey, list[_TransferRef]],
@@ -759,6 +787,7 @@ class _RemoteFWDram:
                 else ()
             ),
         )
+        capture.bind(op)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT target_transfer_started scope=%s request_id=%s op=%d "
@@ -1105,6 +1134,8 @@ class _RemoteFWDram:
             return False
         payload["target_agent"] = kvcr.nixl_agent_name
         payload["sender_incarnation"] = self._dangling_ops.incarnation
+        if payload.get("type") in ("target_metadata_ack", "write_refused"):
+            payload["sender_progress_epoch"] = self._dangling_ops.source_progress_epoch
         sender_endpoint = getattr(self._control, "endpoint", None)
         if isinstance(sender_endpoint, str):
             payload.setdefault("sender_control_endpoint", sender_endpoint)
@@ -1112,7 +1143,7 @@ class _RemoteFWDram:
         if message_type != "target_metadata_ack":
             payload["source_control_endpoint"] = endpoint
         includes_metadata = (
-            message_type not in ("target_metadata_ack", "write_refused")
+            message_type not in ("target_metadata_ack", "write_refused", "ready_probe", "ready_probe_reply")
             and endpoint not in self._metadata_acked_sources
             and (
                 message_type in ("target_metadata", "start_write")
@@ -1164,7 +1195,8 @@ class _RemoteFWDram:
         op = progress._in_flight_ops.get(("target", op_handle))
         if not isinstance(op, _TargetPullOp) or op.remote_ctrl_ep != endpoint:
             return
-        # Whatever answered is not the process our metadata was loaded into, so
+        self._dangling_ops.remember_source_progress(endpoint, payload)
+        # The peer either replaced our metadata or fenced an idle progress gap;
         # drop the snapshot and let the next request republish it.
         self._invalidate_control_peer(endpoint)
         # Refresh the generation for future writes, not already in-flight ones.
@@ -1174,7 +1206,9 @@ class _RemoteFWDram:
             self._dangling_ops.sources.pop(endpoint, None)
         incarnation = payload.get("sender_incarnation")
         if (
-            payload.get("reason") in ("metadata_required", "source_restarted")
+            payload.get("reason") in (
+                "metadata_required", "source_restarted", "source_progress_gap"
+            )
             and isinstance(incarnation, str)
             and incarnation
             and not op.retried
@@ -1199,6 +1233,7 @@ class _RemoteFWDram:
         source_endpoint = payload.get("sender_control_endpoint")
         if not isinstance(source_endpoint, str) or not source_endpoint:
             return
+        self._dangling_ops.remember_source_progress(source_endpoint, payload)
         incarnation = payload.get("sender_incarnation")
         if isinstance(incarnation, str) and incarnation:
             self._dangling_ops.sources[source_endpoint] = incarnation
@@ -1246,6 +1281,7 @@ class _RemoteFWDram:
     # to main; progress writes to the target.
     # -------------------------------------------------------------------------
 
+    @capture.request('source')
     def _handle_start_write(
         self, progress: _KVCRProgress, payload: dict[str, Any]
     ) -> None:
@@ -1253,6 +1289,7 @@ class _RemoteFWDram:
         received_at = self._kvcr._clock()
         op_handle = payload.get("op_handle")
         if type(op_handle) is not int:
+            capture.reason('malformed_op_handle')
             logger.warning("KVCR malformed start_write: invalid op_handle")
             return
         try:
@@ -1272,10 +1309,12 @@ class _RemoteFWDram:
                 payload["dst_descriptors"], type=_MEMORY_REF_LISTS_TYPE
             )
         except (KeyError, TypeError, ValueError, msgspec.ValidationError) as error:
+            capture.reason('malformed_start_write')
             logger.warning("KVCR malformed start_write op=%d: %s", op_handle, error)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
         if not keys or len(keys) != len(dst_descriptors):
+            capture.reason('malformed_cardinality')
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
@@ -1292,16 +1331,18 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            for descriptors in dst_descriptors:
-                self._kvcr._validate_descriptors(
-                    descriptors,
-                    regions=self._remote_agents_by_target[target_agent][2],
-                    agent_name=target_agent,
-                )
+            if not self._options.guard_only_sources:
+                for descriptors in dst_descriptors:
+                    self._kvcr._validate_descriptors(
+                        descriptors,
+                        regions=self._remote_agents_by_target[target_agent][2],
+                        agent_name=target_agent,
+                    )
             self._ack_target_metadata(progress, payload, target_agent)
         except _RemoteAgentCleanupError:
             raise
         except Exception:
+            capture.reason('peer_metadata_validation_failed')
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
             )
@@ -1310,18 +1351,22 @@ class _RemoteFWDram:
 
         write_id = (target_agent, OpHandle(op_handle))
         if status := self._dangling_ops.source_writes.get(write_id):
+            capture.reason('duplicate_write_request')
             if status.cancel_requested and not status.submitted:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.get("source_incarnation")
         if isinstance(expected, str) and expected != self._dangling_ops.incarnation:
+            capture.reason('source_incarnation_changed')
             # Another process was quoted: refuse pre-submit so the target retries
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(progress, payload, op_handle, "source_restarted")
             return
-        if progress._stop_requested or not self._dangling_ops.check_source_progress():
+        source_responsive = self._dangling_ops.check_source_progress()
+        if progress._stop_requested or not source_responsive:
+            reason = "stopping" if progress._stop_requested else "source_stalled"
+            capture.reason(reason)
             if logger.isEnabledFor(logging.DEBUG):
-                reason = "stopping" if progress._stop_requested else "source_stalled"
                 logger.debug(
                     "KVCR_EVENT source_transfer_refused op=%d target=%s "
                     "blocks=%d reason=%s expected_incarnation=%s incarnation=%s",
@@ -1334,7 +1379,20 @@ class _RemoteFWDram:
                 )
             self._send_write_done(progress, remote_agent, op_handle, False)
             return
-        self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
+        epoch = payload.get("source_progress_epoch", 0)
+        if type(epoch) is not int or epoch != self._dangling_ops.source_progress_epoch:
+            capture.reason("source_progress_gap")
+            if isinstance(payload.get("sender_control_endpoint"), str) and isinstance(
+                payload.get("source_control_endpoint"), str
+            ):
+                self._refuse_start_write(
+                    progress, payload, op_handle, "source_progress_gap"
+                )
+            else:
+                # Legacy peers without a control reply route cannot retry.
+                self._send_write_done(progress, remote_agent, op_handle, False)
+            return
+        self._dangling_ops.source_writes[write_id] = _SourceWriteStatus(accepted=True)
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
 
@@ -1361,6 +1419,11 @@ class _RemoteFWDram:
                 remote_agent,
                 op_handle,
                 (target_agent, self._route_generation.get(target_agent, 0)),
+                target_incarnation=(
+                    payload.get("sender_incarnation")
+                    if isinstance(payload.get("sender_incarnation"), str)
+                    else None
+                ),
             )
             return
         source_pin = _SourcePinOp(
@@ -1390,16 +1453,6 @@ class _RemoteFWDram:
 
     def _guard_event(self, event: str, op: _SourceWriteOp, count: int = 1) -> None:
         self._record_progress_counter("kvcr_guard_source_events", count, (event,))
-        logger.info(
-            "KVCR_EVENT guard_only_source event=%s source_op=%d target_op=%d "
-            "count=%d requested=%d completed_indices=%s",
-            event,
-            op.op_id[1],
-            op.op_handle,
-            count,
-            op.guard_requested_count,
-            op.completed_indices,
-        )
 
     def _start_guard_source_write(
         self,
@@ -1413,9 +1466,15 @@ class _RemoteFWDram:
         remote_agent: str,
         op_handle: int,
         route: tuple[str, int],
+        *,
+        target_incarnation: str | None = None,
     ) -> None:
         local = self._kvcr._local_dram
         claim_started = self._kvcr._timer()
+        context = capture.current()
+        if context:
+            context.keys = keys
+            context.timings['claim_begin_ns'] = time.monotonic_ns()
         selected, busy = (
             local.claim_export_subset(
                 keys,
@@ -1426,8 +1485,18 @@ class _RemoteFWDram:
             else ((), False)
         )
         claim_finished = time.monotonic()
+        if context:
+            context.timings['claim_end_ns'] = time.monotonic_ns()
         claims = tuple(claim for _, claim in selected)
         try:
+            # Claims fence the selected source memory while validating every
+            # selected destination. Non-READY destinations never reach NIXL.
+            for index, _ in selected:
+                self._kvcr._validate_descriptors(
+                    destinations[index],
+                    regions=self._remote_agents_by_target[route[0]][2],
+                    agent_name=route[0],
+                )
             op = _SourceWriteOp(
                 state=_SourceWriteState.READY_TO_WRITE,
                 op_id=op_id,
@@ -1447,11 +1516,22 @@ class _RemoteFWDram:
                 guard_accounting=claims,
                 guard_requested_count=len(keys),
                 guard_claim_started_at=claim_started,
+                nvtx_state=_NvtxState(
+                    requested_blocks=len(keys),
+                    target_incarnation=target_incarnation,
+                ) if self._nvtx is not None else None,
             )
             progress._in_flight_ops[op_id] = op
-        except BaseException:
+            capture.bind(op)
+        except BaseException as error:
             if claims:
                 local.release_export_claims(claims)
+            self._dangling_ops.source_writes.pop((route[0], op_handle), None)
+            if isinstance(error, Exception):
+                capture.reason('selected_descriptor_validation_failed')
+                logger.warning("Guard source pre-submit validation failed", exc_info=True)
+                self._send_write_done(progress, remote_agent, op_handle, False)
+                return
             raise
         if self._telemetry_enabled and claim_started is not None:
             self._progress_metrics.append(
@@ -1481,6 +1561,8 @@ class _RemoteFWDram:
         claims = op.guard_claims
         self._kvcr._local_dram.release_export_claims(claims)
         op.guard_claims = ()
+        if op._capture:
+            op._capture.timings['cleanup_done_ns'] = time.monotonic_ns()
         self._record_progress_duration(
             "guard_claim_hold", op.guard_claim_started_at, "quiesced"
         )
@@ -1489,6 +1571,11 @@ class _RemoteFWDram:
     def _guard_source_callback(self, stage: str) -> bool:
         if not self._options.guard_only_sources:
             return False
+        output = self._kvcr._compact_capture
+        if output:
+            output.invalidate('source_callback_violation:' + stage)
+            output.emit(dict(event='capture_error', agent=self._kvcr.nixl_agent_name,
+                             reason='source_callback_violation:' + stage))
         self._record_progress_counter(
             "kvcr_guard_source_events", 1, ("source_callback_violation",)
         )
@@ -2382,13 +2469,22 @@ class _RemoteFWDram:
     def _record_progress_duration(
         self, scope: str, started_at: float | None, result: str
     ) -> None:
-        if not self._telemetry_enabled or started_at is None:
+        context = capture.current() if scope == "source_write" else None
+        if context is not None and context.side != "source":
+            context = None
+        if started_at is None or (not self._telemetry_enabled and context is None):
+            return
+        sampled_at = time.monotonic()
+        if context is not None:
+            # Reuse the metric's exact sample, before finish_source/claim cleanup.
+            context.timings['core_source_write_ns'] = round(sampled_at * 1e9)
+        if not self._telemetry_enabled:
             return
         self._progress_metrics.append(
             (
                 "histogram",
                 DURATION_METRIC,
-                time.monotonic() - started_at,
+                sampled_at - started_at,
                 (scope, result),
             )
         )

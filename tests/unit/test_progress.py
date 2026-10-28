@@ -823,3 +823,28 @@ def test_loop_failure_is_reported_to_main() -> None:
     with pytest.raises(RuntimeError, match="loop failed") as exc_info:
         progress.close()
     assert exc_info.value is expected
+
+
+def test_compact_immediate_done_and_retried_release_landmarks(monkeypatch):
+    from kvcr import operation_capture as capture
+    agent = _TransferAgent()
+    agent.transfer_result = 'DONE'
+    agent.release_failures = 1
+    progress = _transfer_progress(agent)
+    clock = [100]
+    monkeypatch.setattr(progress_module.time, 'monotonic_ns', lambda: clock[0])
+    context = SimpleNamespace(timings={}, native_state=None, native_submitted=None)
+    monkeypatch.setattr(capture, 'current', lambda: context)
+    transfer_id, submitted = progress.submit_transfer('WRITE', [_mem(0)], [_mem(1, owner='remote-agent')], remote_side_agent='remote-agent')
+    assert submitted
+    assert context.timings['first_observed_done_ns'] == 100
+    assert context.native_state == 'DONE'
+    clock[0] = 200
+    assert progress.poll_transfer(transfer_id) is None
+    assert 'native_handle_released_ns' not in context.timings
+    assert transfer_id in progress._active_transfers
+    clock[0] = 300
+    assert progress.poll_transfer(transfer_id) == (True, None)
+    assert context.timings['first_observed_done_ns'] == 100
+    assert context.timings['native_handle_released_ns'] == 300
+    assert transfer_id not in progress._active_transfers
