@@ -22,7 +22,10 @@ RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
  && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}"
 WORKDIR /src/vllm-kvcr
-RUN mkdir -p /overlay \
+# Use the public channel export without changing the validated adapter revision.
+RUN sed -i 's/^from kvcr\.control_channels import ZmqPeerControlChannel$/from kvcr import ZmqPeerControlChannel/' \
+      vllm/v1/kv_offload/tiering/kvcr/manager.py \
+ && mkdir -p /overlay \
  && cp --parents \
       vllm/distributed/kv_events.py \
       vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py \
@@ -94,6 +97,7 @@ ENV DYN_REQUEST_PLANE=tcp \
 # Fail the build if an incompatible source revision displaced any part of the
 # serving path. The validated NCCL restore intentionally differs from the
 # torch wheel's declared pin, so a global `pip check` is not a useful canary.
+RUN kvcr-service --help
 RUN python3 - <<'PY'
 from importlib import metadata
 import inspect

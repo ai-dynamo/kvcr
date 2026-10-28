@@ -117,6 +117,7 @@ print("module:", path)
 print("public API:", KVCR, KVCRBindings)
 assert "site-packages" in str(path), path
 PY
+.venv/bin/kvcr-service --help
 ```
 
 Restore editable development mode after the wheel check:
@@ -215,7 +216,7 @@ The KVCR guard service owns pool lifecycle. It pre-allocates `--guard-count` Gua
 Before starting, ensure `/run/kvcr` and `/dev/shm/kvcr` exist and are writable by the user running the service:
 
 ```bash
-uv run python -m kvcr.kvcr_service \
+uv run kvcr-service \
   --socket-path /run/kvcr/memory.sock \
   --pool-dir /dev/shm/kvcr \
   --guard-count 1 \
@@ -224,6 +225,8 @@ uv run python -m kvcr.kvcr_service \
 ```
 
 The five flags above are required. Logging, heartbeat fencing, Guard startup timeout, and HTTP health options are optional.
+
+When loading a wheel through `PYTHONPATH` without installing it, use `python3 -m kvcr.service.server` with the same flags.
 
 Add `--health-port 9092` to enable read-only `GET /live` and `GET /ready` probes. The listener binds before pool allocation, to `127.0.0.1` by default; use `--health-host 0.0.0.0` for a Kubernetes probe and restrict network access to the probe port. During allocation and mapping, `/live` returns 200 and `/ready` returns 503. Both return 503 on a known failure, a dead Guard thread, a stalled Unix accept loop, or shutdown.
 
