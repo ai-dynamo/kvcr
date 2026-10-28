@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libprotobuf-dev libssl-dev libudev-dev \
     pkg-config protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
-ARG SGLANG_DYNAMO_REF=cfb35b169fb7b49350e95d22a609e49d8381928b
+ARG SGLANG_DYNAMO_REF=7369d088df9eec13ffd51474a94a5a936734f578
 RUN git init /src/dynamo \
  && git -C /src/dynamo remote add origin https://github.com/ai-dynamo/dynamo.git \
  && git -C /src/dynamo fetch --depth 1 origin "${SGLANG_DYNAMO_REF}" \
@@ -24,7 +24,7 @@ RUN /venv/bin/pip wheel --no-deps /src/dynamo --wheel-dir /wheels
 
 FROM ${SGLANG_IMAGE} AS sglang
 USER root
-ARG SGLANG_REF=e3e927225dd93fcf8b21760c217debfe1a29a10e
+ARG SGLANG_REF=d365ebdc70f6503d983d763dcb5b931e2b35af63
 ARG SGLANG_KVCR_REF=7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07
 RUN test "$(uname -m)" = x86_64 \
  && apt-get update && apt-get install -y --no-install-recommends \
