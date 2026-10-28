@@ -942,18 +942,34 @@ class _LocalDram:
         cached = residency.refs
         if isinstance(cached, tuple):
             return cached if full else tuple(cached[index] for index in indices)
+        if full:
+            result = self._full_source_refs(residency)
+            residency.refs = result
+            return result
         refs = []
-        for index in range(len(residency.slots)) if full else indices:
+        for index in indices:
             ref = cached.get(index)
             if ref is None:
-                ref = self._descriptor(*residency.slots[index])
-                if not full:
-                    cached[index] = ref
+                ref = cached[index] = self._descriptor(*residency.slots[index])
             refs.append(ref)
-        result = tuple(refs)
-        if full:
-            residency.refs = result
-        return result
+        return tuple(refs)
+
+    def _full_source_refs(
+        self, residency: _LocalDramResidency
+    ) -> tuple[_TransferRef, ...]:
+        """Build the complete tuple without publishing it to concurrent readers."""
+        cached = residency.refs
+        if isinstance(cached, tuple):
+            return cached
+        if not cached:
+            return tuple(self._descriptors(residency.slots))
+        refs = []
+        for index, location in enumerate(residency.slots):
+            ref = cached.get(index)
+            if ref is None:
+                ref = self._descriptor(*location)
+            refs.append(ref)
+        return tuple(refs)
 
     def release_sources(self, keys: Collection[BlockKey]) -> None:
         for key in keys:
@@ -1136,22 +1152,30 @@ class _LocalDram:
                 residency.remote_cancelled = False
             pending = residency.pending_labels
             newly_ready = False
-            with self._kvcr._source_lock:
-                if key_success and pending:
-                    pending_count = len(pending)
-                    if len(indices) == len(residency.slots):
-                        pending.clear()
-                    else:
-                        pending.difference_update(
-                            residency.slots[index][0] for index in indices
-                        )
-                    newly_ready = len(pending) < pending_count
-                    if newly_ready:
+            if key_success and pending:
+                ready_labels = (
+                    pending
+                    if len(indices) == len(residency.slots)
+                    else pending.intersection(
+                        residency.slots[index][0] for index in indices
+                    )
+                )
+                newly_ready = bool(ready_labels)
+                if newly_ready:
+                    complete = len(ready_labels) == len(pending)
+                    residency.prepare_label_index()
+                    prepared_refs = None
+                    if complete and self._kvcr.framework_control is not None:
+                        prepared_refs = self._full_source_refs(residency)
+                    with self._kvcr._source_lock:
+                        if prepared_refs is not None:
+                            residency.refs = prepared_refs
+                        if complete:
+                            residency.pending_labels = pending = None
+                        else:
+                            pending.difference_update(ready_labels)
                         residency.state = _LocalDramState.READY
-                        residency.prepare_label_index()
-                        if not pending and self._kvcr.framework_control is not None:
-                            self._source_refs(residency, None)
-                residency.settle()
+            residency.settle()
             if newly_ready:
                 record.last_access = now
                 if not was_ready:

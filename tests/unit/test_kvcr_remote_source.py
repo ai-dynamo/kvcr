@@ -304,11 +304,34 @@ def test_local_source_waits_for_declared_pieces(
         )
         _wait_until(lambda: len(agent.xfers) == 2)
         agent.state = "DONE"
-        completed = dict(
-            _poll_until(source, lambda _: not _has_outstanding_operations(source))
-        )
+        local_dram = source._core._local_dram
+        descriptor = local_dram._descriptor
+
+        def read_while_preparing(label, slot):
+            local_dram._descriptor = descriptor
+            control.incoming.append(
+                msgspec.msgpack.encode(
+                    message
+                    | {
+                        "op_handle": 13,
+                        "keys": [key],
+                        "dst_descriptors": [[_TransferRef("target", 0, ":a")]],
+                    }
+                )
+            )
+            # Progress must serve a ready piece while the caller builds refs.
+            _wait_until(lambda: len(agent.transfers) == 3)
+            assert [
+                ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+            ] == [b"a" * 16]
+            return descriptor(label, slot)
+
+        with patch.object(local_dram, "_descriptor", read_while_preparing):
+            completed = dict(
+                _poll_until(source, lambda _: not _has_outstanding_operations(source))
+            )
         assert completed[second][key].success
-        assert len(agent.xfers) == 3
+        assert len(agent.xfers) == 4
         assert [
             ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
         ] == [b"a" * 16, b"b" * 16]
