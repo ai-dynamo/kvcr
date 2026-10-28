@@ -58,6 +58,9 @@ class _G3Residency:
     claim_count: int = 0
 
 
+_RecoveryPreflight = Callable[[BlockKey, "_BlockRecord", _G3Residency], bool]
+
+
 @dataclass(frozen=True)
 class _Reservation:
     key: BlockKey
@@ -216,6 +219,7 @@ class _G3:
         self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
             lambda key, record: None
         )
+        self._recovery_preflight: _RecoveryPreflight | None = None
         try:
             self._open_files()
         except Exception:
@@ -223,9 +227,13 @@ class _G3:
             raise
 
     def observe_residency(
-        self, observer: Callable[[BlockKey, "_BlockRecord"], None]
+        self,
+        observer: Callable[[BlockKey, "_BlockRecord"], None],
+        *,
+        recovery_preflight: _RecoveryPreflight | None = None,
     ) -> None:
         self._residency_observer = observer
+        self._recovery_preflight = recovery_preflight
 
     @property
     def _total_slots(self) -> int:
@@ -454,7 +462,18 @@ class _G3:
     ) -> bool:
         keys = frozenset(blocks)
         reservations = self._reserve(blocks, keys)
-        if len(reservations) != len(blocks):
+        preflight = self._recovery_preflight
+        if len(reservations) != len(blocks) or (
+            preflight is not None
+            and any(
+                not preflight(
+                    item.key,
+                    self._kvcr._block_record_map[item.key],
+                    item.residency,
+                )
+                for item in reservations
+            )
+        ):
             self._rollback(reservations)
             return False
         op = _G3TransferOp(
@@ -496,7 +515,7 @@ class _G3:
         for claim in claims:
             refs = blocks[claim.key]
             indices = _layout_indices(
-                list(claim.residency.layout), [ref.label for ref in refs]
+                claim.residency.layout, [ref.label for ref in refs]
             )
             if indices is None:
                 self._release_claims((claim,))

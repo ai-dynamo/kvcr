@@ -350,6 +350,8 @@ def test_g3_multi_pool_partial_read_and_layout_mismatch(tmp_path):
     layout = ["full", "swa:a", "swa:b"]
     handle = kvcr.deposit({first: [_mem_descriptor(0, "full")]}, expected_layout=layout)
     assert dict(_poll_until(kvcr, bool))[handle][first].success
+    handle = kvcr.deposit({first: [_mem_descriptor(0, "swa:a")]})
+    assert dict(_poll_until(kvcr, bool))[handle][first].success
     handle = kvcr.fetch((first,), expected_layout=layout)
     result = dict(_poll_until(kvcr, bool))[handle][first]
     assert result.success and result.release_handle is not None

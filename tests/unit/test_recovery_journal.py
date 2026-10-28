@@ -4,6 +4,7 @@
 import logging
 import mmap
 import struct
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,10 +16,13 @@ from _kvcr_test_utils import _recovered_record
 
 from kvcr.core import _BlockRecord
 from kvcr.guard_protocol import _PoolDescriptor
-from kvcr.local_disk import _G3Residency
+from kvcr.local_disk import _G3, _G3Residency
 from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
+from kvcr.progress import _TransferRef
 from kvcr.recovery_journal import (
+    _FRAME_HEADER,
     _JOURNAL_HEADER_BYTES,
+    _MAX_FRAME_SIZE,
     _RECORD_BLOCK,
     _SNAPSHOT_HEADER,
     RecoveryJournal,
@@ -42,30 +46,6 @@ _PUBLISHED_OFFSET = 128
 _CONSUMED_OFFSET = 192
 _GENERATION = "a" * 32
 _TEST_DIGEST = "Opaque-Digest"
-
-
-def test_multi_piece_g3_recovery_round_trip():
-    record = _BlockRecord(
-        g3=_G3Residency(("full", "swa:a", "swa:b"), (1, 3, 5, 7)),
-        position=12,
-    )
-    payload = msgspec.msgpack.encode(_project_recovery_record(record))
-    assert _decode_recovery_record(payload, ("full", "swa")) == record
-
-
-@pytest.mark.parametrize(
-    "wire",
-    [
-        [None, 0, -1],
-        [None, [["full"], []], -1],
-        [None, [[], [0]], -1],
-        [None, [["missing"], [0]], -1],
-        [None, [["swa:a", "swa:a"], [0, 1]], -1],
-    ],
-)
-def test_multi_piece_g3_recovery_rejects_incomplete_or_invalid_metadata(wire):
-    with pytest.raises(ValueError):
-        _decode_recovery_record(msgspec.msgpack.encode(wire), ("full", "swa"))
 
 
 def _attachment(mapping: mmap.mmap, journal_bytes: int) -> KVCRPoolAttachment:
@@ -150,13 +130,45 @@ class _Source:
         self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
 
     def observe_residency(
-        self, observer: Callable[[BlockKey, _BlockRecord], None]
+        self,
+        observer: Callable[[BlockKey, _BlockRecord], None],
+        *,
+        recovery_preflight: object = None,
     ) -> None:
         self._observer = observer
 
     def emit(self, key: BlockKey, record: _BlockRecord) -> None:
         assert self._observer is not None
         self._observer(key, record)
+
+
+def test_g3_rejects_spill_that_would_exceed_recovery_frame(journal_and_mapping):
+    journal, _ = journal_and_mapping
+    key = BlockKey(b"large")
+    slots = tuple(range(65536, 65536 + 16385))
+    oversized = _BlockRecord(g3=_G3Residency(("full", "tiny"), slots))
+    payload = msgspec.msgpack.encode(_project_recovery_record(oversized))
+    assert _FRAME_HEADER.size + len(key) + len(payload) > _MAX_FRAME_SIZE
+
+    core = Mock(_block_record_map={key: _BlockRecord()})
+    core._descriptor_bytes.return_value = len(slots) * mmap.PAGESIZE
+    # Avoid preallocating a large real file; this exercises reservation admission.
+    g3 = object.__new__(_G3)
+    g3._kvcr = core
+    g3._slot_size = mmap.PAGESIZE
+    g3._free_slots = deque(slots)
+    g3._evictable_slots = 0
+    g3._pending_keys = set()
+    _attach_journal(_Source(), journal, g3)
+    assert g3._recovery_preflight(
+        key, core._block_record_map[key], _G3Residency(("full", "tiny"), (0, 1))
+    )
+
+    refs = [_TransferRef("local", 0, "full"), _TransferRef("local", 0, "tiny")]
+    assert not g3._start_store(("g3_store", key), {key: refs}, float("inf"))
+    assert not journal.is_invalid()
+    assert journal._published.load_acquire() == 0
+    assert len(g3._free_slots) == len(slots) and not g3._pending_keys
 
 
 def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(

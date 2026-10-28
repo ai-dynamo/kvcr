@@ -79,6 +79,18 @@ _FULLY_LOADED_RECORD = _BlockRecord(
             [None, [[""], [5]], 6],
             replace(_recovered_record(g3=5), position=6),
         ),
+        (
+            _BlockRecord(
+                g3=_G3Residency(("full", "swa:a", "swa:b"), (1, 3, 5, 7)),
+                position=12,
+            ),
+            _TWO_POOLS,
+            [None, [["full", "swa:a", "swa:b"], [1, 3, 5, 7]], 12],
+            _BlockRecord(
+                g3=_G3Residency(("full", "swa:a", "swa:b"), (1, 3, 5, 7)),
+                position=12,
+            ),
+        ),
         # A G2 slot still FILLING or DISCARDING never settled, so it must not wire.
         (
             _BlockRecord(
@@ -161,6 +173,11 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
         msgspec.msgpack.encode([[["", -1]], None]),
         msgspec.msgpack.encode([[], None]),
         msgspec.msgpack.encode([None, [[""], [5]], -2]),
+        msgspec.msgpack.encode([None, 0, -1]),
+        msgspec.msgpack.encode([None, [[""], []], -1]),
+        msgspec.msgpack.encode([None, [[], [0]], -1]),
+        msgspec.msgpack.encode([None, [["missing"], [0]], -1]),
+        msgspec.msgpack.encode([None, [[":a", ":a"], [0, 1]], -1]),
     ],
 )
 def test_mirror_rejects_malformed_or_unknown_wire_state(payload: bytes) -> None:

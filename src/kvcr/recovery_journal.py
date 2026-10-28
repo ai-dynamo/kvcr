@@ -438,7 +438,17 @@ def _attach_journal(
                 journal.invalidate()
 
     if g3 is not None:
-        g3.observe_residency(publish)
+
+        def preflight(key: BlockKey, record: _BlockRecord, disk: _G3Residency) -> bool:
+            candidate = msgspec.structs.replace(record, g3=disk)
+            payload = _RECOVERY_ENCODER.encode(_project_recovery_record(candidate))
+            size = _FRAME_HEADER.size + len(key) + len(payload)
+            return (
+                size <= _MAX_FRAME_SIZE
+                and size + (-size % _ALIGNMENT) <= journal._capacity
+            )
+
+        g3.observe_residency(publish, recovery_preflight=preflight)
     local_dram.observe_residency(publish)
 
 
