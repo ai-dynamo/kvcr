@@ -439,13 +439,22 @@ def _metric_totals(stats):
 @pytest.mark.parametrize(
     ("settings", "expected"),
     [
-        ({}, {"use_aio": "true"}),
-        ({"backend": "GDS_MT"}, {}),
-        ({"backend_options": {"use_aio": "true"}}, {"use_aio": "true"}),
-        ({"backend_options": {"use_uring": "true"}}, {"use_uring": "true"}),
-        ({"backend_options": {"use_uring": "false"}}, {"use_uring": "false"}),
+        ({}, {}),
+        ({"backend": "POSIX"}, {"use_aio": "true"}),
         (
-            {"backend_options": {"kernel_queue_size": "32"}},
+            {"backend": "POSIX", "backend_options": {"use_aio": "true"}},
+            {"use_aio": "true"},
+        ),
+        (
+            {"backend": "POSIX", "backend_options": {"use_uring": "true"}},
+            {"use_uring": "true"},
+        ),
+        (
+            {"backend": "POSIX", "backend_options": {"use_uring": "false"}},
+            {"use_uring": "false"},
+        ),
+        (
+            {"backend": "POSIX", "backend_options": {"kernel_queue_size": "32"}},
             {"use_aio": "true", "kernel_queue_size": "32"},
         ),
     ],
@@ -458,7 +467,7 @@ def test_g3_backend_defaults_and_overrides(tmp_path, settings, expected, existin
         capacity_bytes_per_file=os.sysconf("SC_PAGE_SIZE"),
         **settings,
     )
-    assert config.backend == settings.get("backend", "POSIX")
+    assert config.backend == settings.get("backend", "GDS_MT")
     assert dict(config.backend_options) == original
     agent = Mock(
         backends={config.backend: expected} if existing else {},

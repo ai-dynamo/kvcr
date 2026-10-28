@@ -268,6 +268,7 @@ def test_g3_claim_normalizes_equivalent_backend_defaults(
     g3 = G3Options(
         paths=(tmp_path / "g3.data",),
         capacity_bytes_per_file=mmap.PAGESIZE,
+        backend="POSIX",
         backend_options=options,
     )
     layouts = [(pool.name, mmap.PAGESIZE) for pool in _WIRE_POOLS]

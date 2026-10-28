@@ -424,7 +424,7 @@ For several local DP ranks, provide one `control_ports` entry per local rank in 
 
 The secondary tier can optionally own local G2 capacity through `secondary_g2_slots`, attach to a service-owned pool through `kvcr_service_socket_path` together with `compatibility_digest`, or configure file-backed storage through `g3`. `g3.capacity_bytes_per_file` is rounded down to allocation units (the greatest common divisor of the pool block sizes) and must fit at least one unit. Existing nonempty files must match the rounded capacity. The vLLM adapter uses one unnamed pool per Guard, so start the guard service with one pool size, for example `--pool-sizes-gb 48`. Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes precedence over an in-process `secondary_g2_slots` allocation. Policy names and diagnostic options must match the KVCR and vLLM revisions being tested.
 
-G3 uses the NIXL `POSIX` backend by default; set `g3.backend` to select another backend.
+G3 defaults to NIXL `GDS_MT`. Set `g3.backend="POSIX"` for G3 to G2 (host DRAM) reads; direct GPU delivery requires `GDS_MT`.
 
 The worker configuration enables its side of the contract. Dynamo must still run a KV-aware router that consumes KV events, selects a source and destination, and places the resulting plan in the request metadata. A plain round-robin router does not create KVCR source hints.
 

@@ -58,7 +58,7 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
 
     paths: tuple[Path, ...]
     capacity_bytes_per_file: int
-    backend: str = "POSIX"
+    backend: str = "GDS_MT"
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
 
 

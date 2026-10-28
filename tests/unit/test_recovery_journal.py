@@ -64,9 +64,12 @@ def _attachment(mapping: mmap.mmap, journal_bytes: int) -> KVCRPoolAttachment:
 
 
 @pytest.fixture
-def journal_and_mapping() -> Iterator[tuple[RecoveryJournal, mmap.mmap]]:
-    mapping = mmap.mmap(-1, _TEST_JOURNAL_BYTES + mmap.PAGESIZE)
-    journal = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
+def journal_and_mapping(
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[RecoveryJournal, mmap.mmap]]:
+    journal_bytes = getattr(request, "param", _TEST_JOURNAL_BYTES)
+    mapping = mmap.mmap(-1, journal_bytes + mmap.PAGESIZE)
+    journal = RecoveryJournal(_attachment(mapping, journal_bytes))
     journal.reset()
     try:
         yield journal, mapping
@@ -142,13 +145,24 @@ class _Source:
         self._observer(key, record)
 
 
-def test_g3_rejects_spill_that_would_exceed_recovery_frame(journal_and_mapping):
+@pytest.mark.parametrize(
+    ("slot_count", "journal_and_mapping"),
+    [(16385, _JOURNAL_HEADER_BYTES + 128 * 1024), (1024, _TEST_JOURNAL_BYTES)],
+    indirect=["journal_and_mapping"],
+    ids=["frame-limit", "capacity-limit"],
+)
+def test_g3_rejects_spill_that_would_exceed_recovery_frame(
+    journal_and_mapping, slot_count
+):
     journal, _ = journal_and_mapping
     key = BlockKey(b"large")
-    slots = tuple(range(65536, 65536 + 16385))
+    slots = tuple(range(65536, 65536 + slot_count))
     oversized = _BlockRecord(g3=_G3Residency(("full", "tiny"), slots))
     payload = msgspec.msgpack.encode(_project_recovery_record(oversized))
-    assert _FRAME_HEADER.size + len(key) + len(payload) > _MAX_FRAME_SIZE
+    size = _FRAME_HEADER.size + len(key) + len(payload)
+    exceeds_frame = size > _MAX_FRAME_SIZE
+    exceeds_capacity = (size + 7) // 8 * 8 > journal._capacity
+    assert exceeds_frame != exceeds_capacity
 
     core = Mock(_block_record_map={key: _BlockRecord()})
     core._descriptor_bytes.return_value = len(slots) * mmap.PAGESIZE
