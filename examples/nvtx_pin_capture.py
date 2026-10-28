@@ -16,9 +16,8 @@ from contextlib import ExitStack
 
 import msgspec
 
-from kvcr import KVCR, KVCRBindings
+from kvcr import KVCR, KVCRBindings, ZmqPeerControlChannel
 from kvcr.config import KVCRBackendConfigs, KVCRConfig, RemoteFWDramOptions
-from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.types import BlockKey, MemoryRef, PinRequestId, RegionDescriptor
 
 

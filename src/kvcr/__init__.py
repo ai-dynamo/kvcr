@@ -16,6 +16,7 @@ from .control_channels import (
     KVCRMsgFramingError,
     KVCRServiceError,
     KVCRSocketError,
+    ZmqPeerControlChannel,
 )
 from .guard_protocol import (
     KVCRClient,
@@ -38,4 +39,5 @@ __all__ = [
     "ROUTER_HINT_CAPABILITIES",
     "ROUTER_HINT_KEY",
     "KVCRSocketError",
+    "ZmqPeerControlChannel",
 ]
