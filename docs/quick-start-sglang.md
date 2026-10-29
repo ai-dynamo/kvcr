@@ -35,15 +35,15 @@ DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
 export QS_IMAGE_ID="$(docker image inspect "$QS_TAG" --format '{{.Id}}')"
 ```
 
-The per-run image tag avoids overwriting an existing local build. This recipe builds Dynamo and installs full pinned SGLang/KVCR sources; no private image or credentials are required. Keep these revisions together:
+The per-run image tag avoids overwriting an existing local build. This recipe builds Dynamo and installs pinned SGLang sources, then builds and installs KVCR from the local checkout supplied as the Docker build context (`.`). Local changes to KVCR source are included; the build does not fetch a separate KVCR revision or install a published KVCR wheel. Its package version comes from the checkout's `pyproject.toml`, not a Git tag. No private image or credentials are required.
 
 | Component | Revision |
 | --- | --- |
-| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache/inventory integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `4a083003f9393b758077afe9bbce3f6b1c64f790` |
+| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache/inventory integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `0d37a2bf4db3521a876d1b450a884b91c0e334c9` |
 | Dynamo main with router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) and owned inventory [#17531](https://github.com/ai-dynamo/dynamo/pull/17531) | `83ea37e849e883c27d7ed848e0f329961e1fb173` |
-| KVCR main | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
+| KVCR | Local build-context checkout, including local source changes |
 
-The SGLang revision is a public PR head, while the Dynamo revision is a pinned main commit; neither is a released package. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
+The SGLang revision is a public PR head, while the Dynamo revision is a pinned main commit; neither is a released package. SGLang #45647 includes its #45646 parent, but not the optional performance PR #45649. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
 
 Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`. The vLLM image has a separate [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-vllm); neither build installs both serving runtimes into one image.
 

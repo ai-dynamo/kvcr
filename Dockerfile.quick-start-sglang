@@ -24,8 +24,7 @@ RUN /venv/bin/pip wheel --no-deps /src/dynamo --wheel-dir /wheels
 
 FROM ${SGLANG_IMAGE} AS sglang
 USER root
-ARG SGLANG_REF=4a083003f9393b758077afe9bbce3f6b1c64f790
-ARG SGLANG_KVCR_REF=7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07
+ARG SGLANG_REF=0d37a2bf4db3521a876d1b450a884b91c0e334c9
 RUN test "$(uname -m)" = x86_64 \
  && apt-get update && apt-get install -y --no-install-recommends \
     git curl libatomic1 libhwloc15 libnuma1 libssl3t64 libudev1 \
@@ -34,12 +33,10 @@ RUN git init /opt/sglang-src \
  && git -C /opt/sglang-src remote add origin https://github.com/ziqifan617/sglang.git \
  && git -C /opt/sglang-src fetch --depth 1 origin "${SGLANG_REF}" \
  && git -C /opt/sglang-src checkout --detach FETCH_HEAD \
- && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${SGLANG_REF}" \
- && git init /opt/kvcr-src \
- && git -C /opt/kvcr-src remote add origin https://github.com/ai-dynamo/kvcr.git \
- && git -C /opt/kvcr-src fetch --depth 1 origin "${SGLANG_KVCR_REF}" \
- && git -C /opt/kvcr-src checkout --detach FETCH_HEAD \
- && test "$(git -C /opt/kvcr-src rev-parse HEAD)" = "${SGLANG_KVCR_REF}"
+ && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${SGLANG_REF}"
+# Install KVCR from the checkout used as the Docker build context.
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
+COPY src /opt/kvcr-src/src
 COPY --from=sglang-dynamo-builder /wheels /tmp/dynamo-wheels
 COPY <<'EOF' /opt/sglang-constraints.txt
 torch==2.14.1
@@ -88,12 +85,14 @@ ENV DYN_REQUEST_PLANE=tcp DYN_EVENT_PLANE=zmq DYN_DISCOVERY_BACKEND=file \
 RUN python3 - <<'PY'
 from importlib import metadata
 from pathlib import Path
+import tomllib
 import dynamo.sglang
 import torch
 from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
 from dynamo.llm import WorkerType
 from dynamo.sglang import kv_hints
 from dynamo.sglang.state_agent import StateAgentLifecycle
+from kvcr import ZmqPeerControlChannel
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
 
@@ -107,9 +106,11 @@ assert KV_HINT_TRANSFER_CAPABILITY_KEY == 'router_hint'
 assert callable(KVCRStore.batch_get_v1)
 assert callable(HiCacheStorage.get_kv_hint_source)
 assert callable(StateAgentLifecycle.start)
+assert callable(ZmqPeerControlChannel)
 assert metadata.version('ai-dynamo') == '1.7.0'
 assert metadata.version('ai-dynamo-runtime') == '1.7.0'
-assert metadata.version('kvcr') == '0.1.1'
+kvcr_project = tomllib.loads(Path('/opt/kvcr-src/pyproject.toml').read_text())['project']
+assert metadata.version('kvcr') == kvcr_project['version']
 print('SGLang HiCache import/version checks passed; GPU verification still required')
 PY
 RUN python3 -m pip freeze --all > /opt/sglang-installed-packages.txt
