@@ -94,14 +94,21 @@ class _CountingLock:
         return self._inner.release()
 
 
-def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch):
+@pytest.mark.parametrize("mode", [None, "copy", "move"])
+def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch, mode):
     kvcr, results = _fetch_kvcr(monkeypatch)
     lock = _CountingLock(kvcr._core._state_lock)
     kvcr._core._state_lock = lock
 
-    kvcr.submit_hint(_router_hint("tcp://a:1", (1,)), "req")
+    hint = _router_hint("tcp://a:1", (1,))
+    if mode is not None:
+        hint.actions[0].payload["mode"] = mode
+    kvcr.submit_hint(hint, "req")
 
     assert lock.entries == 0
+    assert kvcr._core._move_handler._request_ids == (
+        {"req"} if mode == "move" else set()
+    )
     assert kvcr.query((_key(1),), "req") == [_FETCHABLE]
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, "req")]
 
@@ -154,3 +161,28 @@ def test_fetch_hint_without_request_id_is_accepted(monkeypatch):
     kvcr.submit_hint(_router_hint("tcp://a:1", (1,)))
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, None)]
     assert not kvcr._core._remote_fw_dram._request_hints
+
+
+@pytest.mark.parametrize("copy_mode", [None, "copy"])
+def test_later_fetch_hint_replaces_move_intent_and_discard_clears_it(
+    monkeypatch, copy_mode
+):
+    kvcr, results = _fetch_kvcr(monkeypatch)
+    moved = _fetch("move-1", "tcp://a:1", [1])
+    moved.payload["mode"] = "move"
+    copied = _fetch("copy-1", "tcp://a:1", [2])
+    if copy_mode is not None:
+        copied.payload["mode"] = copy_mode
+
+    kvcr.submit_hint(_fetch_envelope(moved), "req")
+    assert kvcr._core._move_handler._request_ids == {"req"}
+    kvcr.submit_hint(_fetch_envelope(copied), "req")
+    assert not kvcr._core._move_handler._request_ids
+    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _FETCHABLE]
+
+    kvcr.submit_hint(_fetch_envelope(moved), "req")
+    assert kvcr._core._move_handler._request_ids == {"req"}
+    kvcr.discard_hint("req")
+    assert not kvcr._core._move_handler._request_ids
+    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _MISS]
+    assert all(r.status is HintStatus.ACCEPTED for r in results)

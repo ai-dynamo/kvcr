@@ -335,6 +335,10 @@ class _RemoteFWDram:
             elif isinstance(item, _SourceWriteOp):
                 self._sources.finish_source_write(item)
             elif isinstance(item, _TargetPullOp):
+                if self._kvcr._move_handler._target_transfers and (
+                    item.state is _TargetPullState.FINISHED
+                ):
+                    self._kvcr._move_handler._target_transfers.pop(item.op_id[1], None)
                 if item.state is _TargetPullState.WAITING_TERMINAL:
                     if not item.local_fill:
                         raise RuntimeError(
@@ -356,6 +360,8 @@ class _RemoteFWDram:
                     )
             elif isinstance(item, _ProgressUpdate):
                 self._apply_progress_update(item)
+            elif isinstance(item, _StartWrite):
+                self._kvcr._move_handler.source_cached(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -471,6 +477,14 @@ class _RemoteFWDram:
                 ):
                     continue
                 self._send_control(progress, item.endpoint, _TargetMetadata())
+            elif isinstance(item, _StartWrite):
+                # Cached copies need only source-removal intent. There is no
+                # remote write to await and no public result depends on a reply.
+                if not self._send_control(progress, item.source_control_endpoint, item):
+                    logger.warning(
+                        "KVCR cached move could not reach %s",
+                        item.source_control_endpoint,
+                    )
             else:
                 raise TypeError(f"unsupported KVCR progress item: {type(item)!r}")
 
@@ -713,15 +727,26 @@ class _RemoteFWDram:
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
         dst_descriptors = payload.dst_descriptors
+        valid_layout = (
+            self._kvcr._move_handler.validate_request(payload)
+            if payload.move_keys
+            else len(keys) == len(dst_descriptors)
+        )
         if (
             not math.isfinite(remaining_timeout_ms)
             or remaining_timeout_ms <= 0
             or not keys
             or len(key_set := frozenset(keys)) != len(keys)
-            or len(keys) != len(dst_descriptors)
+            or not valid_layout
         ):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
+            return
+
+        if payload.move_keys and not any(dst_descriptors):
+            # The destination already holds every requested key. Queue source
+            # removal only; no data transfer or completion reply is needed.
+            self._progress_outbound.append(payload)
             return
 
         remaining_timeout_ms = min(
@@ -736,7 +761,9 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            for descriptors in dst_descriptors:
+            for descriptors in (
+                filter(None, dst_descriptors) if payload.move_keys else dst_descriptors
+            ):
                 self._kvcr._validate_descriptors(
                     descriptors,
                     regions=self._remote_agents_by_target[target_agent][2],
@@ -781,6 +808,15 @@ class _RemoteFWDram:
         self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
+        if payload.move_keys:
+            self._kvcr._move_handler._source_transfers[op_id] = payload.move_keys
+            if not all(dst_descriptors):
+                # Some keys are already cached at the destination. Queue their
+                # source removal separately, then write only the missing keys.
+                self._progress_outbound.append(payload)
+                keys = tuple(key for key, refs in zip(keys, dst_descriptors) if refs)
+                dst_descriptors = tuple(refs for refs in dst_descriptors if refs)
+                key_set = frozenset(keys)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -850,6 +886,7 @@ class _RemoteFWDram:
                         else _nvtx.Reason.ROUTE_CHANGED
                     )
                 failure.progress(progress, None)
+                self._kvcr._move_handler._source_transfers.pop(op.op_id, None)
                 observed_work = True
                 continue
             prepared = self._try_local_source_write(progress, op)

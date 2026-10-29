@@ -394,10 +394,12 @@ class _RecoveryMirror:
                     local_dram.claim_count = 0
                     local_dram.source_readers = 0
                     local_dram.retire_on_release = False
+                    local_dram.retention_handles = None
                     # References name the previous agent, unlike the slot layout.
                     local_dram.refs = {}
             if record.g3 is not None:
                 record.g3.claim_count = 0
+            record.pending_invalidation = False
             record.fw_mem = None
             record.in_flight_ops = None
             record.access_count = 0
