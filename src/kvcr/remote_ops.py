@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 
 from . import _nvtx
+from . import operation_capture as capture
 from .core import TRANSFER_BLOCKS_METRIC, logger
 from .local_dram import _GuardExportClaim
 from .progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
@@ -37,6 +38,8 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     key_layout: tuple[str, ...] = ()
     source_incarnation: str | None = None
+    telemetry_request_key: str | None = None
+    request_id: str | None = None
 
 
 class _TargetMetadata(_PeerMessage, tag="target_metadata"):
@@ -118,12 +121,28 @@ class _TargetPullOp(_RemoteOp):
     uncertain: bool = False
     retried: bool = False
 
+    _capture: Any = field(default=None, repr=False, compare=False)
+
+    @capture.operation
     def progress(
         self, progress: _KVCRProgress, event: object | None
     ) -> tuple[bool, bool]:
         backend = self._backend
         now = backend._kvcr._clock()
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
+        if (
+            self.state is _TargetPullState.WAITING_WRITE_DONE
+            and isinstance(event, Mapping)
+            and event.get("success") is False
+        ):
+            capture.reason("peer_write_failed")
+        if (
+            cancelled
+            and self.state
+            not in (_TargetPullState.WAITING_TERMINAL, _TargetPullState.QUARANTINED)
+            and event.get("success") is not False
+        ):
+            capture.reason("target_cancelled")
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
         if (
             self.state is _TargetPullState.WAITING_WRITE_DONE
@@ -150,6 +169,7 @@ class _TargetPullOp(_RemoteOp):
                 # A stale ACK from the dead peer may have re-acked the endpoint.
                 backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
             if now >= self.deadline:
+                capture.reason("target_deadline_expired")
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -161,12 +181,17 @@ class _TargetPullOp(_RemoteOp):
                     op_handle=self.op_id[1],
                     remaining_timeout_ms=(self.deadline - now) * 1000,
                     source_incarnation=self.source_incarnation,
+                    request_id=self.request_id,
                     keys=self.ordered_keys,
                     dst_descriptors=self.dst_descriptors,
                     key_layout=self.key_layout if self.local_fill else (),
+                    telemetry_request_key=self._capture.operation_key
+                    if self._capture
+                    else None,
                 ),
             )
             if not sent:
+                capture.reason("control_enqueue_failed")
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -188,6 +213,11 @@ class _TargetPullOp(_RemoteOp):
                 backend._dangling_ops.report_target(self, "quiesced")
                 self.state = _TargetPullState.FINISHED
                 return True, True
+            if self.state is _TargetPullState.WAITING_WRITE_DONE:
+                if self.local_fill and now >= self.deadline:
+                    capture.reason("target_deadline_expired")
+                elif event.get("success") is not True:
+                    capture.reason("peer_write_failed")
             # After cancellation, native success only permits cleanup.
             success = (
                 event.get("success") is True
@@ -206,6 +236,7 @@ class _TargetPullOp(_RemoteOp):
                 else:
                     completed_keys = set()
             except TypeError:
+                capture.reason("invalid_completed_indices")
                 success = False
                 completed_keys = set()
             all_completed = success and completed_keys == self.keys
@@ -255,6 +286,8 @@ class _TargetPullOp(_RemoteOp):
         if now >= self.deadline or (
             cancelled and self.state is _TargetPullState.WAITING_WRITE_DONE
         ):
+            if now >= self.deadline:
+                capture.reason("target_deadline_expired")
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 self.state = _TargetPullState.QUARANTINED
                 backend._dangling_ops.poll_target(progress, self)
@@ -281,6 +314,7 @@ class _TargetPullOp(_RemoteOp):
             return False, self.probe_sent
         return False, False
 
+    @capture.operation
     def close(self, progress: _KVCRProgress) -> bool:
         # Shutdown must not release destinations still awaiting a remote write.
         return self.state in (_TargetPullState.START_WRITE, _TargetPullState.FINISHED)
@@ -318,6 +352,9 @@ class _SourceWriteOp(_RemoteOp):
     guard_requested_count: int = 0
     guard_claim_started_at: float | None = None
 
+    _capture: Any = field(default=None, repr=False, compare=False)
+
+    @capture.operation
     def progress(
         self, progress: _KVCRProgress, _event: object | None
     ) -> tuple[bool, bool]:
@@ -339,6 +376,15 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
+                capture.reason(
+                    "source_cancelled"
+                    if status.cancel_requested
+                    else "source_stalled"
+                    if not source_responsive
+                    else "source_deadline_expired"
+                    if self.state is not _SourceWriteState.NOTIFY_FAILURE
+                    else "source_pre_submit_failure"
+                )
                 if trace is not None:
                     if status.cancel_requested:
                         failure_reason = _nvtx.Reason.CANCELLED
@@ -373,10 +419,12 @@ class _SourceWriteOp(_RemoteOp):
                 # same handle back for a reused name. The target hears a
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
+                capture.reason("route_generation_changed")
                 if trace is not None:
                     trace.reject("source.write.refused", _nvtx.Reason.ROUTE_CHANGED)
                 return False, True
             if not self.src_descriptors:
+                capture.reason("guard_ready_miss")
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, True
                 )
@@ -404,7 +452,8 @@ class _SourceWriteOp(_RemoteOp):
                         True,
                         completed_indices=self.completed_indices,
                     ),
-                    capture_telemetry=backend._telemetry_enabled,
+                    capture_telemetry=backend._telemetry_enabled
+                    or self._capture is not None,
                     trace=trace,
                 )
                 self.transfer_id = transfer_id
@@ -418,6 +467,7 @@ class _SourceWriteOp(_RemoteOp):
                     "transfer_submit", submit_started_at, result
                 )
                 if not submitted:
+                    capture.reason("native_submission_failed")
                     logger.warning(
                         "KVCR start_write submission failed for op=%d",
                         self.op_handle,
@@ -463,6 +513,11 @@ class _SourceWriteOp(_RemoteOp):
             status.cancel_requested or backend._kvcr._clock() >= self.deadline
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
+            capture.reason(
+                "source_cancelled"
+                if status.cancel_requested
+                else "source_deadline_expired"
+            )
             if trace is not None:
                 trace.mark(
                     "source.write.cancel_requested",
@@ -485,6 +540,8 @@ class _SourceWriteOp(_RemoteOp):
             return False, observed_work
         self.transfer_id = None
         success, telemetry = transfer_result
+        if self._capture:
+            self._capture.native = telemetry
         self.success = success and not cancelling
         if self.success:
             backend._record_transfer_telemetry(telemetry)
@@ -518,6 +575,7 @@ class _SourceWriteOp(_RemoteOp):
             trace.complete_source(self.success, len(self.source_keys))
         return True, True
 
+    @capture.operation
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
         if self.transfer_id is not None:

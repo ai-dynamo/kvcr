@@ -18,7 +18,7 @@ import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
-from . import _nvtx
+from . import _nvtx, compact_telemetry, operation_capture
 from .types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,7 @@ class _TransferState:
     outcome: bool | None = None
     telemetry: Any | None = None
     next_release_log_at: float = 0.0
+    capture_context: Any = None
     trace: _nvtx._LifecycleTrace | None = None
 
 
@@ -175,6 +176,7 @@ class _KVCRProgress:
         )
         self._failure: BaseException | None = None
         self._stop_requested = False
+        self._capture_writer = compact_telemetry.writer()
         self._startup_stage = "thread startup"
         self._startup_timeout_seconds = startup_timeout_seconds
 
@@ -211,7 +213,18 @@ class _KVCRProgress:
         if outcome is None or (require_completion and not outcome):
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
+                if state.capture_context:
+                    state.capture_context.native_state = xfer_state
+                    if xfer_state not in ("PROC", "PEND", "DONE"):
+                        operation_capture.reason("native_state:" + str(xfer_state))
+                if xfer_state == "DONE" and state.capture_context:
+                    state.capture_context.timings.setdefault(
+                        "first_observed_done_ns", time.monotonic_ns()
+                    )
             except Exception as error:
+                operation_capture.reason(
+                    f"native_poll_exception:{type(error).__name__}"
+                )
                 if isinstance(error, nixlRemoteDisconnectError):
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                     # NIXL keeps this as the handle's final status; releasing it
@@ -249,6 +262,14 @@ class _KVCRProgress:
                 return None
             outcome = xfer_state == "DONE" and state.outcome is not False
             state.outcome = outcome
+        if state.capture_context:
+            if outcome:
+                state.capture_context.timings.setdefault(
+                    "first_observed_done_ns", time.monotonic_ns()
+                )
+            state.capture_context.native_state = state.capture_context.native_state or (
+                "DONE" if outcome else "ERR"
+            )
         if outcome and state.capture_telemetry:
             get_telemetry = getattr(agent, "get_xfer_telemetry", None)
             if get_telemetry is not None:
@@ -261,6 +282,7 @@ class _KVCRProgress:
             return None
         return bool(outcome), state.telemetry
 
+    @operation_capture.native_submit
     def submit_transfer(
         self,
         operation: str,
@@ -315,12 +337,19 @@ class _KVCRProgress:
             state = _TransferState(
                 handle, remote_side_agent, capture_telemetry, trace=trace
             )
+            state.capture_context = operation_capture.current()
             self._active_transfers[transfer_id] = state
             if trace is not None:
                 trace.start("nixl.write", transfer_id=transfer_id)
             submitted = True
             try:
                 post_state = agent.transfer(handle)
+                if state.capture_context:
+                    state.capture_context.native_state = post_state
+                    if post_state == "DONE":
+                        state.capture_context.timings.setdefault(
+                            "first_observed_done_ns", time.monotonic_ns()
+                        )
                 if post_state == "DONE":
                     state.outcome = True
                 elif post_state == "ERR":
@@ -513,6 +542,10 @@ class _KVCRProgress:
                     reason=_nvtx.Reason.RELEASE_ERROR,
                 )
             return False
+        if state.capture_context:
+            state.capture_context.timings["native_handle_released_ns"] = (
+                time.monotonic_ns()
+            )
         self._active_transfers.pop(transfer_id, None)
         if state.trace is not None:
             state.trace.mark(
@@ -695,6 +728,7 @@ class _KVCRProgress:
                 raise RuntimeError("KVCR progress operations did not close")
             time.sleep(_IDLE_WAIT_SECONDS)
 
+    @operation_capture.progress_turn
     def _run_one_iteration(self) -> bool:
         published = self._publish_completed(self._batch_size)
         submissions: list[object] = []
@@ -772,6 +806,8 @@ class _KVCRProgress:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)
         if get_agent_metadata is not None:
             self._nixl_agent_metadata = get_agent_metadata()
+        if self._capture_writer and self._nixl_agent_metadata is not None:
+            self._capture_writer.identity_ready(self.nixl_agent_name)
 
     def _close_nixl(self) -> None:
         if self._active_transfers:

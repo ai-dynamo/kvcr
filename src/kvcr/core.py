@@ -200,6 +200,9 @@ class _KVCRCore:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")
 
         self.nixl_agent_name = self.config.nixl_agent_name
+        from .compact_telemetry import writer
+
+        self._compact_capture = writer()
         self._key_history_enabled = os.getenv(
             "KVCR_KEY_HISTORY"
         ) == "1" and logger.isEnabledFor(logging.DEBUG)
@@ -503,6 +506,8 @@ class _KVCRCore:
                 remote_keys.add(key)
             else:
                 statuses.append((QueryStatus.MISS, None))
+        if self._compact_capture:
+            self._compact_capture.query_counts(self.nixl_agent_name, statuses)
         if self._query_diagnostics is not None:
             self._log_query_diagnostics(statuses, request_id)
         return statuses
