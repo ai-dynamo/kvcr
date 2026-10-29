@@ -4,8 +4,7 @@
 
 ARG VLLM_IMAGE=vllm/vllm-openai:nightly-edad8b03c5285a1c12e7e4f83c1af709b319a01b@sha256:2e735ffeef26457f8a3ff44a62ae182870b10af37adc06ecbb08baca152365c6
 
-# The vLLM image, adapter source, and Dynamo revision below are one validated
-# compatibility set. Change them together and repeat the end-to-end test.
+# Keep the vLLM image, adapter source, and Dynamo revision compatible.
 FROM rust:1.93-bookworm AS build-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libprotobuf-dev libudev-dev pkg-config \
@@ -22,7 +21,7 @@ RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
  && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}"
 WORKDIR /src/vllm-kvcr
-# Use the public channel export without changing the validated adapter revision.
+# Use the public channel export.
 RUN sed -i 's/^from kvcr\.control_channels import ZmqPeerControlChannel$/from kvcr import ZmqPeerControlChannel/' \
       vllm/v1/kv_offload/tiering/kvcr/manager.py \
  && mkdir -p /overlay \
@@ -56,9 +55,7 @@ FROM ${VLLM_IMAGE}
 USER root
 ARG NCCL_VERSION=2.30.7
 
-# KVCR's recovery journal reaches libatomic for the 8-byte acquire/release
-# cursor operations CPython does not expose. The runtime image needs it even
-# though it is not a Python distribution and cannot be a pyproject dependency.
+# KVCR's recovery journal requires libatomic at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
  && rm -rf /var/lib/apt/lists/*
 
@@ -79,9 +76,7 @@ RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
  && python3 -m pip install --no-cache-dir \
       "nvidia-nccl-cu13==${NCCL_VERSION}"
 
-# Overlay the six vLLM files fetched from the public KVCR integration commit.
-# The quick start pins that commit and this base image as one validated
-# compatibility set.
+# Overlay the adapter files from the pinned vLLM integration commit.
 COPY --from=vllm-kvcr-source /overlay/vllm /tmp/kvcr-vllm-overlay/vllm
 RUN VLLM_DIR="$(python3 -c 'import os, vllm; print(os.path.dirname(vllm.__file__))')" \
  && cp -a /tmp/kvcr-vllm-overlay/vllm/. "${VLLM_DIR}/" \
@@ -94,9 +89,7 @@ ENV DYN_REQUEST_PLANE=tcp \
     PYTHONHASHSEED=0 \
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1
 
-# Fail the build if an incompatible source revision displaced any part of the
-# serving path. The validated NCCL restore intentionally differs from the
-# torch wheel's declared pin, so a global `pip check` is not a useful canary.
+# Check serving-path compatibility; NCCL is pinned separately from torch.
 RUN kvcr-service --help
 RUN python3 - <<'PY'
 from importlib import metadata

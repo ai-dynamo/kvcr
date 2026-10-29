@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Choose the inference engine you want to evaluate:
 
-- [vLLM + Dynamo](quick-start-vllm.md): the existing public-preview integration.
-- [SGLang HiCache + Dynamo](quick-start-sglang.md): draft build, launch and peer-transfer walkthrough.
+- [vLLM + Dynamo](quick-start-vllm.md)
+- [SGLang HiCache + Dynamo](quick-start-sglang.md)
 
-Each guide states its own validation status and hardware/version boundary. The engines use different adapters; do not mix their images or configuration. For API development, see the [developer guide](dev-guide.md).
+The engines use different adapters, images and configurations. For API development, see the [developer guide](dev-guide.md).

@@ -7,6 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 
 Build and run Dynamo, SGLang and KVCR without editing their serving code. SGLang stages KV through HiCache host memory; KVCR stores it in a separate DRAM pool. A Dynamo state agent indexes KVCR-owned blocks so the router can generate source hints for peer delivery.
 
+> [!IMPORTANT]
+> This integration is a preview built from pinned source revisions, including the open SGLang PR below.
+
 For vLLM, use the [vLLM quick start](quick-start-vllm.md). For implementation and API development, use the [developer guide](dev-guide.md).
 
 ## Prerequisites
@@ -35,21 +38,19 @@ DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
 export QS_IMAGE_ID="$(docker image inspect "$QS_TAG" --format '{{.Id}}')"
 ```
 
-The per-run image tag avoids overwriting an existing local build. This recipe builds Dynamo and installs pinned SGLang sources, then builds and installs KVCR from the local checkout supplied as the Docker build context (`.`). Local changes to KVCR source are included; the build does not fetch a separate KVCR revision or install a published KVCR wheel. Its package version comes from the checkout's `pyproject.toml`, not a Git tag. No private image or credentials are required.
+The build uses pinned SGLang and Dynamo revisions and installs KVCR from the local checkout used as the build context (`.`), including any local changes. No private image or credentials are required.
 
 | Component | Revision |
 | --- | --- |
-| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache/inventory integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `0d37a2bf4db3521a876d1b450a884b91c0e334c9` |
-| Dynamo main with router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) and owned inventory [#17531](https://github.com/ai-dynamo/dynamo/pull/17531) | `83ea37e849e883c27d7ed848e0f329961e1fb173` |
+| SGLang [#45647](https://github.com/sgl-project/sglang/pull/45647) | `b0506add3eac49bbb2c303e83169ea19c907fb98` |
+| Dynamo | `83ea37e849e883c27d7ed848e0f329961e1fb173` |
 | KVCR | Local build-context checkout, including local source changes |
 
-The SGLang revision is a public PR head, while the Dynamo revision is a pinned main commit; neither is a released package. SGLang #45647 includes its #45646 parent, but not the optional performance PR #45649. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
-
-Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`. The vLLM image has a separate [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-vllm); neither build installs both serving runtimes into one image.
+Continue only if the final import/version checks pass. Installed packages are recorded in `/opt/sglang-installed-packages.txt`.
 
 ## 2. Start the container
 
-Select only your allocated GPUs; this example uses `0,1`. Do not use occupied GPUs or stop another user's processes. No host ports are published.
+Select two available GPUs; this example uses `0,1`. No host ports are published.
 
 ```bash
 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name --format=csv
@@ -77,7 +78,7 @@ env -u NATS_SERVER DYN_NAMESPACE=kvcrqs DYN_SYSTEM_PORT=24004 \
   2>&1 | tee /tmp/state-agent.log
 ```
 
-Keep this process running. It receives distinct framework-cache and KVCR-owned inventory events; HiCache host residency alone is not a KVCR source.
+Keep this process running so the router can discover KVCR-owned blocks.
 
 ## 4. Start the Dynamo KV router
 
@@ -138,14 +139,8 @@ env -u NATS_SERVER CUDA_VISIBLE_DEVICES="$RANK" DYN_SYSTEM_PORT="$((24001 + RANK
 
 Control, NIXL, metrics and event ports must be distinct. The ownership descriptor requires a reachable non-loopback control address, even in this same-container example. Both terminals derive the container IP automatically; set the same `KVCR_ADVERTISE_HOST` in both if hostname resolution is unsuitable. KV events bind `*` inside that private network namespace.
 
-SGLang reports the storage backend's resolved `kv_hint_sources` in its scheduler
-initialization metadata. Dynamo validates the complete rank map and publishes it
-without reconstructing KVCR's default ports or rank offsets. The same SGLang
-resolver supplies the channel's startup address. An explicit
-`control_advertise_host` and enabled remote hints are required to advertise a
-source; an older SGLang build without this metadata does not advertise transfer
-capability. Actual KVCR stores and LRU removals update the KVCR-owned inventory
-through the state agent; source coordinates alone do not establish residency.
+The state agent tracks KVCR-owned blocks, and Dynamo uses the advertised source
+addresses to route peer transfers.
 
 ## 6. Verify peer reuse
 
@@ -264,7 +259,7 @@ docker rm "$QS_CID"
 
 Keep the model volume and any underlying GPU allocation unless you deliberately choose to release them. For a failed run, collect whichever evidence exists.
 
-- **Build/import failure:** keep source and kernel pins together; do not skip the canary or silently substitute a private developer image.
+- **Build/import failure:** use the pinned source and kernel versions together and check the final import/version output.
 - **Startup failure:** check worker logs, GPU architecture, driver, memory and unique ports. Model readiness is not a transfer pass.
 - **Cache miss:** check source deposit, KV events, router discovery and hints.
 - **Transfer failure:** retain `UCX_TLS=tcp,sm,self,cuda_copy`; missing CUDA memory support can prevent NIXL startup even for host-staged data.

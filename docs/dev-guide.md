@@ -308,7 +308,7 @@ Validate that counters increase on both success and failure paths, byte counts a
 
 Complete standalone setup and validation first. Use a separate shared environment for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone development loop.
 
-Select a vLLM revision that includes the merged KVCR 0.2.0 secondary-tier adapter (`"type": "kvcr"`), starting with [`fed7de9`](https://github.com/vllm-project/vllm/commit/fed7de909f894fbee0c45130376aed2e2c9bf0d3) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
+Select a vLLM revision that includes the merged KVCR 0.2.0 secondary-tier adapter (`"type": "kvcr"`), starting with [`fed7de9`](https://github.com/vllm-project/vllm/commit/fed7de909f894fbee0c45130376aed2e2c9bf0d3) on `main`. Pair it with a landed Dynamo revision such as [`701da25`](https://github.com/ai-dynamo/dynamo/commit/701da25292ecca8f64d770cc0b17d389200019a1), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
 
 ### Build the integration environment
 
