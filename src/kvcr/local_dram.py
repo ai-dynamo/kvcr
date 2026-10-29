@@ -345,6 +345,7 @@ class _LocalDram:
         # Lock order is caller _state_lock -> _export_lock. Progress takes only
         # _export_lock, and never calls the framework while holding a reader.
         self._export_lock = threading.Lock()
+        self._first_guard_ready_at: float | None = None
         self._exports: dict[BlockKey, _GuardExport] = {}
         self._export_held = 0
         self._export_released: queue.SimpleQueue[
@@ -418,6 +419,8 @@ class _LocalDram:
                 and not residency.retire_on_release
             ):
                 self._exports[key] = entry
+                if self._first_guard_ready_at is None:
+                    self._first_guard_ready_at = time.monotonic()
 
     def claim_export_subset(
         self,

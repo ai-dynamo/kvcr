@@ -46,16 +46,48 @@ class _DanglingOps:
         self.source_writes: dict[tuple[str, OpHandle], _SourceWriteStatus] = {}
         self._last_progress_at: float | None = None
         self._source_stalled = False
+        self._guard_source_armed_at: float | None = None
 
     def begin_poll(self) -> None:
         polled_at = time.monotonic()
         self.check_source_progress()
-        self._last_progress_at = polled_at
+        self._last_progress_at = (
+            polled_at
+            if self._guard_source_armed_at is None
+            else max(polled_at, self._guard_source_armed_at)
+        )
 
     def check_source_progress(self) -> bool:
-        if self._source_stalled or self._last_progress_at is None:
-            return not self._source_stalled
-        gap_ms = (time.monotonic() - self._last_progress_at) * 1000
+        if self._source_stalled:
+            return False
+        checked_at = time.monotonic()
+        if (
+            self._backend._options.no_pinning_mode
+            and self._guard_source_armed_at is None
+        ):
+            local = self._backend._kvcr._local_dram
+            first_ready = local._first_guard_ready_at if local is not None else None
+            if first_ready is None:
+                if not any(status.submitted for status in self.source_writes.values()):
+                    # An empty Guard cannot serve a source write during startup.
+                    return True
+                # Preserve the old deadline if native work was already accepted.
+                first_ready = (
+                    self._last_progress_at
+                    if self._last_progress_at is not None
+                    else checked_at
+                )
+            self._guard_source_armed_at = first_ready
+            # Publication starts the watchdog, not its later observation. Never
+            # reset this baseline on eviction or forgive a post-READY stall.
+            self._last_progress_at = (
+                first_ready
+                if self._last_progress_at is None
+                else max(self._last_progress_at, first_ready)
+            )
+        if self._last_progress_at is None:
+            return True
+        gap_ms = (checked_at - self._last_progress_at) * 1000
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:
             # Require restart so queued pre-stall requests cannot get fresh deadlines.
