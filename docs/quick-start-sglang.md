@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # KVCR Quick Start with SGLang HiCache
 
-Build and run Dynamo, SGLang and KVCR without editing their serving code. SGLang stages KV through HiCache host memory; KVCR stores it in DRAM and delivers it to another worker using Dynamo's source hints.
+Build and run Dynamo, SGLang and KVCR without editing their serving code. SGLang stages KV through HiCache host memory; KVCR stores it in a separate DRAM pool. A Dynamo state agent indexes KVCR-owned blocks so the router can generate source hints for peer delivery.
 
 For vLLM, use the [vLLM quick start](quick-start-vllm.md). For implementation and API development, use the [developer guide](dev-guide.md).
 
@@ -17,6 +17,8 @@ For vLLM, use the [vLLM quick start](quick-start-vllm.md). For implementation an
 - Allow 32 GiB host RAM and 150 GiB disk for this build and model cache.
 
 This example uses two independent TP1 workers on one host, Qwen3-0.6B BF16, `trtllm_mha`, 64-token pages, and the Python radix tree. Each worker has 2 GiB of HiCache staging and a separate 1 GiB KVCR DRAM pool. The same-host transport is UCX TCP/shared memory with CUDA-copy support, not an RDMA performance test.
+
+Keep the same checkpoint and KV-cache encoding on every peer. To change weights, restart the whole worker set with fresh caches; do not update weights in place. This HiCache route uses process-local KVCR allocations, not Guard recovery.
 
 ## 1. Build the integration image
 
@@ -39,11 +41,11 @@ The per-run image tag avoids overwriting an existing local build. This recipe bu
 
 | Component | Revision |
 | --- | --- |
-| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `d365ebdc70f6503d983d763dcb5b931e2b35af63` |
-| Dynamo main, including merged router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) | `f38fb532783a7f42af27653f533b2a515678f305` |
+| SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache/inventory integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `4a083003f9393b758077afe9bbce3f6b1c64f790` |
+| Dynamo router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) plus owned inventory [#17531](https://github.com/ai-dynamo/dynamo/pull/17531) | `25dd503929a4bcfe05f28ce2d272bdd86c072538` |
 | KVCR main | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
 
-The SGLang revisions are draft public PR heads, not released packages. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
+The SGLang and Dynamo inventory revisions are public PR heads, not released packages. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
 
 Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`. The vLLM image has a separate [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-vllm); neither build installs both serving runtimes into one image.
 
@@ -66,9 +68,20 @@ docker exec "$QS_CID" python3 -c \
 printf 'Container: %s\n' "$QS_CID"
 ```
 
-Open separate terminals with `docker exec -it <container-id> bash`, using the printed ID: one for the router, one per worker, and one for requests. All inherit the same private discovery directory and TCP/ZMQ settings. The public model needs no HF token. Commands in Steps 3-5 run inside the container.
+Open separate terminals with `docker exec -it <container-id> bash`, using the printed ID: one for the state agent, one for the router, one per worker, and one for requests. All inherit the same private discovery directory and TCP/ZMQ settings. The public model needs no HF token. Commands in Steps 3-6 run inside the container.
 
-## 3. Start the Dynamo KV router
+## 3. Start the KV state agent
+
+```bash
+set -o pipefail
+env -u NATS_SERVER DYN_NAMESPACE=kvcrqs DYN_SYSTEM_PORT=24004 \
+  python3 -m dynamo.kv_state_agent --max-slots 4 \
+  2>&1 | tee /tmp/state-agent.log
+```
+
+Keep this process running. It receives distinct framework-cache and KVCR-owned inventory events; HiCache host residency alone is not a KVCR source.
+
+## 4. Start the Dynamo KV router
 
 ```bash
 set -o pipefail
@@ -80,7 +93,7 @@ env -u NATS_SERVER DYN_SYSTEM_PORT=24003 python3 -m dynamo.frontend \
 
 The image includes the two-tier selection policy. The KV router supplies source hints; a round-robin router does not demonstrate router-guided peer reuse.
 
-## 4. Start two HiCache workers
+## 5. Start two HiCache workers
 
 Run this block in **each** worker terminal, setting `RANK=0` in the first and `RANK=1` in the second. Keep both running throughout verification.
 
@@ -90,15 +103,19 @@ export RANK=0                         # Use 1 in the second terminal.
 export PROMETHEUS_MULTIPROC_DIR="/tmp/sgl-metrics-$RANK"
 mkdir "$PROMETHEUS_MULTIPROC_DIR"
 KVCR_CONFIG="$(python3 - <<'PY'
-import json, os
+import ipaddress, json, os, socket
 rank = int(os.environ['RANK'])
+host = os.environ.get('KVCR_ADVERTISE_HOST') or socket.gethostbyname(socket.gethostname())
+assert not ipaddress.ip_address(host).is_loopback, 'Set KVCR_ADVERTISE_HOST to a reachable container address'
 print(json.dumps({
-    'control_advertise_host': '127.0.0.1',
+    'control_advertise_host': host,
     'control_port': 24100 + rank * 32, 'nixl_listen_port': 24200 + rank * 32,
     'local_dram_bytes': 1 << 30,
+    'publish_inventory': True,
     'enable_remote_hint': True, 'hicache_storage_pass_prefix_keys': True,
     'align_storage_prefix': True, 'combine_page_reads': True,
     'combine_page_writes': True, 'diagnostic_telemetry': True,
+    'verify_transfer_bytes': True,
     'startup_timeout_seconds': 300,
     'operation_timeout_ms': 20000, 'abandon_timeout_ms': 60000,
 }))
@@ -117,11 +134,11 @@ env -u NATS_SERVER CUDA_VISIBLE_DEVICES="$RANK" DYN_SYSTEM_PORT="$((24001 + RANK
   --hicache-mem-layout page_first --hicache-write-policy write_through \
   --hicache-storage-backend kvcr --hicache-storage-prefetch-policy wait_complete \
   --hicache-storage-backend-extra-config "$KVCR_CONFIG" \
-  --kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"\",\"endpoint\":\"tcp://*:$((24020 + RANK))\"}" \
+  --kv-events-config "{\"publisher\":\"zmq\",\"format\":\"dynamo\",\"topic\":\"\",\"endpoint\":\"tcp://*:$((24020 + RANK))\"}" \
   2>&1 | tee "/tmp/worker-$RANK.log"
 ```
 
-Control, NIXL, metrics and event ports must be distinct. Loopback works because both workers share a container. KV events bind `*` inside that private network namespace so Dynamo can subscribe through the container address.
+Control, NIXL, metrics and event ports must be distinct. The ownership descriptor requires a reachable non-loopback control address, even in this same-container example. Both terminals derive the container IP automatically; set the same `KVCR_ADVERTISE_HOST` in both if hostname resolution is unsuitable. KV events bind `*` inside that private network namespace.
 
 SGLang reports the storage backend's resolved `kv_hint_sources` in its scheduler
 initialization metadata. Dynamo validates the complete rank map and publishes it
@@ -130,10 +147,16 @@ resolver supplies the channel's startup address. An explicit
 `control_advertise_host` and enabled remote hints are required to advertise a
 source; an older SGLang build without this metadata does not advertise transfer
 capability. These are configured coordinates, not proof of a listening socket or
-resident KV: the KVCR runtime remains lazy and transfer success must still be
-verified below.
+resident KV: actual stores and LRU removals update the engine-lifetime KVCR owner
+through the state agent. A raw-event sequence gap stops this attachment; restart
+the affected worker rather than relying on stale inventory. This mode does not
+provide durable recovery or lossless event replay.
 
-## 5. Verify peer reuse
+Inventory remains advisory: dropped events can leave missing or stale hints. Storage lookup and completed delivery determine usable pages. Restart the workers after replacing the state-agent host; automatic reattachment is not supported here.
+
+An uncertain peer write can terminate the worker: HiCache cannot yet quarantine memory that may still receive a late transfer. This prevents unsafe buffer reuse, but is not seamless source-failure recovery.
+
+## 6. Verify peer reuse
 
 Wait for successful LLM registration in both worker logs and `Adding worker` for both IDs in the frontend log. Allow up to 20 minutes per worker for first-use compilation. Then, in the request terminal, require `ready: true`:
 
@@ -159,9 +182,10 @@ from transformers import AutoTokenizer
 workers = []
 for rank in (0, 1):
     log = Path(f'/tmp/worker-{rank}.log').read_text()
-    ids = set(re.findall(r'WorkerKvQuery endpoint starting for worker (\d+)', log))
+    log = re.sub(r'\x1b\[[0-9;]*m', '', log)
+    ids = set(re.findall(r'Backend admission gate created[^\n]*worker_id=([0-9a-f]+)', log))
     assert len(ids) == 1 and 'Successfully registered LLM with runtime config' in log
-    workers.append(int(ids.pop()))
+    workers.append(int(ids.pop(), 16))
 assert workers[0] != workers[1]
 frontend = Path('/tmp/frontend.log').read_text()
 assert all(f'Adding worker WorkerWithDpRank {{ worker_id: {w}, dp_rank: 0 }}' in frontend for w in workers)
@@ -205,7 +229,7 @@ PY
 
 Also inspect `KVCR L3 native stats` and `KVCR L3 operation` in both worker logs:
 
-- Destination: successful peer `deliver` from `tcp://127.0.0.1:24100`, **31 blocks**, **62 spans**, and no failed keys; native `remote_deliver` reports success.
+- Destination: successful peer `deliver` from worker 0's advertised address on port **24100**, **31 blocks**, **62 spans**, and no failed keys; native `remote_deliver` reports success.
 - Source: terminal peer-send (`source_write`) totals **31 blocks / 227,540,992 bytes**. Do not confuse this with initial local deposition (`local_fill`), which may include 32 prompt pages; the destination recomputes the final page for logits.
 - No failed transfers or dropped observations. Sum each relevant drained reporting interval once; do not subtract two snapshots.
 - Destination metrics: **1984** completed HiCache prefetched tokens.
@@ -236,7 +260,7 @@ On the host, collect the session's evidence, then stop only its container:
 
 ```bash
 export QS_EVIDENCE="$(mktemp -d /tmp/kvcr-sgl-evidence.XXXXXX)"
-for log in frontend worker-0 worker-1; do
+for log in state-agent frontend worker-0 worker-1; do
   docker cp "$QS_CID:/tmp/$log.log" "$QS_EVIDENCE/"
 done
 for rank in 0 1; do
