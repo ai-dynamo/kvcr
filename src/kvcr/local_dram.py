@@ -429,12 +429,24 @@ class _LocalDram:
         if not self._export_lock.acquire(blocking=False):
             return (), True
         claims: list[tuple[int, _GuardExportClaim]] = []
+        layout_indices: dict[
+            tuple[tuple[str, ...], tuple[str, ...]], list[int] | None
+        ] = {}
         try:
             for position, (key, requested) in enumerate(zip(keys, layouts)):
                 entry = self._exports.get(key)
-                if entry is None or (key_layout and key_layout != entry.key_layout):
+                if (
+                    entry is None
+                    or entry.residency.retire_on_release
+                    or (key_layout and key_layout != entry.key_layout)
+                ):
                     continue
-                indices = _layout_indices(list(entry.layout), list(requested))
+                pair = (entry.layout, requested)
+                if pair not in layout_indices:
+                    layout_indices[pair] = _layout_indices(
+                        list(entry.layout), list(requested)
+                    )
+                indices = layout_indices[pair]
                 if indices is None or any(entry.refs[i] is None for i in indices):
                     continue
                 refs = tuple(cast(_TransferRef, entry.refs[i]) for i in indices)
