@@ -130,6 +130,8 @@ def make_source(handles=(9,), *, request_id=0):
         control.incoming.append(_start_write_message(handle, BlockKey(b"k0")))
     _poll_until(
         source,
-        lambda _: len(source._core._remote_fw_dram._source_pin_ops) == len(handles),
+        lambda _: (
+            len(source._core._remote_fw_dram._sources._source_pin_ops) == len(handles)
+        ),
     )
     return source, agent, pinning

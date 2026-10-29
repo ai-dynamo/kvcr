@@ -31,17 +31,14 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
+from kvcr.backends.remote_fw_dram import _RemoteFWDram
+from kvcr.backends.remote_ops import _CONTROL_DECODER, _SourceWriteOp, _TargetMetadata
+from kvcr.backends.remote_sources import _FwMemResidency, _RemoteSources, _SourcePinOp
 from kvcr.config import KVCRConfig, LocalDramOptions
-from kvcr.core import _BlockRecord, _KVCRCore
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.progress import _STOP, _TransferRef
-from kvcr.recovery_journal import install_recovery_records
-from kvcr.remote_fw_dram import (
-    _FwMemResidency,
-    _RemoteFWDram,
-    _SourcePinOp,
-)
-from kvcr.remote_ops import _CONTROL_DECODER, _SourceWriteOp, _TargetMetadata
+from kvcr.runtime.core import _BlockRecord, _KVCRCore
+from kvcr.runtime.progress import _STOP, _TransferRef
+from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 
 
@@ -59,7 +56,7 @@ from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
 def test_framework_pin_rejection_diagnostic(
     result, reason, level, custom_argument, caplog
 ):
-    caplog.set_level(level, logger="kvcr.core")
+    caplog.set_level(level, logger="kvcr.runtime.core")
     remote = Mock()
     argument = "private callback data"
     if custom_argument:
@@ -67,7 +64,7 @@ def test_framework_pin_rejection_diagnostic(
         argument.__eq__.return_value = True
         argument.__str__.return_value = "private callback data"
     remote._kvcr._normalize_descriptors.side_effect = ValueError(argument)
-    assert _RemoteFWDram._install_framework_pin(remote, [b"key"], result) is None
+    assert _RemoteSources._install_framework_pin(remote, [b"key"], result) is None
     remote._discard_pin_result.assert_called_once_with(result, [b"key"])
     assert (reason in caplog.text) == (level == logging.DEBUG)
     assert "private callback data" not in caplog.text
@@ -142,8 +139,8 @@ def test_local_source_starts_inline_and_holds_its_slot(
         local = source._core._local_dram
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
-        make_ref = Mock(wraps=local._descriptor)
-        monkeypatch.setattr(local, "_descriptor", make_ref)
+        make_ref = Mock(wraps=local._pools._descriptor)
+        monkeypatch.setattr(local._pools, "_descriptor", make_ref)
         callbacks.clear()
         agent.state = transfer_state
         request = msgspec.msgpack.decode(_start_write_message(12, key))
@@ -206,7 +203,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
         assert agent.xfers[-1][3] == [(4096, 16, 7), (4112, 16, 7)]
         assert pinning.searches == []
         assert make_ref.call_count == 2
-        assert not source._core._remote_fw_dram._source_pin_ops
+        assert not source._core._remote_fw_dram._sources._source_pin_ops
         assert callbacks == []
         if transfer_state == "PROC":
             assert list(source.poll_completed()) == []
@@ -289,14 +286,14 @@ def test_local_source_waits_for_declared_pieces(
         ],
     )
     control.incoming.append(msgspec.msgpack.encode(message))
-    _poll_until(source, lambda _: bool(backend._source_pin_ops))
+    _poll_until(source, lambda _: bool(backend._sources._source_pin_ops))
     assert len(agent.xfers) == 1
     residency = source._core._block_record_map[key].local_dram
     producer_claims = int(not first_piece_ready)
     if mixed:
         _poll_until(
             source,
-            lambda _: pinning.searches and not backend._pending_pin_ops,
+            lambda _: pinning.searches and not backend._sources._pending_pin_ops,
         )
         assert pinning.unpins == ["pin"]
         for rejected_key in rejected:
@@ -331,7 +328,7 @@ def test_local_source_waits_for_declared_pieces(
         notification = agent.xfers[-1][5]
         assert _decode_notif(notification)["completed_indices"] == [1 if mixed else 0]
     assert _decode_notif(notification)["success"] is not timeout
-    assert not backend._source_pin_ops
+    assert not backend._sources._source_pin_ops
     assert not source._core._local_dram_sources_by_op
     assert residency.claim_count == 0
     assert pinning.searches == ([rejected] if mixed else [])
@@ -364,7 +361,7 @@ def test_local_source_retries_after_fill_publication(outcome):
     key = BlockKey(b"local")
     requested_key = BlockKey(b"framework-only") if outcome == "framework" else key
     publishing, resume = threading.Event(), threading.Event()
-    make_evictable = local._make_evictable
+    make_evictable = local._pools._make_evictable
 
     def pause_publication(key):
         # READY is already set, but the caller's fill transaction is unfinished.
@@ -377,7 +374,9 @@ def test_local_source_retries_after_fill_publication(outcome):
         deposit = source.deposit({key: [descriptor]})
         _wait_until(lambda: not source._core._progress._completed.empty())
         with (
-            patch.object(local, "_make_evictable", side_effect=pause_publication),
+            patch.object(
+                local._pools, "_make_evictable", side_effect=pause_publication
+            ),
             ThreadPoolExecutor(max_workers=1) as caller,
         ):
             completion = caller.submit(source.poll_completed)
@@ -423,7 +422,7 @@ def test_local_source_retries_after_fill_publication(outcome):
         if outcome == "write":
             _wait_until(lambda: len(agent.xfers) == 2)
             assert source._core._block_record_map[key].local_dram.claim_count == 1
-            assert local.telemetry_state()["local_g2_evictable_slots"] == 0
+            assert local._pools.telemetry_state()["local_g2_evictable_slots"] == 0
         elif outcome == "framework":
             assert _poll_until(source, lambda _: len(agent.xfers) == 2) == []
         assert pinning.searches == (
@@ -453,7 +452,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
     caplog,
 ) -> None:
     """Source writes must not start after their framework-pin deadline."""
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     now = 0.0
     deadline_captured = threading.Event()
 
@@ -483,7 +482,8 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
     if pin_before_deadline:
         assert (
             _poll_until(
-                source, lambda _: bool(source._core._remote_fw_dram._pending_pin_ops)
+                source,
+                lambda _: bool(source._core._remote_fw_dram._sources._pending_pin_ops),
             )
             == []
         )
@@ -550,7 +550,7 @@ def test_write_probe_fences_write_waiting_on_framework_pin(
 
 @pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
 def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> None:
-    caplog.set_level(log_level, logger="kvcr.core")
+    caplog.set_level(log_level, logger="kvcr.runtime.core")
     errors = []
 
     def on_resilience_event(error):
@@ -566,7 +566,7 @@ def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> N
 
     stalled_for = 0.0
     with patch(
-        "kvcr.dangling_ops.time",
+        "kvcr.backends.dangling_ops.time",
         SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
     ):
         for handle in (1, 2):
@@ -603,11 +603,12 @@ def test_kvcr_close_cleans_pending_pin_operations():
     source = _new_kvcr(agent, pinning, control, name="source")
     assert (
         _poll_until(
-            source, lambda _: bool(source._core._remote_fw_dram._pending_pin_ops)
+            source,
+            lambda _: bool(source._core._remote_fw_dram._sources._pending_pin_ops),
         )
         == []
     )
-    assert source._core._remote_fw_dram._pending_pin_ops
+    assert source._core._remote_fw_dram._sources._pending_pin_ops
 
     # The second request is accepted but has not reached main-thread pinning.
     control.incoming.append(_start_write_message(2, key))
@@ -626,8 +627,8 @@ def test_kvcr_close_cleans_pending_pin_operations():
     ]
     assert agent.xfers == []
     assert pinning.cancelled == [PinRequestId(0)]
-    assert not source._core._remote_fw_dram._source_pin_ops
-    assert not source._core._remote_fw_dram._pending_pin_ops
+    assert not source._core._remote_fw_dram._sources._source_pin_ops
+    assert not source._core._remote_fw_dram._sources._pending_pin_ops
     assert not source._core._framework_pin_keys
 
 
@@ -1092,7 +1093,9 @@ def test_framework_reacquisition_waits_for_pin_release(expires: bool) -> None:
     control.incoming.append(_start_write_message(1, key))
     _poll_until(source, lambda _: pinning.release_pin.called)
     control.incoming.append(_start_write_message(2, key))
-    _poll_until(source, lambda _: backend._source_pin_ops or len(agent.xfers) > 1)
+    _poll_until(
+        source, lambda _: backend._sources._source_pin_ops or len(agent.xfers) > 1
+    )
     assert pinning.searches == [(key,)]
     assert len(agent.xfers) == 1
 
@@ -1253,7 +1256,7 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
     if second_has_uncovered_key:
         pinning.complete(1, "pin-c")
     else:
-        wait = source._core._remote_fw_dram._pending_pin_ops[0]
+        wait = source._core._remote_fw_dram._sources._pending_pin_ops[0]
         second_op = ("source", 2)
         first_op = ("source", 1)
         # Exercise the legal order where the missing-only waiter resolves first.
@@ -1371,10 +1374,9 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     kvcr._claim_local_dram_sources = Mock(return_value={})
     kvcr._release_local_dram_sources = Mock()
     backend._kvcr = kvcr
-    backend._source_pin_ops = {}
-    backend._fw_pins_by_op = {}
+    backend._sources = _RemoteSources(backend, kvcr)
     released: list[PinHandle] = []
-    backend._release_framework_pins = released.extend
+    backend._sources._release_framework_pins = released.extend
 
     key = BlockKey(b"shared")
     borrowed = PinHandle("pinned-by-the-other-operation")
@@ -1399,9 +1401,9 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         keys=frozenset((key,)),
         framework_pins={stale},
     )
-    backend._source_pin_ops[("source", 1)] = waiting
+    backend._sources._source_pin_ops[("source", 1)] = waiting
 
-    backend._submit_prepared_source_write(("source", 1), waiting)
+    backend._sources._submit_prepared_source_write(("source", 1), waiting)
 
     submitted = kvcr._progress.submit.call_args.args[0]
     assert submitted.src_descriptors == (
@@ -1411,7 +1413,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     assert submitted.completed_indices == ((0,) if selected else ())
     expected_pins = {borrowed} if selected else set()
     assert submitted.framework_pins == expected_pins
-    assert backend._fw_pins_by_op[submitted.op_id] == expected_pins
+    assert backend._sources._fw_pins_by_op[submitted.op_id] == expected_pins
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
 

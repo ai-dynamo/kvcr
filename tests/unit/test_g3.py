@@ -31,17 +31,17 @@ from kvcr import (
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
 )
+from kvcr.backends.local_disk import _G3, _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramState
 from kvcr.config import (
     G3Options,
     KVCRConfig,
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from kvcr.core import _BlockRecord
-from kvcr.local_disk import _G3, _G3Residency
-from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
-from kvcr.recovery_journal import install_recovery_records
+from kvcr.runtime.core import _BlockRecord
+from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -1296,12 +1296,12 @@ def test_closing_a_pending_spill_retains_its_memory_and_file_registration(
     agent.state = "PEND"
     kvcr.deposit({second: [_mem_descriptor(1)]})
     local_dram = kvcr._core._local_dram
-    _poll_until(kvcr, lambda _: local_dram._capacity_eviction_key == first)
+    _poll_until(kvcr, lambda _: local_dram._pools._capacity_eviction_key == first)
     g3 = kvcr._core._g3
     op = next(iter(g3._active.values()))
     _poll_until(kvcr, lambda _: op.transfer_id is not None)
     assert not op.close(kvcr._core._progress)
-    assert local_dram._capacity_eviction_key == first
+    assert local_dram._pools._capacity_eviction_key == first
     assert first in kvcr._core._local_dram_sources_by_op[op.op_id]
     assert op.reservations
     registration = g3._file_registration
@@ -1313,7 +1313,7 @@ def test_closing_a_pending_spill_retains_its_memory_and_file_registration(
 
     _OPEN_KVCRS.remove(kvcr)
     kvcr.close()
-    assert local_dram._capacity_eviction_key is None
+    assert local_dram._pools._capacity_eviction_key is None
     assert registration in agent.deregistered
 
 

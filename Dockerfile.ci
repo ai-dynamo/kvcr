@@ -124,8 +124,18 @@ PY
 
 # A successful pip install alone does not prove the base's adapter supports
 # this KVCR API. Fail the build before handing an incompatible image to E2E.
+RUN kvcr-service --help
 RUN python3 - <<'PY'
 from importlib import metadata
+
+# Use the public channel export in the adapter supplied by the base image.
+adapter = metadata.distribution("vllm").locate_file(
+    "vllm/v1/kv_offload/tiering/kvcr/manager.py"
+)
+adapter.write_text(adapter.read_text().replace(
+    "from kvcr.control_channels import ZmqPeerControlChannel",
+    "from kvcr import ZmqPeerControlChannel",
+))
 
 import kvcr
 import dynamo.vllm

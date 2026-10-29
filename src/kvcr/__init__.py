@@ -11,18 +11,18 @@ from .api import (
     TRANSFER_BYTES_METRIC,
     KVCRBindings,
 )
-from .control_channels import (
+from .hints import ROUTER_HINT_CAPABILITIES, ROUTER_HINT_KEY
+from .runtime.control_channels import (
     KVCRGuardProtocolError,
     KVCRMsgFramingError,
     KVCRServiceError,
     KVCRSocketError,
     ZmqPeerControlChannel,
 )
-from .guard_protocol import (
+from .service.protocol import (
     KVCRClient,
     KVCRPoolHold,
 )
-from .hints import ROUTER_HINT_CAPABILITIES, ROUTER_HINT_KEY
 
 __all__ = [
     "DURATION_METRIC",

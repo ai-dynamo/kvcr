@@ -24,10 +24,11 @@ from test_kvcr_service import (
     _service_args,
 )
 
-from kvcr import kvcr_service, memmap
-from kvcr.health import _serve_health
-from kvcr.kvcr_service import _KVCRService
-from kvcr.memory import _KVCRPoolOwner
+from kvcr.service import memmap
+from kvcr.service import server as kvcr_service
+from kvcr.service.health import _serve_health
+from kvcr.service.memory import _KVCRPoolOwner
+from kvcr.service.server import _KVCRService
 
 
 def _get(server, path):

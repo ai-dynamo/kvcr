@@ -14,12 +14,12 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record
 
-from kvcr.core import _BlockRecord
-from kvcr.guard_protocol import _PoolDescriptor
-from kvcr.local_disk import _G3, _G3Residency
-from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
-from kvcr.progress import _TransferRef
-from kvcr.recovery_journal import (
+from kvcr.backends.local_disk import _G3, _G3Residency
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _TransferRef
+from kvcr.service.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
+from kvcr.service.protocol import _PoolDescriptor
+from kvcr.service.recovery_journal import (
     _FRAME_HEADER,
     _JOURNAL_HEADER_BYTES,
     _MAX_FRAME_SIZE,
@@ -194,7 +194,7 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     local_dram, g3 = _Source(), _Source()
     key = BlockKey(b"block")
     _attach_journal(local_dram, journal, g3)
-    caplog.set_level("WARNING", logger="kvcr.recovery_journal")
+    caplog.set_level("WARNING", logger="kvcr.service.recovery_journal")
 
     local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]))
     g3.emit(key, _recovered_record(g2=[("pool0", 2)], g3=7, g3_pool="pool0"))
@@ -219,7 +219,7 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     with patch.object(journal, "publish", wraps=journal.publish) as publish:
         local_dram.emit(key, _recovered_record(g2=[("pool0", 0)]))
         with patch(
-            "kvcr.recovery_journal._project_recovery_record",
+            "kvcr.service.recovery_journal._project_recovery_record",
             side_effect=AssertionError("disabled publication projected a record"),
         ):
             local_dram.emit(key, _recovered_record(g2=[("pool0", 1)]))
@@ -247,7 +247,7 @@ def test_invalidation_stops_every_role_until_an_owner_reset(
 ) -> None:
     """Oversize, overflow, or corruption kills the ring for every role until reset."""
     journal, mapping = journal_and_mapping
-    caplog.set_level("WARNING", logger="kvcr.recovery_journal")
+    caplog.set_level("WARNING", logger="kvcr.service.recovery_journal")
     consumer = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
     assert journal.publish(_RECORD_BLOCK, b"key0", b"record")
     assert consumer.read_next() is not None
@@ -352,7 +352,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
     tmp_path: Path, caplog, pool_size_bytes: int
 ) -> None:
     """Replayed whole under its own terms, discardable when torn, gone once released."""
-    caplog.set_level(logging.DEBUG, logger="kvcr.recovery_journal")
+    caplog.set_level(logging.DEBUG, logger="kvcr.service.recovery_journal")
     with _attached(tmp_path, pool_size_bytes) as pool:
         path = Path(pool._spec.path)
         pools = (
@@ -401,7 +401,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
         interrupted = Mock(
             size=_SNAPSHOT_HEADER.size, pack=Mock(side_effect=OSError("interrupted"))
         )
-        with patch("kvcr.recovery_journal._SNAPSHOT_HEADER", interrupted):
+        with patch("kvcr.service.recovery_journal._SNAPSHOT_HEADER", interrupted):
             with pytest.raises(OSError, match="interrupted"):
                 _write_slot(pool, terms, b"b", 2)
 

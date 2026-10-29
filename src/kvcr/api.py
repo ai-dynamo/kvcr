@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from . import recovery_journal as _recovery
 from .config import (
     FrameworkControl,
     InventorySink,
@@ -19,14 +18,15 @@ from .config import (
     KVCRGuardConfig,
     TelemetryStats,
 )
-from .core import (  # noqa: F401 - public re-exports
+from .runtime.core import (  # noqa: F401 - public re-exports
     DURATION_METRIC,
     STATE_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
     _KVCRCore,
 )
-from .guard_protocol import KVCRPoolHold
+from .service import recovery_journal as _recovery
+from .service.protocol import KVCRPoolHold
 from .types import (
     BlockKey,
     CacheTier,

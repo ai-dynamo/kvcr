@@ -6,11 +6,11 @@ import pytest
 from _kvcr_test_utils import _recovered_record
 from msgspec.structs import replace
 
-from kvcr.core import _BlockRecord
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.progress import _TransferRef
-from kvcr.recovery_journal import (
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _TransferRef
+from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
     _RECOVERY_ENCODER,
     RecoveryMirrorError,

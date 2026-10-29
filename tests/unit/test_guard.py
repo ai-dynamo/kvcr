@@ -21,23 +21,24 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record, _wait_until
 
-from kvcr import guard as guard_module
+from kvcr.backends.dangling_ops import _DanglingOps
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramState
+from kvcr.backends.remote_ops import _WriteProbe
 from kvcr.config import LocalDramOptions
-from kvcr.control_channels import KVCRServiceError, ZmqPeerControlChannel
-from kvcr.core import _BlockRecord
-from kvcr.dangling_ops import _DanglingOps
-from kvcr.guard import (
+from kvcr.runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _KVCRProgress
+from kvcr.service import guard as guard_module
+from kvcr.service.guard import (
     _Command,
     _Guard,
     _Phase,
     _PoolLease,
 )
-from kvcr.guard_protocol import _G3Config, _TierConfig
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramState
-from kvcr.memory import KVCRPoolSpec
-from kvcr.progress import _KVCRProgress
-from kvcr.recovery_journal import (
+from kvcr.service.memory import KVCRPoolSpec
+from kvcr.service.protocol import _G3Config, _TierConfig
+from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
     _RECOVERY_ENCODER,
     RecoveryJournalError,
@@ -46,7 +47,6 @@ from kvcr.recovery_journal import (
     _RecoveryBlock,
     _RecoveryMirror,
 )
-from kvcr.remote_ops import _WriteProbe
 from kvcr.types import BlockKey, RegionDescriptor
 
 _TEST_SPEC = KVCRPoolSpec(
@@ -203,7 +203,7 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
         return [(7, select.POLLIN)]
 
     poller.poll.side_effect = poll_during_which_close_begins
-    monkeypatch.setattr("kvcr.guard.select.poll", Mock(return_value=poller))
+    monkeypatch.setattr("kvcr.service.guard.select.poll", Mock(return_value=poller))
 
     guard._observe_holder()
 
@@ -215,7 +215,7 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
 def _stub_fence(monkeypatch) -> Mock:
     """Heartbeat promotion SIGKILLs its primary; tests must not really signal."""
     fence = Mock()
-    monkeypatch.setattr("kvcr.guard.signal.pidfd_send_signal", fence)
+    monkeypatch.setattr("kvcr.service.guard.signal.pidfd_send_signal", fence)
     return fence
 
 
@@ -228,7 +228,7 @@ def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
     guard._pool_lease.poll_pidfd = Mock(return_value=None)
     guard._promote = Mock(side_effect=lambda: setattr(guard, "_serving", True))
     now = [10.0]
-    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("kvcr.service.guard.time.monotonic", lambda: now[0])
 
     now[0] += 2.0
     guard._observe_holder()
@@ -360,7 +360,7 @@ def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(
     guard._recovery._journal = journal
     guard._serving = serving
     guard._core = core
-    caplog.set_level(logging.ERROR, logger="kvcr.guard")
+    caplog.set_level(logging.ERROR, logger="kvcr.service.guard")
 
     guard._poll()
     guard._poll()
@@ -409,7 +409,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 ) -> None:
     """The Guard's whole life: each stage hands the next exactly what it left."""
     _stub_fence(monkeypatch)
-    caplog.set_level(logging.INFO, logger="kvcr.guard")
+    caplog.set_level(logging.INFO, logger="kvcr.service.guard")
     first, second, g3_only, fresh = (
         BlockKey(b"first"),
         BlockKey(b"second"),
@@ -466,9 +466,11 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         return channel
 
     attach = Mock(return_value=attachment)
-    monkeypatch.setattr("kvcr.guard.KVCRPoolAttachment.attach", attach)
-    monkeypatch.setattr("kvcr.guard.RecoveryJournal", Mock(return_value=journal))
-    monkeypatch.setattr("kvcr.guard._KVCRCore", new_core)
+    monkeypatch.setattr("kvcr.service.guard.KVCRPoolAttachment.attach", attach)
+    monkeypatch.setattr(
+        "kvcr.service.guard.RecoveryJournal", Mock(return_value=journal)
+    )
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", new_core)
     attachment.release_snapshot_region.side_effect = lambda: order.append("clear")
     g3_config = _G3Config(
         paths=(str(tmp_path / "g3.data"),),
@@ -636,7 +638,7 @@ def test_only_promotion_waits_for_a_guard_registration(
             assert release.wait(5)
 
     core = _registering_core(monkeypatch, step)
-    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=core))
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(return_value=core))
     guard = _configurable_guard()
     guard._recovery.attachment = _fake_attachment()
     guard._recovery._journal = _Journal()
@@ -677,7 +679,7 @@ def test_every_released_core_is_kept_until_it_has_registered(monkeypatch) -> Non
             assert release.wait(5)
 
     cores = [_registering_core(monkeypatch, step) for _ in range(2)]
-    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(side_effect=cores))
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(side_effect=cores))
     guard = _configurable_guard()
     guard._recovery.attachment = _fake_attachment()
     guard._recovery._journal = _Journal()
@@ -703,7 +705,7 @@ def test_every_released_core_is_kept_until_it_has_registered(monkeypatch) -> Non
 
 def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
     core = Mock(_block_record_map={})
-    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=core))
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(return_value=core))
     guard = _configurable_guard(startup_timeout_seconds=600)
     guard._recovery.attachment = _fake_attachment()
     guard._recovery._journal = _Journal()
@@ -815,9 +817,9 @@ def test_guard_closes_control_when_its_thread_does_not_start(monkeypatch) -> Non
     control = Mock()
     attachment = _fake_attachment()
     monkeypatch.setattr(
-        "kvcr.guard.KVCRPoolAttachment.attach", Mock(return_value=attachment)
+        "kvcr.service.guard.KVCRPoolAttachment.attach", Mock(return_value=attachment)
     )
-    monkeypatch.setattr("kvcr.guard.RecoveryJournal", Mock())
+    monkeypatch.setattr("kvcr.service.guard.RecoveryJournal", Mock())
     guard = _guard()
     guard._control = control
     guard._configured = _tier(16)
@@ -904,7 +906,7 @@ def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
     guard = _guard()
     guard._configured = _tier(16)
     guard._recovery.attachment = attachment
-    caplog.set_level(logging.WARNING, logger="kvcr.guard")
+    caplog.set_level(logging.WARNING, logger="kvcr.service.guard")
     if orphaned:
         # A released core whose close failed in polling stays owned. (The
         # failure fences the control channel, so none is attached here.)
@@ -978,7 +980,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
             expected = RecoveryJournalError
             tier_config = _tier(16)
             handback = Mock(side_effect=RecoveryJournalError("written for other terms"))
-        monkeypatch.setattr("kvcr.guard.read_handback", handback)
+        monkeypatch.setattr("kvcr.service.guard.read_handback", handback)
 
         with pytest.raises(expected):
             guard._adopt(control, tier_config)
@@ -1050,7 +1052,7 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(
     guard._recovery._journal = _Journal()
     guard._recovery._write_handback = Mock(side_effect=OSError(code, "No space left"))
     prepared = Mock(_block_record_map={})
-    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=prepared))
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(return_value=prepared))
 
     guard._adopt(Mock(), _tier(16))
 

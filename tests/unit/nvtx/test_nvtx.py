@@ -134,15 +134,15 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
         _poll_until(source, lambda _: pinning.unpins == ["pin"])
     elif finish == "failed":
         pinning.completed.append((0, None))
-        _poll_until(source, lambda _: not backend._pending_pin_ops)
+        _poll_until(source, lambda _: not backend._sources._pending_pin_ops)
     elif finish == "timeout":
         source._core._clock = lambda: float("inf")
-        _poll_until(source, lambda _: not backend._pending_pin_ops)
+        _poll_until(source, lambda _: not backend._sources._pending_pin_ops)
     else:
         source.close()
     # The late result is discarded/released, never a second terminal event.
     pinning.completed.append((0, None))
-    backend._process_pending_pin_results()
+    backend._sources._process_pending_pin_results()
     completed = payloads(recording, "source.pin.completed")
     assert len(completed) == 1
     assert int(completed[0]["status"]) == int(
@@ -163,18 +163,18 @@ def test_shared_pin_detach_and_late_result(recording, monkeypatch, level, expect
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
     source, agent, pinning = make_source((9, 10))
     backend = source._core._remote_fw_dram
-    first, last = backend._source_pin_ops.items()
-    backend._cancel_pending_pin_for_op(*first)
+    first, last = backend._sources._source_pin_ops.items()
+    backend._sources._cancel_pending_pin_for_op(*first)
     assert len(payloads(recording, "source.pin.detached")) == expected
     assert not payloads(recording, "source.pin.completed")
     assert not pinning.cancelled
-    backend._cancel_pending_pin_for_op(*last)
+    backend._sources._cancel_pending_pin_for_op(*last)
     assert pinning.cancelled == [0]
     assert len(payloads(recording, "source.pin.detached")) == 2 * expected
     assert len(payloads(recording, "source.pin.completed")) == 1
     assert len(spans(recording, "source.pin.wait", "end")) == 1
     pinning.complete(0)
-    backend._process_pending_pin_results()
+    backend._sources._process_pending_pin_results()
     assert pinning.unpins == ["pin"]
     [completed] = payloads(recording, "source.pin.completed")
     assert int(completed["status"]) == int(_nvtx.Status.CANCELLED)
@@ -296,17 +296,17 @@ def test_off_loads_no_backend_and_records_no_pin_state_or_events(monkeypatch, le
         _nvtx, "_load_backend", lambda: pytest.fail("off mode loaded optional backend")
     )
     monkeypatch.setattr(
-        "kvcr.remote_fw_dram._NvtxState",
+        "kvcr.backends.remote_fw_dram._NvtxState",
         lambda **kwargs: pytest.fail("off mode allocated tracing state"),
     )
     source, agent, pinning = make_source((9, 10))
     assert all(
         op.nvtx_state is None
-        for op in source._core._remote_fw_dram._source_pin_ops.values()
+        for op in source._core._remote_fw_dram._sources._source_pin_ops.values()
     )
-    wait = next(iter(source._core._remote_fw_dram._pending_pin_ops.values()))
+    wait = next(iter(source._core._remote_fw_dram._sources._pending_pin_ops.values()))
     assert wait.trace is None
-    assert wait.op_ids == set(source._core._remote_fw_dram._source_pin_ops)
+    assert wait.op_ids == set(source._core._remote_fw_dram._sources._source_pin_ops)
     agent.state = "DONE"
     pinning.complete(0)
     _poll_until(source, lambda _: pinning.unpins == ["pin"])

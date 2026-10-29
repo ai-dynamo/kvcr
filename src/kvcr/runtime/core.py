@@ -16,33 +16,23 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from . import _nvtx
-from .config import (
+from .. import _nvtx
+from ..backends.local_disk import _G3, _G3Residency
+from ..backends.local_dram import _LocalDram
+from ..backends.local_dram_pools import (
+    _layout_indices,
+    _LocalDramResidency,
+    _LocalDramState,
+)
+from ..config import (
     KVCRBackendConfigs,
     KVCRConfig,
     TelemetryStats,
     _validate_pool_layouts,
 )
-from .hints.dispatcher import HintDispatcher
-from .local_disk import _G3, _G3Residency
-from .local_dram import (
-    _layout_indices,
-    _LocalDram,
-    _LocalDramResidency,
-    _LocalDramState,
-)
-from .policy import G3LRUPolicy, LRUPolicy
-from .policy_runtime import _PolicyInvoker
-from .progress import (
-    _FAILED_RESULT,
-    _KVCRProgress,
-    _MemDescriptor,
-    _Op,
-    _OpId,
-    _resolve_region,
-    _TransferRef,
-)
-from .types import (
+from ..hints.dispatcher import HintDispatcher
+from ..policy import G3LRUPolicy, LRUPolicy
+from ..types import (
     BlockKey,
     BlockMeta,
     CacheTier,
@@ -59,10 +49,20 @@ from .types import (
     ReleaseHandle,
     ReleaseResult,
 )
+from .policy_runtime import _PolicyInvoker
+from .progress import (
+    _FAILED_RESULT,
+    _KVCRProgress,
+    _MemDescriptor,
+    _Op,
+    _OpId,
+    _resolve_region,
+    _TransferRef,
+)
 
 if TYPE_CHECKING:
-    from .api import KVCRBindings
-    from .remote_fw_dram import _FwMemResidency
+    from ..api import KVCRBindings
+    from ..backends.remote_sources import _FwMemResidency
 
 logger = logging.getLogger(__name__)
 
@@ -286,8 +286,8 @@ class _KVCRCore:
         )
 
         # Import lazily to keep the concrete backend private to KVCR setup.
-        from .dangling_ops import _log_resilience_event
-        from .remote_fw_dram import _RemoteFWDram
+        from ..backends.dangling_ops import _log_resilience_event
+        from ..backends.remote_fw_dram import _RemoteFWDram
 
         self._on_resilience_event_callback = (
             _log_resilience_event
@@ -304,7 +304,9 @@ class _KVCRCore:
                 length // block_size * self.config.capacity_low_watermark_percent / 100
             )
             for name, (_, length, block_size) in (
-                self._local_dram._pools.items() if self._local_dram is not None else ()
+                self._local_dram._pools._regions.items()
+                if self._local_dram is not None
+                else ()
             )
         }
         if not any(self._capacity_low_watermarks.values()):
@@ -328,7 +330,7 @@ class _KVCRCore:
         # Built after the backends so hint handlers can bind to them.
         self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
-            {region.label: region for region in self._local_dram.memory_regions}
+            {region.label: region for region in self._local_dram._pools.memory_regions}
             if self._local_dram is not None
             else {}
         )
@@ -392,7 +394,7 @@ class _KVCRCore:
         # Transfer, not copy: rebuilding costs a second population of the set.
         self._block_record_map = records
 
-        local_dram.adopt_recovery_slots(records)
+        local_dram._pools.adopt_recovery_slots(records)
         if g3 is not None:
             g3.adopt_recovery_slots(records)
 
@@ -401,14 +403,14 @@ class _KVCRCore:
         for key, record in records.items():
             if record.local_dram is not None or g3 is None:
                 source = CacheTier.LOCAL_G2
-                slot_size = local_dram._size_bytes(record.local_dram)
+                slot_size = local_dram._pools._size_bytes(record.local_dram)
             else:
                 source, slot_size = CacheTier.G3, g3._size_bytes(record.g3)
             self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
 
         # After every admission: a block resident in both tiers must not be
         # ranked in one of them while the policy still has half of its record.
-        local_dram.rank_recovered(records)
+        local_dram._pools.rank_recovered(records)
         if g3 is not None:
             g3.rank_recovered(records)
         if self._key_history_enabled:
@@ -537,10 +539,10 @@ class _KVCRCore:
                     if record.g3 is not None or (
                         residency is not None and not residency.pending_labels
                     ):
-                        tier = local_dram if residency is not None else g3
+                        tier = local_dram._pools if residency is not None else g3
                         tier._residency_observer(key, record)
                 size_bytes = (
-                    local_dram._size_bytes(record.local_dram)
+                    local_dram._pools._size_bytes(record.local_dram)
                     if record.local_dram is not None
                     else g3._size_bytes(record.g3)
                 )
@@ -548,11 +550,11 @@ class _KVCRCore:
             self._policy.on_align_sequence(blocks, use_current_time)
             for key in records:
                 if local_dram is not None:
-                    local_dram._make_evictable(key)
+                    local_dram._pools._make_evictable(key)
                 if g3 is not None:
                     g3._make_evictable(key)
             if local_dram is not None:
-                local_dram._update_capacity_pressure()
+                local_dram._pools._update_capacity_pressure()
 
     # TODO: Add optional completion callbacks to movement APIs.
     def deliver(
@@ -761,7 +763,7 @@ class _KVCRCore:
         if self._local_dram is None:
             return [(handle, False) for handle in handles]
         with self._state_lock:
-            return self._local_dram.release(handles)
+            return self._local_dram._pools.release(handles)
 
     # TODO: Expose individual entry completions as they become available.
     def poll_completed(self) -> Iterable[OpResult]:
@@ -819,7 +821,7 @@ class _KVCRCore:
                 "completed": len(self._completion_queue),
             }
             if self._local_dram is not None:
-                resources.update(self._local_dram.telemetry_state())
+                resources.update(self._local_dram._pools.telemetry_state())
             if self._g3 is not None:
                 resources.update(self._g3.telemetry_state())
         for resource, value in resources.items():
@@ -896,7 +898,7 @@ class _KVCRCore:
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:
-            run(self._local_dram.close)
+            run(self._local_dram._pools.close)
         run(self._remote_fw_dram.close_main)
         for op_id in tuple(self._local_dram_sources_by_op):
             run(functools.partial(self._release_local_dram_sources, op_id))
@@ -1075,7 +1077,7 @@ class _KVCRCore:
     ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
-            claimed = self._local_dram.acquire_sources(
+            claimed = self._local_dram._pools.acquire_sources(
                 tuple(key for key in keys if key not in sources),
                 notify_capacity=notify_capacity,
                 allow_filling=allow_filling,
@@ -1181,7 +1183,7 @@ class _KVCRCore:
         released = set(sources) if keys is None else set(keys) & sources.keys()
         if self._local_dram is None:
             raise RuntimeError("controller source exists without local DRAM")
-        self._local_dram.release_sources(released)
+        self._local_dram._pools.release_sources(released)
         for key in released:
             sources.pop(key)
         if not sources:

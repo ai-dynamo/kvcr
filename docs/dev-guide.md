@@ -117,6 +117,7 @@ print("module:", path)
 print("public API:", KVCR, KVCRBindings)
 assert "site-packages" in str(path), path
 PY
+.venv/bin/kvcr-service --help
 ```
 
 Restore editable development mode after the wheel check:
@@ -215,7 +216,7 @@ The KVCR guard service owns pool lifecycle. It pre-allocates `--guard-count` Gua
 Before starting, ensure `/run/kvcr` and `/dev/shm/kvcr` exist and are writable by the user running the service:
 
 ```bash
-uv run python -m kvcr.kvcr_service \
+uv run kvcr-service \
   --socket-path /run/kvcr/memory.sock \
   --pool-dir /dev/shm/kvcr \
   --guard-count 1 \
@@ -224,6 +225,8 @@ uv run python -m kvcr.kvcr_service \
 ```
 
 The five flags above are required. Logging, heartbeat fencing, Guard startup timeout, and HTTP health options are optional.
+
+When loading a wheel through `PYTHONPATH` without installing it, use `python3 -m kvcr.service.server` with the same flags.
 
 Add `--health-port 9092` to enable read-only `GET /live` and `GET /ready` probes. The listener binds before pool allocation, to `127.0.0.1` by default; use `--health-host 0.0.0.0` for a Kubernetes probe and restrict network access to the probe port. During allocation and mapping, `/live` returns 200 and `/ready` returns 503. Both return 503 on a known failure, a dead Guard thread, a stalled Unix accept loop, or shutdown.
 
@@ -305,7 +308,7 @@ Validate that counters increase on both success and failure paths, byte counts a
 
 Complete standalone setup and validation first. Use a separate shared environment for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone development loop.
 
-Select a vLLM revision that includes the merged KVCR secondary-tier adapter (`"type": "kvcr"`), starting with [`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
+Select a vLLM revision that includes the merged KVCR 0.2.0 secondary-tier adapter (`"type": "kvcr"`), starting with [`fed7de9`](https://github.com/vllm-project/vllm/commit/fed7de909f894fbee0c45130376aed2e2c9bf0d3) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
 
 ### Build the integration environment
 

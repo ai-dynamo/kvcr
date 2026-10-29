@@ -11,10 +11,10 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-from . import _nvtx
-from .core import TRANSFER_BLOCKS_METRIC, logger
-from .progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
-from .types import BlockKey, OpHandle, PinHandle
+from .. import _nvtx
+from ..runtime.core import TRANSFER_BLOCKS_METRIC, logger
+from ..runtime.progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
+from ..types import BlockKey, OpHandle, PinHandle
 
 if TYPE_CHECKING:
     from .remote_fw_dram import _RemoteFWDram

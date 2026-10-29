@@ -22,15 +22,25 @@ from types import FrameType
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import memmap
-from .control_channels import (
+from ..runtime.control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
     KVCRMsgFramingError,
     KVCRServiceError,
 )
+from ..runtime.progress import _STARTUP_TIMEOUT_SECONDS
+from . import memmap
 from .guard import _Guard, _Lease, _Phase
-from .guard_protocol import (
+from .health import _serve_health
+from .memory import (
+    _POOL_PREFIX,
+    KVCRPoolSpec,
+    _KVCRPoolOwner,
+    _pool_dir_guard,
+    _reclaim_pool_if_orphaned,
+    _unlink_if_identity,
+)
+from .protocol import (
     _CLAIM_DECODER,
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
@@ -44,16 +54,6 @@ from .guard_protocol import (
     _Released,
     _TierConfig,
 )
-from .health import _serve_health
-from .memory import (
-    _POOL_PREFIX,
-    KVCRPoolSpec,
-    _KVCRPoolOwner,
-    _pool_dir_guard,
-    _reclaim_pool_if_orphaned,
-    _unlink_if_identity,
-)
-from .progress import _STARTUP_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 

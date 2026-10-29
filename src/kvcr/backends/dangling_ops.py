@@ -8,12 +8,12 @@ from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from .core import logger
+from ..runtime.core import logger
+from ..types import MemoryRef, OpHandle, TransferError
 from .remote_ops import _WriteProbe, _WriteProbeAck
-from .types import MemoryRef, OpHandle, TransferError
 
 if TYPE_CHECKING:
-    from .progress import _KVCRProgress
+    from ..runtime.progress import _KVCRProgress
     from .remote_fw_dram import _RemoteFWDram
     from .remote_ops import _SourceWriteOp, _TargetPullOp
 

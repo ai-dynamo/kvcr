@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG VLLM_IMAGE=vllm/vllm-openai:nightly-43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5@sha256:f8696a5176c1fb61e025b0772505674a3e092c25597eb26117003945b5121e8d
+ARG VLLM_IMAGE=vllm/vllm-openai:nightly-edad8b03c5285a1c12e7e4f83c1af709b319a01b@sha256:2e735ffeef26457f8a3ff44a62ae182870b10af37adc06ecbb08baca152365c6
 
 # The vLLM image, adapter source, and Dynamo revision below are one validated
 # compatibility set. Change them together and repeat the end-to-end test.
@@ -15,14 +15,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin the merged vLLM KVCR integration to an exact commit SHA.
 FROM build-base AS vllm-kvcr-source
 ARG KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG KVCR_VLLM_REF=08567505b09324f891797f4a13c1bd73fc75a827
+ARG KVCR_VLLM_REF=fed7de909f894fbee0c45130376aed2e2c9bf0d3
 RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr remote add origin "${KVCR_VLLM_REPO}" \
  && git -C /src/vllm-kvcr fetch --depth 1 origin "${KVCR_VLLM_REF}" \
  && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
  && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}"
 WORKDIR /src/vllm-kvcr
-RUN mkdir -p /overlay \
+# Use the public channel export without changing the validated adapter revision.
+RUN sed -i 's/^from kvcr\.control_channels import ZmqPeerControlChannel$/from kvcr import ZmqPeerControlChannel/' \
+      vllm/v1/kv_offload/tiering/kvcr/manager.py \
+ && mkdir -p /overlay \
  && cp --parents \
       vllm/distributed/kv_events.py \
       vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py \
@@ -94,6 +97,7 @@ ENV DYN_REQUEST_PLANE=tcp \
 # Fail the build if an incompatible source revision displaced any part of the
 # serving path. The validated NCCL restore intentionally differs from the
 # torch wheel's declared pin, so a global `pip check` is not a useful canary.
+RUN kvcr-service --help
 RUN python3 - <<'PY'
 from importlib import metadata
 import inspect

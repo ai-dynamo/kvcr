@@ -12,10 +12,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .config import G3Options
-from .local_dram import _layout_indices
-from .policy_runtime import _EvictionQueue
-from .progress import (
+from ..config import G3Options
+from ..runtime.policy_runtime import _EvictionQueue
+from ..runtime.progress import (
     _FAILED_RESULT,
     _SUCCESS_RESULT,
     _KVCRProgress,
@@ -24,7 +23,7 @@ from .progress import (
     _ProgressOp,
     _TransferRef,
 )
-from .types import (
+from ..types import (
     BlockKey,
     BlockMeta,
     CacheTier,
@@ -35,9 +34,10 @@ from .types import (
     PlacementFailure,
     TransferError,
 )
+from .local_dram_pools import _layout_indices
 
 if TYPE_CHECKING:
-    from .core import _BlockRecord, _KVCRCore
+    from ..runtime.core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +352,7 @@ class _G3:
                 self._rollback(op.reservations)
                 if local is not None:
                     for key in op.ordered_keys:
-                        local.abandon_capacity_eviction(key)
+                        local._pools.abandon_capacity_eviction(key)
                 self._kvcr._release_local_dram_sources(op.op_id)
             else:
                 self._release_claims(op.claims)
@@ -405,7 +405,7 @@ class _G3:
             return (PlacementAction.KEEP, None), False
         try:
             source = list(
-                self._kvcr._local_dram.source_refs(
+                self._kvcr._local_dram._pools.source_refs(
                     sources[key], list(range(len(sources[key].slots)))
                 )
             )
@@ -656,7 +656,9 @@ class _G3:
         record = self._kvcr._block_record_map[key]
         self._kvcr._policy.decide_recovery(
             self._kvcr._block_meta(
-                key, record, self._kvcr._local_dram._size_bytes(record.local_dram)
+                key,
+                record,
+                self._kvcr._local_dram._pools._size_bytes(record.local_dram),
             ),
             PlacementFailure(
                 attempted=(PlacementAction.MOVE_TO, CacheTier.G3),
@@ -674,7 +676,7 @@ class _G3:
         local = self._kvcr._local_dram
         if local is None:
             raise RuntimeError("G3 move completed without local DRAM")
-        local.retire_sources(sources)
+        local._pools.retire_sources(sources)
         self._kvcr._release_local_dram_sources(op_id)
 
     def _reserve(

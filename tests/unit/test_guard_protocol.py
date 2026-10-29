@@ -12,14 +12,15 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _wait_until
 
-from kvcr import guard_protocol as protocol_module
 from kvcr.config import G3Options, LocalDramOptions
-from kvcr.control_channels import (
+from kvcr.runtime.control_channels import (
     KVCRGuardProtocolError,
     KVCRServiceError,
     KVCRSocketError,
 )
-from kvcr.guard_protocol import (
+from kvcr.service import protocol as protocol_module
+from kvcr.service.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
+from kvcr.service.protocol import (
     KVCRClient,
     KVCRPoolHold,
     PidfdLiveness,
@@ -33,7 +34,6 @@ from kvcr.guard_protocol import (
     _Released,
     _TierConfig,
 )
-from kvcr.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
 
 _GUARD_INDEX = 3
 _POOL_LAYOUTS = [("pool0", 1024), ("pool1", 3072)]
