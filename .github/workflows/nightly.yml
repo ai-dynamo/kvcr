@@ -49,6 +49,8 @@ jobs:
       contents: read
       actions: read
     uses: ./.github/workflows/release.yml
+    # Without this, the called jobs see empty automated-release secrets.
+    secrets: inherit
     with:
       mode: nightly
       stage: ${{ github.event_name == 'schedule' || github.event_name == 'push' || inputs.release == true }}
