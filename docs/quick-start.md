@@ -14,7 +14,7 @@ For a proposed Kubernetes deployment with an optional KVCR guard service sidecar
 ## Prerequisites
 
 - A Linux x86-64 host with at least two supported NVIDIA GPUs;
-- NVIDIA driver 580.126.20 or newer for the pinned CUDA 13.0.3 runtime;
+- NVIDIA driver 580.126.20 or newer for the pinned CUDA 13.0.2 runtime;
 - Docker Engine with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
 - Git, curl, and Python 3 for the build and verification commands;
 - network access to GitHub, PyPI, Docker Hub, crates.io, Debian package mirrors, and the model source; and
@@ -32,7 +32,7 @@ The repository includes [Dockerfile.quick-start](../Dockerfile.quick-start). The
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-export KVCR_VLLM_REF=08567505b09324f891797f4a13c1bd73fc75a827
+export KVCR_VLLM_REF=fed7de909f894fbee0c45130376aed2e2c9bf0d3
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \
