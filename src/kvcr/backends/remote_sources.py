@@ -85,8 +85,8 @@ class _RemoteSources:
             _SourceWriteState.CANCEL_PENDING,
         ):
             if item.local_sources:
-                # Local readers release on progress; local.poll_main owns
-                # their deferred access accounting and reclamation.
+                # local.poll_main drains reader releases with their access
+                # accounting and reclamation.
                 # TODO: Skip queued local handoffs if useful; keep TransferError events.
                 return
             # Framework ownership can be handed back after uncertainty;

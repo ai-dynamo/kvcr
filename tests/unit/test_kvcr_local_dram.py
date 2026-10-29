@@ -841,9 +841,12 @@ def test_eviction_preserves_reader_claimed_during_policy_decision(monkeypatch):
     assert memory.raw == b"b" * 16
 
 
-@pytest.mark.parametrize("spill_finishes_first", [False, True])
+@pytest.mark.parametrize(
+    "completion_order", ["reader_first", "spill_first", "during_admission"]
+)
 def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
-    spill_finishes_first,
+    completion_order,
+    monkeypatch,
 ):
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     memory = ctypes.create_string_buffer(48)
@@ -879,14 +882,25 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
     deposit = kvcr.deposit(blocks)
     assert list(kvcr.poll_completed()) == []
     local.retire_sources((retiring,))
-    if spill_finishes_first:
+    if completion_order == "spill_first":
         local.release_sources((retiring,))
         kvcr.align_sequence([retiring])
 
     now = 0.3
     local.release_readers((retiring,), (retiring_source[0][0],), success=False)
-    local.release_readers((recent,), (recent_source[0][0],), success=True)
-    if not spill_finishes_first:
+    if completion_order == "during_admission":
+        decide_ingest = kvcr._core._policy.decide_ingest
+
+        def complete_reader(*args, **kwargs):
+            # Finish after the admission's initial completion drain.
+            monkeypatch.setattr(kvcr._core._policy, "decide_ingest", decide_ingest)
+            local.release_readers((recent,), (recent_source[0][0],), success=True)
+            return decide_ingest(*args, **kwargs)
+
+        monkeypatch.setattr(kvcr._core._policy, "decide_ingest", complete_reader)
+    else:
+        local.release_readers((recent,), (recent_source[0][0],), success=True)
+    if completion_order != "spill_first":
         local.release_sources((retiring,))
     duplicate = kvcr.deposit(blocks)
     completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))

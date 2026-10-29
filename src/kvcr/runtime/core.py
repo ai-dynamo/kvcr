@@ -670,7 +670,7 @@ class _KVCRCore:
                     dict.fromkeys(blocks, _FAILED_RESULT),
                 )
             else:
-                self._local_dram._pools._drain_sources()
+                self._local_dram._pools._drain_source_completions()
                 if self._g3 is not None:
                     for key, refs in blocks.items():
                         if self._g3.is_ready(key):
@@ -717,7 +717,7 @@ class _KVCRCore:
                 )
                 return op_handle
 
-            local_dram._pools._drain_sources()
+            local_dram._pools._drain_source_completions()
             sources = {}
             for key in ordered_keys:
                 record = self._block_record_map.get(key)
@@ -1075,14 +1075,12 @@ class _KVCRCore:
         op_id: _OpId,
         keys: Collection[BlockKey],
         *,
-        notify_capacity: bool = True,
         allow_filling: bool = False,
     ) -> Mapping[BlockKey, _LocalDramResidency]:
         sources = self._local_dram_sources_by_op.get(op_id, {})
         if self._local_dram is not None:
             claimed = self._local_dram._pools.acquire_sources(
                 tuple(key for key in keys if key not in sources),
-                notify_capacity=notify_capacity,
                 allow_filling=allow_filling,
             )
             if claimed:

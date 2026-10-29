@@ -178,7 +178,7 @@ def _has_outstanding_operations(kvcr: KVCR) -> bool:
         local is not None
         and (
             local._pools.source_operations > 0
-            or not local._pools._sources.completions.empty()
+            or not local._pools._source_state.completions.empty()
         )
     )
 

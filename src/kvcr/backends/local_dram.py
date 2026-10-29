@@ -517,7 +517,7 @@ class _LocalDram:
         self._start_deliveries(op, blocks)
 
     def discard_fill(self, keys: Collection[BlockKey]) -> None:
-        state = self._pools._sources
+        state = self._pools._source_state
         residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         for key in dict.fromkeys(keys):
@@ -574,7 +574,7 @@ class _LocalDram:
             self._finish_deliver_if_ready(deliver_op)
 
     def poll_main(self, items: Collection[object]) -> list[object]:
-        self._pools._drain_sources()
+        self._pools._drain_source_completions()
         # Progress-side source claims defer framework callbacks to the caller.
         self._pools._update_capacity_pressure()
         unhandled: list[object] = []
@@ -968,7 +968,7 @@ class _LocalDram:
             return
         self._resuming_capacity_waiters = True
         try:
-            self._pools._drain_sources()
+            self._pools._drain_source_completions()
             # One pass lets other waiters run while discarded fills retain slots.
             for _ in range(len(self._capacity_waiters)):
                 waiter = self._capacity_waiters[0]

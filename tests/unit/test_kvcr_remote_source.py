@@ -217,8 +217,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
 
         agent.state = "DONE"
         _wait_until(lambda: len(agent.released_xfers) == prior_transfers + 1)
-        _wait_until(lambda: residency.source_readers == 0)
-        assert list(source.poll_completed()) == []
+        assert _poll_until(source, lambda _: residency.source_readers == 0) == []
         assert not source._core._local_dram_sources_by_op
 
         # The caller-queued path reuses the same parts without pinning the framework.
@@ -370,7 +369,7 @@ def test_local_source_retries_after_reader_contention(outcome):
         deposit = source.deposit({key: [descriptor]})
         assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
         agent.state = "PROC"
-        with local._sources.lock:
+        with local._source_state.lock:
             control.incoming.extend(
                 [
                     _start_write_message(12, requested_key, target_agent="target"),
