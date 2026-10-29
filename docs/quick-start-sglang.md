@@ -18,8 +18,6 @@ For vLLM, use the [vLLM quick start](quick-start-vllm.md). For implementation an
 
 This example uses two independent TP1 workers on one host, Qwen3-0.6B BF16, `trtllm_mha`, 64-token pages, and the Python radix tree. Each worker has 2 GiB of HiCache staging and a separate 1 GiB KVCR DRAM pool. The same-host transport is UCX TCP/shared memory with CUDA-copy support, not an RDMA performance test.
 
-Keep the same checkpoint and KV-cache encoding on every peer. To change weights, restart the whole worker set with fresh caches; do not update weights in place. This HiCache route uses process-local KVCR allocations, not Guard recovery.
-
 ## 1. Build the integration image
 
 Until this PR merges, fetch its public recipe and build the SGLang image from [Dockerfile.quick-start-sglang](../Dockerfile.quick-start-sglang):
@@ -146,15 +144,8 @@ without reconstructing KVCR's default ports or rank offsets. The same SGLang
 resolver supplies the channel's startup address. An explicit
 `control_advertise_host` and enabled remote hints are required to advertise a
 source; an older SGLang build without this metadata does not advertise transfer
-capability. These are configured coordinates, not proof of a listening socket or
-resident KV: actual stores and LRU removals update the engine-lifetime KVCR owner
-through the state agent. A raw-event sequence gap stops this attachment; restart
-the affected worker rather than relying on stale inventory. This mode does not
-provide durable recovery or lossless event replay.
-
-Inventory remains advisory: dropped events can leave missing or stale hints. Storage lookup and completed delivery determine usable pages. Restart the workers after replacing the state-agent host; automatic reattachment is not supported here.
-
-An uncertain peer write can terminate the worker: HiCache cannot yet quarantine memory that may still receive a late transfer. This prevents unsafe buffer reuse, but is not seamless source-failure recovery.
+capability. Actual KVCR stores and LRU removals update the KVCR-owned inventory
+through the state agent; source coordinates alone do not establish residency.
 
 ## 6. Verify peer reuse
 
