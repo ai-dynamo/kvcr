@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 
 from . import _nvtx
-from . import operation_capture as capture
 from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
     DURATION_METRIC,
@@ -239,7 +238,6 @@ class _RemoteFWDram:
             return False
         return True
 
-    @capture.request("target")
     def _start_target_pull(
         self,
         blocks: Mapping[BlockKey, list[_TransferRef]],
@@ -251,8 +249,6 @@ class _RemoteFWDram:
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
-        if started_at is None and capture.current() is not None:
-            started_at = time.monotonic()
         scope = "remote_fetch" if local_fill else "remote_deliver"
         current_hint = (
             self._request_hints.get(request_id) if request_id is not None else None
@@ -300,7 +296,6 @@ class _RemoteFWDram:
                 len(keys),
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
-        capture.bind(op)
         kvcr._add_block_dependencies(op, new_operation=True)
         kvcr._progress.submit(op)
         if not local_fill and request_id is not None:
@@ -769,13 +764,10 @@ class _RemoteFWDram:
     # to main; progress writes to the target.
     # -------------------------------------------------------------------------
 
-    @capture.request("source")
     def _handle_start_write(
         self, progress: _KVCRProgress, payload: _StartWrite
     ) -> None:
         started_at = self._kvcr._timer()
-        if started_at is None and capture.current() is not None:
-            started_at = time.monotonic()
         received_at = self._kvcr._clock()
         op_handle = payload.op_handle
         remaining_timeout_ms = payload.remaining_timeout_ms
@@ -788,7 +780,6 @@ class _RemoteFWDram:
             or len(key_set := frozenset(keys)) != len(keys)
             or len(keys) != len(dst_descriptors)
         ):
-            capture.reason("malformed_start_write")
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
             return
@@ -816,7 +807,6 @@ class _RemoteFWDram:
         except _RemoteAgentCleanupError:
             raise
         except Exception:
-            capture.reason("peer_metadata_validation_failed")
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
             )
@@ -825,19 +815,16 @@ class _RemoteFWDram:
 
         write_id = (target_agent, OpHandle(op_handle))
         if status := self._dangling_ops.source_writes.get(write_id):
-            capture.reason("duplicate_write_request")
             if status.cancel_requested and not status.submitted:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.source_incarnation
         if expected is not None and expected != self._dangling_ops.incarnation:
-            capture.reason("source_incarnation_changed")
             # Another process was quoted: refuse pre-submit so the target retries
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(progress, payload, op_handle, "source_restarted")
             return
         if progress._stop_requested or not self._dangling_ops.check_source_progress():
-            capture.reason("stopping" if progress._stop_requested else "source_stalled")
             if logger.isEnabledFor(logging.DEBUG):
                 reason = "stopping" if progress._stop_requested else "source_stalled"
                 logger.debug(
@@ -914,11 +901,6 @@ class _RemoteFWDram:
     ) -> None:
         local = self._kvcr._local_dram
         claim_started = self._kvcr._timer()
-        context = capture.current()
-        if context:
-            context.keys = payload.keys
-            context.source_requested_keys = payload.keys
-            context.timings["claim_begin_ns"] = time.monotonic_ns()
         selected, busy = (
             local.claim_export_subset(
                 payload.keys,
@@ -931,12 +913,9 @@ class _RemoteFWDram:
             else ((), False)
         )
         claim_finished = time.monotonic()
-        if context:
-            context.timings["claim_end_ns"] = time.monotonic_ns()
-            context.source_ready_keys = tuple(claim.key for _, claim in selected)
         claims = tuple(claim for _, claim in selected)
         try:
-            # Claims keep selected sources stable during destination validation.
+            # Source claims fence memory while validating only READY destinations.
             for index, _ in selected:
                 self._kvcr._validate_descriptors(
                     payload.dst_descriptors[index],
@@ -972,13 +951,11 @@ class _RemoteFWDram:
                 else None,
             )
             progress._in_flight_ops[op_id] = op
-            capture.bind(op)
         except BaseException as error:
             if claims:
                 local.release_export_claims(claims)
             self._dangling_ops.source_writes.pop((route[0], payload.op_handle), None)
             if isinstance(error, Exception):
-                capture.reason("selected_descriptor_validation_failed")
                 logger.warning(
                     "Guard source pre-submit validation failed", exc_info=True
                 )
@@ -1011,8 +988,6 @@ class _RemoteFWDram:
         claims = op.guard_claims
         self._kvcr._local_dram.release_export_claims(claims)
         op.guard_claims = ()
-        if op._capture:
-            op._capture.timings["cleanup_done_ns"] = time.monotonic_ns()
         self._record_progress_duration(
             "guard_claim_hold", op.guard_claim_started_at, "quiesced"
         )
@@ -1021,16 +996,6 @@ class _RemoteFWDram:
     def _guard_source_callback(self, stage: str) -> bool:
         if not self._options.no_pinning_mode:
             return False
-        output = self._kvcr._compact_capture
-        if output:
-            output.invalidate("source_callback_violation:" + stage)
-            output.emit(
-                dict(
-                    event="capture_error",
-                    agent=self._kvcr.nixl_agent_name,
-                    reason="source_callback_violation:" + stage,
-                )
-            )
         self._record_progress_counter(
             "kvcr_guard_source_events", 1, ("source_callback_violation",)
         )
@@ -1253,16 +1218,6 @@ class _RemoteFWDram:
             return False
         if not isinstance(payload, dict) or payload.get("type") != "start_write":
             return False
-        return self._reject_malformed_start_write(progress, payload, error)
-
-    @capture.request("source")
-    def _reject_malformed_start_write(
-        self,
-        progress: _KVCRProgress,
-        payload: Mapping[str, Any],
-        error: msgspec.ValidationError,
-    ) -> bool:
-        capture.reason("malformed_start_write")
         op_handle = payload.get("op_handle")
         if type(op_handle) is not int:
             logger.warning("KVCR malformed start_write: invalid op_handle: %s", error)
@@ -1990,19 +1945,16 @@ class _RemoteFWDram:
     def _record_progress_duration(
         self, scope: str, started_at: float | None, result: str
     ) -> None:
-        context = capture.current() if scope == "source_write" else None
-        if context is not None and context.side != "source":
-            context = None
-        if started_at is None or (not self._telemetry_enabled and context is None):
+        if not self._telemetry_enabled or started_at is None:
             return
-        sampled_at = time.monotonic()
-        if context is not None:
-            # Share the original metric sample, before source claim cleanup.
-            context.timings["core_source_write_ns"] = round(sampled_at * 1e9)
-        if self._telemetry_enabled:
-            self._progress_metrics.append(
-                ("histogram", DURATION_METRIC, sampled_at - started_at, (scope, result))
+        self._progress_metrics.append(
+            (
+                "histogram",
+                DURATION_METRIC,
+                time.monotonic() - started_at,
+                (scope, result),
             )
+        )
 
     def _record_progress_counter(
         self,
