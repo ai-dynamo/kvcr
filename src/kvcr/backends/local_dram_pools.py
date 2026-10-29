@@ -308,7 +308,7 @@ class _LocalDramPools:
         """Return indexed claims; None retries contention, False uses the caller."""
         state = self._source_state
         if not state.lock.acquire(blocking=False):
-            return None
+            return () if allow_missing else None
         try:
             claims = []
             for index, (key, destination) in enumerate(zip(keys, destinations)):

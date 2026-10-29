@@ -95,6 +95,7 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
         (1, [b"local"], [":b"], [], "ready"),
         (1, [b"local"], [":a", ":b"], [], "ready"),
         (2, [b"local"], [":a", ":b"], [0], "ready"),
+        (2, [b"local"], [":a", ":b"], [], "contended"),
         (2, [b"local"], [":a"], [], "no_local"),
         (2, [b"local"], [":a"], [], "key_layout"),
         (2, [b"local"], [":other"], [], "requested_labels"),
@@ -164,7 +165,11 @@ def test_framework_pinning_disabled(
                     (second, _op_entries({b"local": True}))
                 ]
         before = len(agent.xfers)
-        with source._core._state_lock:
+        with (
+            source._core._local_dram._pools._source_state.lock
+            if source_case == "contended"
+            else source._core._state_lock
+        ):
             control.incoming.append(msgspec.msgpack.encode(request))
             _wait_until(
                 lambda: len(agent.xfers) == before + 1 or bool(agent.sent_notifs)
@@ -459,9 +464,6 @@ def test_local_source_retries_after_reader_contention(outcome):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
-    if outcome != "framework":
-        pinning.request_pin = pinning.poll_pin_results = None
-        pinning.release_pin = pinning.cancel_pin_request = None
     source = _new_kvcr(
         agent,
         pinning,
