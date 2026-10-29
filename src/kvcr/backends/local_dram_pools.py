@@ -178,8 +178,7 @@ class _SourceState:
     def __init__(self) -> None:
         # Owner paths take _state_lock before this lock; progress takes only this.
         self.lock = threading.Lock()
-        # None keeps allocated, unpublished keys on the caller's preparation path.
-        self.index: dict[BlockKey, _LocalDramResidency | None] = {}
+        self.index: dict[BlockKey, _LocalDramResidency] = {}
         self.active: dict[BlockKey, _LocalDramResidency] = {}
         self.operations = 0
         self.completions: queue.SimpleQueue[
@@ -258,25 +257,33 @@ class _LocalDramPools:
         with state.lock:
             return state.operations
 
-    def _mark_source_pending(self, key: BlockKey) -> None:
-        if self._kvcr.framework_control is not None:
-            with self._source_state.lock:
-                self._source_state.index[key] = None
-
     def _publish_source(
         self,
         key: BlockKey,
         residency: _LocalDramResidency,
         refs: tuple[_TransferRef, ...] | None = None,
     ) -> None:
-        if self._kvcr.framework_control is None or residency.pending_labels:
+        if self._kvcr.framework_control is None:
             return
         if refs is None:
-            refs = (
-                self.source_refs(residency, range(len(residency.slots)))
-                if residency.refs
-                else tuple(self._descriptors(residency.slots))
-            )
+            cached = residency.refs
+            pending = residency.pending_labels
+            # Replace published snapshots; progress may still be reading the old one.
+            if isinstance(cached, tuple):
+                refs = cached
+            elif pending:
+                refs = {
+                    index: cached.get(index) or self._descriptor(label, slot)
+                    for index, (label, slot) in enumerate(residency.slots)
+                    if label not in pending
+                }
+            elif cached:
+                refs = tuple(
+                    cached.get(index) or self._descriptor(label, slot)
+                    for index, (label, slot) in enumerate(residency.slots)
+                )
+            else:
+                refs = tuple(self._descriptors(residency.slots))
         state = self._source_state
         with state.lock:
             if (
@@ -307,17 +314,21 @@ class _LocalDramPools:
             for index, (key, destination) in enumerate(zip(keys, destinations)):
                 residency = state.index.get(key)
                 if residency is None:
-                    if allow_missing and key not in state.index:
+                    if allow_missing:
                         continue
                     return False
-                available = cast(tuple[_TransferRef, ...], residency.refs)
+                available = residency.refs
+                if not allow_missing and isinstance(available, dict):
+                    return False
                 if key_layout and key_layout != residency.key_layout:
                     if allow_missing:
                         logger.debug("KVCR start_write layout mismatch key=%r", key)
                         continue
                     return False
                 requested = [ref.label for ref in destination]
-                if residency.layout == tuple(requested):
+                if isinstance(available, tuple) and residency.layout == tuple(
+                    requested
+                ):
                     refs = available
                 else:
                     indices = _layout_indices(
@@ -330,7 +341,14 @@ class _LocalDramPools:
                             logger.debug("KVCR start_write layout mismatch key=%r", key)
                             continue
                         return False
-                    refs = tuple(available[index] for index in indices)
+                    if isinstance(available, tuple):
+                        refs = tuple(available[index] for index in indices)
+                    else:
+                        refs = tuple(available.get(index) for index in indices)
+                        if None in refs:
+                            if allow_missing:
+                                continue
+                            return False
                 claims.append((index, residency, refs))
             result = tuple(claims)
             for index, residency, _ in result:
@@ -558,8 +576,7 @@ class _LocalDramPools:
                 raise RuntimeError(f"local DRAM source cannot retire {key!r}")
             with state.lock:
                 residency.retire_on_release = True
-                if self._kvcr.framework_control is not None:
-                    state.index[key] = None
+                state.index.pop(key, None)
 
     def abandon_capacity_eviction(self, key: BlockKey) -> None:
         """Stop blocking local admission on an eviction that will not land.

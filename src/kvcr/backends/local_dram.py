@@ -308,14 +308,12 @@ class _LocalDram:
                         op.results[key] = _FAILED_RESULT
                     continue
                 full_deposit = layout == local_layout
-                residency = _LocalDramResidency(
+                residency = record.local_dram = _LocalDramResidency(
                     locations,
                     _LocalDramState.FILLING,
                     key_layout=declaration,
                     writers=[1 if full_deposit else 0] * len(locations),
                 )
-                self._pools._mark_source_pending(key)
-                record.local_dram = residency
             if full_deposit:
                 selected_slots = residency.slots
                 selected_indices = tuple(range(len(selected_slots)))
@@ -540,8 +538,7 @@ class _LocalDram:
                 and not residency.pending_deposits
             ):
                 with state.lock:
-                    if self._kvcr.framework_control is not None:
-                        state.index[key] = None
+                    state.index.pop(key, None)
                     residency.state = _LocalDramState.DISCARDING
             if residency.remote_indices is not None:
                 residency.remote_cancelled = True
@@ -809,11 +806,9 @@ class _LocalDram:
             layout, op.keys, op.deadline
         )
         if locations is not None:
-            residency = _LocalDramResidency(
+            record.local_dram = _LocalDramResidency(
                 locations, _LocalDramState.FILLING, key_layout=op.key_layout
             )
-            self._pools._mark_source_pending(key)
-            record.local_dram = residency
         self._pools._update_capacity_pressure()
         self._kvcr._publish_inventory(evicted, CacheTier.LOCAL_G2, removed=True)
         return locations is not None, waiting

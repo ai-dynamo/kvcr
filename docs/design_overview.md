@@ -216,7 +216,7 @@ These statuses describe current KVCR knowledge, not a reservation or guarantee. 
 
 To serve from framework-owned memory, the KVCR acquires a pin asynchronously through `request_pin` and `poll_pin_results`, reusing covered keys and requesting only the remainder; the framework keeps it valid until `release_pin` accepts release. `release_pin` must be safely retryable: `False` or an exception leaves release pending; `True` means the framework accepts responsibility for completing release, including retaining uncertain allocations until the matching `quiesced` event.
 
-If framework pinning is not needed, for example when framework DRAM is used only for staging, omit the pin callbacks from `KVCRBindings`.
+If framework pinning is not needed, for example when framework DRAM is used only for staging, omit the pin callbacks from `KVCRBindings`. In this mode, unavailable pieces are reported as misses.
 
 A deployment may choose to use only framework-owned memory. In that case, it uses the pinning mechanism together with `deliver` and does not use `deposit`, `fetch`, or `release`.
 

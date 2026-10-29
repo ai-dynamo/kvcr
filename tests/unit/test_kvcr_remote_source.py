@@ -87,73 +87,106 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "keys,completed_indices,source_case",
+    "ready_pieces,keys,requested,completed_indices,source_case",
     [
-        ([b"local"], [0], "ready"),
-        ([b"missing", b"local", b"absent"], [1], "ready"),
-        ([b"missing"], [], "ready"),
-        ([b"local"], [], "no_local"),
-        ([b"local"], [], "key_layout"),
-        ([b"local"], [], "requested_labels"),
+        (0, [b"local"], [":a"], [], "ready"),
+        (1, [b"local"], [":a"], [0], "ready"),
+        (1, [b"missing", b"local", b"absent"], [":a"], [1], "ready"),
+        (1, [b"local"], [":b"], [], "ready"),
+        (1, [b"local"], [":a", ":b"], [], "ready"),
+        (2, [b"local"], [":a", ":b"], [0], "ready"),
+        (2, [b"local"], [":a"], [], "no_local"),
+        (2, [b"local"], [":a"], [], "key_layout"),
+        (2, [b"local"], [":other"], [], "requested_labels"),
     ],
 )
-def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_caplog):
+def test_framework_pinning_disabled(
+    ready_pieces, keys, requested, completed_indices, source_case, kvcr_caplog
+):
     kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram_pools")
     pinning = SimpleNamespace(
         request_pin=None,
         poll_pin_results=None,
         release_pin=None,
     )
-    memory = ctypes.create_string_buffer(b"a" * 16, 16)
+    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     agent, control = FakeNixlAgent(), FakeBytesControl()
     source = _new_kvcr(
         agent,
         pinning,
         control,
         name="source",
-        framework_regions=[_buffer_region(memory, 16)],
+        framework_regions=[_buffer_region(memory, 16, ":*")],
         local_dram=(
             None
             if source_case == "no_local"
-            else LocalDramOptions([("", ctypes.addressof(memory), 16)])
+            else LocalDramOptions([("", ctypes.addressof(memory), 32)])
         ),
     )
-    agent.state = "DONE"
-    if source_case != "no_local":
-        with patch.object(
-            agent, "make_prepped_xfer", side_effect=RuntimeError("failed")
-        ):
-            failed = source.deposit(
-                {b"missing": [_mem_descriptor(end_point_name="source")]}
-            )
-            assert _poll_until(source, bool) == [
-                (failed, _op_entries({b"missing": False}))
-            ]
-        deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
-        assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    layout = [":a", ":b"]
     request = msgspec.msgpack.decode(_start_write_message(12, b"local"))
     request.update(
         keys=keys,
-        dst_descriptors=[[_TransferRef("target", i)] for i in range(len(keys))],
+        key_layout=[":a", ":other"] if source_case == "key_layout" else layout,
+        target_regions=(
+            {":*": RegionDescriptor(addr=128, size=16, count=3, label=":*")},
+            {},
+        ),
+        dst_descriptors=[
+            [
+                _TransferRef("target", i * len(requested) + j, label)
+                for j, label in enumerate(requested)
+            ]
+            for i in range(len(keys))
+        ],
     )
-    if source_case == "key_layout":
-        request["key_layout"] = ["", ":other"]
-    elif source_case == "requested_labels":
-        request["target_regions"] = ({":*": _buffer_region(memory, 16, ":*")}, {})
-        request["dst_descriptors"] = [[_TransferRef("target", 0, ":other")]]
-    with source._core._state_lock:
-        control.incoming.append(msgspec.msgpack.encode(request))
-        _wait_until(lambda: len(agent.xfers) == 2 or bool(agent.sent_notifs))
-    notification = agent.xfers[-1][5] if completed_indices else agent.sent_notifs[0][1]
-    assert _decode_notif(notification) == {
-        "type": "write_done",
-        "op_handle": 12,
-        "success": True,
-        "completed_indices": completed_indices,
-    }
-    if completed_indices:
-        assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
-    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    try:
+        if source_case != "no_local":
+            first = source.deposit(
+                {b"local": [_mem_descriptor(0, label=":a", end_point_name="source")]},
+                expected_layout=layout,
+            )
+            _wait_until(lambda: len(agent.xfers) == 1)
+            if ready_pieces:
+                agent.state = "DONE"
+                assert _poll_until(source, bool) == [
+                    (first, _op_entries({b"local": True}))
+                ]
+            if ready_pieces == 2:
+                second = source.deposit(
+                    {
+                        b"local": [
+                            _mem_descriptor(1, label=":b", end_point_name="source")
+                        ]
+                    }
+                )
+                assert _poll_until(source, bool) == [
+                    (second, _op_entries({b"local": True}))
+                ]
+        before = len(agent.xfers)
+        with source._core._state_lock:
+            control.incoming.append(msgspec.msgpack.encode(request))
+            _wait_until(
+                lambda: len(agent.xfers) == before + 1 or bool(agent.sent_notifs)
+            )
+        notification = (
+            agent.xfers[-1][5] if completed_indices else agent.sent_notifs[0][1]
+        )
+        assert _decode_notif(notification) == {
+            "type": "write_done",
+            "op_handle": 12,
+            "success": True,
+            "completed_indices": completed_indices,
+        }
+        if completed_indices:
+            assert agent.xfers[-1][3][0] == (128 + 16 * completed_indices[0], 16, 0)
+            assert [
+                ctypes.string_at(addr, size) for addr, size, _ in agent.xfers[-1][1]
+            ] == [b"a" * 16, b"b" * 16][:ready_pieces]
+        agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    finally:
+        agent.state = "DONE"
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (
@@ -316,19 +349,16 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
 
 
 @pytest.mark.parametrize(
-    "first_piece_ready,mixed,framework_pinning",
-    [(False, False, False), (True, False, False), (True, True, True)],
+    "first_piece_ready,mixed",
+    [(False, False), (True, False), (True, True)],
 )
 @pytest.mark.parametrize("timeout", [False, True])
 def test_local_source_waits_for_declared_pieces(
-    first_piece_ready, timeout, mixed, framework_pinning, caplog, request
+    first_piece_ready, timeout, mixed, caplog, request
 ) -> None:
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     local = ctypes.create_string_buffer(32)
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
-    if not framework_pinning:
-        pinning.request_pin = pinning.poll_pin_results = None
-        pinning.release_pin = pinning.cancel_pin_request = None
     request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
     source = _new_kvcr(
         agent,
