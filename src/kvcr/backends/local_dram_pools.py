@@ -254,14 +254,20 @@ class _LocalDramPools:
         with state.lock:
             return state.operations
 
-    def _publish_source(self, key: BlockKey, residency: _LocalDramResidency) -> None:
+    def _publish_source(
+        self,
+        key: BlockKey,
+        residency: _LocalDramResidency,
+        refs: tuple[_TransferRef, ...] | None = None,
+    ) -> None:
         if self._kvcr.framework_control is None or residency.pending_labels:
             return
-        refs = (
-            self.source_refs(residency, range(len(residency.slots)))
-            if residency.refs
-            else tuple(self._descriptors(residency.slots))
-        )
+        if refs is None:
+            refs = (
+                self.source_refs(residency, range(len(residency.slots)))
+                if residency.refs
+                else tuple(self._descriptors(residency.slots))
+            )
         state = self._sources
         with state.lock:
             if (

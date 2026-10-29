@@ -186,6 +186,44 @@ def test_local_deposit_deduplicates_and_evicts_fifo(monkeypatch, caplog, history
         assert {r["event"] for r in records} >= {"ready", "inventory_accepted"}
 
 
+def test_completed_deposit_reuses_destination_descriptors(monkeypatch):
+    payload = b"a" * 8 + b"b" * 8 + b"c" * 8 + b"d" * 8 + b"e" * 8 + b"f" * 8
+    primary = ctypes.create_string_buffer(payload, len(payload))
+    local = ctypes.create_string_buffer(len(payload))
+    agent = FakeNixlAgent()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 8)]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(primary, 8, ":*")],
+    )
+    layout = [":a", ":b", ":c"]
+    keys = (BlockKey(b"reordered"), BlockKey(b"ordered"))
+    expected = _op_entries(dict.fromkeys(keys, True))
+    blocks = {
+        key: [_mem_descriptor(3 * k + i, label) for i, label in enumerate(layout)]
+        for k, key in enumerate(keys)
+    }
+    blocks[keys[0]].reverse()
+    submit = Mock(wraps=kvcr._core._progress.submit)
+    monkeypatch.setattr(kvcr._core._progress, "submit", submit)
+    deposit = kvcr.deposit(blocks, expected_layout=layout)
+    copy = submit.call_args.args[0]
+    agent.state = "DONE"
+    assert dict(_poll_until(kvcr, bool))[deposit] == expected
+    residency = kvcr._core._block_record_map[keys[1]].local_dram
+    assert all(
+        ref is dst
+        for ref, dst in zip(residency.refs, copy.dst_descriptors[3:], strict=True)
+    )
+    primary.raw = b"\0" * len(payload)
+    delivery = kvcr.deliver(blocks)
+    assert dict(_poll_until(kvcr, bool))[delivery] == expected
+    assert primary.raw == payload
+
+
 def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> None:
     pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(24)]
     source = ctypes.create_string_buffer(

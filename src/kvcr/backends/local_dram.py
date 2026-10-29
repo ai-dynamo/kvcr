@@ -618,6 +618,9 @@ class _LocalDram:
             copy.success,
             CacheTier.FW_G2,
             writer=copy.deposit_op,
+            dst_descriptors=(
+                copy.dst_descriptors if self._kvcr.framework_control is not None else ()
+            ),
         )
 
     def _apply_fill_result(
@@ -628,6 +631,7 @@ class _LocalDram:
         source: CacheTier,
         *,
         writer: _PendingResidencyOp | None = None,
+        dst_descriptors: tuple[_TransferRef, ...] = (),
     ) -> None:
         committed: list[BlockKey] = []
         failed: list[BlockKey] = []
@@ -636,7 +640,10 @@ class _LocalDram:
         affected_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
         deliver_keys: dict[_OpId, list[BlockKey]] = {}
         now = self._kvcr._clock()
+        offset = 0
         for key, indices in zip(ordered_keys, local_indices):
+            start = offset
+            offset += len(indices)
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if record is None or residency is None:
@@ -671,7 +678,14 @@ class _LocalDram:
                 if len(pending) < pending_count:
                     residency.state = _LocalDramState.READY
                     residency.prepare_label_index()
-                    self._pools._publish_source(key, residency)
+                    refs = None
+                    if (
+                        dst_descriptors
+                        and len(indices) == len(residency.slots)
+                        and indices == tuple(range(len(indices)))
+                    ):
+                        refs = dst_descriptors[start:offset]
+                    self._pools._publish_source(key, residency, refs)
                     record.last_access = now
                     if not was_ready:
                         self._kvcr._on_ingest(
