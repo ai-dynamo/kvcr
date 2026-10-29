@@ -40,10 +40,10 @@ The per-run image tag avoids overwriting an existing local build. This recipe bu
 | Component | Revision |
 | --- | --- |
 | SGLang shared foundation [#45646](https://github.com/sgl-project/sglang/pull/45646) plus HiCache/inventory integration [#45647](https://github.com/sgl-project/sglang/pull/45647) | `4a083003f9393b758077afe9bbce3f6b1c64f790` |
-| Dynamo router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) plus owned inventory [#17531](https://github.com/ai-dynamo/dynamo/pull/17531) | `25dd503929a4bcfe05f28ce2d272bdd86c072538` |
+| Dynamo main with router hints [#16117](https://github.com/ai-dynamo/dynamo/pull/16117) and owned inventory [#17531](https://github.com/ai-dynamo/dynamo/pull/17531) | `83ea37e849e883c27d7ed848e0f329961e1fb173` |
 | KVCR main | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
 
-The SGLang and Dynamo inventory revisions are public PR heads, not released packages. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
+The SGLang revision is a public PR head, while the Dynamo revision is a pinned main commit; neither is a released package. SGLang #45647 includes its #45646 parent; the optional performance PRs SGLang #45649 and KVCR #113 are **not** in this tuple. A router hint alone is not proof of reuse: require completed physical delivery and a correct destination continuation.
 
 Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`. The vLLM image has a separate [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-vllm); neither build installs both serving runtimes into one image.
 
