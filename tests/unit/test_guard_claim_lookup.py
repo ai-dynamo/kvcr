@@ -21,8 +21,6 @@ def exported():
     local = object.__new__(_LocalDram)
     local._export_lock = threading.Lock()
     local._export_held = 0
-    local._export_sequence = 0
-    local._capture_writer = None
     local._exports = {}
     for index, key in enumerate((b"a", b"b")):
         residency = _LocalDramResidency(
