@@ -21,6 +21,7 @@ from _kvcr_test_utils import (
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _invalidate,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
@@ -159,6 +160,67 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (
         source_case in ("key_layout", "requested_labels")
     )
+
+
+def test_invalidation_without_framework_pinning_preserves_admitted_readers():
+    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 32)]),
+    )
+    key, other = BlockKey(b"removing"), BlockKey(b"unrelated")
+    pools = source._core._local_dram._pools
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit(
+            {
+                key: [_mem_descriptor(end_point_name="source")],
+                other: [_mem_descriptor(1, end_point_name="source")],
+            }
+        )
+        assert dict(_poll_until(source, bool))[deposit] == _op_entries(
+            {key: True, other: True}
+        )
+        prior = len(agent.xfers)
+        agent.state = "PROC"
+        control.incoming.append(_start_write_message(12, key))
+        _wait_until(lambda: len(agent.transfers) == prior + 1)
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.source_readers == 1
+        _invalidate(source, (key,))
+
+        request = msgspec.msgpack.decode(_start_write_message(13, key))
+        request.update(
+            keys=[key, other],
+            dst_descriptors=[[_TransferRef("target", i)] for i in range(2)],
+        )
+        # A pending removal is a miss; unrelated sources still run on progress.
+        with source._core._state_lock:
+            control.incoming.append(msgspec.msgpack.encode(request))
+            _wait_until(lambda: len(agent.transfers) == prior + 2)
+        assert residency.source_readers == 1
+        assert pools.telemetry_state()["local_g2_free_slots"] == 0
+        assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == [1]
+        assert agent.xfers[-1][3] == [(144, 16, 0)]
+
+        agent.state = "DONE"
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        admitted = _decode_notif(agent.xfers[prior][5])
+        assert admitted["success"] and admitted["completed_indices"] == [0]
+        assert not agent.sent_notifs  # No cancellation/failure replaced native success.
+        assert residency.source_readers == 0
+        assert key not in pools._source_state.index
+        assert key not in source._core._block_record_map
+        assert other in pools._source_state.index
+        assert pools.telemetry_state()["local_g2_free_slots"] == 1
+    finally:
+        agent.state = "DONE"
+        source.close()
 
 
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])

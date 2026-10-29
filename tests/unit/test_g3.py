@@ -17,6 +17,7 @@ from _kvcr_test_utils import (
     _ConstantHashAdapter,
     _decode_control_message,
     _has_outstanding_operations,
+    _invalidate,
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
@@ -358,6 +359,46 @@ def test_g3_multi_pool_partial_read_and_layout_mismatch(tmp_path):
     assert local["swa"].raw == b"a" * page + b"b" * page
     assert local["full"].raw == b"f" * page + b"g" * page
     kvcr.release((result.release_handle,))
+
+
+@pytest.mark.parametrize("operation", ["fetch", "deposit"])
+def test_invalidation_skips_g3_key_finished_in_pending_batch(tmp_path, operation):
+    disk, slow = BlockKey(b"disk"), BlockKey(b"slow")
+    page = os.sysconf("SC_PAGE_SIZE")
+    local, framework = (ctypes.create_string_buffer(page) for _ in range(2))
+    agent = _FakeG3Agent()
+    kvcr = _new_g3_kvcr(
+        tmp_path,
+        local,
+        agent=agent,
+        framework_regions=[_buffer_region(framework, page)],
+    )
+    install_recovery_records(kvcr._core, {disk: _recovered_record(g3=0)})
+    agent.state = "PROC"
+    pending = kvcr.deposit({slow: [_mem_descriptor(0)]})
+    mixed = (
+        kvcr.fetch((disk, slow))
+        if operation == "fetch"
+        else kvcr.deposit({key: [_mem_descriptor(0)] for key in (disk, slow)})
+    )
+    op = kvcr._core._local_dram._pending_residency_ops[(operation, mixed)]
+    try:
+        # Only the sibling is unfinished; this key cannot create a G2 copy.
+        assert not op.results[disk].success and slow not in op.results
+        assert kvcr._core._block_record_map[disk].local_dram is None
+        _invalidate(kvcr, (disk,))
+        assert not kvcr._core._invalidation_handler.has_pending()
+        assert kvcr.query((disk,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
+        assert not kvcr.poll_completed()
+        assert kvcr.query((disk,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
+    finally:
+        agent.state = "DONE"
+    results = dict(_poll_until(kvcr, lambda items: len(items) == 2))
+    assert results[pending][slow].success and results[mixed][slow].success
+    assert not results[mixed][disk].success
+    handle = results[mixed][slow].release_handle
+    if handle is not None:
+        assert kvcr.release((handle,)) == [(handle, True)]
 
 
 def test_g3_multi_pool_impossible_spill_preserves_disk_entries(tmp_path):

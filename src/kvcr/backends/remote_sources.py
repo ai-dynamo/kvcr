@@ -38,6 +38,9 @@ class _SourcePinOp(_Op):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
     key_layout: tuple[str, ...] = ()
+    move: bool = False
+    # Keys this move marked pending; reopened if they are not written.
+    moving: tuple[BlockKey, ...] = ()
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -93,6 +96,8 @@ class _RemoteSources:
             # KVCR-owned contents stay claimed until native quiescence.
             pins = self._fw_pins_by_op.pop(item.op_id, None)
             if item.state is _SourceWriteState.FINISHED:
+                if item.moving and not item.success:
+                    self._kvcr._invalidation_handler.reopen(item.moving)
                 self._kvcr._remove_block_dependencies(item)
                 if item.success:
                     self._kvcr._record_access(
@@ -226,6 +231,14 @@ class _RemoteSources:
         )
 
         retained_keys = source_pin.keys if waiting else set(completed_keys)
+        if source_pin.moving:
+            omitted = [key for key in source_pin.moving if key not in retained_keys]
+            # Forget rejected keys before reopening them; later retries must not
+            # cancel a newer invalidation for the same key.
+            source_pin.moving = tuple(
+                key for key in source_pin.moving if key in retained_keys
+            )
+            kvcr._invalidation_handler.reopen(omitted)
         kvcr._release_local_dram_sources(op_id, local_sources.keys() - retained_keys)
         relevant_pins = {
             record.fw_mem.pin_handle
@@ -270,6 +283,7 @@ class _RemoteSources:
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
+            moving=source_pin.moving,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = framework_pins
@@ -383,9 +397,44 @@ class _RemoteSources:
 
     def start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
+        # Decide admission once; retries retain the original request positions.
+        pending = kvcr._invalidation_handler._pending
+        if pending:
+            op.keys = op.keys.difference(pending)
+        if op.move and kvcr._local_dram is not None:
+            # Closing admission must not strand a producer of missing pieces.
+            # Reject busy keys before claiming them or marking removal pending.
+            busy = set()
+            producers = kvcr._local_dram._pending_residency_ops
+            for key in op.keys:
+                record = kvcr._block_record_map.get(key)
+                if record is None:
+                    continue
+                residency = record.local_dram
+                if residency is not None:
+                    if residency.pending_labels or residency.pending_deposits:
+                        busy.add(key)
+                elif any(
+                    producer_id[0] == "deposit"
+                    and (producer := producers.get(producer_id)) is not None
+                    and key not in producer.results
+                    for producer_id in record.active_op_ids
+                ):
+                    busy.add(key)
+            if busy:
+                op.keys = op.keys.difference(busy)
         kvcr._add_block_dependencies(op, new_operation=True)
+        if op.move:
+            # Reject new reads and deposits of these keys while they move.
+            op.moving = kvcr._invalidation_handler.submit(
+                op.keys, key_layout=op.key_layout
+            )
         self._source_pin_ops[op.op_id] = op
-        self._resume_source_pin(op.op_id, op)
+        if op.ordered_keys and not op.keys:
+            # Every requested key was rejected; send failure without a transfer.
+            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+        else:
+            self._resume_source_pin(op.op_id, op)
 
     def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         if self._source_pin_ops.get(op_id) is not op:
@@ -427,6 +476,7 @@ class _RemoteSources:
     def _remove_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         self._cancel_pending_pin_for_op(op_id, op)
         self._source_pin_ops.pop(op_id, None)
+        self._kvcr._invalidation_handler.reopen(op.moving)
         self._kvcr._remove_block_dependencies(op)
         self._kvcr._release_local_dram_sources(op.op_id)
         framework_pins = set(op.framework_pins)
