@@ -4,6 +4,7 @@
 import logging
 import mmap
 import struct
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,9 +16,13 @@ from _kvcr_test_utils import _recovered_record
 
 from kvcr.core import _BlockRecord
 from kvcr.guard_protocol import _PoolDescriptor
+from kvcr.local_disk import _G3, _G3Residency
 from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
+from kvcr.progress import _TransferRef
 from kvcr.recovery_journal import (
+    _FRAME_HEADER,
     _JOURNAL_HEADER_BYTES,
+    _MAX_FRAME_SIZE,
     _RECORD_BLOCK,
     _SNAPSHOT_HEADER,
     RecoveryJournal,
@@ -25,6 +30,7 @@ from kvcr.recovery_journal import (
     RecoveryJournalTornError,
     _attach_journal,
     _decode_recovery_record,
+    _project_recovery_record,
     _recovery_frames,
     _RecoveryMirror,
     canonical_pool_terms,
@@ -58,9 +64,12 @@ def _attachment(mapping: mmap.mmap, journal_bytes: int) -> KVCRPoolAttachment:
 
 
 @pytest.fixture
-def journal_and_mapping() -> Iterator[tuple[RecoveryJournal, mmap.mmap]]:
-    mapping = mmap.mmap(-1, _TEST_JOURNAL_BYTES + mmap.PAGESIZE)
-    journal = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
+def journal_and_mapping(
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[RecoveryJournal, mmap.mmap]]:
+    journal_bytes = getattr(request, "param", _TEST_JOURNAL_BYTES)
+    mapping = mmap.mmap(-1, journal_bytes + mmap.PAGESIZE)
+    journal = RecoveryJournal(_attachment(mapping, journal_bytes))
     journal.reset()
     try:
         yield journal, mapping
@@ -124,13 +133,56 @@ class _Source:
         self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
 
     def observe_residency(
-        self, observer: Callable[[BlockKey, _BlockRecord], None]
+        self,
+        observer: Callable[[BlockKey, _BlockRecord], None],
+        *,
+        recovery_preflight: object = None,
     ) -> None:
         self._observer = observer
 
     def emit(self, key: BlockKey, record: _BlockRecord) -> None:
         assert self._observer is not None
         self._observer(key, record)
+
+
+@pytest.mark.parametrize(
+    ("slot_count", "journal_and_mapping"),
+    [(16385, _JOURNAL_HEADER_BYTES + 128 * 1024), (1024, _TEST_JOURNAL_BYTES)],
+    indirect=["journal_and_mapping"],
+    ids=["frame-limit", "capacity-limit"],
+)
+def test_g3_rejects_spill_that_would_exceed_recovery_frame(
+    journal_and_mapping, slot_count
+):
+    journal, _ = journal_and_mapping
+    key = BlockKey(b"large")
+    slots = tuple(range(65536, 65536 + slot_count))
+    oversized = _BlockRecord(g3=_G3Residency(("full", "tiny"), slots))
+    payload = msgspec.msgpack.encode(_project_recovery_record(oversized))
+    size = _FRAME_HEADER.size + len(key) + len(payload)
+    exceeds_frame = size > _MAX_FRAME_SIZE
+    exceeds_capacity = (size + 7) // 8 * 8 > journal._capacity
+    assert exceeds_frame != exceeds_capacity
+
+    core = Mock(_block_record_map={key: _BlockRecord()})
+    core._descriptor_bytes.return_value = len(slots) * mmap.PAGESIZE
+    # Avoid preallocating a large real file; this exercises reservation admission.
+    g3 = object.__new__(_G3)
+    g3._kvcr = core
+    g3._slot_size = mmap.PAGESIZE
+    g3._free_slots = deque(slots)
+    g3._evictable_slots = 0
+    g3._pending_keys = set()
+    _attach_journal(_Source(), journal, g3)
+    assert g3._recovery_preflight(
+        key, core._block_record_map[key], _G3Residency(("full", "tiny"), (0, 1))
+    )
+
+    refs = [_TransferRef("local", 0, "full"), _TransferRef("local", 0, "tiny")]
+    assert not g3._start_store(("g3_store", key), {key: refs}, float("inf"))
+    assert not journal.is_invalid()
+    assert journal._published.load_acquire() == 0
+    assert len(g3._free_slots) == len(slots) and not g3._pending_keys
 
 
 def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
@@ -145,8 +197,8 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     caplog.set_level("WARNING", logger="kvcr.recovery_journal")
 
     local_dram.emit(key, _recovered_record(g2=[("pool0", 2)]))
-    g3.emit(key, _recovered_record(g2=[("pool0", 2)], g3=7))
-    local_dram.emit(key, _recovered_record(g3=7))
+    g3.emit(key, _recovered_record(g2=[("pool0", 2)], g3=7, g3_pool="pool0"))
+    local_dram.emit(key, _recovered_record(g3=7, g3_pool="pool0"))
     g3.emit(key, _BlockRecord())
     frames = [journal.read_next() for _ in range(4)]
     assert journal.read_next() is None
@@ -154,8 +206,8 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
         _decode_recovery_record(payload, ("pool0",)) for _, _, payload in frames
     ] == [
         _recovered_record(g2=[("pool0", 2)]),
-        _recovered_record(g2=[("pool0", 2)], g3=7),
-        _recovered_record(g3=7),
+        _recovered_record(g2=[("pool0", 2)], g3=7, g3_pool="pool0"),
+        _recovered_record(g3=7, g3_pool="pool0"),
         _BlockRecord(),
     ]
     assert caplog.messages == []
@@ -313,8 +365,10 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
         records = {
             BlockKey(b"a" * 32): _recovered_record(g2=[("pool0", 3)]),
             # One with both halves, one only on disk.
-            BlockKey(b"b" * 32): _recovered_record(g2=[("pool0", 4)], g3=9),
-            BlockKey(b"c" * 32): _recovered_record(g3=2),
+            BlockKey(b"b" * 32): _recovered_record(
+                g2=[("pool0", 4)], g3=9, g3_pool="pool0"
+            ),
+            BlockKey(b"c" * 32): _recovered_record(g3=2, g3_pool="pool0"),
         }
         write_recovery_snapshot(pool, terms, _recovery_frames(records))
         written = [r for r in caplog.records if "snapshot_written " in r.message]

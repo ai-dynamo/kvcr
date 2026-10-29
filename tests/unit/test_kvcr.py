@@ -104,7 +104,7 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
         else:
             assert residency.state is _LocalDramState.READY
             assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
-        observed.append((key, None if residency is None else residency.slots))
+        observed.append((key, None if residency is None else list(residency.slots)))
 
     backend.observe_residency(observe)
     first = kvcr.deposit({keys[0]: [_mem_descriptor(0)]})
@@ -929,7 +929,7 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
     for residency in (
         _BlockRecord(),
         _LocalDramResidency([("", 0)], _LocalDramState.READY),
-        _G3Residency(0),
+        _G3Residency(("",), (0,)),
         _FwMemResidency([_mem_descriptor()], object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__
@@ -996,8 +996,7 @@ def test_named_reference_validation_and_address_reporting():
     with pytest.raises(ValueError, match="part labels must be unique"):
         core._normalize_descriptors([ref, ref])
     with patch.object(core, "_g3", object()):
-        with pytest.raises(ValueError, match="G3 does not support"):
-            core._normalize_descriptors([ref])
+        assert core._normalize_descriptors([ref]) == [internal]
     assert core._normalize_descriptors(
         [MemoryRef(end_point_name="target", label="pool:k", element_index=1)]
     ) == [_TransferRef("target", 1, "pool:k")]

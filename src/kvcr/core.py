@@ -10,13 +10,13 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass
 from itertools import islice
-from math import ceil
+from math import ceil, gcd
 from typing import TYPE_CHECKING
 
 import msgspec
 
+from . import _nvtx
 from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -128,8 +128,8 @@ def _noop_record_transfer(
     return None
 
 
-@dataclass(slots=True)
-class _BlockRecord:
+class _BlockRecord(msgspec.Struct, gc=False):
+    # Cycle-free per-block record; skip cyclic GC to avoid long framework stalls.
     # Locally pinned framework-owned G2 memory. This is never remote
     # KVCR residency and exists only while KVCR controls the pin.
     fw_mem: "_FwMemResidency | None" = None
@@ -223,8 +223,6 @@ class _KVCRCore:
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
-        if g3_config is not None and len(self.pool_layouts) != 1:
-            raise ValueError("G3 does not support multiple pools")
         policy = bindings.policy
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
@@ -316,11 +314,13 @@ class _KVCRCore:
             backend_configs.remote_fw_dram,
             bindings.key_adapter,
         )
+        self._nvtx = self._remote_fw_dram._nvtx
+        self._nvtx_operations = {}
         self._g3 = (
             _G3(
                 self,
                 g3_config,
-                self.pool_layouts[0][1],
+                gcd(*(size for _, size in self.pool_layouts)),
             )
             if g3_config is not None and local_dram_config is not None
             else None
@@ -386,17 +386,6 @@ class _KVCRCore:
         g3 = self._g3
         if g3 is None and any(record.g3 is not None for record in records.values()):
             raise RecoveryMirrorError("recovered G3 residency has no configured G3")
-        if g3 is not None and any(
-            record.local_dram is not None
-            and (
-                len(record.local_dram.slots) != 1
-                or any(":" in label for label in record.local_dram.layout)
-            )
-            for record in records.values()
-        ):
-            raise RecoveryMirrorError(
-                "G3 recovery requires one local DRAM slot without a part label"
-            )
         if self._block_record_map:
             raise RecoveryMirrorError("recovered records need a core that holds none")
 
@@ -414,7 +403,7 @@ class _KVCRCore:
                 source = CacheTier.LOCAL_G2
                 slot_size = local_dram._size_bytes(record.local_dram)
             else:
-                source, slot_size = CacheTier.G3, g3._slot_size
+                source, slot_size = CacheTier.G3, g3._size_bytes(record.g3)
             self._policy.on_ingest(self._block_meta(key, record, slot_size), source)
 
         # After every admission: a block resident in both tiers must not be
@@ -430,7 +419,7 @@ class _KVCRCore:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object] | msgspec.Struct,
+        hints: msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
         self._hints_dispatcher.submit(hints, request_id)
@@ -553,7 +542,7 @@ class _KVCRCore:
                 size_bytes = (
                     local_dram._size_bytes(record.local_dram)
                     if record.local_dram is not None
-                    else g3._slot_size
+                    else g3._size_bytes(record.g3)
                 )
                 blocks.append(self._block_meta(key, record, size_bytes))
             self._policy.on_align_sequence(blocks, use_current_time)
@@ -579,42 +568,65 @@ class _KVCRCore:
             key: self._normalize_descriptors(descriptors)
             for key, descriptors in blocks.items()
         }
-        with self._state_lock:
-            local_blocks: dict[BlockKey, list[_TransferRef]] = {}
-            g3_blocks: dict[BlockKey, _TransferRef] = {}
-            remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
-            remote_keys = self._remote_delivery_keys.get(request_id, ())
-            for key, destination in normalized.items():
-                if key in remote_keys and (
-                    not self._has_complete_local(key)
-                    or self._remote_fw_dram.query(key, request_id)
-                ):
-                    remote_blocks[key] = destination
-                elif self._is_local_resident(key):
-                    local_blocks[key] = destination
-                elif self._g3 is not None and self._g3.is_ready(key):
-                    g3_blocks[key] = destination[0]
-                else:
-                    remote_blocks[key] = destination
+        trace = None
+        pushed = False
+        if self._nvtx is not None:
+            trace = self._nvtx.operation(self, op_handle, normalized, request_id)
+            if trace is not None:
+                self._nvtx_operations[op_handle] = trace
+                pushed = trace.push("op.deliver")
+        try:
+            with self._state_lock:
+                local_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                remote_keys = self._remote_delivery_keys.get(request_id, ())
+                for key, destination in normalized.items():
+                    if key in remote_keys and (
+                        not self._has_complete_local(key)
+                        or self._remote_fw_dram.query(key, request_id)
+                    ):
+                        remote_blocks[key] = destination
+                    elif self._is_local_resident(key):
+                        local_blocks[key] = destination
+                    elif self._g3 is not None and self._g3.is_ready(key):
+                        g3_blocks[key] = destination
+                    else:
+                        remote_blocks[key] = destination
 
-            if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
-                self._joined_completions[op_handle] = (set(blocks), {})
-            if local_dram is not None and local_blocks:
-                local_dram.deliver(op_handle, local_blocks, deadline=deadline)
-            if g3_blocks and (
-                self._g3 is None
-                or not self._g3.start_deliver(op_handle, g3_blocks, deadline)
-            ):
-                self._complete(
-                    op_handle,
-                    dict.fromkeys(g3_blocks, _FAILED_RESULT),
-                )
-            if remote_blocks:
-                self._remote_fw_dram.deliver(
-                    op_handle, remote_blocks, request_id, deadline=deadline
-                )
-            elif not blocks:
-                self._complete(op_handle, {})
+                if trace is not None:
+                    trace.mark(
+                        "op.dispatched",
+                        local_blocks=len(local_blocks),
+                        remote_blocks=len(remote_blocks),
+                        g3_blocks=len(g3_blocks),
+                    )
+                if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
+                    self._joined_completions[op_handle] = (set(blocks), {})
+                if local_dram is not None and local_blocks:
+                    local_dram.deliver(op_handle, local_blocks, deadline=deadline)
+                if g3_blocks and (
+                    self._g3 is None
+                    or not self._g3.start_deliver(op_handle, g3_blocks, deadline)
+                ):
+                    self._complete(
+                        op_handle,
+                        dict.fromkeys(g3_blocks, _FAILED_RESULT),
+                    )
+                if remote_blocks:
+                    self._remote_fw_dram.deliver(
+                        op_handle, remote_blocks, request_id, deadline=deadline
+                    )
+                elif not blocks:
+                    self._complete(op_handle, {})
+        except Exception:
+            self._nvtx_operations.pop(op_handle, None)
+            if trace is not None:
+                trace.reject("op.rejected", _nvtx.Reason.UNKNOWN)
+            raise
+        finally:
+            if trace is not None:
+                trace.tracer.pop(pushed)
         return op_handle
 
     def deposit(
@@ -634,13 +646,12 @@ class _KVCRCore:
                 for key, descriptors in blocks.items()
             }
             if declaration is not None:
-                local_layout = list(declaration)
                 indices = {}
-                for index, label in enumerate(local_layout):
+                for index, label in enumerate(declaration):
                     indices[label] = None if label in indices else index
                 if any(
                     _layout_indices(
-                        local_layout,
+                        declaration,
                         [ref.label for ref in refs],
                         indices_by_label=indices,
                     )
@@ -657,6 +668,20 @@ class _KVCRCore:
                     dict.fromkeys(blocks, _FAILED_RESULT),
                 )
             else:
+                if self._g3 is not None:
+                    for key, refs in blocks.items():
+                        if self._g3.is_ready(key):
+                            record = self._block_record_map[key]
+                            if declaration is not None:
+                                layout = declaration
+                            elif record.local_dram is not None:
+                                layout = record.local_dram.key_layout
+                            else:
+                                layout = tuple(ref.label for ref in refs)
+                            if not self._g3.is_ready(key, layout):
+                                raise ValueError(
+                                    "deposit layout must match existing G3 key layout"
+                                )
                 self._local_dram.deposit(
                     op_handle,
                     blocks,
@@ -699,6 +724,10 @@ class _KVCRCore:
                 ):
                     continue
                 if self._g3 is not None and self._g3.is_ready(key):
+                    if not self._g3.is_ready(key, declaration):
+                        raise ValueError(
+                            "fetch layout must match existing G3 key layout"
+                        )
                     sources[key] = CacheTier.G3
                 elif request_id is not None and self._remote_fw_dram.query(
                     key, request_id
@@ -749,6 +778,11 @@ class _KVCRCore:
                 self._remote_fw_dram.poll_main(progress_items)
         completed = self._completion_queue
         self._completion_queue = []
+        if self._nvtx_operations:
+            for handle, _ in completed:
+                trace = self._nvtx_operations.pop(handle, None)
+                if trace is not None:
+                    trace.returned()
         return completed
 
     def _notify_transfer_errors(self, progress_items: list[object]) -> None:
@@ -824,6 +858,9 @@ class _KVCRCore:
             )
 
         self._closed = True
+        for trace in self._nvtx_operations.values():
+            trace.shutdown_unresolved("op.shutdown_unreturned")
+        self._nvtx_operations.clear()
         try:
             self._close_main_resources()
         except BaseException as error:
@@ -1016,7 +1053,7 @@ class _KVCRCore:
         if source is CacheTier.G3:
             started = self._g3 is not None and self._g3.start_fill(
                 fill_handle,
-                {key: descriptors[0] for key, descriptors in blocks.items()},
+                blocks,
                 deadline,
             )
         elif source is CacheTier.REMOTE_G2:
@@ -1110,8 +1147,6 @@ class _KVCRCore:
                 if ref.label in labels:
                     raise ValueError("block part labels must be unique")
                 labels.add(ref.label)
-        if self._g3 is not None and (len(descriptors) != 1 or labels):
-            raise ValueError("G3 does not support multi-block layouts or part labels")
 
     def _validate_expected_layout(
         self, layout: list[str] | None
@@ -1132,8 +1167,6 @@ class _KVCRCore:
                 if label in labels:
                     raise ValueError("block part labels must be unique")
                 labels.add(label)
-        if self._g3 is not None and (len(layout) != 1 or labels):
-            raise ValueError("G3 does not support multi-block layouts or part labels")
 
         return tuple(layout)
 
@@ -1256,6 +1289,9 @@ class _KVCRCore:
                 return
             self._joined_completions.pop(op_handle)
             entries = completed
+        trace = self._nvtx_operations.get(op_handle)
+        if trace is not None:
+            trace.completed(entries)
         self._completion_queue.append((op_handle, entries))
 
     # Timing and telemetry helpers.

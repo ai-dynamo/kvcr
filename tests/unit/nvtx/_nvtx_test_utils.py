@@ -7,12 +7,14 @@ from types import SimpleNamespace
 from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
+    FakePrimaryPinning,
     PendingPrimaryPinning,
     _new_kvcr,
     _poll_until,
     _start_write_message,
 )
 
+from kvcr.config import RemoteFWDramOptions
 from kvcr.types import BlockKey
 
 
@@ -106,6 +108,17 @@ def wait_for_payload(kvcr, recording, name, *, ended=None):
         ),
     )
     return payloads(recording, name)[0]
+
+
+def make_target(*, eager=False):
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=eager),
+    )
+    return kvcr, agent, control
 
 
 def make_source(handles=(9,), *, request_id=0):

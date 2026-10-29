@@ -218,7 +218,7 @@ def _channels_are_taken():
     _GUARD_BINDS.clear()
 
 
-def _stand_in_pool(spec) -> Mock:
+def _stand_in_pool(spec, **_) -> Mock:
     """The pool-tail surface a Guard reaches for, without a real mapping."""
     attachment = Mock(address=1234, _spec=spec)
     attachment.mapped_snapshot.return_value = nullcontext(None)
@@ -984,7 +984,7 @@ def test_startup_rollback_gives_back_every_pool_but_a_wedged_one(
     """A failed startup closes what it built; an unclosable mapping keeps its file."""
     attached: list[Mock] = []
 
-    def attach(spec):
+    def attach(spec, **_):
         if len(attached) == 0:
             pool = _stand_in_pool(spec)
             # Unlinking under a mapping a Guard still holds would fault the process.

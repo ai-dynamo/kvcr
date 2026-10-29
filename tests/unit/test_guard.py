@@ -46,6 +46,7 @@ from kvcr.recovery_journal import (
     _RecoveryBlock,
     _RecoveryMirror,
 )
+from kvcr.remote_ops import _WriteProbe
 from kvcr.types import BlockKey, RegionDescriptor
 
 _TEST_SPEC = KVCRPoolSpec(
@@ -419,7 +420,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         [
             _frame(first, _recovered_record(g2=[("", 0)], g3=7)),
             _frame(second, _recovered_record(g2=[("", 1)])),
-            _frame(g3_only, _BlockRecord(g3=_G3Residency(9), position=3)),
+            _frame(g3_only, _BlockRecord(g3=_G3Residency(("",), (9,)), position=3)),
         ]
     )
     closed: list[str] = []
@@ -486,7 +487,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     guard._refuse_incompatible(_tier(16))
     guard._adopt(new_channel(), tier)
     try:
-        attach.assert_called_once_with(_PAGE_SPEC)
+        attach.assert_called_once_with(_PAGE_SPEC, collapse=True)
         assert journal.reset_called
         # Adoption registers the Guard transport without starting it.
         assert len(cores) == 1
@@ -517,20 +518,20 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # Speculative serving cannot certify death, but the same core must
         # publish the tombstone once pidfd confirms the primary has exited.
         backend = cores[0]._remote_fw_dram
-        probe = {
-            "target_agent": "target",
-            "op_handle": 1,
-            "sender_control_endpoint": "tcp://target:1",
-            "source_control_endpoint": "tcp://source:1",
-            "source_incarnation": "primary",
-        }
+        probe = _WriteProbe(
+            target_agent="target",
+            op_handle=1,
+            sender_control_endpoint="tcp://target:1",
+            source_control_endpoint="tcp://source:1",
+            source_incarnation="primary",
+        )
         backend._dangling_ops.handle_probe(Mock(), probe)
-        assert "dead_incarnation" not in backend._send_control.call_args.args[2]
+        assert backend._send_control.call_args.args[2].dead_incarnation is None
         guard._pool_lease.poll_pidfd.return_value = select.POLLIN
         guard._observe_holder()
         assert guard._core is cores[0] and len(cores) == 1
         backend._dangling_ops.handle_probe(Mock(), probe)
-        assert backend._send_control.call_args.args[2]["dead_incarnation"] == "primary"
+        assert backend._send_control.call_args.args[2].dead_incarnation == "primary"
 
         # A replacement claims the pool. What is kept must be what a replay
         # gives: the half-written G2 slot is dropped, and the G3 halves are
@@ -549,9 +550,9 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert guard._recovery.mirror._records is records
         assert guard._recovery.mirror._records[first].g3 is retained_g3
         assert guard._recovery.mirror._records == {
-            first: _BlockRecord(g3=_G3Residency(7), position=2),
+            first: _BlockRecord(g3=_G3Residency(("",), (7,)), position=2),
             second: _recovered_record(g2=[("", 1)]),
-            g3_only: _BlockRecord(g3=_G3Residency(9), position=3),
+            g3_only: _BlockRecord(g3=_G3Residency(("",), (9,)), position=3),
         }
         assert guard._recovery._g3_records == {}
 
@@ -569,7 +570,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 
         assert len(set(agent_names)) == 2
         assert set(guard._recovery._g3_records) == {fresh}
-        assert guard._recovery._g3_records[fresh][0].slot == 7
+        assert guard._recovery._g3_records[fresh][0].slots[0] == 7
         assert order[3:] == [("adopt", (second, fresh)), "clear", "start"]
         events = [
             message
@@ -865,7 +866,9 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     guard = _guard(owner=owner)
     guard._recovery.attachment = attachment
     mirror = guard._recovery.mirror = _RecoveryMirror(("",))
-    g3_records = guard._recovery._g3_records = {BlockKey(b"g3"): (_G3Residency(0), -1)}
+    g3_records = guard._recovery._g3_records = {
+        BlockKey(b"g3"): (_G3Residency(("",), (0,)), -1)
+    }
     guard._pool_lease.current = holder
 
     with pytest.raises(RuntimeError) as first:
@@ -992,7 +995,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
 
 
 def test_a_handback_with_an_unexpected_storage_error_fails() -> None:
-    """Only capacity errors (ENOSPC/EDQUOT) are survivable at the handback writer."""
+    """Only capacity errors (ENOSPC/EDQUOT/ENOMEM) survive at the handback writer."""
     guard = _configurable_guard()
     guard._recovery.mirror = _RecoveryMirror(("",))
     _give_serving_core(guard)
@@ -1032,7 +1035,7 @@ def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
     assert guard._recovery.mirror is None
 
 
-@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT, errno.ENOMEM])
 def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(
     code: int, monkeypatch
 ) -> None:

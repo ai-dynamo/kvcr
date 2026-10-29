@@ -45,8 +45,11 @@ class _MemDescriptor(msgspec.Struct, frozen=True):
     device_Id: int
 
 
-class _TransferRef(msgspec.Struct, frozen=True):
+class _TransferRef(msgspec.Struct, frozen=True, gc=False):
     """An element in an agent's framework or KVCR-owned registered memory."""
+
+    # Cached per served piece of a local DRAM block. It holds only atomics, so it
+    # is untracked (gc=False) and keeps the cache that holds it untracked too.
 
     end_point_name: Annotated[str, msgspec.Meta(min_length=1)]
     element_index: Annotated[int, msgspec.Meta(ge=0)]

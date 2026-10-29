@@ -9,11 +9,13 @@ from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from .core import logger
+from .remote_ops import _WriteProbe, _WriteProbeAck
 from .types import MemoryRef, OpHandle, TransferError
 
 if TYPE_CHECKING:
     from .progress import _KVCRProgress
-    from .remote_fw_dram import _RemoteFWDram, _SourceWriteOp, _TargetPullOp
+    from .remote_fw_dram import _RemoteFWDram
+    from .remote_ops import _SourceWriteOp, _TargetPullOp
 
 
 def _log_resilience_event(error: Exception) -> None:
@@ -159,28 +161,23 @@ class _DanglingOps:
         return self._backend._send_control(
             progress,
             op.remote_ctrl_ep,
-            {
-                "type": "write_probe",
-                "op_handle": op.op_id[1],
-                "source_incarnation": op.source_incarnation,
-            },
+            _WriteProbe(
+                op_handle=op.op_id[1],
+                source_incarnation=op.source_incarnation,
+            ),
         )
 
-    def handle_probe(self, progress: "_KVCRProgress", payload: dict[str, Any]) -> None:
-        target_agent = payload.get("target_agent")
-        handle = payload.get("op_handle")
-        reply_to = payload.get("sender_control_endpoint")
-        endpoint = payload.get("source_control_endpoint")
-        expected = payload.get("source_incarnation")
+    def handle_probe(self, progress: "_KVCRProgress", payload: _WriteProbe) -> None:
+        target_agent = payload.target_agent
+        handle = payload.op_handle
+        reply_to = payload.sender_control_endpoint
+        endpoint = payload.source_control_endpoint
+        expected = payload.source_incarnation
         if (
             not isinstance(target_agent, str)
             or not target_agent
-            or type(handle) is not int
-            or not isinstance(reply_to, str)
             or not reply_to
-            or not isinstance(endpoint, str)
             or not endpoint
-            or (expected is not None and not isinstance(expected, str))
         ):
             return
         status = self.source_writes.get((target_agent, handle))
@@ -191,31 +188,24 @@ class _DanglingOps:
                 (target_agent, handle), _SourceWriteStatus()
             )
             status.cancel_requested = True
-        response = {
-            "type": "write_probe_ack",
-            "sender_control_endpoint": endpoint,
-            "op_handle": handle,
-            "terminal": expected in (None, self.incarnation)
+        response = _WriteProbeAck(
+            sender_control_endpoint=endpoint,
+            op_handle=handle,
+            terminal=expected in (None, self.incarnation)
             and (status is None or not status.submitted),
-        }
+        )
         if expected and expected in self.dead_incarnations:
-            response["dead_incarnation"] = expected
+            response.dead_incarnation = expected
         self._backend._send_control(progress, reply_to, response)
 
     def handle_probe_ack(
-        self, progress: "_KVCRProgress", payload: dict[str, Any]
+        self, progress: "_KVCRProgress", payload: _WriteProbeAck
     ) -> None:
-        endpoint = payload.get("sender_control_endpoint")
-        handle = payload.get("op_handle")
-        terminal = payload.get("terminal")
-        incarnation = payload.get("sender_incarnation")
-        if (
-            not isinstance(endpoint, str)
-            or type(handle) is not int
-            or type(terminal) is not bool
-            or not isinstance(incarnation, str)
-            or not incarnation
-        ):
+        endpoint = payload.sender_control_endpoint
+        handle = payload.op_handle
+        terminal = payload.terminal
+        incarnation = payload.sender_incarnation
+        if endpoint is None or not incarnation:
             return
         op = cast(
             "_TargetPullOp | None", progress._in_flight_ops.get(("target", handle))
@@ -223,7 +213,7 @@ class _DanglingOps:
         if op is None or op.remote_ctrl_ep != endpoint:
             return
         expected = op.source_incarnation
-        if expected and payload.get("dead_incarnation") == expected:
+        if expected and payload.dead_incarnation == expected:
             # Guard verifies death of this process, not just an expired heartbeat.
             self.sources[endpoint] = incarnation
             self._backend._refused_writes[("target", handle)] = {"success": False}

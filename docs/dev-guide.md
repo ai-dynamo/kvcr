@@ -223,7 +223,15 @@ uv run python -m kvcr.kvcr_service \
   --compatibility-digest example-model-layout
 ```
 
-All flags except `--log-level`, `--heartbeat-timeout-ms` and `--startup-timeout-seconds` are required.
+The five flags above are required. Logging, heartbeat fencing, Guard startup timeout, and HTTP health options are optional.
+
+Add `--health-port 9092` to enable read-only `GET /live` and `GET /ready` probes. The listener binds before pool allocation, to `127.0.0.1` by default; use `--health-host 0.0.0.0` for a Kubernetes probe and restrict network access to the probe port. During allocation and mapping, `/live` returns 200 and `/ready` returns 503. Both return 503 on a known failure, a dead Guard thread, a stalled Unix accept loop, or shutdown.
+
+`/ready` requires completed pool setup and a serving Unix accept loop. Readiness covers all Guards: promotion or stale loop progress in any Guard makes the whole service return 503, without failing `/live`. The progress deadline defaults to 30 seconds (`--health-timeout-seconds`, finite and greater than 1). An idle Guard wakes once a second. Background NIXL registration starts with a claim and does not block readiness; promotion waits for it if needed. These probes do not claim a pool, change a lease, require an attached engine or an unclaimed pool, or establish inference readiness.
+
+For a supervised companion, optionally set `--health-dependency-url http://127.0.0.1:9091/live`. Only `/ready` requires that endpoint to return 200 (one-second socket timeout, no HTTP proxy); `/live` checks KVCR itself. After shutdown, the listener is unavailable. Unknown paths return 404. Process logs remain on stderr; this listener does not expose Prometheus metrics or validate cached data and every native transport thread.
+
+Use readiness probes for a Guard sidecar. Do not configure automatic sidecar-only restart probes while an engine still maps its pools. A failed Guard requires coordinated shutdown and replacement of the affected engines and service/pools according to the deployment's lifecycle policy.
 
 | Flag | Meaning |
 | --- | --- |
@@ -240,9 +248,11 @@ Heartbeat promotion kills the worker it promotes over. On a missed deadline the 
 
 Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the listed usable sizes. The example therefore creates one mapping of 64 GiB plus 100 MiB, laid out as `[journal header + journal payload][pool 0][pool 1]`. Pool sizes are rounded down to the native memory-page boundary.
 
+Pool backing is chosen automatically and best-effort, with no configuration or wire-protocol change, and works without any hugetlbfs: HugeTLB (a pool file on a writable `hugetlbfs` mount with enough free pages, such as `/dev/hugepages` or a Kubernetes `HugePages-*` volume), then transparent huge pages (THP) on Linux with Python 3.12+, then base pages. A HugeTLB allocation that fails (no pages, no space) and a THP mapping that cannot be set up log a warning and use the next tier; other failures, such as being unable to identify a pool's filesystem or a worker being unable to open the pool path, are not retried and fail. Workers must see the pool files at the same path as the service, so mount the same hugetlbfs volumes at the same paths in the Guard and engine containers (and give the Guard container a matching `hugepages-<size>` limit); where that is not possible, use `--disable-hugepages`.
+
 A worker calls `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)` with its Guard's control address and each ordered pool's name and block size. The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block sizes may differ. The pre-release wire protocol remains version 1.
 
-`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and `KVCRGuardConfig`-driven construction. Remote peers must match pool names, block sizes, and order. G3 currently supports one pool and one block per key.
+`KVCRConfig.pool_layouts` supplies the same ordered layouts to direct and `KVCRGuardConfig`-driven construction. Remote peers must match pool names, block sizes, and order. G3 supports multiple pools and pieces per key; each pool block size must be page aligned. All pools share the configured G3 files.
 
 The compatibility digest must match the service and change whenever the KV layout changes. A group's first claim fixes its ordered pool layout and, when G3 is configured, its ordered paths, per-file capacity, backend and options, and remote framework DRAM backend. Later mismatches are refused; changing the layout requires restarting the service, which recreates the groups.
 
@@ -414,7 +424,9 @@ The important fields are:
 
 For several local DP ranks, provide one `control_ports` entry per local rank in local-rank order. Every worker must advertise an address reachable from its peers, and every port must be unique on that host.
 
-The secondary tier can optionally own local G2 capacity through `secondary_g2_slots`, attach to a service-owned pool through `kvcr_service_socket_path` together with `compatibility_digest`, or configure file-backed storage through `g3`. `g3.capacity_bytes_per_file` is rounded down to whole blocks and must fit at least one. Blocks must be page aligned; existing nonempty files must match the rounded capacity. The vLLM adapter uses one unnamed pool per Guard, so start the guard service with one pool size, for example `--pool-sizes-gb 48`. Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes precedence over an in-process `secondary_g2_slots` allocation. Policy names and diagnostic options must match the KVCR and vLLM revisions being tested.
+The secondary tier can optionally own local G2 capacity through `secondary_g2_slots`, attach to a service-owned pool through `kvcr_service_socket_path` together with `compatibility_digest`, or configure file-backed storage through `g3`. `g3.capacity_bytes_per_file` is rounded down to allocation units (the greatest common divisor of the pool block sizes) and must fit at least one unit. Existing nonempty files must match the rounded capacity. The vLLM adapter uses one unnamed pool per Guard, so start the guard service with one pool size, for example `--pool-sizes-gb 48`. Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes precedence over an in-process `secondary_g2_slots` allocation. Policy names and diagnostic options must match the KVCR and vLLM revisions being tested.
+
+G3 defaults to NIXL `GDS_MT`. Set `g3.backend="POSIX"` for G3 to G2 (host DRAM) reads; direct GPU delivery requires `GDS_MT`.
 
 The worker configuration enables its side of the contract. Dynamo must still run a KV-aware router that consumes KV events, selects a source and destination, and places the resulting plan in the request metadata. A plain round-robin router does not create KVCR source hints.
 

@@ -3,6 +3,7 @@
 """KVCR local-DRAM, capacity, and policy tests."""
 
 import ctypes
+import gc
 import hashlib
 import heapq
 import logging
@@ -255,7 +256,7 @@ def test_parallel_deposits_preserve_committed_pieces_and_claims(monkeypatch) -> 
     for call in journal.publish.call_args_list:
         mirror.apply(*call.args)
     recovered = mirror.take_records()[key].local_dram
-    assert recovered.slots == list(zip(layout, range(3)))
+    assert recovered.slots == tuple(zip(layout, range(3)))
     assert not recovered.pending_labels
     published = journal.publish.call_count
     states[agent.transfers[0]] = "ERR"
@@ -442,7 +443,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     residency = kvcr._core._block_record_map[first].local_dram
     assert local_dram._size_bytes(residency) == 32
     pool_counts = residency.pool_counts
-    assert pool_counts == {"full": 1, "swa": 2}
+    assert dict(pool_counts) == {"full": 1, "swa": 2}
     duplicate = kvcr.deposit({first: descriptors})
     assert kvcr._core._local_dram.telemetry_state()["local_g2_allocated_slots"] == 3
     invalid_layout = ["swa:missing"] if labeled else layout[1:]
@@ -455,6 +456,10 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     assert done[operation][first].success and done[duplicate][first].success
     assert len(agent.transfers) == 1
     assert full.raw + swa.raw == payload
+    # A ready block keeps nothing for the cyclic GC to scan.
+    assert residency.pending_labels is None and residency.writers is None
+    assert not gc.is_tracked(residency)
+    assert not gc.is_tracked(kvcr._core._block_record_map[first])
     duplicate = kvcr.deposit({first: descriptors[1:] + descriptors[:1]})
     assert dict(kvcr.poll_completed())[duplicate][first].success is labeled
     assert len(agent.transfers) == 1
@@ -511,6 +516,7 @@ def test_multi_pool_residency_moves_and_evicts_as_one_key(labeled, monkeypatch) 
     assert dict(_poll_until(kvcr, bool))[matching][first].success
     assert source.raw == payload
     assert make_ref.call_count == 3  # The full copy reuses those earlier parts.
+    assert not gc.is_tracked(residency.refs)
     operation = kvcr.deposit({second: descriptors})
     _poll_until(kvcr, lambda done: operation in dict(done))
     assert kvcr.query((first, second)) == [
@@ -536,7 +542,7 @@ def test_layout_matching_with_and_without_index(requested, expected):
     for index in (None, {"": 0, "swa:a": 1, "swa": None}):
         assert (
             _layout_indices(
-                ["", "swa:a", "swa", "swa"],
+                ("", "swa:a", "swa", "swa"),
                 requested,
                 indices_by_label=index,
             )

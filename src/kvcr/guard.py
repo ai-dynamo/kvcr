@@ -56,7 +56,8 @@ logger = logging.getLogger(__name__)
 # TODO: Wake the mirror on publication rather than polling. A standby still
 # drains at roughly a fifth of the rate a primary can publish.
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
-_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
+# ENOMEM: no memory left to back the handback region.
+_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT, errno.ENOMEM)
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
 # object, so nothing stale (reused pid, retried release) can touch a newer lease.
@@ -196,7 +197,7 @@ class _RecoveryState:
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
-        self.attachment = KVCRPoolAttachment.attach(self._spec)
+        self.attachment = KVCRPoolAttachment.attach(self._spec, collapse=True)
         self._journal = RecoveryJournal(self.attachment)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
@@ -428,6 +429,7 @@ class _Guard:
         # Identity of the lease whose fencing failure has been logged: the actor
         # retries every millisecond, and one warning per lease is enough.
         self._fence_failed: object | None = None
+        self._last_progress = time.monotonic()
 
     @property
     def heartbeat_enabled(self) -> bool:
@@ -615,6 +617,7 @@ class _Guard:
     def _serve_commands(self) -> None:
         draining = False
         while True:
+            self._last_progress = time.monotonic()
             try:
                 if draining:
                     # More was waiting last time round, so do not go back to
@@ -622,13 +625,13 @@ class _Guard:
                     command = self._commands.get_nowait()
                 else:
                     # Nothing publishes into a pool no primary holds, so an
-                    # unclaimed Guard waits rather than waking on an empty journal.
+                    # unclaimed Guard wakes at most once a second for health reporting.
                     busy = (
                         self._serving
                         or self._control is not None
                         or bool(self._orphans)
                     )
-                    timeout = _POLL_SECONDS if busy and not self._failure else None
+                    timeout = _POLL_SECONDS if busy and not self._failure else 1.0
                     command = self._commands.get(timeout=timeout)
             except queue.Empty:
                 self._observe_holder()

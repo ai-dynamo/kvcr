@@ -11,6 +11,8 @@ from enum import Enum, auto
 from itertools import islice
 from typing import TYPE_CHECKING, Literal, cast
 
+import msgspec
+
 from .config import LocalDramOptions
 from .policy_runtime import _EvictionQueue
 from .progress import (
@@ -46,13 +48,13 @@ _Clock = Callable[[], float]
 
 
 def _layout_indices(
-    layout: list[str],
+    layout: tuple[str, ...],
     requested: list[str],
     *,
     indices_by_label: dict[str, int | None] | None = None,
 ) -> list[int] | None:
     """Match full layouts or unambiguous pieces in the requested order."""
-    if layout == requested:
+    if len(layout) == len(requested) and layout == tuple(requested):
         return list(range(len(layout)))
     if not requested:
         return None
@@ -75,50 +77,84 @@ class _LocalDramState(Enum):
     DISCARDING = auto()
 
 
-@dataclass(slots=True)
-class _LocalDramResidency:
-    slots: list[tuple[str, int]]  # Full descriptor label and parent-pool slot.
+class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
+    """Cycle-free per-block DRAM slots; skip cyclic GC to avoid full-GC stalls.
+
+    Reserved pieces become readable only after successful copies. Once all
+    pieces are readable, pending_labels is None; writers is also None when
+    no copies are in flight. refs caches committed physical-slot references.
+    """
+
+    slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
     state: _LocalDramState
     claim_count: int = 0
     retire_on_release: bool = False
     key_layout: tuple[str, ...] | None = None
-    # Reserved pieces become readable only after a successful copy.
-    pending_labels: set[str] = field(default_factory=set, repr=False)
+    pending_labels: set[str] | None = None
     pending_deposits: int = 0
-    writers: list[int] = field(default_factory=list, repr=False)
-    remote_indices: tuple[int, ...] | None = field(default=None, repr=False)
+    writers: list[int] | None = None
+    remote_indices: tuple[int, ...] | None = None
     remote_cancelled: bool = False
-    # Cached references name committed physical slots.
-    refs: dict[int, _TransferRef] = field(
-        default_factory=dict, repr=False, compare=False
-    )
-    indices_by_label: dict[str, int | None] | None = field(
-        default=None, repr=False, compare=False
-    )
-    _layout: list[str] | None = field(default=None, repr=False, compare=False)
-    _pool_counts: Counter[str] | None = field(default=None, repr=False, compare=False)
-    _cached_size: int | None = field(default=None, repr=False, compare=False)
+    refs: dict[int, _TransferRef] = msgspec.field(default_factory=dict)
+    indices_by_label: dict[str, int | None] | None = None
+    _layout: tuple[str, ...] | None = None
+    _pool_counts: tuple[tuple[str, int], ...] | None = None
+    _cached_size: int | None = None
 
     def __post_init__(self) -> None:
+        self.slots = tuple(self.slots)
         if self.key_layout is None:
             self.key_layout = tuple(label for label, _ in self.slots)
         if self.state is _LocalDramState.FILLING:
-            self.pending_labels.update(label for label, _ in self.slots)
+            self.pending_labels = {label for label, _ in self.slots}
         if self.pending_labels and not self.writers:
             self.writers = [0] * len(self.slots)
 
+    def __eq__(self, other: object) -> bool:
+        # The cached fields (refs onward) do not take part in equality.
+        if not isinstance(other, _LocalDramResidency):
+            return NotImplemented
+        return (
+            self.slots == other.slots
+            and self.state is other.state
+            and self.claim_count == other.claim_count
+            and self.retire_on_release == other.retire_on_release
+            and self.key_layout == other.key_layout
+            and self.pending_labels == other.pending_labels
+            and self.pending_deposits == other.pending_deposits
+            and self.writers == other.writers
+            and self.remote_indices == other.remote_indices
+            and self.remote_cancelled == other.remote_cancelled
+        )
+
+    # The Struct's own __ne__ compares identity (eq=False); derive it from __eq__.
+    __ne__ = object.__ne__
+
+    def settle(self) -> None:
+        """Drop the fill bookkeeping once nothing is pending or in flight."""
+        if not self.pending_labels:
+            self.pending_labels = None
+            # Writer counts are held only by pending deposits and a remote fill.
+            if not self.pending_deposits and self.remote_indices is None:
+                self.writers = None
+
     @property
-    def layout(self) -> list[str]:
+    def layout(self) -> tuple[str, ...]:
         if self._layout is None:
-            self._layout = [name for name, _ in self.slots]
+            self._layout = tuple(name for name, _ in self.slots)
         return self._layout
 
     @property
-    def pool_counts(self) -> Counter[str]:
+    def pool_counts(self) -> tuple[tuple[str, int], ...]:
+        """(pool, slot count) pairs; a tuple so it stays out of the GC."""
         if self._pool_counts is None:
-            self._pool_counts = Counter(
-                label.partition(":")[0] for label, _ in self.slots
-            )
+            slots = self.slots
+            if len(slots) == 1:
+                self._pool_counts = ((slots[0][0].partition(":")[0], 1),)
+            else:
+                self._pool_counts = tuple(
+                    Counter(label.partition(":")[0] for label, _ in slots).items()
+                )
         return self._pool_counts
 
     def prepare_label_index(self) -> None:
@@ -409,7 +445,7 @@ class _LocalDram:
             declaration = self._kvcr._validate_expected_layout(
                 list(residency.key_layout)
             )
-            if list(declaration) != residency.layout:
+            if tuple(declaration) != residency.layout:
                 raise ValueError("invalid local DRAM recovery layout")
             # Byte counts depend on the receiving core's pool geometry.
             residency._cached_size = None
@@ -552,10 +588,9 @@ class _LocalDram:
                 if indices is None:
                     op.results[key] = _FAILED_RESULT
                     continue
+                pending = residency.pending_labels or ()
                 selected_indices = tuple(
-                    index
-                    for index in indices
-                    if residency.slots[index][0] in residency.pending_labels
+                    index for index in indices if residency.slots[index][0] in pending
                 )
                 if not selected_indices:
                     op.results[key] = (
@@ -564,16 +599,18 @@ class _LocalDram:
                         else _SUCCESS_RESULT
                     )
                     continue
-                if all(residency.writers[index] for index in selected_indices):
+                # Pending pieces imply writer counts (see _LocalDramResidency.settle).
+                writers = cast(list[int], residency.writers)
+                if all(writers[index] for index in selected_indices):
                     continue  # Attach duplicates; new pieces can still proceed.
                 self._remove_evictable(key, residency)
                 selected_slots = []
                 # Mixed deposits may copy an active slot too; bytes must be identical.
                 for ref, index in zip(sources, indices):
-                    if residency.slots[index][0] in residency.pending_labels:
+                    if residency.slots[index][0] in pending:
                         selected_slots.append(residency.slots[index])
                         src_descriptors.append(ref)
-                        residency.writers[index] += 1
+                        writers[index] += 1
             residency.claim_count += 1
             residency.pending_deposits += 1
             op.active_keys.add(key)
@@ -948,9 +985,11 @@ class _LocalDram:
                 and residency.state is not _LocalDramState.DISCARDING
                 and (writer is not None or not residency.remote_cancelled)
             )
+            # This copy holds a writer count, so writers cannot have been settled.
+            writers = cast(list[int], residency.writers)
             for index in indices:
-                residency.writers[index] -= 1
-                if residency.writers[index] < 0:
+                writers[index] -= 1
+                if writers[index] < 0:
                     raise RuntimeError("local DRAM writer ownership lost")
             if writer is not None:
                 writer.active_keys.remove(key)
@@ -958,15 +997,16 @@ class _LocalDram:
             else:
                 residency.remote_indices = None
                 residency.remote_cancelled = False
-            if key_success:
-                pending_count = len(residency.pending_labels)
+            pending = residency.pending_labels
+            if key_success and pending:
+                pending_count = len(pending)
                 if len(indices) == len(residency.slots):
-                    residency.pending_labels.clear()
+                    pending.clear()
                 else:
-                    residency.pending_labels.difference_update(
+                    pending.difference_update(
                         residency.slots[index][0] for index in indices
                     )
-                if len(residency.pending_labels) < pending_count:
+                if len(pending) < pending_count:
                     residency.state = _LocalDramState.READY
                     residency.prepare_label_index()
                     record.last_access = now
@@ -977,9 +1017,10 @@ class _LocalDram:
                             ),
                             source,
                         )
-                    if not residency.pending_labels:
+                    if not pending:
                         self._residency_observer(key, record)
                         committed.append(key)
+            residency.settle()
             if writer is not None:
                 if key not in writer.results:
                     writer.results[key] = (
@@ -1404,7 +1445,7 @@ class _LocalDram:
                     or residency.claim_count
                 ):
                     raise RuntimeError(f"invalid evictable local DRAM entry {key!r}")
-                if deficient.isdisjoint(residency.pool_counts):
+                if deficient.isdisjoint(pool for pool, _ in residency.pool_counts):
                     continue
                 size_bytes = self._size_bytes(residency)
                 decision, eviction_pending = self._kvcr._decide_eviction(
@@ -1421,7 +1462,8 @@ class _LocalDram:
                 if decision[0] is PlacementAction.KEEP:
                     continue
                 victims.append((key, record, residency, size_bytes))
-                freed.update(residency.pool_counts)
+                for pool, count in residency.pool_counts:
+                    freed[pool] += count
                 deficient = short()
 
         for key, record, residency, size_bytes in victims:
@@ -1466,12 +1508,16 @@ class _LocalDram:
             return
         self._unscored.discard(key)
         if self._evictable.insert(key, score):
-            self._evictable_slots.update(residency.pool_counts)
+            evictable_slots = self._evictable_slots
+            for pool, count in residency.pool_counts:
+                evictable_slots[pool] += count
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)
         if self._evictable.remove(key):
-            self._evictable_slots.subtract(residency.pool_counts)
+            evictable_slots = self._evictable_slots
+            for pool, count in residency.pool_counts:
+                evictable_slots[pool] -= count
 
     def _retry_unscored(self) -> None:
         for key in tuple(self._unscored):
@@ -1497,8 +1543,7 @@ class _LocalDram:
     def _size_bytes(self, residency: _LocalDramResidency) -> int:
         if residency._cached_size is None:
             residency._cached_size = sum(
-                self._pools[pool][2] * count
-                for pool, count in residency.pool_counts.items()
+                self._pools[pool][2] * count for pool, count in residency.pool_counts
             )
         return residency._cached_size
 

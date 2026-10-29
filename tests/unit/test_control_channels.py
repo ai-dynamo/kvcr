@@ -15,13 +15,13 @@ import pytest
 import zmq
 from _kvcr_test_utils import free_port, listening_socket
 
+from kvcr import ZmqPeerControlChannel
 from kvcr.control_channels import (
     _FRAME_HEADER,
     _MAX_FRAME_BYTES,
     FramedConnection,
     KVCRGuardProtocolError,
     KVCRMsgFramingError,
-    ZmqPeerControlChannel,
 )
 
 Pair = tuple[socket.socket, socket.socket]

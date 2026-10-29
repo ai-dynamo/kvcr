@@ -11,7 +11,6 @@ supported ones.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import msgspec
@@ -86,7 +85,7 @@ class HintDispatcher:
 
     def submit(
         self,
-        envelope: Mapping[str, object] | msgspec.Struct,
+        envelope: msgspec.Struct,
         request_id: str | None,
     ) -> None:
         """Parse an envelope, report its rejections, dispatch its hints."""
