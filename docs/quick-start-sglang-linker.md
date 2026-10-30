@@ -41,11 +41,10 @@ Keep these revisions together:
 
 | Component | Revision |
 | --- | --- |
-| SGLang direct linker [#45650](https://github.com/sgl-project/sglang/pull/45650) (includes [#45646](https://github.com/sgl-project/sglang/pull/45646) and [#45648](https://github.com/sgl-project/sglang/pull/45648)) | `2d010d70d080e9ea4a6891bb7219ee9dd833c731` |
+| SGLang direct linker [#45650](https://github.com/sgl-project/sglang/pull/45650) (includes [#45646](https://github.com/sgl-project/sglang/pull/45646) and [#45648](https://github.com/sgl-project/sglang/pull/45648)) | `5b65e088969b872b924355d20a329e9816a1b094` |
 | Dynamo linker inventory [#17655](https://github.com/ai-dynamo/dynamo/pull/17655) | `874861a7fdce464a4c28a880886897309172aacd` |
-| KVCR `main` | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
 
-These are draft public PR heads, not released packages. The linker and HiCache SGLang branches do not contain each other. Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`.
+These are draft public PR heads, not released packages. KVCR is installed from the checkout used as the build context, including any local changes. The linker and HiCache SGLang branches do not contain each other. Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`.
 
 ## 2. Start the container
 
