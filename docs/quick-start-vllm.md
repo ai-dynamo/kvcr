@@ -231,7 +231,7 @@ destination rank 1:
   vllm:kv_offload_tiering_read_bytes:('1:kvcr',)=300941312
 ```
 
-The exact counts may differ, but the source and destination block counts must match, as must the source-write and destination-read byte counts. There must be no positive `remote_deliver` `partial` or `failed` count. These values reset after each reporting interval, so inspect the interval or intervals covering the retrieval instead of subtracting two log lines.
+The exact counts may differ, but the source and destination block counts must match, as must the source-write and destination-read byte counts. There must be no positive `remote_deliver` `partial`, `miss` or `failed` count. `miss` means the source answered but held none of the requested blocks; `failed` is reserved for transport, control or deadline failures. These values reset after each reporting interval, so inspect the interval or intervals covering the retrieval instead of subtracting two log lines.
 
 Because this peer-only configuration has no KVCR-owned local tier, the same log can contain `kv_offload_tiering_cascade_job_failures` for the unused local deposit path. That counter is separate from peer delivery and does not invalidate the matching successful transfer above.
 

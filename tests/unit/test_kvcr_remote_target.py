@@ -33,7 +33,7 @@ from _kvcr_test_utils import (
     _write_done_notification,
 )
 
-from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.backends.remote_ops import _notification_unserved, _write_done_notif
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
@@ -652,7 +652,9 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         target_agent,
         FakePrimaryPinning(),
         target_control,
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+        KVCRConfig(
+            nixl_agent_name="target", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -660,7 +662,9 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         source_agent,
         source_pinning,
         source_control,
-        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        KVCRConfig(
+            nixl_agent_name="source", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         name="source",
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -741,6 +745,18 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     ]
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    # A source that holds none of the blocks is a miss, not a failure.
+    assert ("source_write", "miss") in _duration_labels(source)
+    assert ("remote_deliver", "miss") in _duration_labels(target)
+    assert ("remote_deliver", "failed") not in _duration_labels(target)
+
+
+def _duration_labels(kvcr) -> set[tuple[str, ...]]:
+    return {
+        labels
+        for kind, name, _, labels in kvcr.get_stats().records
+        if kind == "histogram" and name == DURATION_METRIC
+    }
 
 
 def _probe_ack(handle, source="tcp://source:1", **fields):

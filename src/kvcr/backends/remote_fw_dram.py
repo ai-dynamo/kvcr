@@ -234,7 +234,9 @@ class _RemoteFWDram:
         if current_hint is not None and (
             current_hint.failed or current_hint.missing_keys.issuperset(blocks)
         ):
-            kvcr._record_duration(scope, started_at, "failed")
+            kvcr._record_duration(
+                scope, started_at, "failed" if current_hint.failed else "miss"
+            )
             return False
 
         if current_hint is None or current_hint.source is None:

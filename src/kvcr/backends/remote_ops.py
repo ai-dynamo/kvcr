@@ -287,11 +287,14 @@ class _TargetPullOp(_RemoteOp):
                     len(completed_keys),
                     (scope,),
                 )
+            # "miss": the source answered but held none of the blocks.
             result = (
                 "success"
                 if all_completed
                 else "partial"
                 if completed_keys
+                else "miss"
+                if success
                 else "failed"
             )
             backend._record_progress_duration(scope, self.started_at, result)
@@ -482,7 +485,7 @@ class _SourceWriteOp(_RemoteOp):
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
                 backend._record_progress_duration(
-                    "source_write", self.started_at, "failed"
+                    "source_write", self.started_at, "miss"
                 )
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
