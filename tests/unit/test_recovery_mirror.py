@@ -6,11 +6,11 @@ import pytest
 from _kvcr_test_utils import _recovered_record
 from msgspec.structs import replace
 
-from kvcr.core import _BlockRecord
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.progress import _TransferRef
-from kvcr.recovery_journal import (
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _TransferRef
+from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
     _RECOVERY_ENCODER,
     RecoveryMirrorError,
@@ -232,6 +232,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
                 [("full", 0), ("swa", 10)],
                 _LocalDramState.READY,
                 claim_count=2,
+                source_readers=2,
                 retire_on_release=True,
                 pending_deposits=1,
                 writers=[1, 1],
@@ -281,7 +282,10 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     }
     # A kept mirror must match exactly what the handback frames carry.
     residency = served[ready].local_dram
-    residency.refs[0] = _TransferRef("old-agent", 0, "full", framework=False)
+    residency.refs = (
+        _TransferRef("old-agent", 0, "full", framework=False),
+        _TransferRef("old-agent", 10, "swa", framework=False),
+    )
     framed = {
         BlockKey(key): _decode_recovery_record(payload, _TWO_POOLS)
         for _, key, payload in _recovery_frames(served)
@@ -291,6 +295,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
 
     assert mirror._records is served
     assert mirror._records[ready].local_dram is residency
+    assert residency.source_readers == 0
     assert not residency.refs  # A new agent must regenerate its own references.
     assert partially_ready not in mirror._records
     assert mirror._records == framed

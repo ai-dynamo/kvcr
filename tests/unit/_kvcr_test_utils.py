@@ -16,7 +16,8 @@ from unittest.mock import patch
 import msgspec
 
 from kvcr import KVCR, KVCRBindings
-from kvcr import progress as kvcr_progress
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -24,11 +25,10 @@ from kvcr.config import (
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from kvcr.core import _BlockRecord
 from kvcr.hints.results import HintResult
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.policy import FIFOPolicy
+from kvcr.runtime import progress as kvcr_progress
+from kvcr.runtime.core import _BlockRecord
 from kvcr.types import (
     BlockKey,
     MemoryRef,
@@ -172,7 +172,15 @@ def _poll_until(
 
 
 def _has_outstanding_operations(kvcr: KVCR) -> bool:
-    return kvcr._core._outstanding_operations > 0
+    core = kvcr._core
+    local = core._local_dram
+    return core._outstanding_operations > 0 or (
+        local is not None
+        and (
+            local._pools.source_operations > 0
+            or not local._pools._source_state.completions.empty()
+        )
+    )
 
 
 def _wait_until(predicate, *, timeout: float = 1) -> None:

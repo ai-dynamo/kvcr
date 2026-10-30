@@ -2,7 +2,7 @@
 
 This guide is for developers who are comfortable with Python, Linux, and inference engines such as vLLM, but are new to KV Cache Runner (KVCR). It covers the local development path from environment setup through standalone validation.
 
-To try the integrated stack without modifying source, follow the [quick start](quick-start.md).
+To try the integrated stack without modifying source, follow the [vLLM quick start](quick-start-vllm.md) or [SGLang HiCache quick start](quick-start-sglang.md).
 
 ---
 
@@ -117,6 +117,7 @@ print("module:", path)
 print("public API:", KVCR, KVCRBindings)
 assert "site-packages" in str(path), path
 PY
+.venv/bin/kvcr-service --help
 ```
 
 Restore editable development mode after the wheel check:
@@ -215,7 +216,7 @@ The KVCR guard service owns pool lifecycle. It pre-allocates `--guard-count` Gua
 Before starting, ensure `/run/kvcr` and `/dev/shm/kvcr` exist and are writable by the user running the service:
 
 ```bash
-uv run python -m kvcr.kvcr_service \
+uv run kvcr-service \
   --socket-path /run/kvcr/memory.sock \
   --pool-dir /dev/shm/kvcr \
   --guard-count 1 \
@@ -224,6 +225,8 @@ uv run python -m kvcr.kvcr_service \
 ```
 
 The five flags above are required. Logging, heartbeat fencing, Guard startup timeout, and HTTP health options are optional.
+
+When loading a wheel through `PYTHONPATH` without installing it, use `python3 -m kvcr.service.server` with the same flags.
 
 Add `--health-port 9092` to enable read-only `GET /live` and `GET /ready` probes. The listener binds before pool allocation, to `127.0.0.1` by default; use `--health-host 0.0.0.0` for a Kubernetes probe and restrict network access to the probe port. During allocation and mapping, `/live` returns 200 and `/ready` returns 503. Both return 503 on a known failure, a dead Guard thread, a stalled Unix accept loop, or shutdown.
 
@@ -248,7 +251,7 @@ Heartbeat promotion kills the worker it promotes over. On a missed deadline the 
 
 Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the listed usable sizes. The example therefore creates one mapping of 64 GiB plus 100 MiB, laid out as `[journal header + journal payload][pool 0][pool 1]`. Pool sizes are rounded down to the native memory-page boundary.
 
-Pool backing is chosen automatically and best-effort, with no configuration or wire-protocol change, and works without any hugetlbfs: HugeTLB (a pool file on a writable `hugetlbfs` mount with enough free pages, such as `/dev/hugepages` or a Kubernetes `HugePages-*` volume), then transparent huge pages (THP) on Linux with Python 3.12+, then base pages. A HugeTLB allocation that fails (no pages, no space) and a THP mapping that cannot be set up log a warning and use the next tier; other failures, such as being unable to identify a pool's filesystem or a worker being unable to open the pool path, are not retried and fail. Workers must see the pool files at the same path as the service, so mount the same hugetlbfs volumes at the same paths in the Guard and engine containers (and give the Guard container a matching `hugepages-<size>` limit); where that is not possible, use `--disable-hugepages`.
+Pool backing is chosen automatically and best-effort, with no configuration, and works without any hugetlbfs: HugeTLB (a pool file on a writable `hugetlbfs` mount with enough free pages, such as `/dev/hugepages` or a Kubernetes `HugePages-*` volume), then transparent huge pages (THP) on Linux with Python 3.12+, then base pages. A HugeTLB allocation that fails (no pages, no space) and a THP mapping that cannot be set up log a warning and use the next tier; other failures, such as being unable to identify a pool's filesystem, are not retried and fail. A worker receives the pool as a file descriptor over the claim socket, so its container needs no pool-directory or hugetlbfs mount; only the Guard container needs the mount (and a matching `hugepages-<size>` limit).
 
 A worker calls `KVCRClient.claim(guard_index, pool_layouts, compatibility_digest, control_bind)` with its Guard's control address and each ordered pool's name and block size. The returned `KVCRPoolHold` owns the exclusive lease and exposes the mapped pools through `local_dram.pools` as `(name, address, size_bytes)`. Pool block sizes may differ. The pre-release wire protocol remains version 1.
 
@@ -305,7 +308,7 @@ Validate that counters increase on both success and failure paths, byte counts a
 
 Complete standalone setup and validation first. Use a separate shared environment for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone development loop.
 
-Select a vLLM revision that includes the merged KVCR secondary-tier adapter (`"type": "kvcr"`), starting with [`0856750`](https://github.com/vllm-project/vllm/commit/08567505b09324f891797f4a13c1bd73fc75a827) on `main`. Pair it with a landed Dynamo revision such as [`ea23e51`](https://github.com/ai-dynamo/dynamo/commit/ea23e5130c1bfbadec477b99449d0cee5598caa0), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [quick start](quick-start.md) records a pinned combination for its container.
+Select a vLLM revision that includes the merged KVCR 0.2.0 secondary-tier adapter (`"type": "kvcr"`), starting with [`fed7de9`](https://github.com/vllm-project/vllm/commit/fed7de909f894fbee0c45130376aed2e2c9bf0d3) on `main`. Pair it with a landed Dynamo revision such as [`701da25`](https://github.com/ai-dynamo/dynamo/commit/701da25292ecca8f64d770cc0b17d389200019a1), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
 
 ### Build the integration environment
 
@@ -402,7 +405,7 @@ Run integration validation when changing public KVCR contracts, the vLLM tier ad
 
 #### Minimal vLLM configuration
 
-On a compatible vLLM revision, KVCR is a secondary tier behind `OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's [worker configuration](quick-start.md#4-start-a-kvcr-enabled-worker) for the `--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities, ports, and local DP ranks for your environment.
+On a compatible vLLM revision, KVCR is a secondary tier behind `OffloadingConnector` and `TieringOffloadingSpec`. Use the quick start's [worker configuration](quick-start-vllm.md#4-start-a-kvcr-enabled-worker) for the `--kv-transfer-config` and `--kv-events-config` objects, adjusting capacities, ports, and local DP ranks for your environment.
 
 The important fields are:
 

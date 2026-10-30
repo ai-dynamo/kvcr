@@ -20,7 +20,7 @@ from .parser import HintType, _Hint, hint_message_id, parse_hints
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
-    from ..core import _KVCRCore
+    from ..runtime.core import _KVCRCore
 
 # The supported hint types. Every dispatcher builds one handler per entry.
 _HINT_TYPES: tuple[HintType, ...] = (KV_FETCH,)

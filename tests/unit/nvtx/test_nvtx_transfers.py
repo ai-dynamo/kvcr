@@ -144,7 +144,7 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
         source, recording, "source.write.completed", ended="source.write"
     )
     assert int(final["reason"]) == int(_nvtx.Reason.DEADLINE)
-    assert not backend._pending_pin_ops
+    assert not backend._sources._pending_pin_ops
     for name in ("source.write", "nixl.write"):
         assert len(spans(recording, name, "end")) == 1
 
@@ -153,7 +153,7 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
 def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
     source, agent, pinning = make_source()
-    pending = next(iter(source._core._remote_fw_dram._source_pin_ops.values()))
+    pending = next(iter(source._core._remote_fw_dram._sources._source_pin_ops.values()))
     state = pending.nvtx_state
     native_submit = agent.transfer
     open_at_submit = []
@@ -197,7 +197,7 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
     source, agent, pinning = make_source()
     backend = source._core._remote_fw_dram
     if "route" in cause:
-        pending = next(iter(backend._source_pin_ops.values()))
+        pending = next(iter(backend._sources._source_pin_ops.values()))
         backend._route_generation[pending.route[0]] = pending.route[1] + 1
     if "timeout" in cause:
         source._core._clock = lambda: float("inf")
@@ -218,7 +218,7 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
 
 
 def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypatch):
-    from kvcr.remote_fw_dram import _SourceWriteOp
+    from kvcr.backends.remote_fw_dram import _SourceWriteOp
 
     source, agent, pinning = make_source()
     backend = source._core._remote_fw_dram
@@ -264,7 +264,8 @@ def test_failed_source_trace_initialization_is_not_retried(recording, monkeypatc
 def test_local_source_reuses_nvtx_state_on_both_write_paths(
     recording, monkeypatch, level
 ):
-    from kvcr.remote_fw_dram import _SourcePinOp, _SourceWriteOp
+    from kvcr.backends.remote_fw_dram import _SourceWriteOp
+    from kvcr.backends.remote_sources import _SourcePinOp
 
     monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
     pins, writes = {}, {}

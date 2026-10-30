@@ -14,8 +14,8 @@ from unittest.mock import Mock, patch
 import msgspec
 import pytest
 
-from kvcr import memory as kvcr_memory
-from kvcr.memory import (
+from kvcr.service import memory as kvcr_memory
+from kvcr.service.memory import (
     _JOURNAL_HEADER_BYTES,
     KVCRPoolAttachment,
     KVCRPoolSpec,
@@ -69,9 +69,11 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
 ) -> None:
     """A pool is 0600, fully backed, attachable, and unlinked only by its owner."""
 
-    with patch("kvcr.memory.uuid.uuid4") as uuid4:
+    with patch("kvcr.service.memory.uuid.uuid4") as uuid4:
         uuid4.return_value.hex = _TEST_GENERATION
-        with patch("kvcr.memory._populate_pages", wraps=_populate_pages) as populate:
+        with patch(
+            "kvcr.service.memory._populate_pages", wraps=_populate_pages
+        ) as populate:
             owner = _KVCRPoolOwner.allocate(
                 pool_id="engine_dp0",
                 pool_size_bytes=12289,
@@ -118,6 +120,17 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
                 assert ctypes.string_at(data_address, len(data_marker)) == data_marker
             finally:
                 attachment.close()
+            # A descriptor from the service maps the same bytes without the path.
+            fd = os.open(path, os.O_RDWR)
+            with patch("kvcr.service.memory.os.open", side_effect=AssertionError):
+                fd_attachment = KVCRPoolAttachment.attach_fd(fd, spec)
+            try:
+                address = fd_attachment.address
+                assert ctypes.string_at(address, len(journal_marker)) == journal_marker
+            finally:
+                fd_attachment.close()
+            with pytest.raises(OSError):
+                os.fstat(fd)
             # Detaching unmaps but never unlinks the server-owned file.
             assert path.exists()
             with pytest.raises(RuntimeError, match="closed"):
@@ -146,7 +159,9 @@ def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
             staging_path.write_bytes(replacement)
             raise RuntimeError("page population failed")
 
-        with patch("kvcr.memory._populate_pages", side_effect=replace_then_fail):
+        with patch(
+            "kvcr.service.memory._populate_pages", side_effect=replace_then_fail
+        ):
             with pytest.raises(RuntimeError, match="page population failed"):
                 _KVCRPoolOwner.allocate(
                     pool_id="engine_dp0",
@@ -194,8 +209,10 @@ def test_pool_spec_rejects_a_corrupted_grant(
         ),
     ],
 )
+@pytest.mark.parametrize("by_descriptor", [False, True], ids=["path", "descriptor"])
 def test_attachment_refuses_a_tampered_pool_without_mapping_it(
     pool_owner: _KVCRPoolOwner,
+    by_descriptor: bool,
     tamper: str,
     error: type[Exception],
     match: str,
@@ -218,13 +235,21 @@ def test_attachment_refuses_a_tampered_pool_without_mapping_it(
         assert replacement_stat.st_ino != spec.inode
         assert replacement_stat.st_size == original_stat.st_size
         assert stat.S_IMODE(replacement_stat.st_mode) == 0o600
+    fd = os.open(path, os.O_RDWR) if by_descriptor else None
     with (
         patch("mmap.mmap") as map_file,
         pytest.raises(error, match=match),
     ):
-        KVCRPoolAttachment.attach(spec)
+        if fd is None:
+            KVCRPoolAttachment.attach(spec)
+        else:
+            KVCRPoolAttachment.attach_fd(fd, spec)
     map_file.assert_not_called()
     assert path.exists()
+    if fd is not None:
+        # attach_fd owns the descriptor, so a refusal closes it.
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 @pytest.mark.parametrize(
@@ -276,7 +301,7 @@ def test_page_population_backs_only_the_asked_range_without_mapping(
         # Written, not mapped: a store that cannot be backed raises SIGBUS.
         with (
             patch("mmap.mmap") as map_file,
-            patch("kvcr.memory.os.pwrite", side_effect=pwrite) as write,
+            patch("kvcr.service.memory.os.pwrite", side_effect=pwrite) as write,
         ):
             if error_match is None:
                 _populate_pages(pool_file.fileno(), mmap.PAGESIZE, mmap.PAGESIZE)
@@ -328,7 +353,7 @@ def test_a_snapshot_region_is_tail_only_and_a_failed_one_is_retired(
         # A tail with no header reads as a region, and nothing ever retires one.
         with (
             patch(
-                "kvcr.memory._populate_pages",
+                "kvcr.service.memory._populate_pages",
                 side_effect=OSError(errno.ENOSPC, "no space left on device"),
             ),
             pytest.raises(OSError),

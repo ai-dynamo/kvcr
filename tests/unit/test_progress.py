@@ -10,8 +10,13 @@ import numpy as np
 import pytest
 from nixl import nixlRemoteDisconnectError
 
-from kvcr import progress as progress_module
-from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
+from kvcr.runtime import progress as progress_module
+from kvcr.runtime.progress import (
+    _KVCRProgress,
+    _MemDescriptor,
+    _ProgressOp,
+    _TransferRef,
+)
 from kvcr.types import RegionDescriptor
 
 
@@ -192,7 +197,7 @@ def test_typed_disconnect_marks_peer_and_releases_handle(
 def test_prepare_registers_memory_before_backend_activation(
     monkeypatch, caplog, activate, level
 ) -> None:
-    caplog.set_level(level, logger="kvcr.progress")
+    caplog.set_level(level, logger="kvcr.runtime.progress")
     monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
     clock_reads = []
     monkeypatch.setattr(

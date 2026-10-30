@@ -13,6 +13,7 @@ import os
 import socket
 import struct
 from array import array
+from collections.abc import Callable, Collection
 from contextlib import ExitStack
 from typing import TypeVar
 
@@ -25,6 +26,7 @@ _FRAME_HEADER = struct.Struct("!I")
 _MAX_FRAME_BYTES = 1 << 20
 _TIMEOUT_SECONDS = 60.0
 _MAX_RECV_BATCH = 64
+_MAX_FDS = 2
 _ENCODER = msgspec.msgpack.Encoder()
 _T = TypeVar("_T")
 
@@ -77,10 +79,10 @@ class FramedConnection:
     def send(self, message: object) -> None:
         self._connection.sendall(self._encode_frame(message))
 
-    def send_with_fd(self, message: object, file_descriptor: int) -> None:
-        """Send one frame carrying one descriptor on its first byte."""
+    def send_with_fd(self, message: object, *file_descriptors: int) -> None:
+        """Send one frame carrying its descriptors, in order, on its first byte."""
         frame = self._encode_frame(message)
-        sent = socket.send_fds(self._connection, [frame], [file_descriptor])
+        sent = socket.send_fds(self._connection, [frame], list(file_descriptors))
         if sent < len(frame):
             # sendall() of an empty tail still syscalls, so a peer that already
             # answered and closed would raise EPIPE before we read its reply.
@@ -98,14 +100,17 @@ class FramedConnection:
         return self._receive_after_header(header, decoder)
 
     def receive_with_fd(
-        self, decoder: msgspec.msgpack.Decoder[_T]
-    ) -> tuple[_T, int | None]:
-        """Receive one frame and at most one descriptor attached to it."""
+        self,
+        decoder: msgspec.msgpack.Decoder[_T],
+        expected_counts: Callable[[_T], Collection[int]],
+    ) -> tuple[_T, list[int]]:
+        """Receive one frame and its descriptors; a count the message does not
+        expect is refused and every descriptor closed."""
         # Not socket.recv_fds: it drops the flags it is given, so MSG_CMSG_CLOEXEC
         # would never reach recvmsg.
         header, ancillary, flags, _ = self._connection.recvmsg(
             _FRAME_HEADER.size,
-            socket.CMSG_SPACE(array("i").itemsize * 2),
+            socket.CMSG_SPACE(array("i").itemsize * _MAX_FDS),
             socket.MSG_CMSG_CLOEXEC,
         )
         if not header:
@@ -124,15 +129,17 @@ class FramedConnection:
                 raise KVCRMsgFramingError("truncated ancillary data")
             if unexpected_ancillary:
                 raise KVCRMsgFramingError("unexpected ancillary data")
-            if len(descriptors) > 1:
-                raise KVCRMsgFramingError("multiple file descriptors received")
             if len(header) < _FRAME_HEADER.size:
                 try:
                     header += self._receive_exact(_FRAME_HEADER.size - len(header))
                 except EOFError as error:
                     raise KVCRMsgFramingError("truncated frame") from error
             message = self._receive_after_header(header, decoder)
-            return message, descriptors[0] if descriptors else None
+            if len(descriptors) not in expected_counts(message):
+                raise KVCRMsgFramingError(
+                    f"unexpected number of file descriptors: {len(descriptors)}"
+                )
+            return message, list(descriptors)
         except BaseException:
             for file_descriptor in descriptors:
                 os.close(file_descriptor)

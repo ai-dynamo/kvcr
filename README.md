@@ -77,7 +77,9 @@ A hint envelope may carry several hints. KVCR parses and dispatches each one ind
 
 ### Quick start
 
-The [quick start](docs/quick-start.md) is a public preview that builds and runs KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible base image. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
+The [vLLM quick start](docs/quick-start-vllm.md) is a public preview that builds and runs KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible base image. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
+
+The [SGLang HiCache quick start](docs/quick-start-sglang.md) is a preview for building and running KVCR with SGLang and Dynamo.
 
 ### Development
 
@@ -91,7 +93,7 @@ KVCR package source files carry an SPDX Apache-2.0 identifier and the NVIDIA cop
 
 ## Third-party software
 
-vLLM and Dynamo are installed separately in the quick-start image and are not bundled into the `kvcr` wheel. The build uses the public sources and pinned revisions described in the [quick start](docs/quick-start.md).
+The quick-start images install the inference engine and Dynamo separately; they are not bundled into the `kvcr` wheel. See the [vLLM](docs/quick-start-vllm.md) and [SGLang](docs/quick-start-sglang.md) guides for the pinned sources.
 
 KVCR declares runtime dependencies on `msgspec`, `pyzmq`, and `nixl`. Each is installed from its own distribution under its own license. None of them are redistributed by this repository or bundled into the `kvcr` wheel, which packages only `src/kvcr`.
 

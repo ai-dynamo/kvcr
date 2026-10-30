@@ -18,8 +18,8 @@ import msgspec
 import numpy as np
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
-from . import _nvtx
-from .types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
+from .. import _nvtx
+from ..types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
 
 logger = logging.getLogger(__name__)
 _SUCCESS_RESULT = OpEntryResult(OpEntryStatus.SUCCESS)

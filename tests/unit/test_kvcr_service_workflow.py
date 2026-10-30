@@ -31,8 +31,8 @@ from kvcr import (
     KVCRSocketError,
 )
 from kvcr.config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
-from kvcr.control_channels import ZmqPeerControlChannel
-from kvcr.kvcr_service import _DEFAULT_JOURNAL_BYTES, _KVCRService
+from kvcr.runtime.control_channels import ZmqPeerControlChannel
+from kvcr.service.server import _DEFAULT_JOURNAL_BYTES, _KVCRService
 
 _BLOCK_SIZE_BYTES = 1024
 _POOL_LAYOUTS = [("pool0", _BLOCK_SIZE_BYTES)]
@@ -95,7 +95,7 @@ def _running_daemon(pool_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], P
             sys.executable,
             "-c",
             # Host hugetlbfs mounts stay out of the daemon's placement and purge.
-            "from kvcr import kvcr_service as s, memmap;"
+            "from kvcr.service import server as s, memmap;"
             "memmap._hugetlbfs_mounts = lambda: []; s.main()",
             "--socket-path",
             str(socket_path),

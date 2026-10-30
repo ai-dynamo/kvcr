@@ -8,12 +8,12 @@ from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from .core import logger
+from ..runtime.core import logger
+from ..types import MemoryRef, OpHandle, TransferError
 from .remote_ops import _WriteProbe, _WriteProbeAck
-from .types import MemoryRef, OpHandle, TransferError
 
 if TYPE_CHECKING:
-    from .progress import _KVCRProgress
+    from ..runtime.progress import _KVCRProgress
     from .remote_fw_dram import _RemoteFWDram
     from .remote_ops import _SourceWriteOp, _TargetPullOp
 
@@ -98,6 +98,10 @@ class _DanglingOps:
 
     def finish_source(self, op: "_SourceWriteOp") -> None:
         status = self.source_writes.pop((op.route[0], op.op_handle), None)
+        if status is not None and op.local_sources:
+            self._backend._kvcr._local_dram._pools.release_readers(
+                op.source_keys, op.local_sources, success=op.success
+            )
         if status is not None and status.abandoned:
             self.report_source(op, "quiesced")
 

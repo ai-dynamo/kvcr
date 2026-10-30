@@ -18,26 +18,27 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import Any
 
-from .api import KVCRBindings
-from .config import (
+from ..api import KVCRBindings
+from ..backends.local_disk import _G3Residency
+from ..config import (
     KVCRBackendConfigs,
     KVCRConfig,
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from .control_channels import KVCRServiceError, ZmqPeerControlChannel
-from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import (
-    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
-    PidfdLiveness,
-    _PoolDescriptor,
-    _TierConfig,
-)
-from .local_disk import _G3Residency
+from ..runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
+from ..runtime.core import _BlockRecord, _KVCRCore
+from ..types import BlockKey, PoolBlockLayouts
 from .memory import (
     KVCRPoolAttachment,
     KVCRPoolSpec,
     _KVCRPoolOwner,
+)
+from .protocol import (
+    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
+    PidfdLiveness,
+    _PoolDescriptor,
+    _TierConfig,
 )
 from .recovery_journal import (
     RecoveryJournal,
@@ -49,7 +50,6 @@ from .recovery_journal import (
     read_handback,
     write_recovery_snapshot,
 )
-from .types import BlockKey, PoolBlockLayouts
 
 logger = logging.getLogger(__name__)
 

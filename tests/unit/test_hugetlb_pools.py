@@ -10,17 +10,17 @@ from pathlib import Path
 import pytest
 from _kvcr_test_utils import _recovered_record
 
-from kvcr import memmap, memory
-from kvcr.guard_protocol import _PoolDescriptor
-from kvcr.kvcr_service import _PoolRegistry
-from kvcr.memory import KVCRPoolAttachment, _KVCRPoolOwner
-from kvcr.recovery_journal import (
+from kvcr.service import memmap, memory
+from kvcr.service.memory import KVCRPoolAttachment, _KVCRPoolOwner
+from kvcr.service.protocol import _PoolDescriptor
+from kvcr.service.recovery_journal import (
     _recovery_frames,
     _RecoveryMirror,
     canonical_pool_terms,
     read_recovery_snapshot,
     write_recovery_snapshot,
 )
+from kvcr.service.server import _PoolRegistry
 from kvcr.types import BlockKey
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux")
