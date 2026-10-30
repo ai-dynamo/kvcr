@@ -508,9 +508,9 @@ jobs:
           done
           curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=pvijayakrish/onboard-kvcr \
             "${form[@]}" "${GITLAB_PIPELINE_URL}"
-          # The response names an internal pipeline, so only its id is checked, never printed.
-          jq -e '.id | numbers' "${response}" > /dev/null || fail "the release pipeline was not created"
-          echo "Release pipeline triggered for ${VERSION} (${release_type}, DRY_RUN=${DRY_RUN})"
+          # Only the id is printed; the response's URLs name an internal host.
+          pipeline_id="$(jq -e '.id | numbers' "${response}")" || fail "the release pipeline was not created"
+          echo "Release pipeline ${pipeline_id} triggered for ${VERSION} (${release_type}, DRY_RUN=${DRY_RUN})"
 
   notify-failure:
     name: Slack failure alert
