@@ -3,6 +3,7 @@
 """Remote transfer operations and wire-format helpers."""
 
 import logging
+from collections import Counter
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 
 from .. import _nvtx
-from ..runtime.core import TRANSFER_BLOCKS_METRIC, logger
+from ..runtime.core import TRANSFER_BLOCKS_METRIC, UNSERVED_BLOCKS_METRIC, logger
 from ..runtime.progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
 from ..types import BlockKey, OpHandle
 
@@ -298,6 +299,15 @@ class _TargetPullOp(_RemoteOp):
                 else "failed"
             )
             backend._record_progress_duration(scope, self.started_at, result)
+            unserved_counts = (
+                Counter(self.unserved.values())
+                if success
+                else {self.failure_reason or "unknown": len(self.keys)}
+            )
+            for unserved_reason, count in unserved_counts.items():
+                backend._record_progress_counter(
+                    UNSERVED_BLOCKS_METRIC, count, (scope, unserved_reason)
+                )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "KVCR_EVENT target_transfer_completed scope=%s request_id=%s "
@@ -487,6 +497,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "miss"
                 )
+                self._record_unserved()
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
@@ -591,6 +602,7 @@ class _SourceWriteOp(_RemoteOp):
             )
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
+        self._record_unserved()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT source_transfer_completed op=%d source_op=%d target=%s "
@@ -611,6 +623,12 @@ class _SourceWriteOp(_RemoteOp):
         if trace is not None:
             trace.complete_source(self.success, len(self.source_keys))
         return True, True
+
+    def _record_unserved(self) -> None:
+        for reason, indices in self.unserved.items():
+            self._backend._record_progress_counter(
+                UNSERVED_BLOCKS_METRIC, len(indices), ("source_write", reason)
+            )
 
     def abort_reason(self, cancel_requested: bool) -> str:
         # A failed transfer also passes through CANCEL_PENDING.

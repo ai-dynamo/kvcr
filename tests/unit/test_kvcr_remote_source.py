@@ -30,7 +30,12 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
-from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import (
+    DURATION_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
+)
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -121,6 +126,9 @@ def test_framework_pinning_disabled(
         agent,
         pinning,
         control,
+        KVCRConfig(
+            nixl_agent_name="source", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         name="source",
         framework_regions=[_buffer_region(memory, 16)],
         local_dram=(
@@ -166,6 +174,12 @@ def test_framework_pinning_disabled(
     if completed_indices:
         assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    records = source.get_stats().records
+    assert [
+        (labels[1], value)
+        for kind, name, value, labels in records
+        if name == UNSERVED_BLOCKS_METRIC
+    ] == [(reason, len(indices)) for reason, indices in unserved.items()]
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (

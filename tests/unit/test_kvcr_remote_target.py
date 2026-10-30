@@ -33,7 +33,12 @@ from _kvcr_test_utils import (
     _write_done_notification,
 )
 
-from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import (
+    DURATION_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
+)
 from kvcr.backends.remote_ops import _notification_unserved, _write_done_notif
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
@@ -746,15 +751,20 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
     # A source that holds none of the blocks is a miss, not a failure.
-    assert ("source_write", "miss") in _duration_labels(source)
-    assert ("remote_deliver", "miss") in _duration_labels(target)
-    assert ("remote_deliver", "failed") not in _duration_labels(target)
+    source_records = source.get_stats().records
+    target_records = target.get_stats().records
+    assert ("source_write", "miss") in _duration_labels(source_records)
+    assert ("remote_deliver", "miss") in _duration_labels(target_records)
+    assert ("remote_deliver", "failed") not in _duration_labels(target_records)
+    unserved = ("counter", UNSERVED_BLOCKS_METRIC, 1)
+    assert (*unserved, ("source_write", "not_resident")) in source_records
+    assert (*unserved, ("remote_deliver", "not_resident")) in target_records
 
 
-def _duration_labels(kvcr) -> set[tuple[str, ...]]:
+def _duration_labels(records) -> set[tuple[str, ...]]:
     return {
         labels
-        for kind, name, _, labels in kvcr.get_stats().records
+        for kind, name, _, labels in records
         if kind == "histogram" and name == DURATION_METRIC
     }
 

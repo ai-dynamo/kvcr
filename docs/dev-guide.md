@@ -298,7 +298,7 @@ uv run pytest \
 
 Enable telemetry in `KVCRConfig` and provide a framework-specific `stats_factory` through `KVCRBindings`. `get_stats()` should then expose bounded counters, gauges, and duration observations. Each call returns the current interval snapshot and starts a fresh one.
 
-The package exports metric definitions including `DURATION_METRIC`, `TRANSFER_BLOCKS_METRIC`, `TRANSFER_BYTES_METRIC`, and `STATE_METRIC`. Framework wrappers decide how those snapshots are mapped into their metrics system.
+The package exports metric definitions including `DURATION_METRIC`, `TRANSFER_BLOCKS_METRIC`, `TRANSFER_BYTES_METRIC`, `UNSERVED_BLOCKS_METRIC`, and `STATE_METRIC`. `UNSERVED_BLOCKS_METRIC` counts requested blocks a remote transfer did not deliver, labelled by scope and reason: block-level reasons such as `not_resident`, `pin_failed`, `layout_mismatch` and `remembered_miss`, or the operation's failure reason such as `deadline`. Framework wrappers decide how those snapshots are mapped into their metrics system.
 
 Validate that counters increase on both success and failure paths, byte counts agree with block geometry, timers use seconds consistently, and disabling telemetry leaves the runtime behavior unchanged.
 
@@ -508,7 +508,7 @@ A successful control acknowledgement does not prove payload correctness. A succe
 
 ### Remote delivery is partial
 
-Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks.
+Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks. `kvcr_unserved_blocks` breaks the shortfall down by reason on both the source (`source_write`) and the destination (`remote_deliver`/`remote_fetch`).
 
 ### Operations time out or fail slowly
 
