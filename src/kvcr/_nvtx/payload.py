@@ -42,6 +42,10 @@ class Reason(IntEnum):
     SOURCE_STALLED = 18
     HINT_UNAVAILABLE = 19
     HINT_CONFLICT = 20
+    # Why a source left blocks out; names match the write_done unserved reasons.
+    NOT_RESIDENT = 21
+    PIN_FAILED = 22
+    LAYOUT_MISMATCH = 23
 
 
 class _ThreadBuffers(local):

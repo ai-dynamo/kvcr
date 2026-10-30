@@ -33,7 +33,7 @@ def test_zero_selected_source_is_failed_without_posting(recording):
         source, recording, "source.write.completed", ended="source.write"
     )
     assert int(event["status"]) == 4
-    assert int(event["reason"]) == 0
+    assert int(event["reason"]) == int(_nvtx.Reason.NOT_RESIDENT)
     assert int(event["requested_blocks"]) == 1
     assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
     assert not agent.xfers

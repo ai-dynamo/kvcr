@@ -237,7 +237,7 @@ def test_callback_failure_is_correlated_before_registration(recording):
     assert not recording.stack
 
 
-def test_partial_result_counts_available_blocks_without_guessing_cause(recording):
+def test_partial_result_counts_available_blocks_and_source_reported_cause(recording):
     agent, pinning, control = (
         FakeNixlAgent(),
         PendingPrimaryPinning(),
@@ -252,12 +252,16 @@ def test_partial_result_counts_available_blocks_without_guessing_cause(recording
     agent.state = "DONE"
     pinning.complete(0, missing_indices=(1,))
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    for name in ("source.pin.completed", "source.write.completed"):
+    # The pin result gives no cause; the source write knows the block was absent.
+    for name, reason in (
+        ("source.pin.completed", _nvtx.Reason.UNKNOWN),
+        ("source.write.completed", _nvtx.Reason.NOT_RESIDENT),
+    ):
         event = payloads(recording, name)[0]
         assert int(event["requested_blocks"]) == 2
         assert int(event["completed_blocks"]) == 1
         assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
-        assert int(event["reason"]) == int(_nvtx.Reason.UNKNOWN)
+        assert int(event["reason"]) == int(reason)
 
 
 def test_invalid_result_has_bounded_reason_and_releases_handle(recording):

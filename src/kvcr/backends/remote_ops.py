@@ -4,7 +4,7 @@
 
 import logging
 from collections import Counter
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -277,10 +277,13 @@ class _TargetPullOp(_RemoteOp):
                     else "remote_failure"
                 )
             if trace is not None:
-                trace.target_result(
-                    self,
-                    reason if not success or all_completed else _nvtx.Reason.UNKNOWN,
-                )
+                if not success and reason is _nvtx.Reason.REMOTE_FAILURE:
+                    reason = _nvtx_reason(self.failure_reason)
+                    if reason is _nvtx.Reason.UNKNOWN:
+                        reason = _nvtx.Reason.REMOTE_FAILURE
+                elif success and not all_completed:
+                    reason = _dominant_reason(self.unserved.values())
+                trace.target_result(self, reason)
             self.state = _TargetPullState.FINISHED
             if completed_keys:
                 backend._record_progress_counter(
@@ -504,7 +507,9 @@ class _SourceWriteOp(_RemoteOp):
                 self._log_completed("miss")
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
-                    trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
+                    trace.complete_source(
+                        False, 0, reason=_dominant_reason(self._unserved_reasons())
+                    )
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -611,7 +616,13 @@ class _SourceWriteOp(_RemoteOp):
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
         if trace is not None:
-            trace.complete_source(self.success, len(self.source_keys))
+            trace.complete_source(
+                self.success,
+                len(self.source_keys),
+                reason=_dominant_reason(self._unserved_reasons())
+                if self.success and self.unserved
+                else None,
+            )
         return True, True
 
     def _record_unserved(self) -> None:
@@ -619,6 +630,10 @@ class _SourceWriteOp(_RemoteOp):
             self._backend._record_progress_counter(
                 UNSERVED_BLOCKS_METRIC, len(indices), ("source_write", reason)
             )
+
+    def _unserved_reasons(self) -> Iterator[str]:
+        for reason, indices in self.unserved.items():
+            yield from (reason,) * len(indices)
 
     def _log_completed(self, result: str) -> None:
         if not logger.isEnabledFor(logging.DEBUG):
@@ -710,6 +725,15 @@ def _write_done_notif(
 
 def _format_counts(counts: Mapping[str, int]) -> str:
     return ",".join(f"{key}:{count}" for key, count in sorted(counts.items())) or "-"
+
+
+def _nvtx_reason(reason: str | None) -> _nvtx.Reason:
+    return _nvtx.Reason.__members__.get((reason or "").upper(), _nvtx.Reason.UNKNOWN)
+
+
+def _dominant_reason(reasons: Iterable[str]) -> _nvtx.Reason:
+    most_common = Counter(reasons).most_common(1)
+    return _nvtx_reason(most_common[0][0]) if most_common else _nvtx.Reason.UNKNOWN
 
 
 def _wire_reason(reason: _nvtx.Reason) -> str | None:
