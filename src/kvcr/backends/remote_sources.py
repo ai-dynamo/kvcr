@@ -114,7 +114,14 @@ class _RemoteSources:
         now = self._kvcr._clock()
         for op_id, op in list(self._source_pin_ops.items()):
             if now >= op.deadline:
-                logger.warning("KVCR operation %r expired", op_id)
+                logger.warning(
+                    "KVCR source pin wait timed out op=%d source_op=%d target=%s "
+                    "pending_pins=%d",
+                    op.op_handle,
+                    op_id[1],
+                    op.route[0],
+                    len(op.pending_pin_ids),
+                )
                 self._expire_source_pin(op_id, op)
             elif not op.pending_pin_ids:
                 self._resume_source_pin(op_id, op)
@@ -175,6 +182,7 @@ class _RemoteSources:
         completed_indices = []
         selected_sources = []
         unserved: dict[str, list[int]] = {}
+        mismatched = 0
         waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
@@ -216,11 +224,7 @@ class _RemoteSources:
             else:
                 indices = _layout_indices(layout, labels)
             if indices is None:
-                logger.warning(
-                    "KVCR start_write layout mismatch op=%d key=%r",
-                    source_pin.op_handle,
-                    key,
-                )
+                mismatched += 1
                 unserved.setdefault("layout_mismatch", []).append(index)
                 source_pin.keys -= {key}
                 record = kvcr._block_record_map[key]
@@ -232,6 +236,12 @@ class _RemoteSources:
                 kvcr._local_dram._pools.source_refs(residency, indices)
                 if residency is not None
                 else tuple(source[span] for span in indices)
+            )
+        if mismatched:
+            logger.warning(
+                "KVCR start_write layout mismatch op=%d keys=%d",
+                source_pin.op_handle,
+                mismatched,
             )
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices

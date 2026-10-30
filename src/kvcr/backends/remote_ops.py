@@ -311,11 +311,13 @@ class _TargetPullOp(_RemoteOp):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "KVCR_EVENT target_transfer_completed scope=%s request_id=%s "
-                    "op=%d source=%s blocks=%d bytes=%d result=%s",
+                    "op=%d source=%s requested=%d blocks=%d bytes=%d result=%s "
+                    "unserved=%s",
                     scope,
                     self.request_id,
                     self.op_id[1],
                     self.remote_ctrl_ep,
+                    len(self.keys),
                     len(completed_keys),
                     backend._kvcr._descriptor_bytes(
                         descriptor
@@ -326,6 +328,7 @@ class _TargetPullOp(_RemoteOp):
                         for descriptor in descriptors
                     ),
                     result,
+                    _format_counts(unserved_counts),
                 )
             return True, True
 
@@ -498,6 +501,7 @@ class _SourceWriteOp(_RemoteOp):
                     "source_write", self.started_at, "miss"
                 )
                 self._record_unserved()
+                self._log_completed("miss")
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
@@ -603,21 +607,7 @@ class _SourceWriteOp(_RemoteOp):
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
         self._record_unserved()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "KVCR_EVENT source_transfer_completed op=%d source_op=%d target=%s "
-                "blocks=%d bytes=%d result=%s",
-                self.op_handle,
-                self.op_id[1],
-                self.route[0],
-                len(self.source_keys) if self.success else 0,
-                backend._kvcr._descriptor_bytes(
-                    chain.from_iterable(self.src_descriptors)
-                )
-                if self.success
-                else 0,
-                result,
-            )
+        self._log_completed(result)
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
         if trace is not None:
@@ -629,6 +619,27 @@ class _SourceWriteOp(_RemoteOp):
             self._backend._record_progress_counter(
                 UNSERVED_BLOCKS_METRIC, len(indices), ("source_write", reason)
             )
+
+    def _log_completed(self, result: str) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        logger.debug(
+            "KVCR_EVENT source_transfer_completed op=%d source_op=%d target=%s "
+            "blocks=%d bytes=%d result=%s unserved=%s",
+            self.op_handle,
+            self.op_id[1],
+            self.route[0],
+            len(self.source_keys) if self.success else 0,
+            self._backend._kvcr._descriptor_bytes(
+                chain.from_iterable(self.src_descriptors)
+            )
+            if self.success
+            else 0,
+            result,
+            _format_counts(
+                {reason: len(indices) for reason, indices in self.unserved.items()}
+            ),
+        )
 
     def abort_reason(self, cancel_requested: bool) -> str:
         # A failed transfer also passes through CANCEL_PENDING.
@@ -695,6 +706,10 @@ def _write_done_notif(
     if not terminal:
         payload["terminal"] = False
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)
+
+
+def _format_counts(counts: Mapping[str, int]) -> str:
+    return ",".join(f"{key}:{count}" for key, count in sorted(counts.items())) or "-"
 
 
 def _wire_reason(reason: _nvtx.Reason) -> str | None:

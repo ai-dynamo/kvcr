@@ -441,11 +441,12 @@ def test_local_source_waits_for_declared_pieces(
     assert not source._core._local_dram_sources_by_op
     assert residency.claim_count == 0
     assert pinning.searches == ([rejected] if mixed else [])
+    # One warning per operation, without key bytes.
     assert [
         record.args[1]
         for record in caplog.records
         if "start_write layout mismatch" in record.message
-    ] == list(rejected)
+    ] == ([len(rejected)] if rejected else [])
 
 
 @pytest.mark.parametrize(

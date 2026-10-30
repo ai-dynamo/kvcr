@@ -1699,8 +1699,16 @@ def test_remote_framework_dram_transfers_available_keys(
         and completed in event
         for event in events
     )
+    unserved = f"not_resident:{len(missing_indices)}" if missing_indices else "-"
     assert any(
-        "target_transfer_completed" in event and completed in event for event in events
+        "target_transfer_completed" in event
+        and f"requested=3 {completed}" in event
+        and event.endswith(f"unserved={unserved}")
+        for event in events
+    )
+    assert any(
+        "source_transfer_completed" in event and event.endswith(f"unserved={unserved}")
+        for event in events
     )
 
 
