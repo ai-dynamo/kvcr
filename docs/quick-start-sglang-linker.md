@@ -12,8 +12,8 @@ For the HiCache storage route, use the [SGLang HiCache quick start](quick-start-
 ## Support status
 
 - Dense models on TP1 workers (reference: Qwen3-32B): covered by this guide.
-- Rank-replicated hybrid models (DeepSeek-V4-Flash, two TP4 workers over RDMA, no Guard): tested outside this recipe; see [Cross-host and TP>1](#cross-host-and-tp1).
-- Not covered: KVCR Guard with the linker, Dynamo's `--kvcr-state-agent-owner`, remote hints for dense TP>1, CP/PP, and workers spanning several nodes.
+- Rank-replicated hybrid models (DeepSeek-V4-Flash, two TP4 workers over RDMA, no Guard): previously tested with a different Dynamo integration; not covered by the pinned draft in this guide.
+- Not covered: KVCR Guard with the linker, remote hints for dense TP>1, CP/PP, and workers spanning several nodes.
 
 ## Prerequisites
 
@@ -44,8 +44,8 @@ Keep these revisions together:
 
 | Component | Revision |
 | --- | --- |
-| SGLang direct linker [#45650](https://github.com/sgl-project/sglang/pull/45650) (includes [#45646](https://github.com/sgl-project/sglang/pull/45646) and [#45648](https://github.com/sgl-project/sglang/pull/45648)) | `73f4d88d837fdae1506f788e7368dd11fe93b5b5` |
-| Dynamo linker hints [#16827](https://github.com/ai-dynamo/dynamo/pull/16827) (on [#16117](https://github.com/ai-dynamo/dynamo/pull/16117)) | `a310f33e9b55e90a8da0ef742e0ca4cb3491bec2` |
+| SGLang direct linker [#45650](https://github.com/sgl-project/sglang/pull/45650) (includes [#45646](https://github.com/sgl-project/sglang/pull/45646) and [#45648](https://github.com/sgl-project/sglang/pull/45648)) | `2d010d70d080e9ea4a6891bb7219ee9dd833c731` |
+| Dynamo linker inventory [#17655](https://github.com/ai-dynamo/dynamo/pull/17655) | `874861a7fdce464a4c28a880886897309172aacd` |
 | KVCR `main` | `7186e7c20ba6e4d71ac3aff507fac9bfd83e8a07` |
 
 These are draft public PR heads, not released packages. The linker and HiCache SGLang branches do not contain each other. Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`.
@@ -69,9 +69,19 @@ docker exec "$QS_CID" python3 -c \
 printf 'Container: %s\n' "$QS_CID"
 ```
 
-Open separate terminals with `docker exec -it <container-id> bash`: one for the router, one per worker, and one for requests. Commands in Steps 3-5 run inside the container.
+Open separate terminals with `docker exec -it <container-id> bash`: one for the state agent, one for the router, one per worker, and one for requests. Commands in Steps 3-5 run inside the container.
 
 ## 3. Start the Dynamo KV router
+
+First start the KV state agent in its own terminal:
+
+```bash
+set -o pipefail
+env -u NATS_SERVER DYN_NAMESPACE=kvcrqs DYN_SYSTEM_PORT=24004 \
+  python3 -m dynamo.kv_state_agent 2>&1 | tee /tmp/state-agent.log
+```
+
+In another terminal, start the router:
 
 ```bash
 set -o pipefail
@@ -91,11 +101,13 @@ export RANK=0                         # Use 1 in the second terminal.
 export PROMETHEUS_MULTIPROC_DIR="/tmp/sgl-metrics-$RANK"
 mkdir "$PROMETHEUS_MULTIPROC_DIR"
 KVCR_CONFIG="$(python3 - <<'PY'
-import json, os
+import ipaddress, json, os, socket
 rank = int(os.environ['RANK'])
+host = socket.gethostbyname(socket.gethostname())
+assert not ipaddress.ip_address(host).is_loopback, host
 print(json.dumps({
     'kvcr_service_socket_path': None, 'dram_size_gb': 4,
-    'advertise_host': '127.0.0.1',
+    'advertise_host': host, 'publish_inventory': True,
     'control_port': 24100 + rank * 32, 'nixl_port': 24200 + rank * 32,
     'enable_telemetry': True, 'startup_timeout_seconds': 300,
     'operation_timeout_ms': 20000, 'abandon_timeout_ms': 60000,
@@ -114,11 +126,11 @@ env -u NATS_SERVER CUDA_VISIBLE_DEVICES="$RANK" DYN_SYSTEM_PORT="$((24001 + RANK
   --enable-unified-cache-external-linker \
   --unified-cache-external-linker-backend kvcr \
   --hicache-storage-backend-extra-config "$KVCR_CONFIG" \
-  --kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"\",\"endpoint\":\"tcp://*:$((24020 + RANK))\"}" \
+  --kv-events-config "{\"publisher\":\"zmq\",\"format\":\"dynamo\",\"topic\":\"\",\"endpoint\":\"tcp://*:$((24020 + RANK))\"}" \
   2>&1 | tee "/tmp/worker-$RANK.log"
 ```
 
-Linker options are strict; HiCache option names such as `local_dram_bytes`, `control_advertise_host` or `enable_remote_hint` fail startup. `dram_size_gb` is per TP rank. Each TP rank binds `control_port` and `nixl_port` plus its global rank, so keep port ranges apart. Dynamo advertises a worker as a hint source only when `advertise_host` and `control_port` are set in inline JSON. The KV event endpoint must bind a wildcard host (`tcp://*:PORT`); with `tcp://127.0.0.1:PORT` the publisher connects instead and the router gets no events.
+Linker options are strict; HiCache option names such as `local_dram_bytes`, `control_advertise_host` or `enable_remote_hint` fail startup. `dram_size_gb` is per TP rank. Each TP rank binds `control_port` and `nixl_port` plus its global rank, so keep port ranges apart. `publish_inventory` enables KVCR-owned event publication; `advertise_host` must be reachable and non-loopback. The KV event endpoint must bind a wildcard host (`tcp://*:PORT`); with `tcp://127.0.0.1:PORT` the publisher connects instead and the router gets no events.
 
 ## 5. Verify peer reuse
 
@@ -219,7 +231,7 @@ A cache-hit counter alone is not proof of transfer. If any check fails, preserve
 - For RDMA, give the container `/dev/infiniband`, `--cap-add IPC_LOCK` and `--ulimit memlock=-1`, and set `UCX_TLS=rc,ud,self,cuda_copy`.
 - On hosts with several NICs per NUMA node, pin each TP rank to the NIC marked `PIX` for its GPU in `nvidia-smi topo -m` by setting `UCX_NET_DEVICES=<nic>:1` in that rank's process before KVCR starts. Otherwise the first peer connection can stall and time out.
 - Dense models with TP>1 keep local reuse but disable remote hints; scale them with TP1 workers.
-- Rank-replicated (MLA-style) models such as DeepSeek-V4 support TP>1. Use the same settings and TP size on every worker. For example, one DeepSeek-V4-Flash TP4 worker adds `--page-size 256 --enable-linker-mla-dedup` and uses:
+- The linker has a rank-replicated TP>1 mode for MLA-style models, but the pinned Dynamo inventory integration currently advertises TP1 only. The following is a historical linker configuration, not a supported router setup for these pins:
 
 ```json
 {"kvcr_service_socket_path": null, "dram_size_gb": 140, "trailing_capacity_divisor": 16, "advertise_host": "<NODE_A_IP>", "control_port": 19500, "nixl_port": 20500, "replicated_source_rank_routing": true, "shard_replicated": true, "operation_timeout_ms": 20000, "abandon_timeout_ms": 60000, "startup_timeout_seconds": 600}
@@ -233,7 +245,7 @@ On the host, collect the session's evidence, then stop only its container:
 
 ```bash
 export QS_EVIDENCE="$(mktemp -d /tmp/kvcr-sgl-linker-evidence.XXXXXX)"
-for log in frontend worker-0 worker-1; do
+for log in state-agent frontend worker-0 worker-1; do
   docker cp "$QS_CID:/tmp/$log.log" "$QS_EVIDENCE/"
 done
 for rank in 0 1 2; do
@@ -250,4 +262,4 @@ The model volume is kept for reuse; remove it with `docker volume rm "$QS_NAME-m
 - **Startup failure:** check worker logs, GPU memory, unique ports and `startup_timeout_seconds`; on multi-NIC hosts, pin NICs per rank.
 - **Cache miss:** check hint advertisement (`advertise_host`, `control_port`), wildcard KV event endpoints, and that the frontend added both workers. `KVCR remote hints disabled` in a worker log means its layout cannot serve peers.
 - **Transfer failure:** failed loads are not recomputed and can stop the worker. Size `dram_size_gb` for the working set and keep generous timeouts. For same-host runs, retain `UCX_TLS=tcp,sm,self,cuda_copy`.
-- **Weight or layout change:** `flush_cache` does not clear KVCR DRAM; restart the workers.
+- **Weight or layout change:** restart the workers with matching configurations.
