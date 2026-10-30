@@ -45,6 +45,7 @@ concurrency:
 
 jobs:
   wheel:
+    name: ${{ github.event_name == 'pull_request' && 'PR wheel check' || 'Nightly' }}
     permissions:
       contents: read
       actions: read

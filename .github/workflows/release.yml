@@ -58,6 +58,7 @@ defaults:
 
 jobs:
   prepare:
+    name: Prepare version
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -143,6 +144,7 @@ jobs:
           echo "KVCR ${label} (stage=${stage}, publish=${publish})"
 
   slack-start:
+    name: Slack start message
     needs: prepare
     if: needs.prepare.outputs.stage == 'true'
     runs-on: ubuntu-24.04
@@ -177,6 +179,7 @@ jobs:
 
   # Releases and manual nightlies that would stage wait for a reviewer; scheduled runs do not, as in Dynamo.
   approve:
+    name: Approval
     needs: prepare
     if: >-
       needs.prepare.outputs.stage == 'true' &&
@@ -197,6 +200,7 @@ jobs:
           [ "${reviewers}" -gt 0 ] || { echo "::error::the manual-release-approval environment has no required reviewers"; exit 1; }
 
   build:
+    name: Build and check wheel
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -301,6 +305,7 @@ jobs:
           overwrite: true
 
   verify:
+    name: Test wheel and licenses
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -375,6 +380,7 @@ jobs:
 
   # Releases stage only after the GPU test passes, unless it was turned off.
   e2e:
+    name: GPU end-to-end test
     needs: prepare
     if: inputs.run_e2e && needs.prepare.outputs.mode == 'release'
     permissions:
@@ -385,6 +391,7 @@ jobs:
 
   # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
   e2e-nightly:
+    name: GPU end-to-end test (non-blocking)
     needs: prepare
     if: inputs.run_e2e && needs.prepare.outputs.mode == 'nightly'
     permissions:
@@ -394,6 +401,7 @@ jobs:
       kvcr_ref: ${{ github.sha }}
 
   stage:
+    name: Stage to Artifactory
     needs: [prepare, approve, build, verify, e2e]
     if: >-
       !cancelled() &&
@@ -473,6 +481,7 @@ jobs:
           echo "staged_wheels=${WHEEL}" >> "${GITHUB_OUTPUT}"
 
   trigger-gitlab:
+    name: Trigger GitLab pipeline
     needs: [prepare, approve, slack-start, stage]
     if: >-
       !cancelled() &&
@@ -560,6 +569,7 @@ jobs:
           echo "Release pipeline triggered for ${VERSION} (${release_type}, DRY_RUN=${DRY_RUN})"
 
   notify-failure:
+    name: Slack failure alert
     needs: [prepare, slack-start, approve, build, verify, e2e, e2e-nightly, stage, trigger-gitlab]
     # Timed-out jobs end as cancelled; ignore cancels only when the whole run was cancelled.
     if: >-
