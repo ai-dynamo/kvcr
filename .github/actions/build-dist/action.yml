@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build the kvcr sdist and wheel
+description: Reproducibly build the sdist and the wheel from it into dist/, stamping nightly versions.
+
+inputs:
+  mode:
+    description: nightly or release
+    required: true
+  version:
+    description: The version to build
+    required: true
+  wheel:
+    description: Expected wheel file name
+    required: true
+  sdist:
+    description: Expected sdist file name
+    required: true
+  check-pypi:
+    description: Fail if PyPI already has this version (release) or a version at or above it (nightly)
+    required: false
+    default: "false"
+  expect-wheel-sha256:
+    description: When set, fail unless the rebuilt wheel has this sha256
+    required: false
+    default: ""
+  expect-sdist-sha256:
+    description: When set, fail unless the rebuilt sdist has this sha256
+    required: false
+    default: ""
+
+outputs:
+  wheel-sha256:
+    description: sha256 of the wheel
+    value: ${{ steps.dist.outputs.wheel_sha256 }}
+  sdist-sha256:
+    description: sha256 of the sdist
+    value: ${{ steps.dist.outputs.sdist_sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        version: "0.12.6"
+        checksum: 8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477
+        enable-cache: false
+    - name: Check the version against PyPI and stamp it
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        VERSION: ${{ inputs.version }}
+        CHECK_PYPI: ${{ inputs.check-pypi }}
+        PACKAGING_VERSION: "26.3"
+      run: |
+        uv run --no-project --python 3.12 --with "packaging==${PACKAGING_VERSION}" python - <<'PY'
+        import json
+        import os
+        import re
+        import tomllib
+        import urllib.request
+        from pathlib import Path
+
+        from packaging.version import Version
+
+        version = Version(os.environ["VERSION"])
+        if os.environ["CHECK_PYPI"] == "true":
+            with urllib.request.urlopen("https://pypi.org/pypi/kvcr/json", timeout=30) as response:
+                released = [Version(v) for v in json.load(response)["releases"]]
+            if os.environ["MODE"] == "release" and version in released:
+                print(f"::error::kvcr {version} is already on PyPI. Bump [project].version and release that.")
+                raise SystemExit(1)
+            blocking = [v for v in released if v >= version]
+            if os.environ["MODE"] == "nightly" and blocking:
+                print(
+                    f"::error::kvcr {version} must sort above every PyPI release, but {max(blocking)} exists. "
+                    f"Bump [project].version on main above {max(blocking).base_version} right after each release. "
+                    "Only one nightly can publish per day."
+                )
+                raise SystemExit(1)
+
+        if os.environ["MODE"] == "nightly":
+            for path, pattern in (
+                ("pyproject.toml", r'(?m)^(version = )"[^"]+"'),
+                ("uv.lock", r'(?m)^(name = "kvcr"\nversion = )"[^"]+"'),
+            ):
+                text, count = re.subn(pattern, rf'\g<1>"{version}"', Path(path).read_text(), count=1)
+                if count != 1:
+                    print(f"::error::could not stamp {path}")
+                    raise SystemExit(1)
+                Path(path).write_text(text)
+        locked = [p["version"] for p in tomllib.loads(Path("uv.lock").read_text())["package"] if p["name"] == "kvcr"]
+        if locked != [str(version)]:
+            print(f"::error::uv.lock pins kvcr {locked}, expected {version}. Run uv lock after bumping the version.")
+            raise SystemExit(1)
+        assert tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"] == str(version)
+        PY
+    - name: Build the sdist and the wheel from it
+      id: dist
+      shell: bash
+      env:
+        WHEEL: ${{ inputs.wheel }}
+        SDIST: ${{ inputs.sdist }}
+        EXPECT_WHEEL: ${{ inputs.expect-wheel-sha256 }}
+        EXPECT_SDIST: ${{ inputs.expect-sdist-sha256 }}
+        HATCHLING_VERSION: "1.32.4"
+      run: |
+        set -euo pipefail
+        printf 'hatchling==%s\n' "${HATCHLING_VERSION}" > "${RUNNER_TEMP}/build-constraints.txt"
+        SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+        export SOURCE_DATE_EPOCH
+        # uv's own Python keeps the zlib, and so the bytes, the same on every runner.
+        uv build --python 3.12 --managed-python --out-dir dist --build-constraint "${RUNNER_TEMP}/build-constraints.txt"
+        for entry in "${WHEEL}=${EXPECT_WHEEL}" "${SDIST}=${EXPECT_SDIST}"; do
+          file="${entry%%=*}"
+          expected="${entry#*=}"
+          test -f "dist/${file}" || { echo "::error::the build did not produce ${file}"; exit 1; }
+          if [ -n "${expected}" ]; then
+            echo "${expected}  dist/${file}" | sha256sum --check \
+              || { echo "::error::the rebuilt ${file} differs from the one the build job checked"; exit 1; }
+          fi
+        done
+        echo "wheel_sha256=$(sha256sum "dist/${WHEEL}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+        echo "sdist_sha256=$(sha256sum "dist/${SDIST}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"

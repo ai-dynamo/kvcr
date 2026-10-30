@@ -100,10 +100,11 @@ def check_wheel(
         f"{dist_info}{name}"
         for name in ("METADATA", "WHEEL", "RECORD", "licenses/LICENSE")
     }
+    optional = {f"{dist_info}entry_points.txt"}
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         for name in names:
-            if name in required:
+            if name in required | optional:
                 continue
             if not name.startswith("kvcr/"):
                 errors.append(f"{name}: unexpected file outside the kvcr package")

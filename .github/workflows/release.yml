@@ -205,84 +205,28 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
-      wheel_sha256: ${{ steps.dist.outputs.wheel_sha256 }}
-      sdist_sha256: ${{ steps.dist.outputs.sdist_sha256 }}
+      wheel_sha256: ${{ steps.dist.outputs.wheel-sha256 }}
+      sdist_sha256: ${{ steps.dist.outputs.sdist-sha256 }}
     env:
       MODE: ${{ needs.prepare.outputs.mode }}
-      STAGE: ${{ needs.prepare.outputs.stage }}
       PUBLISH: ${{ needs.prepare.outputs.publish }}
       VERSION: ${{ needs.prepare.outputs.version }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
       SDIST: ${{ needs.prepare.outputs.sdist }}
-      HATCHLING_VERSION: "1.32.4"
-      PACKAGING_VERSION: "26.3"
       TWINE_VERSION: "7.0.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          version: "0.12.6"
-          checksum: 8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477
-          enable-cache: false
-      - name: Check the version against PyPI and stamp it
-        run: |
-          uv run --no-project --python 3.12 --with "packaging==${PACKAGING_VERSION}" python - <<'PY'
-          import json
-          import os
-          import re
-          import tomllib
-          import urllib.request
-          from pathlib import Path
-
-          from packaging.version import Version
-
-          version = Version(os.environ["VERSION"])
-          if os.environ["STAGE"] == "true":
-              with urllib.request.urlopen("https://pypi.org/pypi/kvcr/json", timeout=30) as response:
-                  released = [Version(v) for v in json.load(response)["releases"]]
-              if os.environ["MODE"] == "release" and version in released:
-                  print(f"::error::kvcr {version} is already on PyPI. Bump [project].version and release that.")
-                  raise SystemExit(1)
-              blocking = [v for v in released if v >= version]
-              if os.environ["MODE"] == "nightly" and blocking:
-                  print(
-                      f"::error::kvcr {version} must sort above every PyPI release, but {max(blocking)} exists. "
-                      f"Bump [project].version on main above {max(blocking).base_version} right after each release. "
-                      "Only one nightly can publish per day."
-                  )
-                  raise SystemExit(1)
-
-          if os.environ["MODE"] == "nightly":
-              for path, pattern in (
-                  ("pyproject.toml", r'(?m)^(version = )"[^"]+"'),
-                  ("uv.lock", r'(?m)^(name = "kvcr"\nversion = )"[^"]+"'),
-              ):
-                  text, count = re.subn(pattern, rf'\g<1>"{version}"', Path(path).read_text(), count=1)
-                  if count != 1:
-                      print(f"::error::could not stamp {path}")
-                      raise SystemExit(1)
-                  Path(path).write_text(text)
-          locked = [p["version"] for p in tomllib.loads(Path("uv.lock").read_text())["package"] if p["name"] == "kvcr"]
-          if locked != [str(version)]:
-              print(f"::error::uv.lock pins kvcr {locked}, expected {version}. Run uv lock after bumping the version.")
-              raise SystemExit(1)
-          assert tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"] == str(version)
-          PY
-      - name: Build the sdist and the wheel from it
+      - name: Build the sdist and the wheel
         id: dist
-        run: |
-          set -euo pipefail
-          printf 'hatchling==%s\n' "${HATCHLING_VERSION}" > "${RUNNER_TEMP}/build-constraints.txt"
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          export SOURCE_DATE_EPOCH
-          uv build --out-dir dist --build-constraint "${RUNNER_TEMP}/build-constraints.txt"
-          for file in "${WHEEL}" "${SDIST}"; do
-            test -f "dist/${file}"
-          done
-          echo "wheel_sha256=$(sha256sum "dist/${WHEEL}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
-          echo "sdist_sha256=$(sha256sum "dist/${SDIST}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+        uses: ./.github/actions/build-dist
+        with:
+          mode: ${{ needs.prepare.outputs.mode }}
+          version: ${{ needs.prepare.outputs.version }}
+          wheel: ${{ needs.prepare.outputs.wheel }}
+          sdist: ${{ needs.prepare.outputs.sdist }}
+          check-pypi: ${{ needs.prepare.outputs.stage }}
       - name: Check the contents, headers, license, and dependencies
         run: |
           set -euo pipefail
@@ -294,15 +238,6 @@ jobs:
           fi
           python3 .github/scripts/wheel_compliance.py wheel "dist/${WHEEL}" --version "${VERSION}" ${strict[@]+"${strict[@]}"}
           python3 .github/scripts/wheel_compliance.py sdist "dist/${SDIST}" --version "${VERSION}"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist
-          path: |
-            dist/${{ needs.prepare.outputs.wheel }}
-            dist/${{ needs.prepare.outputs.sdist }}
-          if-no-files-found: error
-          retention-days: 30
-          overwrite: true
 
   verify:
     name: Test wheel and licenses
@@ -320,15 +255,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Rebuild the checked sdist and wheel
+        uses: ./.github/actions/build-dist
         with:
-          version: "0.12.6"
-          checksum: 8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477
-          enable-cache: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: dist
-          path: dist
+          mode: ${{ needs.prepare.outputs.mode }}
+          version: ${{ needs.prepare.outputs.version }}
+          wheel: ${{ needs.prepare.outputs.wheel }}
+          sdist: ${{ needs.prepare.outputs.sdist }}
+          expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+          expect-sdist-sha256: ${{ needs.build.outputs.sdist_sha256 }}
       - name: Check dependency licenses and test the installed wheel
         run: |
           set -euo pipefail
@@ -341,7 +276,7 @@ jobs:
             python3 .github/scripts/wheel_compliance.py licenses --python "${venv}/bin/python" \
               --inventory "${RUNNER_TEMP}/inventory/py${py}.csv"
             "${venv}/bin/python" -c 'import importlib.metadata as m, os, sys, kvcr; assert m.version("kvcr") == os.environ["VERSION"]; assert kvcr.__file__.startswith(sys.prefix), kvcr.__file__'
-            "${venv}/bin/python" -m kvcr.kvcr_service --help > /dev/null
+            "${venv}/bin/kvcr-service" --help > /dev/null
             uv pip install --python "${venv}/bin/python" "pytest>=8,<9"
             "${venv}/bin/python" -m pytest tests/unit -q -p no:cacheprovider
           done
@@ -414,7 +349,8 @@ jobs:
     runs-on: prod-kvcr-builder-v1
     timeout-minutes: 15
     environment: automated-release
-    permissions: {}
+    permissions:
+      contents: read
     outputs:
       staged_wheels: ${{ steps.stage.outputs.staged_wheels }}
     env:
@@ -425,10 +361,18 @@ jobs:
       WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
       SDIST_SHA256: ${{ needs.build.outputs.sdist_sha256 }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: dist
-          path: dist
+          persist-credentials: false
+      - name: Rebuild the checked sdist and wheel
+        uses: ./.github/actions/build-dist
+        with:
+          mode: ${{ needs.prepare.outputs.mode }}
+          version: ${{ needs.prepare.outputs.version }}
+          wheel: ${{ needs.prepare.outputs.wheel }}
+          sdist: ${{ needs.prepare.outputs.sdist }}
+          expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+          expect-sdist-sha256: ${{ needs.build.outputs.sdist_sha256 }}
       - name: Stage in Artifactory
         id: stage
         env:
