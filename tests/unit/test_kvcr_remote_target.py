@@ -34,6 +34,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.backends.remote_ops import _notification_unserved, _write_done_notif
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
@@ -688,6 +689,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         "op_handle": op_handle,
         "success": True,
         "completed_indices": [],
+        "unserved": {"not_resident": [0]},
     }
 
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
@@ -1674,3 +1676,19 @@ def test_remote_framework_dram_transfers_available_keys(
     assert any(
         "target_transfer_completed" in event and completed in event for event in events
     )
+
+
+def test_write_done_carries_failure_and_unserved_reasons():
+    failed = _decode_notif(_write_done_notif(7, False, reason="deadline"))
+    assert failed["reason"] == "deadline"
+    served = _decode_notif(
+        _write_done_notif(
+            7, True, (1,), unserved={"pin_failed": [0], "x" * 33: [2], "bad": [9]}
+        )
+    )
+    # Unreported, oversized-reason and out-of-range entries fall back.
+    assert _notification_unserved(served, (b"a", b"b", b"c"), {b"a", b"c", b"d"}) == {
+        b"a": "pin_failed",
+        b"c": "unknown",
+        b"d": "remembered_miss",
+    }

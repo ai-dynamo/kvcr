@@ -80,7 +80,12 @@ class _DanglingOps:
                 + (config.abandon_timeout_ms - config.operation_timeout_ms) / 1000
             )
             self._backend._send_write_done(
-                progress, op.remote_agent, op.op_handle, False, terminal=False
+                progress,
+                op.remote_agent,
+                op.op_handle,
+                False,
+                terminal=False,
+                reason=op.abort_reason(status.cancel_requested),
             )
         result = progress.poll_transfer(
             cast(int, op.transfer_id), require_completion=True

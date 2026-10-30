@@ -3,7 +3,7 @@
 """Remote transfer operations and wire-format helpers."""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -117,6 +117,9 @@ class _TargetPullOp(_RemoteOp):
     source_incarnation: str | None = None
     uncertain: bool = False
     retried: bool = False
+    # Why the whole operation failed, or why each unserved key was not written.
+    failure_reason: str | None = None
+    unserved: dict[BlockKey, str] = field(default_factory=dict)
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
@@ -167,6 +170,7 @@ class _TargetPullOp(_RemoteOp):
                         status=_nvtx.Status.TIMEOUT,
                     )
                 self.success = False
+                self.failure_reason = "deadline"
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
@@ -188,6 +192,7 @@ class _TargetPullOp(_RemoteOp):
                         "target.start_write.rejected", _nvtx.Reason.CONTROL_ERROR
                     )
                 self.success = False
+                self.failure_reason = "control_error"
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
@@ -235,6 +240,7 @@ class _TargetPullOp(_RemoteOp):
                             and now >= self.deadline
                         ):
                             reason = _nvtx.Reason.DEADLINE
+            invalid = False
             try:
                 if success:
                     completed_indices = _notification_completed_indices(
@@ -247,12 +253,28 @@ class _TargetPullOp(_RemoteOp):
                     completed_keys = set()
             except TypeError:
                 success = False
+                invalid = True
                 completed_keys = set()
                 if trace is not None:
                     reason = _nvtx.Reason.INVALID_NOTIFICATION
             all_completed = success and completed_keys == self.keys
             self.success = success
             self.completed_keys = completed_keys
+            if success:
+                self.unserved = _notification_unserved(
+                    event, self.ordered_keys, self.keys - completed_keys
+                )
+            elif self.failure_reason is None:
+                source_reason = event.get("reason")
+                self.failure_reason = (
+                    "invalid_notification"
+                    if invalid
+                    else "deadline"
+                    if event.get("success") is True and not cancelled
+                    else source_reason
+                    if _valid_reason(source_reason)
+                    else "remote_failure"
+                )
             if trace is not None:
                 trace.target_result(
                     self,
@@ -315,6 +337,14 @@ class _TargetPullOp(_RemoteOp):
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
+            source_reason = event.get("reason") if cancelled else None
+            self.failure_reason = (
+                source_reason
+                if _valid_reason(source_reason)
+                else "remote_failure"
+                if cancelled
+                else "deadline"
+            )
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
                 trace.cancel_requested("target.cancel_requested", cancelled)
@@ -354,7 +384,6 @@ class _NvtxState:
     target_incarnation: str | None = None
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
     trace_initialized: bool = False
-    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
 
 
 @dataclass
@@ -375,6 +404,10 @@ class _SourceWriteOp(_RemoteOp):
     nvtx_state: _NvtxState | None = None
     # None uses caller cleanup; a tuple (even empty) is owned by progress.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
+    # Reported to the target: why the operation failed, or why requested
+    # indices were left out of completed_indices.
+    failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN
+    unserved: dict[str, list[int]] = field(default_factory=dict)
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -397,19 +430,22 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
-                if trace is not None:
-                    if status.cancel_requested:
-                        failure_reason = _nvtx.Reason.CANCELLED
-                    elif not source_responsive:
-                        failure_reason = _nvtx.Reason.SOURCE_STALLED
-                    elif self.state is _SourceWriteState.NOTIFY_FAILURE:
-                        failure_reason = nvtx_state.failure_reason
-                    else:
-                        failure_reason = _nvtx.Reason.DEADLINE
-                    if failure_reason is _nvtx.Reason.UNKNOWN:
-                        failure_reason = trace.failure_reason
+                if status.cancel_requested:
+                    failure_reason = _nvtx.Reason.CANCELLED
+                elif not source_responsive:
+                    failure_reason = _nvtx.Reason.SOURCE_STALLED
+                elif self.state is _SourceWriteState.NOTIFY_FAILURE:
+                    failure_reason = self.failure_reason
+                else:
+                    failure_reason = _nvtx.Reason.DEADLINE
+                if failure_reason is _nvtx.Reason.UNKNOWN and trace is not None:
+                    failure_reason = trace.failure_reason
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, False
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    False,
+                    reason=_wire_reason(failure_reason),
                 )
                 self.success = False
                 self.state = _SourceWriteState.FINISHED
@@ -431,12 +467,17 @@ class _SourceWriteOp(_RemoteOp):
                 # same handle back for a reused name. The target hears a
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
+                self.failure_reason = _nvtx.Reason.ROUTE_CHANGED
                 if trace is not None:
                     trace.reject("source.write.refused", _nvtx.Reason.ROUTE_CHANGED)
                 return False, True
             if not self.src_descriptors:
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, True
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    True,
+                    unserved=self.unserved,
                 )
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
@@ -460,6 +501,7 @@ class _SourceWriteOp(_RemoteOp):
                         self.op_handle,
                         True,
                         completed_indices=self.completed_indices,
+                        unserved=self.unserved,
                     ),
                     capture_telemetry=backend._telemetry_enabled,
                     trace=trace,
@@ -491,7 +533,11 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 self.success = False
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, False
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    False,
+                    reason=_wire_reason(_nvtx.Reason.CREATE_ERROR),
                 )
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
@@ -533,7 +579,13 @@ class _SourceWriteOp(_RemoteOp):
                 ("source_write",),
             )
         else:
-            backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
+            backend._send_write_done(
+                progress,
+                self.remote_agent,
+                self.op_handle,
+                False,
+                reason=self.abort_reason(status.cancel_requested),
+            )
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
         if logger.isEnabledFor(logging.DEBUG):
@@ -557,6 +609,14 @@ class _SourceWriteOp(_RemoteOp):
             trace.complete_source(self.success, len(self.source_keys))
         return True, True
 
+    def abort_reason(self, cancel_requested: bool) -> str:
+        # A failed transfer also passes through CANCEL_PENDING.
+        if cancel_requested:
+            return "cancelled"
+        if self._backend._kvcr._clock() >= self.deadline:
+            return "deadline"
+        return "transfer_failed"
+
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
         if self.transfer_id is not None:
@@ -569,7 +629,11 @@ class _SourceWriteOp(_RemoteOp):
                 return False
             self.transfer_id = None
         self._backend._send_write_done(
-            progress, self.remote_agent, self.op_handle, False
+            progress,
+            self.remote_agent,
+            self.op_handle,
+            False,
+            reason=_wire_reason(_nvtx.Reason.SHUTDOWN),
         )
         self._backend._dangling_ops.finish_source(self)
         if trace is not None:
@@ -592,7 +656,10 @@ def _write_done_notif(
     completed_indices: tuple[int, ...] = (),
     *,
     terminal: bool = True,
+    reason: str | None = None,
+    unserved: Mapping[str, list[int]] | None = None,
 ) -> bytes:
+    # reason and unserved are diagnostics; older targets ignore unknown fields.
     payload: dict[str, Any] = {
         "type": "write_done",
         "op_handle": op_handle,
@@ -600,9 +667,44 @@ def _write_done_notif(
     }
     if success:
         payload["completed_indices"] = completed_indices
+        if unserved:
+            payload["unserved"] = unserved
+    elif reason is not None:
+        payload["reason"] = reason
     if not terminal:
         payload["terminal"] = False
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)
+
+
+def _wire_reason(reason: _nvtx.Reason) -> str | None:
+    return None if reason is _nvtx.Reason.UNKNOWN else reason.name.lower()
+
+
+def _valid_reason(reason: object) -> bool:
+    # Peer-supplied reasons reach logs and metric labels, so bound them.
+    return type(reason) is str and 0 < len(reason) <= 32
+
+
+def _notification_unserved(
+    payload: Mapping[str, Any],
+    ordered_keys: tuple[BlockKey, ...],
+    missing: Collection[BlockKey],
+) -> dict[BlockKey, str]:
+    """Return why each missing key was not written; malformed input is ignored."""
+    sent = set(ordered_keys)
+    unserved = {key: "unknown" if key in sent else "remembered_miss" for key in missing}
+    reported = payload.get("unserved")
+    if not isinstance(reported, Mapping):
+        return unserved
+    for reason, indices in reported.items():
+        if not _valid_reason(reason) or not isinstance(indices, list):
+            continue
+        for index in indices:
+            if type(index) is int and 0 <= index < len(ordered_keys):
+                key = ordered_keys[index]
+                if key in unserved:
+                    unserved[key] = reason
+    return unserved
 
 
 def _notification_completed_indices(
