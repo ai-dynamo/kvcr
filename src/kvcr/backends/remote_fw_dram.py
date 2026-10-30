@@ -30,7 +30,6 @@ from ..runtime.core import (
     logger,
 )
 from ..runtime.progress import (
-    _FAILED_RESULT,
     _SUCCESS_RESULT,
     _KVCRProgress,
     _OpId,
@@ -40,6 +39,8 @@ from ..runtime.progress import (
 from ..types import (
     BlockKey,
     CacheTier,
+    OpEntryResult,
+    OpEntryStatus,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -224,7 +225,8 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
-    ) -> bool:
+    ) -> str | None:
+        """Start the pull, or return why it cannot start."""
         kvcr = self._kvcr
         started_at = kvcr._timer()
         scope = "remote_fetch" if local_fill else "remote_deliver"
@@ -237,11 +239,11 @@ class _RemoteFWDram:
             kvcr._record_duration(
                 scope, started_at, "failed" if current_hint.failed else "miss"
             )
-            return False
+            return "hint_failed" if current_hint.failed else "remembered_miss"
 
         if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
-            return False
+            return "hint_unavailable"
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
@@ -302,7 +304,7 @@ class _RemoteFWDram:
             raise
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
-        return True
+        return None
 
     def deliver(
         self,
@@ -316,20 +318,21 @@ class _RemoteFWDram:
         if not blocks:
             kvcr._complete(op_handle, {})
             return
-        if self._start_target_pull(
+        reason = self._start_target_pull(
             blocks,
             request_id,
             deadline,
             op_handle,
             local_fill=False,
-        ):
+        )
+        if reason is None:
             return
         trace = kvcr._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.reject("target.hint_unavailable", _nvtx.Reason.HINT_UNAVAILABLE)
         kvcr._complete(
             op_handle,
-            dict.fromkeys(blocks, _FAILED_RESULT),
+            dict.fromkeys(blocks, OpEntryResult(OpEntryStatus.FAILED, reason=reason)),
         )
 
     def fetch(
@@ -340,12 +343,15 @@ class _RemoteFWDram:
         *,
         op_handle: OpHandle,
     ) -> bool:
-        return self._start_target_pull(
-            blocks,
-            request_id,
-            deadline,
-            op_handle,
-            local_fill=True,
+        return (
+            self._start_target_pull(
+                blocks,
+                request_id,
+                deadline,
+                op_handle,
+                local_fill=True,
+            )
+            is None
         )
 
     def poll_main(self, items: Collection[object]) -> None:
@@ -459,7 +465,12 @@ class _RemoteFWDram:
             kvcr._complete(
                 cast(OpHandle, op.op_id[1]),
                 {
-                    key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
+                    key: _SUCCESS_RESULT
+                    if key in completed_keys
+                    else OpEntryResult(
+                        OpEntryStatus.FAILED,
+                        reason=op.unserved.get(key) or op.failure_reason,
+                    )
                     for key in op.keys
                 },
             )

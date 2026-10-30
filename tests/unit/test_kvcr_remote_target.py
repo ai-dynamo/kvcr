@@ -702,9 +702,9 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     }
 
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
-    assert _poll_until(target, lambda completed: bool(completed)) == [
-        (op_handle, _op_entries({key: False}))
-    ]
+    completed = _poll_until(target, lambda completed: bool(completed))
+    assert completed == [(op_handle, _op_entries({key: False}))]
+    assert completed[0][1][key].reason == "not_resident"
     assert target.query((key, other_group), "req") == [
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -1444,7 +1444,9 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
 
     op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
 
-    assert list(kvcr.poll_completed()) == [(op_handle, _op_entries({key: False}))]
+    completed = list(kvcr.poll_completed())
+    assert completed == [(op_handle, _op_entries({key: False}))]
+    assert completed[0][1][key].reason == "hint_unavailable"
     assert control.sent == []
 
     # A rejected remote attempt must not hide a later local deposit.
