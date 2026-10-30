@@ -15,7 +15,7 @@ For the HiCache storage route, use the [SGLang HiCache quick start](quick-start-
 ## Prerequisites
 
 - A Linux x86-64 host with two available NVIDIA B200 GPUs compatible with the pinned SGLang/CUDA 13 image. Other GPU configurations have not been validated with these instructions.
-- NVIDIA driver 580.95.05 or newer for the pinned CUDA 13 runtime.
+- NVIDIA driver 580.126.20 or newer for the pinned CUDA 13 runtime.
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), Git, and public access to Docker Hub, GitHub, PyPI, `pypi.nvidia.com`, `flashinfer.ai`, crates.io and Hugging Face. These public indexes need no login.
 - Allow 64 GiB host RAM and 250 GiB disk for this build and model cache.
 
