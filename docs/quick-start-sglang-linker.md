@@ -19,7 +19,7 @@ For the HiCache storage route, use the [SGLang HiCache quick start](quick-start-
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), Git, and public access to Docker Hub, GitHub, PyPI, `pypi.nvidia.com`, `flashinfer.ai`, crates.io and Hugging Face. These public indexes need no login.
 - Allow at least 128 GiB host RAM and 250 GiB disk for the build and BF16 model cache.
 
-This example uses two independent TP1 workers on one host, Qwen3-32B BF16, 64-token pages, and the Python radix tree. Each worker has a 4 GiB in-process KVCR DRAM pool. The same-host transport is UCX TCP/shared memory with CUDA-copy support, not an RDMA performance test. The pinned integration was tested across two B200 nodes; this exact same-host recipe has not yet been validated end to end.
+This example uses two independent TP1 workers on one host, Qwen3-32B BF16, 64-token pages, and the Python radix tree. Each worker has a 4 GiB in-process KVCR DRAM pool. The same-host transport is UCX TCP/shared memory with CUDA-copy support, not an RDMA performance test. An earlier Dynamo revision was tested across two B200 nodes; this revision and the exact same-host recipe have not yet been validated end to end.
 
 ## 1. Build the integration image
 
@@ -42,7 +42,7 @@ Keep these revisions together:
 | Component | Revision |
 | --- | --- |
 | SGLang direct linker [#45650](https://github.com/sgl-project/sglang/pull/45650) (includes [#45646](https://github.com/sgl-project/sglang/pull/45646) and [#45648](https://github.com/sgl-project/sglang/pull/45648)) | `5b65e088969b872b924355d20a329e9816a1b094` |
-| Dynamo linker inventory [#17655](https://github.com/ai-dynamo/dynamo/pull/17655) | `874861a7fdce464a4c28a880886897309172aacd` |
+| Dynamo linker inventory [#17655](https://github.com/ai-dynamo/dynamo/pull/17655) | `fe81cfdccedc23b4eabef3a250b538ff11ba102c` |
 
 These are draft public PR heads, not released packages. KVCR is installed from the checkout used as the build context, including any local changes. The linker and HiCache SGLang branches do not contain each other. Continue only if the final import/version checks pass. Packages are recorded in `/opt/sglang-installed-packages.txt`.
 

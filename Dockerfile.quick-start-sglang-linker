@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libprotobuf-dev libssl-dev libudev-dev \
     pkg-config protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
-ARG SGLANG_DYNAMO_REF=874861a7fdce464a4c28a880886897309172aacd
+ARG SGLANG_DYNAMO_REF=fe81cfdccedc23b4eabef3a250b538ff11ba102c
 RUN git init /src/dynamo \
  && git -C /src/dynamo remote add origin https://github.com/ai-dynamo/dynamo.git \
  && git -C /src/dynamo fetch --depth 1 origin "${SGLANG_DYNAMO_REF}" \
@@ -91,7 +91,7 @@ import kvcr
 import torch
 from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
 from dynamo.llm import WorkerType
-from dynamo.sglang.kv_hints import is_single_rank_linker
+from dynamo.sglang.kv_hints import is_supported_kvcr_linker_topology
 from dynamo.sglang.state_agent import state_agent_descriptors
 from kvcr import ZmqPeerControlChannel
 from kvcr.hints.fetch import KV_FETCH
@@ -106,7 +106,7 @@ for line in Path('/opt/sglang-constraints.txt').read_text().splitlines():
     print(f'{name}=={actual}')
 assert torch.version.cuda == '13.0'
 assert KV_HINT_TRANSFER_CAPABILITY_KEY == 'router_hint'
-assert callable(is_single_rank_linker) and callable(state_agent_descriptors)
+assert callable(is_supported_kvcr_linker_topology) and callable(state_agent_descriptors)
 assert callable(ZmqPeerControlChannel)
 assert KVCRDirectLinker.local_storage_ownership == 'kvcr'
 hint = decode_kv_hints_envelope({
