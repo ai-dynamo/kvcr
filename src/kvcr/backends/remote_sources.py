@@ -98,6 +98,9 @@ class _RemoteSources:
                     self._kvcr._record_access(
                         self._kvcr._local_dram_sources_by_op.get(item.op_id, ())
                     )
+                if item.op_id in self._kvcr._move_handler._source_transfers:
+                    # Invalidate before release would score these copies for eviction.
+                    self._kvcr._move_handler.source_finished(item)
                 self._kvcr._release_local_dram_sources(item.op_id)
             if pins is not None:
                 self._release_framework_pins(pins)
@@ -382,9 +385,16 @@ class _RemoteSources:
 
     def start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
+        # Decide admission once; retries retain the original request positions.
+        pending = kvcr._invalidation_handler._pending
+        if pending:
+            op.keys = op.keys.difference(pending)
         kvcr._add_block_dependencies(op, new_operation=True)
         self._source_pin_ops[op.op_id] = op
-        self._resume_source_pin(op.op_id, op)
+        if op.ordered_keys and not op.keys:
+            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+        else:
+            self._resume_source_pin(op.op_id, op)
 
     def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         if self._source_pin_ops.get(op_id) is not op:

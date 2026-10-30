@@ -21,6 +21,7 @@ from _kvcr_test_utils import (
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _invalidate,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
@@ -238,6 +239,102 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
     finally:
         agent.state = "DONE"
         source.close()
+
+
+@pytest.mark.parametrize("ready_source", [False, True])
+def test_source_invalidation_preserves_admitted_reads(ready_source, request):
+    primary = ctypes.create_string_buffer(b"a" * 16, 16)
+    local = ctypes.create_string_buffer(16)
+    agent, pinning, control = (
+        FakeNixlAgent(),
+        PendingPrimaryPinning(),
+        FakeBytesControl(),
+    )
+    request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), 16)]),
+    )
+    core = source._core
+    key, other = BlockKey(b"removing"), BlockKey(b"other")
+    if ready_source:
+        agent.state = "DONE"
+        deposit = source.deposit({key: [_mem_descriptor(end_point_name="source")]})
+        assert dict(_poll_until(source, bool))[deposit][key].success
+        agent.state = "PROC"
+
+    control.incoming.append(_start_write_message(1, key))
+    if ready_source:
+        _wait_until(lambda: len(agent.xfers) == 2)
+        assert core._block_record_map[key].local_dram.source_readers == 1
+    else:
+        # This read is admitted before it has any local source claim.
+        _poll_until(source, lambda _: pinning.searches == [(key,)])
+        deposit = source.deposit({key: [_mem_descriptor(end_point_name="source")]})
+        _wait_until(lambda: len(agent.xfers) == 1)
+        assert not core._local_dram_sources_by_op
+    _invalidate(source, (key,))
+    assert core._block_record_map[key].pending_invalidation
+
+    control.incoming.append(_start_write_message(2, key))
+    mixed = msgspec.msgpack.decode(_start_write_message(3, key))
+    mixed.update(
+        keys=[key, other],
+        dst_descriptors=[[_TransferRef("target", index)] for index in range(2)],
+    )
+    control.incoming.append(msgspec.msgpack.encode(mixed))
+    expected_searches = [] if ready_source else [(key,)]
+    expected_searches.append((other,))
+    _poll_until(
+        source,
+        lambda _: pinning.searches == expected_searches and bool(agent.sent_notifs),
+    )
+    assert [_decode_notif(payload) for _, payload in agent.sent_notifs] == [
+        {"type": "write_done", "op_handle": 2, "success": False}
+    ]
+    # The rejected key neither joins its older pin request nor asks for a new pin.
+    assert pinning.searches == expected_searches
+    pinning.complete(len(expected_searches) - 1, "pin-other")
+    agent.state = "DONE"
+    completed = dict(
+        _poll_until(
+            source,
+            lambda completed: (
+                (ready_source or any(handle == deposit for handle, _ in completed))
+                and any(
+                    xfer[5] and _decode_notif(xfer[5])["op_handle"] == 3
+                    for xfer in agent.xfers
+                )
+            ),
+        )
+    )
+    if not ready_source:
+        assert completed[deposit][key].success
+        assert core._block_record_map[key].pending_invalidation
+        # A missing framework result resumes the older read against G2, even
+        # though it acquires its first local source claim after invalidation.
+        pinning.complete(0, "pin-missing", missing_indices=(0,))
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+
+    notifications = {
+        _decode_notif(xfer[5])["op_handle"]: _decode_notif(xfer[5])
+        for xfer in agent.xfers
+        if xfer[5]
+    }
+    assert notifications[1]["success"]
+    assert notifications[1]["completed_indices"] == [0]
+    assert notifications[3]["success"]
+    assert notifications[3]["completed_indices"] == [1]
+    assert len(agent.xfers) == 3  # Deposit, earlier read, admitted mixed-key entry.
+    assert not core._invalidation_handler.has_pending()
+    assert key not in core._block_record_map
+    assert not core._local_dram_sources_by_op
+    assert not core._remote_fw_dram._sources._source_pin_ops
+    assert not core._remote_fw_dram._dangling_ops.source_writes
 
 
 @pytest.mark.parametrize(

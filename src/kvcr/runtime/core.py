@@ -31,6 +31,7 @@ from ..config import (
     _validate_pool_layouts,
 )
 from ..hints.dispatcher import HintDispatcher
+from ..moves import _MoveHandler
 from ..policy import G3LRUPolicy, LRUPolicy
 from ..types import (
     BlockKey,
@@ -139,6 +140,8 @@ class _BlockRecord(msgspec.Struct, gc=False):
     access_count: int = 0
     last_access: float | None = None
     position: int = -1
+    # Close G2 to new reads; retain the record until existing users drain.
+    pending_invalidation: bool = False
 
     def add_in_flight_op(self, op_id: _OpId) -> None:
         if self.in_flight_ops is None:
@@ -288,7 +291,9 @@ class _KVCRCore:
         # Import lazily to keep the concrete backend private to KVCR setup.
         from ..backends.dangling_ops import _log_resilience_event
         from ..backends.remote_fw_dram import _RemoteFWDram
+        from ..invalidation import _InvalidationHandler
 
+        self._invalidation_handler = _InvalidationHandler(self)
         self._on_resilience_event_callback = (
             _log_resilience_event
             if bindings.on_resilience_event is None
@@ -318,6 +323,7 @@ class _KVCRCore:
         )
         self._nvtx = self._remote_fw_dram._nvtx
         self._nvtx_operations = {}
+        self._move_handler = _MoveHandler(self)
         self._g3 = (
             _G3(
                 self,
@@ -429,12 +435,14 @@ class _KVCRCore:
     def discard_hint(self, request_id: str) -> None:
         self._remote_delivery_keys.pop(request_id, None)
         self._remote_fw_dram.discard_hint(request_id)
+        self._move_handler.discard_hint(request_id)
 
     def _has_complete_local(self, key: BlockKey) -> bool:
         record = self._block_record_map.get(key)
         residency = record.local_dram if record is not None else None
         return (
             residency is not None
+            and not record.pending_invalidation
             and residency.state is _LocalDramState.READY
             and not residency.pending_labels
             and len(residency.slots) == len(residency.key_layout)
@@ -456,6 +464,9 @@ class _KVCRCore:
         remote_keys = self._remote_delivery_keys.get(request_id, ())
         for key in keys:
             record = self._block_record_map.get(key)
+            if record is not None and record.pending_invalidation:
+                statuses.append((QueryStatus.MISS, None))
+                continue
             residency = record.local_dram if record is not None else None
             if key in remote_keys:
                 fetching_locally = (
@@ -582,9 +593,13 @@ class _KVCRCore:
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                rejected: dict[BlockKey, OpEntryResult] = {}
                 remote_keys = self._remote_delivery_keys.get(request_id, ())
                 for key, destination in normalized.items():
-                    if key in remote_keys and (
+                    record = self._block_record_map.get(key)
+                    if record is not None and record.pending_invalidation:
+                        rejected[key] = _FAILED_RESULT
+                    elif key in remote_keys and (
                         not self._has_complete_local(key)
                         or self._remote_fw_dram.query(key, request_id)
                     ):
@@ -603,8 +618,13 @@ class _KVCRCore:
                         remote_blocks=len(remote_blocks),
                         g3_blocks=len(g3_blocks),
                     )
-                if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
+                if (
+                    sum(map(bool, (local_blocks, g3_blocks, remote_blocks, rejected)))
+                    > 1
+                ):
                     self._joined_completions[op_handle] = (set(blocks), {})
+                if rejected:
+                    self._complete(op_handle, rejected)
                 if local_dram is not None and local_blocks:
                     local_dram.deliver(op_handle, local_blocks, deadline=deadline)
                 if g3_blocks and (
@@ -694,12 +714,23 @@ class _KVCRCore:
                 )
         return op_handle
 
+    def move(
+        self,
+        keys: Collection[BlockKey],
+        request_id: str | None = None,
+        expected_layout: list[str] | None = None,
+        hints: object | None = None,
+    ) -> OpHandle:
+        return self.fetch(keys, request_id, expected_layout, hints, move=True)
+
     def fetch(
         self,
         keys: Collection[BlockKey],
         request_id: str | None = None,
         expected_layout: list[str] | None = None,
         hints: object | None = None,
+        *,
+        move: bool = False,
     ) -> OpHandle:
         declaration = self._validate_expected_layout(
             [""] if expected_layout is None else expected_layout
@@ -737,7 +768,24 @@ class _KVCRCore:
                     key, request_id
                 ):
                     sources[key] = CacheTier.REMOTE_G2
+            # Register move intent before fetch can complete on a local hit.
             deadline = self._operation_deadline()
+            if move or (
+                request_id is not None and request_id in self._move_handler._request_ids
+            ):
+                # Even cached keys need source advice for an explicit move.
+                if not self._move_handler.begin(
+                    op_handle,
+                    ordered_keys,
+                    request_id,
+                    declaration,
+                    force=move,
+                ):
+                    self._complete(
+                        op_handle,
+                        dict.fromkeys(ordered_keys, _FAILED_RESULT),
+                    )
+                    return op_handle
             destinations = local_dram.fetch(
                 op_handle,
                 ordered_keys,
@@ -758,6 +806,7 @@ class _KVCRCore:
                     },
                     request_id,
                     deadline,
+                    owner_handle=op_handle,
                 )
         return op_handle
 
@@ -780,6 +829,8 @@ class _KVCRCore:
                 if self._local_dram is not None:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
+                if self._invalidation_handler._dirty:
+                    self._invalidation_handler.drain()
         completed = self._completion_queue
         self._completion_queue = []
         if self._nvtx_operations:
@@ -898,6 +949,9 @@ class _KVCRCore:
                     )
 
         run(self._close_hint_handlers)
+        # Native work has stopped; discard pending intent without waiting for peers.
+        run(self._move_handler.close)
+        run(self._invalidation_handler.close)
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:
@@ -1050,6 +1104,8 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         deadline: float,
+        *,
+        owner_handle: OpHandle | None = None,
     ) -> None:
         if not blocks:
             return
@@ -1062,9 +1118,14 @@ class _KVCRCore:
                 deadline,
             )
         elif source is CacheTier.REMOTE_G2:
-            started = self._remote_fw_dram.fetch(
-                blocks, request_id, deadline, op_handle=fill_handle
-            )
+            if owner_handle in self._move_handler._pending:
+                started = self._move_handler.start_fill(
+                    owner_handle, fill_handle, blocks, request_id, deadline
+                )
+            else:
+                started = self._remote_fw_dram.fetch(
+                    blocks, request_id, deadline, op_handle=fill_handle
+                )
         else:
             raise ValueError(f"unsupported local fill source {source.value}")
         if not started:
@@ -1082,6 +1143,7 @@ class _KVCRCore:
             claimed = self._local_dram._pools.acquire_sources(
                 tuple(key for key in keys if key not in sources),
                 allow_filling=allow_filling,
+                op_id=op_id,
             )
             if claimed:
                 sources.update(claimed)
@@ -1181,12 +1243,19 @@ class _KVCRCore:
         sources = self._local_dram_sources_by_op.get(op_id)
         if not sources:
             return
-        released = set(sources) if keys is None else set(keys) & sources.keys()
+        released = (
+            sources
+            if keys is None
+            else {key: sources[key] for key in keys if key in sources}
+        )
         if self._local_dram is None:
             raise RuntimeError("controller source exists without local DRAM")
         self._local_dram._pools.release_sources(released)
-        for key in released:
-            sources.pop(key)
+        if released is sources:
+            sources.clear()
+        else:
+            for key in released:
+                sources.pop(key)
         if not sources:
             self._local_dram_sources_by_op.pop(op_id)
 
@@ -1217,6 +1286,7 @@ class _KVCRCore:
         record = self._block_record_map.get(key)
         return (
             record is not None
+            and not record.pending_invalidation
             and record.local_dram is not None
             and record.local_dram.state is not _LocalDramState.DISCARDING
         )
@@ -1270,12 +1340,15 @@ class _KVCRCore:
 
     def _prune_block_record(self, key: BlockKey) -> None:
         record = self._block_record_map.get(key)
+        if record is not None and record.pending_invalidation:
+            self._invalidation_handler.notify(key)
         if (
             record is not None
             and record.fw_mem is None
             and record.local_dram is None
             and record.g3 is None
             and not record.in_flight_ops
+            and not record.pending_invalidation
         ):
             self._block_record_map.pop(key)
 
@@ -1292,6 +1365,9 @@ class _KVCRCore:
                 return
             self._joined_completions.pop(op_handle)
             entries = completed
+        if op_handle in self._move_handler._pending:
+            self._move_handler.complete(op_handle, entries)
+            return
         trace = self._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.completed(entries)

@@ -61,6 +61,30 @@ def test_parse_hints_accepts_struct():
     assert hints[0].block_hashes == frozenset({123, 456})
 
 
+@pytest.mark.parametrize("mode", [None, "copy", "move"])
+def test_fetch_hint_parses_optional_copy_or_move_mode(mode):
+    action = _fetch_hint("a", "tcp://source:1", (1, 2))
+    if mode is not None:
+        action.payload["mode"] = mode
+    hints, rejected = parse_hints(_HintEnvelope("0.1", "m", [action]), _types())
+
+    assert not rejected
+    assert hints == [
+        _KVFetchHint("a", "tcp://source:1", frozenset({1, 2}), move=mode == "move")
+    ]
+
+
+@pytest.mark.parametrize("mode", [None, True, 1, "", "MOVE", "delete", [], {}])
+def test_fetch_hint_rejects_invalid_mode(mode):
+    action = _fetch_hint("a", "tcp://source:1", (1,), mode=mode)
+    hints, rejected = parse_hints(_HintEnvelope("0.1", "m", [action]), _types())
+
+    assert not hints
+    assert [(r.status, r.reason) for r in rejected] == [
+        (HintStatus.REJECTED, "kv.fetch mode must be copy or move")
+    ]
+
+
 def test_parse_hints_rejects_invalid_actions_and_payloads():
     hint = _HintEnvelope(
         "0.1",
@@ -178,11 +202,6 @@ def test_parser_exception_rejects_only_its_hint() -> None:
         {"source_control_endpoint": "tcp://source:1", "block_hashes": [True]},
         {"source_control_endpoint": "tcp://source:1", "block_hashes": [-1]},
         {"source_control_endpoint": "tcp://source:1", "block_hashes": [1 << 64]},
-        {
-            "source_control_endpoint": "tcp://source:1",
-            "block_hashes": [1],
-            "mode": "move",
-        },
         {
             "source_control_endpoint": "tcp://source:1",
             "block_hashes": [1],

@@ -34,9 +34,12 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     op_handle: OpHandle
     remaining_timeout_ms: float
     keys: tuple[BlockKey, ...]
+    # Per-key destination memory pieces. Empty entries in a move identify
+    # complete target copies; completion indices cover only actual writes.
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     key_layout: tuple[str, ...] = ()
     source_incarnation: str | None = None
+    move_keys: tuple[BlockKey, ...] = ()
 
 
 class _TargetMetadata(_PeerMessage, tag="target_metadata"):
@@ -170,18 +173,18 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
-            sent = backend._send_control(
-                progress,
-                self.remote_ctrl_ep,
-                _StartWrite(
-                    op_handle=self.op_id[1],
-                    remaining_timeout_ms=(self.deadline - now) * 1000,
-                    source_incarnation=self.source_incarnation,
-                    keys=self.ordered_keys,
-                    dst_descriptors=self.dst_descriptors,
-                    key_layout=self.key_layout if self.local_fill else (),
-                ),
+            request = _StartWrite(
+                op_handle=self.op_id[1],
+                remaining_timeout_ms=(self.deadline - now) * 1000,
+                source_incarnation=self.source_incarnation,
+                keys=self.ordered_keys,
+                dst_descriptors=self.dst_descriptors,
+                key_layout=self.key_layout if self.local_fill else (),
             )
+            moves = backend._kvcr._move_handler
+            if self.op_id[1] in moves._target_transfers:
+                request = moves.transfer_request(request)
+            sent = backend._send_control(progress, self.remote_ctrl_ep, request)
             if not sent:
                 if trace is not None:
                     trace.reject(

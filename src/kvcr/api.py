@@ -185,8 +185,30 @@ class KVCR:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        """Asynchronously fetch blocks into KVCR-managed storage."""
+        """Asynchronously copy blocks into KVCR-managed storage by default.
+
+        kv.fetch mode="move" also requests source removal for matching keys.
+        Completion reports destination readiness without waiting for removal.
+        """
         return self._core.fetch(keys, request_id, expected_layout, hints)
+
+    def move(
+        self,
+        keys: Collection[BlockKey],
+        request_id: str | None = None,
+        expected_layout: list[str] | None = None,
+        hints: object | None = None,
+    ) -> OpHandle:
+        """Fetch complete copies and request asynchronous source G2 removal.
+
+        Every key, including cache hits, must match the request's kv.fetch source
+        advice. Results and release handles follow fetch; source removal is best
+        effort, asynchronous, and unreported. It waits for admitted operations,
+        then preserves any no_evict guarantee granted by an earlier deposit.
+        Pending removal rejects new reads and deposits for those keys.
+        G3 and framework memory stay intact.
+        """
+        return self._core.move(keys, request_id, expected_layout, hints)
 
     def release(
         self,

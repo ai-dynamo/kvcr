@@ -161,6 +161,7 @@ kvcr = KVCR(
 kvcr.deposit(blocks, no_evict=False, hints=None, callback=None, *, expected_layout=None)  # blocks: dict[BlockKey, list[MemoryRef]]; completion includes per-key status and, with no_evict, a release handle
 kvcr.query(block_key_list, request_id=None) -> list[tuple[Status, CacheTier | None]] # HIT/MISS/FETCHING/FETCHABLE with known location
 kvcr.fetch(block_key_list, request_id=None, expected_layout=None, hints=None, callback=None) -> OperationHandle # completion includes per-key status, locations, and a release handle
+kvcr.move(block_key_list, request_id=None, expected_layout=None, hints=None) -> OperationHandle # copy succeeds and source handles local invalidation
 kvcr.deliver(destinations, request_id=None, callback=None) -> OperationHandle # destinations: dict[BlockKey, list[MemoryRef]]
 kvcr.release(release_handle_list) -> list[Result[None, Error]]      # release fetch/no-evict claims
 kvcr.align_sequence(ordered_keys: list[BlockKey], use_current_time=False) -> None
@@ -247,11 +248,11 @@ kvcr.discard_hint(request_id) # request is over or its hints should be discarded
 
 ### Inventory and block identity
 
-The router maintains an eventually-consistent global prefix inventory for cache-aware request routing. The router is the routing-key authority and supplies the request's content-derived `BlockKey` values. A `BlockKey` identifies one cacheable KV unit, while a `BlockKeyList` is an ordered exact request path rather than an implicit prefix expansion. The framework normally passes these keys unchanged to the KVCR; an integration with distinct local hashes translates them at its boundary. The key space may be namespaced by model version, quantization, KV layout, tenant, or hash algorithm, and the KVCR treats each full key as opaque.
+The router maintains an eventually-consistent global prefix inventory for cache-aware request routing. Its advertised hashes may differ from the full keys used by the engine's cache. The framework supplies exact `BlockKey` values to KVCR, including any representation-specific identity such as a cache-group ID. A `BlockKey` identifies one cacheable KV unit, while a `BlockKeyList` is an ordered exact request path rather than an implicit prefix expansion. The key space may be namespaced by model version, quantization, KV layout, tenant, or hash algorithm, and KVCR treats each full key as opaque.
 
 Framework-owned memory is reported through the framework's existing router event path. If needed, `tier_enter`/`tier_exit` reporting or `inventory_snapshot()` can be added to the KVCR API later.
 
-KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
+KVCR-owned inventory events use the same full `BlockKey` values as fetch. Request-scoped hints instead carry hashes interpreted by the configured key adapter. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
 
 ### Request-scoped hints
 
@@ -262,6 +263,20 @@ KVCR-to-KVCR movement is destination-initiated. A router hint gives the destinat
 `submit_hint` may establish the peer connection, but does not start data movement or remote pinning yet. Each hint in an envelope is parsed and handled independently; proactive fetching, staging, or pinning may be added later as new hint types. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole `BlockKeyList` from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
 
 The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
+
+In the current implementation, `kv.fetch` requires a source control endpoint and carries advertised block hashes. The framework supplies complete `BlockKey` values with the same request ID; the key adapter matches those keys against the hint hashes. There is no hash-to-key index for autonomous operations on unrelated hashes, and `no_retain` and source-less hints are not implemented.
+
+`mode="copy"` is the default. `mode="move"` requests the G2 source removal described below. `discard_hint` clears advice without cancelling already-started operations; `deliver` remains a copy into framework-owned buffers, including under move advice.
+
+### Move and source invalidation
+
+Move follows fetch's destination-initiated direction and uses the same source advice. The move handler carries source-removal intent with the existing fetch machinery. New transfers use ordinary fetch's native completion notification; the source starts invalidation independently after successful copy cleanup. There is no separate post-copy invalidation RPC.
+
+A destination reuses complete copies it already holds, while still asking the source to invalidate its copies. Cached keys and new transfers share the initial request, transferring only missing data. Cached keys need no source reply. For a partly cached key, move waits for any unfinished local pieces before requesting the remaining pieces, so successful transfer permits removal of the whole source key. A move joining an already-sent copy waits for that copy before queuing its source command. Results contain ordinary fetch release handles protecting the destination copies.
+
+Move completion reports destination readiness without waiting for source cleanup, invalidation checks, or removal. Source removal is best effort and has no per-result outcome; a failed command can leave the source copy intact. Once internal invalidation is accepted, the G2 copy stops accepting new reads; existing readers and transfers finish before its memory is reclaimed. G3 and framework-owned copies are unchanged.
+
+Invalidation waits for previously admitted operations to finish. Existing `deposit(no_evict=True)` guarantees prevent removal; if an earlier deposit grants that guarantee while invalidation is pending, removal is skipped after prior operations drain. New reads and deposits fail for pending keys; fresh deposits are allowed after removal finishes. This does not change the successful destination copy result.
 
 ### Peer control and liveness
 
@@ -311,7 +326,7 @@ At initialization, an integration selects one built-in policy or supplies an ext
 
 Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
-Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. If it conflicts with a framework `no_evict` claim, `no_evict` wins until the framework calls `release` with the returned handle; policy may then honor or override `no_retain`.
+Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims prevent eviction while held. Move uses the source invalidation rules above rather than a policy eviction decision. `no_retain` is not currently supported.
 
 The policy methods are invoked as follows:
 

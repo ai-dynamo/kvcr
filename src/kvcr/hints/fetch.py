@@ -33,18 +33,19 @@ class _KVFetchHint(msgspec.Struct, frozen=True):
     action_id: str | None
     source_endpoint: str
     block_hashes: frozenset[int]
+    move: bool = False
 
 
 def _parse_kv_fetch(
-    action_id: str | None, payload: Mapping[str, object]
+    action_id: str | None,
+    payload: Mapping[str, object],
 ) -> _KVFetchHint:
-    # TODO: Add mode and no_retain when KVCR starts consuming them.
     if "no_retain" in payload:
         raise ValueError("no_retain is not currently supported")
 
     mode = payload.get("mode", "copy")
-    if mode != "copy":
-        raise ValueError("only copy mode is currently supported")
+    if mode not in ("copy", "move"):
+        raise ValueError("kv.fetch mode must be copy or move")
 
     source = payload.get("source_control_endpoint")
     if source is None:
@@ -66,12 +67,11 @@ def _parse_kv_fetch(
     if not hashes:
         raise ValueError("invalid router hint")
 
-    # Add other fields to the parsed result when KVCR starts consuming them.
-    return _KVFetchHint(action_id, source, frozenset(hashes))
+    return _KVFetchHint(action_id, source, frozenset(hashes), move=mode == "move")
 
 
 class _FetchHintHandler:
-    """Engine-destination ``kv.fetch``: stores the per-request remote hint."""
+    """Store source advice and copy/move intent for the shared fetch path."""
 
     action_type = _KVFetchHint.ACTION_TYPE
 
@@ -91,6 +91,7 @@ class _FetchHintHandler:
         self._core._remote_fw_dram.submit_hint(
             hint.source_endpoint, hint.block_hashes, request_id
         )
+        self._core._move_handler.record_hint(request_id, move=hint.move)
         self._dispatcher.report(
             HintResult(
                 action_id=hint.action_id,
