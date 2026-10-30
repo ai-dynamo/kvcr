@@ -499,11 +499,18 @@ def _write_done_notification(
     return b"KVCR:" + msgspec.msgpack.encode(payload)
 
 
+class _AnyFailure:
+    """Matches any non-success status; tests that care assert the status."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, OpEntryStatus) and other is not OpEntryStatus.SUCCESS
+
+
 def _op_entries(
     entries: Mapping[BlockKey, bool],
 ) -> dict[BlockKey, OpEntryResult]:
     return {
-        key: OpEntryResult(OpEntryStatus.SUCCESS if success else OpEntryStatus.FAILED)
+        key: OpEntryResult(OpEntryStatus.SUCCESS if success else _AnyFailure())  # type: ignore[arg-type]
         for key, success in entries.items()
     }
 

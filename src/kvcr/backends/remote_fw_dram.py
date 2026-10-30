@@ -40,6 +40,8 @@ from ..runtime.progress import (
 from ..types import (
     BlockKey,
     CacheTier,
+    OpEntryResult,
+    OpEntryStatus,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -65,6 +67,32 @@ from .remote_sources import _RemoteSources, _SourcePinOp
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
+
+
+# Wire, log and metric reasons stay finer; callers get the status. Unlisted
+# reasons, including unknown peer-sent ones, are FAILED.
+_STATUS_BY_REASON = {
+    "not_resident": OpEntryStatus.SRC_MISS,
+    "remembered_miss": OpEntryStatus.KNOWN_MISS,
+    "hint_unavailable": OpEntryStatus.NO_HINT,
+    "hint_failed": OpEntryStatus.HINT_ERR,
+    "pin_failed": OpEntryStatus.PIN_ERR,
+    "layout_mismatch": OpEntryStatus.BAD_LAYOUT,
+    "deadline": OpEntryStatus.TIMEOUT,
+    "source_stalled": OpEntryStatus.TIMEOUT,
+    "cancelled": OpEntryStatus.ABORTED,
+    "stopping": OpEntryStatus.ABORTED,
+    "shutdown": OpEntryStatus.ABORTED,
+    "route_changed": OpEntryStatus.ABORTED,
+    "refused": OpEntryStatus.ABORTED,
+}
+_FAILED_RESULTS = {
+    reason: OpEntryResult(status) for reason, status in _STATUS_BY_REASON.items()
+}
+
+
+def _failed_result(reason: str | None) -> OpEntryResult:
+    return _FAILED_RESULTS.get(reason or "", _FAILED_RESULT)
 
 
 @dataclass(frozen=True)
@@ -224,7 +252,8 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
-    ) -> bool:
+    ) -> str | None:
+        """Start the pull, or return why it cannot start."""
         kvcr = self._kvcr
         started_at = kvcr._timer()
         scope = "remote_fetch" if local_fill else "remote_deliver"
@@ -237,11 +266,11 @@ class _RemoteFWDram:
             kvcr._record_duration(
                 scope, started_at, "failed" if current_hint.failed else "miss"
             )
-            return False
+            return "hint_failed" if current_hint.failed else "remembered_miss"
 
         if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
-            return False
+            return "hint_unavailable"
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
@@ -302,7 +331,7 @@ class _RemoteFWDram:
             raise
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
-        return True
+        return None
 
     def deliver(
         self,
@@ -316,20 +345,21 @@ class _RemoteFWDram:
         if not blocks:
             kvcr._complete(op_handle, {})
             return
-        if self._start_target_pull(
+        reason = self._start_target_pull(
             blocks,
             request_id,
             deadline,
             op_handle,
             local_fill=False,
-        ):
+        )
+        if reason is None:
             return
         trace = kvcr._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.reject("target.hint_unavailable", _nvtx.Reason.HINT_UNAVAILABLE)
         kvcr._complete(
             op_handle,
-            dict.fromkeys(blocks, _FAILED_RESULT),
+            dict.fromkeys(blocks, _failed_result(reason)),
         )
 
     def fetch(
@@ -340,12 +370,15 @@ class _RemoteFWDram:
         *,
         op_handle: OpHandle,
     ) -> bool:
-        return self._start_target_pull(
-            blocks,
-            request_id,
-            deadline,
-            op_handle,
-            local_fill=True,
+        return (
+            self._start_target_pull(
+                blocks,
+                request_id,
+                deadline,
+                op_handle,
+                local_fill=True,
+            )
+            is None
         )
 
     def poll_main(self, items: Collection[object]) -> None:
@@ -459,7 +492,9 @@ class _RemoteFWDram:
             kvcr._complete(
                 cast(OpHandle, op.op_id[1]),
                 {
-                    key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
+                    key: _SUCCESS_RESULT
+                    if key in completed_keys
+                    else _failed_result(op.unserved.get(key) or op.failure_reason)
                     for key in op.keys
                 },
             )

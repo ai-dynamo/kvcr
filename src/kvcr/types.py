@@ -91,9 +91,19 @@ class TransferError(RuntimeError):
 
 
 class OpEntryStatus(Enum):
-    # TODO: Add specific statuses for timeout, abort, capacity, and unavailable sources.
     SUCCESS = "SUCCESS"
     DROPPED = "DROPPED"
+
+    # The block was not served; the transfer itself did not break.
+    SRC_MISS = "SRC_MISS"
+    KNOWN_MISS = "KNOWN_MISS"
+    NO_HINT = "NO_HINT"
+    HINT_ERR = "HINT_ERR"
+    PIN_ERR = "PIN_ERR"
+    BAD_LAYOUT = "BAD_LAYOUT"
+
+    TIMEOUT = "TIMEOUT"
+    ABORTED = "ABORTED"
     FAILED = "FAILED"
 
 
