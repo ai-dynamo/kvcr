@@ -105,6 +105,25 @@ class _RemoteFWDram:
             raise ValueError("metadata_retry_interval_ms must be positive")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
+        self._framework_pinning = kvcr._request_pin_callback is not None
+        if (
+            self._framework_pinning
+            and (
+                kvcr._poll_pin_results_callback is None
+                or kvcr._release_pin_callback is None
+            )
+        ) or (
+            not self._framework_pinning
+            and (
+                kvcr._poll_pin_results_callback is not None
+                or kvcr._release_pin_callback is not None
+                or kvcr._cancel_pin_request_callback is not None
+            )
+        ):
+            raise ValueError(
+                "framework pinning requires request_pin, poll_pin_results, "
+                "and release_pin"
+            )
         self._kvcr = kvcr
         self._options = options
         self._key_adapter = key_adapter
@@ -117,7 +136,7 @@ class _RemoteFWDram:
         self._sources = _RemoteSources(self, kvcr)
 
         # Progress-thread state: G2 control and outbound events.
-        self._pending_local_sources: list[_SourcePinOp] = []
+        self._pending_local_sources: list[tuple[_SourceWriteOp, tuple[str, ...]]] = []
         self._progress_outbound: list[object] = []
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
@@ -793,16 +812,18 @@ class _RemoteFWDram:
                 self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
-        source_pin = _SourcePinOp(
+        source_write = _SourceWriteOp(
+            state=_SourceWriteState.READY_TO_WRITE,
             op_id=op_id,
             keys=key_set,
             started_at=started_at,
             deadline=deadline,
             remote_agent=remote_agent,
             op_handle=op_handle,
-            ordered_keys=keys,
+            source_keys=keys,
             dst_descriptors=dst_descriptors,
-            key_layout=payload.key_layout,
+            local_sources=(),
+            _backend=self,
             route=(target_agent, self._route_generation.get(target_agent, 0)),
             nvtx_state=_NvtxState(
                 requested_blocks=len(keys),
@@ -811,16 +832,38 @@ class _RemoteFWDram:
             if self._nvtx is not None
             else None,
         )
-        prepared = self._try_local_source_write(progress, source_pin)
+        prepared = self._try_local_source_write(
+            progress, source_write, payload.key_layout
+        )
         if prepared is None:
-            self._pending_local_sources.append(source_pin)
+            self._pending_local_sources.append((source_write, payload.key_layout))
         elif not prepared:
-            self._progress_outbound.append(source_pin)
+            self._queue_source_pin(source_write, payload.key_layout)
+
+    def _queue_source_pin(
+        self, op: _SourceWriteOp, key_layout: tuple[str, ...]
+    ) -> None:
+        self._progress_outbound.append(
+            _SourcePinOp(
+                op_id=op.op_id,
+                keys=op.keys,
+                started_at=op.started_at,
+                deadline=op.deadline,
+                remote_agent=op.remote_agent,
+                op_handle=op.op_handle,
+                ordered_keys=op.source_keys,
+                dst_descriptors=op.dst_descriptors,
+                key_layout=key_layout,
+                route=op.route,
+                nvtx_state=op.nvtx_state,
+            )
+        )
 
     def _retry_local_sources(self, progress: _KVCRProgress) -> bool:
         pending, self._pending_local_sources = self._pending_local_sources, []
         observed_work = False
-        for op in pending:
+        for item in pending:
+            op, key_layout = item
             status = self._dangling_ops.source_writes[(op.route[0], op.op_handle)]
             if (
                 self._kvcr._clock() >= op.deadline
@@ -829,77 +872,70 @@ class _RemoteFWDram:
                 or self._route_generation.get(op.route[0], 0) != op.route[1]
             ):
                 # No claims were acquired, so there is no caller-side cleanup.
-                failure = _SourceWriteOp(
-                    state=_SourceWriteState.NOTIFY_FAILURE,
-                    op_id=op.op_id,
-                    keys=op.keys,
-                    started_at=op.started_at,
-                    deadline=op.deadline,
-                    remote_agent=op.remote_agent,
-                    op_handle=op.op_handle,
-                    source_keys=(),
-                    dst_descriptors=(),
-                    route=op.route,
-                    nvtx_state=op.nvtx_state,
-                    _backend=self,
-                )
+                op.state = _SourceWriteState.NOTIFY_FAILURE
+                op.source_keys = ()
+                op.dst_descriptors = ()
                 if op.nvtx_state is not None:
                     op.nvtx_state.failure_reason = (
                         _nvtx.Reason.DEADLINE
                         if self._kvcr._clock() >= op.deadline
                         else _nvtx.Reason.ROUTE_CHANGED
                     )
-                failure.progress(progress, None)
+                op.progress(progress, None)
                 observed_work = True
                 continue
-            prepared = self._try_local_source_write(progress, op)
+            prepared = self._try_local_source_write(progress, op, key_layout)
             if prepared is None:
-                self._pending_local_sources.append(op)
+                self._pending_local_sources.append(item)
             else:
                 observed_work = True
                 if not prepared:
-                    self._progress_outbound.append(op)
+                    self._queue_source_pin(op, key_layout)
         return observed_work
 
     def _try_local_source_write(
-        self, progress: _KVCRProgress, source_pin: _SourcePinOp
+        self,
+        progress: _KVCRProgress,
+        source_write: _SourceWriteOp,
+        key_layout: tuple[str, ...],
     ) -> bool | None:
         """Return None to retry contention, False when caller work is needed."""
         local = self._kvcr._local_dram
+        # Until prepared, the unregistered write retains the original request.
+        ordered_keys = source_write.source_keys
+        dst_descriptors = source_write.dst_descriptors
         if local is None:
-            return False
-        selected = local._pools.acquire_readers(
-            source_pin.ordered_keys, source_pin.dst_descriptors, source_pin.key_layout
-        )
+            if self._framework_pinning:
+                return False
+            selected = ()
+        else:
+            selected = local._pools.acquire_readers(
+                ordered_keys,
+                dst_descriptors,
+                key_layout,
+                allow_missing=not self._framework_pinning,
+            )
         if selected is None:
             return None
-        if not selected:
+        if selected is False:
             return False
-        sources = tuple(residency for residency, _ in selected)
+        completed_indices = tuple(index for index, _, _ in selected)
+        if len(selected) != len(ordered_keys):
+            ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
+            dst_descriptors = tuple(dst_descriptors[i] for i in completed_indices)
+            source_write.keys = frozenset(ordered_keys)
+        sources = tuple(residency for _, residency, _ in selected)
         try:
-            source_write = _SourceWriteOp(
-                state=_SourceWriteState.READY_TO_WRITE,
-                op_id=source_pin.op_id,
-                keys=source_pin.keys,
-                started_at=source_pin.started_at,
-                deadline=source_pin.deadline,
-                remote_agent=source_pin.remote_agent,
-                op_handle=source_pin.op_handle,
-                source_keys=source_pin.ordered_keys,
-                src_descriptors=tuple(refs for _, refs in selected),
-                dst_descriptors=source_pin.dst_descriptors,
-                completed_indices=tuple(range(len(source_pin.ordered_keys))),
-                route=source_pin.route,
-                nvtx_state=source_pin.nvtx_state,
-                local_sources=sources,
-                _backend=self,
-            )
+            source_write.source_keys = ordered_keys
+            source_write.src_descriptors = tuple(refs for _, _, refs in selected)
+            source_write.dst_descriptors = dst_descriptors
+            source_write.completed_indices = completed_indices
+            source_write.local_sources = sources
             # Retain cleanup ownership before native submission can start.
             progress._in_flight_ops[source_write.op_id] = source_write
         except BaseException:
-            local._pools.release_readers(
-                source_pin.ordered_keys, sources, success=False
-            )
+            if sources:
+                local._pools.release_readers(ordered_keys, sources, success=False)
             raise
         done, _ = source_write.progress(progress, None)
         if done:

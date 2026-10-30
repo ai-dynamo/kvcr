@@ -14,7 +14,7 @@ import msgspec
 from .. import _nvtx
 from ..runtime.core import TRANSFER_BLOCKS_METRIC, logger
 from ..runtime.progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
-from ..types import BlockKey, OpHandle, PinHandle
+from ..types import BlockKey, OpHandle
 
 if TYPE_CHECKING:
     from .local_dram_pools import _LocalDramResidency
@@ -367,14 +367,14 @@ class _SourceWriteOp(_RemoteOp):
     source_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
-    framework_pins: set[PinHandle] = field(default_factory=set)
     src_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     transfer_id: int | None = None
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
-    local_sources: tuple["_LocalDramResidency", ...] = ()
+    # None uses caller cleanup; a tuple (even empty) is owned by progress.
+    local_sources: tuple["_LocalDramResidency", ...] | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
