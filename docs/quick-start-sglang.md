@@ -38,15 +38,7 @@ DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
 export QS_IMAGE_ID="$(docker image inspect "$QS_TAG" --format '{{.Id}}')"
 ```
 
-The build uses pinned SGLang and Dynamo revisions and installs KVCR from the local checkout used as the build context (`.`), including any local changes. No private image or credentials are required.
-
-| Component | Revision |
-| --- | --- |
-| SGLang [#45647](https://github.com/sgl-project/sglang/pull/45647) | `b0506add3eac49bbb2c303e83169ea19c907fb98` |
-| Dynamo | `83ea37e849e883c27d7ed848e0f329961e1fb173` |
-| KVCR | Local build-context checkout, including local source changes |
-
-Continue only if the final import/version checks pass. Installed packages are recorded in `/opt/sglang-installed-packages.txt`.
+The build uses pinned [SGLang #45647](https://github.com/sgl-project/sglang/pull/45647) and Dynamo revisions from the Dockerfile, and installs KVCR from the local checkout used as the build context (`.`), including any local changes. Continue only if the final import/version checks pass.
 
 ## 2. Start the container
 
@@ -78,7 +70,7 @@ env -u NATS_SERVER DYN_NAMESPACE=kvcrqs DYN_SYSTEM_PORT=24004 \
   2>&1 | tee /tmp/state-agent.log
 ```
 
-Keep this process running so the router can discover KVCR-owned blocks.
+Keep this process running.
 
 ## 4. Start the Dynamo KV router
 
@@ -90,7 +82,7 @@ env -u NATS_SERVER DYN_SYSTEM_PORT=24003 python3 -m dynamo.frontend \
   2>&1 | tee /tmp/frontend.log
 ```
 
-The image includes the two-tier selection policy. The KV router supplies source hints; a round-robin router does not demonstrate router-guided peer reuse.
+The KV router supplies source hints; a round-robin router does not demonstrate router-guided peer reuse.
 
 ## 5. Start two HiCache workers
 
@@ -139,9 +131,6 @@ env -u NATS_SERVER CUDA_VISIBLE_DEVICES="$RANK" DYN_SYSTEM_PORT="$((24001 + RANK
 
 Control, NIXL, metrics and event ports must be distinct. The ownership descriptor requires a reachable non-loopback control address, even in this same-container example. Both terminals derive the container IP automatically; set the same `KVCR_ADVERTISE_HOST` in both if hostname resolution is unsuitable. KV events bind `*` inside that private network namespace.
 
-The state agent tracks KVCR-owned blocks, and Dynamo uses the advertised source
-addresses to route peer transfers.
-
 ## 6. Verify peer reuse
 
 Wait for successful LLM registration in both worker logs and `Adding worker` for both IDs in the frontend log. Allow up to 20 minutes per worker for first-use compilation. Then, in the request terminal, require `ready: true`:
@@ -157,7 +146,7 @@ print(status)
 PY
 ```
 
-This inline check sends a fresh 2048-token prefix to worker 0, then requests the identical prefix on worker 1. It pins only the destination; Dynamo still supplies the source hint. Do not probe this prefix before the test. The first request can compile additional attention kernels after readiness; that startup cost is not cache-transfer latency.
+This check sends a fresh 2048-token prefix to worker 0, then requests the identical prefix on worker 1. Do not probe this prefix before the test. The first request can compile additional attention kernels after readiness.
 
 ```bash
 python3 - <<'PY'
