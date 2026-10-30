@@ -23,14 +23,12 @@ This example uses two independent TP1 workers on one host, Qwen3-0.6B BF16, `trt
 
 ## 1. Build the integration image
 
-Until this PR merges, fetch its public recipe and build the SGLang image from [Dockerfile.quick-start-sglang](../Dockerfile.quick-start-sglang):
+Clone the repository and build the SGLang image from [Dockerfile.quick-start-sglang](../Dockerfile.quick-start-sglang):
 
 ```bash
 set -euo pipefail
 git clone https://github.com/ai-dynamo/kvcr.git kvcr-sgl-quick-start
 cd kvcr-sgl-quick-start
-git fetch origin pull/114/head
-git checkout --detach FETCH_HEAD
 git rev-parse HEAD
 export QS_TAG="kvcr-sgl-quick-start:$(date -u +%Y%m%dT%H%M%SZ)-$$"
 DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \

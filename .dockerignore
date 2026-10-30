@@ -6,5 +6,5 @@ __pycache__
 *.pyc
 build
 dist
-docs/*
+docs
 tests
