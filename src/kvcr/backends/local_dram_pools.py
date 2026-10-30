@@ -373,7 +373,7 @@ class _LocalDramPools:
             state.operations -= 1
             state.completions.put((keys, sources, success))
 
-    def _drain_source_completions(self) -> None:
+    def _drain_source_completions(self, *, resume_waiters: bool = True) -> None:
         if self._draining_source_completions:
             return
         self._draining_source_completions = True
@@ -407,7 +407,7 @@ class _LocalDramPools:
                         freed |= self._after_last_claim(key, residency)
         finally:
             self._draining_source_completions = False
-        if freed and not self._kvcr._closed:
+        if freed and resume_waiters and not self._kvcr._closed:
             self._resume_capacity_waiters()
 
     def _reclaimable_slots(self) -> dict[str, int]:
@@ -633,6 +633,9 @@ class _LocalDramPools:
             or residency.claim_count <= 0
         ):
             raise RuntimeError(f"invalid local DRAM claim for {key!r}")
+        if residency.claim_count == 1 and residency.source_readers:
+            # Keep this claim until completed readers have refreshed access ordering.
+            self._drain_source_completions()
         residency.claim_count -= 1
         if residency.claim_count == 0:
             self._after_last_claim(key, residency)
@@ -677,9 +680,16 @@ class _LocalDramPools:
         self, layout: list[str], protected: frozenset[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
         required = Counter(label.partition(":")[0] for label in layout)
-        if all(
+        available = all(
             len(self._free_slots[name]) >= count for name, count in required.items()
-        ):
+        )
+        if not available:
+            # The caller must install its reservation before other waiters can run.
+            self._drain_source_completions(resume_waiters=False)
+            available = all(
+                len(self._free_slots[name]) >= count for name, count in required.items()
+            )
+        if available:
             return (
                 [
                     (label, self._free_slots[label.partition(":")[0]].popleft())

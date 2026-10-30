@@ -841,8 +841,39 @@ def test_eviction_preserves_reader_claimed_during_policy_decision(monkeypatch):
     assert memory.raw == b"b" * 16
 
 
+def test_deposit_uses_capacity_from_reader_completed_during_admission(monkeypatch):
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    memory = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    local = kvcr._core._local_dram._pools
+    resident, incoming = BlockKey(b"resident"), BlockKey(b"incoming")
+    deposit = kvcr.deposit({resident: [_mem_descriptor()]})
+    assert _poll_until(kvcr, bool) == [(deposit, _op_entries({resident: True}))]
+    destination = ((progress_module._TransferRef("target", 0),),)
+    source = local.acquire_readers((resident,), destination, ())
+
+    def complete_reader(*args, **kwargs):
+        # Native completion arrives after deposit's initial completion drain.
+        local.release_readers((resident,), (source[0][1],), success=True)
+        return PlacementAction.KEEP, None
+
+    monkeypatch.setattr(kvcr._core._policy, "decide_ingest", complete_reader)
+    replacement = kvcr.deposit({incoming: [_mem_descriptor(1)]})
+    assert _poll_until(kvcr, bool) == [(replacement, _op_entries({incoming: True}))]
+    assert memory.raw == b"b" * 16
+
+
 @pytest.mark.parametrize(
-    "completion_order", ["reader_first", "spill_first", "during_admission"]
+    "completion_order",
+    ["reader_first", "spill_first", "during_admission", "during_duplicate"],
 )
 def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
     completion_order,
@@ -882,26 +913,35 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
     deposit = kvcr.deposit(blocks)
     assert list(kvcr.poll_completed()) == []
     local.retire_sources((retiring,))
-    if completion_order == "spill_first":
+    if completion_order in ("spill_first", "during_duplicate"):
         local.release_sources((retiring,))
         kvcr.align_sequence([retiring])
 
     now = 0.3
-    local.release_readers((retiring,), (retiring_source[0][1],), success=False)
-    if completion_order == "during_admission":
+    if completion_order != "during_duplicate":
+        local.release_readers((retiring,), (retiring_source[0][1],), success=False)
+    if completion_order != "during_admission":
+        local.release_readers((recent,), (recent_source[0][1],), success=True)
+    if completion_order in ("during_admission", "during_duplicate"):
         decide_ingest = kvcr._core._policy.decide_ingest
+        key, readers = (
+            (retiring, retiring_source)
+            if completion_order == "during_duplicate"
+            else (recent, recent_source)
+        )
 
         def complete_reader(*args, **kwargs):
             # Finish after the admission's initial completion drain.
             monkeypatch.setattr(kvcr._core._policy, "decide_ingest", decide_ingest)
-            local.release_readers((recent,), (recent_source[0][1],), success=True)
+            local.release_readers((key,), (readers[0][1],), success=key == recent)
             return decide_ingest(*args, **kwargs)
 
         monkeypatch.setattr(kvcr._core._policy, "decide_ingest", complete_reader)
-    else:
-        local.release_readers((recent,), (recent_source[0][1],), success=True)
-    if completion_order != "spill_first":
+    if completion_order in ("reader_first", "during_admission"):
         local.release_sources((retiring,))
+    if completion_order == "reader_first":
+        # The final spill claim releases capacity without another caller poll.
+        _wait_until(lambda: len(agent.transfers) == 4)
     duplicate = kvcr.deposit(blocks)
     completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
     assert completed == dict.fromkeys(
@@ -912,6 +952,12 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
     ]
+    if completion_order == "during_duplicate":
+        # Resuming the duplicate must not leak an overwritten reservation.
+        full_pool = kvcr.deposit(
+            {retiring: [_mem_descriptor(index) for index in range(3)]}
+        )
+        assert _poll_until(kvcr, bool) == [(full_pool, _op_entries({retiring: True}))]
 
 
 @pytest.mark.parametrize(

@@ -249,6 +249,8 @@ class _LocalDram:
         self._pending_residency_ops[op.op_id] = op
         self._kvcr._add_block_dependencies(op, new_operation=True)
         self._start_deposits(op, blocks)
+        if self._capacity_waiters:
+            self._resume_capacity_waiters()
 
     def _start_deposits(
         self, op: _PendingResidencyOp, keys: Collection[BlockKey]
@@ -416,6 +418,8 @@ class _LocalDram:
             if refs:
                 destinations[key] = refs
         self._finish_residency_if_ready(op)
+        if self._capacity_waiters:
+            self._resume_capacity_waiters()
         return destinations
 
     def _prepare_fetch(
