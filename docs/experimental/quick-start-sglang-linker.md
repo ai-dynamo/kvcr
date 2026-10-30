@@ -10,7 +10,7 @@ Build and run Dynamo, SGLang and KVCR without editing their serving code. SGLang
 > [!WARNING]
 > This integration is **very experimental**. The pinned integration has only been tested with the dense Qwen3-32B BF16 model and TP1 workers; other models and parallel configurations are not validated.
 
-For the HiCache storage route, use the [SGLang HiCache quick start](quick-start-sglang.md). For vLLM, use the [vLLM quick start](quick-start-vllm.md). For implementation and API development, use the [developer guide](dev-guide.md).
+For the HiCache storage route, use the [SGLang HiCache quick start](../quick-start-sglang.md). For vLLM, use the [vLLM quick start](../quick-start-vllm.md). For implementation and API development, use the [developer guide](../dev-guide.md).
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ This example uses two independent TP1 workers on one host, Qwen3-32B BF16, 64-to
 
 ## 1. Build the integration image
 
-Until this PR merges, fetch its public recipe and build the image from [Dockerfile.quick-start-sglang-linker](../Dockerfile.quick-start-sglang-linker):
+Until this PR merges, fetch its public recipe and build the image from [Dockerfile.quick-start-sglang-linker](../../Dockerfile.quick-start-sglang-linker):
 
 ```bash
 set -euo pipefail
