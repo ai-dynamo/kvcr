@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import msgspec
 
-from .parser import HintType, _Hint
+from .parser import HintType, _Hint, reject_hint
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
@@ -86,6 +86,17 @@ class _FetchHintHandler:
         message_id: str | None,
     ) -> None:
         hint: _KVFetchHint = hint  # type: ignore[assignment]
+        if self._core._gpu_options is not None:
+            self._dispatcher.report(
+                reject_hint(
+                    hint.action_id,
+                    self.action_type,
+                    "GPU endpoint requires a kv.fetch_gpu action",
+                    message_id,
+                    request_id,
+                )
+            )
+            return
         # One store call per hint; the store's own rules apply (a later hint
         # replaces the request's hashes, a different source fails the request).
         self._core._remote_fw_dram.submit_hint(

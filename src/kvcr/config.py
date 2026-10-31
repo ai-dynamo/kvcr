@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Construction and integration configuration for KVCR."""
 
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
@@ -50,6 +51,75 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     backend: str = "UCX"
 
 
+class RemoteFWGPUOptions(msgspec.Struct, frozen=True, kw_only=True):
+    """An isolated GPU framework-memory endpoint with an explicit transport.
+
+    Host transports in ``ucx_tls`` carry control metadata only. CUDA copy,
+    GDR copy and alternate GPU transports are excluded, so a missing NVLink
+    route must fail rather than stage KV payloads in host memory. Peers share the
+    explicit compatibility domain. The default profile requires the same host;
+    MNNVL requires fabric-capable allocations in the same observed fabric domain.
+    Its TCP transport carries control messages, with software RMA and TCP puts
+    disabled by the dedicated native backend. Framework callbacks fence producer
+    writes before returning pin results and retain CUDA allocations until release.
+    """
+
+    compatibility_domain: str
+    ucx_tls: tuple[str, ...] = ("cuda_ipc", "posix", "self")
+    eager_ctrl_connect: bool = True
+    opportunistic_query: bool = False
+    metadata_retry_interval_ms: int = 100
+    backend: str = "UCX"
+    gpu_transport: str = "cuda_ipc"
+    fabric_domain: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.compatibility_domain, str)
+            or not self.compatibility_domain
+            or self.compatibility_domain.strip() != self.compatibility_domain
+            or "\x00" in self.compatibility_domain
+        ):
+            raise ValueError("GPU compatibility_domain must be explicit and non-empty")
+        if self.gpu_transport not in ("cuda_ipc", "mnnvl"):
+            raise ValueError("GPU transport must be cuda_ipc or mnnvl")
+        if self.gpu_transport == "mnnvl":
+            match = (
+                re.fullmatch(
+                    r"mnnvl:([0-9a-f]{32}):(0|[1-9][0-9]{0,9})", self.fabric_domain
+                )
+                if isinstance(self.fabric_domain, str)
+                else None
+            )
+            if match is None or int(match[1], 16) == 0 or int(match[2]) > 0xFFFFFFFF:
+                raise ValueError(
+                    "MNNVL requires an observed nonzero fabric UUID and clique"
+                )
+            if self.ucx_tls != ("cuda_ipc", "tcp", "self"):
+                raise ValueError("MNNVL ucx_tls must be exactly cuda_ipc,tcp,self")
+        elif self.fabric_domain is not None:
+            raise ValueError("CUDA IPC does not accept an MNNVL fabric domain")
+        allowed = (
+            {"cuda_ipc", "tcp", "self"}
+            if self.gpu_transport == "mnnvl"
+            else {"cuda_ipc", "posix", "sysv", "self"}
+        )
+        if (
+            not isinstance(self.ucx_tls, tuple)
+            or not self.ucx_tls
+            or any(
+                type(token) is not str or token not in allowed for token in self.ucx_tls
+            )
+            or len(set(self.ucx_tls)) != len(self.ucx_tls)
+            or "cuda_ipc" not in self.ucx_tls
+        ):
+            raise ValueError(
+                "GPU ucx_tls must select CUDA IPC and only host control transports"
+            )
+        if self.backend != "UCX":
+            raise ValueError("direct GPU transfer currently requires the UCX backend")
+
+
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     """Bounded file-backed cache storage owned by this KVCR process.
 
@@ -69,6 +139,7 @@ class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     remote_fw_dram: RemoteFWDramOptions = msgspec.field(
         default_factory=RemoteFWDramOptions
     )
+    remote_fw_gpu: RemoteFWGPUOptions | None = None
 
 
 class TelemetryStats(Protocol):

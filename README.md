@@ -85,6 +85,113 @@ The [SGLang HiCache quick start](docs/quick-start-sglang.md) is a preview for bu
 
 For local development, API lifecycle guidance, validation, integration, and KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
 
+### Direct GPU memory endpoints
+
+An opt-in `RemoteFWGPUOptions` endpoint delivers framework-owned CUDA buffers
+without allocating or falling back to CPU or disk payload storage in KVCR:
+
+```python
+from kvcr.config import KVCRBackendConfigs, RemoteFWGPUOptions
+from kvcr.types import RegionDescriptor
+
+backend = KVCRBackendConfigs(
+    framework_regions=[
+        RegionDescriptor(
+            mem_type="VRAM", device_Id=cuda_device, addr=allocation_address,
+            size=bytes_per_block, stride=block_stride, count=block_count,
+        ),
+    ],
+    remote_fw_gpu=RemoteFWGPUOptions(compatibility_domain=compatible_layout_domain),
+)
+```
+
+Use a separate instance and control endpoint from the CPU path. All registrations
+must be VRAM; `local_dram`, G3 and Guard pools are rejected. The instance accepts
+only `kv.fetch_gpu@1.0`, with explicit `source_memory_kind="gpu"`,
+`target_memory_kind="gpu"`, `transport="nixl_gpu_direct"` and a matching
+`compatibility_domain`. Its `deliver()` writes into caller-reserved VRAM and its
+query tier is `REMOTE_G1`; `fetch()` and `deposit()` managed-storage APIs are
+unavailable. Ordinary `kv.fetch` CPU endpoints retain their existing behavior.
+Pass a structurally typed `msgspec.Struct` envelope to `submit_hint()`, including
+its `message_id` and each action's `action_id`; raw dictionaries are not accepted.
+GPU actions require the exact `0.1` envelope and `1.0` action versions, and
+rejected actions use the same per-action results as the other typed hint handlers.
+Before offering destination memory, each GPU delivery performs an operation-bound
+metadata handshake with the exact source endpoint and GPU contract. Legacy,
+mismatched or silent peers fail before any writable destination descriptors or
+native peer connection are exposed; they do not create a target write hazard.
+
+The default transport policy is **same-host CUDA IPC**, with
+`UCX_TLS=cuda_ipc,posix,self` set before starting either process. The explicit
+allowlist also permits `sysv` for host control metadata, but excludes TCP, CUDA
+copy, GDR copy, aliases and network transports. Native UCX must support VRAM.
+This policy is checked before native initialization; actual CUDA IPC usability
+and no-host-staging behavior still require GPU transport qualification. Cross-node
+GPUDirect RDMA is not enabled by this implementation.
+Set `NIXL_UCX_CUDA_IPC_ONLY=1` as well, with a NIXL UCX plugin that implements
+this strict policy and verifies initialized CUDA memory support. GPU endpoint
+startup rejects a missing policy flag; it does not enable CUDA copy to work
+around a native initialization failure.
+
+For cross-host NVLink, select the experimental **MNNVL** profile explicitly:
+
+```python
+RemoteFWGPUOptions(
+    compatibility_domain=compatible_layout_and_fabric_domain,
+    gpu_transport="mnnvl",
+    fabric_domain=observed_fabric_domain,
+    ucx_tls=("cuda_ipc", "tcp", "self"),
+)
+```
+
+Both endpoints must register physical CUDA VMM allocations created with
+`CU_MEM_HANDLE_TYPE_FABRIC`. Ordinary `cudaMalloc` and managed allocations are
+rejected by this profile's native registration checks. The framework observes
+the allocated GPU's completed, successful NVML fabric and supplies its canonical
+`mnnvl:<32-lowercase-hex-cluster-UUID>:<unsigned-clique-ID>` identity; a zero cluster
+UUID is invalid, while clique zero is valid. Bind the routing compatibility domain
+to the raw layout, MNNVL transport and this observed fabric. The operation-bound
+handshake also checks the transport profile and fabric before offering writable
+destination memory. Different fabrics, legacy peers and mixed profiles fail.
+
+MNNVL requires a common IMEX channel with export/import permission on both hosts.
+On SLURM, reserve the channel through the site's IMEX plugin and verify its
+visibility inside both allocated containers. A device file or NVML fabric state
+alone does not prove that a peer can import a handle.
+
+The MNNVL backend sets its own closed UCP configuration; it does not change
+process-wide `UCX_TLS` or the ordinary engine's P-to-D backend. TCP carries active
+message control; TCP puts and software PUT/GET emulation are disabled. CUDA-copy,
+GDR-copy and RDMA payload transports are excluded. An unavailable NVLink route
+fails rather than staging KV payload in CPU memory. Do not enable the legacy
+global `NIXL_UCX_CUDA_IPC_ONLY` flag for an MNNVL endpoint. GPUDirect RDMA for
+this GPU-only endpoint remains outside these profiles.
+
+The experimental [native dependency patches and build contract](docs/gpu-direct-native-dependencies/README.md)
+pin the NIXL/UCX source changes required by these profiles. They are separate from
+the KVCR wheel and do not establish compatibility with arbitrary native builds.
+
+GPU-only instances initialize UCX explicitly with the supported
+`ucx_error_handling_mode=none` option. The same-host IPC transports cannot
+provide UCX's native peer-error handling; ordinary CPU instances retain their
+existing backend defaults. The actual initialized option is checked before
+VRAM registration. This profile does **not** promise native peer-death recovery:
+deadlines do not cancel native writes or make destination slots reusable.
+Uncertain operations retain their pins and GPU allocations until actual native
+completion/quiescence, and a transport failure can still terminate the process.
+Neither profile adds a host-payload fallback to obtain peer-error handling.
+
+The framework must fence producer writes before returning a GPU pin result and
+retain the entire registered allocation until quiescent shutdown. Source block
+pins are held through native completion, including timeout/cancellation grace
+expiry. Destinations must stay reserved until successful completion or a
+quiesced failure: an uncertain `TransferError` requires quarantine, and a late
+native completion does not make canceled data valid. GPU-mode failed results
+are withheld until destination writes are quiesced; `abort()` currently returns
+false and callers must continue draining completions. KVCR does not synchronize
+framework CUDA streams or manage GPU block allocation. The ordinary P-to-D NIXL
+handoff is separate from this D-to-P endpoint.
+
 ## License
 
 KVCR is released under the Apache License 2.0. The full license text is in [LICENSE](LICENSE).

@@ -16,6 +16,7 @@ import zmq
 from _kvcr_test_utils import free_port, listening_socket
 
 from kvcr import ZmqPeerControlChannel
+from kvcr import control_channels as legacy_control_channels
 from kvcr.runtime.control_channels import (
     _FRAME_HEADER,
     _MAX_FRAME_BYTES,
@@ -33,6 +34,13 @@ class _Message(msgspec.Struct, frozen=True):
 
 
 _MESSAGE_DECODER = msgspec.msgpack.Decoder(_Message)
+
+
+def test_legacy_control_channel_imports_reexport_runtime_types():
+    assert legacy_control_channels.ZmqPeerControlChannel is ZmqPeerControlChannel
+    assert legacy_control_channels.FramedConnection is FramedConnection
+    assert legacy_control_channels.KVCRGuardProtocolError is KVCRGuardProtocolError
+    assert legacy_control_channels.KVCRMsgFramingError is KVCRMsgFramingError
 
 
 @contextmanager

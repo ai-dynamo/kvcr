@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Remote DRAM path used by KVCR.
+"""Remote framework-memory path used by KVCR.
 
-This module owns the G2-specific control protocol and NIXL source writes.
+This module owns the control protocol and NIXL source writes.
 Caller-side source acquisition and framework pins are owned by remote_sources.
 Sources and destinations may be local KVCR DRAM or framework memory.
+GPU endpoints expose only framework VRAM and use a separate capability handshake.
 Progress owns accepted operations; KVCR owns block state.
 
 Target: hint/query -> fetch/deliver -> start_write -> write_done.
@@ -22,7 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 
 from .. import _nvtx
-from ..config import KeyAdapter, RemoteFWDramOptions
+from ..config import KeyAdapter, RemoteFWDramOptions, RemoteFWGPUOptions
 from ..runtime.core import (
     DURATION_METRIC,
     TRANSFER_BYTES_METRIC,
@@ -39,7 +40,6 @@ from ..runtime.progress import (
 )
 from ..types import (
     BlockKey,
-    CacheTier,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -52,6 +52,7 @@ from .remote_ops import (
     _SourceWriteOp,
     _SourceWriteState,
     _StartWrite,
+    _StartWriteGPU,
     _TargetMetadata,
     _TargetMetadataAck,
     _TargetPullOp,
@@ -98,7 +99,7 @@ class _RemoteFWDram:
     def __init__(
         self,
         kvcr: "_KVCRCore",
-        options: RemoteFWDramOptions,
+        options: RemoteFWDramOptions | RemoteFWGPUOptions,
         key_adapter: KeyAdapter | None,
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
@@ -126,6 +127,7 @@ class _RemoteFWDram:
             )
         self._kvcr = kvcr
         self._options = options
+        self._gpu = isinstance(options, RemoteFWGPUOptions)
         self._key_adapter = key_adapter
         self._nvtx = _nvtx.create_tracer()
 
@@ -152,6 +154,34 @@ class _RemoteFWDram:
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
+
+    def _gpu_contract(self) -> dict[str, str]:
+        if not self._gpu:
+            return {}
+        contract = {
+            "source_memory_kind": "gpu",
+            "target_memory_kind": "gpu",
+            "transport": "nixl_gpu_direct",
+            "compatibility_domain": self._options.compatibility_domain,
+        }
+        if self._options.gpu_transport == "mnnvl":
+            assert self._options.fabric_domain is not None
+            contract.update(
+                gpu_transport="mnnvl", fabric_domain=self._options.fabric_domain
+            )
+        return contract
+
+    def _matches_gpu_contract(self, payload: _PeerMessage) -> bool:
+        transport = payload.gpu_transport
+        if transport is None:
+            transport = "cuda_ipc"
+        return all(
+            getattr(payload, name) == value
+            for name, value in self._gpu_contract().items()
+        ) and (
+            transport == self._options.gpu_transport
+            and payload.fabric_domain == self._options.fabric_domain
+        )
 
     # -------------------------------------------------------------------------
     # Backend interface used by KVCR.
@@ -361,11 +391,21 @@ class _RemoteFWDram:
                         )
                     self._kvcr._discard_local_dram_fill(item.keys)
                 elif item.state is _TargetPullState.QUARANTINED:
-                    self._finish_target_pull(item)
+                    if self._gpu:
+                        # Do not let a framework recycle a writable GPU slot
+                        # until the matching native operation is quiescent.
+                        self._fail_request_hint(item.request_id)
+                    else:
+                        self._finish_target_pull(item)
                 elif item.state is _TargetPullState.FINISHED and item.uncertain:
-                    self._kvcr._remove_block_dependencies(item)
-                    if item.local_fill:
-                        self._kvcr._complete_local_dram_fill(item.keys, success=False)
+                    if self._gpu:
+                        self._finish_target_pull(item)
+                    else:
+                        self._kvcr._remove_block_dependencies(item)
+                        if item.local_fill:
+                            self._kvcr._complete_local_dram_fill(
+                                item.keys, success=False
+                            )
                 elif item.state is _TargetPullState.FINISHED:
                     self._finish_target_pull(item)
                 else:
@@ -425,7 +465,7 @@ class _RemoteFWDram:
                     if op.local_fill
                     else "remote_deliver_completed",
                     (key for key in op.ordered_keys if key in completed_keys),
-                    CacheTier.REMOTE_G2,
+                    kvcr._remote_tier,
                     request_id=op.request_id,
                     op_handle=cast(OpHandle, op.op_id[1]),
                 )
@@ -590,6 +630,9 @@ class _RemoteFWDram:
         sender_endpoint = getattr(self._control, "endpoint", None)
         if isinstance(sender_endpoint, str) and payload.sender_control_endpoint is None:
             payload.sender_control_endpoint = sender_endpoint
+        if self._gpu:
+            for name, value in self._gpu_contract().items():
+                setattr(payload, name, value)
         if not isinstance(payload, _TargetMetadataAck):
             payload.source_control_endpoint = endpoint
         includes_metadata = (
@@ -600,6 +643,11 @@ class _RemoteFWDram:
                 or kvcr._clock() >= self._metadata_retry_after.get(endpoint, 0)
             )
         )
+        if self._gpu and isinstance(payload, _TargetMetadata):
+            payload.gpu_capability_only = True
+            payload.target_agent_metadata = None
+            payload.target_regions = msgspec.UNSET
+            includes_metadata = False
         if includes_metadata:
             payload.target_agent_metadata = progress.nixl_agent_metadata
             payload.target_regions = progress._memory_regions
@@ -627,6 +675,23 @@ class _RemoteFWDram:
     def _handle_target_metadata(
         self, progress: _KVCRProgress, payload: _TargetMetadata
     ) -> None:
+        if self._gpu:
+            endpoint = payload.sender_control_endpoint
+            if not endpoint:
+                return
+            accepted = payload.gpu_capability_only and self._matches_gpu_contract(
+                payload
+            )
+            self._send_control(
+                progress,
+                endpoint,
+                _TargetMetadataAck(
+                    op_handle=payload.op_handle,
+                    gpu_capability_only=True,
+                    gpu_peer_accepted=accepted,
+                ),
+            )
+            return
         try:
             self._remote_agent(progress, payload)
             self._ack_target_metadata(progress, payload)
@@ -679,6 +744,41 @@ class _RemoteFWDram:
         source_endpoint = payload.sender_control_endpoint
         if not source_endpoint:
             return
+        if self._gpu:
+            handle = payload.op_handle
+            op = (
+                progress._in_flight_ops.get(("target", handle))
+                if handle is not None
+                else None
+            )
+            if (
+                not isinstance(op, _TargetPullOp)
+                or op.remote_ctrl_ep != source_endpoint
+            ):
+                return
+            if (op.state is not _TargetPullState.START_WRITE or op.retried) and (
+                payload.sender_incarnation != op.source_incarnation
+            ):
+                return
+            if (
+                payload.gpu_peer_accepted is not True
+                or not self._matches_gpu_contract(payload)
+            ):
+                if op.state is _TargetPullState.START_WRITE:
+                    op.gpu_peer_refused = True
+                return
+            incarnation = payload.sender_incarnation
+            if not incarnation:
+                op.gpu_peer_refused = True
+                return
+            previous = self._dangling_ops.sources.get(source_endpoint)
+            if previous is not None and previous != incarnation:
+                self._invalidate_control_peer(source_endpoint)
+            op.gpu_peer_verified = True
+            op.source_incarnation = incarnation
+            self._dangling_ops.sources[source_endpoint] = incarnation
+            if payload.gpu_capability_only:
+                return
         incarnation = payload.sender_incarnation
         if incarnation:
             self._dangling_ops.sources[source_endpoint] = incarnation
@@ -710,6 +810,7 @@ class _RemoteFWDram:
         response = _TargetMetadataAck(
             sender_control_endpoint=source_control_endpoint,
             op_handle=payload.op_handle if isinstance(payload, _StartWrite) else None,
+            gpu_peer_accepted=True if self._gpu else None,
         )
         if not self._send_control(progress, target_control_endpoint, response):
             # Kept, route and cache both: an operation this start_write queued
@@ -729,6 +830,16 @@ class _RemoteFWDram:
         started_at = self._kvcr._timer()
         received_at = self._kvcr._clock()
         op_handle = payload.op_handle
+        if self._gpu:
+            if (
+                not isinstance(payload, _StartWriteGPU)
+                or not self._matches_gpu_contract(payload)
+            ):
+                self._notify_start_write_failure(progress, payload, op_handle)
+                return
+        elif isinstance(payload, _StartWriteGPU):
+            self._notify_start_write_failure(progress, payload, op_handle)
+            return
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
         dst_descriptors = payload.dst_descriptors
@@ -953,7 +1064,10 @@ class _RemoteFWDram:
             payload = msgspec.msgpack.decode(message)
         except (TypeError, msgspec.DecodeError):
             return False
-        if not isinstance(payload, dict) or payload.get("type") != "start_write":
+        if not isinstance(payload, dict) or payload.get("type") not in (
+            "start_write",
+            "start_write_gpu",
+        ):
             return False
         op_handle = payload.get("op_handle")
         if type(op_handle) is not int:
@@ -986,6 +1100,14 @@ class _RemoteFWDram:
         payload: _PeerMessage,
         op_handle: OpHandle,
     ) -> None:
+        if self._gpu:
+            # No memory connection to an unverified peer merely to refuse it.
+            endpoint = payload.sender_control_endpoint
+            if endpoint:
+                self._send_control(
+                    progress, endpoint, _WriteRefused(op_handle=op_handle)
+                )
+            return
         # TODO: reuse this request's peer resolution; if it failed, refuse over
         # control instead of retrying setup.
         try:
@@ -1040,6 +1162,10 @@ class _RemoteFWDram:
     ) -> tuple[str, str]:
         if progress._stop_requested:
             raise RuntimeError("KVCR progress is stopping")
+        if self._gpu and not self._matches_gpu_contract(payload):
+            raise ValueError(
+                "GPU peer metadata requires a matching explicit GPU contract"
+            )
         kvcr = self._kvcr
         agent = progress.nixl_agent
         target_agent = payload.target_agent
@@ -1063,6 +1189,14 @@ class _RemoteFWDram:
                     "registration dictionary names must match region label"
                 )
             _validate_memory_regions([*regions[0].values(), *regions[1].values()])
+            if self._gpu and (
+                not regions[0]
+                or regions[1]
+                or any(region.mem_type != "VRAM" for region in regions[0].values())
+            ):
+                raise ValueError(
+                    "GPU peers must expose only framework VRAM registrations"
+                )
         cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None and cached[1] in progress._disconnected_remote_agents:
             # A disconnect may drop NIXL's native metadata; reload only if it did.

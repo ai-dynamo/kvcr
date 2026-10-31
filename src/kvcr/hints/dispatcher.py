@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Protocol
 import msgspec
 
 from .fetch import KV_FETCH
+from .fetch_gpu import KV_FETCH_GPU
 from .parser import HintType, _Hint, hint_message_id, parse_hints
 from .results import HintResult, HintStatus
 
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
 
 # The supported hint types. Every dispatcher builds one handler per entry.
-_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH,)
+_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH, KV_FETCH_GPU)
 
 logger = logging.getLogger(__name__)
 # Handlers run on hot paths; warn once per (phase, action type) about errors.

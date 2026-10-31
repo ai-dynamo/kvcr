@@ -1,0 +1,20 @@
+{
+  "protocol_version": "0.1",
+  "message_id": "decode-to-prefill-attempt",
+  "actions": [
+    {
+      "action_id": "fetch-decode-prefix",
+      "action_type": "kv.fetch",
+      "action_version": "1.0",
+      "payload": {
+        "source_control_endpoint": "tcp://decode-worker:9000",
+        "block_hashes": [
+          0,
+          9223372036854775808,
+          18446744073709551614,
+          18446744073709551615
+        ]
+      }
+    }
+  ]
+}
