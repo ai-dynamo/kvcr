@@ -596,9 +596,9 @@ def test_caller_preparation_leaves_state_lock_available(monkeypatch, method) -> 
     }[method]
     original = getattr(owner, boundary)
 
-    def prepare(*args):
+    def prepare(*args, **kwargs):
         _assert_state_lock_available(core)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(owner, boundary, prepare)
     if method == "poll_completed":
@@ -1036,6 +1036,21 @@ def test_named_reference_validation_and_address_reporting():
                 ]
             }
         )
+    # A destination validated earlier in the same call is still bounds-checked.
+    for repeat_index in (4, True):
+        with pytest.raises(ValueError, match="element_index"):
+            kvcr.deliver(
+                {
+                    BlockKey(b"first"): [ref],
+                    BlockKey(b"repeat"): [
+                        MemoryRef(
+                            end_point_name="target",
+                            label="pool:layer:v:",
+                            element_index=repeat_index,
+                        )
+                    ],
+                }
+            )
     assert agent.xfers == agent.transfers == []
     prefix = MemoryRef(end_point_name="target", element_index=1, label="pool:k")
     for bad in (

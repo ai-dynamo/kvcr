@@ -291,7 +291,11 @@ class _RemoteFWDram:
                 kvcr._descriptor_bytes(chain.from_iterable(op.dst_descriptors)),
             )
         try:
-            kvcr._add_block_dependencies(op, new_operation=True)
+            if local_fill:
+                kvcr._add_block_dependencies(op, new_operation=True)
+            else:
+                # Nothing reads block records for keys that are only delivered.
+                kvcr._outstanding_operations += 1
             kvcr._progress.submit(op)
         except Exception:
             if op.trace is not None:
@@ -363,7 +367,7 @@ class _RemoteFWDram:
                 elif item.state is _TargetPullState.QUARANTINED:
                     self._finish_target_pull(item)
                 elif item.state is _TargetPullState.FINISHED and item.uncertain:
-                    self._kvcr._remove_block_dependencies(item)
+                    self._release_target_dependencies(item)
                     if item.local_fill:
                         self._kvcr._complete_local_dram_fill(item.keys, success=False)
                 elif item.state is _TargetPullState.FINISHED:
@@ -417,7 +421,7 @@ class _RemoteFWDram:
             if caller_trace is not None and op.trace is not None:
                 caller_trace.failure_reason = op.trace.failure_reason
             if op.state is not _TargetPullState.QUARANTINED:
-                kvcr._remove_block_dependencies(op)
+                self._release_target_dependencies(op)
             completed_keys = op.completed_keys if op.success else set()
             if kvcr._key_history_enabled:
                 kvcr._log_key_history(
@@ -464,6 +468,12 @@ class _RemoteFWDram:
         finally:
             if trace is not None:
                 trace.tracer.pop(pushed)
+
+    def _release_target_dependencies(self, op: _TargetPullOp) -> None:
+        if op.local_fill:
+            self._kvcr._remove_block_dependencies(op)
+        else:
+            self._kvcr._outstanding_operations -= 1
 
     # -------------------------------------------------------------------------
     # Progress-thread lifecycle and control transport.
