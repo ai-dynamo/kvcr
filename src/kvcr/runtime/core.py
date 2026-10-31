@@ -1140,14 +1140,10 @@ class _KVCRCore:
         agent_name: str | None = None,
         validated: dict[tuple[str, str, bool], RegionDescriptor] | None = None,
     ) -> None:
-        """Check descriptors against registered regions.
-
-        ``validated`` caches single-piece checks by (endpoint, label, framework)
-        for one call; a repeat only needs its element index bounds-checked.
-        """
         if not descriptors:
             raise ValueError("each block requires at least one _TransferRef")
         cache_key = None
+        # Within one deliver(), a repeated destination only needs a bounds check.
         if validated is not None and len(descriptors) == 1:
             ref = descriptors[0]
             if (

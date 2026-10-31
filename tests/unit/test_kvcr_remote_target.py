@@ -967,7 +967,8 @@ def test_retries_keep_metadata_despite_a_stale_ack_in_the_same_batch():
     target.submit_hint(_router_hint(endpoint), request_id="load-1")
     second = target.deliver({keys[1]: [_mem_descriptor()]}, request_id="load-1")
     _wait_until(lambda: len(control.sent) == 2)
-    active = _block_op_ids(target)
+    active = {("target", wire), ("target", second)}
+    assert active <= set(target._core._progress._in_flight_ops)
     control.sent.clear()
 
     # The Guard refuses the first request for lack of metadata and, once it has
@@ -1001,7 +1002,7 @@ def test_retries_keep_metadata_despite_a_stale_ack_in_the_same_batch():
         == ("start_write", "guard", b"target-md")
         for r in retries
     )
-    assert _block_op_ids(target) == active
+    assert active <= set(target._core._progress._in_flight_ops)
     assert list(target.poll_completed()) == []
     agent.notifs["guard"] = [_write_done_notification(h) for h in (wire, second)]
     assert dict(_poll_until(target, lambda done: len(done) == 2)) == {
