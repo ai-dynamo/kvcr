@@ -293,12 +293,18 @@ class _LocalDramPools:
         key_layout: tuple[str, ...],
         *,
         allow_missing: bool = False,
+        unserved: dict[str, list[int]] | None = None,
     ) -> (
         tuple[tuple[int, _LocalDramResidency, tuple[_TransferRef, ...]], ...]
         | Literal[False]
         | None
     ):
-        """Return indexed claims; None retries contention, False uses the caller."""
+        """Return indexed claims; None retries contention, False uses the caller.
+
+        With ``allow_missing``, skipped indices are recorded in ``unserved`` by
+        reason.
+        """
+        skipped = {} if unserved is None else unserved
         state = self._source_state
         if not state.lock.acquire(blocking=False):
             return None
@@ -308,12 +314,14 @@ class _LocalDramPools:
                 residency = state.index.get(key)
                 if residency is None:
                     if allow_missing and key not in state.index:
+                        skipped.setdefault("not_resident", []).append(index)
                         continue
                     return False
                 available = cast(tuple[_TransferRef, ...], residency.refs)
                 if key_layout and key_layout != residency.key_layout:
                     if allow_missing:
                         logger.debug("KVCR start_write layout mismatch key=%r", key)
+                        skipped.setdefault("layout_mismatch", []).append(index)
                         continue
                     return False
                 requested = [ref.label for ref in destination]
@@ -328,6 +336,7 @@ class _LocalDramPools:
                     if indices is None:
                         if allow_missing:
                             logger.debug("KVCR start_write layout mismatch key=%r", key)
+                            skipped.setdefault("layout_mismatch", []).append(index)
                             continue
                         return False
                     refs = tuple(available[index] for index in indices)

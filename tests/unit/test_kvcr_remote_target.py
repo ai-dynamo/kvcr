@@ -33,7 +33,13 @@ from _kvcr_test_utils import (
     _write_done_notification,
 )
 
-from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import (
+    DURATION_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
+)
+from kvcr.backends.remote_ops import _notification_unserved, _write_done_notif
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
@@ -651,7 +657,9 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         target_agent,
         FakePrimaryPinning(),
         target_control,
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
+        KVCRConfig(
+            nixl_agent_name="target", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -659,7 +667,9 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         source_agent,
         source_pinning,
         source_control,
-        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        KVCRConfig(
+            nixl_agent_name="source", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         name="source",
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -688,12 +698,13 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         "op_handle": op_handle,
         "success": True,
         "completed_indices": [],
+        "unserved": {"not_resident": [0]},
     }
 
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
-    assert _poll_until(target, lambda completed: bool(completed)) == [
-        (op_handle, _op_entries({key: False}))
-    ]
+    completed = _poll_until(target, lambda completed: bool(completed))
+    assert completed == [(op_handle, _op_entries({key: False}))]
+    assert completed[0][1][key].reason == "not_resident"
     assert target.query((key, other_group), "req") == [
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -739,6 +750,23 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     ]
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert target.query((key,), "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
+    # A source that holds none of the blocks is a miss, not a failure.
+    source_records = source.get_stats().records
+    target_records = target.get_stats().records
+    assert ("source_write", "miss") in _duration_labels(source_records)
+    assert ("remote_deliver", "miss") in _duration_labels(target_records)
+    assert ("remote_deliver", "failed") not in _duration_labels(target_records)
+    unserved = ("counter", UNSERVED_BLOCKS_METRIC, 1)
+    assert (*unserved, ("source_write", "not_resident")) in source_records
+    assert (*unserved, ("remote_deliver", "not_resident")) in target_records
+
+
+def _duration_labels(records) -> set[tuple[str, ...]]:
+    return {
+        labels
+        for kind, name, _, labels in records
+        if kind == "histogram" and name == DURATION_METRIC
+    }
 
 
 def _probe_ack(handle, source="tcp://source:1", **fields):
@@ -1416,7 +1444,9 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
 
     op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
 
-    assert list(kvcr.poll_completed()) == [(op_handle, _op_entries({key: False}))]
+    completed = list(kvcr.poll_completed())
+    assert completed == [(op_handle, _op_entries({key: False}))]
+    assert completed[0][1][key].reason == "hint_unavailable"
     assert control.sent == []
 
     # A rejected remote attempt must not hide a later local deposit.
@@ -1671,6 +1701,30 @@ def test_remote_framework_dram_transfers_available_keys(
         and completed in event
         for event in events
     )
+    unserved = f"not_resident:{len(missing_indices)}" if missing_indices else "-"
     assert any(
-        "target_transfer_completed" in event and completed in event for event in events
+        "target_transfer_completed" in event
+        and f"requested=3 {completed}" in event
+        and event.endswith(f"unserved={unserved}")
+        for event in events
     )
+    assert any(
+        "source_transfer_completed" in event and event.endswith(f"unserved={unserved}")
+        for event in events
+    )
+
+
+def test_write_done_carries_failure_and_unserved_reasons():
+    failed = _decode_notif(_write_done_notif(7, False, reason="deadline"))
+    assert failed["reason"] == "deadline"
+    served = _decode_notif(
+        _write_done_notif(
+            7, True, (1,), unserved={"pin_failed": [0], "x" * 33: [2], "bad": [9]}
+        )
+    )
+    # Unreported, oversized-reason and out-of-range entries fall back.
+    assert _notification_unserved(served, (b"a", b"b", b"c"), {b"a", b"c", b"d"}) == {
+        b"a": "pin_failed",
+        b"c": "unknown",
+        b"d": "remembered_miss",
+    }

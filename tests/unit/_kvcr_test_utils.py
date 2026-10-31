@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import msgspec
 
@@ -502,8 +502,11 @@ def _write_done_notification(
 def _op_entries(
     entries: Mapping[BlockKey, bool],
 ) -> dict[BlockKey, OpEntryResult]:
+    # Failure reasons are diagnostics; tests that care assert them directly.
     return {
-        key: OpEntryResult(OpEntryStatus.SUCCESS if success else OpEntryStatus.FAILED)
+        key: OpEntryResult(OpEntryStatus.SUCCESS)
+        if success
+        else OpEntryResult(OpEntryStatus.FAILED, reason=ANY)
         for key, success in entries.items()
     }
 

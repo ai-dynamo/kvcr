@@ -41,6 +41,8 @@ class _SourcePinOp(_Op):
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
+    # Keys whose framework pin request errored, as opposed to found nothing.
+    pin_failed_keys: set[BlockKey] = field(default_factory=set)
     nvtx_state: _NvtxState | None = None
 
 
@@ -112,7 +114,14 @@ class _RemoteSources:
         now = self._kvcr._clock()
         for op_id, op in list(self._source_pin_ops.items()):
             if now >= op.deadline:
-                logger.warning("KVCR operation %r expired", op_id)
+                logger.warning(
+                    "KVCR source pin wait timed out op=%d source_op=%d target=%s "
+                    "pending_pins=%d",
+                    op.op_handle,
+                    op_id[1],
+                    op.route[0],
+                    len(op.pending_pin_ids),
+                )
                 self._expire_source_pin(op_id, op)
             elif not op.pending_pin_ids:
                 self._resume_source_pin(op_id, op)
@@ -172,14 +181,24 @@ class _RemoteSources:
         }
         completed_indices = []
         selected_sources = []
+        unserved: dict[str, list[int]] = {}
+        mismatched = 0
         waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
+                # Only a layout mismatch on an earlier pass removes keys.
+                unserved.setdefault("layout_mismatch", []).append(index)
                 continue
             residency = local_sources.get(key)
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
+                reason = (
+                    "pin_failed"
+                    if key in source_pin.pin_failed_keys
+                    else "not_resident"
+                )
+                unserved.setdefault(reason, []).append(index)
                 continue
             labels = [descriptor.label for descriptor in destination]
             layout = (
@@ -205,11 +224,8 @@ class _RemoteSources:
             else:
                 indices = _layout_indices(layout, labels)
             if indices is None:
-                logger.warning(
-                    "KVCR start_write layout mismatch op=%d key=%r",
-                    source_pin.op_handle,
-                    key,
-                )
+                mismatched += 1
+                unserved.setdefault("layout_mismatch", []).append(index)
                 source_pin.keys -= {key}
                 record = kvcr._block_record_map[key]
                 record.discard_in_flight_op(op_id)
@@ -220,6 +236,12 @@ class _RemoteSources:
                 kvcr._local_dram._pools.source_refs(residency, indices)
                 if residency is not None
                 else tuple(source[span] for span in indices)
+            )
+        if mismatched:
+            logger.warning(
+                "KVCR start_write layout mismatch op=%d keys=%d",
+                source_pin.op_handle,
+                mismatched,
             )
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
@@ -247,8 +269,6 @@ class _RemoteSources:
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
 
-        if source_pin.nvtx_state is not None:
-            source_pin.nvtx_state.failure_reason = failure_reason
         source_write = _SourceWriteOp(
             state=(
                 _SourceWriteState.READY_TO_WRITE
@@ -270,6 +290,8 @@ class _RemoteSources:
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
+            failure_reason=failure_reason,
+            unserved=unserved,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = framework_pins
@@ -313,8 +335,9 @@ class _RemoteSources:
                 continue
 
             pin_handle: PinHandle | None = None
+            pin_failed = False
             if result is not None and wait is not None:
-                pin_handle = self._install_framework_pin(wait.keys, result)
+                pin_handle, pin_failed = self._install_framework_pin(wait.keys, result)
             self._record_pending_pin_wait(
                 wait,
                 "success" if pin_handle is not None else "failed",
@@ -331,9 +354,11 @@ class _RemoteSources:
                     else -1
                 ),
             )
-            if pin_handle is not None:
-                for _, op in active_ops:
+            for _, op in active_ops:
+                if pin_handle is not None:
                     op.framework_pins.add(pin_handle)
+                elif pin_failed:
+                    op.pin_failed_keys.update(wait.keys)
             for op_id, op in expired_ops:
                 op.pending_pin_ids.discard(request)
                 self._expire_source_pin(op_id, op)
@@ -619,7 +644,12 @@ class _RemoteSources:
         self,
         keys: Collection[BlockKey],
         pin_result: tuple[PinHandle, Mapping[BlockKey, list[MemoryRef] | None]],
-    ) -> PinHandle | None:
+    ) -> tuple[PinHandle | None, bool]:
+        """Return the installed handle and whether the result was rejected.
+
+        A result with no descriptors means none of the keys are resident; it is
+        released but not counted as a rejection.
+        """
         try:
             pin_handle, descriptors = pin_result
             if not isinstance(pin_handle, str) or not isinstance(descriptors, Mapping):
@@ -647,20 +677,19 @@ class _RemoteSources:
                     continue
                 record.fw_mem = _FwMemResidency(descriptor, pin_handle)
                 pin_keys.add(key)
-            return pin_handle
+            return pin_handle, False
         except Exception as error:
-            if logger.isEnabledFor(logging.DEBUG):
-                # Only expose known validation reasons, not callback data or keys.
-                reason = error.args[0] if error.args else None
-                if type(reason) is not str or reason not in (
-                    "invalid framework pin result",
-                    "request_pin returned incomplete descriptors",
-                    "request_pin returned no descriptors",
-                ):
-                    reason = "descriptor normalization or installation failed"
-                logger.debug("KVCR_EVENT framework_pin_rejected reason=%s", reason)
+            # Only expose known validation reasons, not callback data or keys.
+            reason = error.args[0] if error.args else None
+            if type(reason) is not str or reason not in (
+                "invalid framework pin result",
+                "request_pin returned incomplete descriptors",
+                "request_pin returned no descriptors",
+            ):
+                reason = "descriptor normalization or installation failed"
+            logger.debug("KVCR_EVENT framework_pin_rejected reason=%s", reason)
             self._discard_pin_result(pin_result, keys)
-            return None
+            return None, reason != "request_pin returned no descriptors"
 
     def _acquire_framework_sources(
         self,
@@ -697,6 +726,8 @@ class _RemoteSources:
             pin_request = self._pin_framework_keys(uncovered_keys, op=op)
             if pin_request is not None:
                 pending_pins.append(pin_request)
+            elif op is not None:
+                op.pin_failed_keys.update(uncovered_keys)
             if pending_pins:
                 return _PendingFrameworkSources(
                     pending_pins=tuple(pending_pins),

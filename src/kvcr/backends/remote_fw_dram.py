@@ -30,7 +30,6 @@ from ..runtime.core import (
     logger,
 )
 from ..runtime.progress import (
-    _FAILED_RESULT,
     _SUCCESS_RESULT,
     _KVCRProgress,
     _OpId,
@@ -40,6 +39,8 @@ from ..runtime.progress import (
 from ..types import (
     BlockKey,
     CacheTier,
+    OpEntryResult,
+    OpEntryStatus,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -224,7 +225,8 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
-    ) -> bool:
+    ) -> str | None:
+        """Start the pull, or return why it cannot start."""
         kvcr = self._kvcr
         started_at = kvcr._timer()
         scope = "remote_fetch" if local_fill else "remote_deliver"
@@ -234,12 +236,14 @@ class _RemoteFWDram:
         if current_hint is not None and (
             current_hint.failed or current_hint.missing_keys.issuperset(blocks)
         ):
-            kvcr._record_duration(scope, started_at, "failed")
-            return False
+            kvcr._record_duration(
+                scope, started_at, "failed" if current_hint.failed else "miss"
+            )
+            return "hint_failed" if current_hint.failed else "remembered_miss"
 
         if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
-            return False
+            return "hint_unavailable"
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
@@ -300,7 +304,7 @@ class _RemoteFWDram:
             raise
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
-        return True
+        return None
 
     def deliver(
         self,
@@ -314,20 +318,21 @@ class _RemoteFWDram:
         if not blocks:
             kvcr._complete(op_handle, {})
             return
-        if self._start_target_pull(
+        reason = self._start_target_pull(
             blocks,
             request_id,
             deadline,
             op_handle,
             local_fill=False,
-        ):
+        )
+        if reason is None:
             return
         trace = kvcr._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.reject("target.hint_unavailable", _nvtx.Reason.HINT_UNAVAILABLE)
         kvcr._complete(
             op_handle,
-            dict.fromkeys(blocks, _FAILED_RESULT),
+            dict.fromkeys(blocks, OpEntryResult(OpEntryStatus.FAILED, reason=reason)),
         )
 
     def fetch(
@@ -338,12 +343,15 @@ class _RemoteFWDram:
         *,
         op_handle: OpHandle,
     ) -> bool:
-        return self._start_target_pull(
-            blocks,
-            request_id,
-            deadline,
-            op_handle,
-            local_fill=True,
+        return (
+            self._start_target_pull(
+                blocks,
+                request_id,
+                deadline,
+                op_handle,
+                local_fill=True,
+            )
+            is None
         )
 
     def poll_main(self, items: Collection[object]) -> None:
@@ -457,7 +465,12 @@ class _RemoteFWDram:
             kvcr._complete(
                 cast(OpHandle, op.op_id[1]),
                 {
-                    key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
+                    key: _SUCCESS_RESULT
+                    if key in completed_keys
+                    else OpEntryResult(
+                        OpEntryStatus.FAILED,
+                        reason=op.unserved.get(key) or op.failure_reason,
+                    )
                     for key in op.keys
                 },
             )
@@ -531,7 +544,9 @@ class _RemoteFWDram:
         for (target, handle), status in self._dangling_ops.source_writes.items():
             cached = self._remote_agents_by_target.get(target)
             if not status.submitted and cached is not None:
-                self._send_write_done(self._kvcr._progress, cached[1], handle, False)
+                self._send_write_done(
+                    self._kvcr._progress, cached[1], handle, False, reason="shutdown"
+                )
         self._pending_local_sources.clear()
         close_control = getattr(self._control, "close", None)
         if close_control is not None:
@@ -671,7 +686,10 @@ class _RemoteFWDram:
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
         # start_write make a source write.
-        self._refused_writes[("target", op_handle)] = {"success": False}
+        self._refused_writes[("target", op_handle)] = {
+            "success": False,
+            "reason": payload.reason or "refused",
+        }
 
     def _handle_target_metadata_ack(
         self, progress: _KVCRProgress, payload: _TargetMetadataAck
@@ -740,7 +758,7 @@ class _RemoteFWDram:
             or len(keys) != len(dst_descriptors)
         ):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
-            self._notify_start_write_failure(progress, payload, op_handle)
+            self._notify_start_write_failure(progress, payload, op_handle, "malformed")
             return
 
         remaining_timeout_ms = min(
@@ -768,13 +786,17 @@ class _RemoteFWDram:
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
             )
-            self._notify_start_write_failure(progress, payload, op_handle)
+            self._notify_start_write_failure(
+                progress, payload, op_handle, "setup_failed"
+            )
             return
 
         write_id = (target_agent, OpHandle(op_handle))
         if status := self._dangling_ops.source_writes.get(write_id):
             if status.cancel_requested and not status.submitted:
-                self._send_write_done(progress, remote_agent, op_handle, False)
+                self._send_write_done(
+                    progress, remote_agent, op_handle, False, reason="cancelled"
+                )
             return
         expected = payload.source_incarnation
         if expected is not None and expected != self._dangling_ops.incarnation:
@@ -783,8 +805,8 @@ class _RemoteFWDram:
             self._refuse_start_write(progress, payload, op_handle, "source_restarted")
             return
         if progress._stop_requested or not self._dangling_ops.check_source_progress():
+            reason = "stopping" if progress._stop_requested else "source_stalled"
             if logger.isEnabledFor(logging.DEBUG):
-                reason = "stopping" if progress._stop_requested else "source_stalled"
                 logger.debug(
                     "KVCR_EVENT source_transfer_refused op=%d target=%s "
                     "blocks=%d reason=%s expected_incarnation=%s incarnation=%s",
@@ -795,7 +817,9 @@ class _RemoteFWDram:
                     expected,
                     self._dangling_ops.incarnation,
                 )
-            self._send_write_done(progress, remote_agent, op_handle, False)
+            self._send_write_done(
+                progress, remote_agent, op_handle, False, reason=reason
+            )
             return
         self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
         op_id = ("source", self._next_source_op_id)
@@ -875,12 +899,11 @@ class _RemoteFWDram:
                 op.state = _SourceWriteState.NOTIFY_FAILURE
                 op.source_keys = ()
                 op.dst_descriptors = ()
-                if op.nvtx_state is not None:
-                    op.nvtx_state.failure_reason = (
-                        _nvtx.Reason.DEADLINE
-                        if self._kvcr._clock() >= op.deadline
-                        else _nvtx.Reason.ROUTE_CHANGED
-                    )
+                op.failure_reason = (
+                    _nvtx.Reason.DEADLINE
+                    if self._kvcr._clock() >= op.deadline
+                    else _nvtx.Reason.ROUTE_CHANGED
+                )
                 op.progress(progress, None)
                 observed_work = True
                 continue
@@ -904,21 +927,25 @@ class _RemoteFWDram:
         # Until prepared, the unregistered write retains the original request.
         ordered_keys = source_write.source_keys
         dst_descriptors = source_write.dst_descriptors
+        unserved: dict[str, list[int]] = {}
         if local is None:
             if self._framework_pinning:
                 return False
             selected = ()
+            unserved["not_resident"] = list(range(len(ordered_keys)))
         else:
             selected = local._pools.acquire_readers(
                 ordered_keys,
                 dst_descriptors,
                 key_layout,
                 allow_missing=not self._framework_pinning,
+                unserved=unserved,
             )
         if selected is None:
             return None
         if selected is False:
             return False
+        source_write.unserved = unserved
         completed_indices = tuple(index for index, _, _ in selected)
         if len(selected) != len(ordered_keys):
             ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
@@ -977,7 +1004,7 @@ class _RemoteFWDram:
                 value = payload.get(name)
                 if isinstance(value, str):
                     setattr(peer, name, value)
-        self._notify_start_write_failure(progress, peer, op_handle)
+        self._notify_start_write_failure(progress, peer, op_handle, "malformed")
         return True
 
     def _notify_start_write_failure(
@@ -985,6 +1012,7 @@ class _RemoteFWDram:
         progress: _KVCRProgress,
         payload: _PeerMessage,
         op_handle: OpHandle,
+        reason: str,
     ) -> None:
         # TODO: reuse this request's peer resolution; if it failed, refuse over
         # control instead of retrying setup.
@@ -1007,7 +1035,7 @@ class _RemoteFWDram:
                 progress, payload, op_handle, "metadata_required" if retryable else None
             )
             return
-        self._send_write_done(progress, remote_agent, op_handle, False)
+        self._send_write_done(progress, remote_agent, op_handle, False, reason=reason)
 
     def _refuse_start_write(
         self,
@@ -1231,6 +1259,8 @@ class _RemoteFWDram:
         success: bool,
         *,
         terminal: bool = True,
+        reason: str | None = None,
+        unserved: Mapping[str, list[int]] | None = None,
     ) -> None:
         agent = progress.nixl_agent
         send_notif = getattr(agent, "send_notif", None)
@@ -1242,7 +1272,14 @@ class _RemoteFWDram:
             return
         try:
             result = send_notif(
-                remote_agent, _write_done_notif(op_handle, success, terminal=terminal)
+                remote_agent,
+                _write_done_notif(
+                    op_handle,
+                    success,
+                    terminal=terminal,
+                    reason=reason,
+                    unserved=unserved,
+                ),
             )
         except Exception:
             logger.warning(

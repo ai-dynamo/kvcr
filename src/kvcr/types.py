@@ -102,6 +102,9 @@ class OpEntryResult(msgspec.Struct, frozen=True):
     # Fetch locations in KVCR-owned memory, valid until release.
     descriptors: list[MemoryRef] | None = None
     release_handle: ReleaseHandle | None = None
+    # Diagnostic cause of a non-success, when known: for example "not_resident"
+    # when the source did not hold the block, or "deadline" for a timeout.
+    reason: str | None = None
 
     @property
     def success(self) -> bool:

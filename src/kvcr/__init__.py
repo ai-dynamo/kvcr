@@ -9,6 +9,7 @@ from .api import (
     STATE_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
     KVCRBindings,
 )
 from .hints import ROUTER_HINT_CAPABILITIES, ROUTER_HINT_KEY
@@ -30,6 +31,7 @@ __all__ = [
     "STATE_METRIC",
     "TRANSFER_BLOCKS_METRIC",
     "TRANSFER_BYTES_METRIC",
+    "UNSERVED_BLOCKS_METRIC",
     "KVCRBindings",
     "KVCRClient",
     "KVCRMsgFramingError",

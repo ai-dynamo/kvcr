@@ -30,7 +30,12 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
-from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import (
+    DURATION_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
+)
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -64,7 +69,11 @@ def test_framework_pin_rejection_diagnostic(
         argument.__eq__.return_value = True
         argument.__str__.return_value = "private callback data"
     remote._kvcr._normalize_descriptors.side_effect = ValueError(argument)
-    assert _RemoteSources._install_framework_pin(remote, [b"key"], result) is None
+    rejected = reason != "request_pin returned no descriptors"
+    assert _RemoteSources._install_framework_pin(remote, [b"key"], result) == (
+        None,
+        rejected,
+    )
     remote._discard_pin_result.assert_called_once_with(result, [b"key"])
     assert (reason in caplog.text) == (level == logging.DEBUG)
     assert "private callback data" not in caplog.text
@@ -87,17 +96,24 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "keys,completed_indices,source_case",
+    "keys,completed_indices,source_case,unserved",
     [
-        ([b"local"], [0], "ready"),
-        ([b"missing", b"local", b"absent"], [1], "ready"),
-        ([b"missing"], [], "ready"),
-        ([b"local"], [], "no_local"),
-        ([b"local"], [], "key_layout"),
-        ([b"local"], [], "requested_labels"),
+        ([b"local"], [0], "ready", {}),
+        (
+            [b"missing", b"local", b"absent"],
+            [1],
+            "ready",
+            {"not_resident": [0, 2]},
+        ),
+        ([b"missing"], [], "ready", {"not_resident": [0]}),
+        ([b"local"], [], "no_local", {"not_resident": [0]}),
+        ([b"local"], [], "key_layout", {"layout_mismatch": [0]}),
+        ([b"local"], [], "requested_labels", {"layout_mismatch": [0]}),
     ],
 )
-def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_caplog):
+def test_framework_pinning_disabled(
+    keys, completed_indices, source_case, unserved, kvcr_caplog
+):
     kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram_pools")
     pinning = SimpleNamespace(
         request_pin=None,
@@ -110,6 +126,9 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
         agent,
         pinning,
         control,
+        KVCRConfig(
+            nixl_agent_name="source", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         name="source",
         framework_regions=[_buffer_region(memory, 16)],
         local_dram=(
@@ -150,10 +169,17 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
         "op_handle": 12,
         "success": True,
         "completed_indices": completed_indices,
+        **({"unserved": unserved} if unserved else {}),
     }
     if completed_indices:
         assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    records = source.get_stats().records
+    assert [
+        (labels[1], value)
+        for kind, name, value, labels in records
+        if name == UNSERVED_BLOCKS_METRIC
+    ] == [(reason, len(indices)) for reason, indices in unserved.items()]
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (
@@ -415,11 +441,12 @@ def test_local_source_waits_for_declared_pieces(
     assert not source._core._local_dram_sources_by_op
     assert residency.claim_count == 0
     assert pinning.searches == ([rejected] if mixed else [])
+    # One warning per operation, without key bytes.
     assert [
         record.args[1]
         for record in caplog.records
         if "start_write layout mismatch" in record.message
-    ] == list(rejected)
+    ] == ([len(rejected)] if rejected else [])
 
 
 @pytest.mark.parametrize(
@@ -481,6 +508,12 @@ def test_local_source_retries_after_reader_contention(outcome):
                     "type": "write_done",
                     "op_handle": 12,
                     "success": False,
+                    "reason": {
+                        "deadline": "deadline",
+                        "cancel": "cancelled",
+                        "route": "route_changed",
+                        "shutdown": "shutdown",
+                    }[outcome],
                 }
                 assert len(agent.xfers) == 1
 
@@ -566,6 +599,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         "type": "write_done",
         "op_handle": 9,
         "success": False,
+        "reason": "deadline",
     }
 
 
@@ -687,7 +721,12 @@ def test_kvcr_close_cleans_pending_pin_operations():
     source.close()
 
     assert notifications_at_close == [
-        {"type": "write_done", "op_handle": handle, "success": False}
+        {
+            "type": "write_done",
+            "op_handle": handle,
+            "success": False,
+            "reason": "shutdown",
+        }
         for handle in (1, 2)
     ]
     assert agent.xfers == []
@@ -739,7 +778,9 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog, field, value):
 
     assert not pinning.searches
     assert not source_agent.xfers
-    assert _decode_notif(source_agent.sent_notifs[0][1]) == {
+    notification = _decode_notif(source_agent.sent_notifs[0][1])
+    assert notification.pop("reason") in ("malformed", "setup_failed")
+    assert notification == {
         "type": "write_done",
         "op_handle": 6,
         "success": False,
@@ -791,6 +832,7 @@ def test_malformed_peer_preserves_route(kvcr_caplog, field, cached, with_metadat
             "type": "write_done",
             "op_handle": 6,
             "success": False,
+            "reason": "malformed",
         }
     else:
         assert not agent.sent_notifs
@@ -913,6 +955,7 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         "type": "write_done",
         "op_handle": 5,
         "success": False,
+        "reason": "create_error" if failure == "initialize" else "transfer_failed",
     }
     assert source_agent.released_xfers == ([] if failure == "initialize" else [1])
     assert not _has_outstanding_operations(kvcr)
@@ -1231,6 +1274,7 @@ def test_framework_reacquisition_waits_for_pin_release(expires: bool) -> None:
             "type": "write_done",
             "op_handle": 2,
             "success": False,
+            "reason": "deadline",
         }
         assert pinning.searches == [(key,)]
 
@@ -1323,6 +1367,7 @@ def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(kvcr_caplog
         "type": "write_done",
         "op_handle": 5,
         "success": False,
+        "reason": "transfer_failed",
     }
     warnings = [rec for rec in kvcr_caplog.records if rec.levelno == logging.WARNING]
     assert any("transfer progress failed" in rec.getMessage() for rec in warnings)
