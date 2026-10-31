@@ -5,7 +5,7 @@
 import heapq
 import logging
 import math
-from collections.abc import Collection, Generator
+from collections.abc import Callable, Collection, Generator
 
 from ..policy import KVCachePolicy
 from ..types import (
@@ -160,6 +160,9 @@ class _EvictionQueue:
     def __len__(self) -> int:
         return len(self._live)
 
+    def __contains__(self, key: BlockKey) -> bool:
+        return key in self._live
+
     def score(self, key: BlockKey) -> float | None:
         entry = self._live.get(key)
         return entry[0] if entry is not None else None
@@ -188,9 +191,15 @@ class _EvictionQueue:
         return self._live.pop(key, None) is not None
 
     def candidates(
-        self, excluded: frozenset[BlockKey]
+        self,
+        excluded: frozenset[BlockKey],
+        refresh: Callable[[BlockKey], None] | None = None,
     ) -> Generator[BlockKey, None, None]:
-        """Visit each key once in score order; close to restore live entries."""
+        """Visit each key once in score order; close to restore live entries.
+
+        refresh may re-insert a key before it is visited; a key whose score
+        changed is then visited at its new rank in the same pass.
+        """
         # Reuse the immutable exclusion set to avoid copying it for each allocation.
         seen: set[BlockKey] = set()
         skipped: list[tuple[float, int, BlockKey]] = []
@@ -200,6 +209,10 @@ class _EvictionQueue:
                 key = item[2]
                 if self._live.get(key) is not item:
                     continue
+                if refresh is not None and key not in excluded and key not in seen:
+                    refresh(key)
+                    if self._live.get(key) is not item:
+                        continue
                 skipped.append(item)
                 if key not in excluded and key not in seen:
                     seen.add(key)

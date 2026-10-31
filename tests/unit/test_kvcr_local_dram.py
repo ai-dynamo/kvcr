@@ -711,6 +711,24 @@ def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     assert list(queue.candidates(frozenset())) == [first, excluded, churned]
 
 
+def test_eviction_candidates_visit_refreshed_keys_at_their_new_rank() -> None:
+    queue = _EvictionQueue()
+    served, kept, other = (BlockKey(name) for name in (b"served", b"kept", b"other"))
+    queue.insert(served, 0)
+    queue.insert(kept, 1)
+    queue.insert(other, 2)
+    refreshed = []
+
+    def refresh(key):
+        refreshed.append(key)
+        if key == served:
+            queue.insert(served, 3)
+
+    assert list(queue.candidates(frozenset(), refresh)) == [kept, other, served]
+    assert refreshed == [served, kept, other, served]
+    assert list(queue.candidates(frozenset())) == [kept, other, served]
+
+
 def test_lru_float_score_uses_small_tail_first_bias() -> None:
     policy = _PolicyInvoker(LRUPolicy())
 
@@ -911,6 +929,64 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("served_at", "evicted"),
+    [(1.0, "served"), (3.0, "newer")],
+    ids=["served-before-newer", "served-after-newer"],
+)
+def test_served_sources_are_rescored_when_eviction_reaches_them(served_at, evicted):
+    scored = []
+
+    class RecordingLRUPolicy(LRUPolicy):
+        def eviction_score(self, meta, source):
+            scored.append(meta.block_key)
+            return super().eviction_score(meta, source)
+
+    primary = ctypes.create_string_buffer(48)
+    memory = ctypes.create_string_buffer(32)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        policy=RecordingLRUPolicy(),
+    )
+    local = kvcr._core._local_dram._pools
+    served, newer, incoming = map(BlockKey, (b"served", b"newer", b"incoming"))
+    now = 0.0
+    kvcr._core._clock = lambda: now
+
+    def deposit(key, index):
+        op = kvcr.deposit({key: [_mem_descriptor(index)]})
+        assert _poll_until(kvcr, bool) == [(op, _op_entries({key: True}))]
+
+    def serve():
+        destination = ((progress_module._TransferRef("target", 0),),)
+        ((_, residency, _),) = local.acquire_readers((served,), destination, ())
+        local.release_readers((served,), (residency,), success=True)
+        scored.clear()
+        local._drain_source_completions()
+        assert scored == []
+
+    deposit(served, 0)
+    for now in sorted((served_at, 2.0)):
+        serve() if now == served_at else deposit(newer, 1)
+
+    now = 4.0
+    scored.clear()
+    deposit(incoming, 2)
+    assert scored == [served, incoming]
+    assert kvcr.query((served, newer, incoming)) == [
+        (QueryStatus.MISS, None)
+        if name == evicted
+        else (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        for name in ("served", "newer", "incoming")
     ]
 
 
