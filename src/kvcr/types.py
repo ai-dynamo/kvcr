@@ -98,7 +98,7 @@ class OpEntryStatus(Enum):
     SRC_MISS = "SRC_MISS"
     KNOWN_MISS = "KNOWN_MISS"
     NO_HINT = "NO_HINT"
-    HINT_ERR = "HINT_ERR"
+    HINT_STALE = "HINT_STALE"
     PIN_ERR = "PIN_ERR"
     BAD_LAYOUT = "BAD_LAYOUT"
 

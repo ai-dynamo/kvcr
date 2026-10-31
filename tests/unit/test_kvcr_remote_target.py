@@ -1532,7 +1532,7 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
     kvcr.submit_hint(_router_hint("tcp://different:1"), request_id="req-a")
     assert kvcr.query((key,), "req-a") == [(QueryStatus.MISS, None)]
     failed = kvcr.deliver({key: [_mem_descriptor(0, ":a")]}, "req-a")
-    assert dict(_poll_until(kvcr, bool))[failed][key].status is OpEntryStatus.HINT_ERR
+    assert dict(_poll_until(kvcr, bool))[failed][key].status is OpEntryStatus.HINT_STALE
     kvcr.discard_hint("req-a")
     assert kvcr.query((key,), "req-a") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert kvcr.query((key,), "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
@@ -1809,7 +1809,7 @@ def test_remembered_miss_survives_a_failed_pull():
     kvcr.deliver({missing: [_mem_descriptor()]}, "no-hint")
     _poll_until(kvcr, lambda done: len(done) == 2)
     assert _unserved_counts(kvcr) == {
-        ("remote_deliver", "hint_failed"): 1,
+        ("remote_deliver", "hint_invalidated"): 1,
         ("remote_deliver", "hint_unavailable"): 1,
     }
 

@@ -77,7 +77,7 @@ _STATUS_BY_REASON = {
     _nvtx.Reason.NOT_RESIDENT: OpEntryStatus.SRC_MISS,
     _nvtx.Reason.REMEMBERED_MISS: OpEntryStatus.KNOWN_MISS,
     _nvtx.Reason.HINT_UNAVAILABLE: OpEntryStatus.NO_HINT,
-    _nvtx.Reason.HINT_FAILED: OpEntryStatus.HINT_ERR,
+    _nvtx.Reason.HINT_INVALIDATED: OpEntryStatus.HINT_STALE,
     _nvtx.Reason.PIN_FAILED: OpEntryStatus.PIN_ERR,
     _nvtx.Reason.LAYOUT_MISMATCH: OpEntryStatus.BAD_LAYOUT,
     _nvtx.Reason.DEADLINE: OpEntryStatus.TIMEOUT,
@@ -271,7 +271,7 @@ class _RemoteFWDram:
             return self._count_rejected(
                 scope,
                 blocks,
-                _nvtx.Reason.HINT_FAILED
+                _nvtx.Reason.HINT_INVALIDATED
                 if current_hint.failed
                 else _nvtx.Reason.REMEMBERED_MISS,
             )

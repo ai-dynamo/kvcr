@@ -427,7 +427,7 @@ def test_failed_hint_rejection_names_its_reason(recording):
     kvcr.deliver({key: [_mem_descriptor()]}, "req")
     assert not list(kvcr.poll_completed())[0][1][key].success
     [rejected] = payloads(recording, "target.rejected")
-    assert int(rejected["reason"]) == _nvtx.Reason.HINT_FAILED
+    assert int(rejected["reason"]) == _nvtx.Reason.HINT_INVALIDATED
 
 
 @pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "end"])

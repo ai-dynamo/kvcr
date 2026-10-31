@@ -931,7 +931,7 @@ class _KVCRCore:
                     "query_ordinal=%d sample_cap=4 sample_scope=request_lru128 "
                     "local_ready=%d local_filling=%d g3_fetchable=%d "
                     "remote_fetchable=%d misses=%d opportunistic=%s "
-                    "hint_present=%s hint_failed=%s",
+                    "hint_present=%s hint_invalidated=%s",
                     request_id,
                     self.nixl_agent_name,
                     len(statuses),
