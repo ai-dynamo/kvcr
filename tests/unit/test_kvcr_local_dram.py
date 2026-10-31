@@ -711,6 +711,25 @@ def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     assert list(queue.candidates(frozenset())) == [first, excluded, churned]
 
 
+def test_eviction_candidates_visit_rescored_keys_at_their_new_rank() -> None:
+    queue = _EvictionQueue()
+    served, kept, other = (BlockKey(name) for name in (b"served", b"kept", b"other"))
+    queue.insert(served, 0)
+    queue.insert(kept, 1)
+    queue.insert(other, 2)
+    rescored = []
+
+    def rescore(key):
+        rescored.append(key)
+        queue.insert(key, 3)
+
+    assert queue.mark_stale(served)
+    assert list(queue.candidates(frozenset(), rescore)) == [kept, other, served]
+    assert rescored == [served]
+    assert list(queue.candidates(frozenset(), rescore)) == [kept, other, served]
+    assert rescored == [served]
+
+
 def test_lru_float_score_uses_small_tail_first_bias() -> None:
     policy = _PolicyInvoker(LRUPolicy())
 
@@ -911,6 +930,71 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("served_at", "held", "evicted"),
+    [(1.0, False, "served"), (3.0, False, "newer"), (1.0, True, "newer")],
+    ids=["served-before-newer", "served-after-newer", "reader-still-held"],
+)
+def test_served_sources_are_rescored_when_eviction_reaches_them(
+    served_at, held, evicted
+):
+    scored = []
+
+    class RecordingLRUPolicy(LRUPolicy):
+        def eviction_score(self, meta, source):
+            scored.append(meta.block_key)
+            return super().eviction_score(meta, source)
+
+    primary = ctypes.create_string_buffer(48)
+    memory = ctypes.create_string_buffer(32)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        policy=RecordingLRUPolicy(),
+    )
+    local = kvcr._core._local_dram._pools
+    served, newer, incoming = map(BlockKey, (b"served", b"newer", b"incoming"))
+    now = 0.0
+    kvcr._core._clock = lambda: now
+
+    def deposit(key, index):
+        op = kvcr.deposit({key: [_mem_descriptor(index)]})
+        assert _poll_until(kvcr, bool) == [(op, _op_entries({key: True}))]
+
+    def serve():
+        destination = ((progress_module._TransferRef("target", 0),),)
+        for _ in range(1 + held):
+            ((_, residency, _),) = local.acquire_readers((served,), destination, ())
+        local.release_readers((served,), (residency,), success=True)
+        scored.clear()
+        local._drain_source_completions()
+        assert scored == []
+
+    deposit(served, 0)
+    for now in sorted((served_at, 2.0)):
+        if now == served_at:
+            serve()
+        else:
+            deposit(newer, 1)
+
+    now = 4.0
+    scored.clear()
+    deposit(incoming, 2)
+    # A block still being read is not rescored, and cannot be evicted.
+    assert scored == ([incoming] if held else [served, incoming])
+    assert kvcr.query((served, newer, incoming)) == [
+        (QueryStatus.MISS, None)
+        if name == evicted
+        else (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        for name in ("served", "newer", "incoming")
     ]
 
 

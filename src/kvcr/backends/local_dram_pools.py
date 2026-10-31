@@ -370,6 +370,7 @@ class _LocalDramPools:
                     break
                 if success:
                     self._kvcr._record_access(keys)
+                released = []
                 with state.lock:
                     for key, residency in zip(keys, sources):
                         if residency.source_readers <= 0:
@@ -379,13 +380,17 @@ class _LocalDramPools:
                         residency.source_readers -= 1
                         if not residency.source_readers:
                             state.active.pop(key)
-                for key, residency in zip(keys, sources):
+                            released.append((key, residency))
+                for key, residency in released:
                     record = self._kvcr._block_record_map.get(key)
                     if (
-                        record is not None
-                        and record.local_dram is residency
-                        and not residency.claim_count
+                        record is None
+                        or record.local_dram is not residency
+                        or residency.claim_count
                     ):
+                        continue
+                    # Reads leave queued sources in place; eviction rescores them.
+                    if not self._evictable.mark_stale(key):
                         freed |= self._after_last_claim(key, residency)
         finally:
             self._draining_source_completions = False
@@ -686,7 +691,9 @@ class _LocalDramPools:
 
         deficient = short()
         state = self._source_state
-        with closing(self._evictable.candidates(protected)) as candidates:
+        with closing(
+            self._evictable.candidates(protected, self._make_evictable)
+        ) as candidates:
             while deficient:
                 key = next(candidates, None)
                 if key is None:
