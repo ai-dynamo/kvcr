@@ -124,7 +124,7 @@ def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording, requ
     assert not recording.stack
 
 
-@pytest.mark.parametrize("finish", ["success", "failed", "timeout", "cancelled"])
+@pytest.mark.parametrize("finish", ["success", "miss", "timeout", "cancelled"])
 def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     source, agent, pinning = make_source()
     backend = source._core._remote_fw_dram
@@ -132,7 +132,7 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     if finish == "success":
         pinning.complete(0)
         _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    elif finish == "failed":
+    elif finish == "miss":
         pinning.completed.append((0, None))
         _poll_until(source, lambda _: not backend._sources._pending_pin_ops)
     elif finish == "timeout":
@@ -148,13 +148,13 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     assert int(completed[0]["status"]) == int(
         {
             "success": _nvtx.Status.SUCCESS,
-            "failed": _nvtx.Status.FAILED,
+            "miss": _nvtx.Status.FAILED,
             "timeout": _nvtx.Status.TIMEOUT,
             "cancelled": _nvtx.Status.CANCELLED,
         }[finish]
     )
-    if finish == "failed":
-        assert int(completed[0]["reason"]) == int(_nvtx.Reason.UNKNOWN)
+    if finish == "miss":
+        assert int(completed[0]["reason"]) == int(_nvtx.Reason.NOT_RESIDENT)
     assert not recording.stack
 
 

@@ -14,8 +14,14 @@ import msgspec
 
 from .. import _nvtx
 from ..runtime.core import TRANSFER_BLOCKS_METRIC, UNSERVED_BLOCKS_METRIC, logger
-from ..runtime.progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
-from ..types import BlockKey, OpHandle
+from ..runtime.progress import (
+    _FAILED_RESULT,
+    _KVCRProgress,
+    _ProgressOp,
+    _RegionMaps,
+    _TransferRef,
+)
+from ..types import BlockKey, OpEntryResult, OpEntryStatus, OpHandle
 
 if TYPE_CHECKING:
     from .local_dram_pools import _LocalDramResidency
@@ -73,6 +79,48 @@ _ControlMessage = (
     | _WriteProbeAck
 )
 _CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
+
+
+# Wire, log and metric reasons stay finer; callers get the status. Unlisted
+# reasons, including unknown peer-sent ones, are FAILED.
+_STATUS_BY_REASON = {
+    _nvtx.Reason.NOT_RESIDENT: OpEntryStatus.SRC_MISS,
+    _nvtx.Reason.REMEMBERED_MISS: OpEntryStatus.KNOWN_MISS,
+    _nvtx.Reason.HINT_UNAVAILABLE: OpEntryStatus.NO_HINT,
+    _nvtx.Reason.HINT_INVALIDATED: OpEntryStatus.HINT_STALE,
+    _nvtx.Reason.PIN_FAILED: OpEntryStatus.PIN_ERR,
+    _nvtx.Reason.LAYOUT_MISMATCH: OpEntryStatus.BAD_LAYOUT,
+    _nvtx.Reason.DEADLINE: OpEntryStatus.TIMEOUT,
+    _nvtx.Reason.SOURCE_STALLED: OpEntryStatus.TIMEOUT,
+    _nvtx.Reason.CANCELLED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.STOPPING: OpEntryStatus.ABORTED,
+    _nvtx.Reason.SHUTDOWN: OpEntryStatus.ABORTED,
+    _nvtx.Reason.ROUTE_CHANGED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.REFUSED: OpEntryStatus.ABORTED,
+}
+_FAILED_RESULTS = {
+    reason.wire: OpEntryResult(status) for reason, status in _STATUS_BY_REASON.items()
+}
+
+
+# Duration result labels name the outcome, so "failed" stays for real faults.
+_OUTCOME_BY_STATUS = {
+    OpEntryStatus.SRC_MISS: "miss",
+    OpEntryStatus.KNOWN_MISS: "miss",
+    OpEntryStatus.NO_HINT: "unavailable",
+    OpEntryStatus.HINT_STALE: "unavailable",
+    OpEntryStatus.BAD_LAYOUT: "incompatible",
+    OpEntryStatus.TIMEOUT: "timeout",
+    OpEntryStatus.ABORTED: "aborted",
+}
+
+
+def _failed_result(reason: str | None) -> OpEntryResult:
+    return _FAILED_RESULTS.get(reason or "", _FAILED_RESULT)
+
+
+def _outcome(reason: str | None) -> str:
+    return _OUTCOME_BY_STATUS.get(_failed_result(reason).status, "failed")
 
 
 class _TargetPullState(Enum):
@@ -173,7 +221,7 @@ class _TargetPullOp(_RemoteOp):
                 self.success = False
                 self.failure_reason = _nvtx.Reason.DEADLINE.wire
                 self.state = _TargetPullState.FINISHED
-                backend._record_progress_duration(scope, self.started_at, "failed")
+                backend._record_progress_duration(scope, self.started_at, "timeout")
                 self._record_unserved(scope)
                 return True, True
             sent = backend._send_control(
@@ -299,7 +347,7 @@ class _TargetPullOp(_RemoteOp):
                 if completed_keys
                 else "miss"
                 if success
-                else "failed"
+                else _outcome(self.failure_reason)
             )
             backend._record_progress_duration(scope, self.started_at, result)
             unserved_counts = self._record_unserved(scope)
@@ -346,7 +394,7 @@ class _TargetPullOp(_RemoteOp):
                         retain_cause=True,
                     )
                 backend._dangling_ops.poll_target(progress, self)
-                backend._record_progress_duration(scope, self.started_at, "failed")
+                backend._record_progress_duration(scope, self.started_at, "timeout")
                 return False, True
             self.failure_reason = (
                 (_known_reason(event.get("reason")) or _nvtx.Reason.REMOTE_FAILURE.wire)
@@ -469,12 +517,11 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 self.success = False
                 self.state = _SourceWriteState.FINISHED
+                wire_reason = _wire_reason(failure_reason) or _nvtx.Reason.UNKNOWN.wire
                 backend._record_progress_duration(
-                    "source_write", self.started_at, "failed"
+                    "source_write", self.started_at, _outcome(wire_reason)
                 )
-                self._record_unserved(
-                    _wire_reason(failure_reason) or _nvtx.Reason.UNKNOWN.wire
-                )
+                self._record_unserved(wire_reason)
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
                     trace.complete_source(False, 0, reason=failure_reason)
@@ -616,7 +663,7 @@ class _SourceWriteOp(_RemoteOp):
                 False,
                 reason=failure_reason,
             )
-        result = "success" if self.success else "failed"
+        result = "success" if self.success else _outcome(failure_reason)
         backend._record_progress_duration("source_write", self.started_at, result)
         self._record_unserved(failure_reason)
         self._log_completed(result)

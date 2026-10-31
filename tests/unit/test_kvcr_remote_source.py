@@ -54,7 +54,7 @@ from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
     [
         ((None, {}), "invalid framework pin result"),
         (("pin", {}), "request_pin returned incomplete descriptors"),
-        (("pin", {b"key": None}), "request_pin returned no descriptors"),
+        (("pin", {b"key": None}), "framework_pin_empty keys=1"),
         (("pin", {b"key": []}), "descriptor normalization or installation failed"),
     ],
 )
@@ -69,7 +69,7 @@ def test_framework_pin_rejection_diagnostic(
         argument.__eq__.return_value = True
         argument.__str__.return_value = "private callback data"
     remote._kvcr._normalize_descriptors.side_effect = ValueError(argument)
-    rejected = reason != "request_pin returned no descriptors"
+    rejected = reason != "framework_pin_empty keys=1"
     assert _RemoteSources._install_framework_pin(remote, [b"key"], result) == (
         None,
         rejected,

@@ -1798,7 +1798,11 @@ def test_remembered_miss_survives_a_failed_pull():
     assert results[served].status is OpEntryStatus.TIMEOUT
     assert results[missing].status is OpEntryStatus.KNOWN_MISS
     # Every requested key is counted once, by its own reason.
-    assert _unserved_counts(kvcr) == {
+    records = kvcr.get_stats().records
+    # A source timeout is labelled as one, not as a failure.
+    assert ("remote_deliver", "timeout") in _duration_labels(records)
+    assert ("remote_deliver", "failed") not in _duration_labels(records)
+    assert _unserved_counts(records) == {
         ("remote_deliver", "unknown"): 1,
         ("remote_deliver", "remembered_miss"): 1,
         ("remote_deliver", "deadline"): 1,
@@ -1808,15 +1812,18 @@ def test_remembered_miss_survives_a_failed_pull():
     kvcr.deliver({missing: [_mem_descriptor()]}, "req")
     kvcr.deliver({missing: [_mem_descriptor()]}, "no-hint")
     _poll_until(kvcr, lambda done: len(done) == 2)
-    assert _unserved_counts(kvcr) == {
+    records = kvcr.get_stats().records
+    assert ("remote_deliver", "unavailable") in _duration_labels(records)
+    assert ("remote_deliver", "failed") not in _duration_labels(records)
+    assert _unserved_counts(records) == {
         ("remote_deliver", "hint_invalidated"): 1,
         ("remote_deliver", "hint_unavailable"): 1,
     }
 
 
-def _unserved_counts(kvcr) -> dict[tuple[str, ...], int]:
+def _unserved_counts(records) -> dict[tuple[str, ...], int]:
     counts: dict[tuple[str, ...], int] = {}
-    for _, name, value, labels in kvcr.get_stats().records:
+    for _, name, value, labels in records:
         if name == UNSERVED_BLOCKS_METRIC:
             counts[labels] = counts.get(labels, 0) + value
     return counts

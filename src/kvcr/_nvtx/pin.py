@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 _PIN_RESULTS = {
     "success": (Status.SUCCESS, Reason.NONE),
     "failed": (Status.FAILED, Reason.UNKNOWN),
+    "miss": (Status.FAILED, Reason.NOT_RESIDENT),
     "timeout": (Status.TIMEOUT, Reason.DEADLINE),
     "cancelled": (Status.CANCELLED, Reason.CANCELLED),
 }

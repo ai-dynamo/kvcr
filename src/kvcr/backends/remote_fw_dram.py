@@ -31,7 +31,6 @@ from ..runtime.core import (
     logger,
 )
 from ..runtime.progress import (
-    _FAILED_RESULT,
     _SUCCESS_RESULT,
     _KVCRProgress,
     _OpId,
@@ -42,7 +41,6 @@ from ..types import (
     BlockKey,
     CacheTier,
     OpEntryResult,
-    OpEntryStatus,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -50,8 +48,10 @@ from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
     _decode_notif,
+    _failed_result,
     _nvtx_reason,
     _NvtxState,
+    _outcome,
     _PeerMessage,
     _SourceWriteOp,
     _SourceWriteState,
@@ -69,32 +69,6 @@ from .remote_sources import _RemoteSources, _SourcePinOp
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
-
-
-# Wire, log and metric reasons stay finer; callers get the status. Unlisted
-# reasons, including unknown peer-sent ones, are FAILED.
-_STATUS_BY_REASON = {
-    _nvtx.Reason.NOT_RESIDENT: OpEntryStatus.SRC_MISS,
-    _nvtx.Reason.REMEMBERED_MISS: OpEntryStatus.KNOWN_MISS,
-    _nvtx.Reason.HINT_UNAVAILABLE: OpEntryStatus.NO_HINT,
-    _nvtx.Reason.HINT_INVALIDATED: OpEntryStatus.HINT_STALE,
-    _nvtx.Reason.PIN_FAILED: OpEntryStatus.PIN_ERR,
-    _nvtx.Reason.LAYOUT_MISMATCH: OpEntryStatus.BAD_LAYOUT,
-    _nvtx.Reason.DEADLINE: OpEntryStatus.TIMEOUT,
-    _nvtx.Reason.SOURCE_STALLED: OpEntryStatus.TIMEOUT,
-    _nvtx.Reason.CANCELLED: OpEntryStatus.ABORTED,
-    _nvtx.Reason.STOPPING: OpEntryStatus.ABORTED,
-    _nvtx.Reason.SHUTDOWN: OpEntryStatus.ABORTED,
-    _nvtx.Reason.ROUTE_CHANGED: OpEntryStatus.ABORTED,
-    _nvtx.Reason.REFUSED: OpEntryStatus.ABORTED,
-}
-_FAILED_RESULTS = {
-    reason.wire: OpEntryResult(status) for reason, status in _STATUS_BY_REASON.items()
-}
-
-
-def _failed_result(reason: str | None) -> OpEntryResult:
-    return _FAILED_RESULTS.get(reason or "", _FAILED_RESULT)
 
 
 @dataclass(frozen=True)
@@ -265,11 +239,9 @@ class _RemoteFWDram:
         if current_hint is not None and (
             current_hint.failed or current_hint.missing_keys.issuperset(blocks)
         ):
-            kvcr._record_duration(
-                scope, started_at, "failed" if current_hint.failed else "miss"
-            )
-            return self._count_rejected(
+            return self._reject_pull(
                 scope,
+                started_at,
                 blocks,
                 _nvtx.Reason.HINT_INVALIDATED
                 if current_hint.failed
@@ -277,8 +249,9 @@ class _RemoteFWDram:
             )
 
         if current_hint is None or current_hint.source is None:
-            kvcr._record_duration(scope, started_at, "failed")
-            return self._count_rejected(scope, blocks, _nvtx.Reason.HINT_UNAVAILABLE)
+            return self._reject_pull(
+                scope, started_at, blocks, _nvtx.Reason.HINT_UNAVAILABLE
+            )
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
@@ -346,9 +319,14 @@ class _RemoteFWDram:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
         return None
 
-    def _count_rejected(
-        self, scope: str, blocks: Collection[BlockKey], reason: _nvtx.Reason
+    def _reject_pull(
+        self,
+        scope: str,
+        started_at: float | None,
+        blocks: Collection[BlockKey],
+        reason: _nvtx.Reason,
     ) -> str:
+        self._kvcr._record_duration(scope, started_at, _outcome(reason.wire))
         stats = self._kvcr._stats
         if stats is not None:
             stats.increase_counter(

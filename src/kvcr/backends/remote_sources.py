@@ -338,15 +338,20 @@ class _RemoteSources:
             pin_failed = False
             if result is not None and wait is not None:
                 pin_handle, pin_failed = self._install_framework_pin(wait.keys, result)
+            # A rejected result is a framework fault; no descriptors is a miss.
             self._record_pending_pin_wait(
                 wait,
-                "success" if pin_handle is not None else "failed",
+                "success"
+                if pin_handle is not None
+                else "failed"
+                if pin_failed
+                else "miss",
                 reason=(
                     _nvtx.Reason.NONE
                     if pin_handle is not None
-                    else _nvtx.Reason.UNKNOWN
-                    if result is None
                     else _nvtx.Reason.INVALID_RESULT
+                    if pin_failed
+                    else _nvtx.Reason.NOT_RESIDENT
                 ),
                 completed_blocks=(
                     _nvtx.pin_result_blocks(result)
@@ -688,10 +693,7 @@ class _RemoteSources:
             logger.debug("KVCR_EVENT framework_pin_rejected reason=%s", reason)
             self._discard_pin_result(pin_result, keys)
             return None, True
-        logger.debug(
-            "KVCR_EVENT framework_pin_rejected reason=%s",
-            "request_pin returned no descriptors",
-        )
+        logger.debug("KVCR_EVENT framework_pin_empty keys=%d", len(keys))
         self._discard_pin_result(pin_result, keys)
         return None, False
 
