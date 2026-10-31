@@ -1461,7 +1461,10 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
             "tcp://source-A:1",
             "tcp://source-B:1",
         ]
-        assert {("target", handle) for handle in handles} <= _block_op_ids(kvcr)
+        # Remote deliveries are tracked per operation, not on block records.
+        in_flight = {("target", handle) for handle in handles}
+        assert in_flight <= set(kvcr._core._progress._in_flight_ops)
+        assert in_flight.isdisjoint(_block_op_ids(kvcr))
         agent.notifs["source"] = [
             _write_done_notification(handle) for handle in handles
         ]
