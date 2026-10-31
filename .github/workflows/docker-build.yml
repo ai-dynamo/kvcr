@@ -15,7 +15,7 @@ on:
       - pyproject.toml
       - src/**
       - tests/e2e/**
-  # Manual runs can override the base image, Dynamo version, and KVCR ref.
+  # Manual runs can override the vLLM image, Dynamo wheel, and KVCR ref.
   workflow_dispatch:
     inputs:
       base_image:
@@ -24,7 +24,7 @@ on:
         type: string
         default: vllm/vllm-openai:nightly
       dynamo_version:
-        description: Dynamo wheel version, or nightly for the latest prerelease
+        description: Dynamo wheel version, or nightly for the newest dev wheel
         required: true
         type: string
         default: nightly

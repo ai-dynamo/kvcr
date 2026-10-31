@@ -18,16 +18,17 @@ from _kvcr_test_utils import (
     _ConstantHashAdapter,
     _decode_control_message,
     _decode_notif,
+    _HintEnvelope,
     _new_kvcr,
     _op_entries,
     _poll_until,
+    _record_hint_results,
     _use_nixl_agent,
     _wait_until,
     _write_done_notification,
 )
 
 from kvcr import KVCR, KVCRBindings
-from kvcr import progress as kvcr_progress
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -36,8 +37,12 @@ from kvcr.config import (
     LocalDramOptions,
     RemoteFWGPUOptions,
 )
-from kvcr.hint_parser import _KVFetchHint, _KVGPUFetchHint
-from kvcr.progress import _KVCRProgress
+from kvcr.hints.fetch import KV_FETCH
+from kvcr.hints.fetch_gpu import KV_FETCH_GPU, _KVGPUFetchHint
+from kvcr.hints.parser import parse_hints
+from kvcr.hints.results import HintStatus
+from kvcr.runtime import progress as kvcr_progress
+from kvcr.runtime.progress import _KVCRProgress
 from kvcr.types import BlockKey, CacheTier, MemoryRef, QueryStatus, RegionDescriptor
 
 DOMAIN = "test-host:cuda-ipc:layout-v1"
@@ -47,8 +52,10 @@ TLS = "cuda_ipc,posix,self"
 def gpu_hint(*, domain=DOMAIN):
     return {
         "protocol_version": "0.1",
+        "message_id": "gpu-message",
         "actions": [
             {
+                "action_id": "gpu-fetch",
                 "action_type": "kv.fetch_gpu",
                 "action_version": "1.0",
                 "payload": {
@@ -62,6 +69,17 @@ def gpu_hint(*, domain=DOMAIN):
             }
         ],
     }
+
+
+def gpu_envelope(*, domain=DOMAIN):
+    return msgspec.convert(gpu_hint(domain=domain), type=_HintEnvelope)
+
+
+def parse_gpu_hint(hint):
+    return parse_hints(
+        msgspec.convert(hint, type=_HintEnvelope),
+        {KV_FETCH_GPU.action_type: KV_FETCH_GPU},
+    )
 
 
 def refs(owner, index):
@@ -234,18 +252,21 @@ def acknowledge_gpu_peer(control, handle):
 
 
 def test_gpu_hint_is_strict_and_isolated_from_cpu():
-    parsed = _KVGPUFetchHint.from_hint(gpu_hint())
+    hints, rejected = parse_gpu_hint(gpu_hint())
+    assert rejected == []
+    (parsed,) = hints
+    assert isinstance(parsed, _KVGPUFetchHint)
     assert (
         parsed.source_endpoint,
         parsed.block_hashes,
         parsed.compatibility_domain,
     ) == ("tcp://source:1", frozenset({123}), DOMAIN)
-    with pytest.raises(ValueError):
-        _KVFetchHint.from_hint(gpu_hint())
+    hints, rejected = parse_hints(gpu_envelope(), {KV_FETCH.action_type: KV_FETCH})
+    assert hints == [] and rejected[0].reason == "unsupported_action_type"
     legacy = gpu_hint()
     legacy["actions"][0]["action_type"] = "kv.fetch"
-    with pytest.raises(ValueError):
-        _KVGPUFetchHint.from_hint(legacy)
+    hints, rejected = parse_gpu_hint(legacy)
+    assert hints == [] and rejected[0].reason == "unsupported_action_type"
 
 
 @pytest.mark.parametrize(
@@ -262,8 +283,8 @@ def test_gpu_hint_is_strict_and_isolated_from_cpu():
 def test_gpu_hint_rejects_unsafe_payload(field, value):
     hint = gpu_hint()
     hint["actions"][0]["payload"][field] = value
-    with pytest.raises(ValueError):
-        _KVGPUFetchHint.from_hint(hint)
+    hints, rejected = parse_gpu_hint(hint)
+    assert hints == [] and rejected[0].status is HintStatus.REJECTED
 
 
 @pytest.mark.parametrize(
@@ -272,8 +293,44 @@ def test_gpu_hint_rejects_unsafe_payload(field, value):
 def test_gpu_hint_rejects_unknown_version(field, value):
     hint = gpu_hint()
     (hint if field == "protocol_version" else hint["actions"][0])[field] = value
-    with pytest.raises(ValueError):
-        _KVGPUFetchHint.from_hint(hint)
+    hints, rejected = parse_gpu_hint(hint)
+    assert hints == [] and rejected[0].reason == "unsupported_version"
+
+
+def test_gpu_hint_strict_version_does_not_change_cpu_version_tolerance():
+    hint = gpu_hint()
+    hint["protocol_version"] = "future"
+    cpu = {**hint["actions"][0], "action_id": "cpu", "action_type": "kv.fetch"}
+    hint["actions"].append(cpu)
+    hints, rejected = parse_hints(
+        msgspec.convert(hint, type=_HintEnvelope),
+        {kind.action_type: kind for kind in (KV_FETCH, KV_FETCH_GPU)},
+    )
+    assert [type(parsed).ACTION_TYPE for parsed in hints] == ["kv.fetch"]
+    assert [(row.action_id, row.reason) for row in rejected] == [
+        ("gpu-fetch", "unsupported_version")
+    ]
+
+
+def test_gpu_hint_cpu_endpoint_rejects_before_storing_or_connecting(monkeypatch):
+    agent, control = FakeNixlAgent(), FakeBytesControl("tcp://target:1")
+    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control, name="target")
+    results = _record_hint_results(monkeypatch, kvcr)
+    kvcr.submit_hint(gpu_envelope(), request_id="bad")
+    assert len(results) == 1 and results[0].status is HintStatus.REJECTED
+    assert not kvcr._core._remote_fw_dram._request_hints
+    assert control.sent == [] and agent.xfers == []
+
+
+def test_legacy_cpu_hint_cannot_authorize_gpu_endpoint(monkeypatch):
+    kvcr, agent, _, control = new_gpu(monkeypatch)
+    results = _record_hint_results(monkeypatch, kvcr)
+    hint = gpu_hint()
+    hint["actions"][0]["action_type"] = "kv.fetch"
+    kvcr.submit_hint(msgspec.convert(hint, type=_HintEnvelope), request_id="bad")
+    assert len(results) == 1 and results[0].status is HintStatus.REJECTED
+    assert not kvcr._core._remote_fw_dram._request_hints
+    assert control.sent == [] and agent.xfers == []
 
 
 @pytest.mark.parametrize(
@@ -510,9 +567,13 @@ def test_cpu_source_never_executes_new_gpu_message():
 
 def test_gpu_target_emits_distinct_wire_and_rejects_domain_and_storage(monkeypatch):
     kvcr, agent, _, control = new_gpu(monkeypatch)
-    with pytest.raises(ValueError, match="domain"):
-        kvcr.submit_hint(gpu_hint(domain="wrong"), request_id="bad")
-    kvcr.submit_hint(gpu_hint(), request_id="req")
+    results = _record_hint_results(monkeypatch, kvcr)
+    kvcr.submit_hint(gpu_envelope(domain="wrong"), request_id="bad")
+    assert len(results) == 1 and results[0].status is HintStatus.REJECTED
+    assert "domain" in results[0].reason
+    assert kvcr.query([BlockKey(b"k0")], "bad") == [(QueryStatus.MISS, None)]
+    assert control.sent == []
+    kvcr.submit_hint(gpu_envelope(), request_id="req")
     assert kvcr.query([BlockKey(b"k0")], "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G1)
     ]
@@ -546,7 +607,7 @@ def test_gpu_target_timeout_quarantines_until_actual_terminal(monkeypatch):
     kvcr, agent, _, control = new_gpu(monkeypatch, on_resilience_event=errors.append)
     clock = [0.0]
     kvcr._core._clock = lambda: clock[0]
-    kvcr.submit_hint(gpu_hint(), request_id="req")
+    kvcr.submit_hint(gpu_envelope(), request_id="req")
     handle = kvcr.deliver({BlockKey(b"k0"): refs("target", 2)}, "req")
     _wait_until(lambda: bool(control.sent))
     acknowledge_gpu_peer(control, handle)
@@ -583,6 +644,80 @@ def test_gpu_partial_pin_preserves_original_target_key_position(monkeypatch):
     assert dst == [(9480, 16, 5), (10240, 8, 5)]
     assert _decode_notif(notification)["completed_indices"] == [1]
     assert pinning.unpins == ["pin"]
+
+
+def test_gpu_labelled_rank_banks_share_one_write_and_preserve_device_ids(monkeypatch):
+    monkeypatch.setenv("UCX_TLS", TLS)
+    monkeypatch.setenv("NIXL_UCX_CUDA_IPC_ONLY", "1")
+
+    def rank_refs(owner, slot, *, reverse=False):
+        labels = (":rank1", ":rank0") if reverse else (":rank0", ":rank1")
+        return [
+            MemoryRef(end_point_name=owner, element_index=slot, label=label)
+            for label in labels
+        ]
+
+    def rank_regions(owner):
+        source = owner == "source"
+        return [
+            RegionDescriptor(
+                addr=address,
+                size=16,
+                stride=64 if source else 80,
+                count=8,
+                mem_type="VRAM",
+                device_Id=device,
+                label=f":rank{rank}",
+            )
+            for rank, (address, device) in enumerate(
+                ((1000, 3), (2000, 7)) if source else ((9000, 5), (10000, 9))
+            )
+        ]
+
+    class RankPinning(FakePrimaryPinning):
+        def request_pin(self, keys):
+            request = super().request_pin(keys)
+            _, (_, mapping) = self.completed.pop()
+            self.completed.append(
+                (
+                    request,
+                    (
+                        "pin",
+                        {
+                            key: rank_refs(self.agent_name, (5, 1)[i], reverse=True)
+                            for i, key in enumerate(mapping)
+                        },
+                    ),
+                )
+            )
+            return request
+
+    agent, pinning = GPUAgent(), RankPinning()
+    control = FakeBytesControl("tcp://source:1")
+    kvcr = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        name="source",
+        framework_regions=rank_regions("source"),
+        remote_gpu_options=RemoteFWGPUOptions(compatibility_domain=DOMAIN),
+    )
+    message = source_message()
+    message["target_regions"] = (
+        {region.label: region for region in rank_regions("target")}, {}
+    )
+    message["dst_descriptors"] = [rank_refs("target", slot) for slot in (2, 6)]
+    agent.state = "DONE"
+    control.incoming.append(msgspec.msgpack.encode(message))
+    _poll_until(kvcr, lambda _: bool(pinning.unpins))
+    assert len(agent.xfers) == 1
+    _, src, _, dst, _, notification = agent.xfers[0]
+    assert set(agent.prep_types) == {"VRAM"}
+    assert src == [(1320, 16, 3), (2320, 16, 7), (1064, 16, 3), (2064, 16, 7)]
+    assert dst == [(9160, 16, 5), (10160, 16, 9), (9480, 16, 5), (10480, 16, 9)]
+    assert _decode_notif(notification)["completed_indices"] == [0, 1]
+    assert len(pinning.searches) == 1 and pinning.unpins == ["pin"]
 
 
 def test_gpu_source_timeout_keeps_allocation_pinned_until_native_done(monkeypatch):
@@ -677,7 +812,7 @@ def test_gpu_native_init_rechecks_required_native_policy(monkeypatch):
 def test_gpu_metadata_rejection_precedes_destination_offer(monkeypatch, change):
     errors = []
     kvcr, agent, _, control = new_gpu(monkeypatch, on_resilience_event=errors.append)
-    kvcr.submit_hint(gpu_hint(), request_id="req")
+    kvcr.submit_hint(gpu_envelope(), request_id="req")
     handle = kvcr.deliver({BlockKey(b"k0"): refs("target", 2)}, "req")
     _wait_until(lambda: bool(control.sent))
     response = {
@@ -730,7 +865,7 @@ def test_legacy_gpu_metadata_timeout_has_no_destination_hazard(monkeypatch):
     kvcr, agent, _, control = new_gpu(monkeypatch, on_resilience_event=errors.append)
     clock = [0.0]
     kvcr._core._clock = lambda: clock[0]
-    kvcr.submit_hint(gpu_hint(), request_id="req")
+    kvcr.submit_hint(gpu_envelope(), request_id="req")
     handle = kvcr.deliver({BlockKey(b"k0"): refs("target", 2)}, "req")
     _wait_until(lambda: bool(control.sent))
     clock[0] = 1.0
@@ -804,7 +939,7 @@ def test_gpu_metadata_ack_must_match_actual_operation_and_source(monkeypatch, ch
     kvcr, agent, _, control = new_gpu(monkeypatch)
     clock = [0.0]
     kvcr._core._clock = lambda: clock[0]
-    kvcr.submit_hint(gpu_hint(), request_id="req")
+    kvcr.submit_hint(gpu_envelope(), request_id="req")
     handle = kvcr.deliver({BlockKey(b"k0"): refs("target", 2)}, "req")
     _wait_until(lambda: bool(control.sent))
     contract = gpu_hint()["actions"][0]["payload"]

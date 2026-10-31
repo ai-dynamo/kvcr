@@ -7,8 +7,8 @@ import logging
 import math
 from collections.abc import Collection, Generator
 
-from .policy import KVCachePolicy
-from .types import (
+from ..policy import KVCachePolicy
+from ..types import (
     BlockKey,
     BlockMeta,
     CacheTier,

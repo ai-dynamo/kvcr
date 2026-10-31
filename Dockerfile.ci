@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The CI workflow resolves the selected vLLM nightly or PR image to a digest.
+# The CI workflow resolves the selected serving image to a digest.
 ARG VLLM_IMAGE=vllm/vllm-openai:nightly
 FROM ${VLLM_IMAGE}
 
@@ -25,14 +25,13 @@ from importlib import metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
-import tempfile
 
-from packaging.utils import parse_wheel_filename
+from packaging.version import Version
 
-# Keep the selected vLLM and torch stack while installing Dynamo's Python
-# dependencies. Do not request ai-dynamo[vllm], which pins a different backend.
+# Keep the selected vLLM and torch stack while installing Dynamo and KVCR.
 backend_versions = {}
 # grpcio-observability requires an exactly matching grpcio version. Preserve
 # the installed gRPC family so Dynamo's tooling dependencies cannot split it.
@@ -65,20 +64,23 @@ for name in ("nvidia-nccl-cu12", "nvidia-nccl-cu13"):
 requested_dynamo_version = os.environ["DYNAMO_VERSION"]
 dynamo_version = requested_dynamo_version
 if dynamo_version == "nightly":
-    # Resolve only Dynamo with --pre. Installing its exact version then avoids
-    # enabling prereleases for unrelated transitive dependencies.
-    with tempfile.TemporaryDirectory() as wheel_dir:
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "download", "--no-cache-dir",
-            "--no-deps", "--only-binary=:all:", "--pre",
-            "--extra-index-url", "https://pypi.nvidia.com/",
-            "--dest", wheel_dir, "ai-dynamo",
-        ])
-        wheel, = Path(wheel_dir).glob("*.whl")
-        _, version, _, _ = parse_wheel_filename(wheel.name)
-        if not version.is_devrelease:
-            raise RuntimeError(f"Expected a Dynamo nightly, resolved {version}")
-        dynamo_version = str(version)
+    # --pre also admits stable releases. Select the newest compatible dev wheel.
+    available = subprocess.check_output([
+        sys.executable, "-m", "pip", "index", "versions", "ai-dynamo",
+        "--pre", "--only-binary=:all:",
+        "--extra-index-url", "https://pypi.nvidia.com/",
+    ], text=True)
+    match = re.search(r"^Available versions: (.+)$", available, re.MULTILINE)
+    if match is None:
+        raise RuntimeError("Could not list available ai-dynamo versions")
+    dev_versions = [
+        version for item in match.group(1).split(", ")
+        if (version := Version(item)).is_devrelease
+    ]
+    if not dev_versions:
+        raise RuntimeError("No ai-dynamo dev wheel is available")
+    dynamo_version = str(max(dev_versions))
+    print(f"Selected ai-dynamo nightly: {dynamo_version}", flush=True)
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade",
     "--extra-index-url", "https://pypi.nvidia.com/",
@@ -122,8 +124,18 @@ PY
 
 # A successful pip install alone does not prove the base's adapter supports
 # this KVCR API. Fail the build before handing an incompatible image to E2E.
+RUN kvcr-service --help
 RUN python3 - <<'PY'
 from importlib import metadata
+
+# Use the public channel export in the adapter supplied by the base image.
+adapter = metadata.distribution("vllm").locate_file(
+    "vllm/v1/kv_offload/tiering/kvcr/manager.py"
+)
+adapter.write_text(adapter.read_text().replace(
+    "from kvcr.control_channels import ZmqPeerControlChannel",
+    "from kvcr import ZmqPeerControlChannel",
+))
 
 import kvcr
 import dynamo.vllm
@@ -134,5 +146,5 @@ print("dynamo.vllm:", dynamo.vllm.__file__)
 print("KVCR adapter:", manager.__file__)
 PY
 
-# The vLLM image normally starts an API server. E2E launches Dynamo explicitly.
+# E2E launches Dynamo explicitly instead of using the image's entrypoint.
 ENTRYPOINT []

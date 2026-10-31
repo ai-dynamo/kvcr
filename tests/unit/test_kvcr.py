@@ -27,8 +27,9 @@ from _kvcr_test_utils import (
 
 from kvcr import KVCR, KVCRBindings
 from kvcr import api as kvcr_api
-from kvcr import progress as kvcr_progress
-from kvcr import recovery_journal as kvcr_recovery
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
+from kvcr.backends.remote_sources import _FwMemResidency
 from kvcr.config import (
     G3Options,
     KVCRBackendConfigs,
@@ -37,13 +38,12 @@ from kvcr.config import (
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from kvcr.core import _BlockRecord
-from kvcr.guard_protocol import KVCRPoolHold
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramResidency, _LocalDramState
-from kvcr.memory import KVCRPoolSpec
-from kvcr.progress import _TransferRef
-from kvcr.remote_fw_dram import _FwMemResidency
+from kvcr.runtime import progress as kvcr_progress
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _TransferRef
+from kvcr.service import recovery_journal as kvcr_recovery
+from kvcr.service.memory import KVCRPoolSpec
+from kvcr.service.protocol import KVCRPoolHold
 from kvcr.types import BlockKey, KVCRStartupError, MemoryRef, RegionDescriptor
 
 
@@ -53,6 +53,24 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
     hold = SimpleNamespace(_incarnation=None, _dead_incarnations=(), **fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
+
+
+@pytest.mark.parametrize(
+    "provided",
+    [
+        ("request_pin", "poll_pin_results"),
+        ("request_pin", "release_pin"),
+        ("poll_pin_results", "release_pin"),
+        ("cancel_pin_request",),
+    ],
+)
+def test_framework_pinning_requires_callbacks(provided):
+    with pytest.raises(ValueError, match="pinning requires"):
+        KVCR(
+            KVCRConfig("source", [("", 16)]),
+            KVCRBindings(**dict.fromkeys(provided, Mock())),
+            KVCRBackendConfigs(),
+        )
 
 
 @pytest.mark.parametrize("budget", [0, True, 1.5])
@@ -100,13 +118,13 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     def observe(key: BlockKey, record: _BlockRecord) -> None:
         residency = record.local_dram
         if residency is None:
-            assert 0 not in backend._free_slots
+            assert 0 not in backend._pools._free_slots
         else:
             assert residency.state is _LocalDramState.READY
             assert local.raw == bytes((ord("a") + keys.index(key),)) * block_size
-        observed.append((key, None if residency is None else residency.slots))
+        observed.append((key, None if residency is None else list(residency.slots)))
 
-    backend.observe_residency(observe)
+    backend._pools.observe_residency(observe)
     first = kvcr.deposit({keys[0]: [_mem_descriptor(0)]})
     _poll_until(kvcr, lambda done: first in dict(done))
     assert observed == [(keys[0], [("", 0)])]
@@ -126,10 +144,10 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
 
     third = kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
     _poll_until(kvcr, lambda done: third in dict(done))
-    backend.acquire_sources((keys[2],))
-    backend.retire_sources((keys[2],))
+    backend._pools.acquire_sources((keys[2],))
+    backend._pools.retire_sources((keys[2],))
     assert len(observed) == 3
-    backend.release_sources((keys[2],))
+    backend._pools.release_sources((keys[2],))
     assert observed[2:] == [
         (keys[2], [("", 0)]),
         (keys[2], None),
@@ -194,10 +212,9 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
 ) -> None:
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
+    block_size = mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024
     hold = _fake_hold(
-        # Reach G3's alignment check even when the invalid half-page block
-        # exceeds 8192 bytes on hosts with large pages.
-        local_dram=LocalDramOptions([("", 1234, max(8192, 2 * mmap.PAGESIZE))]),
+        local_dram=LocalDramOptions([("", 1234, 2 * block_size)]),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -263,9 +280,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
         KVCR(
             KVCRConfig(
                 nixl_agent_name="target",
-                pool_layouts=[
-                    ("", mmap.PAGESIZE // 2 if stage == "g3-invalid" else 1024)
-                ],
+                pool_layouts=[("", block_size)],
                 nixl_listen_port=1,
             ),
             KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
@@ -392,7 +407,7 @@ def test_service_journal_is_attached_before_primary_start(
         release=lambda **_kwargs: events.append("hold.release"),
     )
     claim = Mock(return_value=hold)
-    local_dram = object()
+    local_dram = SimpleNamespace(_pools=object())
     g3 = object()
     core = Mock(_local_dram=local_dram, _g3=g3)
     core.start.side_effect = lambda: events.append("core.start")
@@ -406,7 +421,7 @@ def test_service_journal_is_attached_before_primary_start(
         return journal
 
     def attach_journal(local, configured_journal, disk) -> None:
-        assert (local, configured_journal, disk) == (local_dram, journal, g3)
+        assert (local, configured_journal, disk) == (local_dram._pools, journal, g3)
         events.append("attach")
 
     monkeypatch.setattr(
@@ -932,7 +947,7 @@ def test_resident_records_carry_no_instance_dictionary() -> None:
     for residency in (
         _BlockRecord(),
         _LocalDramResidency([("", 0)], _LocalDramState.READY),
-        _G3Residency(0),
+        _G3Residency(("",), (0,)),
         _FwMemResidency([_mem_descriptor()], object()),
     ):
         assert not hasattr(residency, "__dict__"), type(residency).__name__
@@ -999,8 +1014,7 @@ def test_named_reference_validation_and_address_reporting():
     with pytest.raises(ValueError, match="part labels must be unique"):
         core._normalize_descriptors([ref, ref])
     with patch.object(core, "_g3", object()):
-        with pytest.raises(ValueError, match="G3 does not support"):
-            core._normalize_descriptors([ref])
+        assert core._normalize_descriptors([ref]) == [internal]
     assert core._normalize_descriptors(
         [MemoryRef(end_point_name="target", label="pool:k", element_index=1)]
     ) == [_TransferRef("target", 1, "pool:k")]

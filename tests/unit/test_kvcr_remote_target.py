@@ -76,7 +76,7 @@ def test_submit_hint_filters_unlisted_hash():
 
 def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
     monkeypatch.setenv("KVCR_DIAGNOSTICS", "1")
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     agent = FakeNixlAgent()
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
@@ -423,7 +423,7 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
 
 def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     block_size = 16
     local = ctypes.create_string_buffer(block_size * 3)
     agent = FakeNixlAgent()
@@ -494,7 +494,7 @@ def test_remote_completion_rejects_invalid_notification(
     completed_indices, success, monkeypatch, caplog
 ) -> None:
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     target = _new_kvcr(
@@ -915,7 +915,7 @@ def test_kvcr_metadata_ack_retry_lifecycle():
 
 @pytest.mark.parametrize("terminal,success", [(True, True), (False, False)])
 def test_native_terminal_or_cancellation_outranks_metadata_retry(terminal, success):
-    from kvcr.remote_fw_dram import _TargetPullState
+    from kvcr.backends.remote_fw_dram import _TargetPullState
 
     control, agent = FakeBytesControl(), FakeNixlAgent(metadata=b"target-md")
     kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
@@ -1198,7 +1198,7 @@ def test_remote_write_cancellation_and_late_completion(
     outcome,
     caplog,
 ):
-    caplog.set_level(logging.INFO, logger="kvcr.core")
+    caplog.set_level(logging.INFO, logger="kvcr.runtime.core")
     shutting_down = outcome.startswith("shutdown")
     errors = []
 
@@ -1537,7 +1537,7 @@ def test_remote_framework_dram_transfers_available_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
-    caplog.set_level(logging.DEBUG, logger="kvcr.core")
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_agent = FakeNixlAgent(metadata=b"source-md")
     source_pinning = FakePrimaryPinning(missing_indices=missing_indices)

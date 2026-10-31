@@ -6,6 +6,15 @@ import logging
 import pytest
 from _kvcr_test_utils import _OPEN_KVCRS
 
+from kvcr.service import memmap
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--hugetlbfs-dir",
+        help="directory directly under a hugetlbfs mount, for the real-hugetlbfs test",
+    )
+
 
 @pytest.fixture(autouse=True)
 def _close_open_kvcrs():
@@ -14,9 +23,14 @@ def _close_open_kvcrs():
         _OPEN_KVCRS.pop().close()
 
 
+@pytest.fixture(autouse=True)
+def _no_hugetlb(monkeypatch):
+    monkeypatch.setattr(memmap, "_hugetlbfs_mounts", lambda: [])
+
+
 @pytest.fixture()
 def kvcr_caplog(caplog):
-    kvcr_logger = logging.getLogger("kvcr.core")
+    kvcr_logger = logging.getLogger("kvcr.runtime.core")
     kvcr_logger.addHandler(caplog.handler)
     try:
         with caplog.at_level(logging.WARNING, logger=kvcr_logger.name):

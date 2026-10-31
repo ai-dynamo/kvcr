@@ -17,7 +17,7 @@ commit in a pull request must carry a `Signed-off-by` line; this is enforced on
 every pull request by the `dco` CI workflow.
 
 Before opening a pull request, make sure you can contribute your work to open
-source — that your code introduces no license or patent conflict. You must
+source - that your code introduces no license or patent conflict. You must
 certify compliance with this project's [license terms](LICENSE) and sign off on
 the Developer Certificate of Origin before your pull request can be merged.
 
@@ -50,7 +50,7 @@ GPU E2E tests require maintainer approval with `/ok to test <commit-sha>`
 on the PR. The Docker Build workflow builds and publishes the test image,
 then runs the two-GPU test to verify cross-rank KV cache reuse.
 
-Check the “Verify cross-rank KVCR reuse” step for results.
+Check the "Verify cross-rank KVCR reuse" step for results.
 Full logs and responses are available in the `kvcr-vllm-e2e-<attempt>`
 artifact.
 

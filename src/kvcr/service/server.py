@@ -20,35 +20,41 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import FrameType
 from typing import Any
+from urllib.parse import urlsplit
 
-from .control_channels import (
+from ..runtime.control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
     KVCRMsgFramingError,
     KVCRServiceError,
 )
-from .guard import _Guard, _Lease
-from .guard_protocol import (
-    _CLAIM_DECODER,
-    _HOLD_DECODER,
-    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
-    _PROTOCOL_VERSION,
-    PidfdLiveness,
-    _Claim,
-    _Error,
-    _Granted,
-    _Heartbeat,
-    _PoolDescriptor,
-    _Released,
-    _TierConfig,
-)
+from ..runtime.progress import _STARTUP_TIMEOUT_SECONDS
+from . import memmap
+from .guard import _Guard, _Lease, _Phase
+from .health import _serve_health
 from .memory import (
+    _OPEN_FLAGS,
     _POOL_PREFIX,
     KVCRPoolSpec,
     _KVCRPoolOwner,
     _pool_dir_guard,
     _reclaim_pool_if_orphaned,
     _unlink_if_identity,
+)
+from .protocol import (
+    _CLAIM_DECODER,
+    _HOLD_DECODER,
+    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
+    _PROTOCOL_VERSION,
+    PidfdLiveness,
+    _Claim,
+    _claim_fd_counts,
+    _Error,
+    _Granted,
+    _Heartbeat,
+    _PoolDescriptor,
+    _Released,
+    _TierConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +85,7 @@ class _PoolRegistry:
         journal_bytes: int,
         compatibility_digest: str,
         heartbeat_timeout_seconds: float | None = None,
+        startup_timeout_seconds: int | None = None,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -112,6 +119,7 @@ class _PoolRegistry:
                         owner=owner,
                         refusing=self._refusing.is_set,
                         heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                        startup_timeout_seconds=startup_timeout_seconds,
                     )
                 except BaseException:
                     # Nothing has recorded this pool group yet, so the sweep
@@ -151,8 +159,16 @@ class _PoolRegistry:
         Crash leftovers fill the fixed-size directory and fail the next eager
         allocation. Use is decided by the shared flock, never the filename.
         """
-        with _pool_dir_guard(self._pool_dir, exclusive=True):
-            for path in sorted(self._pool_dir.glob(f"{_POOL_PREFIX}-*")):
+        self._purge_orphaned_pools_in(self._pool_dir)
+        for directory in memmap.pool_dirs():
+            try:
+                self._purge_orphaned_pools_in(directory)
+            except OSError as error:  # optional cleanup must not stop the service
+                logger.warning("Purge skipped for %s: %s", directory, error)
+
+    def _purge_orphaned_pools_in(self, directory: Path) -> None:
+        with _pool_dir_guard(directory, exclusive=True):
+            for path in sorted(directory.glob(f"{_POOL_PREFIX}-*")):
                 recognized = _ORPHANED_POOL_NAME.fullmatch(path.name) is not None
                 if not recognized or path.is_symlink():
                     continue
@@ -281,6 +297,20 @@ class _PoolRegistry:
         self.on_uncontained_failure(error)
 
 
+def _open_pool_fd(spec: KVCRPoolSpec) -> int:
+    """A fresh open-file-description of the pool: flock belongs to it, so the
+    claimant's lock stays independent of the Guard's, as with a path open."""
+    pool_fd = os.open(spec.path, _OPEN_FLAGS)
+    try:
+        pool_stat = os.fstat(pool_fd)
+        if (pool_stat.st_dev, pool_stat.st_ino) != (spec.device, spec.inode):
+            raise KVCRServiceError("KVCR pool file does not match its grant")
+    except BaseException:
+        os.close(pool_fd)
+        raise
+    return pool_fd
+
+
 class _RequestHandler(socketserver.BaseRequestHandler):
     server: "_ThreadingUnixServer"
     request: socket.socket
@@ -290,7 +320,10 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         try:
-            request, worker_pidfd = self.channel.receive_with_fd(_CLAIM_DECODER)
+            request, worker_fds = self.channel.receive_with_fd(
+                _CLAIM_DECODER, _claim_fd_counts
+            )
+            worker_pidfd = worker_fds[0] if worker_fds else None
         except (EOFError, OSError):
             return
         except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
@@ -317,10 +350,18 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 
         guard_index, listener_fd, lease = grant
         try:
+            pool_fd = _open_pool_fd(response.spec)
+        except Exception:  # noqa: BLE001 - nothing sent yet: take the grant back
+            logger.exception("KVCR could not open the pool for a claimant")
+            os.close(listener_fd)
+            self._release_or_fail(guard_index, lease, activated=False)
+            self._send_error(KVCRServiceError("KVCR could not open the pool"))
+            return
+        try:
             # No timeout: a held connection must wait as long as the lease lives.
             # Inside the try: shutdown may have landed; listener_fd closes either way.
             self.request.settimeout(None)
-            self.channel.send_with_fd(response, listener_fd)
+            self.channel.send_with_fd(response, pool_fd, listener_fd)
         # The lease is already granted and the send may have partially
         # crossed: releasing could double-grant a pool a claimant just mapped.
         # Hold it instead, under the same fencing as any lease: the claimant's
@@ -330,8 +371,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         except BaseException:
             logger.exception("KVCR grant delivery failed; holding the lease")
         finally:
-            with contextlib.suppress(OSError):
-                os.close(listener_fd)
+            for file_descriptor in (pool_fd, listener_fd):
+                with contextlib.suppress(OSError):
+                    os.close(file_descriptor)
         self._await_release(guard_index, lease)
 
     def _await_release(self, guard_index: int, lease: "_Lease") -> None:
@@ -401,6 +443,7 @@ class _ThreadingUnixServer(
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
         self._fatal_error: BaseException | None = None
+        self._last_progress: float | None = None
         self._fatal_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
         self._connections_lock = threading.Lock()
@@ -415,6 +458,9 @@ class _ThreadingUnixServer(
         connection.settimeout(_CLIENT_IDLE_TIMEOUT_SECONDS)
         self.add_connection(connection)
         return connection, address
+
+    def service_actions(self) -> None:
+        self._last_progress = time.monotonic()
 
     def dispatch(
         self,
@@ -492,6 +538,7 @@ class _KVCRService:
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
         heartbeat_timeout_seconds: float | None = None,
+        startup_timeout_seconds: int | None = None,
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -515,6 +562,7 @@ class _KVCRService:
             journal_bytes,
             compatibility_digest,
             heartbeat_timeout_seconds,
+            startup_timeout_seconds,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -536,8 +584,35 @@ class _KVCRService:
         with contextlib.suppress(BufferError, OSError):
             self._registry.close()
 
+    def _health_status(self, timeout: float, *, ready: bool = True) -> tuple[int, str]:
+        """Observe progress without claiming pools or entering Guard actor locks."""
+        if self._closed or self._registry._refusing.is_set():
+            return 503, "service stopping"
+        if self._server._fatal_error is not None:
+            return 503, "service failed"
+        now = time.monotonic()
+        progress = self._server._last_progress
+        if progress is not None and now - progress > timeout:
+            return 503, "service stalled"
+        guards = list(self._registry._guards.values())
+        if len(guards) != self._registry._guard_count:
+            return 503, "guards unavailable"
+        for guard in guards:
+            if guard._failure is not None or not guard._thread.is_alive():
+                return 503, "guard failed"
+            if ready and guard._reserved is _Phase.PROMOTING:
+                return 503, "guard promoting"
+            if ready and now - guard._last_progress > timeout:
+                return 503, "guard stalled"
+        if progress is None:
+            return (503 if ready else 200), "service starting"
+        return 200, "ok"
+
     def serve_forever(self) -> None:
-        self._server.serve_forever()
+        try:
+            self._server.serve_forever()
+        finally:
+            self._server._last_progress = None
         if self._server._fatal_error is not None:
             raise self._server._fatal_error
 
@@ -653,10 +728,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--compatibility-digest", required=True)
+    parser.add_argument("--health-host", default="127.0.0.1")
+    parser.add_argument(
+        "--health-port", type=int, help="enable /live and /ready HTTP probes"
+    )
+    parser.add_argument("--health-timeout-seconds", type=float, default=30)
+    parser.add_argument(
+        "--health-dependency-url",
+        help="optional HTTP readiness dependency; /ready requires it to return 200",
+    )
     parser.add_argument(
         "--heartbeat-timeout-ms",
         type=float,
         help="opt in to early Guard promotion (minimum 1000 ms; default: pidfd-only)",
+    )
+    parser.add_argument(
+        "--startup-timeout-seconds",
+        type=int,
+        default=int(_STARTUP_TIMEOUT_SECONDS),
+        help="Guard core preparation and startup budget (default: %(default)s s)",
+    )
+    parser.add_argument(
+        "--disable-hugepages",
+        action="store_true",
+        help="never place pools on hugetlbfs",
     )
     parser.add_argument(
         "--log-level",
@@ -667,12 +762,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.guard_count < 1:
         parser.error("--guard-count must be at least 1")
+    if args.health_port is not None and not 1 <= args.health_port <= 65535:
+        parser.error("--health-port must be between 1 and 65535")
+    if not 1 < args.health_timeout_seconds < float("inf"):
+        parser.error("--health-timeout-seconds must be finite and greater than 1")
+    if args.health_dependency_url is not None:
+        try:
+            dependency = urlsplit(args.health_dependency_url)
+            valid_dependency = (
+                dependency.scheme in ("http", "https")
+                and bool(dependency.hostname)
+                and (dependency.port is None or dependency.port > 0)
+            )
+        except ValueError:
+            valid_dependency = False
+        if args.health_port is None or not valid_dependency:
+            parser.error(
+                "--health-dependency-url requires --health-port and a valid HTTP(S) URL"
+            )
     if args.heartbeat_timeout_ms is not None and not (
         _MIN_HEARTBEAT_TIMEOUT_SECONDS * 1000
         <= args.heartbeat_timeout_ms
         < float("inf")
     ):
         parser.error("--heartbeat-timeout-ms must be at least 1000 and finite")
+    if args.startup_timeout_seconds is not None and args.startup_timeout_seconds <= 0:
+        parser.error("--startup-timeout-seconds must be positive")
     return args
 
 
@@ -680,46 +795,67 @@ def main() -> None:
     """Run the standalone KVCR service daemon."""
     args = _parse_args()
     logging.basicConfig(level=args.log_level)
+    memmap.hugetlb_enabled = not args.disable_hugepages
 
     shutdown_signals = {signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown_signal)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     server: _KVCRService | None = None
+    stopping = False
+
+    def health_status(ready: bool) -> tuple[int, str]:
+        if stopping:
+            return 503, "service stopping"
+        if server is None:
+            return (503 if ready else 200), "service starting"
+        return server._health_status(args.health_timeout_seconds, ready=ready)
+
     try:
-        server = _KVCRService(
-            args.socket_path,
-            args.pool_dir,
-            guard_count=args.guard_count,
-            pool_sizes_bytes=args.pool_sizes_bytes,
-            compatibility_digest=args.compatibility_digest,
-            heartbeat_timeout_seconds=(
-                args.heartbeat_timeout_ms / 1000
-                if args.heartbeat_timeout_ms is not None
-                else None
-            ),
-        )
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        logger.info(
-            "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
-            "journal_bytes=%d",
-            args.socket_path,
-            args.guard_count,
-            args.pool_sizes_bytes,
-            _DEFAULT_JOURNAL_BYTES,
-        )
-        server.serve_forever()
-    except _ShutdownRequested:
-        pass
+        # Bind before allocating pools. Health threads inherit the blocked signals;
+        # the main thread handles shutdown once construction can be cleaned up.
+        with _serve_health(
+            (args.health_host, args.health_port)
+            if args.health_port is not None
+            else None,
+            health_status,
+            args.health_dependency_url,
+        ):
+            try:
+                server = _KVCRService(
+                    args.socket_path,
+                    args.pool_dir,
+                    guard_count=args.guard_count,
+                    pool_sizes_bytes=args.pool_sizes_bytes,
+                    compatibility_digest=args.compatibility_digest,
+                    heartbeat_timeout_seconds=(
+                        args.heartbeat_timeout_ms / 1000
+                        if args.heartbeat_timeout_ms is not None
+                        else None
+                    ),
+                    startup_timeout_seconds=args.startup_timeout_seconds,
+                )
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                logger.info(
+                    "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
+                    "journal_bytes=%d",
+                    args.socket_path,
+                    args.guard_count,
+                    args.pool_sizes_bytes,
+                    _DEFAULT_JOURNAL_BYTES,
+                )
+                server.serve_forever()
+            except _ShutdownRequested:
+                pass
+            finally:
+                stopping = True
+                signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
+                if server is not None:
+                    server.close()
     finally:
-        signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
-        try:
-            if server is not None:
-                server.close()
-        finally:
-            signal.signal(signal.SIGINT, old_sigint)
-            signal.signal(signal.SIGTERM, old_sigterm)
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 if __name__ == "__main__":

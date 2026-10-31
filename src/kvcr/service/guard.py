@@ -18,26 +18,27 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import Any
 
-from .api import KVCRBindings
-from .config import (
+from ..api import KVCRBindings
+from ..backends.local_disk import _G3Residency
+from ..config import (
     KVCRBackendConfigs,
     KVCRConfig,
     LocalDramOptions,
     RemoteFWDramOptions,
 )
-from .control_channels import KVCRServiceError, ZmqPeerControlChannel
-from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import (
-    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
-    PidfdLiveness,
-    _PoolDescriptor,
-    _TierConfig,
-)
-from .local_disk import _G3Residency
+from ..runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
+from ..runtime.core import _BlockRecord, _KVCRCore
+from ..types import BlockKey, PoolBlockLayouts
 from .memory import (
     KVCRPoolAttachment,
     KVCRPoolSpec,
     _KVCRPoolOwner,
+)
+from .protocol import (
+    _MIN_HEARTBEAT_TIMEOUT_SECONDS,
+    PidfdLiveness,
+    _PoolDescriptor,
+    _TierConfig,
 )
 from .recovery_journal import (
     RecoveryJournal,
@@ -49,14 +50,14 @@ from .recovery_journal import (
     read_handback,
     write_recovery_snapshot,
 )
-from .types import BlockKey, PoolBlockLayouts
 
 logger = logging.getLogger(__name__)
 
 # TODO: Wake the mirror on publication rather than polling. A standby still
 # drains at roughly a fifth of the rate a primary can publish.
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
-_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
+# ENOMEM: no memory left to back the handback region.
+_RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT, errno.ENOMEM)
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
 # object, so nothing stale (reused pid, retried release) can touch a newer lease.
@@ -196,7 +197,7 @@ class _RecoveryState:
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
-        self.attachment = KVCRPoolAttachment.attach(self._spec)
+        self.attachment = KVCRPoolAttachment.attach(self._spec, collapse=True)
         self._journal = RecoveryJournal(self.attachment)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
@@ -382,6 +383,7 @@ class _Guard:
         owner: _KVCRPoolOwner | None = None,
         refusing: Callable[[], bool] = lambda: False,
         heartbeat_timeout_seconds: float | None = None,
+        startup_timeout_seconds: int | None = None,
     ) -> None:
         if heartbeat_timeout_seconds is not None and not (
             _MIN_HEARTBEAT_TIMEOUT_SECONDS <= heartbeat_timeout_seconds < float("inf")
@@ -400,6 +402,8 @@ class _Guard:
         self._configured: _TierConfig | None = None
         self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
+        # Released cores still registering; _poll closes each once registered.
+        self._orphans: list[_KVCRCore] = []
         self._commands: queue.Queue[_Command] = queue.Queue()
         self._ops = {
             "claim": self._claim,
@@ -421,9 +425,11 @@ class _Guard:
         self._failure_callback = failure_callback or (lambda guard, error: None)
         self._last_heartbeat: float | None = None
         self._heartbeat_timeout = heartbeat_timeout_seconds
+        self._startup_timeout = startup_timeout_seconds
         # Identity of the lease whose fencing failure has been logged: the actor
         # retries every millisecond, and one warning per lease is enough.
         self._fence_failed: object | None = None
+        self._last_progress = time.monotonic()
 
     @property
     def heartbeat_enabled(self) -> bool:
@@ -611,6 +617,7 @@ class _Guard:
     def _serve_commands(self) -> None:
         draining = False
         while True:
+            self._last_progress = time.monotonic()
             try:
                 if draining:
                     # More was waiting last time round, so do not go back to
@@ -618,9 +625,13 @@ class _Guard:
                     command = self._commands.get_nowait()
                 else:
                     # Nothing publishes into a pool no primary holds, so an
-                    # unclaimed Guard waits rather than waking on an empty journal.
-                    busy = self._serving or self._control is not None
-                    timeout = _POLL_SECONDS if busy and not self._failure else None
+                    # unclaimed Guard wakes at most once a second for health reporting.
+                    busy = (
+                        self._serving
+                        or self._control is not None
+                        or bool(self._orphans)
+                    )
+                    timeout = _POLL_SECONDS if busy and not self._failure else 1.0
                     command = self._commands.get(timeout=timeout)
             except queue.Empty:
                 self._observe_holder()
@@ -919,9 +930,13 @@ class _Guard:
             # Re-adopt lets start_primary() retain or replace the mirror.
             self._recovery.mirror = None
         elif self._core is not None:
-            self._core.close()
+            if self._core._progress._prepare_ready.is_set():
+                self._core.close()
+                self._control = None
+            else:
+                # Closing now would wait out the registration.
+                self._orphans.append(self._core)
             self._core = None
-            self._control = None
         if self._recovery.mirror is not None:
             self._recovery.release()
         if self._control is not None:
@@ -945,9 +960,17 @@ class _Guard:
         if self._failure is not None:
             return False
         try:
+            for orphan in list(self._orphans):
+                if orphan._progress._prepare_ready.is_set():
+                    # Dropped only once closed; shutdown still sees a failed one.
+                    orphan.close()
+                    self._orphans.remove(orphan)
             if self._serving:
                 self._core.poll_completed()
             else:
+                if self._core is not None:
+                    # Preparation runs in the background; report its failure here.
+                    self._core._progress.raise_if_failed()
                 return self._recovery.poll()
         except RecoveryMirrorError as error:
             self._recovery.invalidate_journal()
@@ -1035,9 +1058,6 @@ class _Guard:
     def _prepare_core(self) -> None:
         """Register the Guard's pool without accepting control traffic."""
 
-        def reject_pin(keys: object) -> int:
-            raise RuntimeError("Guard has no framework-owned memory")
-
         dram = LocalDramOptions(
             [
                 (
@@ -1055,13 +1075,9 @@ class _Guard:
                 nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
                 pool_layouts=self._configured.pool_layouts,
                 nixl_listen_port=0,
+                startup_timeout_seconds=self._startup_timeout,
             ),
-            KVCRBindings(
-                reject_pin,
-                lambda: (),
-                lambda _handle: False,
-                framework_control=self._control,
-            ),
+            KVCRBindings(framework_control=self._control),
             KVCRBackendConfigs(
                 local_dram=dram,
                 g3=None,
@@ -1072,7 +1088,8 @@ class _Guard:
         )
         self._core = core
         self._log_promotion_stage("core_init_done")
-        core._progress.prepare()
+        # Registration can take long; promotion's start() waits for it.
+        core._progress.prepare(wait=False)
 
     def _hand_back(self) -> None:
         """Stop serving, leaving this pool group's state where the next primary looks.
@@ -1091,20 +1108,22 @@ class _Guard:
         self._serving = False
 
     def _close_resources(self) -> None:
-        try:
-            if self._core is not None:
-                self._core.close()
-        except BaseException:
-            if not self._core.is_quiescent():
-                # Still moving bytes, so nothing below runs: unmapping the
-                # pool under a thread still writing into it faults the process.
-                raise
-            logger.warning(
-                "KVCR Guard core close failed after reaching quiescence",
-                exc_info=True,
-            )
-        # Every close runs regardless; the first failure is the raised one.
+        # Stop every core, released ones first; a refused close keeps the
+        # pool mapped below.
         failure: BaseException | None = None
+        for core in (*self._orphans, self._core):
+            if core is None:
+                continue
+            try:
+                self._close_core(core)
+            except BaseException as error:  # noqa: BLE001 - raised below
+                failure = failure or error
+            else:
+                if core in self._orphans:
+                    self._orphans.remove(core)
+        if failure is not None:
+            raise failure
+        # Every close runs regardless; the first failure is the raised one.
         for give_back in (
             self._close_control,
             self._recovery.close,
@@ -1116,6 +1135,19 @@ class _Guard:
                 failure = failure or error
         if failure is not None:
             raise failure
+
+    @staticmethod
+    def _close_core(core: _KVCRCore) -> None:
+        try:
+            core.close()
+        except BaseException:
+            if not core.is_quiescent():
+                # Still registering or moving bytes: unmapping under it faults.
+                raise
+            logger.warning(
+                "KVCR Guard core close failed after reaching quiescence",
+                exc_info=True,
+            )
 
     def _close_control(self) -> None:
         if self._control is not None:

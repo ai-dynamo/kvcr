@@ -13,19 +13,21 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from math import gcd
 from typing import Annotated, Literal
 
 import msgspec
 
-from .config import G3Options, LocalDramOptions, _validate_pool_layouts
-from .control_channels import (
+from ..backends.local_disk import _normalize_g3_backend_options
+from ..config import G3Options, LocalDramOptions, _validate_pool_layouts
+from ..runtime.control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
     KVCRServiceError,
     KVCRSocketError,
 )
+from ..types import PoolBlockLayouts
 from .memory import KVCRPoolAttachment, KVCRPoolSpec, _compute_pool_geometry
-from .types import PoolBlockLayouts
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +78,7 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     def __post_init__(self) -> None:
         _validate_pool_layouts(self.pool_layouts)
         if self.g3 is not None:
-            if len(self.pool_layouts) != 1:
-                raise ValueError("G3 does not support multiple pools")
-            block_size_bytes = self.pool_layouts[0][1]
+            block_size_bytes = gcd(*(size for _, size in self.pool_layouts))
             if block_size_bytes % mmap.PAGESIZE:
                 raise ValueError("G3 requires page-aligned slots")
             if self.g3.capacity_bytes_per_file < block_size_bytes:
@@ -137,6 +137,15 @@ class _Released(msgspec.Struct, frozen=True, tag="released"):
 class _Error(msgspec.Struct, frozen=True, tag="error"):
     message: str
     version: ProtocolVersion
+
+
+def _claim_fd_counts(_claim: _Claim) -> tuple[int, ...]:
+    return (0, 1)  # the worker's pidfd, when it has one
+
+
+def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
+    """An error carries none; a grant the pool, then the control listener."""
+    return (0,) if isinstance(response, _Error) else (2,)
 
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim)
@@ -311,7 +320,7 @@ class KVCRClient:
             "paths": [str(path.expanduser().resolve()) for path in g3.paths],
             "capacity_bytes_per_file": g3.capacity_bytes_per_file,
             "backend": g3.backend,
-            "backend_options": dict(g3.backend_options),
+            "backend_options": _normalize_g3_backend_options(g3),
         }
         # msgspec.convert validates where __init__ would not: bad pool layout,
         # port or G3 path fails here, not at the service.
@@ -334,6 +343,7 @@ class KVCRClient:
         connection = FramedConnection.connect(self._socket_path)
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
+        pool_fd: int | None = None
         grant_received = False
         try:
             try:
@@ -345,21 +355,18 @@ class KVCRClient:
                     connection.send_with_fd(request, worker_pidfd)
                 finally:
                     os.close(worker_pidfd)
-            response, listener_fd = connection.receive_with_fd(_CLAIM_RESPONSE_DECODER)
+            response, received_fds = connection.receive_with_fd(
+                _CLAIM_RESPONSE_DECODER, _response_fd_counts
+            )
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
+            pool_fd, listener_fd = received_fds
             grant_received = True
             spec, granted_pools = _grant_layout(
                 response, guard_index, request.tier_config
             )
-            if listener_fd is None:
-                # Every pool has a Guard, and a Guard answers on the endpoint
-                # this claimant named. A grant without it means the two sides
-                # disagree about who serves this pool group.
-                raise KVCRGuardProtocolError(
-                    "claim was granted without the endpoint it answers on"
-                )
-            attachment = KVCRPoolAttachment.attach(spec)
+            fd, pool_fd = pool_fd, None
+            attachment = KVCRPoolAttachment.attach_fd(fd, spec)
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
                     [
@@ -383,9 +390,10 @@ class KVCRClient:
         except BaseException as error:
             # Release the lease only after local access has stopped, or the
             # next claimant could map bytes this process can still reach.
-            if listener_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(listener_fd)
+            for leftover in (listener_fd, pool_fd):
+                if leftover is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(leftover)
             local_access_stopped = True
             if attachment is not None:
                 try:

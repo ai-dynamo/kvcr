@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from . import recovery_journal as _recovery
 from .config import (
     FrameworkControl,
     InventorySink,
@@ -19,14 +18,15 @@ from .config import (
     KVCRGuardConfig,
     TelemetryStats,
 )
-from .core import (  # noqa: F401 - public re-exports
+from .runtime.core import (  # noqa: F401 - public re-exports
     DURATION_METRIC,
     STATE_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
     _KVCRCore,
 )
-from .guard_protocol import KVCRPoolHold
+from .service import recovery_journal as _recovery
+from .service.protocol import KVCRPoolHold
 from .types import (
     BlockKey,
     CacheTier,
@@ -57,10 +57,12 @@ _NONQUIESCENT_STARTUP_RESOURCES: list[tuple[_KVCRCore, KVCRPoolHold | None]] = [
 class KVCRBindings(msgspec.Struct, frozen=True):
     """Framework services and integration callbacks used by KVCR."""
 
-    # Framework-owned source pinning.
-    request_pin: Callable[[Collection[BlockKey]], PinRequestId]
-    poll_pin_results: Callable[[], Iterable[tuple[PinRequestId, PinResult]]]
-    release_pin: Callable[[PinHandle], bool]
+    # Framework-owned source pinning, if used; cancellation is optional.
+    request_pin: Callable[[Collection[BlockKey]], PinRequestId] | None = None
+    poll_pin_results: Callable[[], Iterable[tuple[PinRequestId, PinResult]]] | None = (
+        None
+    )
+    release_pin: Callable[[PinHandle], bool] | None = None
     cancel_pin_request: Callable[[PinRequestId], None] | None = None
 
     # Control, key translation, and inventory reporting.
@@ -135,10 +137,10 @@ class KVCR:
 
     def submit_hint(
         self,
-        hints: Mapping[str, object] | msgspec.Struct,
+        hints: msgspec.Struct,
         request_id: str | None = None,
     ) -> None:
-        """Submit a mapping or msgspec envelope conforming to the hint protocol."""
+        """Submit a msgspec envelope conforming to the hint protocol."""
         self._core.submit_hint(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:

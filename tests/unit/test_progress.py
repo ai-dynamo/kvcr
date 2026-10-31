@@ -10,8 +10,13 @@ import numpy as np
 import pytest
 from nixl import nixlRemoteDisconnectError
 
-from kvcr import progress as progress_module
-from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
+from kvcr.runtime import progress as progress_module
+from kvcr.runtime.progress import (
+    _KVCRProgress,
+    _MemDescriptor,
+    _ProgressOp,
+    _TransferRef,
+)
 from kvcr.types import RegionDescriptor
 
 
@@ -192,7 +197,7 @@ def test_typed_disconnect_marks_peer_and_releases_handle(
 def test_prepare_registers_memory_before_backend_activation(
     monkeypatch, caplog, activate, level
 ) -> None:
-    caplog.set_level(level, logger="kvcr.progress")
+    caplog.set_level(level, logger="kvcr.runtime.progress")
     monkeypatch.setattr(progress_module, "_STARTUP_TIMEOUT_SECONDS", 0)
     clock_reads = []
     monkeypatch.setattr(
@@ -240,6 +245,8 @@ def test_prepare_registers_memory_before_backend_activation(
     )
     assert agent.deregistered == [1]
     assert progress.is_quiescent()
+    with pytest.raises(RuntimeError, match="once"):
+        progress.start()
     # Stages are tracked either way; only DEBUG reads clocks and logs them.
     assert progress._startup_stage == "cleanup"
     stages = [m for m in caplog.messages if "progress_startup_stage " in m]
@@ -249,6 +256,7 @@ def test_prepare_registers_memory_before_backend_activation(
 @pytest.mark.parametrize("prepared", [False, True])
 def test_instance_startup_budget_remains_bounded(monkeypatch, prepared) -> None:
     """A longer default must not hide a blocked instance's shorter deadline."""
+    join_timeout = progress_module._JOIN_TIMEOUT_SECONDS
     entered, release = threading.Event(), threading.Event()
 
     def initialize_agent():
@@ -267,9 +275,46 @@ def test_instance_startup_budget_remains_bounded(monkeypatch, prepared) -> None:
         with pytest.raises(RuntimeError, match="timed out after 0.001s"):
             (progress.prepare if prepared else progress.start)()
         assert entered.wait(1)
+        # Close cannot cancel initialization, so nothing may be released yet.
+        monkeypatch.setattr(progress_module, "_JOIN_TIMEOUT_SECONDS", 0.01)
+        with pytest.raises(RuntimeError, match="did not stop"):
+            progress.close()
+        assert not progress.is_quiescent()
     finally:
+        monkeypatch.setattr(progress_module, "_JOIN_TIMEOUT_SECONDS", join_timeout)
         release.set()
         progress.close()
+    assert progress.is_quiescent()
+
+
+def test_start_bounds_its_wait_for_a_background_preparation(monkeypatch) -> None:
+    """A stalled registration fails start() instead of parking its caller."""
+    entered, release = threading.Event(), threading.Event()
+
+    def register() -> None:
+        entered.set()
+        assert release.wait(5)
+
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        startup_timeout_seconds=0.001,
+    )
+    monkeypatch.setattr(progress, "_initialize_nixl", lambda: None)
+    monkeypatch.setattr(progress, "_register_memory_regions", register)
+    progress.prepare(wait=False)
+    assert entered.wait(1)
+    try:
+        with pytest.raises(RuntimeError, match="preparation timed out after 0.001s"):
+            progress.start()
+        # The registration is still running: nothing was activated or released.
+        assert not progress._activate.is_set()
+        assert not progress.is_quiescent()
+    finally:
+        release.set()
+    progress.close()
     assert progress.is_quiescent()
 
 
@@ -784,7 +829,8 @@ def test_real_thread_owns_lifecycle_and_transfers_same_object() -> None:
     assert lifecycle_threads[0] != main_thread
 
 
-def test_startup_failure_is_reported_to_main() -> None:
+@pytest.mark.parametrize("prepared", [False, True])
+def test_startup_failure_is_reported_to_main(monkeypatch, prepared) -> None:
     expected = RuntimeError("startup failed")
 
     def initialize(_progress: _KVCRProgress) -> None:
@@ -796,6 +842,11 @@ def test_startup_failure_is_reported_to_main() -> None:
         lambda: [],
         lambda: None,
     )
+    if prepared:
+        # A preparer that already died is not restarted.
+        monkeypatch.setattr(progress, "_initialize_nixl", Mock(side_effect=expected))
+        progress.prepare(wait=False)
+        progress._thread.join(5)
 
     with pytest.raises(RuntimeError, match="startup failed") as exc_info:
         progress.start()

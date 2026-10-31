@@ -21,16 +21,22 @@ from test_gpu_direct import (
     DOMAIN,
     GPUAgent,
     GPUPinning,
-    gpu_hint,
+    gpu_envelope,
     refs,
     regions,
     source_message,
 )
 
-from kvcr import progress as kvcr_progress
+from kvcr.backends.remote_fw_dram import _RemoteFWDram
+from kvcr.backends.remote_ops import (
+    _TargetMetadata,
+    _TargetMetadataAck,
+    _TargetPullOp,
+    _TargetPullState,
+)
 from kvcr.config import KVCRConfig, RemoteFWGPUOptions
-from kvcr.progress import _KVCRProgress
-from kvcr.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
+from kvcr.runtime import progress as kvcr_progress
+from kvcr.runtime.progress import _KVCRProgress
 from kvcr.types import BlockKey
 
 FABRIC = "mnnvl:0123456789abcdef0123456789abcdef:0"
@@ -191,7 +197,7 @@ def test_mnnvl_source_rejects_incompatible_peer_before_native_connection(
 
 def test_mnnvl_target_rejects_legacy_ack_before_offering_destination(monkeypatch):
     kvcr, agent, _, control = new_mnnvl(monkeypatch, owner="target")
-    kvcr.submit_hint(gpu_hint(), request_id="mnnvl")
+    kvcr.submit_hint(gpu_envelope(), request_id="mnnvl")
     handle = kvcr.deliver({BlockKey(b"k0"): refs("target", 2)}, "mnnvl")
     _wait_until(lambda: bool(control.sent))
     probe = _decode_control_message(control.sent[-1][1])
@@ -251,11 +257,9 @@ def test_restarted_gpu_source_must_repeat_capability_before_new_offer():
     )
     assert op.progress(Mock(), {"retry_metadata": "new"}) == (False, True)
     assert not op.gpu_peer_verified and op.retried
-    assert backend._send_control.call_args.args[2] == {
-        "type": "target_metadata",
-        "op_handle": 1,
-        "gpu_capability_only": True,
-    }
+    assert backend._send_control.call_args.args[2] == _TargetMetadata(
+        op_handle=1, gpu_capability_only=True
+    )
 
 
 def test_delayed_old_capability_ack_cannot_undo_source_restart():
@@ -279,19 +283,19 @@ def test_delayed_old_capability_ack_cannot_undo_source_restart():
         gpu_peer_verified=False,
     )
     progress = SimpleNamespace(_in_flight_ops={op.op_id: op})
-    reply = {
-        "sender_control_endpoint": "peer",
-        "op_handle": 1,
-        "sender_incarnation": "old",
-        "gpu_peer_accepted": True,
-        "gpu_capability_only": True,
+    reply = _TargetMetadataAck(
+        sender_control_endpoint="peer",
+        op_handle=1,
+        sender_incarnation="old",
+        gpu_peer_accepted=True,
+        gpu_capability_only=True,
         **backend._gpu_contract(),
-    }
+    )
     backend._handle_target_metadata_ack(progress, reply)
     assert op.source_incarnation == "new" and not op.gpu_peer_verified
     assert backend._dangling_ops.sources == {"peer": "old"}
     backend._handle_target_metadata_ack(
-        progress, {**reply, "sender_incarnation": "new"}
+        progress, msgspec.structs.replace(reply, sender_incarnation="new")
     )
     assert op.source_incarnation == "new" and op.gpu_peer_verified
     assert backend._dangling_ops.sources == {"peer": "new"}

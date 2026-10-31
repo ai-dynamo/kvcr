@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.21-cu130-runtime@sha256:797614a377ead47cf89ccaba810685b56a1bf0d6f0c45f84af2e8f42c198e104
+
+FROM rust:1.96.1-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS sglang-dynamo-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake git libclang-dev libhwloc-dev libprotobuf-dev libssl-dev libudev-dev \
+    pkg-config protobuf-compiler python3-dev python3-pip python3-venv \
+ && rm -rf /var/lib/apt/lists/*
+ARG SGLANG_DYNAMO_REF=83ea37e849e883c27d7ed848e0f329961e1fb173
+RUN git init /src/dynamo \
+ && git -C /src/dynamo remote add origin https://github.com/ai-dynamo/dynamo.git \
+ && git -C /src/dynamo fetch --depth 1 origin "${SGLANG_DYNAMO_REF}" \
+ && git -C /src/dynamo checkout --detach FETCH_HEAD \
+ && test "$(git -C /src/dynamo rev-parse HEAD)" = "${SGLANG_DYNAMO_REF}"
+RUN python3 -m venv /venv \
+ && /venv/bin/pip install --no-cache-dir 'maturin[patchelf]==1.9.6'
+ENV CARGO_BUILD_JOBS=4
+RUN cd /src/dynamo/lib/bindings/python \
+ && /venv/bin/maturin build --locked --release --features select-service,kv-indexer --out /wheels
+RUN /venv/bin/pip wheel --no-deps /src/dynamo --wheel-dir /wheels
+
+FROM ${SGLANG_IMAGE} AS sglang
+USER root
+ARG SGLANG_REF=b0506add3eac49bbb2c303e83169ea19c907fb98
+RUN test "$(uname -m)" = x86_64 \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    git curl libatomic1 libhwloc15 libnuma1 libssl3t64 libudev1 \
+ && rm -rf /var/lib/apt/lists/*
+RUN git init /opt/sglang-src \
+ && git -C /opt/sglang-src remote add origin https://github.com/ziqifan617/sglang.git \
+ && git -C /opt/sglang-src fetch --depth 1 origin "${SGLANG_REF}" \
+ && git -C /opt/sglang-src checkout --detach FETCH_HEAD \
+ && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${SGLANG_REF}"
+# Install KVCR from the checkout used as the Docker build context.
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
+COPY src /opt/kvcr-src/src
+COPY --from=sglang-dynamo-builder /wheels /tmp/dynamo-wheels
+COPY <<'EOF' /opt/sglang-constraints.txt
+torch==2.14.1
+transformers==5.19.0
+flashinfer-python==0.7.2
+nvidia-cutlass-dsl==4.8.0
+sgl-deep-gemm==0.2.3
+sglang-kernel==0.4.10
+apache-tvm-ffi==0.1.11
+nixl==1.5.0
+msgspec==0.22.0
+pyzmq==27.1.0
+numpy==2.3.5
+protobuf==7.36.2
+EOF
+ENV SGLANG_BUILD_RUST_EXTS=none SGLANG_RUST_BUILD_MODE=never \
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
+RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-scm==9.2.2' 'hatchling==1.27.0' \
+ && python3 -m pip uninstall -y sglang \
+ && python3 -m pip install --no-cache-dir --no-build-isolation \
+      --constraint /opt/sglang-constraints.txt \
+      --find-links https://pypi.nvidia.com/aisimulate/ \
+      /opt/sglang-src/python /opt/kvcr-src /tmp/dynamo-wheels/*.whl \
+      'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
+ && python3 -m pip install --no-cache-dir --no-deps \
+      --index-url https://flashinfer.ai/whl 'flashinfer-cubin==0.7.2' \
+ && python3 -m pip install --no-cache-dir --no-deps \
+      --index-url https://flashinfer.ai/whl/cu130 'flashinfer-jit-cache==0.7.2'
+COPY <<'EOF' /opt/sglang-router-policy.yaml
+worker_selection:
+  aggregated: two-tier
+  instances:
+    - name: two-tier
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        cache_threshold: 0.5
+        balance_abs_threshold: 4
+        balance_rel_threshold: 1.1
+EOF
+ENV DYN_REQUEST_PLANE=tcp DYN_EVENT_PLANE=zmq DYN_DISCOVERY_BACKEND=file \
+    DYN_FILE_KV=/tmp/dynamo-sglang-quick-start DYN_SYSTEM_HOST=127.0.0.1 \
+    DYN_RUNTIME_NUM_WORKER_THREADS=4 DYN_RUNTIME_MAX_BLOCKING_THREADS=8 \
+    TOKENIZERS_PARALLELISM=false PYTHONHASHSEED=0 RUST_LOG=info \
+    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4
+# Import/version canary only; model/peer-transfer acceptance is in the guide.
+RUN python3 - <<'PY'
+from importlib import metadata
+from pathlib import Path
+import tomllib
+import dynamo.sglang
+import torch
+from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
+from dynamo.llm import WorkerType
+from dynamo.sglang import kv_hints
+from dynamo.sglang.state_agent import StateAgentLifecycle
+from kvcr import ZmqPeerControlChannel
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+
+for line in Path('/opt/sglang-constraints.txt').read_text().splitlines():
+    name, expected = line.split('==')
+    actual = metadata.version(name)
+    assert actual.split('+', 1)[0] == expected, (name, actual, expected)
+    print(f'{name}=={actual}')
+assert torch.version.cuda == '13.0'
+assert KV_HINT_TRANSFER_CAPABILITY_KEY == 'router_hint'
+assert callable(KVCRStore.batch_get_v1)
+assert callable(HiCacheStorage.get_kv_hint_source)
+assert callable(StateAgentLifecycle.start)
+assert callable(ZmqPeerControlChannel)
+assert metadata.version('ai-dynamo') == '1.7.0'
+assert metadata.version('ai-dynamo-runtime') == '1.7.0'
+kvcr_project = tomllib.loads(Path('/opt/kvcr-src/pyproject.toml').read_text())['project']
+assert metadata.version('kvcr') == kvcr_project['version']
+print('SGLang HiCache import/version checks passed; GPU verification still required')
+PY
+RUN python3 -m pip freeze --all > /opt/sglang-installed-packages.txt
+WORKDIR /workspace
+ENTRYPOINT []

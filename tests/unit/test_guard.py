@@ -10,6 +10,9 @@ import queue
 import select
 import signal
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -18,22 +21,24 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record, _wait_until
 
-from kvcr import guard as guard_module
+from kvcr.backends.dangling_ops import _DanglingOps
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.backends.local_dram_pools import _LocalDramState
+from kvcr.backends.remote_ops import _WriteProbe
 from kvcr.config import LocalDramOptions
-from kvcr.control_channels import KVCRServiceError, ZmqPeerControlChannel
-from kvcr.core import _BlockRecord
-from kvcr.dangling_ops import _DanglingOps
-from kvcr.guard import (
+from kvcr.runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
+from kvcr.runtime.core import _BlockRecord
+from kvcr.runtime.progress import _KVCRProgress
+from kvcr.service import guard as guard_module
+from kvcr.service.guard import (
     _Command,
     _Guard,
     _Phase,
     _PoolLease,
 )
-from kvcr.guard_protocol import _G3Config, _TierConfig
-from kvcr.local_disk import _G3Residency
-from kvcr.local_dram import _LocalDramState
-from kvcr.memory import KVCRPoolSpec
-from kvcr.recovery_journal import (
+from kvcr.service.memory import KVCRPoolSpec
+from kvcr.service.protocol import _G3Config, _TierConfig
+from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
     _RECOVERY_ENCODER,
     RecoveryJournalError,
@@ -42,7 +47,7 @@ from kvcr.recovery_journal import (
     _RecoveryBlock,
     _RecoveryMirror,
 )
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, RegionDescriptor
 
 _TEST_SPEC = KVCRPoolSpec(
     pool_id="pool_0",
@@ -198,7 +203,7 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
         return [(7, select.POLLIN)]
 
     poller.poll.side_effect = poll_during_which_close_begins
-    monkeypatch.setattr("kvcr.guard.select.poll", Mock(return_value=poller))
+    monkeypatch.setattr("kvcr.service.guard.select.poll", Mock(return_value=poller))
 
     guard._observe_holder()
 
@@ -210,7 +215,7 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
 def _stub_fence(monkeypatch) -> Mock:
     """Heartbeat promotion SIGKILLs its primary; tests must not really signal."""
     fence = Mock()
-    monkeypatch.setattr("kvcr.guard.signal.pidfd_send_signal", fence)
+    monkeypatch.setattr("kvcr.service.guard.signal.pidfd_send_signal", fence)
     return fence
 
 
@@ -223,7 +228,7 @@ def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
     guard._pool_lease.poll_pidfd = Mock(return_value=None)
     guard._promote = Mock(side_effect=lambda: setattr(guard, "_serving", True))
     now = [10.0]
-    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("kvcr.service.guard.time.monotonic", lambda: now[0])
 
     now[0] += 2.0
     guard._observe_holder()
@@ -335,11 +340,16 @@ def test_default_guard_waits_for_pidfd_without_heartbeats() -> None:
     assert guard._last_heartbeat is None
 
 
-def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> None:
+@pytest.mark.parametrize("serving", [True, False])
+def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(
+    caplog, serving
+) -> None:
     """A mirror failure retires its journal, fences the core, and is reported."""
     error = RecoveryMirrorError("recovery record is malformed")
     core = Mock()
     core.poll_completed.side_effect = error
+    # A standby polls its background preparation instead.
+    core._progress.raise_if_failed.side_effect = error
     core.close.side_effect = OSError("close failed")
     control = Mock()
     journal = Mock()
@@ -348,10 +358,11 @@ def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> N
     guard._control = control
     guard._configured = _tier(16)
     guard._recovery._journal = journal
-    guard._serving = True
+    guard._serving = serving
     guard._core = core
-    caplog.set_level(logging.ERROR, logger="kvcr.guard")
+    caplog.set_level(logging.ERROR, logger="kvcr.service.guard")
 
+    guard._poll()
     guard._poll()
 
     assert guard._failure is error
@@ -398,7 +409,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 ) -> None:
     """The Guard's whole life: each stage hands the next exactly what it left."""
     _stub_fence(monkeypatch)
-    caplog.set_level(logging.INFO, logger="kvcr.guard")
+    caplog.set_level(logging.INFO, logger="kvcr.service.guard")
     first, second, g3_only, fresh = (
         BlockKey(b"first"),
         BlockKey(b"second"),
@@ -409,7 +420,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         [
             _frame(first, _recovered_record(g2=[("", 0)], g3=7)),
             _frame(second, _recovered_record(g2=[("", 1)])),
-            _frame(g3_only, _BlockRecord(g3=_G3Residency(9), position=3)),
+            _frame(g3_only, _BlockRecord(g3=_G3Residency(("",), (9,)), position=3)),
         ]
     )
     closed: list[str] = []
@@ -455,9 +466,11 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         return channel
 
     attach = Mock(return_value=attachment)
-    monkeypatch.setattr("kvcr.guard.KVCRPoolAttachment.attach", attach)
-    monkeypatch.setattr("kvcr.guard.RecoveryJournal", Mock(return_value=journal))
-    monkeypatch.setattr("kvcr.guard._KVCRCore", new_core)
+    monkeypatch.setattr("kvcr.service.guard.KVCRPoolAttachment.attach", attach)
+    monkeypatch.setattr(
+        "kvcr.service.guard.RecoveryJournal", Mock(return_value=journal)
+    )
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", new_core)
     attachment.release_snapshot_region.side_effect = lambda: order.append("clear")
     g3_config = _G3Config(
         paths=(str(tmp_path / "g3.data"),),
@@ -476,11 +489,11 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     guard._refuse_incompatible(_tier(16))
     guard._adopt(new_channel(), tier)
     try:
-        attach.assert_called_once_with(_PAGE_SPEC)
+        attach.assert_called_once_with(_PAGE_SPEC, collapse=True)
         assert journal.reset_called
         # Adoption registers the Guard transport without starting it.
         assert len(cores) == 1
-        cores[0]._progress.prepare.assert_called_once_with()
+        cores[0]._progress.prepare.assert_called_once_with(wait=False)
         cores[0].start.assert_not_called()
         with pytest.raises(RecoveryMirrorError, match="another tier configuration"):
             guard._refuse_incompatible(_tier(16))
@@ -507,20 +520,20 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         # Speculative serving cannot certify death, but the same core must
         # publish the tombstone once pidfd confirms the primary has exited.
         backend = cores[0]._remote_fw_dram
-        probe = {
-            "target_agent": "target",
-            "op_handle": 1,
-            "sender_control_endpoint": "tcp://target:1",
-            "source_control_endpoint": "tcp://source:1",
-            "source_incarnation": "primary",
-        }
+        probe = _WriteProbe(
+            target_agent="target",
+            op_handle=1,
+            sender_control_endpoint="tcp://target:1",
+            source_control_endpoint="tcp://source:1",
+            source_incarnation="primary",
+        )
         backend._dangling_ops.handle_probe(Mock(), probe)
-        assert "dead_incarnation" not in backend._send_control.call_args.args[2]
+        assert backend._send_control.call_args.args[2].dead_incarnation is None
         guard._pool_lease.poll_pidfd.return_value = select.POLLIN
         guard._observe_holder()
         assert guard._core is cores[0] and len(cores) == 1
         backend._dangling_ops.handle_probe(Mock(), probe)
-        assert backend._send_control.call_args.args[2]["dead_incarnation"] == "primary"
+        assert backend._send_control.call_args.args[2].dead_incarnation == "primary"
 
         # A replacement claims the pool. What is kept must be what a replay
         # gives: the half-written G2 slot is dropped, and the G3 halves are
@@ -539,9 +552,9 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert guard._recovery.mirror._records is records
         assert guard._recovery.mirror._records[first].g3 is retained_g3
         assert guard._recovery.mirror._records == {
-            first: _BlockRecord(g3=_G3Residency(7), position=2),
+            first: _BlockRecord(g3=_G3Residency(("",), (7,)), position=2),
             second: _recovered_record(g2=[("", 1)]),
-            g3_only: _BlockRecord(g3=_G3Residency(9), position=3),
+            g3_only: _BlockRecord(g3=_G3Residency(("",), (9,)), position=3),
         }
         assert guard._recovery._g3_records == {}
 
@@ -559,7 +572,7 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
 
         assert len(set(agent_names)) == 2
         assert set(guard._recovery._g3_records) == {fresh}
-        assert guard._recovery._g3_records[fresh][0].slot == 7
+        assert guard._recovery._g3_records[fresh][0].slots[0] == 7
         assert order[3:] == [("adopt", (second, fresh)), "clear", "start"]
         events = [
             message
@@ -585,10 +598,115 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
     assert closed == ["core1", "control1", "core2", "control2", "attachment"]
 
 
+def _registering_core(monkeypatch, step) -> Mock:
+    """A Guard core whose startup steps run through `step(name)`."""
+    progress = _KVCRProgress(
+        lambda _: step("initialize"),
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        nixl_agent_name="guard",
+        memory_regions=({}, {"": RegionDescriptor(addr=128, size=128)}),
+    )
+    progress._nixl_agent = Mock()
+    progress._nixl_agent.register_memory.side_effect = lambda *_, **__: step("register")
+    monkeypatch.setattr(progress, "_initialize_nixl", lambda: step("nixl"))
+    monkeypatch.setattr(progress, "_capture_agent_metadata", lambda: None)
+    core = Mock(_block_record_map={}, _progress=progress)
+    core.configure_mock(
+        start=progress.start, close=progress.close, is_quiescent=progress.is_quiescent
+    )
+    return core
+
+
+_PREPARED_ORDER = ["nixl", "register", "initialize"]
+
+
+@pytest.mark.parametrize("promote", [True, False])
+@pytest.mark.parametrize("blocked", ["register", "nixl"])
+def test_only_promotion_waits_for_a_guard_registration(
+    monkeypatch, blocked, promote
+) -> None:
+    """Promotion waits out a background preparation, in one fixed order, and a
+    release never does."""
+    events, entered, release = [], threading.Event(), threading.Event()
+
+    def step(name: str) -> None:
+        events.append(name)
+        if name == blocked:
+            entered.set()
+            assert release.wait(5)
+
+    core = _registering_core(monkeypatch, step)
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(return_value=core))
+    guard = _configurable_guard()
+    guard._recovery.attachment = _fake_attachment()
+    guard._recovery._journal = _Journal()
+    guard._adopt(Mock(), _tier(16))
+    with ThreadPoolExecutor(1) as pool:
+        try:
+            assert entered.wait(1)
+            action = pool.submit(guard._promote if promote else guard._release)
+            # A release must not wait out the registration (or fail the service).
+            if promote:
+                with pytest.raises(FutureTimeoutError):
+                    action.result(0.1)
+            else:
+                action.result(1)
+            assert action.running() is promote and not guard._serving
+            assert events == _PREPARED_ORDER[: _PREPARED_ORDER.index(blocked) + 1]
+        finally:
+            release.set()
+        action.result(5)
+    if promote:
+        assert guard._serving and events == _PREPARED_ORDER
+        core._progress.close()
+    else:
+        _wait_until(core._progress._prepare_ready.is_set)
+        guard._poll()
+        assert guard._orphans == [] and guard._failure is None
+        assert core.is_quiescent() and "initialize" not in events
+
+
+def test_every_released_core_is_kept_until_it_has_registered(monkeypatch) -> None:
+    """Claims released while registering are all kept: closing the pool under
+    an unowned registration would fault the process."""
+    entered, release = threading.Semaphore(0), threading.Event()
+
+    def step(name: str) -> None:
+        if name == "register":
+            entered.release()
+            assert release.wait(5)
+
+    cores = [_registering_core(monkeypatch, step) for _ in range(2)]
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(side_effect=cores))
+    guard = _configurable_guard()
+    guard._recovery.attachment = _fake_attachment()
+    guard._recovery._journal = _Journal()
+    try:
+        for _ in range(2):
+            guard._adopt(Mock(), _tier(16))
+            assert entered.acquire(timeout=1)
+            guard._release()
+        assert guard._orphans == cores
+        guard._poll()
+        assert guard._orphans == cores and guard._failure is None
+        # Once registered, the actor closes each orphan without a command.
+        guard._started = True
+        guard._thread.start()
+        release.set()
+        _wait_until(lambda: not guard._orphans, timeout=5)
+    finally:
+        release.set()
+        guard.close()
+    assert guard._failure is None
+    assert all(core.is_quiescent() for core in cores)
+
+
 def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
     core = Mock(_block_record_map={})
-    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=core))
-    guard = _configurable_guard()
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(return_value=core))
+    guard = _configurable_guard(startup_timeout_seconds=600)
     guard._recovery.attachment = _fake_attachment()
     guard._recovery._journal = _Journal()
 
@@ -599,9 +717,11 @@ def test_claim_preparation_failure_closes_transport(monkeypatch) -> None:
     control.close.assert_called_once_with()
     core.close.assert_called_once_with()
     assert guard._failure is core._progress.prepare.side_effect
-    core._progress.prepare.assert_called_once_with()
+    core._progress.prepare.assert_called_once_with(wait=False)
     core.start.assert_not_called()
     assert guard._serving is False
+    # The service's budget reaches the Guard core; the default stays None.
+    assert guard_module._KVCRCore.call_args.args[0].startup_timeout_seconds == 600
 
 
 @pytest.mark.parametrize(
@@ -697,9 +817,9 @@ def test_guard_closes_control_when_its_thread_does_not_start(monkeypatch) -> Non
     control = Mock()
     attachment = _fake_attachment()
     monkeypatch.setattr(
-        "kvcr.guard.KVCRPoolAttachment.attach", Mock(return_value=attachment)
+        "kvcr.service.guard.KVCRPoolAttachment.attach", Mock(return_value=attachment)
     )
-    monkeypatch.setattr("kvcr.guard.RecoveryJournal", Mock())
+    monkeypatch.setattr("kvcr.service.guard.RecoveryJournal", Mock())
     guard = _guard()
     guard._control = control
     guard._configured = _tier(16)
@@ -748,7 +868,9 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     guard = _guard(owner=owner)
     guard._recovery.attachment = attachment
     mirror = guard._recovery.mirror = _RecoveryMirror(("",))
-    g3_records = guard._recovery._g3_records = {BlockKey(b"g3"): (_G3Residency(0), -1)}
+    g3_records = guard._recovery._g3_records = {
+        BlockKey(b"g3"): (_G3Residency(("",), (0,)), -1)
+    }
     guard._pool_lease.current = holder
 
     with pytest.raises(RuntimeError) as first:
@@ -770,8 +892,9 @@ def test_recovery_close_error_stays_first_while_lease_cleanup_continues() -> Non
     owner.close.assert_called_once_with()
 
 
+@pytest.mark.parametrize("orphaned", [False, True, "with_successor"])
 def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
-    caplog,
+    caplog, orphaned
 ) -> None:
     """Close keeps everything while the core moves; once quiescent it contains."""
     control = Mock()
@@ -781,18 +904,31 @@ def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
     core.close.side_effect = error
     core.is_quiescent.return_value = False
     guard = _guard()
-    guard._control = control
     guard._configured = _tier(16)
-    guard._core = core
     guard._recovery.attachment = attachment
-    caplog.set_level(logging.WARNING, logger="kvcr.guard")
+    caplog.set_level(logging.WARNING, logger="kvcr.service.guard")
+    if orphaned:
+        # A released core whose close failed in polling stays owned. (The
+        # failure fences the control channel, so none is attached here.)
+        guard._orphans.append(core)
+        guard._poll()
+        assert guard._failure is error and guard._orphans == [core]
+        caplog.clear()
+    else:
+        guard._control = control
+        guard._core = core
+    if orphaned == "with_successor":
+        # A newer core serving the pool while the released one still registers.
+        guard._core = successor = Mock()
 
     # Still moving bytes: nothing may be unmapped under it.
     with pytest.raises(RuntimeError) as raised:
         guard.close()
     assert raised.value is error
-    control.close.assert_not_called()
     attachment.close.assert_not_called()
+    if orphaned == "with_successor":
+        # The refused orphan must not leave the successor polling.
+        successor.close.assert_called_once_with()
 
     # Quiescent: the same failure is contained and everything goes back.
     core.is_quiescent.return_value = True
@@ -800,8 +936,9 @@ def test_a_close_refused_by_a_moving_core_retains_the_pool_until_quiescent(
     assert caplog.messages == ["KVCR Guard core close failed after reaching quiescence"]
     assert caplog.records[0].exc_info is not None
     assert caplog.records[0].exc_info[1] is error
-    control.close.assert_called_once_with()
     attachment.close.assert_called_once_with()
+    if not orphaned:
+        control.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("refused_by", ["geometry", "handback", "hand-over"])
@@ -843,7 +980,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
             expected = RecoveryJournalError
             tier_config = _tier(16)
             handback = Mock(side_effect=RecoveryJournalError("written for other terms"))
-        monkeypatch.setattr("kvcr.guard.read_handback", handback)
+        monkeypatch.setattr("kvcr.service.guard.read_handback", handback)
 
         with pytest.raises(expected):
             guard._adopt(control, tier_config)
@@ -860,7 +997,7 @@ def test_only_a_claim_refused_before_the_pool_moves_costs_nothing(
 
 
 def test_a_handback_with_an_unexpected_storage_error_fails() -> None:
-    """Only capacity errors (ENOSPC/EDQUOT) are survivable at the handback writer."""
+    """Only capacity errors (ENOSPC/EDQUOT/ENOMEM) survive at the handback writer."""
     guard = _configurable_guard()
     guard._recovery.mirror = _RecoveryMirror(("",))
     _give_serving_core(guard)
@@ -900,7 +1037,7 @@ def test_a_handback_the_filesystem_refuses_leaves_a_cold_pool() -> None:
     assert guard._recovery.mirror is None
 
 
-@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT, errno.ENOMEM])
 def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(
     code: int, monkeypatch
 ) -> None:
@@ -915,14 +1052,14 @@ def test_a_dropped_handback_still_leaves_the_new_lease_mirrored(
     guard._recovery._journal = _Journal()
     guard._recovery._write_handback = Mock(side_effect=OSError(code, "No space left"))
     prepared = Mock(_block_record_map={})
-    monkeypatch.setattr("kvcr.guard._KVCRCore", Mock(return_value=prepared))
+    monkeypatch.setattr("kvcr.service.guard._KVCRCore", Mock(return_value=prepared))
 
     guard._adopt(Mock(), _tier(16))
 
     # The pool went cold, not fatal: a fresh standby is ready but not serving.
     assert guard._serving is False
     assert guard._core is prepared
-    prepared._progress.prepare.assert_called_once_with()
+    prepared._progress.prepare.assert_called_once_with(wait=False)
     prepared.start.assert_not_called()
     # The claimant was told cold; the new lease is still mirrored, so this
     # primary's deposits survive its own death.

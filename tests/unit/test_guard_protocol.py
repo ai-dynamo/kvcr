@@ -6,20 +6,22 @@ import mmap
 import os
 import select
 import socket
+from typing import Any
 from unittest.mock import MagicMock, Mock
 
 import msgspec
 import pytest
 from _kvcr_test_utils import _wait_until
 
-from kvcr import guard_protocol as protocol_module
-from kvcr.config import LocalDramOptions
-from kvcr.control_channels import (
+from kvcr.config import G3Options, LocalDramOptions
+from kvcr.runtime.control_channels import (
     KVCRGuardProtocolError,
     KVCRServiceError,
     KVCRSocketError,
 )
-from kvcr.guard_protocol import (
+from kvcr.service import protocol as protocol_module
+from kvcr.service.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
+from kvcr.service.protocol import (
     KVCRClient,
     KVCRPoolHold,
     PidfdLiveness,
@@ -33,7 +35,6 @@ from kvcr.guard_protocol import (
     _Released,
     _TierConfig,
 )
-from kvcr.memory import _JOURNAL_HEADER_BYTES, KVCRPoolSpec
 
 _GUARD_INDEX = 3
 _POOL_LAYOUTS = [("pool0", 1024), ("pool1", 3072)]
@@ -112,24 +113,31 @@ class _RecordingConnection:
         self.events = events if events is not None else []
         self.sent: list[object] = []
         self.sent_fds: list[int] = []
-        # A real descriptor, because the claim path closes what it is given.
-        self.received_fd: int | None = os.open(os.devnull, os.O_RDONLY)
-        self.handed_fd: int | None = None
+        # Real descriptors (pool, then listener), because the claim closes them.
+        self.received_fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2)]
+        self.handed_fds: list[int] = []
         self.closed = False
 
     def send(self, message: object) -> None:
         self.events.append("send")
         self.sent.append(message)
 
-    def send_with_fd(self, message: object, file_descriptor: int) -> None:
+    def send_with_fd(self, message: object, *file_descriptors: int) -> None:
         self.send(message)
-        self.sent_fds.append(file_descriptor)
+        self.sent_fds.extend(file_descriptors)
 
-    def receive_with_fd(self, decoder: object) -> tuple[object, int | None]:
-        # Handing it over transfers ownership, exactly as the real channel does.
+    def receive_with_fd(
+        self, decoder: object, expected_counts: Any
+    ) -> tuple[object, list[int]]:
         message = self.receive(decoder)
-        self.handed_fd, self.received_fd = self.received_fd, None
-        return message, self.handed_fd
+        # Handing them over transfers ownership, exactly as the real channel does.
+        self.handed_fds, self.received_fds = self.received_fds, []
+        return message, self.handed_fds
+
+    def _close_received(self) -> None:
+        for file_descriptor in self.received_fds:
+            os.close(file_descriptor)
+        self.received_fds = []
 
     def receive(self, _decoder: object) -> object:
         self.events.append("receive")
@@ -142,9 +150,7 @@ class _RecordingConnection:
         self.events.append("connection.close")
         self.closed = True
         # Whatever the claim never took off our hands, exactly like a real one.
-        if self.received_fd is not None:
-            os.close(self.received_fd)
-            self.received_fd = None
+        self._close_received()
 
 
 class _Attachment:
@@ -155,6 +161,7 @@ class _Attachment:
     ) -> None:
         self._events = events
         self._close_error = close_error
+        self.fd: int | None = None  # The pool descriptor it owns once attached.
 
     @property
     def address(self) -> int:
@@ -165,6 +172,31 @@ class _Attachment:
             self._events.append("attachment.close")
         if self._close_error is not None:
             raise self._close_error
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def _attach_fd_owning(
+    attachment: _Attachment | None = None, error: BaseException | None = None
+) -> Mock:
+    """An attach_fd that takes ownership of the descriptor, as the real one does."""
+
+    def attach_fd(file_descriptor: int, _spec: object, **_: object) -> _Attachment:
+        if error is not None:
+            os.close(file_descriptor)
+            raise error
+        assert attachment is not None
+        attachment.fd = file_descriptor
+        return attachment
+
+    return Mock(side_effect=attach_fd)
+
+
+def _assert_closed(*file_descriptors: int) -> None:
+    for file_descriptor in file_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(file_descriptor)
 
 
 def _grant(
@@ -236,7 +268,7 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
     with pytest.raises(ValueError, match="unique"):
         _G3Config(**{**good, "paths": ("/g3/a", "/g3//a")})
 
-    with pytest.raises(ValueError, match="does not support multiple pools"):
+    with pytest.raises(ValueError, match="page-aligned"):
         _TierConfig(
             _POOL_LAYOUTS,
             _G3Config(**{**good, "capacity_bytes_per_file": mmap.PAGESIZE}),
@@ -253,12 +285,51 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
         )
 
     tier = _TierConfig(
-        [("pool", mmap.PAGESIZE)],
+        [("full", 2 * mmap.PAGESIZE), ("swa", mmap.PAGESIZE)],
         _G3Config(**{**good, "capacity_bytes_per_file": 2 * mmap.PAGESIZE - 1}),
     )
     assert (
         msgspec.msgpack.decode(msgspec.msgpack.encode(tier), type=_TierConfig) == tier
     )
+
+
+@pytest.mark.parametrize("options", [{}, {"use_aio": "true"}])
+def test_g3_claim_normalizes_equivalent_backend_defaults(
+    monkeypatch, tmp_path, options
+):
+    g3 = G3Options(
+        paths=(tmp_path / "g3.data",),
+        capacity_bytes_per_file=mmap.PAGESIZE,
+        backend="POSIX",
+        backend_options=options,
+    )
+    layouts = [(pool.name, mmap.PAGESIZE) for pool in _WIRE_POOLS]
+    tier = _TierConfig(
+        layouts,
+        _G3Config((str(g3.paths[0]),), mmap.PAGESIZE, "POSIX", {"use_aio": "true"}),
+    )
+    pools = tuple(
+        msgspec.structs.replace(pool, block_size_bytes=mmap.PAGESIZE)
+        for pool in _WIRE_POOLS
+    )
+    connection = _RecordingConnection(
+        [_grant(tier_config=tier, pools=pools), _Released(1)]
+    )
+    _connect_with(monkeypatch, connection)
+    monkeypatch.setattr(
+        protocol_module.KVCRPoolAttachment,
+        "attach_fd",
+        _attach_fd_owning(_Attachment()),
+    )
+    hold = KVCRClient("/unused").claim(
+        _GUARD_INDEX, layouts, _DIGEST, ("127.0.0.1", 5555), g3=g3
+    )
+    try:
+        assert connection.sent[0].tier_config == tier
+        assert dict(g3.backend_options) == options
+    finally:
+        hold.release()
+    _assert_closed(*connection.handed_fds)
 
 
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
@@ -272,9 +343,9 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     )
     connection = _RecordingConnection([decoded, _Released(1)], events)
     attachment = _Attachment(events)
-    attach = Mock(return_value=attachment)
+    attach = _attach_fd_owning(attachment)
     _connect_with(monkeypatch, connection)
-    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
+    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach)
 
     hold = KVCRClient("/unused").claim(
         _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
@@ -307,14 +378,16 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "remote_fw_dram_backend": "UCX",
     }
     assert grant_wire["pools"] == msgspec.to_builtins(_WIRE_POOLS)
-    attach.assert_called_once_with(grant.spec)
+    pool_fd = connection.handed_fds[0]
+    attach.assert_called_once_with(pool_fd, grant.spec)
     assert hold.local_dram == _local_dram()
     # The endpoint a Guard will answer on, handed over with the grant.
-    assert hold._control_listener_fd == connection.handed_fd
+    assert hold._control_listener_fd == connection.handed_fds[-1]
 
     hold.release()
 
     # Released rather than disowned, so the hold closes what it was given.
+    _assert_closed(*connection.handed_fds)
     assert len(connection.sent_fds) == 1  # The claim carried the worker pidfd.
     assert msgspec.to_builtins(connection.sent[-1]) == {
         "type": "release",
@@ -384,9 +457,9 @@ def test_a_failed_claim_is_released_without_masking_the_original(
         ConnectionResetError("rollback failed") if mapping_error else _Released(1)
     )
     connection = _RecordingConnection([reply, rollback_reply])
-    attach = Mock(side_effect=mapping_error)
+    attach = _attach_fd_owning(error=mapping_error)
     _connect_with(monkeypatch, connection)
-    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
+    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach_fd", attach)
 
     original = mapping_error or (reply if isinstance(reply, BaseException) else None)
     with pytest.raises(
@@ -405,6 +478,8 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     # Unactivated: this claim never served, so the Guard may resume.
     assert release == _Release(1, activated=False)
     assert connection.closed is True
+    # Whichever way it failed, no descriptor the claim was handed is left open.
+    _assert_closed(*connection.handed_fds)
 
 
 def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> None:

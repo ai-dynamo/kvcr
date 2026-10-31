@@ -19,9 +19,24 @@ import traceback
 import uuid
 from pathlib import Path
 
+import msgspec
+
 SOURCE_SLOTS = (11, 2, 8, 4, 1, 10, 6)
 TARGET_SLOTS = (0, 12, 3, 9, 5, 1, 7)
 SLOTS = 13
+
+
+class _HintAction(msgspec.Struct, frozen=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict[str, object]
+
+
+class _HintEnvelope(msgspec.Struct, frozen=True):
+    protocol_version: str
+    message_id: str
+    actions: list[_HintAction]
 
 
 def write(path, value):
@@ -34,8 +49,10 @@ def verify_source(manifest):
     assert spec is not None and spec.origin is not None
     package = Path(spec.origin).resolve().parent
     actual = {
-        "src/kvcr/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in package.glob("*.py")
+        "src/kvcr/" + p.relative_to(package).as_posix(): hashlib.sha256(
+            p.read_bytes()
+        ).hexdigest()
+        for p in package.rglob("*.py")
     }
     assert actual == expected, (
         "Actual imported KVCR source differs from external manifest"
@@ -339,13 +356,15 @@ def _peer(
         if role == "target":
             assert stop.wait(0) is False
             kvcr.submit_hint(
-                {
-                    "protocol_version": "0.1",
-                    "actions": [
-                        {
-                            "action_type": "kv.fetch_gpu",
-                            "action_version": "1.0",
-                            "payload": {
+                _HintEnvelope(
+                    "0.1",
+                    "roundtrip",
+                    [
+                        _HintAction(
+                            "gpu-fetch",
+                            "kv.fetch_gpu",
+                            "1.0",
+                            {
                                 "source_control_endpoint": source_endpoint,
                                 "block_hashes": list(range(7)),
                                 "source_memory_kind": "gpu",
@@ -353,9 +372,9 @@ def _peer(
                                 "transport": "nixl_gpu_direct",
                                 "compatibility_domain": domain,
                             },
-                        }
+                        )
                     ],
-                },
+                ),
                 "roundtrip",
             )
             handle = kvcr.deliver(

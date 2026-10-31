@@ -18,11 +18,14 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _record_hint_results,
     _wait_until,
 )
 
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
-from kvcr.hint_parser import _KVFetchHint
+from kvcr.hints.fetch import KV_FETCH
+from kvcr.hints.parser import parse_hints
+from kvcr.hints.results import HintStatus
 from kvcr.types import BlockKey, CacheTier, InventoryEvent, QueryStatus
 
 
@@ -37,15 +40,60 @@ class _U64KeyAdapter:
         return int.from_bytes(key[:8], "big", signed=False)
 
 
-@pytest.mark.parametrize("as_mapping", [False, True])
-def test_dynamo_envelope_accepts_unsigned_root_prefix(dynamo_hint, as_mapping):
-    hint = (
-        dynamo_hint if as_mapping else msgspec.convert(dynamo_hint, type=_HintEnvelope)
+class _VllmHintAction(msgspec.Struct, frozen=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict[str, object]
+
+
+class _VllmHintEnvelope(msgspec.Struct, frozen=True):
+    protocol_version: str
+    message_id: str
+    actions: list[_VllmHintAction]
+
+
+def test_structural_vllm_envelope_preserves_action_and_message_ids(
+    dynamo_hint, monkeypatch
+):
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
-    parsed = _KVFetchHint.from_hint(hint)
+    results = _record_hint_results(monkeypatch, kvcr)
+    envelope = msgspec.convert(dynamo_hint, type=_VllmHintEnvelope)
+    kvcr.submit_hint(envelope, request_id="turn-2")
+    assert len(results) == 1
+    (result,) = results
+    assert result.status is HintStatus.ACCEPTED
+    assert (
+        result.action_id,
+        result.action_type,
+        result.message_id,
+        result.request_id,
+    ) == (
+        envelope.actions[0].action_id,
+        "kv.fetch",
+        envelope.message_id,
+        "turn-2",
+    )
+
+
+def test_dynamo_envelope_accepts_unsigned_root_prefix(dynamo_hint):
+    hint = msgspec.convert(dynamo_hint, type=_HintEnvelope)
+    hints, rejected = parse_hints(hint, {KV_FETCH.action_type: KV_FETCH})
+    assert rejected == []
+    (parsed,) = hints
 
     assert parsed.source_endpoint == "tcp://decode-worker:9000"
     assert parsed.block_hashes == frozenset((0, 1 << 63, (1 << 64) - 2, (1 << 64) - 1))
+
+
+def test_dynamo_mapping_must_be_decoded_to_typed_envelope(dynamo_hint):
+    with pytest.raises(ValueError, match="invalid router hint"):
+        parse_hints(dynamo_hint, {KV_FETCH.action_type: KV_FETCH})
 
 
 @pytest.mark.parametrize("local_prefix_blocks", [1, 2])
@@ -105,7 +153,9 @@ def test_dynamo_root_hint_fetches_only_missing_suffix_and_keeps_source_copy(
         )
         agent.state = "PROC"
 
-    target.submit_hint(dynamo_hint, request_id="turn-2-prefill")
+    target.submit_hint(
+        msgspec.convert(dynamo_hint, type=_HintEnvelope), request_id="turn-2-prefill"
+    )
     assert target.query(keys, "turn-2-prefill") == [
         *((QueryStatus.HIT, CacheTier.LOCAL_G2),) * len(local_keys),
         *((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),) * len(missing_keys),

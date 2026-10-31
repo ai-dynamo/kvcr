@@ -17,16 +17,20 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
-from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
-from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
-from .local_disk import _G3, _G3Residency
-from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
+from ..backends.local_disk import _G3, _G3Residency
+from ..backends.local_dram_pools import (
+    _LocalDramPools,
+    _LocalDramResidency,
+    _LocalDramState,
+)
+from ..config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
+from ..runtime.core import _BlockRecord, _KVCRCore
+from ..types import BlockKey, RecoveryMirrorError
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
-from .types import BlockKey, RecoveryMirrorError
+from .protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
 
 if TYPE_CHECKING:
-    from .api import KVCRBindings
+    from ..api import KVCRBindings
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +78,8 @@ _RECORD_BLOCK = 1
 _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 
 
-# Arrays avoid repeating field names in the bounded ring. Field order is the
-# format: append only, never reorder or remove. G2 cost grows with its location
-# count and pool-name lengths.
+# Arrays avoid repeating field names in the bounded ring. G3 stores its complete
+# layout and slots; recovery records from the old single-slot format are rejected.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
     # Ordered (full descriptor label, slot) pairs, or nothing. Pools may repeat.
     g2: (
@@ -86,7 +89,16 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
         ]
         | None
     ) = None
-    g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    g3: (
+        tuple[
+            Annotated[tuple[str, ...], msgspec.Meta(min_length=1)],
+            Annotated[
+                tuple[Annotated[int, msgspec.Meta(ge=0)], ...],
+                msgspec.Meta(min_length=1),
+            ],
+        ]
+        | None
+    ) = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
 
 
@@ -114,21 +126,34 @@ def _is_recoverable(record: _BlockRecord) -> bool:
 
 
 def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
-    g3 = record.g3.slot if record.g3 is not None else None
+    disk = record.g3
     local_dram = record.local_dram
-    if (
-        local_dram is None
-        or local_dram.state is not _LocalDramState.READY
-        or local_dram.pending_labels
-    ):
-        return _RecoveryBlock(g3=g3, position=record.position)
-    return _RecoveryBlock(g2=local_dram.slots, g3=g3, position=record.position)
+    complete = (
+        local_dram is not None
+        and local_dram.state is _LocalDramState.READY
+        and not local_dram.pending_labels
+    )
+    return _RecoveryBlock(
+        g2=local_dram.slots if complete else None,
+        g3=(disk.layout, disk.slots) if disk is not None else None,
+        position=record.position,
+    )
 
 
 def _decode_recovery_record(
     payload: bytes, pool_names: tuple[str, ...]
 ) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
+    disk = _G3Residency(*recovered.g3) if recovered.g3 is not None else None
+    if disk is not None:
+        labels = set()
+        for label in disk.layout:
+            pool, separator, part = label.partition(":")
+            if pool not in pool_names or (
+                separator and (part in ("", "*") or label in labels)
+            ):
+                raise ValueError("G3 recovery layout does not match the pool group")
+            labels.add(label)
     labels: set[str] = set()
     for label, _ in recovered.g2 or ():
         pool, separator, part = label.partition(":")
@@ -143,7 +168,7 @@ def _decode_recovery_record(
             if recovered.g2 is not None
             else None
         ),
-        g3=_G3Residency(recovered.g3) if recovered.g3 is not None else None,
+        g3=disk,
         position=recovered.position,
     )
 
@@ -363,13 +388,14 @@ class _RecoveryMirror:
                     record.local_dram = None
                 else:
                     local_dram.pending_deposits = 0
-                    local_dram.writers.clear()
+                    local_dram.writers = None
                     local_dram.remote_indices = None
                     local_dram.remote_cancelled = False
                     local_dram.claim_count = 0
+                    local_dram.source_readers = 0
                     local_dram.retire_on_release = False
                     # References name the previous agent, unlike the slot layout.
-                    local_dram.refs.clear()
+                    local_dram.refs = {}
             if record.g3 is not None:
                 record.g3.claim_count = 0
             record.fw_mem = None
@@ -394,7 +420,7 @@ class _RecoveryMirror:
 
 
 def _attach_journal(
-    local_dram: _LocalDram, journal: RecoveryJournal, g3: _G3 | None = None
+    local_dram: _LocalDramPools, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
     enabled = True
@@ -417,7 +443,17 @@ def _attach_journal(
                 journal.invalidate()
 
     if g3 is not None:
-        g3.observe_residency(publish)
+
+        def preflight(key: BlockKey, record: _BlockRecord, disk: _G3Residency) -> bool:
+            candidate = msgspec.structs.replace(record, g3=disk)
+            payload = _RECOVERY_ENCODER.encode(_project_recovery_record(candidate))
+            size = _FRAME_HEADER.size + len(key) + len(payload)
+            return (
+                size <= _MAX_FRAME_SIZE
+                and size + (-size % _ALIGNMENT) <= journal._capacity
+            )
+
+        g3.observe_residency(publish, recovery_preflight=preflight)
     local_dram.observe_residency(publish)
 
 
@@ -523,7 +559,9 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
         dangling.dead_incarnations.update(hold._dead_incarnations)
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
-    _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
+    _attach_journal(
+        core._local_dram._pools, RecoveryJournal(hold._attachment), core._g3
+    )
     install_recovery_records(core, claimed.recovered.take_records())
     hold.hand_listener_to(claimed.adopt_listener)
 
@@ -634,7 +672,7 @@ def write_recovery_snapshot(
         # which is discarded.
         region[: _SNAPSHOT_HEADER.size] = bytes(_SNAPSHOT_HEADER.size)
         region.flush()
-        region[_SNAPSHOT_HEADER.size :] = body
+        region[_SNAPSHOT_HEADER.size : _SNAPSHOT_HEADER.size + len(body)] = body
         region[: _SNAPSHOT_HEADER.size] = _SNAPSHOT_HEADER.pack(
             digest.digest(), len(body)
         )
