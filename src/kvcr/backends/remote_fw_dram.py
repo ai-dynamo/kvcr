@@ -50,6 +50,7 @@ from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
     _decode_notif,
+    _nvtx_reason,
     _NvtxState,
     _PeerMessage,
     _SourceWriteOp,
@@ -378,7 +379,7 @@ class _RemoteFWDram:
             return
         trace = kvcr._nvtx_operations.get(op_handle)
         if trace is not None:
-            trace.reject("target.hint_unavailable", _nvtx.Reason.HINT_UNAVAILABLE)
+            trace.reject("target.rejected", _nvtx_reason(reason))
         kvcr._complete(
             op_handle,
             dict.fromkeys(blocks, _failed_result(reason)),

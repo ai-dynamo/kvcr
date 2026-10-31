@@ -416,6 +416,20 @@ def test_missing_hint_has_specific_reason(recording):
     )
 
 
+def test_failed_hint_rejection_names_its_reason(recording):
+    kvcr, agent, control = make_target()
+    kvcr.submit_hint(_router_hint("tcp://source:1"), "req")
+    key = BlockKey(b"k")
+    first = kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [_write_done_notification(first, success=False)]
+    _poll_until(kvcr, bool)
+    kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    assert not list(kvcr.poll_completed())[0][1][key].success
+    [rejected] = payloads(recording, "target.rejected")
+    assert int(rejected["reason"]) == _nvtx.Reason.HINT_FAILED
+
+
 @pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "end"])
 def test_target_annotations_cannot_break_empty_or_missing_hint_delivery(
     recording, failure
