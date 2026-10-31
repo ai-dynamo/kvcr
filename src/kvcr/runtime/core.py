@@ -1057,20 +1057,24 @@ class _KVCRCore:
             return
         fill_handle = self._next_fill_handle
         self._next_fill_handle -= 1
+        failure: OpEntryResult | None = _FAILED_RESULT
         if source is CacheTier.G3:
-            started = self._g3 is not None and self._g3.start_fill(
+            if self._g3 is not None and self._g3.start_fill(
                 fill_handle,
                 blocks,
                 deadline,
-            )
+            ):
+                failure = None
         elif source is CacheTier.REMOTE_G2:
-            started = self._remote_fw_dram.fetch(
+            failure = self._remote_fw_dram.fetch(
                 blocks, request_id, deadline, op_handle=fill_handle
             )
         else:
             raise ValueError(f"unsupported local fill source {source.value}")
-        if not started:
-            self._complete_local_dram_fill(blocks, success=False)
+        if failure is not None:
+            self._complete_local_dram_fill(
+                blocks, success=False, failures=dict.fromkeys(blocks, failure)
+            )
 
     def _claim_local_dram_sources(
         self,
@@ -1193,11 +1197,15 @@ class _KVCRCore:
             self._local_dram_sources_by_op.pop(op_id)
 
     def _complete_local_dram_fill(
-        self, keys: Collection[BlockKey], *, success: bool
+        self,
+        keys: Collection[BlockKey],
+        *,
+        success: bool,
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
     ) -> None:
         if self._local_dram is None:
             raise RuntimeError("remote fetch completed without local DRAM")
-        self._local_dram.complete_fill(keys, success=success)
+        self._local_dram.complete_fill(keys, success=success, failures=failures)
 
     def _discard_local_dram_fill(self, keys: Collection[BlockKey]) -> None:
         if self._local_dram is None:

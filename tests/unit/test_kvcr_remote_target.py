@@ -466,7 +466,11 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
             {"type": "write_done", "op_handle": handle, "success": False}
         )
         for handle in (str(message["op_handle"]), float("inf"))
-    ] + [_write_done_notification(message["op_handle"], completed_indices=(0, 2))]
+    ] + [
+        _write_done_notif(
+            message["op_handle"], True, (0, 2), unserved={"not_resident": [1]}
+        )
+    ]
 
     completed = _poll_until(target, lambda results: bool(results))
     assert len(completed) == 1 and completed[0][0] == fetch
@@ -479,7 +483,8 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
             assert results[key].release_handle is not None
             release_handles.append(results[key].release_handle)
         else:
-            assert results[key] == OpEntryResult(OpEntryStatus.FAILED)
+            # The fill reports the source's per-key reason, as deliver does.
+            assert results[key] == OpEntryResult(OpEntryStatus.SRC_MISS)
     assert target.query(keys, "req") == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
@@ -1761,3 +1766,31 @@ def test_dead_source_probe_refusal_names_the_restart():
     assert backend._refused_writes == {
         ("target", 7): {"success": False, "reason": "source_restarted"}
     }
+
+
+def test_remembered_miss_survives_a_failed_pull():
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    served, missing = BlockKey(b"a"), BlockKey(b"b")
+    blocks = {served: [_mem_descriptor()], missing: [_mem_descriptor()]}
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+
+    first = kvcr.deliver(blocks, "req")
+    _wait_until(lambda: len(control.sent) == 1)
+    agent.notifs["source"] = [_write_done_notif(first, True, (0,))]
+    assert dict(_poll_until(kvcr, bool))[first][served].success
+
+    # Only the served key is requested again; the source then fails the pull.
+    second = kvcr.deliver(blocks, "req")
+    _wait_until(lambda: len(control.sent) == 2)
+    assert _decode_control_message(control.sent[1][1])["keys"] == [served]
+    agent.notifs["source"] = [_write_done_notif(second, False, reason="deadline")]
+    results = dict(_poll_until(kvcr, bool))[second]
+    assert results[served].status is OpEntryStatus.TIMEOUT
+    assert results[missing].status is OpEntryStatus.KNOWN_MISS

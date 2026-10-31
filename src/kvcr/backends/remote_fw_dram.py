@@ -291,6 +291,11 @@ class _RemoteFWDram:
             _backend=self,
             ordered_keys=keys,
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
+            # Kept if the pull fails, so these keys still report the known miss.
+            unserved=dict.fromkeys(
+                current_hint.missing_keys.intersection(blocks),
+                _nvtx.Reason.REMEMBERED_MISS.wire,
+            ),
             request_id=request_id,
             key_layout=(
                 kvcr._block_record_map[keys[0]].local_dram.key_layout
@@ -373,17 +378,16 @@ class _RemoteFWDram:
         deadline: float,
         *,
         op_handle: OpHandle,
-    ) -> bool:
-        return (
-            self._start_target_pull(
-                blocks,
-                request_id,
-                deadline,
-                op_handle,
-                local_fill=True,
-            )
-            is None
+    ) -> OpEntryResult | None:
+        """Start a local fill, or return the result for every key if it cannot."""
+        reason = self._start_target_pull(
+            blocks,
+            request_id,
+            deadline,
+            op_handle,
+            local_fill=True,
         )
+        return None if reason is None else _failed_result(reason)
 
     def poll_main(self, items: Collection[object]) -> None:
         self._sources.retry_releases()
@@ -491,6 +495,12 @@ class _RemoteFWDram:
                     kvcr._complete_local_dram_fill(
                         op.keys - completed_keys,
                         success=False,
+                        failures={
+                            key: _failed_result(
+                                op.unserved.get(key) or op.failure_reason
+                            )
+                            for key in op.keys - completed_keys
+                        },
                     )
                 return
             kvcr._complete(
