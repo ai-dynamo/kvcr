@@ -39,7 +39,13 @@ from kvcr import (
     TRANSFER_BYTES_METRIC,
     UNSERVED_BLOCKS_METRIC,
 )
-from kvcr.backends.remote_ops import _notification_unserved, _write_done_notif
+from kvcr.backends.dangling_ops import _DanglingOps
+from kvcr.backends.remote_ops import (
+    _known_reason,
+    _notification_unserved,
+    _write_done_notif,
+    _WriteProbeAck,
+)
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
@@ -1719,12 +1725,39 @@ def test_write_done_carries_failure_and_unserved_reasons():
     assert failed["reason"] == "deadline"
     served = _decode_notif(
         _write_done_notif(
-            7, True, (1,), unserved={"pin_failed": [0], "x" * 33: [2], "bad": [9]}
+            7, True, (1,), unserved={"pin_failed": [0], "none": [2], "bad": [9]}
         )
     )
-    # Unreported, oversized-reason and out-of-range entries fall back.
+    # Unreported, unknown-reason and out-of-range entries fall back.
     assert _notification_unserved(served, (b"a", b"b", b"c"), {b"a", b"c", b"d"}) == {
         b"a": "pin_failed",
         b"c": "unknown",
         b"d": "remembered_miss",
+    }
+
+
+def test_peer_reasons_are_limited_to_known_names():
+    assert _known_reason("not_resident") == "not_resident"
+    assert _known_reason("source_restarted") == "source_restarted"
+    for reason in ("none", "unknown", "x" * 33, "bad\nline", 21, None):
+        assert _known_reason(reason) is None
+
+
+def test_dead_source_probe_refusal_names_the_restart():
+    backend = Mock(_refused_writes={})
+    dangling = _DanglingOps(backend)
+    op = Mock(remote_ctrl_ep="tcp://source:1", source_incarnation="old")
+    progress = Mock(_in_flight_ops={("target", 7): op})
+    dangling.handle_probe_ack(
+        progress,
+        _WriteProbeAck(
+            op_handle=7,
+            terminal=False,
+            sender_control_endpoint="tcp://source:1",
+            sender_incarnation="new",
+            dead_incarnation="old",
+        ),
+    )
+    assert backend._refused_writes == {
+        ("target", 7): {"success": False, "reason": "source_restarted"}
     }

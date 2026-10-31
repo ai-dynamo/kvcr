@@ -450,8 +450,10 @@ def test_off_skips_annotation_work_but_preserves_results(
             return super().pop(*args)
 
     class Reasons:
+        # Members also name wire reasons, so only reason mapping counts as work.
         def __getattr__(self, name):
-            accesses.append(name)
+            if name not in reasons.__members__:
+                accesses.append(name)
             return getattr(reasons, name)
 
     monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")

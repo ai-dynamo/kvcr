@@ -46,6 +46,21 @@ class Reason(IntEnum):
     NOT_RESIDENT = 21
     PIN_FAILED = 22
     LAYOUT_MISMATCH = 23
+    # Remaining write_done and pull reasons, so this enum is their only vocabulary.
+    STOPPING = 24
+    TRANSFER_FAILED = 25
+    MALFORMED = 26
+    SETUP_FAILED = 27
+    REMEMBERED_MISS = 28
+    HINT_FAILED = 29
+    REFUSED = 30
+    METADATA_REQUIRED = 31
+    SOURCE_RESTARTED = 32
+
+    @property
+    def wire(self) -> str:
+        """Name used in write_done messages, logs and metric labels."""
+        return self.name.lower()
 
 
 class _ThreadBuffers(local):

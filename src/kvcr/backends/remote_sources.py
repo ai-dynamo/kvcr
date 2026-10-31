@@ -187,16 +187,16 @@ class _RemoteSources:
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
                 # Only a layout mismatch on an earlier pass removes keys.
-                unserved.setdefault("layout_mismatch", []).append(index)
+                unserved.setdefault(_nvtx.Reason.LAYOUT_MISMATCH.wire, []).append(index)
                 continue
             residency = local_sources.get(key)
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
                 reason = (
-                    "pin_failed"
+                    _nvtx.Reason.PIN_FAILED.wire
                     if key in source_pin.pin_failed_keys
-                    else "not_resident"
+                    else _nvtx.Reason.NOT_RESIDENT.wire
                 )
                 unserved.setdefault(reason, []).append(index)
                 continue
@@ -225,7 +225,7 @@ class _RemoteSources:
                 indices = _layout_indices(layout, labels)
             if indices is None:
                 mismatched += 1
-                unserved.setdefault("layout_mismatch", []).append(index)
+                unserved.setdefault(_nvtx.Reason.LAYOUT_MISMATCH.wire, []).append(index)
                 source_pin.keys -= {key}
                 record = kvcr._block_record_map[key]
                 record.discard_in_flight_op(op_id)
@@ -665,31 +665,35 @@ class _RemoteSources:
                 )
                 for key, descriptor_list in descriptors.items()
             }
-            if not any(descriptor is not None for descriptor in normalized.values()):
-                raise ValueError("request_pin returned no descriptors")
-            pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
-            block_record = self._kvcr._block_record
-            for key, descriptor in normalized.items():
-                if descriptor is None:
-                    continue
-                record = block_record(key)
-                if record.fw_mem is not None:
-                    continue
-                record.fw_mem = _FwMemResidency(descriptor, pin_handle)
-                pin_keys.add(key)
-            return pin_handle, False
+            if any(descriptor is not None for descriptor in normalized.values()):
+                pin_keys = self._kvcr._framework_pin_keys.setdefault(pin_handle, set())
+                block_record = self._kvcr._block_record
+                for key, descriptor in normalized.items():
+                    if descriptor is None:
+                        continue
+                    record = block_record(key)
+                    if record.fw_mem is not None:
+                        continue
+                    record.fw_mem = _FwMemResidency(descriptor, pin_handle)
+                    pin_keys.add(key)
+                return pin_handle, False
         except Exception as error:
             # Only expose known validation reasons, not callback data or keys.
             reason = error.args[0] if error.args else None
             if type(reason) is not str or reason not in (
                 "invalid framework pin result",
                 "request_pin returned incomplete descriptors",
-                "request_pin returned no descriptors",
             ):
                 reason = "descriptor normalization or installation failed"
             logger.debug("KVCR_EVENT framework_pin_rejected reason=%s", reason)
             self._discard_pin_result(pin_result, keys)
-            return None, reason != "request_pin returned no descriptors"
+            return None, True
+        logger.debug(
+            "KVCR_EVENT framework_pin_rejected reason=%s",
+            "request_pin returned no descriptors",
+        )
+        self._discard_pin_result(pin_result, keys)
+        return None, False
 
     def _acquire_framework_sources(
         self,

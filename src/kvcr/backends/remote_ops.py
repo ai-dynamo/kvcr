@@ -171,7 +171,7 @@ class _TargetPullOp(_RemoteOp):
                         status=_nvtx.Status.TIMEOUT,
                     )
                 self.success = False
-                self.failure_reason = "deadline"
+                self.failure_reason = _nvtx.Reason.DEADLINE.wire
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
@@ -193,7 +193,7 @@ class _TargetPullOp(_RemoteOp):
                         "target.start_write.rejected", _nvtx.Reason.CONTROL_ERROR
                     )
                 self.success = False
-                self.failure_reason = "control_error"
+                self.failure_reason = _nvtx.Reason.CONTROL_ERROR.wire
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
@@ -266,15 +266,13 @@ class _TargetPullOp(_RemoteOp):
                     event, self.ordered_keys, self.keys - completed_keys
                 )
             elif self.failure_reason is None:
-                source_reason = event.get("reason")
                 self.failure_reason = (
-                    "invalid_notification"
+                    _nvtx.Reason.INVALID_NOTIFICATION.wire
                     if invalid
-                    else "deadline"
+                    else _nvtx.Reason.DEADLINE.wire
                     if event.get("success") is True and not cancelled
-                    else source_reason
-                    if _valid_reason(source_reason)
-                    else "remote_failure"
+                    else _known_reason(event.get("reason"))
+                    or _nvtx.Reason.REMOTE_FAILURE.wire
                 )
             if trace is not None:
                 if not success and reason is _nvtx.Reason.REMOTE_FAILURE:
@@ -305,7 +303,7 @@ class _TargetPullOp(_RemoteOp):
             unserved_counts = (
                 Counter(self.unserved.values())
                 if success
-                else {self.failure_reason or "unknown": len(self.keys)}
+                else {self.failure_reason or _nvtx.Reason.UNKNOWN.wire: len(self.keys)}
             )
             for unserved_reason, count in unserved_counts.items():
                 backend._record_progress_counter(
@@ -356,13 +354,10 @@ class _TargetPullOp(_RemoteOp):
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
-            source_reason = event.get("reason") if cancelled else None
             self.failure_reason = (
-                source_reason
-                if _valid_reason(source_reason)
-                else "remote_failure"
+                (_known_reason(event.get("reason")) or _nvtx.Reason.REMOTE_FAILURE.wire)
                 if cancelled
-                else "deadline"
+                else _nvtx.Reason.DEADLINE.wire
             )
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
@@ -659,10 +654,10 @@ class _SourceWriteOp(_RemoteOp):
     def abort_reason(self, cancel_requested: bool) -> str:
         # A failed transfer also passes through CANCEL_PENDING.
         if cancel_requested:
-            return "cancelled"
+            return _nvtx.Reason.CANCELLED.wire
         if self._backend._kvcr._clock() >= self.deadline:
-            return "deadline"
-        return "transfer_failed"
+            return _nvtx.Reason.DEADLINE.wire
+        return _nvtx.Reason.TRANSFER_FAILED.wire
 
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
@@ -737,12 +732,19 @@ def _dominant_reason(reasons: Iterable[str]) -> _nvtx.Reason:
 
 
 def _wire_reason(reason: _nvtx.Reason) -> str | None:
-    return None if reason is _nvtx.Reason.UNKNOWN else reason.name.lower()
+    return None if reason is _nvtx.Reason.UNKNOWN else reason.wire
 
 
-def _valid_reason(reason: object) -> bool:
-    # Peer-supplied reasons reach logs and metric labels, so bound them.
-    return type(reason) is str and 0 < len(reason) <= 32
+# Peer-supplied reasons reach logs and metric labels, so only known names pass.
+_KNOWN_REASONS = frozenset(
+    reason.wire
+    for reason in _nvtx.Reason
+    if reason not in (_nvtx.Reason.UNKNOWN, _nvtx.Reason.NONE)
+)
+
+
+def _known_reason(reason: object) -> str | None:
+    return reason if type(reason) is str and reason in _KNOWN_REASONS else None
 
 
 def _notification_unserved(
@@ -752,12 +754,17 @@ def _notification_unserved(
 ) -> dict[BlockKey, str]:
     """Return why each missing key was not written; malformed input is ignored."""
     sent = set(ordered_keys)
-    unserved = {key: "unknown" if key in sent else "remembered_miss" for key in missing}
+    unserved = {
+        key: _nvtx.Reason.UNKNOWN.wire
+        if key in sent
+        else _nvtx.Reason.REMEMBERED_MISS.wire
+        for key in missing
+    }
     reported = payload.get("unserved")
     if not isinstance(reported, Mapping):
         return unserved
     for reason, indices in reported.items():
-        if not _valid_reason(reason) or not isinstance(indices, list):
+        if _known_reason(reason) is None or not isinstance(indices, list):
             continue
         for index in indices:
             if type(index) is int and 0 <= index < len(ordered_keys):
