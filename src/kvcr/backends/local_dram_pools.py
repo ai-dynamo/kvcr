@@ -232,8 +232,6 @@ class _LocalDramPools:
         self._evictable = _EvictionQueue()
         self._evictable_slots: Counter[str] = Counter()
         self._unscored: set[BlockKey] = set()
-        # Queued keys read since their score; eviction rescores them on visit.
-        self._stale_scores: set[BlockKey] = set()
         self._capacity_eviction_key: BlockKey | None = None
         self._public_claims: dict[
             ReleaseHandle, tuple[BlockKey, _LocalDramResidency]
@@ -372,6 +370,7 @@ class _LocalDramPools:
                     break
                 if success:
                     self._kvcr._record_access(keys)
+                released = []
                 with state.lock:
                     for key, residency in zip(keys, sources):
                         if residency.source_readers <= 0:
@@ -381,7 +380,8 @@ class _LocalDramPools:
                         residency.source_readers -= 1
                         if not residency.source_readers:
                             state.active.pop(key)
-                for key, residency in zip(keys, sources):
+                            released.append((key, residency))
+                for key, residency in released:
                     record = self._kvcr._block_record_map.get(key)
                     if (
                         record is None
@@ -389,14 +389,8 @@ class _LocalDramPools:
                         or residency.claim_count
                     ):
                         continue
-                    if (
-                        key in self._evictable
-                        and residency.state is _LocalDramState.READY
-                        and not residency.retire_on_release
-                    ):
-                        # Readers left it queued; rescore only if eviction reaches it.
-                        self._stale_scores.add(key)
-                    else:
+                    # Reads leave queued sources in place; eviction rescores them.
+                    if not self._evictable.mark_stale(key):
                         freed |= self._after_last_claim(key, residency)
         finally:
             self._draining_source_completions = False
@@ -698,7 +692,7 @@ class _LocalDramPools:
         deficient = short()
         state = self._source_state
         with closing(
-            self._evictable.candidates(protected, self._refresh_stale_score)
+            self._evictable.candidates(protected, self._make_evictable)
         ) as candidates:
             while deficient:
                 key = next(candidates, None)
@@ -768,7 +762,6 @@ class _LocalDramPools:
         record = self._kvcr._block_record_map.get(key)
         if record is None:
             raise RuntimeError(f"missing block record for {key!r}")
-        self._stale_scores.discard(key)
         residency = record.local_dram
         if (
             residency is None
@@ -794,15 +787,10 @@ class _LocalDramPools:
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)
-        self._stale_scores.discard(key)
         if self._evictable.remove(key):
             evictable_slots = self._evictable_slots
             for pool, count in residency.pool_counts:
                 evictable_slots[pool] -= count
-
-    def _refresh_stale_score(self, key: BlockKey) -> None:
-        if key in self._stale_scores:
-            self._make_evictable(key)
 
     def _retry_unscored(self) -> None:
         for key in tuple(self._unscored):

@@ -711,22 +711,23 @@ def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     assert list(queue.candidates(frozenset())) == [first, excluded, churned]
 
 
-def test_eviction_candidates_visit_refreshed_keys_at_their_new_rank() -> None:
+def test_eviction_candidates_visit_rescored_keys_at_their_new_rank() -> None:
     queue = _EvictionQueue()
     served, kept, other = (BlockKey(name) for name in (b"served", b"kept", b"other"))
     queue.insert(served, 0)
     queue.insert(kept, 1)
     queue.insert(other, 2)
-    refreshed = []
+    rescored = []
 
-    def refresh(key):
-        refreshed.append(key)
-        if key == served:
-            queue.insert(served, 3)
+    def rescore(key):
+        rescored.append(key)
+        queue.insert(key, 3)
 
-    assert list(queue.candidates(frozenset(), refresh)) == [kept, other, served]
-    assert refreshed == [served, kept, other, served]
-    assert list(queue.candidates(frozenset())) == [kept, other, served]
+    assert queue.mark_stale(served)
+    assert list(queue.candidates(frozenset(), rescore)) == [kept, other, served]
+    assert rescored == [served]
+    assert list(queue.candidates(frozenset(), rescore)) == [kept, other, served]
+    assert rescored == [served]
 
 
 def test_lru_float_score_uses_small_tail_first_bias() -> None:
@@ -933,11 +934,13 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
 
 
 @pytest.mark.parametrize(
-    ("served_at", "evicted"),
-    [(1.0, "served"), (3.0, "newer")],
-    ids=["served-before-newer", "served-after-newer"],
+    ("served_at", "held", "evicted"),
+    [(1.0, False, "served"), (3.0, False, "newer"), (1.0, True, "newer")],
+    ids=["served-before-newer", "served-after-newer", "reader-still-held"],
 )
-def test_served_sources_are_rescored_when_eviction_reaches_them(served_at, evicted):
+def test_served_sources_are_rescored_when_eviction_reaches_them(
+    served_at, held, evicted
+):
     scored = []
 
     class RecordingLRUPolicy(LRUPolicy):
@@ -968,7 +971,8 @@ def test_served_sources_are_rescored_when_eviction_reaches_them(served_at, evict
 
     def serve():
         destination = ((progress_module._TransferRef("target", 0),),)
-        ((_, residency, _),) = local.acquire_readers((served,), destination, ())
+        for _ in range(1 + held):
+            ((_, residency, _),) = local.acquire_readers((served,), destination, ())
         local.release_readers((served,), (residency,), success=True)
         scored.clear()
         local._drain_source_completions()
@@ -976,12 +980,16 @@ def test_served_sources_are_rescored_when_eviction_reaches_them(served_at, evict
 
     deposit(served, 0)
     for now in sorted((served_at, 2.0)):
-        serve() if now == served_at else deposit(newer, 1)
+        if now == served_at:
+            serve()
+        else:
+            deposit(newer, 1)
 
     now = 4.0
     scored.clear()
     deposit(incoming, 2)
-    assert scored == [served, incoming]
+    # A block still being read is not rescored, and cannot be evicted.
+    assert scored == ([incoming] if held else [served, incoming])
     assert kvcr.query((served, newer, incoming)) == [
         (QueryStatus.MISS, None)
         if name == evicted

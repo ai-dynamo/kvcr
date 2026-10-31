@@ -155,20 +155,27 @@ class _EvictionQueue:
     def __init__(self) -> None:
         self._heap: list[tuple[float, int, BlockKey]] = []
         self._live: dict[BlockKey, tuple[float, int, BlockKey]] = {}
+        # Queued keys read since their score; candidates() rescores them on visit.
+        self._stale: set[BlockKey] = set()
         self._next_sequence = 0
 
     def __len__(self) -> int:
         return len(self._live)
 
-    def __contains__(self, key: BlockKey) -> bool:
-        return key in self._live
-
     def score(self, key: BlockKey) -> float | None:
         entry = self._live.get(key)
         return entry[0] if entry is not None else None
 
+    def mark_stale(self, key: BlockKey) -> bool:
+        """Defer rescoring a queued key to the next scan, returning whether queued."""
+        if key not in self._live:
+            return False
+        self._stale.add(key)
+        return True
+
     def insert(self, key: BlockKey, score: float) -> bool:
         """Refresh a score, returning whether the key newly became evictable."""
+        self._stale.discard(key)
         previous = self._live.get(key)
         if previous is not None and previous[0] == score:
             return False
@@ -188,17 +195,18 @@ class _EvictionQueue:
         return previous is None
 
     def remove(self, key: BlockKey) -> bool:
+        self._stale.discard(key)
         return self._live.pop(key, None) is not None
 
     def candidates(
         self,
         excluded: frozenset[BlockKey],
-        refresh: Callable[[BlockKey], None] | None = None,
+        rescore: Callable[[BlockKey], None] | None = None,
     ) -> Generator[BlockKey, None, None]:
         """Visit each key once in score order; close to restore live entries.
 
-        refresh may re-insert a key before it is visited; a key whose score
-        changed is then visited at its new rank in the same pass.
+        A stale key is passed to rescore before its visit; if its score changed,
+        it is visited at its new rank in the same pass.
         """
         # Reuse the immutable exclusion set to avoid copying it for each allocation.
         seen: set[BlockKey] = set()
@@ -209,8 +217,9 @@ class _EvictionQueue:
                 key = item[2]
                 if self._live.get(key) is not item:
                     continue
-                if refresh is not None and key not in excluded and key not in seen:
-                    refresh(key)
+                if rescore is not None and key in self._stale and key not in excluded:
+                    self._stale.remove(key)
+                    rescore(key)
                     if self._live.get(key) is not item:
                         continue
                 skipped.append(item)
