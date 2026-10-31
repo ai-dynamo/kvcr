@@ -912,6 +912,9 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         source_agent,
         pinning,
         control,
+        KVCRConfig(
+            nixl_agent_name="source", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         name="source",
         local_dram=(
             LocalDramOptions([("", ctypes.addressof(memory), len(memory))])
@@ -957,6 +960,12 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         "success": False,
         "reason": "create_error" if failure == "initialize" else "transfer_failed",
     }
+    # The block the source selected is counted under the failure reason.
+    assert [
+        (labels, value)
+        for _, name, value, labels in kvcr.get_stats().records
+        if name == UNSERVED_BLOCKS_METRIC
+    ] == [(("source_write", _decode_notif(notif)["reason"]), 1)]
     assert source_agent.released_xfers == ([] if failure == "initialize" else [1])
     assert not _has_outstanding_operations(kvcr)
 

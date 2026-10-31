@@ -26,6 +26,7 @@ from ..config import KeyAdapter, RemoteFWDramOptions
 from ..runtime.core import (
     DURATION_METRIC,
     TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
     _validate_memory_regions,
     logger,
 )
@@ -266,15 +267,17 @@ class _RemoteFWDram:
             kvcr._record_duration(
                 scope, started_at, "failed" if current_hint.failed else "miss"
             )
-            return (
-                _nvtx.Reason.HINT_FAILED.wire
+            return self._count_rejected(
+                scope,
+                blocks,
+                _nvtx.Reason.HINT_FAILED
                 if current_hint.failed
-                else _nvtx.Reason.REMEMBERED_MISS.wire
+                else _nvtx.Reason.REMEMBERED_MISS,
             )
 
         if current_hint is None or current_hint.source is None:
             kvcr._record_duration(scope, started_at, "failed")
-            return _nvtx.Reason.HINT_UNAVAILABLE.wire
+            return self._count_rejected(scope, blocks, _nvtx.Reason.HINT_UNAVAILABLE)
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
@@ -341,6 +344,16 @@ class _RemoteFWDram:
         if not local_fill and request_id is not None:
             kvcr._remote_delivery_keys.setdefault(request_id, set()).update(keys)
         return None
+
+    def _count_rejected(
+        self, scope: str, blocks: Collection[BlockKey], reason: _nvtx.Reason
+    ) -> str:
+        stats = self._kvcr._stats
+        if stats is not None:
+            stats.increase_counter(
+                UNSERVED_BLOCKS_METRIC, len(blocks), (scope, reason.wire)
+            )
+        return reason.wire
 
     def deliver(
         self,

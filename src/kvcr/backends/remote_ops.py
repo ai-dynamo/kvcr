@@ -174,6 +174,7 @@ class _TargetPullOp(_RemoteOp):
                 self.failure_reason = _nvtx.Reason.DEADLINE.wire
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
+                self._record_unserved(scope)
                 return True, True
             sent = backend._send_control(
                 progress,
@@ -196,6 +197,7 @@ class _TargetPullOp(_RemoteOp):
                 self.failure_reason = _nvtx.Reason.CONTROL_ERROR.wire
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
+                self._record_unserved(scope)
                 return True, True
             self.state = _TargetPullState.WAITING_WRITE_DONE
             if trace is not None:
@@ -300,15 +302,7 @@ class _TargetPullOp(_RemoteOp):
                 else "failed"
             )
             backend._record_progress_duration(scope, self.started_at, result)
-            unserved_counts = (
-                Counter(self.unserved.values())
-                if success
-                else {self.failure_reason or _nvtx.Reason.UNKNOWN.wire: len(self.keys)}
-            )
-            for unserved_reason, count in unserved_counts.items():
-                backend._record_progress_counter(
-                    UNSERVED_BLOCKS_METRIC, count, (scope, unserved_reason)
-                )
+            unserved_counts = self._record_unserved(scope)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "KVCR_EVENT target_transfer_completed scope=%s request_id=%s "
@@ -391,6 +385,18 @@ class _TargetPullOp(_RemoteOp):
             self.trace.end("target.remote")
         return safe
 
+    def _record_unserved(self, scope: str) -> Counter[str]:
+        """Count every requested key that was not written, by reason."""
+        counts = Counter(self.unserved.values())
+        if not self.success:
+            failure = self.failure_reason or _nvtx.Reason.UNKNOWN.wire
+            counts[failure] += len(self.keys) - len(self.unserved)
+        for reason, count in counts.items():
+            self._backend._record_progress_counter(
+                UNSERVED_BLOCKS_METRIC, count, (scope, reason)
+            )
+        return counts
+
 
 @dataclass(slots=True)
 class _NvtxState:
@@ -465,6 +471,9 @@ class _SourceWriteOp(_RemoteOp):
                 self.state = _SourceWriteState.FINISHED
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
+                )
+                self._record_unserved(
+                    _wire_reason(failure_reason) or _nvtx.Reason.UNKNOWN.wire
                 )
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
@@ -560,6 +569,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
+                self._record_unserved(_nvtx.Reason.CREATE_ERROR.wire)
                 self.state = _SourceWriteState.FINISHED
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
@@ -589,6 +599,7 @@ class _SourceWriteOp(_RemoteOp):
         self.transfer_id = None
         success, telemetry = transfer_result
         self.success = success and not cancelling
+        failure_reason: str | None = None
         if self.success:
             backend._record_transfer_telemetry(telemetry)
             backend._record_progress_counter(
@@ -597,16 +608,17 @@ class _SourceWriteOp(_RemoteOp):
                 ("source_write",),
             )
         else:
+            failure_reason = self.abort_reason(status.cancel_requested)
             backend._send_write_done(
                 progress,
                 self.remote_agent,
                 self.op_handle,
                 False,
-                reason=self.abort_reason(status.cancel_requested),
+                reason=failure_reason,
             )
         result = "success" if self.success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
-        self._record_unserved()
+        self._record_unserved(failure_reason)
         self._log_completed(result)
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
@@ -620,10 +632,16 @@ class _SourceWriteOp(_RemoteOp):
             )
         return True, True
 
-    def _record_unserved(self) -> None:
-        for reason, indices in self.unserved.items():
+    def _record_unserved(self, failure_reason: str | None = None) -> None:
+        """Count left-out keys by reason, and on failure the rest under it."""
+        counts = Counter(
+            {reason: len(indices) for reason, indices in self.unserved.items()}
+        )
+        if failure_reason is not None:
+            counts[failure_reason] += len(self.keys) - sum(counts.values())
+        for reason, count in counts.items():
             self._backend._record_progress_counter(
-                UNSERVED_BLOCKS_METRIC, len(indices), ("source_write", reason)
+                UNSERVED_BLOCKS_METRIC, count, ("source_write", reason)
             )
 
     def _unserved_reasons(self) -> Iterator[str]:

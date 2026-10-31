@@ -1774,6 +1774,9 @@ def test_remembered_miss_survives_a_failed_pull():
         agent,
         FakePrimaryPinning(),
         control,
+        KVCRConfig(
+            nixl_agent_name="target", pool_layouts=[("", 16)], enable_telemetry=True
+        ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
     )
@@ -1794,3 +1797,26 @@ def test_remembered_miss_survives_a_failed_pull():
     results = dict(_poll_until(kvcr, bool))[second]
     assert results[served].status is OpEntryStatus.TIMEOUT
     assert results[missing].status is OpEntryStatus.KNOWN_MISS
+    # Every requested key is counted once, by its own reason.
+    assert _unserved_counts(kvcr) == {
+        ("remote_deliver", "unknown"): 1,
+        ("remote_deliver", "remembered_miss"): 1,
+        ("remote_deliver", "deadline"): 1,
+    }
+
+    # Rejections before a pull starts are counted too.
+    kvcr.deliver({missing: [_mem_descriptor()]}, "req")
+    kvcr.deliver({missing: [_mem_descriptor()]}, "no-hint")
+    _poll_until(kvcr, lambda done: len(done) == 2)
+    assert _unserved_counts(kvcr) == {
+        ("remote_deliver", "hint_failed"): 1,
+        ("remote_deliver", "hint_unavailable"): 1,
+    }
+
+
+def _unserved_counts(kvcr) -> dict[tuple[str, ...], int]:
+    counts: dict[tuple[str, ...], int] = {}
+    for _, name, value, labels in kvcr.get_stats().records:
+        if name == UNSERVED_BLOCKS_METRIC:
+            counts[labels] = counts.get(labels, 0) + value
+    return counts
