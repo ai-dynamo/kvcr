@@ -148,7 +148,7 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     assert int(completed[0]["status"]) == int(
         {
             "success": _nvtx.Status.SUCCESS,
-            "miss": _nvtx.Status.FAILED,
+            "miss": _nvtx.Status.MISS,
             "timeout": _nvtx.Status.TIMEOUT,
             "cancelled": _nvtx.Status.CANCELLED,
         }[finish]

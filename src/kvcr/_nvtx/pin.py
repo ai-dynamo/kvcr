@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 _PIN_RESULTS = {
     "success": (Status.SUCCESS, Reason.NONE),
     "failed": (Status.FAILED, Reason.UNKNOWN),
-    "miss": (Status.FAILED, Reason.NOT_RESIDENT),
+    "miss": (Status.MISS, Reason.NOT_RESIDENT),
     "timeout": (Status.TIMEOUT, Reason.DEADLINE),
     "cancelled": (Status.CANCELLED, Reason.CANCELLED),
 }
@@ -109,10 +109,12 @@ class _PinTrace:
             result, (Status.UNRESOLVED, Reason.UNKNOWN)
         )
         if status is Status.SUCCESS and 0 <= completed_blocks < self.requested_blocks:
-            status = Status.FAILED if completed_blocks == 0 else Status.PARTIAL
+            status = Status.MISS if completed_blocks == 0 else Status.PARTIAL
         if reason is None:
             reason = default_reason
-        if status in (Status.PARTIAL, Status.FAILED) and reason is Reason.NONE:
+        if status in (Status.PARTIAL, Status.MISS, Status.FAILED) and (
+            reason is Reason.NONE
+        ):
             reason = Reason.UNKNOWN
         self._mark(
             "source.pin.completed",

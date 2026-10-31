@@ -15,8 +15,11 @@ from hashlib import blake2b
 from importlib import import_module
 from threading import Lock
 
+from ..types import OpEntryStatus
 from .payload import Reason, Status, _PayloadEmitter
 from .pin import _PinTrace
+
+_MISS_STATUSES = (OpEntryStatus.SRC_MISS, OpEntryStatus.KNOWN_MISS)
 
 _LOGGER = logging.getLogger(__name__)
 _WARNED: set[str] = set()
@@ -315,6 +318,9 @@ class _LifecycleTrace:
                 if all_completed
                 else Status.PARTIAL
                 if completed
+                else Status.MISS
+                if entries
+                and all(entry.status in _MISS_STATUSES for entry in entries.values())
                 else Status.FAILED,
                 reason=Reason.NONE if all_completed else self.failure_reason,
                 completed_blocks=completed,
@@ -356,6 +362,8 @@ class _LifecycleTrace:
                 if op.success and complete == len(op.keys)
                 else Status.PARTIAL
                 if complete
+                else Status.MISS
+                if op.success
                 else Status.FAILED,
                 reason=reason,
                 completed_blocks=complete,
@@ -368,7 +376,7 @@ class _LifecycleTrace:
         requested = self.requested_blocks
         status = Status.SUCCESS if success else Status.FAILED
         if success and blocks < requested:
-            status = Status.FAILED if blocks == 0 else Status.PARTIAL
+            status = Status.MISS if blocks == 0 else Status.PARTIAL
         if reason is None:
             reason = (
                 Reason.NONE if success and blocks >= requested else self.failure_reason
@@ -380,7 +388,7 @@ class _LifecycleTrace:
                 status=status,
                 reason=reason,
                 completed_blocks=blocks if success else 0,
-                completed_bytes=self.selected_bytes if success else 0,
+                completed_bytes=self.selected_bytes if success and blocks else 0,
             )
         finally:
             self.end("source.write")

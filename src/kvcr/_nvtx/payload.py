@@ -18,6 +18,8 @@ class Status(IntEnum):
     REJECTED = 7
     AMBIGUOUS = 8
     UNRESOLVED = 9
+    # The source answered but served none of the blocks; nothing broke.
+    MISS = 10
 
 
 class Reason(IntEnum):

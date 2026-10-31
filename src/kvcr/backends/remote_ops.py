@@ -559,7 +559,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
                     trace.complete_source(
-                        False, 0, reason=_dominant_reason(self._unserved_reasons())
+                        True, 0, reason=_dominant_reason(self._unserved_reasons())
                     )
                 return True, True
             submit_started_at = backend._kvcr._timer()
