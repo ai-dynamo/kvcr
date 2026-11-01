@@ -69,7 +69,6 @@ logger = logging.getLogger(__name__)
 DURATION_METRIC = "kvcr_duration_seconds"
 TRANSFER_BYTES_METRIC = "kvcr_transfer_bytes"
 TRANSFER_BLOCKS_METRIC = "kvcr_transfer_blocks"
-# Requested blocks a transfer did not deliver, labelled by scope and reason.
 UNSERVED_BLOCKS_METRIC = "kvcr_unserved_blocks"
 STATE_METRIC = "kvcr_state"
 
