@@ -508,7 +508,7 @@ A successful control acknowledgement does not prove payload correctness. A succe
 
 ### Remote delivery is partial
 
-Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks. `OpEntryResult.status` names why a remote entry failed: `SRC_MISS`, `KNOWN_MISS`, `NO_HINT`, `HINT_STALE` and `BAD_LAYOUT` mean the block was not served; `PIN_ERR`, `TIMEOUT`, `ABORTED` and `FAILED` mean something went wrong. `kvcr_unserved_blocks` counts undelivered blocks by reason.
+Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks. `OpEntryResult.status` names why a remote entry failed: `SRC_MISS`, `KNOWN_MISS`, `NO_HINT`, `HINT_STALE` and `BAD_LAYOUT` mean the block was not served; `PIN_ERR`, `TIMEOUT`, `ABORTED` and `FAILED` mean something went wrong. `kvcr_unserved_blocks` counts undelivered blocks by reason on both the source (`source_write`) and the target (`remote_deliver`/`remote_fetch`), so a block the source left out is counted twice; filter by `scope` instead of summing across scopes.
 
 ### Operations time out or fail slowly
 
