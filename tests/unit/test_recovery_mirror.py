@@ -233,6 +233,8 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
                 _LocalDramState.READY,
                 claim_count=2,
                 source_readers=2,
+                source_completions=3,
+                export_refs=(_TransferRef("old-agent", 0, "full", framework=False),),
                 retire_on_release=True,
                 pending_deposits=1,
                 writers=[1, 1],
@@ -296,6 +298,8 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records is served
     assert mirror._records[ready].local_dram is residency
     assert residency.source_readers == 0
+    assert residency.source_completions == 0
+    assert not residency.export_refs
     assert not residency.refs  # A new agent must regenerate its own references.
     assert partially_ready not in mirror._records
     assert mirror._records == framed

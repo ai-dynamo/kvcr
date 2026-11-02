@@ -71,6 +71,7 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     pieces are readable, pending_labels is None; writers is also None when
     no copies are in flight. refs is sparse until a completed residency is
     published for remote reads, then holds its immutable descriptor tuple.
+    export_refs snapshots committed labels separately for progress-only readers.
     """
 
     slots: tuple[tuple[str, int], ...]  # Full descriptor label and parent-pool slot.
@@ -90,7 +91,9 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     _layout: tuple[str, ...] | None = None
     _pool_counts: tuple[tuple[str, int], ...] | None = None
     _cached_size: int | None = None
-    source_readers: int = 0  # Includes completed reads awaiting access accounting.
+    source_readers: int = 0  # Framework mode also holds through caller accounting.
+    source_completions: int = 0  # Quiesced reads awaiting caller accounting.
+    export_refs: tuple[_TransferRef | None, ...] = ()  # Immutable ready snapshot.
 
     def __post_init__(self) -> None:
         self.slots = tuple(self.slots)
@@ -178,12 +181,13 @@ class _SourceState:
     def __init__(self) -> None:
         # Owner paths take _state_lock before this lock; progress takes only this.
         self.lock = threading.Lock()
-        # None keeps allocated, unpublished keys on the caller's preparation path.
+        # None keeps unpublished keys on the framework-enabled caller path.
+        # Guard-only reads treat these keys as misses.
         self.index: dict[BlockKey, _LocalDramResidency | None] = {}
         self.active: dict[BlockKey, _LocalDramResidency] = {}
         self.operations = 0
         self.completions: queue.SimpleQueue[
-            tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool]
+            tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool, bool]
         ] = queue.SimpleQueue()
 
 
@@ -269,7 +273,9 @@ class _LocalDramPools:
         residency: _LocalDramResidency,
         refs: tuple[_TransferRef, ...] | None = None,
     ) -> None:
-        if self._kvcr.framework_control is None or residency.pending_labels:
+        if self._kvcr.framework_control is None or (
+            residency.pending_labels and self._kvcr._request_pin_callback is not None
+        ):
             return
         if refs is None:
             refs = (
@@ -284,6 +290,11 @@ class _LocalDramPools:
                 and not residency.retire_on_release
             ):
                 residency.refs = refs
+                # Progress must not inspect mutable owner-side readiness sets.
+                pending = residency.pending_labels
+                residency.export_refs = tuple(
+                    None if pending and ref.label in pending else ref for ref in refs
+                )
                 state.index[key] = residency
 
     def acquire_readers(
@@ -307,10 +318,10 @@ class _LocalDramPools:
             for index, (key, destination) in enumerate(zip(keys, destinations)):
                 residency = state.index.get(key)
                 if residency is None:
-                    if allow_missing and key not in state.index:
+                    if allow_missing:
                         continue
                     return False
-                available = cast(tuple[_TransferRef, ...], residency.refs)
+                available = residency.export_refs
                 if key_layout and key_layout != residency.key_layout:
                     if allow_missing:
                         logger.debug("KVCR start_write layout mismatch key=%r", key)
@@ -331,7 +342,11 @@ class _LocalDramPools:
                             continue
                         return False
                     refs = tuple(available[index] for index in indices)
-                claims.append((index, residency, refs))
+                if any(ref is None for ref in refs):
+                    if allow_missing:
+                        continue
+                    return False
+                claims.append((index, residency, cast(tuple[_TransferRef, ...], refs)))
             result = tuple(claims)
             for index, residency, _ in result:
                 residency.source_readers += 1
@@ -349,11 +364,23 @@ class _LocalDramPools:
         *,
         success: bool,
     ) -> None:
-        """Queue reader release; retain eviction protection until access accounting."""
+        """End Guard slot protection on progress; defer only owner bookkeeping."""
         state = self._source_state
+        release_on_progress = self._kvcr._request_pin_callback is None
         with state.lock:
+            for key, residency in zip(keys, sources):
+                if (
+                    residency.source_readers <= 0
+                    or state.active.get(key) is not residency
+                ):
+                    raise RuntimeError("local DRAM source reader ownership lost")
+                if release_on_progress:
+                    residency.source_readers -= 1
+                    if not residency.source_readers:
+                        state.active.pop(key)
+                residency.source_completions += 1
             state.operations -= 1
-            state.completions.put((keys, sources, success))
+            state.completions.put((keys, sources, success, release_on_progress))
 
     def _drain_source_completions(self) -> None:
         if self._draining_source_completions:
@@ -365,20 +392,39 @@ class _LocalDramPools:
         try:
             while True:
                 try:
-                    keys, sources, success = completions.get_nowait()
+                    keys, sources, success, released = completions.get_nowait()
                 except queue.Empty:
                     break
                 if success:
-                    self._kvcr._record_access(keys)
+                    # Guard slots may already have been evicted and reused, even
+                    # for the same key. Never credit a replacement residency.
+                    accessed = tuple(
+                        key
+                        for key, residency in zip(keys, sources)
+                        if (record := self._kvcr._block_record_map.get(key)) is not None
+                        and record.local_dram is residency
+                        and not residency.retire_on_release
+                    )
+                    if accessed:
+                        self._kvcr._record_access(accessed)
                 with state.lock:
                     for key, residency in zip(keys, sources):
-                        if residency.source_readers <= 0:
+                        if residency.source_completions <= 0:
                             raise RuntimeError(
-                                "local DRAM source reader ownership lost"
+                                "local DRAM source completion ownership lost"
                             )
-                        residency.source_readers -= 1
-                        if not residency.source_readers:
-                            state.active.pop(key)
+                        residency.source_completions -= 1
+                        if not released:
+                            if (
+                                residency.source_readers <= 0
+                                or state.active.get(key) is not residency
+                            ):
+                                raise RuntimeError(
+                                    "local DRAM source reader ownership lost"
+                                )
+                            residency.source_readers -= 1
+                            if not residency.source_readers:
+                                state.active.pop(key)
                 for key, residency in zip(keys, sources):
                     record = self._kvcr._block_record_map.get(key)
                     if (

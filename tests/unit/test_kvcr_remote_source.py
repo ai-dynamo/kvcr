@@ -317,7 +317,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
 
 @pytest.mark.parametrize(
     "first_piece_ready,mixed,framework_pinning",
-    [(False, False, False), (True, False, False), (True, True, True)],
+    [(False, False, True), (True, False, True), (True, True, True)],
 )
 @pytest.mark.parametrize("timeout", [False, True])
 def test_local_source_waits_for_declared_pieces(
@@ -1838,3 +1838,208 @@ def test_start_write_refusal_names_why(incarnation, with_metadata, stopping, rea
     )
     assert not agent.sent_notifs
     assert bool(tier._dangling_ops.source_writes) is (reason is None and not stopping)
+
+
+@pytest.mark.parametrize(
+    "requested,completed", [(":a", [1]), (":b", []), (":unknown", [])]
+)
+@pytest.mark.parametrize("first_ready", [False, True])
+def test_guard_only_mixed_pending_sources_without_caller_poll(
+    requested, completed, first_ready
+):
+    primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    memory = ctypes.create_string_buffer(48)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(primary, 16, ":*")],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 48)]),
+    )
+    try:
+        agent.state = "DONE"
+        ready = source.deposit(
+            {b"ready": [_mem_descriptor(label=":a", end_point_name="source")]}
+        )
+        assert _poll_until(source, bool) == [(ready, _op_entries({b"ready": True}))]
+        agent.state = "DONE" if first_ready else "PROC"
+        partial = source.deposit(
+            {b"partial": [_mem_descriptor(label=":a", end_point_name="source")]},
+            expected_layout=[":a", ":b"],
+        )
+        _wait_until(lambda: len(agent.xfers) == 2)
+        if first_ready:
+            assert _poll_until(source, bool) == [
+                (partial, _op_entries({b"partial": True}))
+            ]
+        message = msgspec.msgpack.decode(_start_write_message(77, b"partial"))
+        message.update(
+            keys=[b"absent", b"partial", b"ready"],
+            target_regions=({":*": _buffer_region(primary, 16, ":*")}, {}),
+            dst_descriptors=[[_TransferRef("target", 0, requested)]] * 3,
+        )
+        expected = (completed if first_ready else []) + (
+            [2] if requested == ":a" else []
+        )
+        backend = source._core._remote_fw_dram
+        with (
+            source._core._state_lock,
+            patch.object(
+                backend, "_queue_source_pin", wraps=backend._queue_source_pin
+            ) as handoff,
+            patch.object(
+                source._core,
+                "_record_access",
+                side_effect=AssertionError("callback reentry"),
+            ),
+        ):
+            control.incoming.extend(
+                [msgspec.msgpack.encode(message), _write_probe_message(99)]
+            )
+            _wait_until(
+                lambda: any(
+                    _decode_control_message(raw).get("type") == "write_probe_ack"
+                    for _, raw in control.sent
+                )
+            )
+            handoff.assert_not_called()
+            source._core._progress.raise_if_failed()
+            notification = agent.xfers[-1][5] if expected else agent.sent_notifs[-1][1]
+            assert _decode_notif(notification)["completed_indices"] == expected
+            if expected:
+                assert all(
+                    ctypes.string_at(addr, size) == b"a" * 16
+                    for addr, size, _ in agent.xfers[-1][1]
+                )
+            assert not backend._sources._source_pin_ops
+            assert not source._core._local_dram_sources_by_op
+    finally:
+        agent.state = "DONE"
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_guard_reader_release_on_progress_after_native_cleanup(ambiguous):
+    memory = ctypes.create_string_buffer(b"a" * 16, 16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+    )
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+        assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+        pools = source._core._local_dram._pools
+        residency = source._core._block_record_map[b"local"].local_dram
+        agent.state = "PROC"
+        release = agent.release_xfer_handle
+        allow_cleanup = threading.Event()
+        cleanup_attempted = threading.Event()
+
+        def sticky_release(handle):
+            cleanup_attempted.set()
+            if not allow_cleanup.is_set():
+                raise RuntimeError("cleanup busy")
+            return release(handle)
+
+        def ambiguous_submit(handle):
+            raise RuntimeError("ambiguous submission")
+
+        with (
+            source._core._state_lock,
+            patch.object(agent, "release_xfer_handle", side_effect=sticky_release),
+            patch.object(agent, "transfer", side_effect=ambiguous_submit)
+            if ambiguous
+            else patch.object(agent, "state", "PROC"),
+            patch.object(
+                source._core,
+                "_record_access",
+                side_effect=AssertionError("callback reentry"),
+            ),
+        ):
+            control.incoming.append(_start_write_message(88, b"local"))
+            _wait_until(lambda: len(agent.xfers) == 2)
+            assert residency.source_readers == 1
+            assert pools._reclaimable_slots()[""] == 0
+            assert pools._allocate_slots(
+                [""], frozenset(), source._core._clock() + 1
+            ) == (None, [], False)
+            assert memory.raw == b"a" * 16
+            agent.state = "DONE"
+            _wait_until(cleanup_attempted.is_set)
+            assert residency.source_readers == 1
+            allow_cleanup.set()
+            _wait_until(lambda: pools.source_operations == 0)
+            assert residency.source_readers == 0
+            assert residency.source_completions == 1
+            # Deferred accounting must not retain physical slot protection.
+            assert pools._reclaimable_slots()[""] == 1
+            selected = pools.acquire_readers(
+                (b"local",), ((_TransferRef("target", 0),),), ()
+            )
+            assert selected
+        assert _poll_until(source, lambda _: residency.source_completions == 0) == []
+        assert residency.source_readers == 1
+        assert pools._source_state.active[b"local"] is residency
+        assert pools._reclaimable_slots()[""] == 0
+        pools.release_readers((b"local",), (residency,), success=False)
+        assert _poll_until(source, lambda _: residency.source_completions == 0) == []
+        assert residency.source_readers == 0
+        assert pools._reclaimable_slots()[""] == 1
+    finally:
+        agent.state = "DONE"
+
+
+@pytest.mark.parametrize("reuse_key", [False, True])
+def test_guard_done_allows_eviction_before_accounting_without_aba(reuse_key):
+    memory = ctypes.create_string_buffer(b"a" * 16, 16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    agent.state = "DONE"
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+    )
+    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    core = source._core
+    pools = core._local_dram._pools
+    old = core._block_record_map[b"local"].local_dram
+    with core._state_lock:
+        control.incoming.append(_start_write_message(89, b"local"))
+        _wait_until(lambda: len(agent.xfers) == 2 and pools.source_operations == 0)
+        assert old.source_readers == 0 and old.source_completions == 1
+        slots, evicted, pending = pools._allocate_slots(
+            [""], frozenset(), core._clock() + 1
+        )
+        assert slots is not None and evicted == [b"local"] and not pending
+        assert b"local" not in core._block_record_map
+        key = b"local" if reuse_key else b"replacement"
+        replacement = _LocalDramResidency(slots, _LocalDramState.READY)
+        record = _BlockRecord(local_dram=replacement, access_count=7, last_access=123.0)
+        core._block_record_map[key] = record
+        pools._publish_source(key, replacement)
+        pools._make_evictable(key)
+        ctypes.memmove(ctypes.addressof(memory), b"b" * 16, 16)
+        assert pools.acquire_readers((key,), ((_TransferRef("target", 0),),), ())
+        with patch.object(
+            core, "_record_access", side_effect=AssertionError("stale access")
+        ):
+            pools._drain_source_completions()
+        assert old.source_completions == 0
+        assert record.local_dram is replacement
+        assert record.access_count == 7 and record.last_access == 123.0
+        assert replacement.source_readers == 1
+        assert pools._source_state.active[key] is replacement
+        assert memory.raw == b"b" * 16
+        pools.release_readers((key,), (replacement,), success=False)
+        pools._drain_source_completions()

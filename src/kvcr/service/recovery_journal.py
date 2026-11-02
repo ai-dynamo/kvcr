@@ -393,6 +393,8 @@ class _RecoveryMirror:
                     local_dram.remote_cancelled = False
                     local_dram.claim_count = 0
                     local_dram.source_readers = 0
+                    local_dram.source_completions = 0
+                    local_dram.export_refs = ()
                     local_dram.retire_on_release = False
                     # References name the previous agent, unlike the slot layout.
                     local_dram.refs = {}
