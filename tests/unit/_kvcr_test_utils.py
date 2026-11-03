@@ -662,7 +662,7 @@ class _RecordingFIFOPolicy(FIFOPolicy):
 
 
 class _ConstantHashAdapter:
-    def decode(self, key):
+    def encode_to_router(self, key):
         return 123
 
 

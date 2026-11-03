@@ -211,7 +211,7 @@ class _RemoteFWDram:
             return False
         if (
             not self._options.opportunistic_query
-            and adapter.decode(key) not in request_hint.block_hashes
+            and adapter.encode_to_router(key) not in request_hint.block_hashes
         ):
             return False
         return True
