@@ -1158,7 +1158,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     # Two receives ensure a full progress pass has observed the advanced clock.
     _wait_until(lambda: control.recv.call_count >= received + 2)
     assert list(kvcr.poll_completed()) == []
-    assert _has_outstanding_operations(kvcr)
+    assert kvcr._core._outstanding_operations == 1
     assert len(errors) == 1
     control.incoming.append(
         _probe_ack(
@@ -1166,7 +1166,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         )
     )
     assert _poll_until(kvcr, lambda _: len(errors) == 2) == []
-    assert not _has_outstanding_operations(kvcr)
+    assert kvcr._core._outstanding_operations == 0
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
     assert (
         errors[0].destination_regions == errors[1].destination_regions == [destination]
@@ -1238,6 +1238,7 @@ def test_remote_write_cancellation_and_late_completion(
             notifications.append(cancelled)
         agent.notifs["source"] = notifications
         assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        assert kvcr._core._outstanding_operations == 0
         return
     now = 1.0
     _wait_until(
@@ -1466,12 +1467,14 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
         in_flight = {("target", handle) for handle in handles}
         assert in_flight <= set(kvcr._core._progress._in_flight_ops)
         assert in_flight.isdisjoint(_block_op_ids(kvcr))
+        assert kvcr._core._outstanding_operations == 2
         agent.notifs["source"] = [
             _write_done_notification(handle) for handle in handles
         ]
         assert dict(_poll_until(kvcr, lambda done: len(done) == 2)) == {
             handle: _op_entries({key: True}) for handle in handles
         }
+        assert kvcr._core._outstanding_operations == 0
 
     if select_with_query:
         for request in ("req-a", "req-b"):
