@@ -37,7 +37,7 @@ RUN sed -i 's/^from kvcr\.control_channels import ZmqPeerControlChannel$/from kv
 # Pin a landed Dynamo revision with the versioned KV hint protocol and
 # per-rank KVCR control ports.
 FROM build-base AS dynamo-builder
-ARG DYNAMO_REF=701da25292ecca8f64d770cc0b17d389200019a1
+ARG DYNAMO_REF=318ab0390d8e3e1fa7517ea6a1ebf46a7854c236
 RUN git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git /src/dynamo \
  && git -C /src/dynamo fetch --depth 1 origin "${DYNAMO_REF}" \
  && git -C /src/dynamo checkout --detach "${DYNAMO_REF}"
@@ -97,6 +97,9 @@ import inspect
 from types import SimpleNamespace
 
 import dynamo.vllm
+# The worker entry point: fails here, not at `python -m dynamo.vllm`, when the
+# pinned Dynamo and vLLM disagree on an internal API.
+import dynamo.vllm.main
 import kvcr
 import vllm
 from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
