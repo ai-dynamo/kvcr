@@ -625,9 +625,17 @@ def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> N
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl()
+    memory = ctypes.create_string_buffer(16)
     source = _new_kvcr(
-        agent, pinning, control, name="source", on_resilience_event=on_resilience_event
+        agent,
+        pinning,
+        control,
+        name="source",
+        on_resilience_event=on_resilience_event,
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
     )
+    # A published source arms the watchdog before the framework pin waits.
+    install_recovery_records(source._core, {b"seed": _recovered_record(g2=[("", 0)])})
 
     stalled_for = 0.0
     with patch(
@@ -2043,3 +2051,156 @@ def test_guard_done_allows_eviction_before_accounting_without_aba(reuse_key):
         assert memory.raw == b"b" * 16
         pools.release_readers((key,), (replacement,), success=False)
         pools._drain_source_completions()
+
+
+@pytest.mark.parametrize("framework_pinning", [False, True])
+@pytest.mark.parametrize("bad_selected", [False, True])
+@pytest.mark.parametrize(
+    "bad_field,bad_value",
+    [
+        ("end_point_name", "unknown"),
+        ("element_index", 1024),
+        ("framework", False),
+        ("label", "unknown-pool"),
+    ],
+)
+def test_validate_only_selected_guard_destinations(
+    framework_pinning, bad_selected, bad_field, bad_value, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
+    memory = ctypes.create_string_buffer(b"a" * 32, 32)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    pinning = (
+        FakePrimaryPinning()
+        if framework_pinning
+        else SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None)
+    )
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 32)]),
+    )
+    agent.state = "DONE"
+    deposit = source.deposit(
+        {
+            b"ready": [_mem_descriptor(end_point_name="source")],
+            b"ready2": [_mem_descriptor(1, end_point_name="source")],
+        }
+    )
+    assert _poll_until(source, bool) == [
+        (deposit, _op_entries({b"ready": True, b"ready2": True}))
+    ]
+    backend = source._core._remote_fw_dram
+    pools = source._core._local_dram._pools
+    residency = source._core._block_record_map[b"ready"].local_dram
+    request = msgspec.msgpack.decode(
+        _start_write_message(90, b"ready", target_agent="target")
+    )
+    request.update(
+        keys=[b"ready", b"ready2", b"missing"],
+        dst_descriptors=[
+            [dict(end_point_name="target", element_index=0)],
+            [dict(end_point_name="target", element_index=0)],
+            [dict(end_point_name="target", element_index=0)],
+        ],
+    )
+    request["dst_descriptors"][1 if bad_selected else 2][0][bad_field] = bad_value
+    # An unknown label is incompatible with the source, so that key is a miss.
+    selected_bad = bad_selected and bad_field != "label"
+    should_fail = framework_pinning or selected_bad
+    validate_original = source._core._validate_descriptors
+
+    def validate_claimed(descriptors, **kwargs):
+        if not framework_pinning:
+            assert residency.source_readers == 1
+            assert source._core._block_record_map[
+                b"ready2"
+            ].local_dram.source_readers == int(
+                not (bad_selected and bad_field == "label")
+            )
+        return validate_original(descriptors, **kwargs)
+
+    with (
+        source._core._state_lock,
+        patch.object(
+            source._core,
+            "_validate_descriptors",
+            side_effect=validate_claimed,
+        ) as validate,
+        patch.object(pools, "acquire_readers", wraps=pools.acquire_readers) as acquire,
+    ):
+        control.incoming.extend(
+            [msgspec.msgpack.encode(request), _write_probe_message(99)]
+        )
+        _wait_until(
+            lambda: any(
+                _decode_control_message(raw).get("type") == "write_probe_ack"
+                for _, raw in control.sent
+            )
+        )
+        source._core._progress.raise_if_failed()
+        if should_fail:
+            assert len(agent.xfers) == 1
+            assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+        else:
+            assert len(agent.xfers) == 2
+            assert _decode_notif(agent.xfers[-1][5])["completed_indices"] == (
+                [0] if bad_selected else [0, 1]
+            )
+        if not framework_pinning:
+            assert validate.call_count == (2 if not bad_selected or selected_bad else 1)
+            if validate.call_count:
+                # Validation happens after the complete source subset is claimed.
+                assert acquire.call_count == 1
+            assert not backend._sources._source_pin_ops
+        assert residency.source_readers == 0
+        assert source._core._block_record_map[b"ready2"].local_dram.source_readers == 0
+        assert pools.source_operations == 0
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+
+
+@pytest.mark.parametrize("arm_with", ["ready", "native"])
+def test_source_watchdog_ignores_empty_startup_then_latches(arm_with):
+    from kvcr.backends.dangling_ops import _DanglingOps
+    from kvcr.backends.local_dram_pools import _LocalDramPools, _SourceState
+
+    pools = object.__new__(_LocalDramPools)
+    pools._source_state = _SourceState()
+    core = SimpleNamespace(
+        config=KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        framework_control=object(),
+        _request_pin_callback=None,
+        _local_dram=SimpleNamespace(_pools=pools),
+        _progress=SimpleNamespace(_first_native_work_at=None),
+    )
+    pools._kvcr = core
+    backend = SimpleNamespace(_kvcr=core, _progress_outbound=[])
+    watchdog = _DanglingOps(backend)
+    now = 0.0
+    clock = SimpleNamespace(monotonic=lambda: now)
+    with (
+        patch("kvcr.backends.dangling_ops.time", clock),
+        patch("kvcr.backends.local_dram_pools.time", clock, create=True),
+    ):
+        watchdog.begin_poll()
+        now = 60.0
+        watchdog.begin_poll()
+        assert watchdog.check_source_progress()
+        assert not backend._progress_outbound
+        if arm_with == "ready":
+            residency = _LocalDramResidency([("", 0)], _LocalDramState.READY)
+            pools._publish_source(
+                b"ready", residency, (_TransferRef("source", 0, framework=False),)
+            )
+        else:
+            core._progress._first_native_work_at = now
+        watchdog.begin_poll()
+        assert watchdog.check_source_progress()
+        now += 2.0
+        assert not watchdog.check_source_progress()
+        watchdog.begin_poll()
+        assert not watchdog.check_source_progress()
+        assert len(backend._progress_outbound) == 1

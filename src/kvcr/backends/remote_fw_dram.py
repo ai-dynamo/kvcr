@@ -755,12 +755,13 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            for descriptors in dst_descriptors:
-                self._kvcr._validate_descriptors(
-                    descriptors,
-                    regions=self._remote_agents_by_target[target_agent][2],
-                    agent_name=target_agent,
-                )
+            if self._framework_pinning:
+                for descriptors in dst_descriptors:
+                    self._kvcr._validate_descriptors(
+                        descriptors,
+                        regions=self._remote_agents_by_target[target_agent][2],
+                        agent_name=target_agent,
+                    )
             self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
             raise
@@ -809,7 +810,10 @@ class _RemoteFWDram:
                 op_id[1],
                 target_agent,
                 len(keys),
-                self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
+                sum(
+                    self._kvcr._block_sizes.get(ref.label.partition(":")[0], 0)
+                    for ref in chain.from_iterable(dst_descriptors)
+                ),
             )
 
         source_write = _SourceWriteOp(
@@ -937,6 +941,23 @@ class _RemoteFWDram:
             if sources:
                 local._pools.release_readers(ordered_keys, sources, success=False)
             raise
+        if not self._framework_pinning:
+            try:
+                for descriptors in dst_descriptors:
+                    self._kvcr._validate_descriptors(
+                        descriptors,
+                        regions=self._remote_agents_by_target[source_write.route[0]][2],
+                        agent_name=source_write.route[0],
+                    )
+            except Exception:
+                logger.warning(
+                    "KVCR start_write selected destination invalid for op=%d",
+                    source_write.op_handle,
+                    exc_info=True,
+                )
+                # Claims are registered, but no native submission has happened.
+                # The normal failure path releases every claimed source.
+                source_write.state = _SourceWriteState.NOTIFY_FAILURE
         done, _ = source_write.progress(progress, None)
         if done:
             progress._in_flight_ops.pop(source_write.op_id)

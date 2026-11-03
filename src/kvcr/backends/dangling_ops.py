@@ -48,13 +48,29 @@ class _DanglingOps:
         self._source_stalled = False
 
     def begin_poll(self) -> None:
-        polled_at = time.monotonic()
         self.check_source_progress()
-        self._last_progress_at = polled_at
+        if self._last_progress_at is not None:
+            self._last_progress_at = time.monotonic()
 
     def check_source_progress(self) -> bool:
-        if self._source_stalled or self._last_progress_at is None:
-            return not self._source_stalled
+        if self._source_stalled:
+            return False
+        if self._last_progress_at is None:
+            kvcr = self._backend._kvcr
+            local = kvcr._local_dram
+            ready_at = (
+                local._pools._source_state.first_ready_at if local is not None else None
+            )
+            native_at = kvcr._progress._first_native_work_at
+            # These one-time markers do not reset an armed or latched watchdog.
+            if ready_at is None:
+                self._last_progress_at = native_at
+            elif native_at is None:
+                self._last_progress_at = ready_at
+            else:
+                self._last_progress_at = min(ready_at, native_at)
+            if self._last_progress_at is None:
+                return True
         gap_ms = (time.monotonic() - self._last_progress_at) * 1000
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:

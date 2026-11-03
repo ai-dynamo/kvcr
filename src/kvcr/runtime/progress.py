@@ -152,6 +152,7 @@ class _KVCRProgress:
         self._active_transfers: dict[int, _TransferState] = {}
         self._disconnected_remote_agents: set[str] = set()
         self._next_transfer_id = 0
+        self._first_native_work_at: float | None = None
         self._nixl_listen_port = nixl_listen_port
         self._dram_backends = dram_backends
         self._memory_regions = (
@@ -339,6 +340,10 @@ class _KVCRProgress:
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                 submitted = False
                 logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
+            # Definite rejection is not work. An ambiguous post may own live
+            # DMA, so it arms the source watchdog just like accepted work.
+            if self._first_native_work_at is None and state.outcome is not False:
+                self._first_native_work_at = time.monotonic()
             if trace is not None:
                 if submitted:
                     post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE

@@ -4,7 +4,7 @@
 import logging
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -874,3 +874,50 @@ def test_loop_failure_is_reported_to_main() -> None:
     with pytest.raises(RuntimeError, match="loop failed") as exc_info:
         progress.close()
     assert exc_info.value is expected
+
+
+@pytest.mark.parametrize(
+    "post_state",
+    ["PROC", "PEND", "DONE", "ERR", "unknown", "exception", "create_error"],
+)
+def test_first_native_work_marker_requires_native_acceptance(post_state):
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    assert getattr(progress, "_first_native_work_at", None) is None
+    agent.transfer_result = post_state
+    agent.submit_exception = post_state == "exception"
+    now = 123.0
+    with patch.object(progress_module, "time", SimpleNamespace(monotonic=lambda: now)):
+        if post_state == "create_error":
+            with patch.object(
+                agent, "make_prepped_xfer", side_effect=RuntimeError("create failed")
+            ):
+                with pytest.raises(RuntimeError, match="create failed"):
+                    progress.submit_transfer(
+                        "WRITE",
+                        [_mem(0)],
+                        [_mem(1, owner="remote-agent")],
+                        remote_side_agent="remote-agent",
+                    )
+            assert getattr(progress, "_first_native_work_at", None) is None
+            assert not progress._active_transfers
+            return
+        transfer_id, _ = progress.submit_transfer(
+            "WRITE",
+            [_mem(0)],
+            [_mem(1, owner="remote-agent")],
+            remote_side_agent="remote-agent",
+        )
+        expected = None if post_state == "ERR" else now
+        assert getattr(progress, "_first_native_work_at", None) == expected
+        now += 1
+        progress.poll_transfer(transfer_id, require_completion=True)
+        if expected is not None:
+            second, _ = progress.submit_transfer(
+                "WRITE",
+                [_mem(0)],
+                [_mem(1, owner="remote-agent")],
+                remote_side_agent="remote-agent",
+            )
+            assert progress._first_native_work_at == expected
+            progress.poll_transfer(second, require_completion=True)
