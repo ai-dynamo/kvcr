@@ -37,7 +37,7 @@ def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
 
 
 class _PrefixAdapter:
-    def decode(self, key):
+    def encode_to_router(self, key):
         return int.from_bytes(key[:8], "big")
 
 

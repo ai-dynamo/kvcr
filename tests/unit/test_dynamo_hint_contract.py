@@ -37,7 +37,7 @@ def dynamo_hint():
 
 
 class _U64KeyAdapter:
-    def decode(self, key: BlockKey) -> int:
+    def encode_to_router(self, key: BlockKey) -> int:
         return int.from_bytes(key[:8], "big", signed=False)
 
 

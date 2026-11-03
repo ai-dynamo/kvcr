@@ -81,7 +81,7 @@ class Stats:
 
 
 class Keys:
-    def decode(self, key):
+    def encode_to_router(self, key):
         return int.from_bytes(key, "big")
 
 
