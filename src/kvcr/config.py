@@ -139,6 +139,7 @@ class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     remote_fw_dram: RemoteFWDramOptions = msgspec.field(
         default_factory=RemoteFWDramOptions
     )
+    remote_fw_gpu: RemoteFWGPUOptions | None = None
 
 
 class TelemetryStats(Protocol):

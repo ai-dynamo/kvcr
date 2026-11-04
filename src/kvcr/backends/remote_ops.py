@@ -78,6 +78,7 @@ class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
 
 _ControlMessage = (
     _StartWrite
+    | _StartWriteGPU
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused
@@ -130,6 +131,9 @@ class _TargetPullOp(_RemoteOp):
     source_incarnation: str | None = None
     uncertain: bool = False
     retried: bool = False
+    gpu_peer_verified: bool = False
+    gpu_peer_refused: bool = False
+    gpu_probe_after: float = 0.0
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
@@ -163,6 +167,9 @@ class _TargetPullOp(_RemoteOp):
             )
             self.source_incarnation = event["retry_metadata"]
             self.retried = True
+            self.gpu_peer_verified = False
+            self.gpu_peer_refused = False
+            self.gpu_probe_after = 0.0
             self.state = _TargetPullState.START_WRITE
         if self.state is _TargetPullState.START_WRITE:
             if not self.retried:
@@ -172,21 +179,44 @@ class _TargetPullOp(_RemoteOp):
             else:
                 # A stale ACK from the dead peer may have re-acked the endpoint.
                 backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
-            if now >= self.deadline:
+            if now >= self.deadline or self.gpu_peer_refused:
                 if trace is not None:
                     trace.reject(
                         "target.start_write.rejected",
-                        _nvtx.Reason.DEADLINE,
-                        status=_nvtx.Status.TIMEOUT,
+                        _nvtx.Reason.DEADLINE
+                        if now >= self.deadline
+                        else _nvtx.Reason.REMOTE_FAILURE,
+                        status=_nvtx.Status.TIMEOUT
+                        if now >= self.deadline
+                        else _nvtx.Status.FAILED,
                     )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
+            if backend._gpu and not self.gpu_peer_verified:
+                if now < self.gpu_probe_after:
+                    return False, False
+                sent = backend._send_control(
+                    progress,
+                    self.remote_ctrl_ep,
+                    _TargetMetadata(op_handle=self.op_id[1], gpu_capability_only=True),
+                )
+                if not sent:
+                    self.success = False
+                    self.state = _TargetPullState.FINISHED
+                    backend._record_progress_duration(
+                        scope, self.started_at, "failed"
+                    )
+                    return True, True
+                self.gpu_probe_after = (
+                    now + backend._options.metadata_retry_interval_ms / 1000
+                )
+                return False, True
             sent = backend._send_control(
                 progress,
                 self.remote_ctrl_ep,
-                _StartWrite(
+                (_StartWriteGPU if backend._gpu else _StartWrite)(
                     op_handle=self.op_id[1],
                     remaining_timeout_ms=(self.deadline - now) * 1000,
                     source_incarnation=self.source_incarnation,

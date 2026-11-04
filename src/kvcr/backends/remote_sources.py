@@ -84,6 +84,9 @@ class _RemoteSources:
             _SourceWriteState.FINISHED,
             _SourceWriteState.CANCEL_PENDING,
         ):
+            if self._backend._gpu and item.state is _SourceWriteState.CANCEL_PENDING:
+                # A timeout or uncertainty report cannot release live GPU DMA.
+                return
             if item.local_sources is not None:
                 # local.poll_main drains reader releases with their access
                 # accounting and reclamation.

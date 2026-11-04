@@ -24,6 +24,9 @@ class RegionDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     ``stride=0`` means contiguous elements. The registered extent includes
     gaps between elements. Framework registration names must be unique: ``pool``,
     ``pool:part``, or ``pool:*`` to share a buffer across parts.
+    CUDA registrations use ``mem_type="VRAM"`` and the allocation's CUDA device
+    ordinal in ``device_Id``. The framework owns and retains the entire extent,
+    including stride gaps, until KVCR has closed quiescently.
     """
 
     mem_type: str = "DRAM"
@@ -123,6 +126,7 @@ class CacheTier(Enum):
     FW_G2 = "FW_DRAM"
     LOCAL_G2 = "DRAM"
     REMOTE_G2 = "REMOTE_G2"
+    REMOTE_G1 = "REMOTE_G1"
     G3 = "G3"
     # TODO: G4 is not supported; enable it with its backend.
     # G4 = "G4"

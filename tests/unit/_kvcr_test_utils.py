@@ -24,6 +24,7 @@ from kvcr.config import (
     KVCRConfig,
     LocalDramOptions,
     RemoteFWDramOptions,
+    RemoteFWGPUOptions,
 )
 from kvcr.hints.results import HintResult
 from kvcr.policy import FIFOPolicy
@@ -548,6 +549,7 @@ def _new_kvcr(
     name: str = "target",
     key_adapter: object | None = None,
     remote_options: RemoteFWDramOptions | None = None,
+    remote_gpu_options: RemoteFWGPUOptions | None = None,
     framework_regions: list[RegionDescriptor] | None = None,
     local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
@@ -594,6 +596,7 @@ def _new_kvcr(
                 local_dram=local_dram,
                 g3=g3,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
+                remote_fw_gpu=remote_gpu_options,
             ),
         )
     _OPEN_KVCRS.append(kvcr)
