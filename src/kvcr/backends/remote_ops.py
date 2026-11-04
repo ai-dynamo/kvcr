@@ -37,6 +37,14 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     key_layout: tuple[str, ...] = ()
     source_incarnation: str | None = None
+    move: bool = False
+
+
+class _Invalidate(_PeerMessage, tag="invalidate"):
+    """Remove eligible source G2 copies already held completely at the destination."""
+
+    keys: tuple[BlockKey, ...]
+    key_layout: tuple[str, ...]
 
 
 class _TargetMetadata(_PeerMessage, tag="target_metadata"):
@@ -65,6 +73,7 @@ class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
 
 _ControlMessage = (
     _StartWrite
+    | _Invalidate
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused
@@ -111,6 +120,7 @@ class _TargetPullOp(_RemoteOp):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
     key_layout: tuple[str, ...] = ()
+    move: bool = False
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
@@ -180,6 +190,7 @@ class _TargetPullOp(_RemoteOp):
                     keys=self.ordered_keys,
                     dst_descriptors=self.dst_descriptors,
                     key_layout=self.key_layout if self.local_fill else (),
+                    move=self.move,
                 ),
             )
             if not sent:
@@ -373,6 +384,8 @@ class _SourceWriteOp(_RemoteOp):
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
+    # Keys this move marked pending at the source; reopened if the write fails.
+    moving: tuple[BlockKey, ...] = ()
     # None uses caller cleanup; a tuple (even empty) is owned by progress.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
 

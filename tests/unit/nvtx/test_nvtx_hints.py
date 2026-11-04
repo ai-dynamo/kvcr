@@ -5,6 +5,7 @@
 import msgspec
 import pytest
 from _kvcr_test_utils import (
+    _has_outstanding_operations,
     _mem_descriptor,
     _poll_until,
     _record_hint_results,
@@ -13,6 +14,7 @@ from _kvcr_test_utils import (
     _write_done_notification,
 )
 from _nvtx_test_utils import make_target, payloads
+from test_kvcr_move import _Pair
 
 from kvcr import _nvtx
 from kvcr.hints.results import HintStatus
@@ -85,3 +87,50 @@ def test_batch_hint_traces(recording, monkeypatch, level, scenario):
         == int(submitted[-1]["trace_id"])
         == stored.trace.trace_id
     )
+
+
+@pytest.mark.parametrize("advice", ["unchanged", "discarded", "replaced"])
+def test_move_preserves_captured_hint_trace(recording, monkeypatch, advice):
+    pair = _Pair()
+    key = BlockKey(b"move-trace")
+    pair.deposit(key, no_evict=False)
+    core = pair.target._core
+    remote = core._remote_fw_dram
+    durations = []
+    monkeypatch.setattr(core, "_timer", lambda: 1.0)
+    monkeypatch.setattr(
+        core, "_record_duration", lambda *event: durations.append(event)
+    )
+    pair.advise("move")
+    original_hint = remote._request_hints["req"]
+    start_pull = remote._start_target_pull
+
+    def start_after_advice_change(*args, **kwargs):
+        # Admission already captured the source; the first fill can start later.
+        if advice != "unchanged":
+            pair.target.discard_hint("req")
+        if advice == "replaced":
+            pair.advise(hashes=(999,), source="tcp://replacement:1")
+        return start_pull(*args, **kwargs)
+
+    monkeypatch.setattr(remote, "_start_target_pull", start_after_advice_change)
+    moved = pair.target.fetch((key,), "req")
+    future_hint = remote._request_hints.get("req")
+    [used] = payloads(recording, "hint.used")
+    [queued] = payloads(recording, "target.queued")
+    assert int(used["trace_id"]) == original_hint.trace.trace_id
+    assert int(queued["hint_trace_id"]) == original_hint.trace.trace_id
+    assert int(used["op_handle"]) == int(queued["op_handle"])
+    assert (("hint_wait", 1.0, "complete") in durations) is (advice == "unchanged")
+    if advice == "unchanged":
+        assert future_hint.submitted_at is None
+    elif advice == "replaced":
+        assert future_hint.submitted_at == 1.0
+
+    pair.until(lambda: len(pair.source_agent.xfers) == 2)
+    pair.source_agent.state = "ERR"
+    assert not pair.result(moved)[key].success
+    pair.source_agent.state = "DONE"
+    pair.until(lambda: not _has_outstanding_operations(pair.source))
+    assert remote._request_hints.get("req") is future_hint
+    assert future_hint is None or not future_hint.failed

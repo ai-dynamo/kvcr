@@ -187,7 +187,15 @@ class KVCR:
         expected_layout: list[str] | None = None,
         hints: object | None = None,
     ) -> OpHandle:
-        """Asynchronously fetch blocks into KVCR-managed storage."""
+        """Asynchronously fetch blocks into KVCR storage and return release claims.
+
+        A usable kv.fetch hint with mode="move" requests best-effort source G2
+        removal for matching successful keys, including destination cache hits.
+        Other keys retain ordinary fetch behavior. Failed advice does not
+        prevent local cache hits. Completion reports destination readiness
+        without waiting for source cleanup, which respects no_evict protection
+        and leaves G3 and framework memory intact.
+        """
         return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(

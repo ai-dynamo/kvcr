@@ -94,27 +94,38 @@ class _CountingLock:
         return self._inner.release()
 
 
-def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch):
+@pytest.mark.parametrize("mode", [None, "copy", "move"])
+def test_gpu_fetch_hint_takes_inline_path_without_lock(monkeypatch, mode):
     kvcr, results = _fetch_kvcr(monkeypatch)
     lock = _CountingLock(kvcr._core._state_lock)
     kvcr._core._state_lock = lock
 
-    kvcr.submit_hint(_router_hint("tcp://a:1", (1,)), "req")
+    hint = _router_hint("tcp://a:1", (1,))
+    if mode is not None:
+        hint.actions[0].payload["mode"] = mode
+    kvcr.submit_hint(hint, "req")
 
     assert lock.entries == 0
+    assert kvcr._core._remote_fw_dram._request_hints["req"].move is (mode == "move")
     assert kvcr.query((_key(1),), "req") == [_FETCHABLE]
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, "req")]
 
 
 @pytest.mark.parametrize("one_envelope", [True, False], ids=["envelope", "calls"])
+@pytest.mark.parametrize("modes", [(None, None), ("copy", "move"), ("move", "copy")])
 @pytest.mark.parametrize(
     ("second_source", "expected"),
     [("tcp://a:1", [_MISS, _FETCHABLE]), ("tcp://b:1", [_MISS, _MISS])],
     ids=["same_source_replaces", "other_source_fails"],
 )
-def test_second_fetch_for_a_request(monkeypatch, one_envelope, second_source, expected):
+def test_second_fetch_for_a_request(
+    monkeypatch, one_envelope, second_source, expected, modes
+):
     kvcr, results = _fetch_kvcr(monkeypatch)
     first, second = _fetch("a1", "tcp://a:1", [1]), _fetch("a2", second_source, [2])
+    for hint, mode in zip((first, second), modes):
+        if mode is not None:
+            hint.payload["mode"] = mode
     for hints in [(first, second)] if one_envelope else [(first,), (second,)]:
         kvcr.submit_hint(_fetch_envelope(*hints), "req")
     # The store's rules apply within an envelope as across calls, and it reports
@@ -124,6 +135,9 @@ def test_second_fetch_for_a_request(monkeypatch, one_envelope, second_source, ex
         ("a2", HintStatus.ACCEPTED, None),
     ]
     assert kvcr.query((_key(1), _key(2)), "req") == expected
+    # A same-source hint replaces the mode; a rejected conflicting hint does not.
+    kept = modes[1] if second_source == "tcp://a:1" else modes[0]
+    assert kvcr._core._remote_fw_dram._request_hints["req"].move is (kept == "move")
 
 
 def test_mixed_valid_and_unknown_hints(monkeypatch):
@@ -154,3 +168,20 @@ def test_fetch_hint_without_request_id_is_accepted(monkeypatch):
     kvcr.submit_hint(_router_hint("tcp://a:1", (1,)))
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, None)]
     assert not kvcr._core._remote_fw_dram._request_hints
+
+
+def test_later_hint_replaces_move_mode_and_discard_clears_it(monkeypatch):
+    kvcr, results = _fetch_kvcr(monkeypatch)
+    moved = _fetch("move-1", "tcp://a:1", [1])
+    moved.payload["mode"] = "move"
+    copied = _fetch("copy-1", "tcp://a:1", [2])
+    hints = kvcr._core._remote_fw_dram._request_hints
+
+    kvcr.submit_hint(_fetch_envelope(moved), "req")
+    assert hints["req"].move
+    kvcr.submit_hint(_fetch_envelope(copied), "req")
+    assert not hints["req"].move
+    assert kvcr.query((_key(1), _key(2)), "req") == [_MISS, _FETCHABLE]
+    kvcr.discard_hint("req")
+    assert "req" not in hints
+    assert all(r.status is HintStatus.ACCEPTED for r in results)

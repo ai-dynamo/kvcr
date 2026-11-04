@@ -38,6 +38,7 @@ from .local_dram_pools import (
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
+    from .moves import _PendingMove
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ class _PendingResidencyOp(_Op):
     key_layout: tuple[str, ...] | None = None
     fill_sources: Mapping[BlockKey, CacheTier] = field(default_factory=dict)
     claimed_keys: set[BlockKey] = field(default_factory=set)
+    # Move advice captured at admission; see _PendingMove.
+    move: "_PendingMove | None" = None
 
 
 @dataclass
@@ -247,8 +250,22 @@ class _LocalDram:
             key_layout=key_layout,
         )
         self._pending_residency_ops[op.op_id] = op
-        self._kvcr._add_block_dependencies(op, new_operation=True)
+        self._admit(op)
         self._start_deposits(op, blocks)
+
+    def _admit(self, op: _PendingResidencyOp) -> None:
+        """Decide admission once: keys pending removal fail now and never hold a
+        dependency, so work on other keys cannot delay their removal. Accepted
+        keys may finish even if removal becomes pending later.
+        """
+        rejected = self._kvcr._invalidation_handler.rejected_entries(op.keys)
+        if rejected:
+            op.results.update(rejected)
+        self._kvcr._add_block_dependencies(
+            op,
+            new_operation=True,
+            keys=op.keys - op.results.keys() if rejected else None,
+        )
 
     def _start_deposits(
         self, op: _PendingResidencyOp, keys: Collection[BlockKey]
@@ -394,6 +411,7 @@ class _LocalDram:
         hints: object | None,
         layout: list[str],
         key_layout: tuple[str, ...] | None = None,
+        move: "_PendingMove | None" = None,
     ) -> dict[BlockKey, list[_TransferRef]]:
         ordered_keys = tuple(dict.fromkeys(keys))
         if not ordered_keys:
@@ -409,9 +427,10 @@ class _LocalDram:
             key_layout=key_layout,
             fill_sources=sources,
             hints=hints,
+            move=move,
         )
         self._pending_residency_ops[op.op_id] = op
-        self._kvcr._add_block_dependencies(op, new_operation=True)
+        self._admit(op)
         destinations = {}
         for key in ordered_keys:
             refs = self._prepare_fetch(op, key)
@@ -423,6 +442,8 @@ class _LocalDram:
     def _prepare_fetch(
         self, op: _PendingResidencyOp, key: BlockKey
     ) -> list[_TransferRef] | None:
+        if key in op.results:
+            return None
         layout = op.requested_layout
         record = self._kvcr._block_record(key)
         residency = record.local_dram
@@ -463,11 +484,21 @@ class _LocalDram:
             ready = [residency.slots[index] for index in indices]
             self._kvcr._record_access((key,))
             op.results[key] = self._pools._new_public_claim(key, residency, slots=ready)
+            if op.move is not None and key in op.move.keys:
+                op.move.keys.remove(key)
+                op.move.cached_keys.append(key)
         else:
             if key not in op.claimed_keys:
                 self._pools._acquire_claim(key, residency)
                 op.claimed_keys.add(key)
             if source is None or residency.remote_indices is not None:
+                return None
+            if (
+                op.move is not None
+                and key in op.move.keys
+                and residency.pending_deposits
+            ):
+                # Source removal requires every piece outside this write to be ready.
                 return None
             # One remote fill owns these destinations until its native terminal.
             missing = [
@@ -783,6 +814,7 @@ class _LocalDram:
                 {key: refs},
                 residency_op.request_id,
                 residency_op.deadline,
+                move=residency_op.move,
             )
         return key in residency_op.results
 
@@ -898,6 +930,9 @@ class _LocalDram:
             self._finish_deliver_if_ready(op)
 
     def _finish_residency_if_ready(self, op: _PendingResidencyOp) -> None:
+        if op.move is not None:
+            # Complete local hits ask the source to drop its copies right away.
+            self._kvcr._move_handler.invalidate_cached(op.move)
         if (
             len(op.results) != len(op.keys)
             or self._pending_residency_ops.get(op.op_id) is not op
