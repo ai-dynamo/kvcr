@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# QS_MODE selects the SGLang integration in docs/quick-start-sglang.md: hicache or
+# linker. They are separate SGLang PR branches, so each mode pins its own SGLang
+# and Dynamo revisions.
+ARG QS_MODE=hicache
 ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.21-cu130-runtime@sha256:797614a377ead47cf89ccaba810685b56a1bf0d6f0c45f84af2e8f42c198e104
 
 FROM rust:1.96.1-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS sglang-dynamo-builder
@@ -9,12 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libprotobuf-dev libssl-dev libudev-dev \
     pkg-config protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
-ARG SGLANG_DYNAMO_REF=83ea37e849e883c27d7ed848e0f329961e1fb173
-RUN git init /src/dynamo \
+ARG QS_MODE
+RUN case "${QS_MODE}" in \
+      hicache) ref=83ea37e849e883c27d7ed848e0f329961e1fb173 ;; \
+      linker) ref=fe81cfdccedc23b4eabef3a250b538ff11ba102c ;; \
+      *) echo "QS_MODE must be hicache or linker" >&2; exit 1 ;; \
+    esac \
+ && git init /src/dynamo \
  && git -C /src/dynamo remote add origin https://github.com/ai-dynamo/dynamo.git \
- && git -C /src/dynamo fetch --depth 1 origin "${SGLANG_DYNAMO_REF}" \
+ && git -C /src/dynamo fetch --depth 1 origin "${ref}" \
  && git -C /src/dynamo checkout --detach FETCH_HEAD \
- && test "$(git -C /src/dynamo rev-parse HEAD)" = "${SGLANG_DYNAMO_REF}"
+ && test "$(git -C /src/dynamo rev-parse HEAD)" = "${ref}"
 RUN python3 -m venv /venv \
  && /venv/bin/pip install --no-cache-dir 'maturin[patchelf]==1.9.6'
 ENV CARGO_BUILD_JOBS=4
@@ -24,16 +33,20 @@ RUN /venv/bin/pip wheel --no-deps /src/dynamo --wheel-dir /wheels
 
 FROM ${SGLANG_IMAGE} AS sglang
 USER root
-ARG SGLANG_REF=658755604ace9f476b84f98511f76b815606072a
+ARG QS_MODE
 RUN test "$(uname -m)" = x86_64 \
  && apt-get update && apt-get install -y --no-install-recommends \
     git curl libatomic1 libhwloc15 libnuma1 libssl3t64 libudev1 \
  && rm -rf /var/lib/apt/lists/*
-RUN git init /opt/sglang-src \
+RUN case "${QS_MODE}" in \
+      hicache) ref=24a3a79ed3ed3ee5811f78ba2c4cbd5ceaac27d1 ;; \
+      linker) ref=002d6d8d1df91a58695a8868ce2c2db590809f75 ;; \
+    esac \
+ && git init /opt/sglang-src \
  && git -C /opt/sglang-src remote add origin https://github.com/ziqifan617/sglang.git \
- && git -C /opt/sglang-src fetch --depth 1 origin "${SGLANG_REF}" \
+ && git -C /opt/sglang-src fetch --depth 1 origin "${ref}" \
  && git -C /opt/sglang-src checkout --detach FETCH_HEAD \
- && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${SGLANG_REF}"
+ && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${ref}"
 # Install KVCR from the checkout used as the Docker build context.
 COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
 COPY src /opt/kvcr-src/src
@@ -80,9 +93,10 @@ ENV DYN_REQUEST_PLANE=tcp DYN_EVENT_PLANE=zmq DYN_DISCOVERY_BACKEND=file \
     DYN_FILE_KV=/tmp/dynamo-sglang-quick-start DYN_SYSTEM_HOST=127.0.0.1 \
     DYN_RUNTIME_NUM_WORKER_THREADS=4 DYN_RUNTIME_MAX_BLOCKING_THREADS=8 \
     TOKENIZERS_PARALLELISM=false PYTHONHASHSEED=0 RUST_LOG=info \
-    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4
+    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 # Import/version canary only; model/peer-transfer acceptance is in the guide.
 RUN python3 - <<'PY'
+import os
 from importlib import metadata
 from pathlib import Path
 import tomllib
@@ -90,11 +104,7 @@ import dynamo.sglang
 import torch
 from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
 from dynamo.llm import WorkerType
-from dynamo.sglang import kv_hints
-from dynamo.sglang.state_agent import StateAgentLifecycle
 from kvcr import ZmqPeerControlChannel
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
-from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
 
 for line in Path('/opt/sglang-constraints.txt').read_text().splitlines():
     name, expected = line.split('==')
@@ -103,15 +113,41 @@ for line in Path('/opt/sglang-constraints.txt').read_text().splitlines():
     print(f'{name}=={actual}')
 assert torch.version.cuda == '13.0'
 assert KV_HINT_TRANSFER_CAPABILITY_KEY == 'router_hint'
-assert callable(KVCRStore.batch_get_v1)
-assert callable(HiCacheStorage.get_kv_hint_source)
-assert callable(StateAgentLifecycle.start)
 assert callable(ZmqPeerControlChannel)
+if os.environ['QS_MODE'] == 'hicache':
+    from dynamo.sglang import kv_hints
+    from dynamo.sglang.state_agent import StateAgentLifecycle
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+    from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+
+    assert callable(KVCRStore.batch_get_v1)
+    assert callable(HiCacheStorage.get_kv_hint_source)
+    assert callable(StateAgentLifecycle.start)
+else:
+    from dynamo.sglang.kv_hints import is_supported_kvcr_linker_topology
+    from dynamo.sglang.state_agent import state_agent_descriptors
+    from kvcr.hints.fetch import KV_FETCH
+    from kvcr.hints.parser import parse_hints
+    from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
+    from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import KVCRDirectLinker
+
+    assert callable(is_supported_kvcr_linker_topology) and callable(state_agent_descriptors)
+    assert KVCRDirectLinker.local_storage_ownership == 'kvcr'
+    hint = decode_kv_hints_envelope({
+        'protocol_version': '0.1', 'message_id': 'canary',
+        'actions': [{'action_id': 'fetch', 'action_type': 'kv.fetch',
+                     'action_version': '1.0', 'payload': {
+                         'source_control_endpoint': 'tcp://127.0.0.1:19500',
+                         'block_hashes': [1],
+                     }}],
+    })
+    parsed, rejected = parse_hints(hint, {'kv.fetch': KV_FETCH})
+    assert len(parsed) == 1 and not rejected
 assert metadata.version('ai-dynamo') == '1.7.0'
 assert metadata.version('ai-dynamo-runtime') == '1.7.0'
 kvcr_project = tomllib.loads(Path('/opt/kvcr-src/pyproject.toml').read_text())['project']
 assert metadata.version('kvcr') == kvcr_project['version']
-print('SGLang HiCache import/version checks passed; GPU verification still required')
+print(f"SGLang {os.environ['QS_MODE']} import/version checks passed; GPU verification still required")
 PY
 RUN python3 -m pip freeze --all > /opt/sglang-installed-packages.txt
 WORKDIR /workspace
