@@ -1,0 +1,287 @@
+diff --git a/src/plugins/ucx/meson.build b/src/plugins/ucx/meson.build
+--- a/src/plugins/ucx/meson.build
++++ b/src/plugins/ucx/meson.build
+@@ -35,6 +35,12 @@
+                             thread_dep,
+                             ucx_dep]
+ 
++ucx_backend_cpp_args = []
++if cuda_dep.found()
++    ucx_backend_dependencies += [cuda_dep]
++    ucx_backend_cpp_args += ['-DNIXL_UCX_HAVE_CUDA']
++endif
++
+ ucx_backend_include_directories = [nixl_inc_dirs,
+                                    utils_inc_dirs]
+ 
+@@ -43,6 +49,7 @@
+                ucx_backend_sources,
+                dependencies: ucx_backend_dependencies,
+                include_directories: ucx_backend_include_directories,
++               cpp_args: ucx_backend_cpp_args,
+                install: false,
+                name_prefix: 'libplugin_')  # Custom prefix for plugin libraries
+ else
+@@ -51,7 +58,7 @@
+                dependencies: ucx_backend_dependencies,
+                include_directories: ucx_backend_include_directories,
+                install: true,
+-               cpp_args : ['-fPIC'],
++               cpp_args : ucx_backend_cpp_args + ['-fPIC'],
+                name_prefix: 'libplugin_',  # Custom prefix for plugin libraries
+                install_dir: plugin_install_dir,
+                build_rpath: get_option('ucx_path') != '' ? get_option('ucx_path') + '/lib' : '',
+diff --git a/src/plugins/ucx/ucx_utils.cpp b/src/plugins/ucx/ucx_utils.cpp
+--- a/src/plugins/ucx/ucx_utils.cpp
++++ b/src/plugins/ucx/ucx_utils.cpp
+@@ -23,6 +23,10 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <limits>
++#if defined(NIXL_UCX_HAVE_CUDA)
++#include <cuda.h>
++#endif
+ 
+ #include <nixl_types.h>
+ 
+@@ -498,10 +502,6 @@
+       name_(name),
+       mnnvlOnly_(mnnvl_only) {
+ 
+-    if (mnnvlOnly_) {
+-        throw std::runtime_error("MNNVL FABRIC registration is not available in this source stage");
+-    }
+-
+     ucp_params_t ucp_params;
+     ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_MT_WORKERS_SHARED;
+     ucp_params.features = UCP_FEATURE_RMA | UCP_FEATURE_AMO32 | UCP_FEATURE_AMO64 | UCP_FEATURE_AM;
+@@ -700,8 +700,96 @@
+  * =========================================== */
+ 
+ 
++bool
++validate_mnnvl_fabric_range(const void *address, size_t length) {
++#if defined(NIXL_UCX_HAVE_CUDA) && CUDA_VERSION >= 12040
++    if (address == nullptr || length == 0) {
++        return false;
++    }
++    CUmemorytype memory_type = CU_MEMORYTYPE_HOST;
++    unsigned managed = 0;
++    int ordinal = -1;
++    unsigned long long allowed_handles = 0;
++    int legacy_capable = 0;
++    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
++        CU_POINTER_ATTRIBUTE_IS_MANAGED, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
++        CU_POINTER_ATTRIBUTE_ALLOWED_HANDLE_TYPES, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE};
++    void *values[] = {&memory_type, &managed, &ordinal, &allowed_handles, &legacy_capable};
++    const auto pointer = reinterpret_cast<CUdeviceptr>(address);
++    if (length - 1 > std::numeric_limits<CUdeviceptr>::max() - pointer) {
++        return false;
++    }
++    if (cuPointerGetAttributes(5, attributes, values, pointer) != CUDA_SUCCESS ||
++        memory_type != CU_MEMORYTYPE_DEVICE || managed || ordinal < 0 || legacy_capable ||
++        !(allowed_handles & CU_MEM_HANDLE_TYPE_FABRIC)) {
++        return false;
++    }
++    CUdevice device;
++    int fabric_supported = 0;
++    if (cuDeviceGet(&device, ordinal) != CUDA_SUCCESS ||
++        cuDeviceGetAttribute(&fabric_supported,
++            CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device) != CUDA_SUCCESS ||
++        !fabric_supported) {
++        return false;
++    }
++    CUcontext primary;
++    if (cuDevicePrimaryCtxRetain(&primary, device) != CUDA_SUCCESS) {
++        return false;
++    }
++    if (cuCtxPushCurrent(primary) != CUDA_SUCCESS) {
++        cuDevicePrimaryCtxRelease(device);
++        return false;
++    }
++    const bool valid = [&]() {
++        CUdeviceptr base = 0;
++        size_t extent = 0;
++        unsigned mapped = 0;
++        CUpointer_attribute range_attributes[] = {CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
++            CU_POINTER_ATTRIBUTE_MAPPING_SIZE, CU_POINTER_ATTRIBUTE_MAPPED};
++        void *range_values[] = {&base, &extent, &mapped};
++        if (cuPointerGetAttributes(3, range_attributes, range_values, pointer) != CUDA_SUCCESS ||
++            !mapped || pointer < base || length > extent || pointer - base > extent - length) {
++            return false;
++        }
++        // A reservation can span multiple mappings. Require both endpoints to
++        // resolve to the same retained physical VMM handle before accepting it.
++        CUmemGenericAllocationHandle first = 0, last = 0;
++        if (cuMemRetainAllocationHandle(&first, const_cast<void *>(address)) != CUDA_SUCCESS) {
++            return false;
++        }
++        if (cuMemRetainAllocationHandle(&last, reinterpret_cast<void *>(pointer + length - 1)) != CUDA_SUCCESS) {
++            cuMemRelease(first);
++            return false;
++        }
++        CUmemAllocationProp properties = {};
++        CUmemFabricHandle exported = {};
++        const bool physical = first == last &&
++            cuMemGetAllocationPropertiesFromHandle(&properties, first) == CUDA_SUCCESS &&
++            properties.type == CU_MEM_ALLOCATION_TYPE_PINNED &&
++            properties.location.type == CU_MEM_LOCATION_TYPE_DEVICE &&
++            (properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
++            cuMemExportToShareableHandle(&exported, first, CU_MEM_HANDLE_TYPE_FABRIC, 0) == CUDA_SUCCESS;
++        const auto release_last = cuMemRelease(last);
++        const auto release_first = cuMemRelease(first);
++        return physical && release_last == CUDA_SUCCESS && release_first == CUDA_SUCCESS;
++    }();
++    CUcontext popped = nullptr;
++    const auto pop_status = cuCtxPopCurrent(&popped);
++    const auto release_status = cuDevicePrimaryCtxRelease(device);
++    return valid && pop_status == CUDA_SUCCESS && popped == primary && release_status == CUDA_SUCCESS;
++#else
++    // A CPU-only or pre-FABRIC build must never accept a claimed MNNVL buffer.
++    return false;
++#endif
++}
++
+ int
+ nixlUcxContext::memReg(void *addr, size_t size, nixlUcxMem &mem, nixl_mem_t nixl_mem_type) {
++    if (mnnvlOnly_ && nixl_mem_type == nixl_mem_t::VRAM_SEG &&
++        !validate_mnnvl_fabric_range(addr, size)) {
++        NIXL_ERROR << "MNNVL VRAM registration requires a bounded physical FABRIC VMM allocation";
++        return -1;
++    }
+     mem.base = addr;
+     mem.size = size;
+ 
+@@ -728,7 +816,8 @@
+             return -1;
+         }
+ 
+-        if (attr.mem_type == UCS_MEMORY_TYPE_HOST) {
++        if (attr.mem_type == UCS_MEMORY_TYPE_HOST ||
++            (mnnvlOnly_ && attr.mem_type != UCS_MEMORY_TYPE_CUDA)) {
+             NIXL_ERROR << *this
+                        << ": VRAM memory is detected as host by UCX. "
+                           "UCX is likely not configured with CUDA/ROCm support. "
+diff --git a/src/plugins/ucx/ucx_utils.h b/src/plugins/ucx/ucx_utils.h
+--- a/src/plugins/ucx/ucx_utils.h
++++ b/src/plugins/ucx/ucx_utils.h
+@@ -300,4 +300,8 @@
+ [[nodiscard]] bool
+ resolve_ucx_mnnvl_only(const nixl_b_params_t *params);
+ 
++// Physical DEVICE + FABRIC VMM allocation validation; no payload is read.
++[[nodiscard]] bool
++validate_mnnvl_fabric_range(const void *address, size_t length);
++
+ #endif
+diff --git a/test/gtest/hw_warning_test.cpp b/test/gtest/hw_warning_test.cpp
+--- a/test/gtest/hw_warning_test.cpp
++++ b/test/gtest/hw_warning_test.cpp
+@@ -20,6 +20,10 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <limits>
++#if defined(HAVE_CUDA)
++#include <cuda.h>
++#endif
+ 
+ #include "absl/strings/str_join.h"
+ #include "common.h"
+@@ -366,10 +370,88 @@
+     EXPECT_EQ(resolve_ucx_error_handling_mode(nullptr), UCP_ERR_HANDLING_MODE_NONE);
+ }
+ 
+-TEST(UcxMnnvlOnlyValidation, RejectsConstructionUntilFabricRegistration) {
+-    EXPECT_THROW(
+-        nixlUcxContext(std::vector<std::string>{}, false, 1,
+-                       nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE, 0, "", "", true,
+-                       "cuda_ipc,tcp,self"),
+-        std::runtime_error);
+-}
++TEST(UcxMnnvlOnlyRegistration, RejectsNullHostInvalidAndOverflowRanges) {
++    int host = 0;
++    EXPECT_FALSE(validate_mnnvl_fabric_range(nullptr, 4096));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(&host, sizeof(host)));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(1), 1));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(1), 0));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(4096),
++                                             std::numeric_limits<size_t>::max()));
++}
++
++#if defined(HAVE_CUDA) && CUDA_VERSION >= 12040
++namespace {
++struct MnnvlFabricTestAllocation {
++    CUdeviceptr address = 0;
++    CUmemGenericAllocationHandle handle = 0;
++    size_t bytes = 0;
++    bool mapped = false;
++    ~MnnvlFabricTestAllocation() {
++        if (mapped) cuMemUnmap(address, bytes);
++        if (address) cuMemAddressFree(address, bytes);
++        if (handle) cuMemRelease(handle);
++    }
++    CUresult allocate() {
++        CUdevice device;
++        CUresult status = cuCtxGetDevice(&device);
++        if (status != CUDA_SUCCESS) return status;
++        CUmemAllocationProp prop = {};
++        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        prop.location.id = device;
++        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
++        status = cuMemGetAllocationGranularity(&bytes, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
++        if (status != CUDA_SUCCESS) return status;
++        status = cuMemCreate(&handle, bytes, &prop, 0);
++        if (status != CUDA_SUCCESS) return status;
++        status = cuMemAddressReserve(&address, bytes, 0, 0, 0);
++        if (status != CUDA_SUCCESS) return status;
++        status = cuMemMap(address, bytes, 0, handle, 0);
++        if (status != CUDA_SUCCESS) return status;
++        mapped = true;
++        CUmemAccessDesc access = {};
++        access.location = prop.location;
++        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        return cuMemSetAccess(address, bytes, &access, 1);
++    }
++};
++}
++
++TEST(UcxMnnvlOnlyRegistration, RealFabricVmmInteriorExtentAndLegacyNegative) {
++    int count = 0;
++    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
++        GTEST_SKIP() << "Actual CUDA GPU required";
++    }
++    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
++    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
++    MnnvlFabricTestAllocation allocation;
++    const auto status = allocation.allocate();
++    if (status == CUDA_ERROR_NOT_SUPPORTED || status == CUDA_ERROR_NOT_PERMITTED) {
++        GTEST_SKIP() << "Actual FABRIC allocation/IMEX permission unavailable";
++    }
++    ASSERT_EQ(status, CUDA_SUCCESS);
++    CUdeviceptr observed_base = 0;
++    size_t observed_extent = 0;
++    unsigned mapped = 0;
++    CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
++        CU_POINTER_ATTRIBUTE_MAPPING_SIZE, CU_POINTER_ATTRIBUTE_MAPPED};
++    void *values[] = {&observed_base, &observed_extent, &mapped};
++    ASSERT_EQ(cuPointerGetAttributes(3, attrs, values, allocation.address), CUDA_SUCCESS);
++    EXPECT_TRUE(mapped);
++    EXPECT_EQ(observed_base, allocation.address);
++    EXPECT_EQ(observed_extent, allocation.bytes);
++    EXPECT_TRUE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address), allocation.bytes));
++    EXPECT_TRUE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address + 17), 100));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address + 17), allocation.bytes));
++    EXPECT_FALSE(validate_mnnvl_fabric_range(reinterpret_cast<void *>(allocation.address), allocation.bytes + 1));
++    void *legacy = nullptr;
++    ASSERT_EQ(cudaMalloc(&legacy, 4096), cudaSuccess);
++    EXPECT_FALSE(validate_mnnvl_fabric_range(legacy, 4096));
++    EXPECT_EQ(cudaFree(legacy), cudaSuccess);
++    void *managed = nullptr;
++    ASSERT_EQ(cudaMallocManaged(&managed, 4096), cudaSuccess);
++    EXPECT_FALSE(validate_mnnvl_fabric_range(managed, 4096));
++    EXPECT_EQ(cudaFree(managed), cudaSuccess);
++}
++#endif

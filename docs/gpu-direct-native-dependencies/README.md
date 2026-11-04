@@ -21,13 +21,62 @@ or native binaries.
 its Apache-2.0 license; UCX changes retain the upstream BSD license in
 [UCX-LICENSE.txt](UCX-LICENSE.txt). No third-party runtime library is bundled.
 
-## Ordered MNNVL source patches
+The MNNVL profile adds [nixl-mnnvl-policy.patch](nixl-mnnvl-policy.patch), followed by
+[nixl-mnnvl-registration.patch](nixl-mnnvl-registration.patch), after the
+existing NIXL patch and
+[ucx-mnnvl-fabric-detection.patch](ucx-mnnvl-fabric-detection.patch) after the
+existing UCX patch. [mnnvl-source-lock.json](mnnvl-source-lock.json) records the
+additional hashes and apply order against the same public bases. The original
+CUDA IPC patch and lock remain unchanged.
 
-Apply [nixl-mnnvl-policy.patch](nixl-mnnvl-policy.patch) after the IPC patch.
-[mnnvl-source-lock.json](mnnvl-source-lock.json) pins the exact order and hashes.
-This first stage exposes and tests closed per-backend options but explicitly
-rejects MNNVL context construction: FABRIC registration is not present yet.
-Ordinary and same-host CUDA IPC profiles retain their existing behavior.
+## MNNVL backend policy
+
+Create the dedicated UCX backend with `gpu_direct_transport="mnnvl"`,
+`gpu_direct_ucx_tls="cuda_ipc,tcp,self"` and `ucx_error_handling_mode="none"`.
+Both new parameters default to empty for ordinary backends. Actual backend
+parameter readback must report the selected policy before VRAM registration.
+The native MNNVL constructor forces these settings on its own UCP configuration:
+
+| UCP setting | Value |
+| --- | --- |
+| TLS | cuda_ipc,tcp,self |
+| CUDA_IPC_ENABLE_MNNVL | y |
+| CUDA_IPC_GPU_DIRECT_FABRIC_ONLY | y |
+| PROTO_ENABLE | y |
+| PROTO_EMULATION_ENABLE | n |
+| TCP_PUT_ENABLE | n |
+
+TCP retains active-message control, while its native PUT capability and UCP's
+software PUT/GET protocols are disabled. Only `cuda_ipc` supplies native CUDA
+RMA in this closed transport set. Missing settings, unsupported fabric or an
+unavailable route fail instead of enabling another GPU payload transport.
+These settings do not mutate the process environment or ordinary P-to-D contexts.
+
+MNNVL VRAM registrations must cover bounded physical DEVICE VMM allocations
+created with CUDA FABRIC handles. Native checks reject legacy, managed, host and
+out-of-bounds memory. The new per-MD FABRIC-only detector is default-off, so the
+existing CUDA IPC detector retains its legacy-allocation rules even on MNNVL
+hardware. Existing UCX FABRIC handle export, import, remote mapping and completion
+are reused. A matching NVML fabric UUID/clique and an allocated common IMEX
+channel are required; actual cross-host export/import must still succeed.
+
+The NIXL plugin's new registration checks link the existing CUDA dependency.
+Build with CUDA 12.4 or later. Rebuild the complete CUDA IPC module against the
+modified private MD/config headers; its private struct layout changes. Record
+actual source and loaded-library hashes rather than assuming binary identity
+from an unchanged version string. These are experimental dependency patches,
+not stock NIXL/UCX functionality supplied by the KVCR wheel.
+
+Run the added native parameter, real FABRIC registration and default-versus-strict
+MD tests on allocated hardware. Then require a two-host KVCR full-byte test with
+distinct GPUs in one observed fabric, a job-reserved IMEX channel, untouched
+guards, native pin/quiescence checks and an isolated CUDA activity review. A
+same-host test or skipped hardware case cannot qualify cross-host MNNVL. Model
+correctness and serving performance require their own complete runs.
+
+The policy patch rejects MNNVL construction until the registration patch
+removes that fence. Apply the complete ordered list before native qualification;
+the two patches compose to the original fully guarded native implementation.
 
 ## Native behavior
 
