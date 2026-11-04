@@ -124,7 +124,15 @@ isolated IPC-only qualification. It does not replace validation of the actual
 installed libraries or qualify a different transport profile.
 
 Run the added NIXL option/TLS tests and UCX CUDA IPC memory-domain tests on the
-native build. Require actual VRAM registration, explicit native source and
-loaded-library identities, full-byte transfer and quiescent close before
-qualification. Native construction and model/performance validation are
-separate results; preserve failures and workload identity for each.
+native build. Before a model test, require actual VRAM registration, ordinary
+eager SDK construction without an explicit endpoint override, and the
+[two-peer KVCR byte test](../../tests/integration/gpu_direct_roundtrip.py).
+Verify full payload and untouched guard rows, pin lifetime and quiescent close.
+Independently review CUDA activity over the payload window: peer-copy bytes
+must cover the expected payload, with no host staging. An empty trace, endpoint
+label, successful constructor or source-only test does not establish that claim.
+Separate-container GPU exposure requires an additional deployment test.
+
+Native construction, isolated transport qualification, full model correctness
+and end-to-end performance are separate results. Preserve the exact source,
+library hashes, workload and failed attempts for each.

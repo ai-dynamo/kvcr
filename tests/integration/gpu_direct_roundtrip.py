@@ -8,6 +8,8 @@ return to the host. A byte PASS alone is not hidden-host-staging trace proof.
 """
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import multiprocessing as mp
 import os
@@ -41,6 +43,21 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def verify_source(manifest):
+    expected = json.loads(Path(manifest).read_text())["package_entries_sha256"]
+    spec = importlib.util.find_spec("kvcr")
+    assert spec is not None and spec.origin is not None
+    package = Path(spec.origin).resolve().parent
+    actual = {
+        "src/kvcr/" + p.relative_to(package).as_posix(): hashlib.sha256(
+            p.read_bytes()
+        ).hexdigest()
+        for p in package.rglob("*.py")
+    }
+    assert actual == expected, (
+        "Actual imported KVCR source differs from external manifest"
+    )
+    return {"package": str(package), "package_entries_sha256": actual}
 
 
 class Stats:
@@ -96,6 +113,28 @@ def gpu_identity(device):
     }
 
 
+def mapped_libraries():
+    paths = set()
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if (
+            len(fields) == 6
+            and fields[5].startswith("/")
+            and any(
+                token in fields[5]
+                for token in (
+                    "libplugin_UCX",
+                    "libucp",
+                    "libucs",
+                    "libnixl",
+                    "libserdes",
+                    "_bindings",
+                )
+            )
+        ):
+            paths.add(fields[5])
+    assert len([p for p in paths if "libplugin_UCX" in p]) == 1
+    return {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in sorted(paths)}
 
 
 def _peer(
@@ -108,6 +147,8 @@ def _peer(
     domain,
     run_id,
     output,
+    manifest,
+    profile_enabled,
     ready,
     stop,
     channel,
@@ -115,10 +156,40 @@ def _peer(
     output = Path(output)
     kvcr = None
     bank = None
+    profiler = None
+    profile_range = None
+    profile_info = {"requested": profile_enabled, "trace_qualified": False}
+    nvtx_active = False
+
+    def stop_profile():
+        nonlocal profiler, profile_range, nvtx_active
+        if profiler is None:
+            return
+        if nvtx_active:
+            torch.cuda.nvtx.range_pop()
+            nvtx_active = False
+        if profile_range is not None:
+            profile_range.__exit__(None, None, None)
+            profile_range = None
+        captured = profiler
+        profiler = None
+        captured.stop()
+        profile_end_ns = time.time_ns()
+        trace = output / f"{role}.cuda-trace.json"
+        captured.export_chrome_trace(str(trace))
+        profile_info.update(
+            {
+                "status": "TRACE_CAPTURED_UNREVIEWED",
+                "end_unix_ns": profile_end_ns,
+                "trace_file": trace.name,
+                "trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
+            }
+        )
 
     try:
         assert os.environ.get("UCX_TLS") == "cuda_ipc,posix,self"
         assert os.environ.get("NIXL_UCX_CUDA_IPC_ONLY") == "1"
+        source_proof = verify_source(manifest)
         import torch
 
         from kvcr import KVCR, KVCRBindings
@@ -234,8 +305,50 @@ def _peer(
             "device": device,
             "device_name": torch.cuda.get_device_name(device),
             "torch_version": torch.__version__,
+            "source": source_proof,
+            "registration": {
+                "memory_type": region.mem_type,
+                "device_Id": region.device_Id,
+                "address": region.addr,
+                "stride": region.stride,
+                "count": region.count,
+                "element_bytes": region.size,
+            },
+            "configured_cpu_or_disk_payload_pools": 0,
+            "gpu_pattern": "mixed32-position-key-v1",
+            "UCX_TLS": os.environ["UCX_TLS"],
+            "NIXL_UCX_CUDA_IPC_ONLY": "1",
+            "NIXL_PLUGIN_DIR": os.environ.get("NIXL_PLUGIN_DIR"),
         }
         proof["physical_device"] = physical_device
+        proof["native_libraries"] = mapped_libraries()
+        proof["profile"] = profile_info
+        if profile_enabled:
+            assert (
+                torch.profiler.ProfilerActivity.CUDA
+                in torch.profiler.supported_activities()
+            ), "CUDA profiler activity unsupported"
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            profiler.start()
+            profile_info["start_unix_ns"] = time.time_ns()
+            profile_range = torch.profiler.record_function(
+                f"KVCR_GPU_{role}_PAYLOAD_WINDOW"
+            )
+            profile_range.__enter__()
+            try:
+                torch.cuda.nvtx.range_push(f"KVCR_GPU_{role}_PAYLOAD_WINDOW")
+                nvtx_active = True
+                profile_info["nvtx_range_pushed"] = True
+            except RuntimeError:
+                profile_info["nvtx_range_pushed"] = False
         write(output / f"{role}.ready.json", proof)
         ready.set()
         deadline = time.monotonic() + (240 if role == "source" else 150)
@@ -279,6 +392,7 @@ def _peer(
                 e.success for e in result[0][1].values()
             )
             torch.cuda.synchronize(device)
+            stop_profile()  # Exclude verification scalar DtoH copies.
             mismatch_by_key = {
                 str(i): int(torch.count_nonzero(bank[slot] != pattern(i)).item())
                 for i, slot in enumerate(TARGET_SLOTS)
@@ -308,6 +422,7 @@ def _peer(
                 "pin"
             ]
             assert not kvcr._core._framework_pin_keys
+            stop_profile()  # Native source work and pin release have completed.
             proof.update(
                 {
                     "source_slots": SOURCE_SLOTS,
@@ -336,6 +451,14 @@ def _peer(
         write(output / f"{role}.failure.json", error)
         channel.send(error)
     finally:
+        if profiler is not None:
+            try:
+                stop_profile()
+            except BaseException:
+                write(
+                    output / f"{role}.profile-failure.json",
+                    {"traceback": traceback.format_exc()},
+                )
         if kvcr is not None:
             try:
                 kvcr.close()
@@ -352,12 +475,18 @@ def _peer(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-manifest", type=Path, required=True)
     parser.add_argument("--source-device", type=int, default=0)
     parser.add_argument("--target-device", type=int, default=1)
     parser.add_argument(
         "--row-bytes", type=int, choices=(9437184, 17694720), required=True
     )
     parser.add_argument("--port-base", type=int, default=28340)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Capture child CUDA activity; independent trace review required",
+    )
     args = parser.parse_args()
     assert args.source_device != args.target_device
     args.output.mkdir(parents=True, exist_ok=False)
@@ -392,6 +521,8 @@ def main():
                     domain,
                     run_id,
                     str(args.output.resolve()),
+                    str(args.source_manifest.resolve()),
+                    args.profile,
                     ready[i],
                     stop,
                     child,
@@ -439,6 +570,7 @@ def main():
                 "source_device": args.source_device,
                 "target_device": args.target_device,
                 "physical_devices": physical,
+                "profile_requested": args.profile,
                 "verification": "FULL_BYTE_GPU_ORACLE_NO_HOST_PAYLOAD_DUMP",
                 "physical_no_host_staging_trace_qualified": False,
                 "limits": (
