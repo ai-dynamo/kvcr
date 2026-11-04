@@ -52,7 +52,15 @@ from phase1.common import (  # noqa: E402
     write_junit,
 )
 from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
-from phase1.stack import GUARD, MODES, Settings, Stack  # noqa: E402
+from phase1.stack import (  # noqa: E402
+    ENGINES,
+    GUARD,
+    MODES,
+    NON_GUARD,
+    SGLANG,
+    Settings,
+    Stack,
+)
 
 CASES.update(PERF_CASES)
 PERF_CASE_NAMES = set(PERF_CASES)
@@ -119,6 +127,11 @@ class Runner:
             model=args.model,
             output=self.output,
             mode=args.mode,
+            engine=args.engine,
+            sglang_verify_bytes=args.sglang_verify_bytes,
+            worker_env=dict(
+                item.split("=", 1) for item in args.worker_env if "=" in item
+            ),
             topology=args.topology,
             gpus=tuple(args.gpus),
             http_port=args.http_port,
@@ -181,6 +194,9 @@ class Runner:
                 "tc02_seed_prefix": args.tc02_seed_prefix,
             },
             "worker_args": list(args.worker_arg),
+            "engine": args.engine,
+            "sglang_verify_bytes": args.sglang_verify_bytes,
+            "worker_env": sorted(args.worker_env),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
             "topology": (
@@ -429,8 +445,10 @@ class Runner:
         if self.settings.mode == GUARD:
             for index in (0, 1):
                 stack.start_service(index)
-            if stack.uses_state_agent():
-                stack.start_state_agent()
+        if stack.uses_state_agent():
+            # Guard mode (vLLM) and every SGLang run: the SGLang backend waits
+            # for a live KV state-agent host at startup.
+            stack.start_state_agent()
         stack.start_frontend(self.settings.http_port)
         if stack.disagg:
             # The frontend lists the model only once a prefill worker is
@@ -573,6 +591,27 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--mode", choices=MODES, default=GUARD)
+    parser.add_argument(
+        "--sglang-verify-bytes",
+        action="store_true",
+        help="SGLang engine: enable the backend's verify_transfer_bytes digests "
+        "(functional evidence; adds ~2 ms/MB to every delivery)",
+    )
+    parser.add_argument(
+        "--worker-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra environment for every worker process, repeatable",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=ENGINES,
+        default="vllm",
+        help="vllm: dynamo.vllm + OffloadingConnector KVCR tier; sglang: "
+        "dynamo.sglang + HiCache KVCR storage backend (no Guard: --mode nonguard, "
+        "TC-01..03 and TC-05 only)",
+    )
     parser.add_argument(
         "--gpus",
         default="0,1",
@@ -791,6 +830,18 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             f"{args.topology}"
         )
     args.gpus = [int(part) for part in gpus]
+    if args.engine == SGLANG:
+        # KVCR runs inside the SGLang worker: no Guard service, no sidecars,
+        # no disaggregated layout, so the Guard cases cannot run.
+        if args.mode != NON_GUARD:
+            parser.error("--engine sglang needs --mode nonguard (no Guard service)")
+        if args.topology != "agg" or args.external_services or args.remote_worker:
+            parser.error("--engine sglang supports only --topology agg on one node")
+        unsupported = {"TC-04", "TC-06"} & set(args.cases.split(","))
+        if unsupported:
+            parser.error(
+                f"--engine sglang cannot run {sorted(unsupported)} (Guard cases)"
+            )
     if args.topology == "disagg" and args.external_services is None:
         parser.error(
             "--topology disagg needs --external-services (kvcr_service sidecars)"

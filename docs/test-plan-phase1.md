@@ -471,3 +471,47 @@ runs, so the reference stability check fails regardless of `--perf-max-tokens`.
 Hybrid TC-05/06 therefore have no result on this nightly; the options are to wait
 for the CUDA-graph fix (then batch invariance is still unavailable for GDN) or to
 let the harness swap an unstable perf prompt for a salted one.
+
+## SGLang HiCache engine (2026-11-04)
+
+`--engine sglang` runs the same cases against `dynamo.sglang` with HiCache and the
+KVCR storage backend (sgl-project/sglang#45647, preview; image from
+`Dockerfile.quick-start-sglang`, `QS_MODE=hicache`). KVCR runs inside the worker,
+so there is no Guard service: `--mode nonguard` is required, TC-04/TC-06 and
+`--topology disagg` are rejected, and the KV state agent always runs (the backend
+waits for a live V2 state-agent host at startup). Worker flags follow the
+quick start (`page_first`, `write_through`, prefetch `wait_complete`, page 64,
+`publish_inventory`, `enable_remote_hint`, `diagnostic_telemetry`); the
+reference engine is the same `dynamo.sglang` without HiCache.
+
+Engine differences the harness absorbs:
+
+- Telemetry: the backend logs `KVCR L3 native stats {json}` every 5 s
+  (epoch-stamped interval samples whose keys are `[kind, name, labels, field]`
+  tuples); `telemetry.py` maps them onto the vLLM metric names. KVCR counts
+  bytes for `local_fill` and `source_write` but only blocks for
+  `remote_deliver`/`local_deliver`, so the target's read bytes are derived as
+  delivered blocks × bytes per page taken from the worker's own `local_fill`
+  (every page of a model has one size; 7,340,032 B for Qwen3-0.6B).
+- Determinism: SGLang is not batch-invariant by default (Qwen3-0.6B diverged at
+  token 11 between two bare runs). `--batch-invariant` maps to
+  `--enable-deterministic-inference`, which with the radix cache requires
+  `--attention-backend fa3` (fa3/fa4/triton); otherwise `trtllm_mha`.
+- Geometry: 64-token pages, last page recomputed, so hits are `(n − 1) // 64`
+  blocks exactly as for vLLM's block 64.
+
+| Run (dev-02, 2×H100, `sgl-hicache-dd5df02c076d`) | Verdict | cold / local / remote TTFT p50 |
+| --- | --- | --- |
+| `sgl-smoke4-06b` Qwen3-0.6B | TC-01/02/03/05 PASS (134 checks) | 110 / 102 / 604 ms |
+| `sgl-dense8b` Qwen3-8B | TC-01/02/03/05 PASS | 146 / 129 / 692 ms |
+
+Observation for the SGLang side: the hinted remote hit costs about five times
+the cold prefill on both models (vLLM: 143 ms vs 87 ms cold on Qwen3-8B). The
+transfer itself is small (0.25 s for 50 pages); the rest is HiCache's
+`wait_complete` prefetch and the two-hop KVCR → host page → GPU restore.
+Delivered pages are exact (`remote_deliver == source_write`), byte digests
+verified by the backend (`verify_transfer_bytes`).
+
+Not covered on SGLang: Guard (TC-04/06), 2P+1D, two nodes, hybrid models
+(HiCache + GDN untested), the direct-device linker (`QS_MODE=linker`, kvcr#129),
+and a CI lane (the upstream runner image is vLLM-based).

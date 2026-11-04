@@ -46,6 +46,9 @@ from .common import (
 
 GUARD = "guard"
 NON_GUARD = "nonguard"
+VLLM = "vllm"
+SGLANG = "sglang"
+ENGINES = (VLLM, SGLANG)
 DISABLED = "disabled"
 MODES = (GUARD, NON_GUARD)
 MIN_GUARD_KERNEL = (6, 5)
@@ -104,6 +107,21 @@ class Settings:
     model: str
     output: Path
     mode: str = GUARD
+    # "vllm": dynamo.vllm with the OffloadingConnector KVCR tier (Guard or
+    # non-Guard). "sglang": dynamo.sglang with HiCache and the KVCR storage
+    # backend (sgl-project/sglang#45647); KVCR runs inside the worker, so no
+    # Guard, no sidecars, TC-01..03 and TC-05 only.
+    engine: str = "vllm"
+    # KVCR NIXL listen ports of the SGLang workers (vLLM's tier picks its own).
+    kvcr_nixl_ports: tuple[int, ...] = (18771, 18772, 18773)
+    # HiCache host staging per SGLang worker, GiB.
+    hicache_gb: int = 2
+    # SGLang backend's verify_transfer_bytes: blake2b over every delivered byte
+    # on the request path (~360 ms for 183 MB). Functional evidence, not for
+    # latency arms; off by default.
+    sglang_verify_bytes: bool = False
+    # Extra environment for every worker process (engine experiments).
+    worker_env: dict[str, str] = field(default_factory=dict)
     # "agg": two decode workers, worker 0 KVCR source, worker 1 target.
     # "disagg": 2P+1D on three GPUs: workers 0/1 are prefill workers (KVCR
     # source/target, the P->D hop uses NixlConnector), worker 2 is the single
@@ -116,6 +134,7 @@ class Settings:
     event_ports: tuple[int, ...] = (20081, 20082, 20083)
     system_ports: tuple[int, ...] = (9091, 9092, 9093)
     nixl_side_channel_ports: tuple[int, ...] = (5601, 5602, 5603)
+    sglang_ports: tuple[int, ...] = (24010, 24011, 24012)
     pool_gb: int = 2
     g2_slots: int = 256
     cpu_bytes_to_use: int = 2_000_000_000
@@ -572,6 +591,10 @@ class Stack:
         return str(self._remote_info[index]["ip"])
 
     def uses_state_agent(self) -> bool:
+        if self.settings.engine == SGLANG:
+            # The SGLang backend publishes KVCR-owned inventory only through
+            # Dynamo's KV state-agent host.
+            return self.settings.state_agent
         return self.settings.mode == GUARD and self.settings.state_agent
 
     def transfer_config(self, index: int) -> dict[str, Any]:
@@ -665,7 +688,110 @@ class Stack:
             "enable_kv_cache_events": True,
         }
 
+    def sglang_kvcr_config(self, index: int) -> dict[str, Any]:
+        """``--hicache-storage-backend-extra-config`` for worker[index].
+
+        Mirrors KVCR's SGLang quick start: KVCR DRAM inside the worker, remote
+        hints on, prefix keys passed to the storage layer, diagnostic telemetry
+        on so the worker logs the ``KVCR L3 native stats`` lines the cases read.
+        The control address must be routable (the backend rejects loopback).
+        """
+        return {
+            "publish_inventory": True,
+            "control_advertise_host": self.advertise_host(),
+            "control_port": self.settings.control_ports[index],
+            "nixl_listen_port": self.settings.kvcr_nixl_ports[index],
+            "local_dram_bytes": self.settings.pool_gb << 30,
+            "enable_remote_hint": True,
+            "hicache_storage_pass_prefix_keys": True,
+            "align_storage_prefix": True,
+            "combine_page_reads": True,
+            "combine_page_writes": True,
+            "diagnostic_telemetry": True,
+            "verify_transfer_bytes": self.settings.sglang_verify_bytes,
+            "startup_timeout_seconds": 300,
+            "operation_timeout_ms": 20000,
+            "abandon_timeout_ms": 60000,
+        }
+
+    def sglang_worker_command(self, index: int, *, kvcr: bool) -> list[str]:
+        command = [
+            sys.executable,
+            "-m",
+            "dynamo.sglang",
+            "--model-path",
+            self.settings.model,
+            "--served-model-name",
+            self.settings.model,
+            "--tp-size",
+            "1",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.settings.sglang_ports[index]),
+            "--dtype",
+            "bfloat16",
+            # Deterministic inference with the radix cache needs fa3/fa4/triton
+            # (SGLang RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND); the
+            # quick start's trtllm_mha stays the default otherwise.
+            "--attention-backend",
+            "fa3" if self.settings.batch_invariant else "trtllm_mha",
+            "--context-length",
+            str(min(self.settings.max_model_len, 8192)),
+            "--max-total-tokens",
+            str(min(self.settings.max_model_len, 8192)),
+            "--chunked-prefill-size",
+            str(min(self.settings.max_model_len, 8192)),
+            "--max-running-requests",
+            "4",
+            "--page-size",
+            str(BLOCK_SIZE),
+            "--mem-fraction-static",
+            str(self.settings.gpu_memory_utilization),
+            "--disable-cuda-graph",
+            "--disable-piecewise-cuda-graph",
+            "--incremental-streaming-output",
+            "--enable-metrics",
+            # SGLang's batch-invariant mode; the token comparison against the
+            # reference needs it (a bare Qwen3-0.6B diverged at token 11
+            # between two identical runs without it).
+            *(
+                ["--enable-deterministic-inference"]
+                if self.settings.batch_invariant
+                else []
+            ),
+            *self.settings.extra_worker_args,
+        ]
+        if kvcr:
+            command += [
+                "--enable-hierarchical-cache",
+                "--hicache-size",
+                str(self.settings.hicache_gb),
+                "--hicache-mem-layout",
+                "page_first",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-backend",
+                "kvcr",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+                "--hicache-storage-backend-extra-config",
+                json.dumps(self.sglang_kvcr_config(index)),
+                "--kv-events-config",
+                json.dumps(
+                    {
+                        "publisher": "zmq",
+                        "format": "dynamo",
+                        "topic": "",
+                        "endpoint": f"tcp://*:{self.settings.event_ports[index]}",
+                    }
+                ),
+            ]
+        return command
+
     def worker_command(self, index: int, *, kvcr: bool) -> list[str]:
+        if self.settings.engine == SGLANG:
+            return self.sglang_worker_command(index, kvcr=kvcr)
         command = [
             sys.executable,
             "-m",
@@ -850,6 +976,7 @@ class Stack:
 
     def start_worker(self, index: int, *, kvcr: bool = True, tag: str = "") -> Managed:
         env = self.base_env()
+        env.update(self.settings.worker_env)
         env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpus[index])
         env["VLLM_LOGGING_LEVEL"] = "DEBUG"
         env["DYN_SYSTEM_PORT"] = str(self.settings.system_ports[index])
@@ -861,10 +988,18 @@ class Stack:
                 self.settings.nixl_side_channel_ports[index]
             )
         name = f"worker-{index}{tag}"
-        save_json(
-            self.evidence / f"{name}.kv-transfer-config.json",
-            self.transfer_config(index) if kvcr else None,
-        )
+        if self.settings.engine == SGLANG:
+            env["PROMETHEUS_MULTIPROC_DIR"] = str(self.evidence / f"{name}.prometheus")
+            Path(env["PROMETHEUS_MULTIPROC_DIR"]).mkdir(parents=True, exist_ok=True)
+            save_json(
+                self.evidence / f"{name}.kvcr-config.json",
+                self.sglang_kvcr_config(index) if kvcr else None,
+            )
+        else:
+            save_json(
+                self.evidence / f"{name}.kv-transfer-config.json",
+                self.transfer_config(index) if kvcr else None,
+            )
         agent = self.remote_agent(index)
         if agent is not None:
             host = self.worker_host(index)
