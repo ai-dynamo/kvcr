@@ -358,12 +358,12 @@ Precompiled vLLM artifacts must be compatible with the checkout. A customized br
 
 ### Verify a shared integration environment
 
-Run the following after Dynamo, vLLM, and KVCR are all installed. The first command should print frontend help and exit successfully; the remaining checks record import paths and native-package versions:
+Run the following after Dynamo, vLLM, and KVCR are all installed. The first command should print frontend help and exit successfully; the remaining checks record import paths and native-package versions. `-P` keeps the workspace's `vllm/` checkout directory from shadowing the editable install as a namespace package:
 
 ```bash
 python -m dynamo.frontend --help
 
-python - <<'PY'
+python -P - <<'PY'
 from pathlib import Path
 import importlib
 import importlib.metadata as metadata
