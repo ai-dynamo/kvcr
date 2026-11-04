@@ -21,6 +21,14 @@ or native binaries.
 its Apache-2.0 license; UCX changes retain the upstream BSD license in
 [UCX-LICENSE.txt](UCX-LICENSE.txt). No third-party runtime library is bundled.
 
+## Ordered MNNVL source patches
+
+Apply [nixl-mnnvl-policy.patch](nixl-mnnvl-policy.patch) after the IPC patch.
+[mnnvl-source-lock.json](mnnvl-source-lock.json) pins the exact order and hashes.
+This first stage exposes and tests closed per-backend options but explicitly
+rejects MNNVL context construction: FABRIC registration is not present yet.
+Ordinary and same-host CUDA IPC profiles retain their existing behavior.
+
 ## Native behavior
 
 With `NIXL_UCX_CUDA_IPC_ONLY=1`, NIXL requires an explicit `UCX_TLS` containing
