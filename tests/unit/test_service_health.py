@@ -3,6 +3,7 @@
 
 import functools
 import http.client
+import mmap
 import select
 import signal
 import socket
@@ -226,7 +227,7 @@ def test_service_health_startup_and_cleanup(tmp_path, outcome):
         )
         with subprocess.Popen(
             [sys.executable, "-c", bootstrap, str(Path(__file__).parent)]
-            + _service_args(str(8192 / (1 << 30)))
+            + _service_args(str(2 * mmap.PAGESIZE / (1 << 30)))
             + [
                 "--pool-dir",
                 str(pool_dir),

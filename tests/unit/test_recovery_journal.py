@@ -376,6 +376,9 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(
             assert snapshot is not None
             # The snapshot's byte count excludes alignment padding after the pool.
             assert written[-1].args == (pool._spec.pool_id, len(snapshot))
+            snapshot_offset = path.stat().st_size - len(snapshot)
+            assert snapshot_offset >= pool._spec.mapping_bytes
+            assert snapshot_offset % mmap.ALLOCATIONGRANULARITY == 0
         # Inside the pool file, so it has no name of its own to be found under.
         assert set(tmp_path.iterdir()) == {path}
         assert path.stat().st_size > pool._spec.mapping_bytes
