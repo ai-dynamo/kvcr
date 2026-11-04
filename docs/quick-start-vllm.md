@@ -32,7 +32,7 @@ The repository includes [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-
 
 ```bash
 export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-export KVCR_VLLM_REF=fed7de909f894fbee0c45130376aed2e2c9bf0d3
+export KVCR_VLLM_REF=a5db4c9ff58a0ec4dc20594ba5cea9f776dcd693
 
 DOCKER_BUILDKIT=1 docker build \
   --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \

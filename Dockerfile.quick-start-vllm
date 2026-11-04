@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG VLLM_IMAGE=vllm/vllm-openai:nightly-edad8b03c5285a1c12e7e4f83c1af709b319a01b@sha256:2e735ffeef26457f8a3ff44a62ae182870b10af37adc06ecbb08baca152365c6
+ARG VLLM_IMAGE=vllm/vllm-openai:nightly-40941f2c4ba96fba0a7e282a5355e89cd74d9ac5@sha256:298b8765981d9dabda0da1504487bcdca876d5c18e8533455b3fda65ae964ba2
 
 # Keep the vLLM image, adapter source, and Dynamo revision compatible.
 FROM rust:1.93-bookworm AS build-base
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin the merged vLLM KVCR integration to an exact commit SHA.
 FROM build-base AS vllm-kvcr-source
 ARG KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG KVCR_VLLM_REF=fed7de909f894fbee0c45130376aed2e2c9bf0d3
+ARG KVCR_VLLM_REF=a5db4c9ff58a0ec4dc20594ba5cea9f776dcd693
 RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr remote add origin "${KVCR_VLLM_REPO}" \
  && git -C /src/vllm-kvcr fetch --depth 1 origin "${KVCR_VLLM_REF}" \
