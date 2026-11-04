@@ -347,10 +347,12 @@ uv pip install -e '.[vllm]'
 cd ..
 
 VLLM_USE_PRECOMPILED=1 \
-  uv pip install --editable ./vllm --torch-backend=auto
+  uv pip install --editable ./vllm --torch-backend=cu130
 
 uv pip install --editable ./kvcr
 ```
+
+Pin `--torch-backend` to the CUDA variant of the precompiled vLLM artifact (`cu130` on current vLLM `main`). With `auto`, a CUDA 13.2+ driver selects cu132 PyTorch, but `torchaudio==2.11.0` has no cu132 build; the cu130 wheel from PyPI is installed instead, and importing vLLM fails with `PyTorch and TorchAudio were compiled with different CUDA versions`.
 
 Precompiled vLLM artifacts must be compatible with the checkout. A customized branch may require an explicit wheel commit/variant or its documented native build. The quick start's CUDA, PyTorch, FlashInfer, and vLLM versions describe that validated environment rather than universal KVCR requirements.
 
