@@ -1,0 +1,555 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+run-name: Release ${{ inputs.version }} rc${{ inputs.rc }} (by @${{ github.actor }})
+
+on:
+  # nightly.yml calls this for nightlies and pull-request wheel checks.
+  workflow_call:
+    inputs:
+      mode:
+        required: true
+        type: string
+      stage:
+        required: false
+        type: boolean
+        default: false
+      run_e2e:
+        required: false
+        type: boolean
+        default: true
+      skip_gitlab_pipeline:
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release. It must equal [project].version in pyproject.toml.
+        required: true
+        type: string
+      rc:
+        description: Release-candidate round. Stage a fixed build as the next round.
+        required: true
+        type: number
+        default: 0
+      run_e2e:
+        description: Run the GPU end-to-end test and require it to pass before staging.
+        required: false
+        type: boolean
+        default: true
+      skip_gitlab_pipeline:
+        description: Stage the candidate but skip the release pipeline trigger.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.mode == 'nightly' && github.run_id || inputs.version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      wheel: ${{ steps.plan.outputs.wheel }}
+      sdist: ${{ steps.plan.outputs.sdist }}
+      nightly_tag: ${{ steps.plan.outputs.nightly_tag }}
+      stage_path: ${{ steps.plan.outputs.stage_path }}
+      stage: ${{ steps.plan.outputs.stage }}
+      publish: ${{ steps.plan.outputs.publish }}
+      label: ${{ steps.plan.outputs.label }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plan the version and release mode
+        id: plan
+        env:
+          MODE: ${{ inputs.mode || 'release' }}
+          STAGE: ${{ inputs.stage }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RC: ${{ inputs.rc }}
+          NIGHTLY_RELEASE_ENABLED: ${{ vars.KVCR_NIGHTLY_RELEASE_ENABLED }}
+          NIGHTLY_PUBLISH: ${{ vars.KVCR_NIGHTLY_PUBLISH }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          base="$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' pyproject.toml)"
+          [ -n "${base}" ] || fail "pyproject.toml [project].version must be a plain X.Y.Z release"
+          case "${MODE}" in
+            nightly)
+              # TEMP: pull-request/66 is allowed for the dry run; remove before merge.
+              if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ "${GITHUB_REF}" != "refs/heads/main" ] \
+                && [ "${GITHUB_REF}" != "refs/heads/pull-request/66" ]; then
+                fail "nightlies run only on main"
+              fi
+              date="$(date -u +%Y%m%d)"
+              version="${base}.dev${date}"
+              nightly_tag="${date}-${GITHUB_SHA:0:7}"
+              stage_path="nightly/${GITHUB_RUN_ID}"
+              label="nightly ${version}"
+              stage=false
+              if [ "${STAGE}" = "true" ] && [ "${NIGHTLY_RELEASE_ENABLED}" = "true" ]; then
+                stage=true
+              fi
+              publish=false
+              if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+                publish=true
+              fi
+              ;;
+            release)
+              [[ "${INPUT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version '${INPUT_VERSION}' must be X.Y.Z"
+              [ "${INPUT_VERSION}" = "${base}" ] \
+                || fail "version ${INPUT_VERSION} does not match pyproject.toml ${base} on ${GITHUB_REF_NAME}"
+              case "${GITHUB_REF}" in
+                refs/heads/main | "refs/heads/release/${INPUT_VERSION}") ;;
+                *) fail "release ${INPUT_VERSION} runs from main or release/${INPUT_VERSION}, not ${GITHUB_REF}" ;;
+              esac
+              [[ "${RC}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || fail "rc '${RC}' must be a whole number below 1000"
+              version="${base}"
+              nightly_tag=""
+              stage_path="release/${version}/rc${RC}"
+              label="release ${version} rc${RC}"
+              stage=true
+              publish=true
+              ;;
+            *)
+              fail "mode '${MODE}' must be nightly or release"
+              ;;
+          esac
+          {
+            echo "mode=${MODE}"
+            echo "version=${version}"
+            echo "wheel=kvcr-${version}-py3-none-any.whl"
+            echo "sdist=kvcr-${version}.tar.gz"
+            echo "nightly_tag=${nightly_tag}"
+            echo "stage_path=${stage_path}"
+            echo "stage=${stage}"
+            echo "publish=${publish}"
+            echo "label=${label}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "KVCR ${label} (stage=${stage}, publish=${publish})"
+
+  slack-start:
+    name: Slack start message
+    needs: prepare
+    if: needs.prepare.outputs.stage == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: automated-release
+    permissions: {}
+    outputs:
+      thread_ts: ${{ steps.post.outputs.thread_ts }}
+    steps:
+      - name: Start the Slack thread
+        id: post
+        continue-on-error: true
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_RELEASE_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+          LABEL: ${{ needs.prepare.outputs.label }}
+          ICON: ${{ needs.prepare.outputs.mode == 'release' && ':package:' || ':crescent_moon:' }}
+        run: |
+          set -euo pipefail
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${SLACK_BOT_TOKEN}" > "${auth}"
+          text="${ICON} *KVCR ${LABEL}* started from \`${GITHUB_SHA:0:7}\` <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|GitHub run>"
+          response="$(jq -n --arg channel "${SLACK_CHANNEL_ID}" --arg text "${text}" '{channel: $channel, text: $text}' \
+            | curl -q -fsS --max-time 15 --retry 2 -H "@${auth}" -H 'Content-Type: application/json; charset=utf-8' \
+              --data @- https://slack.com/api/chat.postMessage)"
+          if [ "$(jq -r '.ok' <<< "${response}")" != "true" ]; then
+            echo "::error::Slack chat.postMessage failed: $(jq -r '.error // "unknown"' <<< "${response}")"
+            exit 1
+          fi
+          echo "thread_ts=$(jq -r '.ts' <<< "${response}")" >> "${GITHUB_OUTPUT}"
+
+  # Releases and manual nightlies that would stage wait for a reviewer; scheduled runs do not, as in Dynamo.
+  approve:
+    name: Approval
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.stage == 'true' &&
+      (needs.prepare.outputs.mode == 'release' || github.event_name != 'schedule')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: manual-release-approval
+    permissions: {}
+    steps:
+      # GitHub creates a missing environment without reviewers, which would approve everything.
+      - name: Check that the approval environment has reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewers="$(gh api "repos/${GITHUB_REPOSITORY}/environments/manual-release-approval" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers | length] | add // 0')"
+          [ "${reviewers}" -gt 0 ] || { echo "::error::the manual-release-approval environment has no required reviewers"; exit 1; }
+
+  build:
+    name: Build and check wheel
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      wheel_sha256: ${{ steps.dist.outputs.wheel-sha256 }}
+      sdist_sha256: ${{ steps.dist.outputs.sdist-sha256 }}
+    env:
+      MODE: ${{ needs.prepare.outputs.mode }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+      SDIST: ${{ needs.prepare.outputs.sdist }}
+      TWINE_VERSION: "7.0.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the sdist and the wheel
+        id: dist
+        uses: ./.github/actions/build-dist
+        with:
+          mode: ${{ needs.prepare.outputs.mode }}
+          version: ${{ needs.prepare.outputs.version }}
+          wheel: ${{ needs.prepare.outputs.wheel }}
+          sdist: ${{ needs.prepare.outputs.sdist }}
+          check-pypi: ${{ needs.prepare.outputs.stage }}
+      - name: Check the contents, headers, license, and dependencies
+        run: |
+          set -euo pipefail
+          uvx "twine==${TWINE_VERSION}" check --strict "dist/${WHEEL}" "dist/${SDIST}"
+          # Anything that can reach PyPI must have every dependency reviewed.
+          strict=()
+          if [ "${PUBLISH}" = "true" ]; then
+            strict=(--strict)
+          fi
+          python3 .github/scripts/wheel_compliance.py wheel "dist/${WHEEL}" --version "${VERSION}" ${strict[@]+"${strict[@]}"}
+          python3 .github/scripts/wheel_compliance.py sdist "dist/${SDIST}" --version "${VERSION}"
+
+  verify:
+    name: Test wheel and licenses
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      MODE: ${{ needs.prepare.outputs.mode }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rebuild the checked sdist and wheel
+        uses: ./.github/actions/build-dist
+        with:
+          mode: ${{ needs.prepare.outputs.mode }}
+          version: ${{ needs.prepare.outputs.version }}
+          wheel: ${{ needs.prepare.outputs.wheel }}
+          sdist: ${{ needs.prepare.outputs.sdist }}
+          expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+          expect-sdist-sha256: ${{ needs.build.outputs.sdist_sha256 }}
+      - name: Check dependency licenses and test the installed wheel
+        run: |
+          set -euo pipefail
+          for py in 3.10 3.12; do
+            venv="${RUNNER_TEMP}/venv-${py}"
+            uv venv --python "${py}" "${venv}"
+            uv pip install --python "${venv}/bin/python" "dist/${WHEEL}[profiling]"
+            uv pip check --python "${venv}/bin/python"
+            # Inventory before pytest so test tooling stays out of the license evidence.
+            python3 .github/scripts/wheel_compliance.py licenses --python "${venv}/bin/python" \
+              --inventory "${RUNNER_TEMP}/inventory/py${py}.csv"
+            "${venv}/bin/python" -c 'import importlib.metadata as m, os, sys, kvcr; assert m.version("kvcr") == os.environ["VERSION"]; assert kvcr.__file__.startswith(sys.prefix), kvcr.__file__'
+            "${venv}/bin/kvcr-service" --help > /dev/null
+            uv pip install --python "${venv}/bin/python" "pytest>=8,<9"
+            "${venv}/bin/python" -m pytest tests/unit -q -p no:cacheprovider
+          done
+      - name: Write the license evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Releases diff against the previous release, whose evidence reached the open-source review.
+          if [ "${MODE}" = "release" ]; then
+            query="actions/workflows/release.yml/runs?event=workflow_dispatch&status=success&per_page=10"
+          else
+            query="actions/workflows/nightly.yml/runs?branch=main&event=schedule&status=success&per_page=10"
+          fi
+          prior=()
+          runs="$(gh api "repos/${GITHUB_REPOSITORY}/${query}" --jq '.workflow_runs[].id')" || runs=""
+          for run in ${runs}; do
+            dir="${RUNNER_TEMP}/prior-${run}"
+            if gh run download "${run}" -R "${GITHUB_REPOSITORY}" -n license-artifacts -D "${dir}" 2> /dev/null \
+              && [ -f "${dir}/deps.csv" ]; then
+              prior=(--prior "${dir}/deps.csv")
+              echo "Comparing with run ${run}"
+              break
+            fi
+          done
+          python3 .github/scripts/wheel_compliance.py evidence "${RUNNER_TEMP}"/inventory/py*.csv \
+            --out "${RUNNER_TEMP}/license-artifacts" ${prior[@]+"${prior[@]}"}
+      # The release pipeline attaches the one artifact whose name contains "license".
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: license-artifacts
+          path: ${{ runner.temp }}/license-artifacts/deps*.csv
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+  # Releases stage only after the GPU test passes, unless it was turned off.
+  e2e:
+    name: GPU end-to-end test
+    needs: prepare
+    if: inputs.run_e2e && needs.prepare.outputs.mode == 'release'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      kvcr_ref: ${{ github.sha }}
+
+  # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
+  e2e-nightly:
+    name: GPU end-to-end test (non-blocking)
+    needs: prepare
+    if: inputs.run_e2e && needs.prepare.outputs.mode == 'nightly'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      kvcr_ref: ${{ github.sha }}
+
+  stage:
+    name: Stage to Artifactory
+    needs: [prepare, approve, build, verify, e2e]
+    if: >-
+      !cancelled() &&
+      needs.prepare.outputs.stage == 'true' &&
+      needs.build.result == 'success' &&
+      needs.verify.result == 'success' &&
+      (needs.prepare.outputs.mode == 'nightly' || needs.e2e.result == 'success' || !inputs.run_e2e) &&
+      (needs.prepare.outputs.mode == 'release' || vars.KVCR_NIGHTLY_RELEASE_ENABLED == 'true') &&
+      ((needs.prepare.outputs.mode == 'nightly' && github.event_name == 'schedule') || needs.approve.result == 'success')
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 15
+    environment: automated-release
+    permissions:
+      contents: read
+    outputs:
+      staged_wheels: ${{ steps.stage.outputs.staged_wheels }}
+    env:
+      MODE: ${{ needs.prepare.outputs.mode }}
+      STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+      SDIST: ${{ needs.prepare.outputs.sdist }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+      SDIST_SHA256: ${{ needs.build.outputs.sdist_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rebuild the checked sdist and wheel
+        uses: ./.github/actions/build-dist
+        with:
+          mode: ${{ needs.prepare.outputs.mode }}
+          version: ${{ needs.prepare.outputs.version }}
+          wheel: ${{ needs.prepare.outputs.wheel }}
+          sdist: ${{ needs.prepare.outputs.sdist }}
+          expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+          expect-sdist-sha256: ${{ needs.build.outputs.sdist_sha256 }}
+      - name: Stage in Artifactory
+        id: stage
+        env:
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          for name in ARTIFACTORY_URL ARTIFACTORY_TOKEN ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || { echo "::error::secret ${name} is not set in the automated-release environment"; exit 1; }
+          done
+          # curl errors name the host, which a secret mask alone does not cover.
+          host="${ARTIFACTORY_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          # Nightlies publish only the wheel; releases also publish the sdist.
+          files=("${WHEEL}=${WHEEL_SHA256}")
+          if [ "${MODE}" = "release" ]; then
+            files+=("${SDIST}=${SDIST_SHA256}")
+          fi
+          # Tokens go through files so they never appear in argv.
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_TOKEN}" > "${auth}"
+          for entry in "${files[@]}"; do
+            file="${entry%%=*}"
+            sha="${entry#*=}"
+            [[ "${sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${file}"; exit 1; }
+            echo "${sha}  dist/${file}" | sha256sum --check
+            dest="${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${file}"
+            status="$(curl -q -sS --max-time 30 --head -o "${RUNNER_TEMP}/head.txt" -w '%{http_code}' -H "@${auth}" "${dest}")"
+            staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
+            case "${status}" in
+              200)
+                [ "${staged}" = "${sha}" ] || { echo "::error::a different ${file} is already staged at ${STAGE_PATH}; stage the next rc"; exit 1; }
+                echo "already staged: ${file}"
+                ;;
+              404)
+                curl -q -fsS --retry 3 --max-time 120 -o /dev/null -H "@${auth}" -H "X-Checksum-Sha256: ${sha}" \
+                  --upload-file "dist/${file}" "${dest}"
+                echo "staged: ${file}"
+                ;;
+              *)
+                echo "::error::checking the staged ${file} returned HTTP ${status}"
+                exit 1
+                ;;
+            esac
+            curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
+            echo "${sha}  ${RUNNER_TEMP}/staged" | sha256sum --check
+          done
+          echo "staged_wheels=${WHEEL}" >> "${GITHUB_OUTPUT}"
+
+  trigger-gitlab:
+    name: Trigger GitLab pipeline
+    needs: [prepare, approve, slack-start, stage]
+    if: >-
+      !cancelled() &&
+      needs.stage.result == 'success' &&
+      !inputs.skip_gitlab_pipeline &&
+      (needs.prepare.outputs.mode == 'release' || vars.KVCR_NIGHTLY_RELEASE_ENABLED == 'true') &&
+      ((needs.prepare.outputs.mode == 'nightly' && github.event_name == 'schedule') || needs.approve.result == 'success')
+    runs-on:
+      group: gitlab_ci_runners
+    timeout-minutes: 10
+    environment: automated-release
+    permissions: {}
+    env:
+      MODE: ${{ needs.prepare.outputs.mode }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
+      RC: ${{ inputs.rc }}
+      STAGED_WHEELS: ${{ needs.stage.outputs.staged_wheels }}
+      SLACK_THREAD_TS: ${{ needs.slack-start.outputs.thread_ts }}
+      # TEMP: always a dry run during PR verification; restore the expression before merge.
+      DRY_RUN: "true"
+    steps:
+      - name: Trigger the release pipeline
+        env:
+          GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
+          GITLAB_PIPELINE_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          for name in GITLAB_TRIGGER_TOKEN GITLAB_PIPELINE_URL SLACK_CHANNEL_ID ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || fail "${name} is not set in the automated-release environment"
+          done
+          host="${GITLAB_PIPELINE_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          case "${MODE}" in
+            nightly)
+              [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || fail "nightly version ${VERSION} is not X.Y.Z.devYYYYMMDD"
+              release_type=nightly release_version="" rc_number=""
+              ;;
+            release)
+              [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "${RC}" =~ ^[0-9]+$ ]] || fail "release ${VERSION} rc${RC} is malformed"
+              release_type=ondemand release_version="${VERSION}" rc_number="${RC}"
+              ;;
+            *)
+              fail "mode '${MODE}' must be nightly or release"
+              ;;
+          esac
+          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ && "${GITHUB_RUN_ID}" =~ ^[0-9]+$ ]] \
+            || fail "commit or run id does not match the trigger contract"
+          [[ "${SLACK_THREAD_TS}" =~ ^[0-9]+\.[0-9]+$ ]] || SLACK_THREAD_TS=""
+          token="$(mktemp -p "${RUNNER_TEMP}")"
+          response="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${token}" "${response}"' EXIT
+          printf '%s' "${GITLAB_TRIGGER_TOKEN}" > "${token}"
+          # Unsent variables reach the release pipeline as a literal "$NAME", so every one it reads is sent.
+          variables=(
+            PROJECT=kvcr
+            PIPELINE_TYPE=security
+            "RELEASE_TYPE=${release_type}"
+            RC_TAG=
+            "NIGHTLY_TAG=${NIGHTLY_TAG}"
+            "RELEASE_VERSION=${release_version}"
+            "RC_NUMBER=${rc_number}"
+            "WHEEL_VERSION=${VERSION}"
+            "STAGED_WHEELS=${STAGED_WHEELS}"
+            "GITHUB_RUN_ID=${GITHUB_RUN_ID}"
+            "COMMIT_SHA=${GITHUB_SHA}"
+            ARTIFACTS=wheel
+            "DRY_RUN=${DRY_RUN}"
+            "ARTIFACTORY_PYPI_REPO_NAME=${ARTIFACTORY_PYPI_REPO_NAME}"
+            "SONAR_BRANCH=${GITHUB_REF_NAME}"
+            "SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}"
+            "SLACK_THREAD_TS=${SLACK_THREAD_TS}"
+          )
+          form=()
+          for kv in "${variables[@]}"; do
+            form+=(--form-string "variables[${kv%%=*}]=${kv#*=}")
+          done
+          curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=pvijayakrish/onboard-kvcr \
+            "${form[@]}" "${GITLAB_PIPELINE_URL}"
+          # Only the id is printed; the response's URLs name an internal host.
+          pipeline_id="$(jq -e '.id | numbers' "${response}")" || fail "the release pipeline was not created"
+          echo "Release pipeline ${pipeline_id} triggered for ${VERSION} (${release_type}, DRY_RUN=${DRY_RUN})"
+
+  notify-failure:
+    name: Slack failure alert
+    needs: [prepare, slack-start, approve, build, verify, e2e, e2e-nightly, stage, trigger-gitlab]
+    # Timed-out jobs end as cancelled; ignore cancels only when the whole run was cancelled.
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      (inputs.mode != 'nightly' || github.event_name == 'schedule' || needs.prepare.outputs.stage == 'true') &&
+      (contains(needs.*.result, 'failure') || (!cancelled() && contains(needs.*.result, 'cancelled')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: automated-release
+    permissions: {}
+    steps:
+      - name: Post the failure to Slack
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL }}
+          MENTION_IDS: ${{ secrets.SLACK_NOTIFY_MENTIONS }}
+          LABEL: ${{ needs.prepare.outputs.label || inputs.mode || 'release' }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          [ -n "${WEBHOOK_URL}" ] || { echo "::warning::secret SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL is not set; no Slack alert sent"; exit 0; }
+          failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<< "${NEEDS}")"
+          mentions=""
+          IFS=',' read -ra ids <<< "${MENTION_IDS}"
+          for id in "${ids[@]}"; do
+            id="${id//[[:space:]]/}"
+            case "${id}" in
+              "") ;;
+              U*|W*) mentions+=" <@${id}>" ;;
+              S*) mentions+=" <!subteam^${id}>" ;;
+              *) mentions+=" ${id}" ;;
+            esac
+          done
+          config="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${config}"' EXIT
+          printf 'url = "%s"\n' "${WEBHOOK_URL}" > "${config}"
+          jq -n --arg text ":alert: *KVCR ${LABEL} failed* (${failed})${mentions} <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|GitHub run>" \
+            '{text: $text}' \
+            | curl -q -fsS --retry 3 --max-time 30 -o /dev/null -H 'Content-Type: application/json' --data @- --config "${config}"
