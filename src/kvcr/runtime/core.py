@@ -170,6 +170,7 @@ class _KVCRCore:
         backend_configs: KVCRBackendConfigs,
     ) -> None:
         self.config = config
+        self._gpu_options = None
         self.pool_layouts = list(config.pool_layouts)
         _validate_pool_layouts(self.pool_layouts)
         self._block_sizes = dict(self.pool_layouts)

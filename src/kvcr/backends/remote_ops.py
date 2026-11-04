@@ -28,6 +28,12 @@ class _PeerMessage(msgspec.Struct, kw_only=True, omit_defaults=True):
     sender_incarnation: str | None = None
     sender_control_endpoint: str | None = None
     source_control_endpoint: str | None = None
+    source_memory_kind: str | None = None
+    target_memory_kind: str | None = None
+    transport: str | None = None
+    compatibility_domain: str | None = None
+    gpu_transport: str | None = None
+    fabric_domain: str | None = None
 
 
 class _StartWrite(_PeerMessage, tag="start_write"):
@@ -39,12 +45,19 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     source_incarnation: str | None = None
 
 
-class _TargetMetadata(_PeerMessage, tag="target_metadata"):
+class _StartWriteGPU(_StartWrite, tag="start_write_gpu"):
     pass
+
+
+class _TargetMetadata(_PeerMessage, tag="target_metadata"):
+    op_handle: OpHandle | None = None
+    gpu_capability_only: bool = False
 
 
 class _TargetMetadataAck(_PeerMessage, tag="target_metadata_ack"):
     op_handle: OpHandle | None = None
+    gpu_capability_only: bool = False
+    gpu_peer_accepted: bool | None = None
 
 
 class _WriteRefused(_PeerMessage, tag="write_refused"):

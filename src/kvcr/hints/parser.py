@@ -78,12 +78,15 @@ class HintType:
     ``ValueError(reason)``, which becomes the hint's rejection reason.
     ``handler_factory(core, dispatcher)`` builds the handler: ``core`` for
     backend access, ``dispatcher`` to ``report`` results.
+    ``strict_versions`` opts an action into exact envelope/action versions;
+    the existing CPU action retains warning-only version compatibility.
     """
 
     action_type: str
     version: str
     parse: _HintParser
     handler_factory: _HintHandlerFactory
+    strict_versions: bool = False
 
 
 def reject_hint(
@@ -176,6 +179,15 @@ def parse_hints(
                     message_id,
                     supported=False,
                 )
+            )
+            continue
+
+        if hint_type.strict_versions and (
+            getattr(hint, "protocol_version", None) != _KV_HINT_PROTOCOL_VERSION
+            or getattr(raw, "action_version", None) != hint_type.version
+        ):
+            rejected.append(
+                reject_hint(action_id, action_type, "unsupported_version", message_id)
             )
             continue
 
