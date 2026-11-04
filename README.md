@@ -33,7 +33,7 @@ For more details, see the [design document](docs/design_overview.md).
 
 ## Framework support
 
-KVCR is vendor and framework agnostic, with no dependency on a specific request router. The list below summarizes framework integrations that are complete or in progress. We plan to extend support to additional frameworks and routers in the future.
+KVCR is vendor and framework agnostic and can integrate with any request router that supports the KV Hint Protocol. The list below summarizes framework integrations that are complete or in progress. We plan to extend support to additional frameworks and routers in the future.
 
 ### KV Hint Protocol
 
@@ -46,7 +46,7 @@ KVCR is vendor and framework agnostic, with no dependency on a specific request 
 - SGLang - supported
   - Additional features tracked in [RFC #36224](https://github.com/sgl-project/sglang/issues/36224).
 
-- Dynamo KV Router - supported
+- [Dynamo KV Router](https://docs.nvidia.com/dynamo/dev/knowledge-base/modular-components/router/overview) - supported
 
 A hint envelope may carry several hints. KVCR parses and dispatches each one independently and records a per-hint outcome.
 
@@ -59,15 +59,8 @@ A hint envelope may carry several hints. KVCR parses and dispatches each one ind
 - vLLM - supported
 
 - SGLang - supported
-  - HiCache storage backend: [#45647](https://github.com/sgl-project/sglang/pull/45647), [RFC #32903](https://github.com/sgl-project/sglang/issues/32903)
+  - HiCache storage backend: [#45647](https://github.com/sgl-project/sglang/pull/45647)
   - Direct linker (experimental, TP1 for now): [#45650](https://github.com/sgl-project/sglang/pull/45650)
-
-
-### Routers
-
-- [Dynamo KV Router](https://docs.nvidia.com/dynamo/dev/knowledge-base/modular-components/router/overview)
-- [sgl-router](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router)
-- [llmd-router](https://llm-d.ai/docs/dev/architecture/core/router)
 
 ## Using KVCR
 
