@@ -6,7 +6,7 @@ Sequence:
   1. preflight        GPUs, shared memory, kernel (Guard), ports
   2. reference        KVCR disabled worker; every prompt generated twice
   3. stack            per-worker kvcr_service (Guard) + KV router + 2 workers
-  4. cases            TC-01, TC-02, TC-03 same-node
+  4. cases            TC-01, TC-02, TC-03 same-node, TC-04 (Guard only),
   5. evidence         result.json, junit.xml, all requests/responses/logs
 
 Exit status is 0 only when every selected case is PASS. BLOCKED cases are
@@ -208,6 +208,7 @@ class Runner:
             "TC-01": {"tc01"},
             "TC-02": {"tc02_p1", "tc02_full", "tc02_partial", "tc02_absent"},
             "TC-03": {"tc03", "tc03_isolated"},
+            "TC-04": {"tc04", "tc04_fresh", "tc04_second"},
         }
         wanted: set[str] = set()
         for case in self.args.cases:
@@ -355,6 +356,7 @@ class Runner:
             self.references,
             index_wait=self.args.index_wait,
             telemetry_timeout=self.args.telemetry_timeout,
+            recovery_timeout=self.args.recovery_timeout,
             hit_block_tokens=self.args.hit_block_tokens,
             engine_cached=self.reference_cached,
             tc02_seed_prefix=self.args.tc02_seed_prefix,
@@ -462,7 +464,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default="0,1",
         help="two CUDA device indices, e.g. 0,1",
     )
-    parser.add_argument("--cases", default="TC-01,TC-02,TC-03")
+    parser.add_argument("--cases", default="TC-01,TC-02,TC-03,TC-04")
     parser.add_argument("--http-port", type=int, default=8000)
     parser.add_argument("--reference-http-port", type=int, default=8001)
     parser.add_argument(
@@ -587,7 +589,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-state-agent",
         action="store_true",
-        help="Guard mode: do not run dynamo.kv_state_agent (no router hints)",
+        help="Guard mode: do not run dynamo.kv_state_agent (TC-04 then has no hint)",
     )
     parser.add_argument(
         "--timeout", type=float, default=2400, help="Overall deadline in seconds"
@@ -595,6 +597,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--readiness-timeout", type=float, default=600)
     parser.add_argument("--request-timeout", type=float, default=120)
     parser.add_argument("--telemetry-timeout", type=float, default=60)
+    parser.add_argument("--recovery-timeout", type=float, default=180)
     parser.add_argument("--index-wait", type=float, default=15)
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument(
@@ -619,6 +622,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "readiness_timeout",
         "request_timeout",
         "telemetry_timeout",
+        "recovery_timeout",
     ):
         if not 0 < getattr(args, name) <= 7200:
             parser.error(f"--{name.replace('_', '-')} must be >0 and <=7200 seconds")
