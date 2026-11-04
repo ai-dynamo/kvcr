@@ -12,12 +12,15 @@ jobs:
   dco:
     runs-on: ubuntu-24.04
     steps:
-      - name: Get PR Commits
-        id: get-pr-commits
-        uses: tim-actions/get-pr-commits@v1.3.1
+      - name: Check out validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: DCO Check
-        uses: tim-actions/dco@v1.1.0
+          persist-credentials: false
+      - name: Test DCO validation policy
+        run: node --test .github/scripts/check-dco.test.cjs
+      - name: Check every PR commit
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
-          commits: ${{ steps.get-pr-commits.outputs.commits }}
+          script: |
+            const {checkPullRequest} = require('./.github/scripts/check-dco.cjs');
+            await checkPullRequest({github, context, core});
