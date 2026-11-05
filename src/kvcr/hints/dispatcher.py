@@ -3,27 +3,55 @@
 """Hint dispatch infrastructure.
 
 ``HintDispatcher`` owns the hint type table and reports every hint's
-result; core holds one dispatcher and delegates to it. Each hint module
-defines a ``HintType`` (its parser and handler); ``_HINT_TYPES`` lists the
-supported ones.
+result; core holds one dispatcher and delegates to it. ``_HINT_TYPES`` binds
+the supported hint types to their payload parsers and handlers.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Protocol
+from functools import partial
+from typing import TYPE_CHECKING
 
 import msgspec
 
-from .fetch import KV_FETCH
-from .parser import HintType, _Hint, hint_message_id, parse_hints
+from .hint_handler import _FetchHintHandler, _HintHandler
+from .hint_types import (
+    HintType,
+    _Hint,
+    _KVFetchHint,
+    _KVMoveHint,
+    _KVPrefetchHint,
+)
+from .parser import _parse_payload, hint_message_id, parse_hints
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
 
+KV_FETCH = HintType(
+    _KVFetchHint.ACTION_TYPE,
+    "1.0",
+    partial(_parse_payload, peer="source", hint_factory=_KVFetchHint),
+    _FetchHintHandler,
+)
+# Core builds the independent hint handler before the dispatcher; it handles
+# both independent actions.
+KV_PREFETCH = HintType(
+    _KVPrefetchHint.ACTION_TYPE,
+    "1.0",
+    partial(_parse_payload, peer="destination", hint_factory=_KVPrefetchHint),
+    lambda core, dispatcher: core._independent_hint_handler,
+)
+KV_MOVE = HintType(
+    _KVMoveHint.ACTION_TYPE,
+    "1.0",
+    partial(_parse_payload, peer="destination", hint_factory=_KVMoveHint),
+    lambda core, dispatcher: core._independent_hint_handler,
+)
+
 # The supported hint types. Every dispatcher builds one handler per entry.
-_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH,)
+_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH, KV_PREFETCH, KV_MOVE)
 
 logger = logging.getLogger(__name__)
 # Handlers run on hot paths; warn once per (phase, action type) about errors.
@@ -42,25 +70,6 @@ def _warn_handler_error(action_type: str, phase: str) -> None:
         action_type,
         exc_info=True,
     )
-
-
-class _HintHandler(Protocol):
-    """Executes one action type.
-
-    ``submit`` runs on the caller's thread without the state lock, once per
-    hint, and must report exactly one result for it.
-    """
-
-    action_type: str
-
-    def submit(
-        self,
-        hint: _Hint,
-        request_id: str | None,
-        message_id: str | None,
-    ) -> None: ...
-
-    def close(self) -> None: ...
 
 
 class HintDispatcher:
@@ -105,25 +114,28 @@ class HintDispatcher:
         request_id: str | None,
         message_id: str | None,
     ) -> None:
-        # Contract: a handler reports the hint exactly once, or raises before
-        # doing so. Inline hints are terminal at submit time, so a raise
-        # means REJECTED, unless the raise is the fatal progress-thread
+        # Contract: a handler reports admission exactly once, or raises before
+        # doing so. ACCEPTED means admission, not asynchronous completion.
+        # A raise means REJECTED, unless it is the fatal progress-thread
         # failure, which propagates to the caller as it does without hints.
         try:
             handler.submit(hint, request_id, message_id)
         except Exception:
             self._core._progress.raise_if_failed()
-            _warn_handler_error(handler.action_type, "submit")
+            _warn_handler_error(hint.ACTION_TYPE, "submit")
             self.report(
                 HintResult(
                     action_id=hint.action_id,
-                    action_type=handler.action_type,
+                    action_type=hint.ACTION_TYPE,
                     status=HintStatus.REJECTED,
                     reason="handler_error",
                     request_id=request_id,
                     message_id=message_id,
                 )
             )
+
+    # Handlers warn through the dispatcher's once-per-issue logger.
+    warn_handler_error = staticmethod(_warn_handler_error)
 
     def report(self, result: HintResult) -> None:
         """Record a hint's result; called by handlers and by the dispatcher.
@@ -133,11 +145,13 @@ class HintDispatcher:
         forward KVCR stats and may reject names they do not declare.
         """
         logger.debug(
-            "KV hint result; action_id=%s action_type=%s status=%s reason=%s",
+            "KV hint result; action_id=%s action_type=%s status=%s reason=%s "
+            "failures=%s",
             result.action_id,
             result.action_type,
             result.status.value,
             result.reason,
+            result.failures,
         )
 
     # Main thread, under the state lock.
@@ -147,8 +161,12 @@ class HintDispatcher:
         if self._closed:
             return
         self._closed = True
-        for handler in self._handlers.values():
+        closed: set[int] = set()
+        for action_type, handler in self._handlers.items():
+            if id(handler) in closed:
+                continue
+            closed.add(id(handler))
             try:
                 handler.close()
             except Exception:
-                _warn_handler_error(handler.action_type, "close")
+                _warn_handler_error(action_type, "close")

@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""KV hint handling: envelope parsing, per-type dispatch, and the hint handlers.
+"""KV hint parsing, dispatch, and execution.
 
-``parser`` turns a router envelope into typed hints, ``dispatcher`` routes each
-hint to its handler, and one module per hint type (``fetch`` today)
-implements the parser and the handler and ties them together in a
-``HintType``. Core holds one ``HintDispatcher`` and never names a handler;
-adding a hint type is adding a module here and listing its ``HintType`` in
-the dispatcher's ``_HINT_TYPES``.
+``hint_types`` defines typed hints and registrations.
+``parser`` validates envelopes and payloads into typed hints.
+``dispatcher`` registers supported actions, routes hints, and reports results.
+``hint_handler`` stores request-scoped advice and runs independent-scoped operations.
+``results`` defines hint statuses and failure reports.
 """
 
 from .parser import ROUTER_HINT_CAPABILITIES, ROUTER_HINT_KEY

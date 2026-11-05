@@ -73,7 +73,6 @@ class _NamedSource:
                 )
             )
         except Exception:
-            # Removal is best effort; the destination result stands.
             logger.warning(
                 "KVCR cached-key invalidation could not reach %s",
                 self.source,
@@ -96,7 +95,6 @@ class _PendingResidencyOp(_Op):
     key_layout: tuple[str, ...] | None = None
     fill_sources: Mapping[BlockKey, CacheTier] = field(default_factory=dict)
     claimed_keys: set[BlockKey] = field(default_factory=set)
-    # Explicit peer source retained through deferred fills; see _NamedSource.
     named_source: "_NamedSource | None" = None
 
 
