@@ -218,6 +218,7 @@ class _KVCRCore:
         self._release_pin_callback = bindings.release_pin
         self._cancel_pin_request_callback = bindings.cancel_pin_request
         self.framework_control = bindings.framework_control
+        self._key_adapter = bindings.key_adapter
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
@@ -311,11 +312,7 @@ class _KVCRCore:
         }
         if not any(self._capacity_low_watermarks.values()):
             self._capacity_needed_callback = None
-        self._remote_fw_dram = _RemoteFWDram(
-            self,
-            backend_configs.remote_fw_dram,
-            bindings.key_adapter,
-        )
+        self._remote_fw_dram = _RemoteFWDram(self, backend_configs.remote_fw_dram)
         self._nvtx = self._remote_fw_dram._nvtx
         self._nvtx_operations = {}
         self._g3 = (
@@ -429,6 +426,61 @@ class _KVCRCore:
     def discard_hint(self, request_id: str) -> None:
         self._remote_delivery_keys.pop(request_id, None)
         self._remote_fw_dram.discard_hint(request_id)
+
+    def resolve_hashes(
+        self, hashes: Collection[int]
+    ) -> tuple[
+        dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]],
+        dict[int, str],
+    ]:
+        """Resolve advisory identities under the owner lock; the later transfer
+        claims source memory. Returns the transferable blocks grouped by
+        (layout, piece sizes) as key -> hash, and the reason each other hash failed."""
+        adapter = self._key_adapter
+        if adapter is None:
+            return {}, dict.fromkeys(hashes, "key_adapter_unavailable")
+        groups: dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]] = {}
+        failures: dict[int, str] = {}
+        sizes_by_layout: dict[tuple[str, ...], tuple[int, ...]] = {}
+        lookup_failed = False
+        for block_hash in hashes:
+            try:
+                key = adapter.decode_from_router(block_hash)
+            except KeyError:
+                failures[block_hash] = "not_found"
+                continue
+            except ValueError:
+                failures[block_hash] = "ambiguous_hash"
+                continue
+            except Exception:
+                # An adapter error fails this hash, not the whole request.
+                if not lookup_failed:
+                    lookup_failed = True
+                    logger.warning("Hash metadata lookup failed", exc_info=True)
+                failures[block_hash] = "resolution_failed"
+                continue
+            record = self._block_record_map.get(key)
+            local = record.local_dram if record is not None else None
+            layout = local.key_layout if local is not None else None
+            if (
+                local is None
+                or local.state is not _LocalDramState.READY
+                or local.pending_labels
+                or not layout
+            ):
+                failures[block_hash] = "source_not_transferable"
+                continue
+            sizes = sizes_by_layout.get(layout)
+            if sizes is None:
+                sizes = sizes_by_layout[layout] = tuple(
+                    self._block_sizes[label.partition(":")[0]] for label in layout
+                )
+            resolved = groups.setdefault((layout, sizes), {})
+            if key in resolved and resolved[key] != block_hash:
+                failures[block_hash] = "resolution_failed"
+            else:
+                resolved[key] = block_hash
+        return groups, failures
 
     def _has_complete_local(self, key: BlockKey) -> bool:
         record = self._block_record_map.get(key)

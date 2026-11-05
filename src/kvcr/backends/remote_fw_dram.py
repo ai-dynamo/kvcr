@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 
 from .. import _nvtx
-from ..config import KeyAdapter, RemoteFWDramOptions
+from ..config import RemoteFWDramOptions
 from ..runtime.core import (
     DURATION_METRIC,
     TRANSFER_BYTES_METRIC,
@@ -99,7 +99,6 @@ class _RemoteFWDram:
         self,
         kvcr: "_KVCRCore",
         options: RemoteFWDramOptions,
-        key_adapter: KeyAdapter | None,
     ) -> None:
         if options.metadata_retry_interval_ms <= 0:
             raise ValueError("metadata_retry_interval_ms must be positive")
@@ -126,7 +125,6 @@ class _RemoteFWDram:
             )
         self._kvcr = kvcr
         self._options = options
-        self._key_adapter = key_adapter
         self._nvtx = _nvtx.create_tracer()
 
         # Main-thread state: request hints, source ownership, and progress state.
@@ -200,7 +198,7 @@ class _RemoteFWDram:
     def query(self, key: BlockKey, request_id: str) -> bool:
         """Return whether ``key`` matches the request's remote hint."""
         request_hint = self._request_hints.get(request_id)
-        adapter = self._key_adapter
+        adapter = self._kvcr._key_adapter
         if (
             request_hint is None
             or request_hint.source is None
