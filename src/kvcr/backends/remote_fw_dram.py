@@ -48,6 +48,7 @@ from .remote_ops import (
     _ControlMessage,
     _decode_notif,
     _Invalidate,
+    _KeysToFetch,
     _NvtxState,
     _PeerMessage,
     _SourceWriteOp,
@@ -401,6 +402,9 @@ class _RemoteFWDram:
                 self._kvcr._invalidation_handler.submit(
                     item.keys, key_layout=item.key_layout
                 )
+            elif isinstance(item, _KeysToFetch):
+                # A source resolved its hashes; fetch them once outside the lock.
+                self._kvcr._independent_hint_handler.receive(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
         if not self._closed:
@@ -516,7 +520,7 @@ class _RemoteFWDram:
                 ):
                     continue
                 self._send_control(progress, item.endpoint, _TargetMetadata())
-            elif isinstance(item, _Invalidate):
+            elif isinstance(item, (_Invalidate, _KeysToFetch)):
                 # One-way: no reply is awaited and no public result depends on it.
                 if not self._send_control(progress, item.source_control_endpoint, item):
                     logger.warning(
@@ -591,7 +595,8 @@ class _RemoteFWDram:
             handled_at = self._kvcr._timer()
             if isinstance(payload, _StartWrite):
                 self._handle_start_write(progress, payload)
-            elif isinstance(payload, _Invalidate):
+            elif isinstance(payload, (_Invalidate, _KeysToFetch)):
+                # Owner-thread work: the main poll applies or starts it.
                 self._progress_outbound.append(payload)
             elif isinstance(payload, _TargetMetadata):
                 self._handle_target_metadata(progress, payload)
@@ -631,7 +636,7 @@ class _RemoteFWDram:
         includes_metadata = (
             not isinstance(
                 payload,
-                (_TargetMetadataAck, _WriteRefused, _Invalidate),
+                (_TargetMetadataAck, _WriteRefused, _Invalidate, _KeysToFetch),
             )
             and endpoint not in self._metadata_acked_sources
             and (

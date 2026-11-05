@@ -31,6 +31,7 @@ from ..config import (
     _validate_pool_layouts,
 )
 from ..hints.dispatcher import HintDispatcher
+from ..hints.hint_handler import _IndependentHintHandler
 from ..policy import G3LRUPolicy, LRUPolicy
 from ..types import (
     BlockKey,
@@ -329,6 +330,7 @@ class _KVCRCore:
             else None
         )
         # Built after the backends so hint handlers can bind to them.
+        self._independent_hint_handler = _IndependentHintHandler(self)
         self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
             {region.label: region for region in self._local_dram._pools.memory_regions}
@@ -879,8 +881,11 @@ class _KVCRCore:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
                 self._drain_invalidation()
+        self._independent_hint_handler.poll()
         completed = self._completion_queue
         self._completion_queue = []
+        if self._independent_hint_handler._pending_operations:
+            completed = self._independent_hint_handler.finish(completed)
         if self._nvtx_operations:
             for handle, _ in completed:
                 trace = self._nvtx_operations.pop(handle, None)

@@ -4,8 +4,8 @@
 
 import logging
 from typing import ClassVar
+from unittest.mock import Mock
 
-import msgspec
 import pytest
 from _kvcr_test_utils import (
     FakeBytesControl,
@@ -19,8 +19,10 @@ from _kvcr_test_utils import (
 
 from kvcr import STATE_METRIC
 from kvcr.config import KVCRConfig
-from kvcr.hints.dispatcher import _HINT_TYPES, _LOGGED_HANDLER_ERRORS, HintDispatcher
-from kvcr.hints.parser import _LOGGED_HINT_ISSUES, HintType
+from kvcr.hints.dispatcher import _HINT_TYPES, _LOGGED_HANDLER_ERRORS
+from kvcr.hints.hint_handler import _HintHandler
+from kvcr.hints.hint_types import HintType, _Hint
+from kvcr.hints.parser import _LOGGED_HINT_ISSUES
 from kvcr.hints.results import HintResult, HintStatus
 
 
@@ -35,13 +37,11 @@ def _reset_once_logs():
 # Dispatch infrastructure tests use stub action types; no production handler.
 
 
-class _StubHint(msgspec.Struct, frozen=True):
+class _StubHint(_Hint):
     ACTION_TYPE: ClassVar[str] = "kv.test"
 
-    action_id: str | None
 
-
-class _StubHandler:
+class _StubHandler(_HintHandler):
     """Inline handler that accepts every hint except those listed in ``fail``."""
 
     action_type = "kv.test"
@@ -97,33 +97,13 @@ def _stub_kvcr(monkeypatch, **config_fields):
     return kvcr, handler, _record_hint_results(monkeypatch, kvcr)
 
 
-def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
-    """Statuses reported since the previous take."""
-    taken = [(r.action_id, r.status, r.reason) for r in results]
-    results.clear()
-    return taken
-
-
 def test_dispatcher_owns_the_hint_type_table(monkeypatch):
-    # Core names no handler: the built-in handler comes from the dispatcher's
-    # table, and a type added to the table appears in a fresh dispatcher
-    # without any core change.
-    kvcr = _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl())
-    assert set(kvcr._core._hints_dispatcher._handlers) == {"kv.fetch"}
-
-    built_for: list[tuple[object, object]] = []
-
-    def factory(core, dispatcher):
-        built_for.append((core, dispatcher))
-        return _StubHandler(core, dispatcher)
-
-    monkeypatch.setattr(
-        "kvcr.hints.dispatcher._HINT_TYPES",
-        (*_HINT_TYPES, HintType("kv.test", "1.0", lambda i, p: _StubHint(i), factory)),
-    )
-    dispatcher = HintDispatcher(kvcr._core)
-    assert set(dispatcher._handlers) == {"kv.fetch", "kv.test"}
-    assert built_for == [(kvcr._core, dispatcher)]
+    # Registering a new action type needs no change to core.
+    kvcr, handler, _ = _stub_kvcr(monkeypatch)
+    dispatcher = kvcr._core._hints_dispatcher
+    registered = {hint.action_type for hint in _HINT_TYPES}
+    assert set(dispatcher._handlers) == registered | {"kv.test"}
+    assert handler.core is kvcr._core and handler.dispatcher is dispatcher
 
 
 def test_submit_routes_to_handler_and_rejects_unregistered_types(monkeypatch):
@@ -142,17 +122,21 @@ def test_submit_routes_to_handler_and_rejects_unregistered_types(monkeypatch):
 
 def test_handlers_close_only_once_the_loop_is_quiescent(monkeypatch):
     kvcr, handler, _ = _stub_kvcr(monkeypatch)
-    monkeypatch.setattr(kvcr._core, "is_quiescent", lambda: False)
-    with pytest.raises(RuntimeError, match="not quiescent"):
-        kvcr.close()
+    with monkeypatch.context() as patch:
+        patch.setattr(kvcr._core, "is_quiescent", lambda: False)
+        with pytest.raises(RuntimeError, match="not quiescent"):
+            kvcr.close()
     # Native operations may still reference backend state, so handlers (which
     # may own such state) stay open until quiescence is proven.
     assert handler.close_calls == 0
-    monkeypatch.undo()
+    independent = kvcr._core._independent_hint_handler
+    close = Mock(wraps=independent.close)
+    monkeypatch.setattr(independent, "close", close)
     kvcr.close()
     assert handler.close_calls == 1
     kvcr.close()
     assert handler.close_calls == 1
+    close.assert_called_once_with()
 
 
 def test_handler_close_failure_does_not_skip_backend_cleanup(monkeypatch):
@@ -178,7 +162,7 @@ def test_handler_exception_rejects_only_its_hint(monkeypatch, caplog):
     # The healthy sibling right after a failing hint is still dispatched.
     assert handler.submitted == [_StubHint("b")]
     assert all((r.request_id, r.message_id) == ("req", "m1") for r in results)
-    assert _take(results) == [
+    assert [(r.action_id, r.status, r.reason) for r in results] == [
         ("a", HintStatus.REJECTED, "handler_error"),
         ("b", HintStatus.ACCEPTED, None),
         ("c", HintStatus.REJECTED, "handler_error"),

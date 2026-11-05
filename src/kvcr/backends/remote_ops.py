@@ -42,6 +42,24 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     g2_only: bool = False
 
 
+class _FetchGroup(msgspec.Struct, frozen=True):
+    """Resolved keys sharing one layout and its piece sizes."""
+
+    keys: tuple[BlockKey, ...]
+    block_hashes: tuple[int, ...]
+    key_layout: tuple[str, ...]
+    sizes: tuple[int, ...]
+
+
+class _KeysToFetch(_PeerMessage, tag="keys_to_fetch"):
+    """All resolved layout groups for one independent hint."""
+
+    action_id: str | None
+    message_id: str | None
+    move: bool
+    groups: tuple[_FetchGroup, ...]
+
+
 class _Invalidate(_PeerMessage, tag="invalidate"):
     """Remove eligible source G2 copies already held completely at the destination."""
 
@@ -76,6 +94,7 @@ class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
 _ControlMessage = (
     _StartWrite
     | _Invalidate
+    | _KeysToFetch
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused

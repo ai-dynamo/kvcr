@@ -3,27 +3,20 @@
 
 """Parse KV hint envelopes into typed hints.
 
-Hints are advisory request metadata. This module validates versioned KV hint
-envelopes and parses every hint with the ``HintType`` the caller supplies for
-its ``action_type``. Hints that cannot be used are reported as ``REJECTED``
-results instead of raising. Integration constants are exported by
-``kvcr.__init__``.
+The caller supplies a ``HintType`` registry for envelope and payload validation.
+Unusable hints become ``REJECTED`` results instead of raising. Integration
+constants are exported by ``kvcr.__init__``.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import msgspec
 
+from .hint_types import HintType, _Hint
 from .results import HintResult, HintStatus
-
-if TYPE_CHECKING:
-    from ..runtime.core import _KVCRCore
-    from .dispatcher import HintDispatcher, _HintHandler
 
 # Public integration constants exported by kvcr.__init__.
 ROUTER_HINT_KEY = "kv_hint"
@@ -50,40 +43,6 @@ def _warn_version_mismatch(
         return
     _LOGGED_HINT_ISSUES.add(issue)
     logger.warning(message, supported, received)
-
-
-class _Hint(Protocol):
-    """A parsed envelope hint: a frozen struct per action type.
-
-    ``ACTION_TYPE`` is the wire ``action_type`` the struct was parsed from and
-    the key of its handler in the dispatcher.
-    """
-
-    ACTION_TYPE: ClassVar[str]
-
-    @property
-    def action_id(self) -> str | None: ...
-
-
-_HintParser = Callable[[str | None, Mapping[str, object]], _Hint]
-_HintHandlerFactory = Callable[["_KVCRCore", "HintDispatcher"], "_HintHandler"]
-
-
-@dataclass(frozen=True)
-class HintType:
-    """One supported hint type: how its payload is parsed and who handles it.
-
-    ``version`` is the ``action_version`` the parser understands.
-    ``parse(action_id, payload)`` returns the typed hint or raises
-    ``ValueError(reason)``, which becomes the hint's rejection reason.
-    ``handler_factory(core, dispatcher)`` builds the handler: ``core`` for
-    backend access, ``dispatcher`` to ``report`` results.
-    """
-
-    action_type: str
-    version: str
-    parse: _HintParser
-    handler_factory: _HintHandlerFactory
 
 
 def reject_hint(
@@ -121,6 +80,40 @@ def hint_message_id(hint: msgspec.Struct) -> str | None:
     """The envelope's ``message_id`` when it is a string, else ``None``."""
     message_id = getattr(hint, "message_id", None)
     return message_id if isinstance(message_id, str) else None
+
+
+def _parse_payload(
+    action_id: str | None,
+    payload: Mapping[str, object],
+    *,
+    peer: str,
+    hint_factory: Callable[[str | None, str, frozenset[int]], _Hint],
+) -> _Hint:
+    """The ``{peer}_control_endpoint`` and ``block_hashes`` of a hint payload."""
+    if "no_retain" in payload:
+        raise ValueError("no_retain is not currently supported")
+    endpoint = payload.get(f"{peer}_control_endpoint")
+    if endpoint is None:
+        raise ValueError(f"{peer}-less hints are not currently supported")
+    block_hashes = payload.get("block_hashes")
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint
+        or not isinstance(block_hashes, list)
+    ):
+        raise ValueError("invalid router hint")
+    hashes: set[int] = set()
+    for block_hash in block_hashes:
+        if (
+            isinstance(block_hash, bool)
+            or not isinstance(block_hash, int)
+            or not 0 <= block_hash < 1 << 64
+        ):
+            raise ValueError("invalid router hint")
+        hashes.add(block_hash)
+    if not hashes:
+        raise ValueError("invalid router hint")
+    return hint_factory(action_id, endpoint, frozenset(hashes))
 
 
 def parse_hints(
