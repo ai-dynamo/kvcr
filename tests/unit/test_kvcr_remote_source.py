@@ -726,9 +726,10 @@ def test_source_watchdog_arms_at_earliest_event_and_latches(
     assert len(backend._progress_outbound) == 1
 
 
-def test_armed_source_poll_refreshes_progress_after_eviction(monkeypatch):
+def test_recovered_source_arms_at_activation_and_survives_eviction(monkeypatch):
     now = 10.0
-    monkeypatch.setattr(dangling_module, "time", SimpleNamespace(monotonic=lambda: now))
+    clock = SimpleNamespace(monotonic=lambda: now)
+    monkeypatch.setattr(dangling_module, "time", clock)
     local = ctypes.create_string_buffer(16)
     source = _new_kvcr(
         FakeNixlAgent(),
@@ -738,26 +739,38 @@ def test_armed_source_poll_refreshes_progress_after_eviction(monkeypatch):
     )
     # Exercise publication and withdrawal without a racing progress poll.
     source._core._progress.close()
-    monkeypatch.setattr(
-        "kvcr.backends.local_dram_pools.time", SimpleNamespace(monotonic=lambda: now)
-    )
+    monkeypatch.setattr("kvcr.backends.local_dram_pools.time", clock)
+    watchdog = source._core._remote_fw_dram._dangling_ops
+    # Recovery runs before core.start(): no progress poll has happened yet.
+    watchdog._last_progress_at = None
+    watchdog._activated_at = None
     pools = source._core._local_dram._pools
     key = BlockKey(b"ready")
     install_recovery_records(source._core, {key: _recovered_record(g2=[("", 0)])})
-    watchdog = source._core._remote_fw_dram._dangling_ops
+    assert pools._source_state.first_ready_at == 10.0
     assert watchdog.check_source_progress()
-    now = 10.5
+    assert watchdog._last_progress_at is None
+    # Startup outlasts the 1 s operation timeout; recovered data still serves.
+    now = 11.1
     watchdog.begin_poll()
-    assert watchdog._last_progress_at == 10.5
+    assert watchdog.check_source_progress()
+    assert watchdog._last_progress_at == 11.1
+    now = 11.5
+    watchdog.begin_poll()
+    assert watchdog._last_progress_at == 11.5
     residency = source._core._block_record_map[key].local_dram
     residency.retire_on_release = True
     assert pools._after_last_claim(key, residency)
     assert not pools._source_state.index
     assert pools._source_state.first_ready_at == 10.0
-    now = 11.4
+    # Eviction does not reset the epoch: a real post-activation stall latches.
+    now = 12.4
     assert watchdog.check_source_progress()
-    now = 11.6
+    now = 12.6
     assert not watchdog.check_source_progress()
+    assert "disabled until restart" in str(
+        source._core._remote_fw_dram._progress_outbound[-1]
+    )
 
 
 def test_kvcr_close_cleans_pending_pin_operations():
