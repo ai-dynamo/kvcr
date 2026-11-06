@@ -426,7 +426,7 @@ def test_first_native_work_records_accepted_or_uncertain_submission(
 ) -> None:
     agent = _TransferAgent()
     progress = _transfer_progress(agent)
-    assert getattr(progress, "_first_native_work_at", None) is None
+    assert progress._first_native_work_at is None
     now = 10.0
     monkeypatch.setattr(progress_module, "time", SimpleNamespace(monotonic=lambda: now))
     agent.transfer_result = post
@@ -437,9 +437,7 @@ def test_first_native_work_records_accepted_or_uncertain_submission(
         (_mem(1, owner=remote_agent),),
         remote_side_agent=remote_agent,
     )
-    assert getattr(progress, "_first_native_work_at", None) == (
-        None if post == "ERR" else 10.0
-    )
+    assert progress._first_native_work_at == (None if post == "ERR" else 10.0)
 
     now = 20.0
     agent.transfer_result = "PROC"
@@ -450,9 +448,7 @@ def test_first_native_work_records_accepted_or_uncertain_submission(
         (_mem(1, owner=remote_agent),),
         remote_side_agent=remote_agent,
     )
-    assert getattr(progress, "_first_native_work_at", None) == (
-        20.0 if post == "ERR" else 10.0
-    )
+    assert progress._first_native_work_at == (20.0 if post == "ERR" else 10.0)
 
 
 def test_progress_treats_poll_exception_as_terminal_failure() -> None:

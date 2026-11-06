@@ -78,26 +78,24 @@ def test_first_ready_publication_survives_withdrawal_and_republication(monkeypat
     )
     pools = source._core._local_dram._pools
     state = pools._source_state
-    assert getattr(state, "first_ready_at", None) is None
+    assert state.first_ready_at is None
     now = 10.0
-    monkeypatch.setattr(
-        pools_module, "time", SimpleNamespace(monotonic=lambda: now), raising=False
-    )
+    monkeypatch.setattr(pools_module, "time", SimpleNamespace(monotonic=lambda: now))
     key = BlockKey(b"ready")
     residency = _LocalDramResidency([("", 0)], _LocalDramState.FILLING)
     pools._publish_source(key, residency)
-    assert getattr(state, "first_ready_at", None) is None
+    assert state.first_ready_at is None
     residency.state = _LocalDramState.READY
     residency.pending_labels = {""}
     pools._publish_source(key, residency)
-    assert getattr(state, "first_ready_at", None) is None
+    assert state.first_ready_at is None
     residency.pending_labels = None
     residency.retire_on_release = True
     pools._publish_source(key, residency)
-    assert getattr(state, "first_ready_at", None) is None
+    assert state.first_ready_at is None
     residency.retire_on_release = False
     pools._publish_source(key, residency)
-    assert getattr(state, "first_ready_at", None) == 10.0
+    assert state.first_ready_at == 10.0
     source._core._block_record_map[key] = _BlockRecord(local_dram=residency)
     residency.retire_on_release = True
     assert pools._after_last_claim(key, residency)
@@ -107,7 +105,7 @@ def test_first_ready_publication_survives_withdrawal_and_republication(monkeypat
         BlockKey(b"replacement"),
         _LocalDramResidency([("", 0)], _LocalDramState.READY),
     )
-    assert getattr(state, "first_ready_at", None) == 10.0
+    assert state.first_ready_at == 10.0
 
 
 def _two_pool_kvcr(
