@@ -212,8 +212,13 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     )
 
 
-@pytest.mark.parametrize("invalid_index", [0, 1])
-def test_pinless_write_validates_only_claimed_destinations(invalid_index):
+@pytest.mark.parametrize(
+    "invalid_index,invalid_pool", [(0, ""), (1, ""), (0, "unknown")]
+)
+def test_pinless_write_validates_only_claimed_destinations(
+    invalid_index, invalid_pool, kvcr_caplog
+):
+    kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     memory = ctypes.create_string_buffer(16)
     agent, control = FakeNixlAgent(), FakeBytesControl()
     agent.state = "DONE"
@@ -233,13 +238,22 @@ def test_pinless_write_validates_only_claimed_destinations(invalid_index):
     )
     payload["keys"] = [b"missing", b"local"]
     payload["dst_descriptors"] = [[_TransferRef("target", i)] for i in range(2)]
-    payload["dst_descriptors"][invalid_index] = [_TransferRef("target", 1024)]
+    payload["dst_descriptors"][invalid_index] = [
+        _TransferRef("target", 1024, invalid_pool)
+    ]
     with patch.object(
         source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
     ) as validate:
         with source._core._state_lock:
             control.incoming.append(msgspec.msgpack.encode(payload))
-            _wait_until(lambda: len(agent.xfers) == 2 or bool(agent.sent_notifs))
+            _wait_until(
+                lambda: (
+                    len(agent.xfers) == 2
+                    or bool(agent.sent_notifs)
+                    or source._core._progress._failure is not None
+                )
+            )
+            source._core._progress.raise_if_failed()
         notification = (
             agent.xfers[-1][5] if invalid_index == 0 else agent.sent_notifs[-1][1]
         )
