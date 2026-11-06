@@ -602,14 +602,10 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         _wait_until(lambda: not target._core._progress._completed.empty())
 
     now = 1.5  # Past T, but still inside the destination's grace period.
-    results = dict(_poll_until(target, lambda completed: len(completed) == 2))
-    assert results == {
-        fetch: _op_entries({key: False}),
-        second_fetch: _op_entries({key: False}),
-    }
     # Both waiters learn that the shared fill timed out, whichever side noticed.
-    assert {entries[key].status for entries in results.values()} == {
-        OpEntryStatus.TIMEOUT
+    assert dict(_poll_until(target, lambda completed: len(completed) == 2)) == {
+        fetch: _op_entries({key: OpEntryStatus.TIMEOUT}),
+        second_fetch: _op_entries({key: OpEntryStatus.TIMEOUT}),
     }
     if resolution != "queued":
         assert target.query((key,), "req") == [
@@ -778,8 +774,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
 
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
     completed = _poll_until(target, lambda completed: bool(completed))
-    assert completed == [(op_handle, _op_entries({key: False}))]
-    assert completed[0][1][key].status is OpEntryStatus.UNAVAILABLE
+    assert completed == [(op_handle, _op_entries({key: OpEntryStatus.UNAVAILABLE}))]
     assert target.query((key, other_group), "req") == [
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -792,7 +787,9 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         {key: [_mem_descriptor()]},
         request_id="req",
     )
-    assert list(target.poll_completed()) == [(retry_handle, _op_entries({key: False}))]
+    assert list(target.poll_completed()) == [
+        (retry_handle, _op_entries({key: OpEntryStatus.UNAVAILABLE}))
+    ]
     assert target_control.sent == []
 
     other_destination = [_mem_descriptor(8)]
@@ -814,7 +811,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     ]
     target_agent.notifs["source"] = [_write_done_notification(mixed_handle)]
     assert _poll_until(target, bool) == [
-        (mixed_handle, _op_entries({key: False, other_group: True}))
+        (mixed_handle, _op_entries({key: OpEntryStatus.UNAVAILABLE, other_group: True}))
     ]
     assert target.query((key,), "req") == [(QueryStatus.MISS, None)]
     assert not _has_outstanding_operations(target)
@@ -949,7 +946,7 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
     # A second refusal of the same operation is terminal.
     refuse(source, **_metadata_refusal(source, op_handle))
     assert _poll_until(kvcr, lambda done: bool(done)) == [
-        (handle, _op_entries({key: False}))
+        (handle, _op_entries({key: OpEntryStatus.ABORTED}))
     ]
     assert len(control.sent) == 1
     # The refusing peer replaced the one we cached, so the next write re-learns
@@ -1049,7 +1046,9 @@ def test_native_terminal_or_cancellation_outranks_metadata_retry(terminal, succe
         _wait_until(lambda: op.state is _TargetPullState.WAITING_TERMINAL)
         assert list(kvcr.poll_completed()) == []
         agent.notifs["source"] = [_write_done_notification(wire_handle, success=False)]
-        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        assert _poll_until(kvcr, bool) == [
+            (handle, _op_entries({key: OpEntryStatus.ABORTED}))
+        ]
     assert not op.retried
     assert not any(
         _decode_control_message(raw)["type"] == "start_write" for _, raw in control.sent
@@ -1186,7 +1185,13 @@ def test_refusal_resends_only_with_reason(case, retries):
         ]
         assert _poll_until(target, bool) == [(handle, _op_entries({key: True}))]
     else:
-        assert _poll_until(target, bool) == [(handle, _op_entries({key: False}))]
+        # A refusal that lands past the deadline still reports the refusal.
+        outcome = (
+            OpEntryStatus.TIMEOUT
+            if case == "expired_in_flight"
+            else OpEntryStatus.ABORTED
+        )
+        assert _poll_until(target, bool) == [(handle, _op_entries({key: outcome}))]
     assert op.retried is (retries or case == "expired_in_flight")
     assert (
         not any(
@@ -1237,7 +1242,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     time.sleep(0.01)
     assert list(kvcr.poll_completed()) == []
     now = 7.0
-    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    assert _poll_until(kvcr, bool) == [
+        (handle, _op_entries({key: OpEntryStatus.TIMEOUT}))
+    ]
     assert control.send.call_count == 3  # Retry at T, then cleanup at abandonment.
     assert [error.state for error in errors] == ["uncertain"]
     assert errors[0].op_handle == handle
@@ -1344,7 +1351,9 @@ def test_remote_write_cancellation_and_late_completion(
         else:
             notifications.append(cancelled)
         agent.notifs["source"] = notifications
-        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        assert _poll_until(kvcr, bool) == [
+            (handle, _op_entries({key: OpEntryStatus.ABORTED}))
+        ]
         return
     now = 1.0
     _wait_until(
@@ -1373,14 +1382,18 @@ def test_remote_write_cancellation_and_late_completion(
             ]
 
         control.recv = guard_reply
-        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        assert _poll_until(kvcr, bool) == [
+            (handle, _op_entries({key: OpEntryStatus.TIMEOUT}))
+        ]
         return
     now = 5.0
     if outcome == "raise":
         with pytest.raises(RuntimeError):
             _poll_until(kvcr, bool)
         assert [error.state for error in errors] == ["uncertain"]
-    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    assert _poll_until(kvcr, bool) == [
+        (handle, _op_entries({key: OpEntryStatus.TIMEOUT}))
+    ]
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
     _wait_until(
@@ -1504,7 +1517,12 @@ def test_kvcr_deliver_fails_closed_on_mixed_hint_sources():
     )
 
     assert list(kvcr.poll_completed()) == [
-        (op_handle, _op_entries({key_a: False, key_b: False}))
+        (
+            op_handle,
+            _op_entries(
+                {key_a: OpEntryStatus.UNAVAILABLE, key_b: OpEntryStatus.UNAVAILABLE}
+            ),
+        )
     ]
     assert control.sent == []
 
@@ -1525,8 +1543,7 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
     op_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="req")
 
     completed = list(kvcr.poll_completed())
-    assert completed == [(op_handle, _op_entries({key: False}))]
-    assert completed[0][1][key].status is OpEntryStatus.UNAVAILABLE
+    assert completed == [(op_handle, _op_entries({key: OpEntryStatus.UNAVAILABLE}))]
     assert control.sent == []
 
     # A rejected remote attempt must not hide a later local deposit.
@@ -1726,7 +1743,12 @@ def test_remote_framework_dram_transfers_available_keys(
         (
             op_handle,
             _op_entries(
-                {key: index in completed_indices for index, key in enumerate(keys)}
+                {
+                    key: True
+                    if index in completed_indices
+                    else OpEntryStatus.UNAVAILABLE
+                    for index, key in enumerate(keys)
+                }
             ),
         )
     ]
@@ -1801,7 +1823,7 @@ def test_write_done_carries_failure_and_unserved_reasons():
     assert failed["reason"] == "deadline"
     served = _decode_notif(
         _write_done_notif(
-            7, True, (1,), unserved={"pin_failed": [0], "none": [2], "bad": [9]}
+            7, True, (1,), unserved={"pin_failed": [0, 9], "none": [2], "bad": [1]}
         )
     )
     # Unreported, unknown-reason and out-of-range entries fall back.
