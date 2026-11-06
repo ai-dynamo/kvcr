@@ -161,6 +161,45 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     )
 
 
+@pytest.mark.parametrize("invalid_index", [0, 1])
+def test_pinless_write_validates_only_claimed_destinations(invalid_index):
+    memory = ctypes.create_string_buffer(16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    agent.state = "DONE"
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+    )
+    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    residency = source._core._block_record_map[b"local"].local_dram
+    payload = msgspec.msgpack.decode(
+        _start_write_message(12, b"local", target_agent="target")
+    )
+    payload["keys"] = [b"missing", b"local"]
+    payload["dst_descriptors"] = [[_TransferRef("target", i)] for i in range(2)]
+    payload["dst_descriptors"][invalid_index] = [_TransferRef("target", 1024)]
+    with patch.object(
+        source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
+    ) as validate:
+        with source._core._state_lock:
+            control.incoming.append(msgspec.msgpack.encode(payload))
+            _wait_until(lambda: len(agent.xfers) == 2 or bool(agent.sent_notifs))
+        notification = (
+            agent.xfers[-1][5] if invalid_index == 0 else agent.sent_notifs[-1][1]
+        )
+        assert _decode_notif(notification)["success"] == (invalid_index == 0)
+        assert [call.args[0] for call in validate.call_args_list] == [
+            tuple(payload["dst_descriptors"][1])
+        ]
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert residency.source_readers == 0
+
+
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
 def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
