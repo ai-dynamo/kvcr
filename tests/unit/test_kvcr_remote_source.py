@@ -31,6 +31,8 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.backends import dangling_ops as dangling_module
+from kvcr.backends.dangling_ops import _DanglingOps
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -656,6 +658,106 @@ def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> N
     assert bool(refusals) is (log_level == logging.DEBUG)
     if refusals:
         assert "reason=source_stalled" in refusals[0]
+
+
+@pytest.mark.parametrize("has_local", [False, True])
+def test_empty_source_startup_does_not_arm_watchdog(monkeypatch, has_local):
+    now = 0.0
+    monkeypatch.setattr(dangling_module, "time", SimpleNamespace(monotonic=lambda: now))
+    state = SimpleNamespace(first_ready_at=None)
+    backend = SimpleNamespace(
+        _framework_pinning=False,
+        _progress_outbound=[],
+        _kvcr=SimpleNamespace(
+            config=SimpleNamespace(operation_timeout_ms=1000),
+            _local_dram=(
+                SimpleNamespace(_pools=SimpleNamespace(_source_state=state))
+                if has_local
+                else None
+            ),
+            _progress=SimpleNamespace(_first_native_work_at=None),
+        ),
+    )
+    watchdog = _DanglingOps(backend)
+    watchdog.begin_poll()
+    now = 60.0
+    watchdog.begin_poll()
+    assert watchdog.check_source_progress()
+    assert watchdog._last_progress_at is None
+    assert backend._progress_outbound == []
+
+
+@pytest.mark.parametrize(
+    "ready_at,native_at", [(10.0, None), (None, 10.0), (10.0, 10.8), (10.8, 10.0)]
+)
+@pytest.mark.parametrize("observe_late", [False, True])
+def test_source_watchdog_arms_at_earliest_event_and_latches(
+    monkeypatch, ready_at, native_at, observe_late
+):
+    now = 0.0
+    monkeypatch.setattr(dangling_module, "time", SimpleNamespace(monotonic=lambda: now))
+    state = SimpleNamespace(first_ready_at=None)
+    progress = SimpleNamespace(_first_native_work_at=None)
+    backend = SimpleNamespace(
+        _framework_pinning=False,
+        _progress_outbound=[],
+        _kvcr=SimpleNamespace(
+            config=SimpleNamespace(operation_timeout_ms=1000),
+            _local_dram=SimpleNamespace(_pools=SimpleNamespace(_source_state=state)),
+            _progress=progress,
+        ),
+    )
+    watchdog = _DanglingOps(backend)
+    watchdog.begin_poll()
+    state.first_ready_at = ready_at
+    progress._first_native_work_at = native_at
+    now = 11.1 if observe_late else 10.9
+    assert watchdog.check_source_progress() is (not observe_late)
+    assert watchdog._last_progress_at == 10.0
+    now = 11.1
+    # begin_poll must check the old epoch before recording fresh progress.
+    watchdog.begin_poll()
+    assert not watchdog.check_source_progress()
+    assert len(backend._progress_outbound) == 1
+    assert "disabled until restart" in str(backend._progress_outbound[0])
+    now = 20.0
+    watchdog.begin_poll()
+    assert not watchdog.check_source_progress()
+    assert len(backend._progress_outbound) == 1
+
+
+def test_armed_source_poll_refreshes_progress_after_eviction(monkeypatch):
+    now = 10.0
+    monkeypatch.setattr(dangling_module, "time", SimpleNamespace(monotonic=lambda: now))
+    local = ctypes.create_string_buffer(16)
+    source = _new_kvcr(
+        FakeNixlAgent(),
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        FakeBytesControl(),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), 16)]),
+    )
+    # Exercise publication and withdrawal without a racing progress poll.
+    source._core._progress.close()
+    monkeypatch.setattr(
+        "kvcr.backends.local_dram_pools.time", SimpleNamespace(monotonic=lambda: now)
+    )
+    pools = source._core._local_dram._pools
+    key = BlockKey(b"ready")
+    install_recovery_records(source._core, {key: _recovered_record(g2=[("", 0)])})
+    watchdog = source._core._remote_fw_dram._dangling_ops
+    assert watchdog.check_source_progress()
+    now = 10.5
+    watchdog.begin_poll()
+    assert watchdog._last_progress_at == 10.5
+    residency = source._core._block_record_map[key].local_dram
+    residency.retire_on_release = True
+    assert pools._after_last_claim(key, residency)
+    assert not pools._source_state.index
+    assert pools._source_state.first_ready_at == 10.0
+    now = 11.4
+    assert watchdog.check_source_progress()
+    now = 11.6
+    assert not watchdog.check_source_progress()
 
 
 def test_kvcr_close_cleans_pending_pin_operations():
