@@ -488,12 +488,15 @@ class _SourceWriteOp(_RemoteOp):
             submit_started_at = backend._kvcr._timer()
             try:
                 if not backend._framework_pinning:
+                    regions = backend._remote_agents_by_target[route_name][2]
                     for descriptors in self.dst_descriptors:
                         backend._kvcr._validate_descriptors(
                             descriptors,
-                            regions=backend._remote_agents_by_target[self.route[0]][2],
-                            agent_name=self.route[0],
+                            regions=regions,
+                            agent_name=route_name,
                         )
+                if backend._kvcr._clock() >= self.deadline:
+                    return False, True
                 status.submitted = True
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
