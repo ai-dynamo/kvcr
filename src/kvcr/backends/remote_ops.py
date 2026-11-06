@@ -319,8 +319,10 @@ class _TargetPullOp(_RemoteOp):
                             and now >= self.deadline
                         ):
                             reason = _nvtx.Reason.DEADLINE
-            invalid = False
+            invalid = type(event.get("success")) is not bool
             try:
+                if invalid:
+                    raise TypeError("invalid success flag")
                 if success:
                     completed_indices = _notification_completed_indices(
                         event, len(self.ordered_keys)
