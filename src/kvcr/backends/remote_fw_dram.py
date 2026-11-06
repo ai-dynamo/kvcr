@@ -755,12 +755,13 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            for descriptors in dst_descriptors:
-                self._kvcr._validate_descriptors(
-                    descriptors,
-                    regions=self._remote_agents_by_target[target_agent][2],
-                    agent_name=target_agent,
-                )
+            if self._framework_pinning:
+                for descriptors in dst_descriptors:
+                    self._kvcr._validate_descriptors(
+                        descriptors,
+                        regions=self._remote_agents_by_target[target_agent][2],
+                        agent_name=target_agent,
+                    )
             self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
             raise
@@ -804,12 +805,11 @@ class _RemoteFWDram:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT source_transfer_requested op=%d source_op=%d target=%s "
-                "blocks=%d bytes=%d",
+                "blocks=%d",
                 op_handle,
                 op_id[1],
                 target_agent,
                 len(keys),
-                self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
         source_write = _SourceWriteOp(
