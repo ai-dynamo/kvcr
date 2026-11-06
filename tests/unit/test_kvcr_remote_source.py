@@ -335,11 +335,9 @@ def test_pending_pinless_source_validates_before_native_submission():
         )
         agent.state = "DONE"
         _poll_until(source, lambda _: bool(agent.sent_notifs) or len(agent.xfers) > 1)
-        notification = (
-            agent.sent_notifs[-1][1] if agent.sent_notifs else agent.xfers[-1][5]
-        )
-        assert _decode_notif(notification)["success"] is False
         assert len(agent.xfers) == 1
+        assert agent.sent_notifs
+        assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
         assert validate.call_count == 1
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
     assert source._core._block_record_map[b"pending"].local_dram.claim_count == 0
