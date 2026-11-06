@@ -45,16 +45,42 @@ class _DanglingOps:
         self.sources: dict[str, str] = {}
         self.source_writes: dict[tuple[str, OpHandle], _SourceWriteStatus] = {}
         self._last_progress_at: float | None = None
+        # First progress poll: serving is active from here. Recovery and
+        # startup work before it must not count toward the operation timeout.
+        self._activated_at: float | None = None
         self._source_stalled = False
 
     def begin_poll(self) -> None:
         polled_at = time.monotonic()
+        if self._activated_at is None:
+            self._activated_at = polled_at
         self.check_source_progress()
-        self._last_progress_at = polled_at
+        if self._backend._framework_pinning:
+            self._last_progress_at = polled_at
+        elif self._last_progress_at is not None:
+            self._last_progress_at = max(polled_at, self._last_progress_at)
 
     def check_source_progress(self) -> bool:
-        if self._source_stalled or self._last_progress_at is None:
-            return not self._source_stalled
+        if self._source_stalled:
+            return False
+        if self._last_progress_at is None:
+            if self._backend._framework_pinning or self._activated_at is None:
+                return True
+            kvcr = self._backend._kvcr
+            local = kvcr._local_dram
+            ready_at = (
+                local._pools._source_state.first_ready_at if local is not None else None
+            )
+            native_at = kvcr._progress._first_native_work_at
+            first_at = min(
+                (at for at in (ready_at, native_at) if at is not None), default=None
+            )
+            if first_at is None:
+                return True
+            # Publication starts the epoch, not its later observation; data
+            # recovered before serving began starts it at activation. These
+            # one-time markers survive eviction and never reset a stall.
+            self._last_progress_at = max(first_at, self._activated_at)
         gap_ms = (time.monotonic() - self._last_progress_at) * 1000
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:

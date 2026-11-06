@@ -28,6 +28,7 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
+from kvcr.backends import local_dram_pools as pools_module
 from kvcr.backends.local_dram import _LocalCopyOp
 from kvcr.backends.local_dram_pools import (
     _layout_indices,
@@ -65,6 +66,46 @@ def test_expired_copy_logs_without_submitting(caplog):
     assert _LocalCopyOp.progress(copy, progress, None) == (True, True)
     progress.submit_transfer.assert_not_called()
     assert "local_copy_expired_before_submit op=7" in caplog.text
+
+
+def test_first_ready_publication_survives_withdrawal_and_republication(monkeypatch):
+    local = ctypes.create_string_buffer(16)
+    source = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), 16)]),
+    )
+    pools = source._core._local_dram._pools
+    state = pools._source_state
+    assert state.first_ready_at is None
+    now = 10.0
+    monkeypatch.setattr(pools_module, "time", SimpleNamespace(monotonic=lambda: now))
+    key = BlockKey(b"ready")
+    residency = _LocalDramResidency([("", 0)], _LocalDramState.FILLING)
+    pools._publish_source(key, residency)
+    assert state.first_ready_at is None
+    residency.state = _LocalDramState.READY
+    residency.pending_labels = {""}
+    pools._publish_source(key, residency)
+    assert state.first_ready_at is None
+    residency.pending_labels = None
+    residency.retire_on_release = True
+    pools._publish_source(key, residency)
+    assert state.first_ready_at is None
+    residency.retire_on_release = False
+    pools._publish_source(key, residency)
+    assert state.first_ready_at == 10.0
+    source._core._block_record_map[key] = _BlockRecord(local_dram=residency)
+    residency.retire_on_release = True
+    assert pools._after_last_claim(key, residency)
+    assert key not in state.index
+    now = 20.0
+    pools._publish_source(
+        BlockKey(b"replacement"),
+        _LocalDramResidency([("", 0)], _LocalDramState.READY),
+    )
+    assert state.first_ready_at == 10.0
 
 
 def _two_pool_kvcr(
