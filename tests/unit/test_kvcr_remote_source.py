@@ -214,6 +214,45 @@ def test_pinless_write_validates_only_claimed_destinations(
     assert residency.source_readers == 0
 
 
+def test_pinless_validation_expiry_does_not_submit_write():
+    memory = ctypes.create_string_buffer(16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+    )
+    key = BlockKey(b"local")
+    install_recovery_records(source._core, {key: _recovered_record(g2=[("", 0)])})
+    residency = source._core._block_record_map[key].local_dram
+    now = 0.0
+    source._core._clock = lambda: now
+    validate = source._core._validate_descriptors
+
+    def consume_deadline(*args, **kwargs):
+        nonlocal now
+        validate(*args, **kwargs)
+        now = 2.0
+
+    try:
+        with patch.object(
+            source._core, "_validate_descriptors", side_effect=consume_deadline
+        ) as checked:
+            control.incoming.append(
+                _start_write_message(12, key, target_agent="target")
+            )
+            _poll_until(source, lambda _: bool(agent.xfers) or bool(agent.sent_notifs))
+            assert agent.xfers == []
+            assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+            assert checked.call_count == 1
+        _poll_until(source, lambda _: not _has_outstanding_operations(source))
+        assert residency.source_readers == 0
+    finally:
+        agent.state = "DONE"
+
+
 def test_pending_pinless_source_validates_before_native_submission():
     primary, memory = ctypes.create_string_buffer(32), ctypes.create_string_buffer(32)
     agent, control = FakeNixlAgent(), FakeBytesControl()
