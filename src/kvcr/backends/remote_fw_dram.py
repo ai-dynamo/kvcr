@@ -805,12 +805,11 @@ class _RemoteFWDram:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT source_transfer_requested op=%d source_op=%d target=%s "
-                "blocks=%d bytes=%d",
+                "blocks=%d",
                 op_handle,
                 op_id[1],
                 target_agent,
                 len(keys),
-                self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
             )
 
         source_write = _SourceWriteOp(
