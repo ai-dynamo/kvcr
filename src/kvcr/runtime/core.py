@@ -1206,10 +1206,14 @@ class _KVCRCore:
             raise RuntimeError("remote fetch completed without local DRAM")
         self._local_dram.complete_fill(keys, success=success, failures=failures)
 
-    def _discard_local_dram_fill(self, keys: Collection[BlockKey]) -> None:
+    def _discard_local_dram_fill(
+        self,
+        keys: Collection[BlockKey],
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
+    ) -> None:
         if self._local_dram is None:
             raise RuntimeError("remote fetch update without local DRAM")
-        self._local_dram.discard_fill(keys)
+        self._local_dram.discard_fill(keys, failures)
 
     def _block_record(self, key: BlockKey) -> _BlockRecord:
         record = self._block_record_map.get(key)

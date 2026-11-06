@@ -393,7 +393,9 @@ class _RemoteFWDram:
                         raise RuntimeError(
                             "non-local target pull is waiting for terminal state"
                         )
-                    self._kvcr._discard_local_dram_fill(item.keys)
+                    self._kvcr._discard_local_dram_fill(
+                        item.keys, failures=item.key_results()
+                    )
                 elif item.state is _TargetPullState.QUARANTINED:
                     self._finish_target_pull(item)
                 elif item.state is _TargetPullState.FINISHED and item.uncertain:
@@ -1222,6 +1224,9 @@ class _RemoteFWDram:
                         "success", False
                     )
                     terminal |= previous.get("terminal", False)
+                    # The first failure's reason survives a later native success.
+                    if "reason" in previous:
+                        payload.setdefault("reason", previous["reason"])
                     payload.update(terminal=terminal, cancelled=cancelled)
                     events[op_id] = payload
         except Exception:

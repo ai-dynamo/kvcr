@@ -7,6 +7,7 @@ import hashlib
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import DEFAULT, Mock
 
 import msgspec
@@ -40,6 +41,7 @@ from kvcr import (
     UNSERVED_BLOCKS_METRIC,
 )
 from kvcr.backends.dangling_ops import _DanglingOps
+from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import (
     _known_reason,
     _notification_unserved,
@@ -600,9 +602,14 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         _wait_until(lambda: not target._core._progress._completed.empty())
 
     now = 1.5  # Past T, but still inside the destination's grace period.
-    assert dict(_poll_until(target, lambda completed: len(completed) == 2)) == {
+    results = dict(_poll_until(target, lambda completed: len(completed) == 2))
+    assert results == {
         fetch: _op_entries({key: False}),
         second_fetch: _op_entries({key: False}),
+    }
+    # Both waiters learn that the shared fill timed out, whichever side noticed.
+    assert {entries[key].status for entries in results.values()} == {
+        OpEntryStatus.TIMEOUT
     }
     if resolution != "queued":
         assert target.query((key,), "req") == [
@@ -656,6 +663,63 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     deposit = target.deposit({replacement: [_mem_descriptor()]})
     assert _poll_until(target, bool) == [(deposit, _op_entries({replacement: True}))]
     assert local.raw == primary.raw
+
+
+def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted():
+    now, errors = 0.0, []
+    local = ctypes.create_string_buffer(16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", 16)],
+            operation_timeout_ms=1000,
+            abandon_timeout_ms=2000,
+            enable_telemetry=True,
+        ),
+        on_resilience_event=errors.append,
+        key_adapter=_ConstantHashAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
+    )
+    target._core._clock = lambda: now
+    key = BlockKey(b"k0")
+    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    fetch = target.fetch((key,), request_id="req")
+    _wait_until(lambda: bool(control.sent))
+    handle = _decode_control_message(control.sent[0][1])["op_handle"]
+
+    # The source gives up before its transfer is known to be quiescent.
+    agent.notifs["source"] = [
+        _write_done_notif(handle, False, terminal=False, reason="cancelled")
+    ]
+    assert dict(_poll_until(target, bool))[fetch][key].status is OpEntryStatus.ABORTED
+    # The destination stays quarantined until the source proves quiescence.
+    now = 2.5
+    _poll_until(target, lambda _: bool(errors))
+    agent.notifs["source"] = [_write_done_notif(handle, False, reason="cancelled")]
+    _poll_until(target, lambda _: not _has_outstanding_operations(target))
+    assert [error.state for error in errors] == ["uncertain", "quiesced"]
+    # The block is counted once, when the pull is quarantined.
+    assert _unserved_counts(target.get_stats().records) == {
+        ("remote_fetch", "cancelled"): 1
+    }
+
+
+@pytest.mark.parametrize("failure_first", [True, False])
+def test_merged_notifications_keep_the_first_failure_reason(failure_first):
+    failed = _write_done_notif(7, False, terminal=False, reason="deadline")
+    finished = _write_done_notification(7)
+    batch = [failed, finished] if failure_first else [finished, failed]
+    progress = SimpleNamespace(
+        nixl_agent=SimpleNamespace(get_new_notifs=lambda: {"source": batch})
+    )
+    event = _RemoteFWDram._poll_notifications(Mock(), progress)[("target", 7)]
+    assert event["cancelled"] and event["terminal"]
+    assert event["reason"] == "deadline"
 
 
 def test_kvcr_deliver_propagates_source_pin_miss():

@@ -14,6 +14,7 @@ from ..runtime.progress import (
     _DROPPED_RESULT,
     _FAILED_RESULT,
     _SUCCESS_RESULT,
+    _TIMEOUT_RESULT,
     _KVCRProgress,
     _Op,
     _OpId,
@@ -528,7 +529,12 @@ class _LocalDram:
         self._kvcr._add_block_dependencies(op, new_operation=True)
         self._start_deliveries(op, blocks)
 
-    def discard_fill(self, keys: Collection[BlockKey]) -> None:
+    def discard_fill(
+        self,
+        keys: Collection[BlockKey],
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
+    ) -> None:
+        """Abandon remote fills; ``failures`` is what their waiters are told."""
         state = self._pools._source_state
         residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
@@ -569,7 +575,12 @@ class _LocalDram:
                         or residency.state is _LocalDramState.DISCARDING
                     )
                 ):
-                    residency_op.results[key] = _FAILED_RESULT
+                    # Every waiter here was waiting on the abandoned fill.
+                    residency_op.results[key] = (
+                        failures.get(key, _FAILED_RESULT)
+                        if failures
+                        else _FAILED_RESULT
+                    )
                     residency_ops[op_id] = residency_op
                 deliver_op = self._pending_deliver_ops.get(op_id)
                 if (
@@ -721,7 +732,7 @@ class _LocalDram:
                         if key_success and writer.claim_on_ready
                         else _SUCCESS_RESULT
                         if key_success
-                        else _FAILED_RESULT
+                        else failure
                     )
                     affected_residency_ops[writer.op_id] = writer
             else:
@@ -959,9 +970,11 @@ class _LocalDram:
             waiting_keys = residency_op.keys - residency_op.results.keys()
             remote_fill_keys = waiting_keys & residency_op.remote_fill_keys
             for key in waiting_keys - remote_fill_keys:
-                residency_op.results[key] = _FAILED_RESULT
+                residency_op.results[key] = _TIMEOUT_RESULT
             if remote_fill_keys:
-                self.discard_fill(remote_fill_keys)
+                self.discard_fill(
+                    remote_fill_keys, dict.fromkeys(remote_fill_keys, _TIMEOUT_RESULT)
+                )
             else:
                 self._finish_residency_if_ready(residency_op)
 

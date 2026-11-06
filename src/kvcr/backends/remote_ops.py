@@ -426,6 +426,8 @@ class _TargetPullOp(_RemoteOp):
                     )
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "timeout")
+                # Quarantine only ever ends in quiescence, so count here.
+                self._record_unserved(scope)
                 return False, True
             self.failure_reason = (
                 (_known_reason(event.get("reason")) or _nvtx.Reason.REMOTE_FAILURE.wire)
