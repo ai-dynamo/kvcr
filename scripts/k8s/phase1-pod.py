@@ -45,6 +45,13 @@ p.add_argument("--model", default="Qwen/Qwen3-0.6B")
 p.add_argument("--timeout", type=int, default=3600)
 p.add_argument("--pool-gb", type=int, default=2)
 p.add_argument("--no-batch-invariant", action="store_true")
+p.add_argument(
+    "--engine",
+    choices=("vllm", "sglang"),
+    default="vllm",
+    help="sglang: dynamo.sglang + HiCache KVCR backend image, no kvcr-service "
+    "sidecars, --mode nonguard, TC-01..03/TC-05 only",
+)
 p.add_argument("--harness-arg", action="append", default=[])
 p.add_argument("--two-node", action="store_true")
 p.add_argument(
@@ -128,7 +135,9 @@ harness = [
     "--output-dir",
     f"{evidence}/run",
     "--mode",
-    "guard",
+    "nonguard" if args.engine == "sglang" else "guard",
+    "--engine",
+    args.engine,
     "--cases",
     args.cases,
     "--timeout",
@@ -141,10 +150,11 @@ harness = [
     args.model,
     "--pool-gb",
     str(args.pool_gb),
-    "--external-services",
-    "/run/kvcr",
-    "--compatibility-digest",
-    digest,
+    *(
+        []
+        if args.engine == "sglang"
+        else ["--external-services", "/run/kvcr", "--compatibility-digest", digest]
+    ),
     *([] if args.no_batch_invariant else ["--batch-invariant"]),
 ]
 if args.two_node:
@@ -330,7 +340,9 @@ if not args.two_node:
         pod(
             run_id,
             "single",
-            [
+            []
+            if args.engine == "sglang"
+            else [
                 sidecar(0, "/run/kvcr/kvcr-service-0.log"),
                 sidecar(1, "/run/kvcr/kvcr-service-1.log"),
             ],

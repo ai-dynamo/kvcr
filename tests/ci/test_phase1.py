@@ -111,6 +111,62 @@ def test_parse_log_ignores_naive_or_partial_leading_timestamps():
     assert window.blocks(telemetry.REMOTE_DELIVER) == 0
 
 
+def test_parse_log_reads_sglang_native_stats():
+    # SGLang's KVCR backend logs one JSON payload per interval, stamped with an
+    # epoch; its tuple keys map onto the vLLM metric names the cases use, and
+    # the tier read/write bytes are derived from the KVCR transfer bytes.
+    payload = {
+        "epoch": 1790000010.25,
+        "agent": "a",
+        "endpoint": "tcp://10.0.0.1:17771",
+        "interval_seconds": 5.0,
+        "metrics": {
+            json.dumps(
+                ["counter", "kvcr_transfer_blocks", ["remote_deliver"], "value"]
+            ): 22,
+            json.dumps(["counter", "kvcr_transfer_blocks", ["local_fill"], "value"]): 2,
+            json.dumps(
+                ["counter", "kvcr_transfer_bytes", ["local_fill"], "value"]
+            ): 4096,
+            json.dumps(
+                [
+                    "histogram",
+                    "kvcr_duration_seconds",
+                    ["remote_deliver", "success"],
+                    "count",
+                ]
+            ): 1,
+            json.dumps(
+                [
+                    "histogram",
+                    "kvcr_duration_seconds",
+                    ["remote_deliver", "success"],
+                    "bucket_3",
+                ]
+            ): 1,
+            json.dumps(
+                ["gauge", "kvcr_state", ["local_g2_allocated_slots"], "value"]
+            ): 7,
+        },
+    }
+    text = (
+        "[2026-09-25 10:00:10] INFO kvcr_store: KVCR L3 ready: endpoint=x\n"
+        "[2026-09-25 10:00:10] INFO kvcr_store: KVCR L3 native stats "
+        f"{json.dumps(payload)}\n"
+    )
+    snapshots, errors = telemetry.parse_log(text)
+    assert errors == [] and len(snapshots) == 1
+    start = datetime.fromtimestamp(1790000000, tz=timezone.utc)
+    window = telemetry.window(snapshots, errors, start)
+    assert window.blocks(telemetry.REMOTE_DELIVER) == 22
+    assert window.get(telemetry.duration_count(telemetry.REMOTE_DELIVER)) == 1
+    # KVCR counts no bytes for remote_deliver: 22 blocks x (4096 / 2) per block.
+    assert window.get(telemetry.TIER_READ_BYTES) == 22 * 2048
+    assert window.get(telemetry.TIER_WRITE_BYTES) == 4096
+    assert window.gauge("local_g2_allocated_slots") == 7
+    assert snapshots[0].second_precision is False
+
+
 def test_window_sums_intervals_and_keeps_latest_gauge():
     blocks = telemetry.metric(telemetry.TRANSFER_BLOCKS, telemetry.REMOTE_DELIVER)
     gauge = telemetry.metric(telemetry.STATE, "pinned_keys")

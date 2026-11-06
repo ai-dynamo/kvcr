@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Parse vLLM reset-interval KV transfer metrics from one worker's log.
+"""Parse per-interval KVCR telemetry from one worker's log.
+
+vLLM logs ``KV Transfer metrics:`` lines (reset-interval samples of the
+connector and KVCR counters). SGLang's KVCR HiCache backend logs
+``KVCR L3 native stats {json}`` lines every few seconds with the same KVCR
+counters under JSON tuple keys; they are mapped onto the vLLM metric names so
+the cases read both engines through one window API.
 
 Each Phase 1 worker runs one data-parallel rank, so every metric line in a log
 belongs to that worker. Values are interval samples; a window sums the samples
@@ -10,6 +16,7 @@ whose timestamps fall inside [start, end]. Nothing is subtracted between lines.
 from __future__ import annotations
 
 import ast
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -53,6 +60,55 @@ TRANSFER = "transfer"
 
 
 VLLM_STAMP = re.compile(r"\b(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\b")
+SGLANG_STATS = "KVCR L3 native stats "
+
+
+def sglang_metrics(
+    payload: dict, page_bytes: dict[str, float] | None = None
+) -> dict[str, int | float]:
+    """Map one SGLang ``KVCR L3 native stats`` payload onto vLLM metric names.
+
+    The payload's ``metrics`` keys are JSON tuples ``[kind, name, labels,
+    field]`` from the backend's TelemetryStats; counters and gauges keep their
+    value, histograms keep ``count`` and ``sum`` (as ``_count`` / ``_sum``).
+    SGLang has no vLLM tiering counters, so the tier read/write bytes the cases
+    check are derived: writes are the KVCR ``local_fill`` bytes; reads are the
+    delivered blocks times the bytes per block. KVCR counts bytes for
+    ``local_fill`` and ``source_write`` but only blocks for ``remote_deliver``
+    and ``local_deliver``, so the per-block size is taken from this worker's own
+    ``local_fill`` samples (``page_bytes`` carries it between samples of one log;
+    every KVCR page of a model has the same size).
+    """
+    out: dict[str, int | float] = {}
+    for key, value in payload.get("metrics", {}).items():
+        if key == "dropped_observations":
+            out["_dropped_observations"] = value
+            continue
+        try:
+            kind, name, labels, field = json.loads(key)
+        except (ValueError, TypeError):
+            continue
+        base = metric(str(name), *[str(label) for label in labels])
+        if kind == "histogram":
+            if field in ("count", "sum"):
+                out[f"{base}_{field}"] = value
+        elif field == "value":
+            out[base] = value
+    fill_blocks = out.get(metric(TRANSFER_BLOCKS, LOCAL_FILL), 0)
+    fill_bytes = out.get(metric(TRANSFER_BYTES, LOCAL_FILL), 0)
+    if page_bytes is not None and fill_blocks and fill_bytes:
+        page_bytes["value"] = fill_bytes / fill_blocks
+    per_block = (page_bytes or {}).get("value")
+    read_bytes: float = 0
+    for scope in (REMOTE_DELIVER, LOCAL_DELIVER):
+        explicit = out.get(metric(TRANSFER_BYTES, scope))
+        if explicit is not None:
+            read_bytes += explicit
+        elif per_block is not None:
+            read_bytes += out.get(metric(TRANSFER_BLOCKS, scope), 0) * per_block
+    out[TIER_READ_BYTES] = int(read_bytes)
+    out[TIER_WRITE_BYTES] = fill_bytes
+    return out
 
 
 def parse_timestamp(stamp: str) -> datetime | None:
@@ -126,11 +182,24 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
     snapshots: list[Snapshot] = []
     errors: list[str] = []
     last_precise: datetime | None = None
+    page_bytes: dict[str, float] = {}  # SGLang: bytes per KVCR page, from local_fill
     for number, raw in enumerate(text.split("\n")[:-1], 1):
         line = ANSI.sub("", raw).strip()
         precise = precise_stamp(line)
         if precise is not None and (last_precise is None or precise > last_precise):
             last_precise = precise
+        if SGLANG_STATS in line:
+            # SGLang: one JSON payload per interval, stamped with an epoch.
+            try:
+                payload = json.loads(line.split(SGLANG_STATS, 1)[1].strip())
+                stamp = datetime.fromtimestamp(float(payload["epoch"]), tz=timezone.utc)
+            except (ValueError, KeyError, TypeError):
+                errors.append(f"line {number}: unparsable SGLang KVCR stats payload")
+                continue
+            snapshots.append(
+                Snapshot(stamp, number, sglang_metrics(payload, page_bytes))
+            )
+            continue
         if "KV Transfer metrics:" not in line:
             continue
         stamp = line_timestamp(line)
