@@ -155,6 +155,13 @@ def _use_nixl_agent(agent):
         yield
 
 
+def _invalidate(kvcr: KVCR, keys: Collection[BlockKey]) -> None:
+    """Exercise the internal invalidation mechanism under its owner lock."""
+    core = kvcr._core
+    with core._state_lock:
+        core._invalidation_handler.submit(keys)
+
+
 def _poll_until(
     kvcr: KVCR,
     predicate,

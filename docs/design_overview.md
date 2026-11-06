@@ -263,7 +263,7 @@ Failed or conflicting advice does not prevent local cache hits. `discard_hint` c
 
 ### Peer control and liveness
 
-The router is never on the data path: KVCR instances execute transfers peer-to-peer via NIXL. Source endpoints remain request-scoped rather than becoming part of global block state, so this coordination adds no KVCR-side peer inventory.
+The router is never on the data path: KVCR instances execute transfers peer-to-peer via NIXL. Source endpoints belong to request advice or an independent operation rather than global block state, so this coordination adds no KVCR-side peer inventory.
 
 Peer transfers use a separate control channel for connection metadata, acknowledgements, and transfer control; payload bytes move directly through NIXL and never traverse the router or control channel. Peer-protocol versioning and compatibility checks may be added as needed.
 
