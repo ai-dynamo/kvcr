@@ -1535,10 +1535,13 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
     [("abc", (0, 1, 2)), ("ca", (2, 0)), ("x", ())],
     ids=["whole", "partial", "unknown"],
 )
+@pytest.mark.parametrize("g2_only", [False, True])
 def test_a_resumed_write_holds_a_pin_another_operation_acquired(
-    parts, selected
+    parts, selected, g2_only
 ) -> None:
-    """fw_mem belongs to the block, so two writes can want the same pin."""
+    """fw_mem belongs to the block; G2-only writes must not borrow its pin."""
+    if g2_only:
+        selected = ()
     backend = object.__new__(_RemoteFWDram)
     kvcr = object.__new__(_KVCRCore)
     kvcr._block_record_map = {}
@@ -1576,6 +1579,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
         op_id=("source", 1),
         keys=frozenset((key,)),
         framework_pins={stale},
+        g2_only=g2_only,
     )
     backend._sources._source_pin_ops[("source", 1)] = waiting
 
