@@ -91,9 +91,15 @@ class TransferError(RuntimeError):
 
 
 class OpEntryStatus(Enum):
-    # TODO: Add specific statuses for timeout, abort, capacity, and unavailable sources.
     SUCCESS = "SUCCESS"
     DROPPED = "DROPPED"
+    # Not deliverable (miss, no route, or the peer could not serve it); nothing
+    # on this worker broke, so the caller just recomputes.
+    UNAVAILABLE = "UNAVAILABLE"
+    TIMEOUT = "TIMEOUT"
+    # Given up deliberately, or the peer could not run the transfer.
+    ABORTED = "ABORTED"
+    # A fault on this worker.
     FAILED = "FAILED"
 
 

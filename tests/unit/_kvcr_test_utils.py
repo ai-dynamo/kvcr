@@ -500,11 +500,18 @@ def _write_done_notification(
 
 
 def _op_entries(
-    entries: Mapping[BlockKey, bool],
+    entries: Mapping[BlockKey, bool | OpEntryStatus],
 ) -> dict[BlockKey, OpEntryResult]:
+    """True and False are SUCCESS and FAILED; pass a status for other outcomes."""
     return {
-        key: OpEntryResult(OpEntryStatus.SUCCESS if success else OpEntryStatus.FAILED)
-        for key, success in entries.items()
+        key: OpEntryResult(
+            OpEntryStatus.SUCCESS
+            if outcome is True
+            else OpEntryStatus.FAILED
+            if outcome is False
+            else outcome
+        )
+        for key, outcome in entries.items()
     }
 
 

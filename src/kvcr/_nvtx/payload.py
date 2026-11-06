@@ -18,6 +18,8 @@ class Status(IntEnum):
     REJECTED = 7
     AMBIGUOUS = 8
     UNRESOLVED = 9
+    # The source answered but served none of the blocks; nothing broke.
+    MISS = 10
 
 
 class Reason(IntEnum):
@@ -42,6 +44,25 @@ class Reason(IntEnum):
     SOURCE_STALLED = 18
     HINT_UNAVAILABLE = 19
     HINT_CONFLICT = 20
+    # Why a source left blocks out; names match the write_done unserved reasons.
+    NOT_RESIDENT = 21
+    PIN_FAILED = 22
+    LAYOUT_MISMATCH = 23
+    # Remaining write_done and pull reasons, so this enum is their only vocabulary.
+    STOPPING = 24
+    TRANSFER_FAILED = 25
+    MALFORMED = 26
+    SETUP_FAILED = 27
+    REMEMBERED_MISS = 28
+    HINT_INVALIDATED = 29
+    REFUSED = 30
+    METADATA_REQUIRED = 31
+    SOURCE_RESTARTED = 32
+
+    @property
+    def wire(self) -> str:
+        """Name used in write_done messages, logs and metric labels."""
+        return self.name.lower()
 
 
 class _ThreadBuffers(local):

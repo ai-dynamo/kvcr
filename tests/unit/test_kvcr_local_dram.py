@@ -1153,7 +1153,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     agent.state = "DONE"
     now = 0.25
     assert _poll_until(kvcr, lambda results: bool(results)) == [
-        (deliver, _op_entries({first_key: True, second_key: False}))
+        (deliver, _op_entries({first_key: True, second_key: OpEntryStatus.UNAVAILABLE}))
     ]
     assert destination.raw[:block_size] == b"a" * block_size
     assert agent.xfer_backends and all(

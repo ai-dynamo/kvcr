@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from .. import _nvtx
 from ..runtime.core import logger
 from ..types import MemoryRef, OpHandle, TransferError
 from .remote_ops import _WriteProbe, _WriteProbeAck
@@ -80,7 +81,12 @@ class _DanglingOps:
                 + (config.abandon_timeout_ms - config.operation_timeout_ms) / 1000
             )
             self._backend._send_write_done(
-                progress, op.remote_agent, op.op_handle, False, terminal=False
+                progress,
+                op.remote_agent,
+                op.op_handle,
+                False,
+                terminal=False,
+                reason=op.abort_reason(status.cancel_requested),
             )
         result = progress.poll_transfer(
             cast(int, op.transfer_id), require_completion=True
@@ -220,6 +226,9 @@ class _DanglingOps:
         if expected and payload.dead_incarnation == expected:
             # Guard verifies death of this process, not just an expired heartbeat.
             self.sources[endpoint] = incarnation
-            self._backend._refused_writes[("target", handle)] = {"success": False}
+            self._backend._refused_writes[("target", handle)] = {
+                "success": False,
+                "reason": _nvtx.Reason.SOURCE_RESTARTED.wire,
+            }
         elif expected == incarnation and terminal:
             self._backend._refused_writes[("target", handle)] = {"success": False}

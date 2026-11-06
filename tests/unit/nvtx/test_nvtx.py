@@ -124,7 +124,7 @@ def test_shared_pin_has_one_lifetime_and_two_waiter_associations(recording, requ
     assert not recording.stack
 
 
-@pytest.mark.parametrize("finish", ["success", "failed", "timeout", "cancelled"])
+@pytest.mark.parametrize("finish", ["success", "miss", "timeout", "cancelled"])
 def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     source, agent, pinning = make_source()
     backend = source._core._remote_fw_dram
@@ -132,7 +132,7 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     if finish == "success":
         pinning.complete(0)
         _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    elif finish == "failed":
+    elif finish == "miss":
         pinning.completed.append((0, None))
         _poll_until(source, lambda _: not backend._sources._pending_pin_ops)
     elif finish == "timeout":
@@ -148,13 +148,13 @@ def test_terminal_pin_event_is_not_duplicated_by_late_result(recording, finish):
     assert int(completed[0]["status"]) == int(
         {
             "success": _nvtx.Status.SUCCESS,
-            "failed": _nvtx.Status.FAILED,
+            "miss": _nvtx.Status.MISS,
             "timeout": _nvtx.Status.TIMEOUT,
             "cancelled": _nvtx.Status.CANCELLED,
         }[finish]
     )
-    if finish == "failed":
-        assert int(completed[0]["reason"]) == int(_nvtx.Reason.UNKNOWN)
+    if finish == "miss":
+        assert int(completed[0]["reason"]) == int(_nvtx.Reason.NOT_RESIDENT)
     assert not recording.stack
 
 
@@ -237,7 +237,7 @@ def test_callback_failure_is_correlated_before_registration(recording):
     assert not recording.stack
 
 
-def test_partial_result_counts_available_blocks_without_guessing_cause(recording):
+def test_partial_result_counts_available_blocks_and_source_reported_cause(recording):
     agent, pinning, control = (
         FakeNixlAgent(),
         PendingPrimaryPinning(),
@@ -252,12 +252,16 @@ def test_partial_result_counts_available_blocks_without_guessing_cause(recording
     agent.state = "DONE"
     pinning.complete(0, missing_indices=(1,))
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    for name in ("source.pin.completed", "source.write.completed"):
+    # The pin result gives no cause; the source write knows the block was absent.
+    for name, reason in (
+        ("source.pin.completed", _nvtx.Reason.UNKNOWN),
+        ("source.write.completed", _nvtx.Reason.NOT_RESIDENT),
+    ):
         event = payloads(recording, name)[0]
         assert int(event["requested_blocks"]) == 2
         assert int(event["completed_blocks"]) == 1
         assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
-        assert int(event["reason"]) == int(_nvtx.Reason.UNKNOWN)
+        assert int(event["reason"]) == int(reason)
 
 
 def test_invalid_result_has_bounded_reason_and_releases_handle(recording):
