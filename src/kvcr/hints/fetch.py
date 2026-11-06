@@ -38,13 +38,8 @@ class _KVFetchHint(msgspec.Struct, frozen=True):
 def _parse_kv_fetch(
     action_id: str | None, payload: Mapping[str, object]
 ) -> _KVFetchHint:
-    # TODO: Add mode and no_retain when KVCR starts consuming them.
     if "no_retain" in payload:
         raise ValueError("no_retain is not currently supported")
-
-    mode = payload.get("mode", "copy")
-    if mode != "copy":
-        raise ValueError("only copy mode is currently supported")
 
     source = payload.get("source_control_endpoint")
     if source is None:

@@ -110,7 +110,14 @@ class FrameworkControl(Protocol):
 
 
 class KeyAdapter(Protocol):
-    """Convert between KVCR BlockKey and external key representations."""
+    """Convert between KVCR storage keys and external key representations.
+
+    ``BlockKey`` is the key KVCR uses for storage. A framework key is the key
+    the framework uses to identify its stored blocks. Here, a router key means
+    the external block hash published to the Dynamo router
+    (``ExternalSequenceBlockHash``), currently an unsigned 64-bit integer.
+    Dynamo's internal router keys are separate from this published hash.
+    """
 
     def encode_to_framework(self, key: BlockKey) -> object: ...
 
