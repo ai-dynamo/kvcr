@@ -251,6 +251,47 @@ def test_pinless_write_validates_only_claimed_destinations(invalid_index):
     assert residency.source_readers == 0
 
 
+def test_pending_pinless_source_validates_before_native_submission():
+    primary, memory = ctypes.create_string_buffer(32), ctypes.create_string_buffer(32)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(primary, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 32)]),
+    )
+    source.deposit(
+        {b"pending": [_mem_descriptor(i, end_point_name="source") for i in range(2)]}
+    )
+    _wait_until(lambda: len(agent.xfers) == 1)
+    payload = msgspec.msgpack.decode(
+        _start_write_message(12, b"pending", target_agent="target")
+    )
+    payload["dst_descriptors"] = [
+        [_TransferRef("target", 0), _TransferRef("foreign", 1)]
+    ]
+    with patch.object(
+        source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
+    ) as validate:
+        control.incoming.append(msgspec.msgpack.encode(payload))
+        _poll_until(
+            source,
+            lambda _: bool(source._core._remote_fw_dram._sources._source_pin_ops),
+        )
+        agent.state = "DONE"
+        _poll_until(source, lambda _: bool(agent.sent_notifs) or len(agent.xfers) > 1)
+        notification = (
+            agent.sent_notifs[-1][1] if agent.sent_notifs else agent.xfers[-1][5]
+        )
+        assert _decode_notif(notification)["success"] is False
+        assert len(agent.xfers) == 1
+        assert validate.call_count == 1
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert source._core._block_record_map[b"pending"].local_dram.claim_count == 0
+
+
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
 def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered):
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
