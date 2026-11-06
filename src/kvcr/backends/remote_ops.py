@@ -448,8 +448,15 @@ class _SourceWriteOp(_RemoteOp):
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
-            status.submitted = True
             try:
+                if not backend._framework_pinning:
+                    for descriptors in self.dst_descriptors:
+                        backend._kvcr._validate_descriptors(
+                            descriptors,
+                            regions=backend._remote_agents_by_target[self.route[0]][2],
+                            agent_name=self.route[0],
+                        )
+                status.submitted = True
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
                     tuple(chain.from_iterable(self.src_descriptors)),
