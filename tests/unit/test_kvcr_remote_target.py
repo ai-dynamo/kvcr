@@ -484,7 +484,7 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
             release_handles.append(results[key].release_handle)
         else:
             # The fill reports the source's per-key reason, as deliver does.
-            assert results[key] == OpEntryResult(OpEntryStatus.SRC_MISS)
+            assert results[key] == OpEntryResult(OpEntryStatus.UNAVAILABLE)
     assert target.query(keys, "req") == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
@@ -715,7 +715,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
     completed = _poll_until(target, lambda completed: bool(completed))
     assert completed == [(op_handle, _op_entries({key: False}))]
-    assert completed[0][1][key].status is OpEntryStatus.SRC_MISS
+    assert completed[0][1][key].status is OpEntryStatus.UNAVAILABLE
     assert target.query((key, other_group), "req") == [
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -767,9 +767,14 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert ("source_write", "miss") in _duration_labels(source_records)
     assert ("remote_deliver", "miss") in _duration_labels(target_records)
     assert ("remote_deliver", "failed") not in _duration_labels(target_records)
-    unserved = ("counter", UNSERVED_BLOCKS_METRIC, 1)
-    assert (*unserved, ("source_write", "not_resident")) in source_records
-    assert (*unserved, ("remote_deliver", "not_resident")) in target_records
+    # Only the target counts undelivered blocks; the source has its result label.
+    assert not any(name == UNSERVED_BLOCKS_METRIC for _, name, _, _ in source_records)
+    assert (
+        "counter",
+        UNSERVED_BLOCKS_METRIC,
+        1,
+        ("remote_deliver", "not_resident"),
+    ) in target_records
 
 
 def _duration_labels(records) -> set[tuple[str, ...]]:
@@ -1457,7 +1462,7 @@ def test_kvcr_deliver_fails_closed_when_hint_source_missing():
 
     completed = list(kvcr.poll_completed())
     assert completed == [(op_handle, _op_entries({key: False}))]
-    assert completed[0][1][key].status is OpEntryStatus.NO_HINT
+    assert completed[0][1][key].status is OpEntryStatus.UNAVAILABLE
     assert control.sent == []
 
     # A rejected remote attempt must not hide a later local deposit.
@@ -1532,7 +1537,9 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
     kvcr.submit_hint(_router_hint("tcp://different:1"), request_id="req-a")
     assert kvcr.query((key,), "req-a") == [(QueryStatus.MISS, None)]
     failed = kvcr.deliver({key: [_mem_descriptor(0, ":a")]}, "req-a")
-    assert dict(_poll_until(kvcr, bool))[failed][key].status is OpEntryStatus.HINT_STALE
+    assert (
+        dict(_poll_until(kvcr, bool))[failed][key].status is OpEntryStatus.UNAVAILABLE
+    )
     kvcr.discard_hint("req-a")
     assert kvcr.query((key,), "req-a") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert kvcr.query((key,), "req-b") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)]
@@ -1796,7 +1803,7 @@ def test_remembered_miss_survives_a_failed_pull():
     agent.notifs["source"] = [_write_done_notif(second, False, reason="deadline")]
     results = dict(_poll_until(kvcr, bool))[second]
     assert results[served].status is OpEntryStatus.TIMEOUT
-    assert results[missing].status is OpEntryStatus.KNOWN_MISS
+    assert results[missing].status is OpEntryStatus.UNAVAILABLE
     # Every requested key is counted once, by its own reason.
     records = kvcr.get_stats().records
     # A source timeout is labelled as one, not as a failure.

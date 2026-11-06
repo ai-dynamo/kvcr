@@ -93,17 +93,13 @@ class TransferError(RuntimeError):
 class OpEntryStatus(Enum):
     SUCCESS = "SUCCESS"
     DROPPED = "DROPPED"
-
-    # The block was not served; the transfer itself did not break.
-    SRC_MISS = "SRC_MISS"
-    KNOWN_MISS = "KNOWN_MISS"
-    NO_HINT = "NO_HINT"
-    HINT_STALE = "HINT_STALE"
-    PIN_ERR = "PIN_ERR"
-    BAD_LAYOUT = "BAD_LAYOUT"
-
+    # Not deliverable (miss, no route, or the peer could not serve it); nothing
+    # on this worker broke, so the caller just recomputes.
+    UNAVAILABLE = "UNAVAILABLE"
     TIMEOUT = "TIMEOUT"
+    # Given up deliberately, or the peer could not run the transfer.
     ABORTED = "ABORTED"
+    # A fault on this worker.
     FAILED = "FAILED"
 
 

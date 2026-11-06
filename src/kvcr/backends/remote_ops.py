@@ -16,6 +16,7 @@ from .. import _nvtx
 from ..runtime.core import TRANSFER_BLOCKS_METRIC, UNSERVED_BLOCKS_METRIC, logger
 from ..runtime.progress import (
     _FAILED_RESULT,
+    _SUCCESS_RESULT,
     _KVCRProgress,
     _ProgressOp,
     _RegionMaps,
@@ -81,15 +82,18 @@ _ControlMessage = (
 _CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
 
 
-# Wire, log and metric reasons stay finer; callers get the status. Unlisted
-# reasons, including unknown peer-sent ones, are FAILED.
+# Callers get a status that says what to do; the finer reasons stay on the
+# wire, in logs and in metric labels. Each worker reports its own health: a
+# block the source could not serve is UNAVAILABLE here, a source-side fault is
+# a transfer that did not happen (ABORTED), and FAILED is kept for faults on
+# this worker, including any reason not listed.
 _STATUS_BY_REASON = {
-    _nvtx.Reason.NOT_RESIDENT: OpEntryStatus.SRC_MISS,
-    _nvtx.Reason.REMEMBERED_MISS: OpEntryStatus.KNOWN_MISS,
-    _nvtx.Reason.HINT_UNAVAILABLE: OpEntryStatus.NO_HINT,
-    _nvtx.Reason.HINT_INVALIDATED: OpEntryStatus.HINT_STALE,
-    _nvtx.Reason.PIN_FAILED: OpEntryStatus.PIN_ERR,
-    _nvtx.Reason.LAYOUT_MISMATCH: OpEntryStatus.BAD_LAYOUT,
+    _nvtx.Reason.NOT_RESIDENT: OpEntryStatus.UNAVAILABLE,
+    _nvtx.Reason.REMEMBERED_MISS: OpEntryStatus.UNAVAILABLE,
+    _nvtx.Reason.HINT_UNAVAILABLE: OpEntryStatus.UNAVAILABLE,
+    _nvtx.Reason.HINT_INVALIDATED: OpEntryStatus.UNAVAILABLE,
+    _nvtx.Reason.PIN_FAILED: OpEntryStatus.UNAVAILABLE,
+    _nvtx.Reason.LAYOUT_MISMATCH: OpEntryStatus.UNAVAILABLE,
     _nvtx.Reason.DEADLINE: OpEntryStatus.TIMEOUT,
     _nvtx.Reason.SOURCE_STALLED: OpEntryStatus.TIMEOUT,
     _nvtx.Reason.CANCELLED: OpEntryStatus.ABORTED,
@@ -97,30 +101,54 @@ _STATUS_BY_REASON = {
     _nvtx.Reason.SHUTDOWN: OpEntryStatus.ABORTED,
     _nvtx.Reason.ROUTE_CHANGED: OpEntryStatus.ABORTED,
     _nvtx.Reason.REFUSED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.SOURCE_RESTARTED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.METADATA_REQUIRED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.CREATE_ERROR: OpEntryStatus.ABORTED,
+    _nvtx.Reason.TRANSFER_FAILED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.SETUP_FAILED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.MALFORMED: OpEntryStatus.ABORTED,
+    _nvtx.Reason.REMOTE_FAILURE: OpEntryStatus.ABORTED,
+    _nvtx.Reason.UNKNOWN: OpEntryStatus.ABORTED,
 }
-_FAILED_RESULTS = {
+_RESULTS = {
     reason.wire: OpEntryResult(status) for reason, status in _STATUS_BY_REASON.items()
 }
-
-
-# Duration result labels name the outcome, so "failed" stays for real faults.
-_OUTCOME_BY_STATUS = {
-    OpEntryStatus.SRC_MISS: "miss",
-    OpEntryStatus.KNOWN_MISS: "miss",
-    OpEntryStatus.NO_HINT: "unavailable",
-    OpEntryStatus.HINT_STALE: "unavailable",
-    OpEntryStatus.BAD_LAYOUT: "incompatible",
+_UNAVAILABLE_RESULT = OpEntryResult(OpEntryStatus.UNAVAILABLE)
+_MISS_REASONS = frozenset(
+    (_nvtx.Reason.NOT_RESIDENT.wire, _nvtx.Reason.REMEMBERED_MISS.wire)
+)
+# Duration result labels: "failed" is kept for this worker's own faults.
+_LABEL_BY_STATUS = {
+    OpEntryStatus.UNAVAILABLE: "unavailable",
     OpEntryStatus.TIMEOUT: "timeout",
     OpEntryStatus.ABORTED: "aborted",
 }
+# The source labels these as its own faults; the target does not (see above).
+_SOURCE_FAULTS = frozenset(
+    reason.wire
+    for reason in (
+        _nvtx.Reason.PIN_FAILED,
+        _nvtx.Reason.LAYOUT_MISMATCH,
+        _nvtx.Reason.CREATE_ERROR,
+        _nvtx.Reason.TRANSFER_FAILED,
+        _nvtx.Reason.SETUP_FAILED,
+        _nvtx.Reason.MALFORMED,
+    )
+)
 
 
 def _failed_result(reason: str | None) -> OpEntryResult:
-    return _FAILED_RESULTS.get(reason or "", _FAILED_RESULT)
+    return _RESULTS.get(reason or "", _FAILED_RESULT)
 
 
 def _outcome(reason: str | None) -> str:
-    return _OUTCOME_BY_STATUS.get(_failed_result(reason).status, "failed")
+    if reason in _MISS_REASONS:
+        return "miss"
+    return _LABEL_BY_STATUS.get(_failed_result(reason).status, "failed")
+
+
+def _source_outcome(reason: str | None) -> str:
+    return "failed" if reason in _SOURCE_FAULTS else _outcome(reason)
 
 
 class _TargetPullState(Enum):
@@ -339,13 +367,16 @@ class _TargetPullOp(_RemoteOp):
                     len(completed_keys),
                     (scope,),
                 )
-            # "miss": the source answered but held none of the blocks.
+            # Zero blocks from a source that answered: a miss, or unavailable
+            # when it held them but could not serve them.
             result = (
                 "success"
                 if all_completed
                 else "partial"
                 if completed_keys
                 else "miss"
+                if success and _dominant_wire(self.unserved.values()) in _MISS_REASONS
+                else "unavailable"
                 if success
                 else _outcome(self.failure_reason)
             )
@@ -445,6 +476,19 @@ class _TargetPullOp(_RemoteOp):
             )
         return counts
 
+    def key_results(self) -> dict[BlockKey, OpEntryResult]:
+        """Per-key results: delivered, unavailable, or the operation's failure."""
+        completed = self.completed_keys if self.success else ()
+        failure = _failed_result(self.failure_reason)
+        return {
+            key: _SUCCESS_RESULT
+            if key in completed
+            else _UNAVAILABLE_RESULT
+            if key in self.unserved
+            else failure
+            for key in self.keys
+        }
+
 
 @dataclass(slots=True)
 class _NvtxState:
@@ -517,11 +561,11 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 self.success = False
                 self.state = _SourceWriteState.FINISHED
-                wire_reason = _wire_reason(failure_reason) or _nvtx.Reason.UNKNOWN.wire
                 backend._record_progress_duration(
-                    "source_write", self.started_at, _outcome(wire_reason)
+                    "source_write",
+                    self.started_at,
+                    _source_outcome(_wire_reason(failure_reason)),
                 )
-                self._record_unserved(wire_reason)
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
                     trace.complete_source(False, 0, reason=failure_reason)
@@ -551,11 +595,15 @@ class _SourceWriteOp(_RemoteOp):
                 )
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
-                backend._record_progress_duration(
-                    "source_write", self.started_at, "miss"
+                # Nothing to write: a miss, or this source's own fault.
+                result = _source_outcome(
+                    _dominant_wire(self._unserved_reasons())
+                    or _nvtx.Reason.NOT_RESIDENT.wire
                 )
-                self._record_unserved()
-                self._log_completed("miss")
+                backend._record_progress_duration(
+                    "source_write", self.started_at, result
+                )
+                self._log_completed(result)
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
                     trace.complete_source(
@@ -616,7 +664,6 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
-                self._record_unserved(_nvtx.Reason.CREATE_ERROR.wire)
                 self.state = _SourceWriteState.FINISHED
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
@@ -663,9 +710,12 @@ class _SourceWriteOp(_RemoteOp):
                 False,
                 reason=failure_reason,
             )
-        result = "success" if self.success else _outcome(failure_reason)
+        result = (
+            ("partial" if self.unserved else "success")
+            if self.success
+            else _source_outcome(failure_reason)
+        )
         backend._record_progress_duration("source_write", self.started_at, result)
-        self._record_unserved(failure_reason)
         self._log_completed(result)
         self.state = _SourceWriteState.FINISHED
         backend._dangling_ops.finish_source(self)
@@ -678,18 +728,6 @@ class _SourceWriteOp(_RemoteOp):
                 else None,
             )
         return True, True
-
-    def _record_unserved(self, failure_reason: str | None = None) -> None:
-        """Count left-out keys by reason, and on failure the rest under it."""
-        counts = Counter(
-            {reason: len(indices) for reason, indices in self.unserved.items()}
-        )
-        if failure_reason is not None:
-            counts[failure_reason] += len(self.keys) - sum(counts.values())
-        for reason, count in counts.items():
-            self._backend._record_progress_counter(
-                UNSERVED_BLOCKS_METRIC, count, ("source_write", reason)
-            )
 
     def _unserved_reasons(self) -> Iterator[str]:
         for reason, indices in self.unserved.items():
@@ -791,9 +829,13 @@ def _nvtx_reason(reason: str | None) -> _nvtx.Reason:
     return _nvtx.Reason.__members__.get((reason or "").upper(), _nvtx.Reason.UNKNOWN)
 
 
-def _dominant_reason(reasons: Iterable[str]) -> _nvtx.Reason:
+def _dominant_wire(reasons: Iterable[str]) -> str | None:
     most_common = Counter(reasons).most_common(1)
-    return _nvtx_reason(most_common[0][0]) if most_common else _nvtx.Reason.UNKNOWN
+    return most_common[0][0] if most_common else None
+
+
+def _dominant_reason(reasons: Iterable[str]) -> _nvtx.Reason:
+    return _nvtx_reason(_dominant_wire(reasons))
 
 
 def _wire_reason(reason: _nvtx.Reason) -> str | None:

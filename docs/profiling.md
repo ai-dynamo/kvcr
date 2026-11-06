@@ -97,7 +97,7 @@ Pin events use the [schema 3 context join](nvtx-events.md#payloads-and-identitie
 
 Join pins by `(instance_hi, instance_lo, pin_id)`, not framework request ID alone. Handles are not globally unique across targets; no request, session or parent identity is inferred from them.
 
-Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`, `6=cancelled`, `10=miss`. For a nonempty request, a pin or source that answered with zero usable blocks is a miss, not a failure; a positive subset is partial. An empty request with zero completed blocks remains success. The reason code carries the most common reason the source reported for missing blocks (`21=not_resident`, `22=pin_failed`, `23=layout_mismatch`), or `0=unknown` when none was reported.
+Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`, `6=cancelled`, `10=miss`. For a nonempty request, a pin or source that answered with zero usable blocks is a miss when the reason is a miss (not resident or unknown) and failed when it is the framework's or source's fault (pin failed, layout mismatch); a positive subset is partial. An empty request with zero completed blocks remains success. The reason code carries the most common reason the source reported for missing blocks (`21=not_resident`, `22=pin_failed`, `23=layout_mismatch`), or `0=unknown` when none was reported.
 
 Reason codes: `0=unknown`, `1=none`, `2=callback_error`, `3=duplicate_request`, `4=invalid_result`, `5=deadline`, `6=cancelled`, `7=shutdown`, `8=no_waiters`. A framework result of `None` gives no failure cause: it is **not** evidence of cache pressure. Callback errors identify the stage, not an underlying diagnosis. Exception strings are not recorded.
 

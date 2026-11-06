@@ -19,7 +19,13 @@ from ..types import OpEntryStatus
 from .payload import Reason, Status, _PayloadEmitter
 from .pin import _PinTrace
 
-_MISS_STATUSES = (OpEntryStatus.SRC_MISS, OpEntryStatus.KNOWN_MISS)
+# Zero blocks for one of these reasons is a miss; for any other, a failure.
+_MISS_REASONS = (
+    Reason.NOT_RESIDENT,
+    Reason.REMEMBERED_MISS,
+    Reason.UNKNOWN,
+    Reason.NONE,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _WARNED: set[str] = set()
@@ -320,7 +326,10 @@ class _LifecycleTrace:
                 if completed
                 else Status.MISS
                 if entries
-                and all(entry.status in _MISS_STATUSES for entry in entries.values())
+                and all(
+                    entry.status is OpEntryStatus.UNAVAILABLE
+                    for entry in entries.values()
+                )
                 else Status.FAILED,
                 reason=Reason.NONE if all_completed else self.failure_reason,
                 completed_blocks=completed,
@@ -363,7 +372,7 @@ class _LifecycleTrace:
                 else Status.PARTIAL
                 if complete
                 else Status.MISS
-                if op.success
+                if op.success and reason in _MISS_REASONS
                 else Status.FAILED,
                 reason=reason,
                 completed_blocks=complete,
@@ -375,11 +384,17 @@ class _LifecycleTrace:
     def complete_source(self, success, blocks, *, reason=None):
         requested = self.requested_blocks
         status = Status.SUCCESS if success else Status.FAILED
-        if success and blocks < requested:
-            status = Status.MISS if blocks == 0 else Status.PARTIAL
         if reason is None:
             reason = (
                 Reason.NONE if success and blocks >= requested else self.failure_reason
+            )
+        if success and blocks < requested:
+            status = (
+                Status.PARTIAL
+                if blocks
+                else Status.MISS
+                if reason in _MISS_REASONS
+                else Status.FAILED
             )
         try:
             self.mark(

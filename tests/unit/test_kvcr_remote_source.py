@@ -175,11 +175,21 @@ def test_framework_pinning_disabled(
         assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
     records = source.get_stats().records
-    assert [
-        (labels[1], value)
-        for kind, name, value, labels in records
-        if name == UNSERVED_BLOCKS_METRIC
-    ] == [(reason, len(indices)) for reason, indices in unserved.items()]
+    # The source labels its own view: a layout mismatch is its fault, a block it
+    # does not hold is a miss. Undelivered blocks are counted on the target only.
+    expected = (
+        "success"
+        if not unserved
+        else "partial"
+        if completed_indices
+        else "miss"
+        if "not_resident" in unserved
+        else "failed"
+    )
+    assert ("source_write", expected) in {
+        labels for _, name, _, labels in records if name == DURATION_METRIC
+    }
+    assert not any(name == UNSERVED_BLOCKS_METRIC for _, name, _, _ in records)
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (
@@ -960,12 +970,12 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         "success": False,
         "reason": "create_error" if failure == "initialize" else "transfer_failed",
     }
-    # The block the source selected is counted under the failure reason.
-    assert [
-        (labels, value)
-        for _, name, value, labels in kvcr.get_stats().records
-        if name == UNSERVED_BLOCKS_METRIC
-    ] == [(("source_write", _decode_notif(notif)["reason"]), 1)]
+    # The source reports its own fault; only the target counts undelivered blocks.
+    records = kvcr.get_stats().records
+    assert ("histogram", DURATION_METRIC, ("source_write", "failed")) in {
+        (kind, name, labels) for kind, name, _, labels in records
+    }
+    assert not any(name == UNSERVED_BLOCKS_METRIC for _, name, _, _ in records)
     assert source_agent.released_xfers == ([] if failure == "initialize" else [1])
     assert not _has_outstanding_operations(kvcr)
 

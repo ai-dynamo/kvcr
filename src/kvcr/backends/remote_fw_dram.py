@@ -31,7 +31,6 @@ from ..runtime.core import (
     logger,
 )
 from ..runtime.progress import (
-    _SUCCESS_RESULT,
     _KVCRProgress,
     _OpId,
     _RegionMaps,
@@ -474,6 +473,7 @@ class _RemoteFWDram:
                     hint,
                     missing_keys=(hint.missing_keys | op.keys) - completed_keys,
                 )
+            results = op.key_results()
             if op.local_fill:
                 if op.state is _TargetPullState.QUARANTINED:
                     # DISCARDING already failed callers, but still owns the slots.
@@ -483,27 +483,15 @@ class _RemoteFWDram:
                         tuple(key for key in op.ordered_keys if key in completed_keys),
                         success=True,
                     )
-                if completed_keys != op.keys:
+                failures = {
+                    key: result for key, result in results.items() if not result.success
+                }
+                if failures:
                     kvcr._complete_local_dram_fill(
-                        op.keys - completed_keys,
-                        success=False,
-                        failures={
-                            key: _failed_result(
-                                op.unserved.get(key) or op.failure_reason
-                            )
-                            for key in op.keys - completed_keys
-                        },
+                        failures.keys(), success=False, failures=failures
                     )
                 return
-            kvcr._complete(
-                cast(OpHandle, op.op_id[1]),
-                {
-                    key: _SUCCESS_RESULT
-                    if key in completed_keys
-                    else _failed_result(op.unserved.get(key) or op.failure_reason)
-                    for key in op.keys
-                },
-            )
+            kvcr._complete(cast(OpHandle, op.op_id[1]), results)
         finally:
             if trace is not None:
                 trace.tracer.pop(pushed)
