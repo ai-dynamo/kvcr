@@ -419,6 +419,42 @@ def test_progress_reports_rejected_transfer_submission() -> None:
     assert not success
 
 
+@pytest.mark.parametrize("remote_agent", ["remote-agent", "transfer-test"])
+@pytest.mark.parametrize("post", ["DONE", "PROC", "PEND", "ERR", "unknown", "raises"])
+def test_first_native_work_records_accepted_or_uncertain_submission(
+    monkeypatch, remote_agent, post
+) -> None:
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    assert getattr(progress, "_first_native_work_at", None) is None
+    now = 10.0
+    monkeypatch.setattr(progress_module, "time", SimpleNamespace(monotonic=lambda: now))
+    agent.transfer_result = post
+    agent.submit_exception = post == "raises"
+    progress.submit_transfer(
+        "WRITE",
+        (_mem(0),),
+        (_mem(1, owner=remote_agent),),
+        remote_side_agent=remote_agent,
+    )
+    assert getattr(progress, "_first_native_work_at", None) == (
+        None if post == "ERR" else 10.0
+    )
+
+    now = 20.0
+    agent.transfer_result = "PROC"
+    agent.submit_exception = False
+    progress.submit_transfer(
+        "WRITE",
+        (_mem(0),),
+        (_mem(1, owner=remote_agent),),
+        remote_side_agent=remote_agent,
+    )
+    assert getattr(progress, "_first_native_work_at", None) == (
+        20.0 if post == "ERR" else 10.0
+    )
+
+
 def test_progress_treats_poll_exception_as_terminal_failure() -> None:
     agent = _TransferAgent()
     agent.check_exception = True

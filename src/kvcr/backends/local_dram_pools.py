@@ -5,6 +5,7 @@
 import logging
 import queue
 import threading
+import time
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
@@ -182,6 +183,7 @@ class _SourceState:
         self.index: dict[BlockKey, _LocalDramResidency | None] = {}
         self.active: dict[BlockKey, _LocalDramResidency] = {}
         self.operations = 0
+        self.first_ready_at: float | None = None
         self.completions: queue.SimpleQueue[
             tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool]
         ] = queue.SimpleQueue()
@@ -285,6 +287,8 @@ class _LocalDramPools:
             ):
                 residency.refs = refs
                 state.index[key] = residency
+                if state.first_ready_at is None:
+                    state.first_ready_at = time.monotonic()
 
     def acquire_readers(
         self,

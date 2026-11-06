@@ -150,6 +150,7 @@ class _KVCRProgress:
         self._nixl_agent_name = nixl_agent_name
         self._nixl_agent: Any | None = None
         self._active_transfers: dict[int, _TransferState] = {}
+        self._first_native_work_at: float | None = None
         self._disconnected_remote_agents: set[str] = set()
         self._next_transfer_id = 0
         self._nixl_listen_port = nixl_listen_port
@@ -339,6 +340,8 @@ class _KVCRProgress:
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                 submitted = False
                 logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
+            if self._first_native_work_at is None and state.outcome is not False:
+                self._first_native_work_at = time.monotonic()
             if trace is not None:
                 if submitted:
                     post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE
