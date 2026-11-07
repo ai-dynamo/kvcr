@@ -255,15 +255,29 @@ Framework-owned memory is reported through the framework's existing router event
 
 KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
 
-### Request-scoped hints
+### KV transfer hints
 
 For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
 
-KVCR-to-KVCR movement is destination-initiated. A router hint gives the destination the source node and KVCR control endpoint. `mode=copy` retains the source copy, while `mode=move` permits source eviction only after successful completion. Timeout or cancellation keeps the source copy. When the hint has no source control endpoint, the destination uses its local storage information or checks object storage when enabled. The router does not need object-store inventory for locality decisions, but may track object presence to issue source hints.
+The router may choose not to send a hint based on its internal cost model. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
-`submit_hint` may establish the peer connection, but does not start data movement or remote pinning yet. Each hint in an envelope is parsed and handled independently; proactive fetching, staging, or pinning may be added later as new hint types. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole `BlockKeyList` from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
+#### Request-scoped hints
 
-The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
+KVCR-to-KVCR movement is destination-initiated for request-scoped hints. A request-scoped `kv.fetch` gives the destination the source node, KVCR control endpoint, and advertised block hashes. It provides advice for copying and does not request source removal. When the hint has no source control endpoint, the destination uses its local storage information or checks object storage when enabled. The router does not need object-store inventory for locality decisions, but may track object presence to issue source hints.
+
+`submit_hint` may establish the peer connection, but does not start data movement or remote pinning yet. The framework initiates copying through `fetch()` or `deliver()` with the same request ID; the configured key adapter matches its full `BlockKey` values against the hint hashes.
+
+Each hint in an envelope is parsed and handled independently. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole request's block hashes from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
+
+We plan to add a request-scoped `kv.migrate` hint to move KV cache for cold starts.
+
+#### Independent hints
+
+`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Hints are sent to the source with `destination_control_endpoint` and `block_hashes`. They run independently of their carrier request's keys and lifetime, work without a request ID, and can share an envelope with request advice.
+
+During submission, the source resolves hashes into full keys through `KeyAdapter.decode_from_router` and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates G2 space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers need managed G2 storage and compatible layouts. Independent transfers use complete source G2 copies only, with no framework-memory or G3 fallback. Resolution does not reserve blocks, so they may disappear before transfer.
+
+The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed. Inventory events can update this map; the integration must restore it after Guard recovery, which does not replay those events.
 
 ### Peer control and liveness
 
