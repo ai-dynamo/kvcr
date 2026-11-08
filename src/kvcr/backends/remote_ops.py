@@ -485,18 +485,25 @@ class _SourceWriteOp(_RemoteOp):
                 if trace is not None:
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
+            if not backend._framework_pinning:
+                # Pinless start_write defers validation to the claimed subset.
+                # A peer protocol error is a refusal, not a native submit failure.
+                try:
+                    backend._validate_destinations(route_name, self.dst_descriptors)
+                except Exception:
+                    logger.warning(
+                        "KVCR start_write destination validation failed for op=%d",
+                        self.op_handle,
+                        exc_info=True,
+                    )
+                    self.state = _SourceWriteState.NOTIFY_FAILURE
+                    if trace is not None:
+                        trace.reject(
+                            "source.write.refused", _nvtx.Reason.INVALID_RESULT
+                        )
+                    return False, True
             submit_started_at = backend._kvcr._timer()
             try:
-                if not backend._framework_pinning:
-                    regions = backend._remote_agents_by_target[route_name][2]
-                    for descriptors in self.dst_descriptors:
-                        backend._kvcr._validate_descriptors(
-                            descriptors,
-                            regions=regions,
-                            agent_name=route_name,
-                        )
-                if backend._kvcr._clock() >= self.deadline:
-                    return False, True
                 status.submitted = True
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",

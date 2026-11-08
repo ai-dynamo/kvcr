@@ -14,7 +14,7 @@ Source: start_write -> local claim/framework pin -> write -> write_done.
 import logging
 import math
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, cast
@@ -799,12 +799,7 @@ class _RemoteFWDram:
                 progress, payload, fallback_target=fallback_target
             )
             if self._framework_pinning:
-                for descriptors in dst_descriptors:
-                    self._kvcr._validate_descriptors(
-                        descriptors,
-                        regions=self._remote_agents_by_target[target_agent][2],
-                        agent_name=target_agent,
-                    )
+                self._validate_destinations(target_agent, dst_descriptors)
             self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
             raise
@@ -848,11 +843,17 @@ class _RemoteFWDram:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT source_transfer_requested op=%d source_op=%d target=%s "
-                "blocks=%d",
+                "blocks=%d bytes=%s",
                 op_handle,
                 op_id[1],
                 target_agent,
                 len(keys),
+                # Pinless destinations are validated later; don't inspect them.
+                (
+                    self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors))
+                    if self._framework_pinning
+                    else "unvalidated"
+                ),
             )
 
         source_write = _SourceWriteOp(
@@ -943,6 +944,15 @@ class _RemoteFWDram:
                 if not prepared:
                     self._queue_source_pin(op, key_layout)
         return observed_work
+
+    def _validate_destinations(
+        self, target_agent: str, dst_descriptors: Iterable[Any]
+    ) -> None:
+        regions = self._remote_agents_by_target[target_agent][2]
+        for descriptors in dst_descriptors:
+            self._kvcr._validate_descriptors(
+                descriptors, regions=regions, agent_name=target_agent
+            )
 
     def _try_local_source_write(
         self,
