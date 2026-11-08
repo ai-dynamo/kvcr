@@ -879,12 +879,16 @@ def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatc
     watchdog.begin_poll()
     clock[0] = 60.0  # Long idle gap: nothing retained, so not a stall.
     watchdog.begin_poll()
-    assert not watchdog.check_source_progress()  # Same-poll requests may be stale.
+    assert not watchdog.check_source_progress()  # Queued requests may be stale.
     assert backend._progress_outbound == []
     clock[0] = 60.1
-    watchdog.begin_poll()  # Short gap: admitting resumes, nothing latched.
+    watchdog.begin_poll()  # Short gap, but the backlog is not drained yet.
+    assert not watchdog.check_source_progress()
+    watchdog.end_poll(drained=False)
+    assert not watchdog.check_source_progress()
+    watchdog.end_poll(drained=True)  # Drained: admitting resumes, nothing latched.
     assert watchdog.check_source_progress()
-    watchdog.source_writes[("t", 1)] = _SourceWriteStatus()
+    watchdog.admit_source(("t", 1))
     clock[0] = 60.5
     watchdog.begin_poll()  # Gap since the last poll is short.
     assert watchdog.check_source_progress()
@@ -894,6 +898,7 @@ def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatc
     assert len(backend._progress_outbound) == 1
     assert "disabled until restart" in str(backend._progress_outbound[0])
     watchdog.source_writes.clear()  # Latched even after the work drains.
+    watchdog._retained = 0
     clock[0] = 70.0
     watchdog.begin_poll()
     assert not watchdog.check_source_progress()
@@ -903,35 +908,42 @@ def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatc
 def test_probe_fence_is_not_retained_work(monkeypatch):
     watchdog, backend, clock = _watchdog(monkeypatch)
     watchdog.begin_poll()
-    watchdog.source_writes[("t", 1)] = _SourceWriteStatus(cancel_requested=True)
+    watchdog.source_writes[("t", 1)] = _SourceWriteStatus(
+        cancel_requested=True, fence=True
+    )
     clock[0] = 60.0  # Idle gap with only a cancel fence: no latch.
     watchdog.begin_poll()
     assert backend._progress_outbound == []
-    watchdog.source_writes[("t", 2)] = _SourceWriteStatus()  # Accepted write.
+    watchdog.end_poll(drained=True)
+    watchdog.admit_source(("t", 2))  # Accepted write.
+    watchdog.source_writes[("t", 2)].cancel_requested = True  # Probed pre-submit.
     clock[0] = 61.5
     watchdog.begin_poll()
     assert len(backend._progress_outbound) == 1
 
 
 class _GapControl(FakeBytesControl):
-    """Hold a message back until a poll whose begin_poll saw an idle gap."""
+    """Hold messages back past an idle gap, then release them in capped batches."""
+
+    batch = 2  # Stands in for the real receive cap of 64 per poll.
 
     def __init__(self, offset):
         super().__init__()
-        self.offset, self.armed, self.held = offset, False, None
+        self.offset, self.armed, self.held = offset, False, []
 
     def recv(self):
-        if self.armed:
+        if self.armed and self.incoming:
             self.offset[0], self.armed = 2.0, False  # Next begin_poll sees the gap.
             self.held, self.incoming = self.incoming, []
             return []
         if self.held:
-            self.incoming, self.held = self.held + self.incoming, None
+            released, self.held = self.held[: self.batch], self.held[self.batch :]
+            return released
         return super().recv()
 
 
 @pytest.mark.parametrize("fence", [False, True])
-def test_idle_stall_refuses_queued_write_without_latching(fence) -> None:
+def test_idle_stall_refuses_queued_backlog_without_latching(fence) -> None:
     errors = []
     offset = [0.0]
     agent = FakeNixlAgent(metadata=b"source-md")
@@ -940,6 +952,7 @@ def test_idle_stall_refuses_queued_write_without_latching(fence) -> None:
     source = _new_kvcr(
         agent, pinning, control, name="source", on_resilience_event=errors.append
     )
+    dangling = source._core._remote_fw_dram._dangling_ops
     with patch(
         "kvcr.backends.dangling_ops.time",
         SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0]),
@@ -948,16 +961,18 @@ def test_idle_stall_refuses_queued_write_without_latching(fence) -> None:
             control.incoming.append(_write_probe_message(9))
             _wait_until(lambda: bool(control.sent))
         control.armed = True
-        control.incoming.append(
-            _start_write_message(1, BlockKey(b"k0"), target_agent="target")
+        # More queued writes than one receive batch: all are refused.
+        control.incoming.extend(
+            _start_write_message(h, BlockKey(b"k0"), target_agent="target")
+            for h in (1, 2, 3)
         )
-        # Queued across the idle gap: refused pre-submit, nothing latched.
-        assert _poll_until(source, lambda _: len(agent.sent_notifs) == 1) == []
-        assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+        assert _poll_until(source, lambda _: len(agent.sent_notifs) == 3) == []
+        assert not any(_decode_notif(n[1])["success"] for n in agent.sent_notifs)
         assert pinning.searches == [] and agent.xfers == []
-        # The next poll sees a short gap, so new writes are admitted again.
+        # Once the backlog drains, new writes are admitted again.
+        _wait_until(lambda: not dangling._idle_gap)
         control.incoming.append(
-            _start_write_message(2, BlockKey(b"k0"), target_agent="target")
+            _start_write_message(4, BlockKey(b"k0"), target_agent="target")
         )
         _poll_until(source, lambda _: bool(pinning.searches))
     assert errors == []

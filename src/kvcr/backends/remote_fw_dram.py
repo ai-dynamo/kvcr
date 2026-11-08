@@ -42,7 +42,7 @@ from ..types import (
     CacheTier,
     OpHandle,
 )
-from .dangling_ops import _DanglingOps, _SourceWriteStatus
+from .dangling_ops import _DanglingOps
 from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
@@ -532,7 +532,9 @@ class _RemoteFWDram:
 
         # Warning suppression can be added if persistent backend faults
         # cause excessive polling logs.
-        observed_work |= self._process_control_messages(progress)
+        handled = self._process_control_messages(progress)
+        self._dangling_ops.end_poll(drained=not handled)
+        observed_work |= handled
         if self._pending_local_sources and not progress._stop_requested:
             observed_work |= self._retry_local_sources(progress)
         # Only terminal notifications outrank a refusal for the same operation.
@@ -836,7 +838,7 @@ class _RemoteFWDram:
                 )
             self._send_write_done(progress, remote_agent, op_handle, False)
             return
-        self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
+        self._dangling_ops.admit_source(write_id)
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
 

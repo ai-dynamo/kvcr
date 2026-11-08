@@ -33,6 +33,8 @@ class _SourceWriteStatus:
     cancel_requested: bool = False
     cancel_deadline: float | None = None
     abandoned: bool = False
+    # Cancel-only probe fence: retains nothing and is kept until restart.
+    fence: bool = False
 
 
 class _DanglingOps:
@@ -47,33 +49,47 @@ class _DanglingOps:
         self._last_progress_at: float | None = None
         self._source_stalled = False
         self._idle_gap = False
+        self._retained = 0  # Non-fence entries in source_writes.
 
     def begin_poll(self) -> None:
         polled_at = time.monotonic()
-        # Cancel-only probe fences retain nothing; every other entry does.
-        retained = any(
-            s.submitted or not s.cancel_requested for s in self.source_writes.values()
-        )
-        gap_ms = (
-            0.0
-            if self._last_progress_at is None
-            else (polled_at - self._last_progress_at) * 1000
-        )
-        if retained or self._source_stalled:
+        gap_ms = self._gap_ms()
+        if self._retained or self._source_stalled:
             self._idle_gap = False
             self.check_source_progress()
-        else:
+        elif gap_ms >= self._backend._kvcr.config.operation_timeout_ms:
             # An idle gap is not a stall, but requests queued during it may
-            # carry expired deadlines: refuse this poll's, latch nothing.
-            self._idle_gap = gap_ms >= self._backend._kvcr.config.operation_timeout_ms
+            # carry expired deadlines: refuse them until end_poll sees the
+            # backlog drained, and latch nothing.
+            if not self._idle_gap:
+                logger.warning(
+                    "KVCR source progress gap of %.1f ms with no retained source "
+                    "writes; refusing source writes queued across it",
+                    gap_ms,
+                )
+            self._idle_gap = True
         self._last_progress_at = polled_at
 
+    def end_poll(self, drained: bool) -> None:
+        """Clear the idle-gap refusal once a poll finds no queued control messages."""
+        if drained:
+            self._idle_gap = False
+
+    def _gap_ms(self) -> float:
+        if self._last_progress_at is None:
+            return 0.0
+        return (time.monotonic() - self._last_progress_at) * 1000
+
+    def admit_source(self, write_id: tuple[str, OpHandle]) -> None:
+        self.source_writes[write_id] = _SourceWriteStatus()
+        self._retained += 1
+
     def check_source_progress(self) -> bool:
-        if self._source_stalled or self._last_progress_at is None:
-            return not self._source_stalled
+        if self._source_stalled:
+            return False
         if self._idle_gap:
             return False
-        gap_ms = (time.monotonic() - self._last_progress_at) * 1000
+        gap_ms = self._gap_ms()
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:
             # Require restart so queued pre-stall requests cannot get fresh deadlines.
@@ -116,6 +132,8 @@ class _DanglingOps:
 
     def finish_source(self, op: "_SourceWriteOp") -> None:
         status = self.source_writes.pop((op.route[0], op.op_handle), None)
+        if status is not None:
+            self._retained -= 1
         if status is not None and op.local_sources:
             self._backend._kvcr._local_dram._pools.release_readers(
                 op.source_keys, op.local_sources, success=op.success
@@ -207,7 +225,7 @@ class _DanglingOps:
             # A probe can overtake start_write after a control reconnect. Keep
             # this small cancellation fence until restart, even if no op exists.
             status = self.source_writes.setdefault(
-                (target_agent, handle), _SourceWriteStatus()
+                (target_agent, handle), _SourceWriteStatus(fence=True)
             )
             status.cancel_requested = True
         response = _WriteProbeAck(
