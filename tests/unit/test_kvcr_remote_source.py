@@ -32,6 +32,8 @@ from _kvcr_test_utils import (
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.backends import dangling_ops
+from kvcr.backends import dangling_ops as dangling_module
+from kvcr.backends.dangling_ops import _DanglingOps, _SourceWriteStatus
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -857,6 +859,108 @@ def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> N
     assert bool(refusals) is (log_level == logging.DEBUG)
     if refusals:
         assert "reason=source_stalled" in refusals[0]
+
+
+def _watchdog(monkeypatch):
+    clock = [0.0]
+    # Stub only this module's clock; the global time module stays real.
+    monkeypatch.setattr(
+        dangling_module, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    backend = SimpleNamespace(
+        _progress_outbound=[],
+        _kvcr=SimpleNamespace(config=SimpleNamespace(operation_timeout_ms=1000)),
+    )
+    return _DanglingOps(backend), backend, clock
+
+
+def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatch):
+    watchdog, backend, clock = _watchdog(monkeypatch)
+    watchdog.begin_poll()
+    clock[0] = 60.0  # Long idle gap: nothing retained, so not a stall.
+    watchdog.begin_poll()
+    assert not watchdog.check_source_progress()  # Same-poll requests may be stale.
+    assert backend._progress_outbound == []
+    clock[0] = 60.1
+    watchdog.begin_poll()  # Short gap: admitting resumes, nothing latched.
+    assert watchdog.check_source_progress()
+    watchdog.source_writes[("t", 1)] = _SourceWriteStatus()
+    clock[0] = 60.5
+    watchdog.begin_poll()  # Gap since the last poll is short.
+    assert watchdog.check_source_progress()
+    clock[0] = 61.6
+    watchdog.begin_poll()  # Gap >= timeout while a write is in flight.
+    assert not watchdog.check_source_progress()
+    assert len(backend._progress_outbound) == 1
+    assert "disabled until restart" in str(backend._progress_outbound[0])
+    watchdog.source_writes.clear()  # Latched even after the work drains.
+    clock[0] = 70.0
+    watchdog.begin_poll()
+    assert not watchdog.check_source_progress()
+    assert len(backend._progress_outbound) == 1
+
+
+def test_probe_fence_is_not_retained_work(monkeypatch):
+    watchdog, backend, clock = _watchdog(monkeypatch)
+    watchdog.begin_poll()
+    watchdog.source_writes[("t", 1)] = _SourceWriteStatus(cancel_requested=True)
+    clock[0] = 60.0  # Idle gap with only a cancel fence: no latch.
+    watchdog.begin_poll()
+    assert backend._progress_outbound == []
+    watchdog.source_writes[("t", 2)] = _SourceWriteStatus()  # Accepted write.
+    clock[0] = 61.5
+    watchdog.begin_poll()
+    assert len(backend._progress_outbound) == 1
+
+
+class _GapControl(FakeBytesControl):
+    """Hold a message back until a poll whose begin_poll saw an idle gap."""
+
+    def __init__(self, offset):
+        super().__init__()
+        self.offset, self.armed, self.held = offset, False, None
+
+    def recv(self):
+        if self.armed:
+            self.offset[0], self.armed = 2.0, False  # Next begin_poll sees the gap.
+            self.held, self.incoming = self.incoming, []
+            return []
+        if self.held:
+            self.incoming, self.held = self.held + self.incoming, None
+        return super().recv()
+
+
+@pytest.mark.parametrize("fence", [False, True])
+def test_idle_stall_refuses_queued_write_without_latching(fence) -> None:
+    errors = []
+    offset = [0.0]
+    agent = FakeNixlAgent(metadata=b"source-md")
+    pinning = PendingPrimaryPinning()
+    control = _GapControl(offset)
+    source = _new_kvcr(
+        agent, pinning, control, name="source", on_resilience_event=errors.append
+    )
+    with patch(
+        "kvcr.backends.dangling_ops.time",
+        SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0]),
+    ):
+        if fence:  # A probe fence must not count as retained work.
+            control.incoming.append(_write_probe_message(9))
+            _wait_until(lambda: bool(control.sent))
+        control.armed = True
+        control.incoming.append(
+            _start_write_message(1, BlockKey(b"k0"), target_agent="target")
+        )
+        # Queued across the idle gap: refused pre-submit, nothing latched.
+        assert _poll_until(source, lambda _: len(agent.sent_notifs) == 1) == []
+        assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+        assert pinning.searches == [] and agent.xfers == []
+        # The next poll sees a short gap, so new writes are admitted again.
+        control.incoming.append(
+            _start_write_message(2, BlockKey(b"k0"), target_agent="target")
+        )
+        _poll_until(source, lambda _: bool(pinning.searches))
+    assert errors == []
 
 
 def test_kvcr_close_cleans_pending_pin_operations():

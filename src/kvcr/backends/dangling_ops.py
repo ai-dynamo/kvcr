@@ -46,15 +46,33 @@ class _DanglingOps:
         self.source_writes: dict[tuple[str, OpHandle], _SourceWriteStatus] = {}
         self._last_progress_at: float | None = None
         self._source_stalled = False
+        self._idle_gap = False
 
     def begin_poll(self) -> None:
         polled_at = time.monotonic()
-        self.check_source_progress()
+        # Cancel-only probe fences retain nothing; every other entry does.
+        retained = any(
+            s.submitted or not s.cancel_requested for s in self.source_writes.values()
+        )
+        gap_ms = (
+            0.0
+            if self._last_progress_at is None
+            else (polled_at - self._last_progress_at) * 1000
+        )
+        if retained or self._source_stalled:
+            self._idle_gap = False
+            self.check_source_progress()
+        else:
+            # An idle gap is not a stall, but requests queued during it may
+            # carry expired deadlines: refuse this poll's, latch nothing.
+            self._idle_gap = gap_ms >= self._backend._kvcr.config.operation_timeout_ms
         self._last_progress_at = polled_at
 
     def check_source_progress(self) -> bool:
         if self._source_stalled or self._last_progress_at is None:
             return not self._source_stalled
+        if self._idle_gap:
+            return False
         gap_ms = (time.monotonic() - self._last_progress_at) * 1000
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:
