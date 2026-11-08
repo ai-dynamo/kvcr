@@ -166,6 +166,11 @@ class _RemoteSources:
             force_failure = True
             if failure_reason is _nvtx.Reason.UNKNOWN:
                 failure_reason = _nvtx.Reason.ROUTE_CHANGED
+        if not force_failure and not self._backend._pinless_destinations_valid(
+            source_pin.op_handle, route_name, source_pin.dst_descriptors
+        ):
+            force_failure = True
+            failure_reason = _nvtx.Reason.INVALID_RESULT
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.keys
         )

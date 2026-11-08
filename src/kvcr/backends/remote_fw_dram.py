@@ -954,6 +954,23 @@ class _RemoteFWDram:
                 descriptors, regions=regions, agent_name=target_agent
             )
 
+    def _pinless_destinations_valid(
+        self, op_handle: int, target_agent: str, dst_descriptors: Iterable[Any]
+    ) -> bool:
+        """Validate deferred pinless destinations; a bad peer is refused."""
+        if self._framework_pinning:
+            return True
+        try:
+            self._validate_destinations(target_agent, dst_descriptors)
+        except Exception:
+            logger.warning(
+                "KVCR start_write destination validation failed for op=%d",
+                op_handle,
+                exc_info=True,
+            )
+            return False
+        return True
+
     def _try_local_source_write(
         self,
         progress: _KVCRProgress,
@@ -986,6 +1003,26 @@ class _RemoteFWDram:
             ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
             dst_descriptors = tuple(dst_descriptors[i] for i in completed_indices)
             source_write.keys = frozenset(ordered_keys)
+        # Pinless start_write defers validation until readers are claimed: check
+        # the claimed subset, or the whole request when nothing was claimed so a
+        # malformed peer is refused rather than told "success".
+        invalid = not self._pinless_destinations_valid(
+            source_write.op_handle,
+            source_write.route[0],
+            dst_descriptors if selected else source_write.dst_descriptors,
+        )
+        if invalid:
+            if selected:
+                local._pools.release_readers(
+                    ordered_keys,
+                    tuple(residency for _, residency, _ in selected),
+                    success=False,
+                )
+            selected, ordered_keys, dst_descriptors = (), (), ()
+            source_write.keys = frozenset()
+            source_write.state = _SourceWriteState.NOTIFY_FAILURE
+            if source_write.nvtx_state is not None:
+                source_write.nvtx_state.failure_reason = _nvtx.Reason.INVALID_RESULT
         sources = tuple(residency for _, residency, _ in selected)
         try:
             source_write.source_keys = ordered_keys

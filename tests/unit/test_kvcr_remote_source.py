@@ -266,7 +266,7 @@ def test_pinless_write_validates_only_claimed_destinations(
 
 
 @pytest.mark.parametrize("pinning", [True, False])
-def test_unclaimed_write_destination_validation_by_mode(pinning):
+def test_unclaimed_write_invalid_destination_refused_by_mode(pinning):
     memory = ctypes.create_string_buffer(16)
     agent, control = FakeNixlAgent(), FakeBytesControl()
     source = _new_kvcr(
@@ -285,9 +285,8 @@ def test_unclaimed_write_destination_validation_by_mode(pinning):
     payload["dst_descriptors"] = [[_TransferRef("target", 1024, "unknown")]]
     control.incoming.append(msgspec.msgpack.encode(payload))
     _poll_until(source, lambda _: bool(agent.sent_notifs))
-    # Pinning validates every destination up front; pinless validates only
-    # claimed ones, so an all-unclaimed request is a clean no-op success.
-    assert _decode_notif(agent.sent_notifs[-1][1])["success"] is (not pinning)
+    # Both modes refuse malformed destinations, even when nothing is claimed.
+    assert _decode_notif(agent.sent_notifs[-1][1])["success"] is False
     assert agent.xfers == []
 
 
@@ -316,10 +315,6 @@ def test_pending_pinless_source_validates_before_native_submission():
         source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
     ) as validate:
         control.incoming.append(msgspec.msgpack.encode(payload))
-        _poll_until(
-            source,
-            lambda _: bool(source._core._remote_fw_dram._sources._source_pin_ops),
-        )
         agent.state = "DONE"
         _poll_until(source, lambda _: bool(agent.sent_notifs) or len(agent.xfers) > 1)
         assert len(agent.xfers) == 1
@@ -1661,6 +1656,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     if g2_only:
         selected = ()
     backend = object.__new__(_RemoteFWDram)
+    backend._framework_pinning = True
     kvcr = object.__new__(_KVCRCore)
     kvcr._block_record_map = {}
     kvcr._framework_pin_keys = {}
