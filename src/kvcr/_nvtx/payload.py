@@ -80,6 +80,8 @@ class _PayloadEmitter:
                 ("target_incarnation_lo", "u8"),
                 ("route_generation", "u8"),
                 ("transfer_id", "u8"),
+                ("nixl_request_id", "u8"),
+                ("nixl_execution", "u8"),
                 ("hint_trace_id", "u8"),
                 ("local_blocks", "i8"),
                 ("remote_blocks", "i8"),

@@ -4,6 +4,7 @@
 
 import ctypes
 import threading
+from types import SimpleNamespace
 
 import pytest
 from _kvcr_test_utils import (
@@ -122,7 +123,7 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
     agent.state = "PROC"
     pinning.complete(0)
     backend = source._core._remote_fw_dram
-    wait_for_payload(source, recording, "nixl.write.posted")
+    _poll_until(source, lambda _: bool(agent.transfers))
     source._core._clock = lambda: float("inf")
     wait_for_payload(source, recording, "source.write.cancel_requested")
     assert not payloads(recording, "nixl.done_observed")
@@ -171,8 +172,8 @@ def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
     _poll_until(source, lambda _: pinning.unpins == ["pin"])
     assert open_at_submit == [{"source.write", "nixl.write"}]
     pin = payloads(recording, "source.pin.completed")[0]
-    submitted = payloads(recording, "nixl.write.posted")
-    assert len(submitted) == 1
+    submitted = payloads(recording, "nixl.write")
+    assert len(spans(recording, "nixl.write")) == 1
     assert int(submitted[0]["source_op_id"]) == int(pin["source_op_id"])
     assert int(submitted[0]["instance_hi"]) == int(pin["instance_hi"])
     assert int(submitted[0]["op_handle"]) == 9
@@ -213,7 +214,7 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
     assert pinning.cancelled == ([0] if "timeout" in cause else [])
     assert pinning.unpins == ([] if "timeout" in cause else ["pin"])
     assert _decode_notif(agent.sent_notifs[0][1])["success"] is False
-    assert not payloads(recording, "nixl.write.posted")
+    assert not spans(recording, "nixl.write")
     assert len(spans(recording, "source.write", "end")) == 1
 
 
@@ -234,7 +235,7 @@ def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypat
     pinning.complete(0)
     wait_for_payload(source, recording, "source.write.completed", ended="source.write")
     assert len(payloads(recording, "source.write.refused")) == 1
-    assert not payloads(recording, "nixl.write.posted")
+    assert not spans(recording, "nixl.write")
     assert int(payloads(recording, "source.write.completed")[0]["reason"]) == int(
         _nvtx.Reason.ROUTE_CHANGED
     )
@@ -316,7 +317,8 @@ def test_local_source_reuses_nvtx_state_on_both_write_paths(
 def setup_transfer():
     agent = _TransferAgent()
     progress = _transfer_progress(agent)
-    trace = _nvtx.create_tracer().lifecycle(
+    tracer = _nvtx.create_tracer()
+    trace = tracer and tracer.lifecycle(
         op_handle=-9, source_op_id=2, target_agent="target-α", requested_blocks=2
     )
     return agent, progress, trace
@@ -363,11 +365,12 @@ def test_rejected_or_ambiguous_post_retains_native_handle(recording, post):
     agent, progress, trace = setup_transfer()
     agent.transfer_result = post
     agent.submit_exception = post == "exception"
+    agent.get_xfer_trace_info = lambda handle: SimpleNamespace(requestId=1, execution=0)
     transfer, accepted = submit(progress, trace)
     assert not accepted
-    posted = payloads(recording, "nixl.write.posted")[0]
-    assert int(posted["status"]) == int(
-        _nvtx.Status.REJECTED if post == "ERR" else _nvtx.Status.AMBIGUOUS
+    assert int(payloads(recording, "nixl.write.correlated")[0]["nixl_execution"]) == 0
+    assert trace.failure_reason == (
+        _nvtx.Reason.SUBMIT_REJECTED if post == "ERR" else _nvtx.Reason.SUBMIT_AMBIGUOUS
     )
     agent.state = "PROC"
     assert progress.poll_transfer(transfer, require_completion=True) is None
@@ -378,6 +381,10 @@ def test_rejected_or_ambiguous_post_retains_native_handle(recording, post):
     assert result == (post != "ERR", None)
     assert len(payloads(recording, "nixl.done_observed")) == 1
     assert len(payloads(recording, "nixl.write.released")) == 1
+    trace.complete_source(False, 0)
+    assert int(payloads(recording, "source.write.completed")[0]["reason"]) == (
+        _nvtx.Reason.SUBMIT_REJECTED if post == "ERR" else _nvtx.Reason.SUBMIT_AMBIGUOUS
+    )
 
 
 def test_poll_error_and_later_native_done_are_both_observed(recording):
@@ -394,13 +401,18 @@ def test_poll_error_and_later_native_done_are_both_observed(recording):
     assert not recording.stack
 
 
-def test_creation_failure_closes_scope_and_reports_rejection(recording):
-    agent, progress, trace = setup_transfer()
+def test_creation_failure_preserves_source_reason_and_cleanup(recording):
+    source, agent, pinning = make_source()
     agent.make_prepped_xfer = lambda *a, **kw: None
-    with pytest.raises(RuntimeError, match="creation returned None"):
-        submit(progress, trace)
-    assert not progress._active_transfers
-    assert len(payloads(recording, "nixl.write.rejected")) == 1
+    pinning.complete(0)
+    final = wait_for_payload(
+        source, recording, "source.write.completed", ended="source.write"
+    )
+    assert int(final["reason"]) == _nvtx.Reason.CREATE_ERROR
+    assert int(final["status"]) == _nvtx.Status.FAILED
+    assert not source._core._progress._active_transfers
+    assert not spans(recording, "nixl.write")
+    _poll_until(source, lambda _: pinning.unpins == ["pin"])
     assert not recording.stack
 
 
@@ -425,3 +437,51 @@ def test_release_retry_detail_level(recording, monkeypatch, level, count, failur
     agent.release_xfer_handle = release
     assert progress.poll_transfer(transfer, require_completion=True) == (True, None)
     assert len(spans(recording, "nixl.write", "end")) == 1
+
+
+@pytest.mark.parametrize("level", ["off", "low", "medium"])
+@pytest.mark.parametrize("native_trace", ["available", "disabled", "missing", "error"])
+def test_native_correlation_is_optional_and_queried_once_after_post(
+    recording, monkeypatch, level, native_trace
+):
+    monkeypatch.setenv("KVCR_NVTX_LEVEL", level)
+    agent, progress, trace = setup_transfer()
+
+    def snapshot(handle):
+        agent.events.append(f"trace:{handle}")
+        if native_trace == "error":
+            raise RuntimeError("trace lookup failed")
+        return (
+            SimpleNamespace(requestId=2**64 - 1, execution=1, traceparent="native-only")
+            if native_trace == "available"
+            else None
+        )
+
+    if native_trace != "missing":
+        agent.get_xfer_trace_info = snapshot
+    transfer, accepted = submit(progress, trace)
+    assert accepted
+    assert progress.poll_transfer(transfer, require_completion=True) == (True, None)
+    calls = [event for event in agent.events if event.startswith("trace:")]
+    queried = level != "off" and native_trace != "missing"
+    assert len(calls) == int(queried)
+    if queried:
+        assert agent.events.index("submit:1") < agent.events.index("trace:1")
+        assert agent.events.index("trace:1") < agent.events.index("release-transfer:1")
+    correlated = payloads(recording, "nixl.write.correlated")
+    assert len(correlated) == int(level != "off" and native_trace == "available")
+    if correlated:
+        assert int(correlated[0]["nixl_request_id"]) == 2**64 - 1
+        assert int(correlated[0]["nixl_execution"]) == 1
+        assert int(correlated[0]["transfer_id"]) == transfer
+        assert int(correlated[0]["op_handle"]) == -9
+    if trace is not None:
+        assert len(payloads(recording, "nixl.done_observed")) == 1
+        assert len(payloads(recording, "nixl.write.released")) == 1
+        assert trace.failure_reason == _nvtx.Reason.UNKNOWN
+    else:
+        assert not recording.events
+    assert not payloads(recording, "nixl.write.posted")
+    assert not spans(recording, "nixl.write.submit", "push")
+    assert not recording.ranges
+    assert not recording.stack
