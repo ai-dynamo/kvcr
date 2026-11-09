@@ -348,22 +348,38 @@ def test_pending_pinless_source_validates_before_native_submission():
         {b"pending": [_mem_descriptor(i, end_point_name="source") for i in range(2)]}
     )
     _wait_until(lambda: len(agent.xfers) == 1)
+    backend = source._core._remote_fw_dram
+    bad = [_TransferRef("target", 0), _TransferRef("foreign", 1)]
+    good = [_TransferRef("target", 0), _TransferRef("target", 1)]
     payload = msgspec.msgpack.decode(
         _start_write_message(12, b"pending", target_agent="target")
     )
-    payload["dst_descriptors"] = [
-        [_TransferRef("target", 0), _TransferRef("foreign", 1)]
-    ]
+    # Op 12 is invalid for the block it selects; op 13 only has an invalid
+    # destination for a key the source does not hold, so it is not inspected.
+    payload["dst_descriptors"] = [bad]
+    refused = msgspec.msgpack.encode(payload)
+    payload.update(op_handle=13, keys=[b"missing", b"pending"])
+    payload["dst_descriptors"] = [bad, good]
+    accepted = msgspec.msgpack.encode(payload)
     with patch.object(
         source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
     ) as validate:
-        control.incoming.append(msgspec.msgpack.encode(payload))
+        control.incoming.extend([refused, accepted])
+        # Wait until both are queued behind the filling block, then poll more:
+        # a queued op must not validate while it waits.
+        _poll_until(source, lambda _: len(backend._sources._source_pin_ops) == 2)
+        for _ in range(5):
+            source.poll_completed()
+        assert validate.call_count == 0
         agent.state = "DONE"
-        _poll_until(source, lambda _: bool(agent.sent_notifs) or len(agent.xfers) > 1)
-        assert len(agent.xfers) == 1
-        assert agent.sent_notifs
-        assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
-        assert validate.call_count == 1
+        _poll_until(
+            source, lambda _: bool(agent.sent_notifs) and len(agent.xfers) == 2
+        )
+        # Op 12 is refused; op 13 reaches a native write (its success notification
+        # rides on that write, not on sent_notifs).
+        assert [_decode_notif(n)["op_handle"] for _, n in agent.sent_notifs] == [12]
+        assert not _decode_notif(agent.sent_notifs[0][1])["success"]
+        assert validate.call_count == 2  # Once per op, after selection.
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
     assert source._core._block_record_map[b"pending"].local_dram.claim_count == 0
 
