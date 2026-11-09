@@ -15,20 +15,8 @@ on:
       - pyproject.toml
       - src/**
       - tests/e2e/**
-  # The nightly and release workflows call this with the defaults below.
+  # The nightly and release workflows call this to test their commit.
   workflow_call:
-    inputs:
-      base_image:
-        required: false
-        type: string
-        default: vllm/vllm-openai:nightly
-      dynamo_version:
-        required: false
-        type: string
-        default: nightly
-      kvcr_ref:
-        required: false
-        type: string
   # Manual runs can override the vLLM image, Dynamo wheel, and KVCR ref.
   workflow_dispatch:
     inputs:

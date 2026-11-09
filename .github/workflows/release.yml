@@ -19,10 +19,6 @@ on:
         required: false
         type: boolean
         default: true
-      skip_gitlab_pipeline:
-        required: false
-        type: boolean
-        default: false
   workflow_dispatch:
     inputs:
       version:
@@ -39,11 +35,6 @@ on:
         required: false
         type: boolean
         default: true
-      skip_gitlab_pipeline:
-        description: Stage the candidate but skip the release pipeline trigger.
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -81,7 +72,6 @@ jobs:
           STAGE: ${{ inputs.stage }}
           INPUT_VERSION: ${{ inputs.version }}
           RC: ${{ inputs.rc }}
-          NIGHTLY_RELEASE_ENABLED: ${{ vars.KVCR_NIGHTLY_RELEASE_ENABLED }}
           NIGHTLY_PUBLISH: ${{ vars.KVCR_NIGHTLY_PUBLISH }}
         run: |
           set -euo pipefail
@@ -100,10 +90,7 @@ jobs:
               nightly_tag="${date}-${GITHUB_SHA:0:7}"
               stage_path="nightly/${GITHUB_RUN_ID}"
               label="nightly ${version}"
-              stage=false
-              if [ "${STAGE}" = "true" ] && [ "${NIGHTLY_RELEASE_ENABLED}" = "true" ]; then
-                stage=true
-              fi
+              stage="${STAGE}"
               publish=false
               if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
                 publish=true
@@ -205,7 +192,6 @@ jobs:
     outputs:
       wheel_sha256: ${{ steps.dist.outputs.wheel-sha256 }}
     env:
-      MODE: ${{ needs.prepare.outputs.mode }}
       PUBLISH: ${{ needs.prepare.outputs.publish }}
       VERSION: ${{ needs.prepare.outputs.version }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
@@ -313,8 +299,6 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/docker-build.yml
-    with:
-      kvcr_ref: ${{ github.sha }}
 
   # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
   e2e-nightly:
@@ -324,8 +308,6 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/docker-build.yml
-    with:
-      kvcr_ref: ${{ github.sha }}
 
   stage:
     name: Stage to Artifactory
@@ -336,15 +318,12 @@ jobs:
       needs.build.result == 'success' &&
       needs.verify.result == 'success' &&
       (needs.prepare.outputs.mode == 'nightly' || needs.e2e.result == 'success' || !inputs.run_e2e) &&
-      (needs.prepare.outputs.mode == 'release' || vars.KVCR_NIGHTLY_RELEASE_ENABLED == 'true') &&
       ((needs.prepare.outputs.mode == 'nightly' && github.event_name == 'schedule') || needs.approve.result == 'success')
     runs-on: prod-kvcr-builder-v1
     timeout-minutes: 15
     environment: automated-release
     permissions:
       contents: read
-    outputs:
-      staged_wheels: ${{ steps.stage.outputs.staged_wheels }}
     env:
       STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
@@ -361,7 +340,6 @@ jobs:
           wheel: ${{ needs.prepare.outputs.wheel }}
           expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
       - name: Stage in Artifactory
-        id: stage
         env:
           ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
@@ -379,7 +357,6 @@ jobs:
           trap 'rm -f "${auth}"' EXIT
           printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_TOKEN}" > "${auth}"
           [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${WHEEL}"; exit 1; }
-          echo "${WHEEL_SHA256}  dist/${WHEEL}" | sha256sum --check
           dest="${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
           status="$(curl -q -sS --max-time 30 --head -o "${RUNNER_TEMP}/head.txt" -w '%{http_code}' -H "@${auth}" "${dest}")"
           staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
@@ -400,7 +377,6 @@ jobs:
           esac
           curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
           echo "${WHEEL_SHA256}  ${RUNNER_TEMP}/staged" | sha256sum --check
-          echo "staged_wheels=${WHEEL}" >> "${GITHUB_OUTPUT}"
 
   trigger-gitlab:
     name: Trigger GitLab pipeline
@@ -408,8 +384,6 @@ jobs:
     if: >-
       !cancelled() &&
       needs.stage.result == 'success' &&
-      !inputs.skip_gitlab_pipeline &&
-      (needs.prepare.outputs.mode == 'release' || vars.KVCR_NIGHTLY_RELEASE_ENABLED == 'true') &&
       ((needs.prepare.outputs.mode == 'nightly' && github.event_name == 'schedule') || needs.approve.result == 'success')
     runs-on:
       group: gitlab_ci_runners
@@ -421,7 +395,7 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
       RC: ${{ inputs.rc }}
-      STAGED_WHEELS: ${{ needs.stage.outputs.staged_wheels }}
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
       SLACK_THREAD_TS: ${{ needs.slack-start.outputs.thread_ts }}
       # TEMP: always a dry run during PR verification; restore the expression before merge.
       DRY_RUN: "true"
@@ -440,22 +414,10 @@ jobs:
           done
           host="${GITLAB_PIPELINE_URL#*://}"
           echo "::add-mask::${host%%[/:]*}"
-          case "${MODE}" in
-            nightly)
-              [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || fail "nightly version ${VERSION} is not X.Y.Z.devYYYYMMDD"
-              release_type=nightly release_version="" rc_number=""
-              ;;
-            release)
-              [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "${RC}" =~ ^[0-9]+$ ]] || fail "release ${VERSION} rc${RC} is malformed"
-              release_type=ondemand release_version="${VERSION}" rc_number="${RC}"
-              ;;
-            *)
-              fail "mode '${MODE}' must be nightly or release"
-              ;;
-          esac
-          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ && "${GITHUB_RUN_ID}" =~ ^[0-9]+$ ]] \
-            || fail "commit or run id does not match the trigger contract"
-          [[ "${SLACK_THREAD_TS}" =~ ^[0-9]+\.[0-9]+$ ]] || SLACK_THREAD_TS=""
+          release_type=nightly release_version="" rc_number=""
+          if [ "${MODE}" = "release" ]; then
+            release_type=ondemand release_version="${VERSION}" rc_number="${RC}"
+          fi
           token="$(mktemp -p "${RUNNER_TEMP}")"
           response="$(mktemp -p "${RUNNER_TEMP}")"
           trap 'rm -f "${token}" "${response}"' EXIT
@@ -470,13 +432,12 @@ jobs:
             "RELEASE_VERSION=${release_version}"
             "RC_NUMBER=${rc_number}"
             "WHEEL_VERSION=${VERSION}"
-            "STAGED_WHEELS=${STAGED_WHEELS}"
+            "STAGED_WHEELS=${WHEEL}"
             "GITHUB_RUN_ID=${GITHUB_RUN_ID}"
             "COMMIT_SHA=${GITHUB_SHA}"
             ARTIFACTS=wheel
             "DRY_RUN=${DRY_RUN}"
             "ARTIFACTORY_PYPI_REPO_NAME=${ARTIFACTORY_PYPI_REPO_NAME}"
-            "SONAR_BRANCH=${GITHUB_REF_NAME}"
             "SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}"
             "SLACK_THREAD_TS=${SLACK_THREAD_TS}"
           )
