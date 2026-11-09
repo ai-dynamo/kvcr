@@ -8,8 +8,9 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
-from kvcr.hints.fetch import KV_FETCH, _KVFetchHint
-from kvcr.hints.parser import _LOGGED_HINT_ISSUES, HintType, parse_hints
+from kvcr.hints.dispatcher import KV_FETCH
+from kvcr.hints.hint_types import HintType, _Hint, _KVFetchHint
+from kvcr.hints.parser import _LOGGED_HINT_ISSUES, parse_hints
 from kvcr.hints.results import HintStatus
 
 
@@ -23,9 +24,8 @@ def _types(*extra: HintType) -> dict[str, HintType]:
     return {t.action_type: t for t in (KV_FETCH, *extra)}
 
 
-def _fetch_hint(action_id, source, hashes, **extra) -> _HintAction:
+def _fetch_hint(action_id, source, hashes) -> _HintAction:
     payload = {"source_control_endpoint": source, "block_hashes": list(hashes)}
-    payload.update(extra)
     return _HintAction(action_id, "kv.fetch", "1.0", payload)
 
 
@@ -51,14 +51,6 @@ def test_parse_hints_returns_every_valid_action_in_order():
     ]
     assert all(r.message_id == "m" for r in rejected)
     assert [r.action_type for r in rejected] == ["kv.future_action", "kv.fetch"]
-
-
-def test_parse_hints_accepts_struct():
-    hint = _router_hint("tcp://source:1234", (123, 456, 123))
-    hints, rejected = parse_hints(hint, _types())
-    assert len(hints) == 1 and rejected == []
-    assert hints[0].source_endpoint == "tcp://source:1234"
-    assert hints[0].block_hashes == frozenset({123, 456})
 
 
 def test_parse_hints_rejects_invalid_actions_and_payloads():
@@ -181,11 +173,6 @@ def test_parser_exception_rejects_only_its_hint() -> None:
         {
             "source_control_endpoint": "tcp://source:1",
             "block_hashes": [1],
-            "mode": "move",
-        },
-        {
-            "source_control_endpoint": "tcp://source:1",
-            "block_hashes": [1],
             "no_retain": True,
         },
     ],
@@ -201,9 +188,8 @@ def test_kv_fetch_invalid_payload_is_rejected(fetch_payload: object) -> None:
 
 
 def test_supplied_hint_type_is_parsed():
-    class _Stub(msgspec.Struct, frozen=True):
+    class _Stub(_Hint):
         ACTION_TYPE: ClassVar[str] = "kv.stub"
-        action_id: str | None
         n: int
 
     def parse(action_id, payload):

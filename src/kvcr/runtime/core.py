@@ -18,7 +18,7 @@ import msgspec
 
 from .. import _nvtx
 from ..backends.local_disk import _G3, _G3Residency
-from ..backends.local_dram import _LocalDram
+from ..backends.local_dram import _LocalDram, _NamedSource
 from ..backends.local_dram_pools import (
     _layout_indices,
     _LocalDramResidency,
@@ -31,6 +31,7 @@ from ..config import (
     _validate_pool_layouts,
 )
 from ..hints.dispatcher import HintDispatcher
+from ..hints.hint_handler import _IndependentHintHandler
 from ..policy import G3LRUPolicy, LRUPolicy
 from ..types import (
     BlockKey,
@@ -49,6 +50,7 @@ from ..types import (
     ReleaseHandle,
     ReleaseResult,
 )
+from .invalidation import _InvalidationHandler
 from .policy_runtime import _PolicyInvoker
 from .progress import (
     _FAILED_RESULT,
@@ -139,6 +141,8 @@ class _BlockRecord(msgspec.Struct, gc=False):
     access_count: int = 0
     last_access: float | None = None
     position: int = -1
+    # Close G2 to new reads; retain the record until existing users drain.
+    pending_invalidation: bool = False
 
     def add_in_flight_op(self, op_id: _OpId) -> None:
         if self.in_flight_ops is None:
@@ -218,6 +222,7 @@ class _KVCRCore:
         self._release_pin_callback = bindings.release_pin
         self._cancel_pin_request_callback = bindings.cancel_pin_request
         self.framework_control = bindings.framework_control
+        self._key_adapter = bindings.key_adapter
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
@@ -289,6 +294,7 @@ class _KVCRCore:
         from ..backends.dangling_ops import _log_resilience_event
         from ..backends.remote_fw_dram import _RemoteFWDram
 
+        self._invalidation_handler = _InvalidationHandler(self)
         self._on_resilience_event_callback = (
             _log_resilience_event
             if bindings.on_resilience_event is None
@@ -311,11 +317,7 @@ class _KVCRCore:
         }
         if not any(self._capacity_low_watermarks.values()):
             self._capacity_needed_callback = None
-        self._remote_fw_dram = _RemoteFWDram(
-            self,
-            backend_configs.remote_fw_dram,
-            bindings.key_adapter,
-        )
+        self._remote_fw_dram = _RemoteFWDram(self, backend_configs.remote_fw_dram)
         self._nvtx = self._remote_fw_dram._nvtx
         self._nvtx_operations = {}
         self._g3 = (
@@ -328,6 +330,7 @@ class _KVCRCore:
             else None
         )
         # Built after the backends so hint handlers can bind to them.
+        self._independent_hint_handler = _IndependentHintHandler(self)
         self._hints_dispatcher = HintDispatcher(self)
         kvcr_regions = (
             {region.label: region for region in self._local_dram._pools.memory_regions}
@@ -430,11 +433,68 @@ class _KVCRCore:
         self._remote_delivery_keys.pop(request_id, None)
         self._remote_fw_dram.discard_hint(request_id)
 
+    def resolve_hashes(
+        self, hashes: Collection[int]
+    ) -> tuple[
+        dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]],
+        dict[int, str],
+    ]:
+        """Resolve advisory identities under the owner lock; the later transfer
+        claims source memory. Returns the transferable blocks grouped by
+        (layout, piece sizes) as key -> hash, and the reason each other hash failed."""
+        adapter = self._key_adapter
+        if adapter is None:
+            return {}, dict.fromkeys(hashes, "key_adapter_unavailable")
+        groups: dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]] = {}
+        failures: dict[int, str] = {}
+        sizes_by_layout: dict[tuple[str, ...], tuple[int, ...]] = {}
+        lookup_failed = False
+        for block_hash in hashes:
+            try:
+                key = adapter.decode_from_router(block_hash)
+            except KeyError:
+                failures[block_hash] = "not_found"
+                continue
+            except ValueError:
+                failures[block_hash] = "ambiguous_hash"
+                continue
+            except Exception:
+                # An adapter error fails this hash, not the whole request.
+                if not lookup_failed:
+                    lookup_failed = True
+                    logger.warning("Hash metadata lookup failed", exc_info=True)
+                failures[block_hash] = "resolution_failed"
+                continue
+            record = self._block_record_map.get(key)
+            local = record.local_dram if record is not None else None
+            layout = local.key_layout if local is not None else None
+            if (
+                local is None
+                or record.pending_invalidation
+                or local.state is not _LocalDramState.READY
+                or local.pending_labels
+                or not layout
+            ):
+                failures[block_hash] = "source_not_transferable"
+                continue
+            sizes = sizes_by_layout.get(layout)
+            if sizes is None:
+                sizes = sizes_by_layout[layout] = tuple(
+                    self._block_sizes[label.partition(":")[0]] for label in layout
+                )
+            resolved = groups.setdefault((layout, sizes), {})
+            if key in resolved and resolved[key] != block_hash:
+                failures[block_hash] = "resolution_failed"
+            else:
+                resolved[key] = block_hash
+        return groups, failures
+
     def _has_complete_local(self, key: BlockKey) -> bool:
         record = self._block_record_map.get(key)
         residency = record.local_dram if record is not None else None
         return (
             residency is not None
+            and not record.pending_invalidation
             and residency.state is _LocalDramState.READY
             and not residency.pending_labels
             and len(residency.slots) == len(residency.key_layout)
@@ -456,6 +516,9 @@ class _KVCRCore:
         remote_keys = self._remote_delivery_keys.get(request_id, ())
         for key in keys:
             record = self._block_record_map.get(key)
+            if record is not None and record.pending_invalidation:
+                statuses.append((QueryStatus.MISS, None))
+                continue
             residency = record.local_dram if record is not None else None
             if key in remote_keys:
                 fetching_locally = (
@@ -582,9 +645,14 @@ class _KVCRCore:
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
+                # Record pending-removal failures while other keys proceed.
+                rejected: dict[BlockKey, OpEntryResult] = {}
                 remote_keys = self._remote_delivery_keys.get(request_id, ())
                 for key, destination in normalized.items():
-                    if key in remote_keys and (
+                    record = self._block_record_map.get(key)
+                    if record is not None and record.pending_invalidation:
+                        rejected[key] = _FAILED_RESULT
+                    elif key in remote_keys and (
                         not self._has_complete_local(key)
                         or self._remote_fw_dram.query(key, request_id)
                     ):
@@ -603,8 +671,13 @@ class _KVCRCore:
                         remote_blocks=len(remote_blocks),
                         g3_blocks=len(g3_blocks),
                     )
-                if sum(map(bool, (local_blocks, g3_blocks, remote_blocks))) > 1:
+                if (
+                    sum(map(bool, (local_blocks, g3_blocks, remote_blocks, rejected)))
+                    > 1
+                ):
                     self._joined_completions[op_handle] = (set(blocks), {})
+                if rejected:
+                    self._complete(op_handle, rejected)
                 if local_dram is not None and local_blocks:
                     local_dram.deliver(op_handle, local_blocks, deadline=deadline)
                 if g3_blocks and (
@@ -671,6 +744,7 @@ class _KVCRCore:
                 )
             else:
                 self._local_dram._pools._drain_source_completions()
+                self._drain_invalidation()
                 if self._g3 is not None:
                     for key, refs in blocks.items():
                         if self._g3.is_ready(key):
@@ -700,7 +774,15 @@ class _KVCRCore:
         request_id: str | None = None,
         expected_layout: list[str] | None = None,
         hints: object | None = None,
+        *,
+        source_endpoint: str | None = None,
+        move: bool = False,
     ) -> OpHandle:
+        if move:
+            if not isinstance(source_endpoint, str) or not source_endpoint:
+                raise ValueError("move source endpoint must be a non-empty string")
+            if source_endpoint == getattr(self.framework_control, "endpoint", None):
+                raise ValueError("move source must not be this node")
         declaration = self._validate_expected_layout(
             [""] if expected_layout is None else expected_layout
         )
@@ -718,6 +800,16 @@ class _KVCRCore:
                 return op_handle
 
             local_dram._pools._drain_source_completions()
+            self._drain_invalidation()
+            named_source = (
+                _NamedSource(
+                    source_endpoint,
+                    declaration,
+                    set(ordered_keys) if move else None,
+                )
+                if source_endpoint is not None
+                else None
+            )
             sources = {}
             for key in ordered_keys:
                 record = self._block_record_map.get(key)
@@ -727,7 +819,9 @@ class _KVCRCore:
                     and residency.ready_indices(requested) is not None
                 ):
                     continue
-                if self._g3 is not None and self._g3.is_ready(key):
+                if named_source is not None:
+                    sources[key] = CacheTier.REMOTE_G2
+                elif self._g3 is not None and self._g3.is_ready(key):
                     if not self._g3.is_ready(key, declaration):
                         raise ValueError(
                             "fetch layout must match existing G3 key layout"
@@ -738,6 +832,12 @@ class _KVCRCore:
                 ):
                     sources[key] = CacheTier.REMOTE_G2
             deadline = self._operation_deadline()
+            if move:
+                # Accept delayed completion using the existing abandonment budget.
+                # The source independently caps its native transfer timeout.
+                deadline += (
+                    self.config.abandon_timeout_ms - self.config.operation_timeout_ms
+                ) / 1000
             destinations = local_dram.fetch(
                 op_handle,
                 ordered_keys,
@@ -747,6 +847,7 @@ class _KVCRCore:
                 hints=hints,
                 layout=requested,
                 key_layout=declaration,
+                named_source=named_source,
             )
             for source in (CacheTier.G3, CacheTier.REMOTE_G2):
                 self._start_local_fill(
@@ -758,6 +859,7 @@ class _KVCRCore:
                     },
                     request_id,
                     deadline,
+                    named_source=named_source,
                 )
         return op_handle
 
@@ -765,7 +867,9 @@ class _KVCRCore:
         if self._local_dram is None:
             return [(handle, False) for handle in handles]
         with self._state_lock:
-            return self._local_dram._pools.release(handles)
+            results = self._local_dram._pools.release(handles)
+            self._drain_invalidation()
+            return results
 
     # TODO: Expose individual entry completions as they become available.
     def poll_completed(self) -> Iterable[OpResult]:
@@ -780,14 +884,24 @@ class _KVCRCore:
                 if self._local_dram is not None:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
+                self._drain_invalidation()
+        self._independent_hint_handler.poll()
         completed = self._completion_queue
         self._completion_queue = []
+        if self._independent_hint_handler._pending_operations:
+            completed = self._independent_hint_handler.finish(completed)
         if self._nvtx_operations:
             for handle, _ in completed:
                 trace = self._nvtx_operations.pop(handle, None)
                 if trace is not None:
                     trace.returned()
         return completed
+
+    def _drain_invalidation(self) -> None:
+        # Cheap when nothing is pending; otherwise a released or finished user
+        # lets its source copy drop (and free capacity) without waiting for a poll.
+        if self._invalidation_handler._dirty:
+            self._invalidation_handler.drain()
 
     def _notify_transfer_errors(self, progress_items: list[object]) -> None:
         # Notify before cleanup can return a buffer to its allocator. Retain the
@@ -898,6 +1012,8 @@ class _KVCRCore:
                     )
 
         run(self._close_hint_handlers)
+        # Native work has stopped; abandon pending removals without waiting.
+        run(self._invalidation_handler.close)
         if self._g3 is not None:
             run(self._g3.close_main)
         if self._local_dram is not None:
@@ -1028,10 +1144,17 @@ class _KVCRCore:
 
     # Generic operation/block dependency bookkeeping.
 
-    def _add_block_dependencies(self, op: _Op, *, new_operation: bool) -> None:
+    def _add_block_dependencies(
+        self,
+        op: _Op,
+        *,
+        new_operation: bool,
+        keys: Collection[BlockKey] | None = None,
+    ) -> None:
         if new_operation:
             self._outstanding_operations += 1
-        for key in op.keys:
+        # Exclude rejected keys so work on other keys cannot delay their removal.
+        for key in op.keys if keys is None else keys:
             self._block_record(key).add_in_flight_op(op.op_id)
 
     def _remove_block_dependencies(self, op: _Op) -> None:
@@ -1050,6 +1173,8 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[_TransferRef]],
         request_id: str | None,
         deadline: float,
+        *,
+        named_source: _NamedSource | None = None,
     ) -> None:
         if not blocks:
             return
@@ -1062,8 +1187,13 @@ class _KVCRCore:
                 deadline,
             )
         elif source is CacheTier.REMOTE_G2:
+            # Independent operations retain their named source across deferral.
             started = self._remote_fw_dram.fetch(
-                blocks, request_id, deadline, op_handle=fill_handle
+                blocks,
+                request_id,
+                deadline,
+                op_handle=fill_handle,
+                named_source=named_source,
             )
         else:
             raise ValueError(f"unsupported local fill source {source.value}")
@@ -1082,6 +1212,7 @@ class _KVCRCore:
             claimed = self._local_dram._pools.acquire_sources(
                 tuple(key for key in keys if key not in sources),
                 allow_filling=allow_filling,
+                op_id=op_id,
             )
             if claimed:
                 sources.update(claimed)
@@ -1217,6 +1348,7 @@ class _KVCRCore:
         record = self._block_record_map.get(key)
         return (
             record is not None
+            and not record.pending_invalidation
             and record.local_dram is not None
             and record.local_dram.state is not _LocalDramState.DISCARDING
         )
@@ -1270,12 +1402,15 @@ class _KVCRCore:
 
     def _prune_block_record(self, key: BlockKey) -> None:
         record = self._block_record_map.get(key)
+        if record is not None and record.pending_invalidation:
+            self._invalidation_handler.notify(key)
         if (
             record is not None
             and record.fw_mem is None
             and record.local_dram is None
             and record.g3 is None
             and not record.in_flight_ops
+            and not record.pending_invalidation
         ):
             self._block_record_map.pop(key)
 
