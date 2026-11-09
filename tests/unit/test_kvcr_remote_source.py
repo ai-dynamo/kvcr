@@ -290,6 +290,49 @@ def test_unclaimed_write_invalid_destination_refused_by_mode(pinning):
     assert agent.xfers == []
 
 
+def test_pinless_write_refused_when_validation_expires_source_watchdog():
+    """The request deadline is still valid, but the source watchdog is not."""
+    memory = ctypes.create_string_buffer(16)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    agent.state = "DONE"
+    errors = []
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 16)]),
+        on_resilience_event=errors.append,
+    )
+    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    residency = source._core._block_record_map[b"local"].local_dram
+    stalled_for = 0.0
+    validate = source._core._validate_descriptors
+
+    def slow_validate(*args, **kwargs):
+        nonlocal stalled_for
+        validate(*args, **kwargs)
+        stalled_for = 3600.0  # Validation "took" longer than the watchdog allows.
+
+    with (
+        patch(
+            "kvcr.backends.dangling_ops.time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
+        ),
+        patch.object(source._core, "_validate_descriptors", slow_validate),
+    ):
+        control.incoming.append(
+            _start_write_message(12, b"local", target_agent="target")
+        )
+        _poll_until(source, lambda _: bool(agent.sent_notifs) or bool(errors))
+    assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+    assert len(agent.xfers) == 1  # Only the deposit; no native WRITE.
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert residency.source_readers == 0
+
+
 def test_pending_pinless_source_validates_before_native_submission():
     primary, memory = ctypes.create_string_buffer(32), ctypes.create_string_buffer(32)
     agent, control = FakeNixlAgent(), FakeBytesControl()
