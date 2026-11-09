@@ -5,7 +5,8 @@
 import threading
 
 import pytest
-from _nvtx_test_utils import make_source, spans, wait_for_payload
+from _kvcr_test_utils import _poll_until
+from _nvtx_test_utils import make_source, spans
 
 from kvcr import _nvtx
 
@@ -32,7 +33,7 @@ def test_source_close_ends_range_after_native_completion(recording):
     source, agent, pinning = make_source()
     agent.state = "PROC"
     pinning.complete(0)
-    wait_for_payload(source, recording, "nixl.write.posted")
+    _poll_until(source, lambda _: bool(agent.transfers))
     agent.state = "DONE"
     source.close()
     assert len(spans(recording, "source.write")) == 1
