@@ -319,16 +319,12 @@ class _KVCRProgress:
         self._active_transfers[transfer_id] = state
         if trace is not None:
             trace.start("nixl.write", transfer_id=transfer_id)
-        submitted = True
         try:
             post_state = agent.transfer(handle)
-            if post_state == "DONE":
-                state.outcome = True
-            elif post_state == "ERR":
-                state.outcome = False
-                submitted = False
-            elif post_state not in ("PROC", "PEND"):
-                submitted = False
+            submitted = post_state in ("DONE", "PROC", "PEND")
+            if post_state in ("DONE", "ERR"):
+                state.outcome = post_state == "DONE"
+            elif not submitted:
                 logger.warning("NIXL transfer returned unexpected state %r", post_state)
         except Exception as error:
             if isinstance(error, nixlRemoteDisconnectError):

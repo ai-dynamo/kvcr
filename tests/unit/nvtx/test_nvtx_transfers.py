@@ -366,12 +366,13 @@ def test_rejected_or_ambiguous_post_retains_native_handle(recording, post):
     agent.transfer_result = post
     agent.submit_exception = post == "exception"
     agent.get_xfer_trace_info = lambda handle: SimpleNamespace(requestId=1, execution=0)
+    reason = (
+        _nvtx.Reason.SUBMIT_REJECTED if post == "ERR" else _nvtx.Reason.SUBMIT_AMBIGUOUS
+    )
     transfer, accepted = submit(progress, trace)
     assert not accepted
     assert int(payloads(recording, "nixl.write.correlated")[0]["nixl_execution"]) == 0
-    assert trace.failure_reason == (
-        _nvtx.Reason.SUBMIT_REJECTED if post == "ERR" else _nvtx.Reason.SUBMIT_AMBIGUOUS
-    )
+    assert trace.failure_reason == reason
     agent.state = "PROC"
     assert progress.poll_transfer(transfer, require_completion=True) is None
     assert transfer in progress._active_transfers
@@ -382,9 +383,7 @@ def test_rejected_or_ambiguous_post_retains_native_handle(recording, post):
     assert len(payloads(recording, "nixl.done_observed")) == 1
     assert len(payloads(recording, "nixl.write.released")) == 1
     trace.complete_source(False, 0)
-    assert int(payloads(recording, "source.write.completed")[0]["reason"]) == (
-        _nvtx.Reason.SUBMIT_REJECTED if post == "ERR" else _nvtx.Reason.SUBMIT_AMBIGUOUS
-    )
+    assert int(payloads(recording, "source.write.completed")[0]["reason"]) == reason
 
 
 def test_poll_error_and_later_native_done_are_both_observed(recording):
@@ -451,20 +450,16 @@ def test_native_correlation_is_optional_and_queried_once_after_post(
         agent.events.append(f"trace:{handle}")
         if native_trace == "error":
             raise RuntimeError("trace lookup failed")
-        return (
-            SimpleNamespace(requestId=2**64 - 1, execution=1, traceparent="native-only")
-            if native_trace == "available"
-            else None
-        )
+        if native_trace == "available":
+            return SimpleNamespace(requestId=2**64 - 1, execution=1)
 
     if native_trace != "missing":
         agent.get_xfer_trace_info = snapshot
     transfer, accepted = submit(progress, trace)
     assert accepted
     assert progress.poll_transfer(transfer, require_completion=True) == (True, None)
-    calls = [event for event in agent.events if event.startswith("trace:")]
     queried = level != "off" and native_trace != "missing"
-    assert len(calls) == int(queried)
+    assert sum(event.startswith("trace:") for event in agent.events) == int(queried)
     if queried:
         assert agent.events.index("submit:1") < agent.events.index("trace:1")
         assert agent.events.index("trace:1") < agent.events.index("release-transfer:1")
