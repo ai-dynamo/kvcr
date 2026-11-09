@@ -64,13 +64,11 @@ nsys --version
 In the **worker terminal**, before running the quick start's worker block, set a fresh report path. Set `REPORT_NAME=vllm-ranks` for the two-rank vLLM launch. For SGLang, run this in both worker terminals with `REPORT_NAME=sglang-source` and `REPORT_NAME=sglang-target` respectively:
 
 ```bash
-export KVCR_CAPTURE_DIR=/traces
 export REPORT_NAME=vllm-ranks
-mkdir -p "$KVCR_CAPTURE_DIR"
 export KVCR_NVTX_LEVEL=low
 KVCR_PROFILE=(nsys profile --trace=nvtx,cuda --sample=none --cpuctxsw=none
   --start-later=true --session-new="$REPORT_NAME" --kill=none
-  --output="$KVCR_CAPTURE_DIR/$REPORT_NAME")
+  --output="/traces/$REPORT_NAME")
 ```
 
 The quick-start launch expands this Bash array immediately before `python3`. Leave it unset or use `KVCR_PROFILE=()` for an ordinary launch. Confirm vLLM's engine ranks or SGLang's scheduler children appear in the report: those processes own the KVCR instances.
@@ -79,7 +77,6 @@ After readiness, warm up each worker with a different unrelated prefix so warm-u
 
 ```bash
 export PATH=/opt/kvcr-nsys/bin:$PATH
-export KVCR_CAPTURE_DIR=/traces
 export REPORT_NAME=vllm-ranks
 nsys start --session=vllm-ranks
 # For SGLang, start both sessions instead:
@@ -94,8 +91,8 @@ After the transfer's telemetry interval drains, stop each named capture and expo
 ```bash
 nsys stop --session="$REPORT_NAME"
 nsys export --type=sqlite --include-json=true \
-  --output="$KVCR_CAPTURE_DIR/$REPORT_NAME.sqlite" \
-  "$KVCR_CAPTURE_DIR/$REPORT_NAME.nsys-rep"
+  --output="/traces/$REPORT_NAME.sqlite" \
+  "/traces/$REPORT_NAME.nsys-rep"
 ```
 
 Inspect the following lanes using the [event identities](nvtx-events.md#payloads-and-identities), rather than proximity on the timeline:
