@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Release compliance checks for the kvcr wheel and sdist."""
+"""Release compliance checks for the kvcr wheel."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import json
 import re
 import subprocess
 import sys
-import tarfile
 import zipfile
 from email.parser import Parser
 from pathlib import Path
@@ -157,40 +156,6 @@ def check_wheel(
     return errors
 
 
-def check_sdist(sdist: Path, version: str, license_file: Path) -> list[str]:
-    root = f"kvcr-{version}"
-    with tarfile.open(sdist) as archive:
-        members = archive.getmembers()
-        tops = sorted({m.name.split("/")[0] for m in members})
-        if tops != [root]:
-            return [f"the sdist's top-level entries are {tops}, expected [{root!r}]"]
-        errors = [
-            f"{m.name}: only regular files and directories may ship in the sdist"
-            for m in members
-            if not (m.isfile() or m.isdir()) or ".." in m.name.split("/")
-        ]
-        if errors:
-            return errors
-        names = {m.name for m in members}
-        missing = [f"{root}/{n}" for n in ("PKG-INFO", "LICENSE")]
-        missing = [name for name in missing if name not in names]
-        if missing:
-            return [f"{name}: missing from the sdist" for name in missing]
-        metadata = Parser().parsestr(
-            archive.extractfile(f"{root}/PKG-INFO").read().decode("utf-8")
-        )
-        license_text = archive.extractfile(f"{root}/LICENSE").read()
-    found = f"{metadata['Name']} {metadata['Version']}"
-    if found != f"kvcr {version}":
-        errors.append(f"PKG-INFO names {found}, expected kvcr {version}")
-    expression = metadata["License-Expression"]
-    if expression != "Apache-2.0":
-        errors.append(f"License-Expression is {expression!r}, expected 'Apache-2.0'")
-    if license_text != license_file.read_bytes():
-        errors.append("the sdist's LICENSE differs from the repository LICENSE")
-    return errors
-
-
 def check_licenses(python: str, inventory: Path) -> list[str]:
     dists = json.loads(
         subprocess.run(
@@ -306,12 +271,6 @@ def main() -> int:
         action="store_true",
         help="Fail, not warn, on optional dependencies without open-source review",
     )
-    sdist = commands.add_parser(
-        "sdist", help="Check the sdist's layout, metadata, and license"
-    )
-    sdist.add_argument("sdist", type=Path)
-    sdist.add_argument("--version", required=True)
-    sdist.add_argument("--license-file", type=Path, default=Path("LICENSE"))
     licenses = commands.add_parser(
         "licenses", help="Check and inventory the licenses installed in an environment"
     )
@@ -326,8 +285,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "wheel":
         errors = check_wheel(args.wheel, args.version, args.license_file, args.strict)
-    elif args.command == "sdist":
-        errors = check_sdist(args.sdist, args.version, args.license_file)
     elif args.command == "licenses":
         errors = check_licenses(args.python, args.inventory)
     else:

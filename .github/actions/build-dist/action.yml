@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Build the kvcr sdist and wheel
-description: Reproducibly build the sdist and the wheel from it into dist/, stamping nightly versions.
+name: Build the kvcr wheel
+description: Reproducibly build the wheel into dist/, stamping nightly versions.
 
 inputs:
   mode:
@@ -14,9 +14,6 @@ inputs:
   wheel:
     description: Expected wheel file name
     required: true
-  sdist:
-    description: Expected sdist file name
-    required: true
   check-pypi:
     description: Fail if PyPI already has this version (release) or a version at or above it (nightly)
     required: false
@@ -25,18 +22,11 @@ inputs:
     description: When set, fail unless the rebuilt wheel has this sha256
     required: false
     default: ""
-  expect-sdist-sha256:
-    description: When set, fail unless the rebuilt sdist has this sha256
-    required: false
-    default: ""
 
 outputs:
   wheel-sha256:
     description: sha256 of the wheel
     value: ${{ steps.dist.outputs.wheel_sha256 }}
-  sdist-sha256:
-    description: sha256 of the sdist
-    value: ${{ steps.dist.outputs.sdist_sha256 }}
 
 runs:
   using: composite
@@ -97,14 +87,12 @@ runs:
             raise SystemExit(1)
         assert tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"] == str(version)
         PY
-    - name: Build the sdist and the wheel from it
+    - name: Build the wheel
       id: dist
       shell: bash
       env:
         WHEEL: ${{ inputs.wheel }}
-        SDIST: ${{ inputs.sdist }}
         EXPECT_WHEEL: ${{ inputs.expect-wheel-sha256 }}
-        EXPECT_SDIST: ${{ inputs.expect-sdist-sha256 }}
         HATCHLING_VERSION: "1.32.4"
       run: |
         set -euo pipefail
@@ -112,15 +100,10 @@ runs:
         SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
         export SOURCE_DATE_EPOCH
         # uv's own Python keeps the zlib, and so the bytes, the same on every runner.
-        uv build --python 3.12 --managed-python --out-dir dist --build-constraint "${RUNNER_TEMP}/build-constraints.txt"
-        for entry in "${WHEEL}=${EXPECT_WHEEL}" "${SDIST}=${EXPECT_SDIST}"; do
-          file="${entry%%=*}"
-          expected="${entry#*=}"
-          test -f "dist/${file}" || { echo "::error::the build did not produce ${file}"; exit 1; }
-          if [ -n "${expected}" ]; then
-            echo "${expected}  dist/${file}" | sha256sum --check \
-              || { echo "::error::the rebuilt ${file} differs from the one the build job checked"; exit 1; }
-          fi
-        done
+        uv build --wheel --python 3.12 --managed-python --out-dir dist --build-constraint "${RUNNER_TEMP}/build-constraints.txt"
+        test -f "dist/${WHEEL}" || { echo "::error::the build did not produce ${WHEEL}"; exit 1; }
+        if [ -n "${EXPECT_WHEEL}" ]; then
+          echo "${EXPECT_WHEEL}  dist/${WHEEL}" | sha256sum --check \
+            || { echo "::error::the rebuilt ${WHEEL} differs from the one the build job checked"; exit 1; }
+        fi
         echo "wheel_sha256=$(sha256sum "dist/${WHEEL}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
-        echo "sdist_sha256=$(sha256sum "dist/${SDIST}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"

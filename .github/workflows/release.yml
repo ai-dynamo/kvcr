@@ -65,7 +65,6 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       version: ${{ steps.plan.outputs.version }}
       wheel: ${{ steps.plan.outputs.wheel }}
-      sdist: ${{ steps.plan.outputs.sdist }}
       nightly_tag: ${{ steps.plan.outputs.nightly_tag }}
       stage_path: ${{ steps.plan.outputs.stage_path }}
       stage: ${{ steps.plan.outputs.stage }}
@@ -134,7 +133,6 @@ jobs:
             echo "mode=${MODE}"
             echo "version=${version}"
             echo "wheel=kvcr-${version}-py3-none-any.whl"
-            echo "sdist=kvcr-${version}.tar.gz"
             echo "nightly_tag=${nightly_tag}"
             echo "stage_path=${stage_path}"
             echo "stage=${stage}"
@@ -206,38 +204,34 @@ jobs:
     timeout-minutes: 30
     outputs:
       wheel_sha256: ${{ steps.dist.outputs.wheel-sha256 }}
-      sdist_sha256: ${{ steps.dist.outputs.sdist-sha256 }}
     env:
       MODE: ${{ needs.prepare.outputs.mode }}
       PUBLISH: ${{ needs.prepare.outputs.publish }}
       VERSION: ${{ needs.prepare.outputs.version }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
-      SDIST: ${{ needs.prepare.outputs.sdist }}
       TWINE_VERSION: "7.0.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Build the sdist and the wheel
+      - name: Build the wheel
         id: dist
         uses: ./.github/actions/build-dist
         with:
           mode: ${{ needs.prepare.outputs.mode }}
           version: ${{ needs.prepare.outputs.version }}
           wheel: ${{ needs.prepare.outputs.wheel }}
-          sdist: ${{ needs.prepare.outputs.sdist }}
           check-pypi: ${{ needs.prepare.outputs.stage }}
       - name: Check the contents, headers, license, and dependencies
         run: |
           set -euo pipefail
-          uvx "twine==${TWINE_VERSION}" check --strict "dist/${WHEEL}" "dist/${SDIST}"
+          uvx "twine==${TWINE_VERSION}" check --strict "dist/${WHEEL}"
           # Anything that can reach PyPI must have every dependency reviewed.
           strict=()
           if [ "${PUBLISH}" = "true" ]; then
             strict=(--strict)
           fi
           python3 .github/scripts/wheel_compliance.py wheel "dist/${WHEEL}" --version "${VERSION}" ${strict[@]+"${strict[@]}"}
-          python3 .github/scripts/wheel_compliance.py sdist "dist/${SDIST}" --version "${VERSION}"
 
   verify:
     name: Test wheel and licenses
@@ -255,15 +249,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rebuild the checked sdist and wheel
+      - name: Rebuild the checked wheel
         uses: ./.github/actions/build-dist
         with:
           mode: ${{ needs.prepare.outputs.mode }}
           version: ${{ needs.prepare.outputs.version }}
           wheel: ${{ needs.prepare.outputs.wheel }}
-          sdist: ${{ needs.prepare.outputs.sdist }}
           expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
-          expect-sdist-sha256: ${{ needs.build.outputs.sdist_sha256 }}
       - name: Check dependency licenses and test the installed wheel
         run: |
           set -euo pipefail
@@ -354,25 +346,20 @@ jobs:
     outputs:
       staged_wheels: ${{ steps.stage.outputs.staged_wheels }}
     env:
-      MODE: ${{ needs.prepare.outputs.mode }}
       STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
-      SDIST: ${{ needs.prepare.outputs.sdist }}
       WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
-      SDIST_SHA256: ${{ needs.build.outputs.sdist_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rebuild the checked sdist and wheel
+      - name: Rebuild the checked wheel
         uses: ./.github/actions/build-dist
         with:
           mode: ${{ needs.prepare.outputs.mode }}
           version: ${{ needs.prepare.outputs.version }}
           wheel: ${{ needs.prepare.outputs.wheel }}
-          sdist: ${{ needs.prepare.outputs.sdist }}
           expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
-          expect-sdist-sha256: ${{ needs.build.outputs.sdist_sha256 }}
       - name: Stage in Artifactory
         id: stage
         env:
@@ -387,41 +374,32 @@ jobs:
           # curl errors name the host, which a secret mask alone does not cover.
           host="${ARTIFACTORY_URL#*://}"
           echo "::add-mask::${host%%[/:]*}"
-          # Nightlies publish only the wheel; releases also publish the sdist.
-          files=("${WHEEL}=${WHEEL_SHA256}")
-          if [ "${MODE}" = "release" ]; then
-            files+=("${SDIST}=${SDIST_SHA256}")
-          fi
           # Tokens go through files so they never appear in argv.
           auth="$(mktemp -p "${RUNNER_TEMP}")"
           trap 'rm -f "${auth}"' EXIT
           printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_TOKEN}" > "${auth}"
-          for entry in "${files[@]}"; do
-            file="${entry%%=*}"
-            sha="${entry#*=}"
-            [[ "${sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${file}"; exit 1; }
-            echo "${sha}  dist/${file}" | sha256sum --check
-            dest="${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${file}"
-            status="$(curl -q -sS --max-time 30 --head -o "${RUNNER_TEMP}/head.txt" -w '%{http_code}' -H "@${auth}" "${dest}")"
-            staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
-            case "${status}" in
-              200)
-                [ "${staged}" = "${sha}" ] || { echo "::error::a different ${file} is already staged at ${STAGE_PATH}; stage the next rc"; exit 1; }
-                echo "already staged: ${file}"
-                ;;
-              404)
-                curl -q -fsS --retry 3 --max-time 120 -o /dev/null -H "@${auth}" -H "X-Checksum-Sha256: ${sha}" \
-                  --upload-file "dist/${file}" "${dest}"
-                echo "staged: ${file}"
-                ;;
-              *)
-                echo "::error::checking the staged ${file} returned HTTP ${status}"
-                exit 1
-                ;;
-            esac
-            curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
-            echo "${sha}  ${RUNNER_TEMP}/staged" | sha256sum --check
-          done
+          [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${WHEEL}"; exit 1; }
+          echo "${WHEEL_SHA256}  dist/${WHEEL}" | sha256sum --check
+          dest="${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
+          status="$(curl -q -sS --max-time 30 --head -o "${RUNNER_TEMP}/head.txt" -w '%{http_code}' -H "@${auth}" "${dest}")"
+          staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
+          case "${status}" in
+            200)
+              [ "${staged}" = "${WHEEL_SHA256}" ] || { echo "::error::a different ${WHEEL} is already staged at ${STAGE_PATH}; stage the next rc"; exit 1; }
+              echo "already staged: ${WHEEL}"
+              ;;
+            404)
+              curl -q -fsS --retry 3 --max-time 120 -o /dev/null -H "@${auth}" -H "X-Checksum-Sha256: ${WHEEL_SHA256}" \
+                --upload-file "dist/${WHEEL}" "${dest}"
+              echo "staged: ${WHEEL}"
+              ;;
+            *)
+              echo "::error::checking the staged ${WHEEL} returned HTTP ${status}"
+              exit 1
+              ;;
+          esac
+          curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
+          echo "${WHEEL_SHA256}  ${RUNNER_TEMP}/staged" | sha256sum --check
           echo "staged_wheels=${WHEEL}" >> "${GITHUB_OUTPUT}"
 
   trigger-gitlab:
