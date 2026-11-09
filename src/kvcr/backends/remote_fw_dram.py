@@ -532,8 +532,8 @@ class _RemoteFWDram:
 
         # Warning suppression can be added if persistent backend faults
         # cause excessive polling logs.
-        handled = self._process_control_messages(progress)
-        self._dangling_ops.end_poll(drained=not handled)
+        handled, drained = self._process_control_messages(progress)
+        self._dangling_ops.end_poll(drained=drained)
         observed_work |= handled
         if self._pending_local_sources and not progress._stop_requested:
             observed_work |= self._retry_local_sources(progress)
@@ -576,14 +576,15 @@ class _RemoteFWDram:
         if close_control is not None:
             close_control()
 
-    def _process_control_messages(self, progress: _KVCRProgress) -> bool:
+    def _process_control_messages(self, progress: _KVCRProgress) -> tuple[bool, bool]:
+        """Return (handled, drained); drained only if recv succeeded and was empty."""
         if self._control is None:
-            return False
+            return False, True
         try:
             messages = self._control.recv()
         except Exception:
             logger.warning("KVCR control receive failed", exc_info=True)
-            return False
+            return False, False
         handled = False
         for message in messages:
             try:
@@ -614,7 +615,7 @@ class _RemoteFWDram:
                 self._record_progress_duration(
                     f"control_{payload.__struct_config__.tag}", handled_at, "handled"
                 )
-        return handled
+        return handled, not messages
 
     def _send_control(
         self,

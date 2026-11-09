@@ -905,6 +905,38 @@ def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatc
     assert len(backend._progress_outbound) == 1
 
 
+def test_idle_source_does_not_latch_on_mid_poll_gap(monkeypatch):
+    watchdog, backend, clock = _watchdog(monkeypatch)
+    watchdog.begin_poll()
+    clock[0] = 0.5
+    watchdog.begin_poll()  # Short gap: no idle-gap refusal.
+    clock[0] = 2.0  # A slow first start_write runs past the timeout mid-poll.
+    assert watchdog.check_source_progress()
+    assert watchdog.check_source_progress()
+    assert backend._progress_outbound == []
+    assert not watchdog._source_stalled
+
+
+def test_idle_gap_clears_only_on_successful_empty_recv(monkeypatch):
+    class Control:
+        def __init__(self, result):
+            self.result = result
+
+        def recv(self):
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    backend = _RemoteFWDram.__new__(_RemoteFWDram)
+    for result, drained in [
+        (RuntimeError("zmq"), False),
+        ([b"\xff"], False),  # Undecodable batch: backlog may be behind it.
+        ([], True),
+    ]:
+        backend._control = Control(result)
+        assert backend._process_control_messages(None)[1] is drained
+
+
 def test_probe_fence_is_not_retained_work(monkeypatch):
     watchdog, backend, clock = _watchdog(monkeypatch)
     watchdog.begin_poll()

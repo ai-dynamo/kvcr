@@ -89,6 +89,9 @@ class _DanglingOps:
             return False
         if self._idle_gap:
             return False
+        if not self._retained:
+            # Nothing to stall; an idle source must never latch.
+            return True
         gap_ms = self._gap_ms()
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
         if gap_ms >= timeout_ms:
