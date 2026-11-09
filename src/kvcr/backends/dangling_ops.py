@@ -33,8 +33,6 @@ class _SourceWriteStatus:
     cancel_requested: bool = False
     cancel_deadline: float | None = None
     abandoned: bool = False
-    # Cancel-only probe fence: retains nothing and is kept until restart.
-    fence: bool = False
 
 
 class _DanglingOps:
@@ -49,13 +47,14 @@ class _DanglingOps:
         self._last_progress_at: float | None = None
         self._source_stalled = False
         self._idle_gap = False
-        self._retained = 0  # Non-fence entries in source_writes.
+        self._retained = 0  # Admitted source writes; cancel-only probe entries are not counted.
 
     def begin_poll(self) -> None:
         polled_at = time.monotonic()
         gap_ms = self._gap_ms()
         if self._retained or self._source_stalled:
-            self._idle_gap = False
+            # _idle_gap is left to end_poll: a backlog queued across the gap
+            # stays refused after the first admission.
             self.check_source_progress()
         elif gap_ms >= self._backend._kvcr.config.operation_timeout_ms:
             # An idle gap is not a stall, but requests queued during it may
@@ -82,6 +81,13 @@ class _DanglingOps:
 
     def admit_source(self, write_id: tuple[str, OpHandle]) -> None:
         self.source_writes[write_id] = _SourceWriteStatus()
+        if not self._retained:
+            # Retained-work timing starts here, not at the last poll. A timeout
+            # crossed while idle (e.g. slow first-request setup) is not a stall,
+            # but requests queued behind it are stale: refuse them.
+            if self._gap_ms() >= self._backend._kvcr.config.operation_timeout_ms:
+                self._idle_gap = True
+            self._last_progress_at = time.monotonic()
         self._retained += 1
 
     def check_source_progress(self) -> bool:
@@ -228,7 +234,7 @@ class _DanglingOps:
             # A probe can overtake start_write after a control reconnect. Keep
             # this small cancellation fence until restart, even if no op exists.
             status = self.source_writes.setdefault(
-                (target_agent, handle), _SourceWriteStatus(fence=True)
+                (target_agent, handle), _SourceWriteStatus()
             )
             status.cancel_requested = True
         response = _WriteProbeAck(

@@ -908,40 +908,68 @@ def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatc
 def test_idle_source_does_not_latch_on_mid_poll_gap(monkeypatch):
     watchdog, backend, clock = _watchdog(monkeypatch)
     watchdog.begin_poll()
-    clock[0] = 0.5
-    watchdog.begin_poll()  # Short gap: no idle-gap refusal.
-    clock[0] = 2.0  # A slow first start_write runs past the timeout mid-poll.
+    clock[0] = 2.0  # Gap crossed while idle, before any admission.
     assert watchdog.check_source_progress()
-    assert watchdog.check_source_progress()
-    assert backend._progress_outbound == []
     assert not watchdog._source_stalled
+    # Slow first-request setup: the timeout is crossed, then the write is admitted.
+    watchdog.admit_source(("t", 1))
+    assert watchdog._idle_gap  # Requests queued behind it are stale.
+    assert not watchdog.check_source_progress()
+    clock[0] = 2.5  # Retained-work timer started at admission, not at the poll.
+    watchdog.begin_poll()
+    assert not watchdog._source_stalled
+    assert backend._progress_outbound == []
+    assert not watchdog.check_source_progress()  # Backlog still refused.
+    watchdog.end_poll(drained=True)  # Drained: fresh work resumes, no latch.
+    assert watchdog.check_source_progress()
+    watchdog.admit_source(("t", 2))  # A second admission must not reset the timer.
+    clock[0] = 3.6
+    watchdog.begin_poll()  # 1.1 s after the last poll, with work in flight.
+    assert not watchdog.check_source_progress()
+    assert len(backend._progress_outbound) == 1
 
 
 def test_idle_gap_clears_only_on_successful_empty_recv(monkeypatch):
-    class Control:
-        def __init__(self, result):
-            self.result = result
+    import zmq
 
-        def recv(self):
-            if isinstance(self.result, Exception):
-                raise self.result
-            return self.result
+    from kvcr.runtime.control_channels import ZmqPeerControlChannel
 
+    class Socket:
+        def __init__(self, *items):
+            self.items = list(items)
+
+        def poll(self, _timeout):
+            if self.items and isinstance(self.items[0], zmq.ZMQError):
+                raise self.items.pop(0)
+            return bool(self.items)
+
+        def recv(self, flags=0):
+            item = self.items.pop(0) if self.items else zmq.Again()
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    def drained(*items):
+        channel = ZmqPeerControlChannel.__new__(ZmqPeerControlChannel)
+        channel._socket = Socket(*items)
+        backend = _RemoteFWDram.__new__(_RemoteFWDram)
+        backend._control = channel
+        return backend._process_control_messages(None)[1]
+
+    assert drained(zmq.ZMQError(zmq.EAGAIN + 1)) is False  # poll() failure.
+    assert drained(b"x", zmq.ZMQError(zmq.EAGAIN + 1)) is False  # Partial batch.
+    assert drained(zmq.Again()) is True  # Genuinely empty.
+    assert drained() is True
     backend = _RemoteFWDram.__new__(_RemoteFWDram)
-    for result, drained in [
-        (RuntimeError("zmq"), False),
-        ([b"\xff"], False),  # Undecodable batch: backlog may be behind it.
-        ([], True),
-    ]:
-        backend._control = Control(result)
-        assert backend._process_control_messages(None)[1] is drained
+    backend._control = SimpleNamespace(recv=lambda: [])
+    assert backend._process_control_messages(None) == (False, True)
 
 
 def test_probe_fence_is_not_retained_work(monkeypatch):
     watchdog, backend, clock = _watchdog(monkeypatch)
     watchdog.begin_poll()
     watchdog.source_writes[("t", 1)] = _SourceWriteStatus(
-        cancel_requested=True, fence=True
+        cancel_requested=True
     )
     clock[0] = 60.0  # Idle gap with only a cancel fence: no latch.
     watchdog.begin_poll()

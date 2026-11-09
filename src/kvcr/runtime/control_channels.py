@@ -308,6 +308,10 @@ class ZmqPeerControlChannel:
             # Warning suppression can be added if persistent ZMQ failures
             # cause excessive receive logs.
             logger.warning("KVCR control recv failed", exc_info=True)
+            if not messages:
+                # An empty result would read as a drained queue; let the caller
+                # see the failure. Partial batches are still delivered.
+                raise
         return messages
 
     def close(self) -> None:
