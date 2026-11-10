@@ -428,8 +428,7 @@ class _SourceWriteOp(_RemoteOp):
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
         if self.transfer_id is None:
-            source_responsive = backend._dangling_ops.check_source_progress()
-            if not source_responsive or status.cancel_requested:
+            if status.cancel_requested:
                 self.state = _SourceWriteState.NOTIFY_FAILURE
             if (
                 self.state is _SourceWriteState.NOTIFY_FAILURE
@@ -438,8 +437,6 @@ class _SourceWriteOp(_RemoteOp):
                 if trace is not None:
                     if status.cancel_requested:
                         failure_reason = _nvtx.Reason.CANCELLED
-                    elif not source_responsive:
-                        failure_reason = _nvtx.Reason.SOURCE_STALLED
                     elif self.state is _SourceWriteState.NOTIFY_FAILURE:
                         failure_reason = nvtx_state.failure_reason
                     else:

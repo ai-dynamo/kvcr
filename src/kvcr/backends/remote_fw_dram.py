@@ -508,7 +508,6 @@ class _RemoteFWDram:
     def poll_progress(
         self, progress: _KVCRProgress, submissions: list[object]
     ) -> tuple[dict[object, object], bool]:
-        self._dangling_ops.begin_poll()
         observed_work = bool(submissions)
         for item in submissions:
             if isinstance(item, _TargetMetadataRequest):
@@ -583,7 +582,7 @@ class _RemoteFWDram:
             logger.warning("KVCR control receive failed", exc_info=True)
             return False
         handled = False
-        for message in messages:
+        for message, received_at in messages:
             try:
                 payload = _CONTROL_DECODER.decode(message)
             except msgspec.ValidationError as error:
@@ -593,7 +592,7 @@ class _RemoteFWDram:
                 continue
             handled_at = self._kvcr._timer()
             if isinstance(payload, _StartWrite):
-                self._handle_start_write(progress, payload)
+                self._handle_start_write(progress, payload, received_at)
             elif isinstance(payload, (_Invalidate, _KeysToFetch)):
                 # Owner-thread work: the main poll applies or starts it.
                 self._progress_outbound.append(payload)
@@ -767,10 +766,9 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def _handle_start_write(
-        self, progress: _KVCRProgress, payload: _StartWrite
+        self, progress: _KVCRProgress, payload: _StartWrite, received_at: float
     ) -> None:
         started_at = self._kvcr._timer()
-        received_at = self._kvcr._clock()
         op_handle = payload.op_handle
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
@@ -821,9 +819,11 @@ class _RemoteFWDram:
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(progress, payload, op_handle, "source_restarted")
             return
-        if progress._stop_requested or not self._dangling_ops.check_source_progress():
+        # Duplicate requests above must not terminate an already submitted write.
+        # Refuse expiry before claiming sources or handing a move to the owner.
+        if progress._stop_requested or self._kvcr._clock() >= deadline:
             if logger.isEnabledFor(logging.DEBUG):
-                reason = "stopping" if progress._stop_requested else "source_stalled"
+                reason = "stopping" if progress._stop_requested else "deadline"
                 logger.debug(
                     "KVCR_EVENT source_transfer_refused op=%d target=%s "
                     "blocks=%d reason=%s expected_incarnation=%s incarnation=%s",
@@ -920,7 +920,6 @@ class _RemoteFWDram:
             if (
                 self._kvcr._clock() >= op.deadline
                 or status.cancel_requested
-                or not self._dangling_ops.check_source_progress()
                 or self._route_generation.get(op.route[0], 0) != op.route[1]
             ):
                 # No claims were acquired, so there is no caller-side cleanup.

@@ -139,7 +139,7 @@ Until safety is established, KVCR prevents affected allocations in its own pool 
 
 A transport error, a missed heartbeat, or a replacement peer at the same address does not prove that access has stopped. Confirmed death of the original source, for example through its KVCR Guard, permits reclamation only when the transport guarantees that its accesses have ended.
 
-Some underlying failures may require restarting the affected process. KVCR makes a best effort to complete cleanup without a restart, but unresolved memory may remain unavailable indefinitely. A stalled source stops accepting new writes until restart while cleanup continues. If a Guard takes over, it serves new requests and fails old operations without replaying them.
+Some underlying failures may require restarting the affected process. KVCR makes a best effort to complete cleanup without a restart, but unresolved memory may remain unavailable indefinitely. After progress resumes, expired operations fail while fresh requests remain eligible. If a Guard takes over, it serves new requests and fails old operations without replaying them.
 
 ---
 

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Cancellation, quarantine, and lifecycle events for unresolved remote writes."""
 
-import time
 import uuid
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -44,30 +43,6 @@ class _DanglingOps:
         self.dead_incarnations: set[str] = set()
         self.sources: dict[str, str] = {}
         self.source_writes: dict[tuple[str, OpHandle], _SourceWriteStatus] = {}
-        self._last_progress_at: float | None = None
-        self._source_stalled = False
-
-    def begin_poll(self) -> None:
-        polled_at = time.monotonic()
-        self.check_source_progress()
-        self._last_progress_at = polled_at
-
-    def check_source_progress(self) -> bool:
-        if self._source_stalled or self._last_progress_at is None:
-            return not self._source_stalled
-        gap_ms = (time.monotonic() - self._last_progress_at) * 1000
-        timeout_ms = self._backend._kvcr.config.operation_timeout_ms
-        if gap_ms >= timeout_ms:
-            # Require restart so queued pre-stall requests cannot get fresh deadlines.
-            self._source_stalled = True
-            self._backend._progress_outbound.append(
-                RuntimeError(
-                    f"KVCR source progress stalled for {gap_ms:.1f} ms "
-                    f"(timeout: {timeout_ms} ms); "
-                    "new source writes disabled until restart"
-                )
-            )
-        return not self._source_stalled
 
     def poll_source(
         self, progress: "_KVCRProgress", op: "_SourceWriteOp", *, cancelling: bool

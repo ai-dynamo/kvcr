@@ -90,7 +90,7 @@ def _recv_until(channel: ZmqPeerControlChannel, count: int) -> list[bytes]:
     deadline = time.monotonic() + 1
     messages: list[bytes] = []
     while len(messages) < count and time.monotonic() < deadline:
-        messages.extend(channel.recv())
+        messages.extend(message for message, _ in channel.recv())
         if len(messages) < count:
             time.sleep(0.001)
     return messages
@@ -253,7 +253,7 @@ def test_recv_is_bounded_per_progress_turn(channel: ZmqPeerControlChannel) -> No
     _push_messages(channel.endpoint, 65)
     time.sleep(0.02)
 
-    first = channel.recv()
+    first = [message for message, _ in channel.recv()]
     second = _recv_until(channel, 1)
 
     assert len(first) == 64
@@ -263,7 +263,7 @@ def test_recv_is_bounded_per_progress_turn(channel: ZmqPeerControlChannel) -> No
     } == set(range(65))
 
 
-def test_recv_checks_for_data_without_blocking() -> None:
+def test_recv_checks_for_data_without_blocking(monkeypatch) -> None:
     fake_socket = Mock()
     fake_socket.poll.return_value = False
     with _channel(free_port()) as channel:
@@ -271,6 +271,15 @@ def test_recv_checks_for_data_without_blocking() -> None:
 
         assert channel.recv() == []
         fake_socket.poll.assert_called_once_with(0)
+
+        fake_socket.poll.return_value = True
+        fake_socket.recv.side_effect = [b"first", b"second", zmq.Again()]
+        # Time advances on reads, so stamping after the batch would yield 3/3.
+        monkeypatch.setattr(
+            "kvcr.runtime.control_channels.time",
+            Mock(monotonic=lambda: float(fake_socket.recv.call_count)),
+        )
+        assert channel.recv() == [(b"first", 1.0), (b"second", 2.0)]
 
 
 def test_an_adopted_listener_serves_conflicts_primary_and_guard() -> None:
@@ -322,5 +331,5 @@ def test_an_adopted_listener_serves_conflicts_primary_and_guard() -> None:
             while not received and time.monotonic() < deadline:
                 sender.send(b"guard")
                 time.sleep(0.01)
-                received.extend(guard.recv())
+                received.extend(message for message, _ in guard.recv())
             assert b"guard" in received

@@ -934,7 +934,8 @@ def test_native_terminal_or_cancellation_outranks_metadata_retry(terminal, succe
         agent.notifs["source"] = [
             _write_done_notification(wire_handle, success=success, terminal=terminal)
         ]
-        return [msgspec.msgpack.encode(_metadata_refusal(source, wire_handle))]
+        refusal = msgspec.msgpack.encode(_metadata_refusal(source, wire_handle))
+        return [(refusal, control._clock())]
 
     control.recv = recv
     if terminal:
@@ -992,7 +993,7 @@ def test_retries_keep_metadata_despite_a_stale_ack_in_the_same_batch():
         if delivered:
             return []
         delivered.append(True)
-        return batch
+        return [(message, control._clock()) for message in batch]
 
     control.recv = recv
     _wait_until(lambda: len(control.sent) == 2)
@@ -1064,7 +1065,7 @@ def test_refusal_resends_only_with_reason(case, retries):
                 target._core._clock = lambda: op.deadline + 1
 
             backend._handle_write_refused = classify_then_expire
-        return [msgspec.msgpack.encode(payload)]
+        return [(msgspec.msgpack.encode(payload), control._clock())]
 
     control.recv = recv
     _wait_until(lambda: bool(delivered))
@@ -1257,14 +1258,13 @@ def test_remote_write_cancellation_and_late_completion(
                 _write_done_notification(handle),
                 _write_done_notification(handle, success=False),
             ]
-            return [
-                _probe_ack(
-                    handle,
-                    source,
-                    sender_incarnation="guard",
-                    dead_incarnation="source",
-                ),
-            ]
+            reply = _probe_ack(
+                handle,
+                source,
+                sender_incarnation="guard",
+                dead_incarnation="source",
+            )
+            return [(reply, control._clock())]
 
         control.recv = guard_reply
         assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
@@ -1352,7 +1352,7 @@ def test_kvcr_target_ignores_unknown_op_handle_notification():
 @pytest.mark.parametrize("failure_source", ["control", "notification"])
 def test_kvcr_receive_failure_is_logged(kvcr_caplog, failure_source):
     class FailingControl(FakeBytesControl):
-        def recv(self) -> list[bytes]:
+        def recv(self) -> list[tuple[bytes, float]]:
             raise RuntimeError("receive failed")
 
     class FailingNotificationAgent(FakeNixlAgent):
