@@ -31,6 +31,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.backends import dangling_ops
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -210,6 +211,155 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     assert ("start_write layout mismatch" in kvcr_caplog.text) == (
         source_case in ("key_layout", "requested_labels")
     )
+
+
+def _pinless_source(size=16, **kwargs):
+    """Pinless source over one local-DRAM buffer; keep the returned buffer alive."""
+    memory = ctypes.create_string_buffer(size)
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(
+        agent,
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        control,
+        name="source",
+        framework_regions=[_buffer_region(memory, 16)],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), size)]),
+        **kwargs,
+    )
+    return source, agent, control, memory
+
+
+@pytest.mark.parametrize(
+    "keys,invalid_index,invalid_pool,accepted,validated",
+    [
+        (2, 0, "", True, 1),  # Invalid destination belongs to a missing key.
+        (2, 1, "", False, 1),
+        (2, 0, "unknown", True, 1),
+        (1, 0, "unknown", False, 0),  # Nothing claimed: whole request is checked.
+    ],
+)
+def test_pinless_write_validates_only_claimed_destinations(
+    keys, invalid_index, invalid_pool, accepted, validated, kvcr_caplog
+):
+    kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
+    source, agent, control, _memory = _pinless_source()
+    agent.state = "DONE"
+    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    residency = source._core._block_record_map[b"local"].local_dram
+    payload = msgspec.msgpack.decode(
+        _start_write_message(12, b"local", target_agent="target")
+    )
+    payload["keys"] = [b"missing", b"local"][:keys]
+    payload["dst_descriptors"] = [[_TransferRef("target", i)] for i in range(keys)]
+    payload["dst_descriptors"][invalid_index] = [
+        _TransferRef("target", 1024, invalid_pool)
+    ]
+    with patch.object(
+        source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
+    ) as validate:
+        with source._core._state_lock:
+            control.incoming.append(msgspec.msgpack.encode(payload))
+            _wait_until(
+                lambda: (
+                    len(agent.xfers) == 2
+                    or bool(agent.sent_notifs)
+                    or source._core._progress._failure is not None
+                )
+            )
+            source._core._progress.raise_if_failed()
+        notification = agent.xfers[-1][5] if accepted else agent.sent_notifs[-1][1]
+        assert _decode_notif(notification)["success"] is accepted
+        assert [call.args[0] for call in validate.call_args_list] == [
+            tuple(payload["dst_descriptors"][validated])
+        ]
+        assert len(agent.xfers) == (2 if accepted else 1)  # Deposit [+ one WRITE].
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert residency.source_readers == 0
+
+
+@pytest.mark.parametrize("expires", ["watchdog", "request_deadline"])
+def test_pinless_write_refused_when_validation_expires_a_deadline(expires):
+    """Validation outlasts the source watchdog or the request deadline."""
+    errors = []
+    source, agent, control, _memory = _pinless_source(on_resilience_event=errors.append)
+    agent.state = "DONE"
+    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    residency = source._core._block_record_map[b"local"].local_dram
+    stalled_for = 0.0
+    validate = source._core._validate_descriptors
+    clock = source._core._clock
+
+    def slow_validate(*args, **kwargs):
+        nonlocal stalled_for
+        validate(*args, **kwargs)
+        stalled_for = 3600.0  # Validation "took" longer than the deadline allows.
+
+    # Advance only the clock under test, so each check is covered on its own.
+    stalled_clock = (
+        patch.object(
+            dangling_ops,
+            "time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
+        )
+        if expires == "watchdog"
+        else patch.object(source._core, "_clock", lambda: clock() + stalled_for)
+    )
+    with (
+        stalled_clock,
+        patch.object(source._core, "_validate_descriptors", slow_validate),
+    ):
+        control.incoming.append(
+            _start_write_message(12, b"local", target_agent="target")
+        )
+        _poll_until(source, lambda _: bool(agent.sent_notifs) or bool(errors))
+    assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
+    assert len(agent.xfers) == 1  # Only the deposit; no native WRITE.
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert residency.source_readers == 0
+
+
+def test_pending_pinless_source_validates_before_native_submission():
+    source, agent, control, _memory = _pinless_source(32)
+    source.deposit(
+        {b"pending": [_mem_descriptor(i, end_point_name="source") for i in range(2)]}
+    )
+    _wait_until(lambda: len(agent.xfers) == 1)
+    backend = source._core._remote_fw_dram
+    bad = [_TransferRef("target", 0), _TransferRef("foreign", 1)]
+    good = [_TransferRef("target", 0), _TransferRef("target", 1)]
+    payload = msgspec.msgpack.decode(
+        _start_write_message(12, b"pending", target_agent="target")
+    )
+    # Op 12 is invalid for the block it selects; op 13 only has an invalid
+    # destination for a key the source does not hold, so it is not inspected.
+    payload["dst_descriptors"] = [bad]
+    refused = msgspec.msgpack.encode(payload)
+    payload.update(op_handle=13, keys=[b"missing", b"pending"])
+    payload["dst_descriptors"] = [bad, good]
+    accepted = msgspec.msgpack.encode(payload)
+    with patch.object(
+        source._core, "_validate_descriptors", wraps=source._core._validate_descriptors
+    ) as validate:
+        control.incoming.extend([refused, accepted])
+        # Wait until both are queued behind the filling block, then poll more:
+        # a queued op must not validate while it waits.
+        _poll_until(source, lambda _: len(backend._sources._source_pin_ops) == 2)
+        for _ in range(5):
+            source.poll_completed()
+        assert validate.call_count == 0
+        agent.state = "DONE"
+        _poll_until(
+            source, lambda _: bool(agent.sent_notifs) and len(agent.xfers) == 2
+        )
+        # Op 12 is refused; op 13 reaches a native write (its success notification
+        # rides on that write, not on sent_notifs).
+        assert [_decode_notif(n)["op_handle"] for _, n in agent.sent_notifs] == [12]
+        assert not _decode_notif(agent.sent_notifs[0][1])["success"]
+        assert validate.call_count == 2  # Once per op, after selection.
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert source._core._block_record_map[b"pending"].local_dram.claim_count == 0
 
 
 @pytest.mark.parametrize("transfer_state,recovered", [("PROC", False), ("DONE", True)])
@@ -1543,6 +1693,7 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     if g2_only:
         selected = ()
     backend = object.__new__(_RemoteFWDram)
+    backend._framework_pinning = True
     kvcr = object.__new__(_KVCRCore)
     kvcr._block_record_map = {}
     kvcr._framework_pin_keys = {}

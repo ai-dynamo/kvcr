@@ -14,7 +14,7 @@ Source: start_write -> local claim/framework pin -> write -> write_done.
 import logging
 import math
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, cast
@@ -798,12 +798,8 @@ class _RemoteFWDram:
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
-            for descriptors in dst_descriptors:
-                self._kvcr._validate_descriptors(
-                    descriptors,
-                    regions=self._remote_agents_by_target[target_agent][2],
-                    agent_name=target_agent,
-                )
+            if self._framework_pinning:
+                self._validate_destinations(target_agent, dst_descriptors)
             self._ack_target_metadata(progress, payload)
         except _RemoteAgentCleanupError:
             raise
@@ -847,12 +843,17 @@ class _RemoteFWDram:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KVCR_EVENT source_transfer_requested op=%d source_op=%d target=%s "
-                "blocks=%d bytes=%d",
+                "blocks=%d bytes=%s",
                 op_handle,
                 op_id[1],
                 target_agent,
                 len(keys),
-                self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors)),
+                # Pinless destinations are validated later; don't inspect them.
+                (
+                    self._kvcr._descriptor_bytes(chain.from_iterable(dst_descriptors))
+                    if self._framework_pinning
+                    else "unvalidated"
+                ),
             )
 
         source_write = _SourceWriteOp(
@@ -944,6 +945,32 @@ class _RemoteFWDram:
                     self._queue_source_pin(op, key_layout)
         return observed_work
 
+    def _validate_destinations(
+        self, target_agent: str, dst_descriptors: Iterable[Any]
+    ) -> None:
+        regions = self._remote_agents_by_target[target_agent][2]
+        for descriptors in dst_descriptors:
+            self._kvcr._validate_descriptors(
+                descriptors, regions=regions, agent_name=target_agent
+            )
+
+    def _pinless_destinations_valid(
+        self, op_handle: int, target_agent: str, dst_descriptors: Iterable[Any]
+    ) -> bool:
+        """Validate deferred pinless destinations; a bad peer is refused."""
+        if self._framework_pinning:
+            return True
+        try:
+            self._validate_destinations(target_agent, dst_descriptors)
+        except Exception:
+            logger.warning(
+                "KVCR start_write destination validation failed for op=%d",
+                op_handle,
+                exc_info=True,
+            )
+            return False
+        return True
+
     def _try_local_source_write(
         self,
         progress: _KVCRProgress,
@@ -976,6 +1003,21 @@ class _RemoteFWDram:
             ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
             dst_descriptors = tuple(dst_descriptors[i] for i in completed_indices)
             source_write.keys = frozenset(ordered_keys)
+        # Pinless start_write defers validation until readers are claimed: check
+        # the claimed subset, or the whole request when nothing was claimed so a
+        # malformed peer is refused rather than told "success".
+        invalid = not self._pinless_destinations_valid(
+            source_write.op_handle,
+            source_write.route[0],
+            dst_descriptors if selected else source_write.dst_descriptors,
+        )
+        if invalid:
+            # The claimed readers stay owned by the op; finish_source releases
+            # them as failed once the failure notification is sent.
+            source_write.keys = frozenset()
+            source_write.state = _SourceWriteState.NOTIFY_FAILURE
+            if source_write.nvtx_state is not None:
+                source_write.nvtx_state.failure_reason = _nvtx.Reason.INVALID_RESULT
         sources = tuple(residency for _, residency, _ in selected)
         try:
             source_write.source_keys = ordered_keys

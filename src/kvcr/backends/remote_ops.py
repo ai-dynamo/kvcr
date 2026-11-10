@@ -486,8 +486,8 @@ class _SourceWriteOp(_RemoteOp):
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
-            status.submitted = True
             try:
+                status.submitted = True
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
                     tuple(chain.from_iterable(self.src_descriptors)),

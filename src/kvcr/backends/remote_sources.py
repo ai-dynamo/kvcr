@@ -230,6 +230,20 @@ class _RemoteSources:
                 if residency is not None
                 else tuple(source[span] for span in indices)
             )
+        if not waiting and not force_failure and not self._backend._framework_pinning:
+            # Validate once, after selection: the selected destinations, or the
+            # whole request when nothing was selected so a bad peer is refused.
+            if not self._backend._pinless_destinations_valid(
+                source_pin.op_handle,
+                route_name,
+                [source_pin.dst_descriptors[i] for i in completed_indices]
+                if completed_indices
+                else source_pin.dst_descriptors,
+            ):
+                force_failure = True
+                failure_reason = _nvtx.Reason.INVALID_RESULT
+                completed_indices.clear()
+                selected_sources.clear()
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
         )
