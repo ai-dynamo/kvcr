@@ -379,6 +379,7 @@ class _LocalDramPools:
                     break
                 if success:
                     self._kvcr._record_access(keys)
+                released = []
                 with state.lock:
                     for key, residency in zip(keys, sources):
                         if residency.source_readers <= 0:
@@ -388,7 +389,8 @@ class _LocalDramPools:
                         residency.source_readers -= 1
                         if not residency.source_readers:
                             state.active.pop(key)
-                for key, residency in zip(keys, sources):
+                            released.append((key, residency))
+                for key, residency in released:
                     record = self._kvcr._block_record_map.get(key)
                     if record is not None and record.pending_invalidation:
                         self._kvcr._invalidation_handler.notify(key)
