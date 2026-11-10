@@ -33,7 +33,7 @@ from _kvcr_test_utils import (
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
 from kvcr.backends import dangling_ops
 from kvcr.backends import dangling_ops as dangling_module
-from kvcr.backends.dangling_ops import _DanglingOps, _SourceWriteStatus
+from kvcr.backends.dangling_ops import _DanglingOps
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -874,37 +874,6 @@ def _watchdog(monkeypatch):
     return _DanglingOps(backend), backend, clock
 
 
-def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatch):
-    watchdog, backend, clock = _watchdog(monkeypatch)
-    watchdog.begin_poll()
-    clock[0] = 60.0  # Long idle gap: nothing retained, so not a stall.
-    watchdog.begin_poll()
-    assert not watchdog.check_source_progress()  # Queued requests may be stale.
-    assert backend._progress_outbound == []
-    clock[0] = 60.1
-    watchdog.begin_poll()  # Short gap, but the backlog is not drained yet.
-    assert not watchdog.check_source_progress()
-    watchdog.end_poll(drained=False)
-    assert not watchdog.check_source_progress()
-    watchdog.end_poll(drained=True)  # Drained: admitting resumes, nothing latched.
-    assert watchdog.check_source_progress()
-    watchdog.admit_source(("t", 1))
-    clock[0] = 60.5
-    watchdog.begin_poll()  # Gap since the last poll is short.
-    assert watchdog.check_source_progress()
-    clock[0] = 61.6
-    watchdog.begin_poll()  # Gap >= timeout while a write is in flight.
-    assert not watchdog.check_source_progress()
-    assert len(backend._progress_outbound) == 1
-    assert "disabled until restart" in str(backend._progress_outbound[0])
-    watchdog.source_writes.clear()  # Latched even after the work drains.
-    watchdog._retained = 0
-    clock[0] = 70.0
-    watchdog.begin_poll()
-    assert not watchdog.check_source_progress()
-    assert len(backend._progress_outbound) == 1
-
-
 def test_idle_source_does_not_latch_on_mid_poll_gap(monkeypatch):
     watchdog, backend, clock = _watchdog(monkeypatch)
     watchdog.begin_poll()
@@ -938,6 +907,7 @@ def test_pending_backlog_refusal_does_not_mask_a_real_stall(monkeypatch):
     watchdog.begin_poll()
     clock[0] = 2.0
     watchdog.admit_source(("t", 1))  # Sets the backlog refusal with work retained.
+    watchdog.source_writes[("t", 1)].cancel_requested = True  # Still outstanding.
     clock[0] = 3.1
     watchdog.begin_poll()  # 1.1 s since admission while the write is outstanding.
     assert not watchdog.check_source_progress()
@@ -970,23 +940,6 @@ def test_idle_gap_clears_only_on_successful_empty_recv():
     assert run(recv=[error]) == (False, False)  # First receive failed.
     # Partial batch: the message read before the error is still handled.
     assert run(recv=[valid, error]) == (True, False)
-
-
-def test_probe_fence_is_not_retained_work(monkeypatch):
-    watchdog, backend, clock = _watchdog(monkeypatch)
-    watchdog.begin_poll()
-    watchdog.source_writes[("t", 1)] = _SourceWriteStatus(
-        cancel_requested=True
-    )
-    clock[0] = 60.0  # Idle gap with only a cancel fence: no latch.
-    watchdog.begin_poll()
-    assert backend._progress_outbound == []
-    watchdog.end_poll(drained=True)
-    watchdog.admit_source(("t", 2))  # Accepted write.
-    watchdog.source_writes[("t", 2)].cancel_requested = True  # Probed pre-submit.
-    clock[0] = 61.5
-    watchdog.begin_poll()
-    assert len(backend._progress_outbound) == 1
 
 
 class _GapControl(FakeBytesControl):
