@@ -908,61 +908,68 @@ def test_idle_source_never_stalls_and_stalls_only_with_work_in_flight(monkeypatc
 def test_idle_source_does_not_latch_on_mid_poll_gap(monkeypatch):
     watchdog, backend, clock = _watchdog(monkeypatch)
     watchdog.begin_poll()
-    clock[0] = 2.0  # Gap crossed while idle, before any admission.
-    assert watchdog.check_source_progress()
+    clock[0] = 2.0  # Metadata processing consumed 2 s mid-poll; nothing retained.
+    assert not watchdog.may_admit_source()  # A queued move is refused pre-admission.
+    watchdog.end_poll(drained=True)  # An empty receive cannot clear it mid-poll.
+    assert not watchdog.may_admit_source()
     assert not watchdog._source_stalled
-    # Slow first-request setup: the timeout is crossed, then the write is admitted.
+    watchdog.begin_poll()  # The next poll restarts timing; backlog is drained.
+    watchdog.end_poll(drained=True)
+    assert watchdog.may_admit_source()
+    clock[0] = 4.0  # Slow first-request setup, then admission.
     watchdog.admit_source(("t", 1))
-    assert watchdog._idle_gap  # Requests queued behind it are stale.
-    assert not watchdog.check_source_progress()
-    clock[0] = 2.5  # Retained-work timer started at admission, not at the poll.
+    assert watchdog.check_source_progress()  # The admitted write itself runs.
+    assert not watchdog.may_admit_source()  # Requests queued behind it do not.
+    clock[0] = 4.5  # Retained-work timer started at admission, not at the poll.
     watchdog.begin_poll()
-    assert not watchdog._source_stalled
     assert backend._progress_outbound == []
-    assert not watchdog.check_source_progress()  # Backlog still refused.
     watchdog.end_poll(drained=True)  # Drained: fresh work resumes, no latch.
-    assert watchdog.check_source_progress()
+    assert watchdog.may_admit_source()
+    clock[0] = 4.9
     watchdog.admit_source(("t", 2))  # A second admission must not reset the timer.
-    clock[0] = 3.6
+    clock[0] = 5.6
     watchdog.begin_poll()  # 1.1 s after the last poll, with work in flight.
     assert not watchdog.check_source_progress()
     assert len(backend._progress_outbound) == 1
 
 
-def test_idle_gap_clears_only_on_successful_empty_recv(monkeypatch):
+def test_pending_backlog_refusal_does_not_mask_a_real_stall(monkeypatch):
+    watchdog, backend, clock = _watchdog(monkeypatch)
+    watchdog.begin_poll()
+    clock[0] = 2.0
+    watchdog.admit_source(("t", 1))  # Sets the backlog refusal with work retained.
+    clock[0] = 3.1
+    watchdog.begin_poll()  # 1.1 s since admission while the write is outstanding.
+    assert not watchdog.check_source_progress()
+    assert len(backend._progress_outbound) == 1
+    assert "disabled until restart" in str(backend._progress_outbound[0])
+
+
+def test_idle_gap_clears_only_on_successful_empty_recv():
     import zmq
 
     from kvcr.runtime.control_channels import ZmqPeerControlChannel
 
-    class Socket:
-        def __init__(self, *items):
-            self.items = list(items)
+    valid = msgspec.msgpack.encode({"type": "target_metadata_ack"})
+    error = zmq.ZMQError(zmq.ENOTSOCK)
 
-        def poll(self, _timeout):
-            if self.items and isinstance(self.items[0], zmq.ZMQError):
-                raise self.items.pop(0)
-            return bool(self.items)
-
-        def recv(self, flags=0):
-            item = self.items.pop(0) if self.items else zmq.Again()
-            if isinstance(item, Exception):
-                raise item
-            return item
-
-    def drained(*items):
+    def run(poll=True, recv=()):
+        socket = Mock()
+        socket.poll.side_effect = [poll] if poll is not error else error
+        socket.recv.side_effect = recv
         channel = ZmqPeerControlChannel.__new__(ZmqPeerControlChannel)
-        channel._socket = Socket(*items)
+        channel._socket = socket
         backend = _RemoteFWDram.__new__(_RemoteFWDram)
         backend._control = channel
-        return backend._process_control_messages(None)[1]
+        backend._kvcr = Mock(_timer=Mock(return_value=None))
+        backend._handle_target_metadata_ack = Mock()
+        return backend._process_control_messages(Mock())
 
-    assert drained(zmq.ZMQError(zmq.EAGAIN + 1)) is False  # poll() failure.
-    assert drained(b"x", zmq.ZMQError(zmq.EAGAIN + 1)) is False  # Partial batch.
-    assert drained(zmq.Again()) is True  # Genuinely empty.
-    assert drained() is True
-    backend = _RemoteFWDram.__new__(_RemoteFWDram)
-    backend._control = SimpleNamespace(recv=lambda: [])
-    assert backend._process_control_messages(None) == (False, True)
+    assert run(poll=False) == (False, True)  # Genuinely empty.
+    assert run(poll=error) == (False, False)  # poll() failed.
+    assert run(recv=[error]) == (False, False)  # First receive failed.
+    # Partial batch: the message read before the error is still handled.
+    assert run(recv=[valid, error]) == (True, False)
 
 
 def test_probe_fence_is_not_retained_work(monkeypatch):

@@ -47,27 +47,12 @@ class _DanglingOps:
         self._last_progress_at: float | None = None
         self._source_stalled = False
         self._idle_gap = False
-        self._retained = 0  # Admitted source writes; cancel-only probe entries are not counted.
+        # Admitted source writes; cancel-only probe entries are not counted.
+        self._retained = 0
 
     def begin_poll(self) -> None:
-        polled_at = time.monotonic()
-        gap_ms = self._gap_ms()
-        if self._retained or self._source_stalled:
-            # _idle_gap is left to end_poll: a backlog queued across the gap
-            # stays refused after the first admission.
-            self.check_source_progress()
-        elif gap_ms >= self._backend._kvcr.config.operation_timeout_ms:
-            # An idle gap is not a stall, but requests queued during it may
-            # carry expired deadlines: refuse them until end_poll sees the
-            # backlog drained, and latch nothing.
-            if not self._idle_gap:
-                logger.warning(
-                    "KVCR source progress gap of %.1f ms with no retained source "
-                    "writes; refusing source writes queued across it",
-                    gap_ms,
-                )
-            self._idle_gap = True
-        self._last_progress_at = polled_at
+        self.check_source_progress()
+        self._last_progress_at = time.monotonic()
 
     def end_poll(self, drained: bool) -> None:
         """Clear the idle-gap refusal once a poll finds no queued control messages."""
@@ -91,15 +76,29 @@ class _DanglingOps:
         self._retained += 1
 
     def check_source_progress(self) -> bool:
+        """Whether source writes may run: no stall latched, no stale backlog.
+
+        Admitted work (_retained) is only ever subject to the real-stall check,
+        so a pending backlog refusal cannot fail it or mask a genuine stall.
+        """
         if self._source_stalled:
             return False
-        if self._idle_gap:
-            return False
-        if not self._retained:
-            # Nothing to stall; an idle source must never latch.
-            return True
         gap_ms = self._gap_ms()
         timeout_ms = self._backend._kvcr.config.operation_timeout_ms
+        if gap_ms >= timeout_ms and not self._retained:
+            # An idle gap is not a stall, but requests queued across it may
+            # carry expired deadlines: refuse them until end_poll sees the
+            # backlog drained, and latch nothing.
+            if not self._idle_gap:
+                logger.warning(
+                    "KVCR source progress gap of %.1f ms with no retained source "
+                    "writes; refusing source writes queued across it",
+                    gap_ms,
+                )
+            self._idle_gap = True
+            return False
+        if not self._retained:
+            return not self._idle_gap
         if gap_ms >= timeout_ms:
             # Require restart so queued pre-stall requests cannot get fresh deadlines.
             self._source_stalled = True
@@ -111,6 +110,10 @@ class _DanglingOps:
                 )
             )
         return not self._source_stalled
+
+    def may_admit_source(self) -> bool:
+        """Admission gate: also refuses a backlog queued behind a slow admission."""
+        return self.check_source_progress() and not self._idle_gap
 
     def poll_source(
         self, progress: "_KVCRProgress", op: "_SourceWriteOp", *, cancelling: bool

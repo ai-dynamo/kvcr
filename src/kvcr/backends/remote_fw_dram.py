@@ -824,7 +824,7 @@ class _RemoteFWDram:
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(progress, payload, op_handle, "source_restarted")
             return
-        if progress._stop_requested or not self._dangling_ops.check_source_progress():
+        if progress._stop_requested or not self._dangling_ops.may_admit_source():
             if logger.isEnabledFor(logging.DEBUG):
                 reason = "stopping" if progress._stop_requested else "source_stalled"
                 logger.debug(
