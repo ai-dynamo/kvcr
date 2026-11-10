@@ -230,7 +230,7 @@ class _RemoteSources:
                 if residency is not None
                 else tuple(source[span] for span in indices)
             )
-        if not waiting and not force_failure:
+        if not waiting and not force_failure and not self._backend._framework_pinning:
             # Validate once, after selection: the selected destinations, or the
             # whole request when nothing was selected so a bad peer is refused.
             if not self._backend._pinless_destinations_valid(

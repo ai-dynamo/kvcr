@@ -31,6 +31,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr.backends import dangling_ops
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -290,8 +291,9 @@ def test_unclaimed_write_invalid_destination_refused_by_mode(pinning):
     assert agent.xfers == []
 
 
-def test_pinless_write_refused_when_validation_expires_source_watchdog():
-    """The request deadline is still valid, but the source watchdog is not."""
+@pytest.mark.parametrize("expires", ["watchdog", "request_deadline"])
+def test_pinless_write_refused_when_validation_expires_a_deadline(expires):
+    """Validation outlasts the source watchdog or the request deadline."""
     memory = ctypes.create_string_buffer(16)
     agent, control = FakeNixlAgent(), FakeBytesControl()
     agent.state = "DONE"
@@ -310,16 +312,27 @@ def test_pinless_write_refused_when_validation_expires_source_watchdog():
     residency = source._core._block_record_map[b"local"].local_dram
     stalled_for = 0.0
     validate = source._core._validate_descriptors
+    clock = source._core._clock
 
     def slow_validate(*args, **kwargs):
         nonlocal stalled_for
         validate(*args, **kwargs)
-        stalled_for = 3600.0  # Validation "took" longer than the watchdog allows.
+        stalled_for = 3600.0  # Validation "took" longer than the deadline allows.
 
+    # Each variant advances only one clock, so each check is covered on its own.
+    watchdog = expires == "watchdog"
     with (
-        patch(
-            "kvcr.backends.dangling_ops.time",
-            SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
+        patch.object(
+            dangling_ops,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: time.monotonic() + (stalled_for if watchdog else 0.0)
+            ),
+        ),
+        patch.object(
+            source._core,
+            "_clock",
+            lambda: clock() + (0.0 if watchdog else stalled_for),
         ),
         patch.object(source._core, "_validate_descriptors", slow_validate),
     ):

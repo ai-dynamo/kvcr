@@ -1012,13 +1012,8 @@ class _RemoteFWDram:
             dst_descriptors if selected else source_write.dst_descriptors,
         )
         if invalid:
-            if selected:
-                local._pools.release_readers(
-                    ordered_keys,
-                    tuple(residency for _, residency, _ in selected),
-                    success=False,
-                )
-            selected, ordered_keys, dst_descriptors = (), (), ()
+            # The claimed readers stay owned by the op; finish_source releases
+            # them as failed once the failure notification is sent.
             source_write.keys = frozenset()
             source_write.state = _SourceWriteState.NOTIFY_FAILURE
             if source_write.nvtx_state is not None:
