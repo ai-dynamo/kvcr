@@ -1663,7 +1663,7 @@ def test_remote_framework_dram_transfers_available_keys(
     assert any(
         "source_transfer_requested" in event
         and source_ops in event
-        and "blocks=3" in event
+        and "blocks=3 bytes=48" in event
         for event in events
     )
     completed = f"blocks={len(completed_indices)} bytes={16 * len(completed_indices)}"
