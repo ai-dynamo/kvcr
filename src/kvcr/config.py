@@ -106,7 +106,9 @@ class TelemetryStats(Protocol):
 class FrameworkControl(Protocol):
     def send(self, endpoint: str, message: bytes) -> bool: ...
 
-    def recv(self) -> list[bytes]: ...
+    def recv(self) -> list[tuple[bytes, float]]:
+        """Return messages with their local time.monotonic() receipt timestamps."""
+        ...
 
 
 class KeyAdapter(Protocol):

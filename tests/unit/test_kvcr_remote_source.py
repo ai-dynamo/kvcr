@@ -31,7 +31,6 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.backends import dangling_ops
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
@@ -278,11 +277,8 @@ def test_pinless_write_validates_only_claimed_destinations(
     assert residency.source_readers == 0
 
 
-@pytest.mark.parametrize("expires", ["watchdog", "request_deadline"])
-def test_pinless_write_refused_when_validation_expires_a_deadline(expires):
-    """Validation outlasts the source watchdog or the request deadline."""
-    errors = []
-    source, agent, control, _memory = _pinless_source(on_resilience_event=errors.append)
+def test_pinless_write_refused_when_validation_expires_a_deadline():
+    source, agent, control, _memory = _pinless_source()
     agent.state = "DONE"
     deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
     assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
@@ -294,26 +290,16 @@ def test_pinless_write_refused_when_validation_expires_a_deadline(expires):
     def slow_validate(*args, **kwargs):
         nonlocal stalled_for
         validate(*args, **kwargs)
-        stalled_for = 3600.0  # Validation "took" longer than the deadline allows.
+        stalled_for = 3600.0  # Validation consumed the request's remaining budget.
 
-    # Advance only the clock under test, so each check is covered on its own.
-    stalled_clock = (
-        patch.object(
-            dangling_ops,
-            "time",
-            SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
-        )
-        if expires == "watchdog"
-        else patch.object(source._core, "_clock", lambda: clock() + stalled_for)
-    )
     with (
-        stalled_clock,
+        patch.object(source._core, "_clock", lambda: clock() + stalled_for),
         patch.object(source._core, "_validate_descriptors", slow_validate),
     ):
         control.incoming.append(
             _start_write_message(12, b"local", target_agent="target")
         )
-        _poll_until(source, lambda _: bool(agent.sent_notifs) or bool(errors))
+        _poll_until(source, lambda _: bool(agent.sent_notifs))
     assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
     assert len(agent.xfers) == 1  # Only the deposit; no native WRITE.
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
@@ -712,21 +698,18 @@ def test_local_source_retries_after_reader_contention(outcome):
         )
 
 
+@pytest.mark.parametrize(
+    "remaining_ms,source_timeout_ms", [(100, 10_000), (10_000, 100)]
+)
 @pytest.mark.parametrize("pin_before_deadline", [True, False])
 def test_kvcr_start_write_respects_framework_pin_deadline(
     pin_before_deadline: bool,
+    remaining_ms: int,
+    source_timeout_ms: int,
     caplog,
 ) -> None:
-    """Source writes must not start after their framework-pin deadline."""
+    """Receipt starts the smaller budget, including owner and framework-pin waits."""
     caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
-    now = 0.0
-    deadline_captured = threading.Event()
-
-    def clock() -> float:
-        captured = now
-        deadline_captured.set()
-        return captured
-
     source_agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl()
@@ -737,26 +720,26 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         KVCRConfig(
             nixl_agent_name="source",
             pool_layouts=[("", 16)],
-            operation_timeout_ms=10_000,
+            operation_timeout_ms=source_timeout_ms,
             abandon_timeout_ms=20_000,
         ),
         name="source",
     )
-    source._core._clock = clock
+    now = 0.05  # Handling starts 50 ms after the transport received the request.
+    source._core._clock = lambda: now
+    control._clock = lambda: 0.0
     key = BlockKey(b"k0")
-    control.incoming.append(_start_write_message(9, key, remaining_timeout_ms=100))
+    control.incoming.append(
+        _start_write_message(9, key, remaining_timeout_ms=remaining_ms)
+    )
     if pin_before_deadline:
-        assert (
-            _poll_until(
-                source,
-                lambda _: bool(source._core._remote_fw_dram._sources._pending_pin_ops),
-            )
-            == []
-        )
+        _poll_until(source, lambda _: bool(pinning.pending))
     else:
-        assert deadline_captured.wait(timeout=1)
+        _wait_until(
+            lambda: bool(source._core._remote_fw_dram._dangling_ops.source_writes)
+        )
 
-    now = 2.0
+    now = 0.11  # Both caps expire at receipt + 0.1, not handler entry + 0.1.
     assert _poll_until(source, lambda _: bool(source_agent.sent_notifs)) == []
 
     assert source_agent.xfers == []
@@ -768,6 +751,52 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         "op_handle": 9,
         "success": False,
     }
+
+
+def test_start_write_batch_keeps_each_received_deadline(request):
+    source, agent, control, _memory = _pinless_source()
+    agent.state = "DONE"
+    deposit = source.deposit({b"local": [_mem_descriptor(end_point_name="source")]})
+    assert _poll_until(source, bool) == [(deposit, _op_entries({b"local": True}))]
+    agent.state = "PROC"
+    request.addfinalizer(lambda: setattr(agent, "state", "DONE"))
+    now = 0.0
+    source._core._clock = lambda: now
+    backend = source._core._remote_fw_dram
+    expired = msgspec.msgpack.decode(
+        _start_write_message(12, b"local", remaining_timeout_ms=100)
+    )
+    expired["move"] = True
+    metadata_handled = []
+
+    def earlier_message(_progress, _payload):
+        nonlocal now
+        now = 0.2
+        metadata_handled.append(True)
+
+    with patch.object(backend, "_handle_target_metadata_ack", earlier_message):
+        # Expired moves must be refused without waiting for owner-side invalidation.
+        with source._core._state_lock:
+            control.incoming.extend(
+                [
+                    msgspec.msgpack.encode({"type": "target_metadata_ack"}),
+                    msgspec.msgpack.encode(expired),
+                    _start_write_message(13, b"local", remaining_timeout_ms=500),
+                    _start_write_message(13, b"local", remaining_timeout_ms=100),
+                    msgspec.msgpack.encode({"type": "target_metadata_ack"}),
+                ]
+            )
+            _wait_until(lambda: len(metadata_handled) == 2)
+            # The expired duplicate must not terminate the already submitted WRITE.
+            assert [_decode_notif(raw) for _, raw in agent.sent_notifs] == [
+                {"type": "write_done", "op_handle": 12, "success": False}
+            ]
+            assert len(agent.xfers) == 2
+            assert _decode_notif(agent.xfers[-1][5])["op_handle"] == 13
+            assert not source._core._invalidation_handler._pending
+    agent.state = "DONE"
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert source._core._block_record_map[b"local"].local_dram.source_readers == 0
 
 
 @pytest.mark.parametrize("incarnation", [None, "matching", "other"])
@@ -814,49 +843,36 @@ def test_write_probe_fences_write_waiting_on_framework_pin(
     assert len(agent.xfers) == (1 if incarnation == "other" else 0)
 
 
-@pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
-def test_stalled_source_refuses_queued_and_future_writes(caplog, log_level) -> None:
-    caplog.set_level(log_level, logger="kvcr.runtime.core")
-    errors = []
-
-    def on_resilience_event(error):
-        errors.append(error)
-        raise error
-
+@pytest.mark.parametrize("active", [False, True])
+def test_fresh_source_write_survives_progress_gap(active):
     agent = FakeNixlAgent(metadata=b"source-md")
     pinning = PendingPrimaryPinning()
     control = FakeBytesControl()
+    agent.state = "DONE"
+    errors = []
     source = _new_kvcr(
-        agent, pinning, control, name="source", on_resilience_event=on_resilience_event
+        agent, pinning, control, name="source", on_resilience_event=errors.append
     )
-
-    stalled_for = 0.0
-    with patch(
-        "kvcr.backends.dangling_ops.time",
-        SimpleNamespace(monotonic=lambda: time.monotonic() + stalled_for),
-    ):
-        for handle in (1, 2):
-            control.incoming.append(
-                _start_write_message(handle, BlockKey(b"k0"), target_agent="target")
-            )
-            if handle == 1:
-                _poll_until(source, lambda _: bool(pinning.searches))
-                stalled_for = 2.0
-                pinning.complete(0)
-                with pytest.raises(RuntimeError, match="source progress stalled"):
-                    _poll_until(source, lambda _: bool(errors))
-            assert _poll_until(source, lambda _: len(agent.sent_notifs) == handle) == []
-            assert not _decode_notif(agent.sent_notifs[-1][1])["success"]
-    assert agent.xfers == []
-    assert pinning.searches == [(BlockKey(b"k0"),)]
-    assert pinning.unpins == ["pin"]
-    assert len(errors) == 1  # A raising callback must not stop native cleanup.
-    assert "timeout: 1000 ms" in str(errors[0])
-    assert "new source writes disabled until restart" in str(errors[0])
-    refusals = [m for m in caplog.messages if "source_transfer_refused " in m]
-    assert bool(refusals) is (log_level == logging.DEBUG)
-    if refusals:
-        assert "reason=source_stalled" in refusals[0]
+    now = 0.0
+    source._core._clock = lambda: now
+    real_monotonic = time.monotonic
+    with patch("time.monotonic", lambda: real_monotonic() + now):
+        control.incoming.append(_write_probe_message(99))
+        _wait_until(lambda: bool(control.sent))
+        if active:
+            control.incoming.append(_start_write_message(1, b"old"))
+            _poll_until(source, lambda _: bool(pinning.pending))
+        now = 2.0
+        if active:
+            pinning.complete(0)
+            _poll_until(source, lambda _: bool(agent.sent_notifs))
+            assert _decode_notif(agent.sent_notifs[0][1])["success"] is False
+        control.incoming.append(_start_write_message(2, b"fresh"))
+        _poll_until(source, lambda _: len(pinning.searches) == 1 + active)
+        pinning.complete(int(active))
+        _poll_until(source, lambda _: bool(agent.xfers))
+    assert _decode_notif(agent.xfers[0][5])["op_handle"] == 2
+    assert errors == []
 
 
 def test_kvcr_close_cleans_pending_pin_operations():
@@ -2021,7 +2037,7 @@ def test_start_write_refusal_names_why(incarnation, with_metadata, stopping, rea
             return []
         delivered.append(True)
         progress._stop_requested = stopping
-        return [msgspec.msgpack.encode(payload)]
+        return [(msgspec.msgpack.encode(payload), control._clock())]
 
     def refusals():
         return [

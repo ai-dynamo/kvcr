@@ -450,15 +450,16 @@ class FakeBytesControl:
         self.sent: list[tuple[str, bytes]] = []
         self.incoming: list[bytes] = []
         self.send_result = True
+        self._clock = time.monotonic
 
     def send(self, endpoint: str, message: bytes) -> bool:
         self.sent.append((endpoint, message))
         return self.send_result
 
-    def recv(self) -> list[bytes]:
+    def recv(self) -> list[tuple[bytes, float]]:
         incoming = self.incoming
         self.incoming = []
-        return incoming
+        return [(message, self._clock()) for message in incoming]
 
 
 def _mem_descriptor(
@@ -547,7 +548,7 @@ def _start_write_message(
 def _new_kvcr(
     agent: FakeNixlAgent,
     pinning: FakePrimaryPinning,
-    control: FakeBytesControl,
+    control: FakeBytesControl | None,
     config: KVCRConfig | None = None,
     name: str = "target",
     key_adapter: object | None = None,
@@ -600,6 +601,8 @@ def _new_kvcr(
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
             ),
         )
+    if control is not None:
+        control._clock = lambda: kvcr._core._clock()
     _OPEN_KVCRS.append(kvcr)
     return kvcr
 

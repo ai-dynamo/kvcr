@@ -12,6 +12,7 @@ import logging
 import os
 import socket
 import struct
+import time
 from array import array
 from collections.abc import Callable, Collection
 from contextlib import ExitStack
@@ -292,16 +293,17 @@ class ZmqPeerControlChannel:
             return False
         return True
 
-    def recv(self) -> list[bytes]:
+    def recv(self) -> list[tuple[bytes, float]]:
         socket = self._socket
         if socket is None:
             raise RuntimeError("KVCR control channel is not initialized")
-        messages: list[bytes] = []
+        messages: list[tuple[bytes, float]] = []
         try:
             if not socket.poll(0):
                 return messages
             while len(messages) < _MAX_RECV_BATCH:
-                messages.append(socket.recv(flags=zmq.NOBLOCK))
+                message = socket.recv(flags=zmq.NOBLOCK)
+                messages.append((message, time.monotonic()))
         except zmq.Again:
             return messages
         except zmq.ZMQError:
