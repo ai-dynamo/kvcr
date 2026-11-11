@@ -173,7 +173,7 @@ def test_parser_exception_rejects_only_its_hint() -> None:
         {
             "source_control_endpoint": "tcp://source:1",
             "block_hashes": [1],
-            "no_retain": True,
+            "no_retain": 1,
         },
     ],
 )

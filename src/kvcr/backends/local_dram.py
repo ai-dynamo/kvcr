@@ -284,6 +284,9 @@ class _LocalDram:
             hints=hints,
             key_layout=key_layout,
         )
+        for key in keys:
+            if self._kvcr._no_retain.pop(key, None) and not no_evict:
+                op.results[key] = _DROPPED_RESULT
         self._pending_residency_ops[op.op_id] = op
         self._admit(op)
         self._start_deposits(op, blocks)
@@ -293,13 +296,15 @@ class _LocalDram:
         dependency, so work on other keys cannot delay their removal. Accepted
         keys may finish even if removal becomes pending later.
         """
-        rejected = self._kvcr._invalidation_handler.rejected_entries(op.keys)
+        rejected = self._kvcr._invalidation_handler.rejected_entries(
+            op.keys - op.results.keys() if op.results else op.keys
+        )
         if rejected:
             op.results.update(rejected)
         self._kvcr._add_block_dependencies(
             op,
             new_operation=True,
-            keys=op.keys - op.results.keys() if rejected else None,
+            keys=op.keys - op.results.keys() if op.results else None,
         )
 
     def _start_deposits(

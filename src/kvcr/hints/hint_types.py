@@ -30,6 +30,7 @@ class _KVFetchHint(_Hint):
 
     source_endpoint: str
     block_hashes: frozenset[int]
+    no_retain: bool = False
 
 
 class _KVEvictOnFetchHint(_KVFetchHint):

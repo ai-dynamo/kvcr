@@ -90,8 +90,9 @@ def _parse_payload(
     hint_factory: Callable[[str | None, str, frozenset[int]], _Hint],
 ) -> _Hint:
     """The ``{peer}_control_endpoint`` and ``block_hashes`` of a hint payload."""
-    if "no_retain" in payload:
-        raise ValueError("no_retain is not currently supported")
+    no_retain = payload.get("no_retain", False)
+    if not isinstance(no_retain, bool):
+        raise ValueError("no_retain must be a boolean")
     endpoint = payload.get(f"{peer}_control_endpoint")
     if endpoint is None:
         raise ValueError(f"{peer}-less hints are not currently supported")
@@ -113,7 +114,13 @@ def _parse_payload(
         hashes.add(block_hash)
     if not hashes:
         raise ValueError("invalid router hint")
-    return hint_factory(action_id, endpoint, frozenset(hashes))
+    hint = hint_factory(action_id, endpoint, frozenset(hashes))
+    if "no_retain" in payload:
+        try:
+            hint = msgspec.structs.replace(hint, no_retain=no_retain)
+        except TypeError as exc:
+            raise ValueError("no_retain is not supported by this hint") from exc
+    return hint
 
 
 def parse_hints(

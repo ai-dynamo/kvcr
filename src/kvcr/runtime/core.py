@@ -64,6 +64,7 @@ from .progress import (
 
 if TYPE_CHECKING:
     from ..api import KVCRBindings
+    from ..backends.remote_fw_dram import _RequestHint
     from ..backends.remote_sources import _FwMemResidency
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,7 @@ class _KVCRCore:
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         # Preserve remote selections until a successful fetch or discard_hint().
         self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
+        self._no_retain: dict[BlockKey, set[str]] = {}
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
@@ -265,7 +267,9 @@ class _KVCRCore:
         self._resilience_errors: deque[Exception] = deque()
         self._pending_progress_items: list[object] = []
         self._joined_completions: dict[
-            OpHandle, tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
+            OpHandle,
+            tuple[set[BlockKey], dict[BlockKey, OpEntryResult]]
+            | tuple[set[BlockKey], dict[BlockKey, OpEntryResult], "_RequestHint"],
         ] = {}
         # Both seeded from the clock rather than a constant, so a refusal sent before a
         # restart cannot complete a different operation that reused the number.
@@ -643,6 +647,7 @@ class _KVCRCore:
                 pushed = trace.push("op.deliver")
         try:
             with self._state_lock:
+                hint = self._remote_fw_dram._request_hints.get(request_id)
                 local_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 g3_blocks: dict[BlockKey, list[_TransferRef]] = {}
                 remote_blocks: dict[BlockKey, list[_TransferRef]] = {}
@@ -673,6 +678,14 @@ class _KVCRCore:
                         g3_blocks=len(g3_blocks),
                     )
                 if (
+                    hint is not None
+                    and hint.no_retain
+                    and not hint.failed
+                    and local_dram is not None
+                    and self._key_adapter is not None
+                ):
+                    self._joined_completions[op_handle] = (set(blocks), {}, hint)
+                elif (
                     sum(map(bool, (local_blocks, g3_blocks, remote_blocks, rejected)))
                     > 1
                 ):
@@ -999,6 +1012,8 @@ class _KVCRCore:
 
     def _close_main_resources(self) -> None:
         self._remote_delivery_keys.clear()
+        self._no_retain.clear()
+        self._joined_completions.clear()
         # Every stage runs even if an earlier one failed: skipping the rest
         # would leak files and pins for a failure that says nothing about them.
         first_error: BaseException | None = None
@@ -1428,12 +1443,14 @@ class _KVCRCore:
     ) -> None:
         joined = self._joined_completions.get(op_handle)
         if joined is not None:
-            expected, completed = joined
+            expected, completed = joined[0], joined[1]
             completed.update(entries)
             if not expected.issubset(completed):
                 return
             self._joined_completions.pop(op_handle)
             entries = completed
+            if len(joined) == 3:
+                self._remote_fw_dram.mark_no_retain(joined[2], entries)
         trace = self._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.completed(entries)

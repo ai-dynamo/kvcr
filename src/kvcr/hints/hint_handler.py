@@ -69,6 +69,7 @@ class _FetchHintHandler(_HintHandler):
             hint.block_hashes,
             request_id,
             move=hint.ACTION_TYPE == "kv.evict_on_fetch",
+            no_retain=hint.no_retain,
         )
         self._dispatcher.report(
             HintResult(

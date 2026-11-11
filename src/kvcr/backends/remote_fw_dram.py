@@ -40,6 +40,7 @@ from ..runtime.progress import (
 from ..types import (
     BlockKey,
     CacheTier,
+    OpEntryResult,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -72,10 +73,15 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class _RequestHint:
+    request_id: str
     source: str | None
     block_hashes: frozenset[int]
     submitted_at: float | None
     move: bool = False
+    no_retain: bool = False
+    no_retain_keys: set[BlockKey] | None = field(
+        default=None, repr=False, compare=False
+    )
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
@@ -166,6 +172,7 @@ class _RemoteFWDram:
         request_id: str | None,
         *,
         move: bool = False,
+        no_retain: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -188,10 +195,16 @@ class _RemoteFWDram:
                     previous.trace.mark("hint.replaced", once=True)
                 if trace is not None:
                     trace.mark("hint.submitted")
+            marked = previous.no_retain_keys if previous is not None else None
+            if no_retain and marked is None:
+                marked = set()
             self._request_hints[request_id] = _RequestHint(
+                request_id=request_id,
                 source=src,
                 block_hashes=block_hashes,
                 move=move,
+                no_retain=no_retain,
+                no_retain_keys=marked,
                 submitted_at=(
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
@@ -427,9 +440,34 @@ class _RemoteFWDram:
         if not self._closed:
             self._sources.poll()
 
+    def mark_no_retain(
+        self, hint: _RequestHint, entries: Mapping[BlockKey, OpEntryResult]
+    ) -> None:
+        current = self._request_hints.get(hint.request_id)
+        marked = hint.no_retain_keys
+        if marked is None or current is None or current.no_retain_keys is not marked:
+            return
+        for key, result in entries.items():
+            if (
+                result.success
+                and self._kvcr._key_adapter.encode_to_router(key) in hint.block_hashes
+            ):
+                self._kvcr._no_retain.setdefault(key, set()).add(hint.request_id)
+                marked.add(key)
+
     def discard_hint(self, request_id: str) -> None:
         hint = self._request_hints.pop(request_id, None)
-        if hint is not None and hint.trace is not None:
+        if hint is None:
+            return
+        marked = self._kvcr._no_retain
+        for key in hint.no_retain_keys or ():
+            owners = marked.get(key)
+            if owners is None:
+                continue
+            owners.discard(request_id)
+            if not owners:
+                del marked[key]
+        if hint.trace is not None:
             hint.trace.mark("hint.discarded", once=True)
 
     def _fail_request_hint(self, request_id: str | None) -> None:
