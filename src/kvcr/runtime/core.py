@@ -509,7 +509,8 @@ class _KVCRCore:
     ) -> list[tuple[QueryStatus, CacheTier | None]]:
         """Return the best available local or remote path for each key.
 
-        Exact hint membership is used unless opportunistic querying is enabled.
+        Exact hint membership is used unless opportunistic querying is enabled;
+        ``kv.evict_on_fetch`` advice always uses it, so only hinted keys are removed.
         Usable remote selections persist until successful fetch or discard_hint.
         """
         statuses = []
@@ -689,6 +690,8 @@ class _KVCRCore:
                         dict.fromkeys(g3_blocks, _FAILED_RESULT),
                     )
                 if remote_blocks:
+                    if self._remote_fw_dram.is_move(request_id, None):
+                        deadline = self._clock() + self.config.abandon_timeout_ms / 1000
                     self._remote_fw_dram.deliver(
                         op_handle, remote_blocks, request_id, deadline=deadline
                     )
@@ -832,7 +835,8 @@ class _KVCRCore:
                 ):
                     sources[key] = CacheTier.REMOTE_G2
             deadline = self._operation_deadline()
-            if move:
+            allow_move = self._remote_fw_dram.is_move(request_id, named_source)
+            if allow_move:
                 # Accept delayed completion using the existing abandonment budget.
                 # The source independently caps its native transfer timeout.
                 deadline += (
@@ -859,6 +863,7 @@ class _KVCRCore:
                     },
                     request_id,
                     deadline,
+                    allow_move=allow_move,
                     named_source=named_source,
                 )
         return op_handle
@@ -1174,6 +1179,7 @@ class _KVCRCore:
         request_id: str | None,
         deadline: float,
         *,
+        allow_move: bool,
         named_source: _NamedSource | None = None,
     ) -> None:
         if not blocks:
@@ -1193,6 +1199,7 @@ class _KVCRCore:
                 request_id,
                 deadline,
                 op_handle=fill_handle,
+                allow_move=allow_move,
                 named_source=named_source,
             )
         else:

@@ -12,7 +12,7 @@ from ..runtime.core import logger
 from ..runtime.progress import _Op, _OpId, _TransferRef
 from ..types import BlockKey, MemoryRef, PinHandle, PinRequestId, PinResult
 from .local_dram_pools import _layout_indices, _LocalDramState
-from .remote_ops import _NvtxState, _SourceWriteOp, _SourceWriteState
+from .remote_ops import _Invalidate, _NvtxState, _SourceWriteOp, _SourceWriteState
 
 if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
@@ -42,6 +42,7 @@ class _SourcePinOp(_Op):
     g2_only: bool = False
     # Keys this move marked pending; reopened if they are not written.
     moving: tuple[BlockKey, ...] = ()
+    evict: bool = False
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -179,6 +180,7 @@ class _RemoteSources:
         }
         completed_indices = []
         selected_sources = []
+        evictions = []
         waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
@@ -225,6 +227,10 @@ class _RemoteSources:
                 kvcr._prune_block_record(key)
                 continue
             completed_indices.append(index)
+            if source_pin.evict and (
+                source_pin.key_layout or len(labels) == len(layout)
+            ):
+                evictions.append(_Invalidate(keys=(key,), key_layout=layout))
             selected_sources.append(
                 kvcr._local_dram._pools.source_refs(residency, indices)
                 if residency is not None
@@ -303,6 +309,7 @@ class _RemoteSources:
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
             moving=source_pin.moving,
+            evict=tuple(evictions) if source_pin.evict else None,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = framework_pins

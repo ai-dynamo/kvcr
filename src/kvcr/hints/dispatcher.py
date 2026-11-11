@@ -19,6 +19,7 @@ from .hint_handler import _FetchHintHandler, _HintHandler
 from .hint_types import (
     HintType,
     _Hint,
+    _KVEvictOnFetchHint,
     _KVFetchHint,
     _KVMoveHint,
     _KVPrefetchHint,
@@ -33,6 +34,12 @@ KV_FETCH = HintType(
     _KVFetchHint.ACTION_TYPE,
     "1.0",
     partial(_parse_payload, peer="source", hint_factory=_KVFetchHint),
+    _FetchHintHandler,
+)
+KV_EVICT_ON_FETCH = HintType(
+    _KVEvictOnFetchHint.ACTION_TYPE,
+    "1.0",
+    partial(_parse_payload, peer="source", hint_factory=_KVEvictOnFetchHint),
     _FetchHintHandler,
 )
 # Core builds the independent hint handler before the dispatcher; it handles
@@ -51,7 +58,7 @@ KV_MOVE = HintType(
 )
 
 # The supported hint types. Every dispatcher builds one handler per entry.
-_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH, KV_PREFETCH, KV_MOVE)
+_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH, KV_EVICT_ON_FETCH, KV_PREFETCH, KV_MOVE)
 
 logger = logging.getLogger(__name__)
 # Handlers run on hot paths; warn once per (phase, action type) about errors.

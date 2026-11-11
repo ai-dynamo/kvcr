@@ -267,6 +267,8 @@ KVCR-to-KVCR movement is destination-initiated for request-scoped hints. A reque
 
 `submit_hint` may establish the peer connection, but does not start data movement or remote pinning yet. The framework initiates copying through `fetch()` or `deliver()` with the same request ID; the configured key adapter matches its full `BlockKey` values against the hint hashes.
 
+`kv.evict_on_fetch` uses the same payload and request ID, but removes the source's eligible local DRAM copies of whole keys successfully retrieved through `fetch()` or `deliver()`. Destination cache hits and `deliver()` calls that request only part of a key leave the source unchanged. `fetch()` may transfer only missing pieces and still remove the whole source key, since it completes the destination's full copy. Framework-owned memory can supply the data and is always retained. G3 copies and local DRAM copies protected by `no_evict` are also retained.
+
 Each hint in an envelope is parsed and handled independently. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole request's block hashes from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
 
 #### Independent hints

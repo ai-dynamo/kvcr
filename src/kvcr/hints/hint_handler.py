@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The hint handlers: ``kv.fetch`` advice stored at the destination, and the
+"""The hint handlers: request-scoped advice stored at the destination, and the
 independent ``kv.prefetch`` / ``kv.move`` actions, which the source resolves
 and asks the named destination to fetch; the destination transfers and reports
 the outcome."""
@@ -45,7 +45,7 @@ class _HintHandler(ABC):
 
 
 class _FetchHintHandler(_HintHandler):
-    """Engine-destination ``kv.fetch``: stores the per-request remote hint.
+    """Store ``kv.fetch`` / ``kv.evict_on_fetch`` advice at the destination.
 
     Inline only: no state lock, no block records, and no transfer beyond the
     store's own eager control connect.
@@ -65,7 +65,10 @@ class _FetchHintHandler(_HintHandler):
         # One store call per hint; the store's own rules apply (a later hint
         # replaces the request's hashes, a different source fails the request).
         self._core._remote_fw_dram.submit_hint(
-            hint.source_endpoint, hint.block_hashes, request_id
+            hint.source_endpoint,
+            hint.block_hashes,
+            request_id,
+            move=hint.ACTION_TYPE == "kv.evict_on_fetch",
         )
         self._dispatcher.report(
             HintResult(

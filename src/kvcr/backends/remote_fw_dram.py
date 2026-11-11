@@ -75,6 +75,7 @@ class _RequestHint:
     source: str | None
     block_hashes: frozenset[int]
     submitted_at: float | None
+    move: bool = False
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
@@ -163,6 +164,8 @@ class _RemoteFWDram:
         src: str | None,
         block_hashes: frozenset[int],
         request_id: str | None,
+        *,
+        move: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -188,6 +191,7 @@ class _RemoteFWDram:
             self._request_hints[request_id] = _RequestHint(
                 source=src,
                 block_hashes=block_hashes,
+                move=move,
                 submitted_at=(
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
@@ -211,11 +215,16 @@ class _RemoteFWDram:
         ):
             return False
         if (
-            not self._options.opportunistic_query
-            and adapter.encode_to_router(key) not in request_hint.block_hashes
-        ):
+            request_hint.move or not self._options.opportunistic_query
+        ) and adapter.encode_to_router(key) not in request_hint.block_hashes:
             return False
         return True
+
+    def is_move(self, request_id: str | None, named: "_NamedSource | None") -> bool:
+        if named is not None:
+            return named.move_keys is not None
+        hint = self._request_hints.get(request_id)
+        return hint is not None and hint.move and not hint.failed
 
     def _start_target_pull(
         self,
@@ -225,6 +234,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
+        allow_move: bool = True,
         named_source: "_NamedSource | None" = None,
     ) -> bool:
         kvcr = self._kvcr
@@ -233,6 +243,7 @@ class _RemoteFWDram:
         current_hint = None
         if named_source is not None:
             source, keys = named_source.source, tuple(blocks)
+            move = named_source.move_keys is not None
         else:
             current_hint = self._request_hints.get(request_id)
             if (
@@ -243,12 +254,17 @@ class _RemoteFWDram:
             ):
                 kvcr._record_duration(scope, started_at, "failed")
                 return False
-            source = current_hint.source
+            source, move = current_hint.source, allow_move and current_hint.move
             keys = (
                 tuple(key for key in blocks if key not in current_hint.missing_keys)
                 if current_hint.missing_keys
                 else tuple(blocks)
             )
+            if current_hint.move:
+                keys = tuple(key for key in keys if self.query(key, request_id))
+                if not keys:
+                    kvcr._record_duration(scope, started_at, "failed")
+                    return False
             if current_hint.submitted_at is not None:
                 self._request_hints[request_id] = replace(
                     current_hint, submitted_at=None
@@ -270,7 +286,7 @@ class _RemoteFWDram:
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             # Explicit operations have no request advice to update on completion.
             request_id=request_id if current_hint is not None else None,
-            move=named_source is not None and named_source.move_keys is not None,
+            move=move,
             g2_only=named_source is not None,
             key_layout=(
                 kvcr._block_record_map[keys[0]].local_dram.key_layout
@@ -356,6 +372,7 @@ class _RemoteFWDram:
         deadline: float,
         *,
         op_handle: OpHandle,
+        allow_move: bool,
         named_source: "_NamedSource | None" = None,
     ) -> bool:
         return self._start_target_pull(
@@ -364,6 +381,7 @@ class _RemoteFWDram:
             deadline,
             op_handle,
             local_fill=True,
+            allow_move=allow_move,
             named_source=named_source,
         )
 
@@ -466,7 +484,8 @@ class _RemoteFWDram:
             ):
                 self._request_hints[op.request_id] = replace(
                     hint,
-                    missing_keys=(hint.missing_keys | op.keys) - completed_keys,
+                    missing_keys=hint.missing_keys.union(op.ordered_keys)
+                    - completed_keys,
                 )
             if op.local_fill:
                 if op.state is _TargetPullState.QUARANTINED:
@@ -770,6 +789,12 @@ class _RemoteFWDram:
     ) -> None:
         started_at = self._kvcr._timer()
         op_handle = payload.op_handle
+        if (
+            payload.move
+            and payload.sender_incarnation == self._dangling_ops.incarnation
+        ):
+            self._refuse_start_write(progress, payload, op_handle, "self_source")
+            return
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
         dst_descriptors = payload.dst_descriptors
@@ -877,11 +902,12 @@ class _RemoteFWDram:
             if self._nvtx is not None
             else None,
         )
-        if payload.move:
+        if payload.move and payload.g2_only:
             # A move closes owner-side admission for its keys, so the owner
             # thread admits it; the write itself still runs on progress.
             self._queue_source_pin(source_write, payload.key_layout, move=True)
             return
+        source_write.evict = () if payload.move else None
         prepared = self._try_local_source_write(
             progress, source_write, payload.key_layout
         )
@@ -908,6 +934,7 @@ class _RemoteFWDram:
                 route=op.route,
                 nvtx_state=op.nvtx_state,
                 move=move,
+                evict=op.evict is not None,
             )
         )
 
@@ -997,6 +1024,12 @@ class _RemoteFWDram:
             return None
         if selected is False:
             return False
+        if source_write.evict is not None:
+            source_write.evict = tuple(
+                _Invalidate(keys=(ordered_keys[i],), key_layout=r.key_layout)
+                for i, r, _ in selected
+                if key_layout or len(dst_descriptors[i]) == len(r.key_layout)
+            )
         completed_indices = tuple(index for index, _, _ in selected)
         if len(selected) != len(ordered_keys):
             ordered_keys = tuple(ordered_keys[i] for i in completed_indices)

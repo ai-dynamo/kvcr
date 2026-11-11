@@ -84,6 +84,7 @@ class _NamedSource:
 class _PendingResidencyOp(_Op):
     deadline: float
     claim_on_ready: bool
+    move: bool = False
     request_id: str | None = None
     results: dict[BlockKey, OpEntryResult] = field(default_factory=dict)
     remote_fill_keys: set[BlockKey] = field(default_factory=set)
@@ -456,6 +457,7 @@ class _LocalDram:
             keys=frozenset(ordered_keys),
             deadline=deadline,
             claim_on_ready=True,
+            move=self._kvcr._remote_fw_dram.is_move(request_id, named_source),
             request_id=request_id,
             requested_layout=layout,
             key_layout=key_layout,
@@ -532,13 +534,7 @@ class _LocalDram:
                 op.claimed_keys.add(key)
             if source is None or residency.remote_indices is not None:
                 return None
-            named = op.named_source
-            if (
-                named is not None
-                and named.move_keys is not None
-                and key in named.move_keys
-                and residency.pending_deposits
-            ):
+            if residency.pending_deposits and source is CacheTier.REMOTE_G2 and op.move:
                 # Source removal requires every piece outside this write to be ready.
                 return None
             # One remote fill owns these destinations until its native terminal.
@@ -848,13 +844,19 @@ class _LocalDram:
         key: BlockKey,
         residency_op: _PendingResidencyOp,
     ) -> bool:
+        op, remote = residency_op, self._kvcr._remote_fw_dram
+        if not op.move and remote.is_move(op.request_id, op.named_source):
+            op.deadline += self._abandon_grace
+            op.move = True
+        allow_move, deadline = op.move, op.deadline
         refs = self._prepare_fetch(residency_op, key)
         if refs:
             self._kvcr._start_local_fill(
                 residency_op.fill_sources[key],
                 {key: refs},
                 residency_op.request_id,
-                residency_op.deadline,
+                deadline,
+                allow_move=allow_move,
                 named_source=residency_op.named_source,
             )
         return key in residency_op.results

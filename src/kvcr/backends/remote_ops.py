@@ -411,6 +411,8 @@ class _SourceWriteOp(_RemoteOp):
     nvtx_state: _NvtxState | None = None
     # Keys this move marked pending at the source; reopened if the write fails.
     moving: tuple[BlockKey, ...] = ()
+    # None means copy; () requests eviction, populated during source preparation.
+    evict: tuple[_Invalidate, ...] | None = None
     # None uses caller cleanup; a tuple (even empty) is owned by progress.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
 
@@ -567,6 +569,8 @@ class _SourceWriteOp(_RemoteOp):
                 len(self.keys),
                 ("source_write",),
             )
+            if self.evict is not None:
+                backend._progress_outbound.extend(self.evict)
         else:
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
         result = "success" if self.success else "failed"
