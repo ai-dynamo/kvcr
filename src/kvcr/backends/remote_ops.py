@@ -82,18 +82,16 @@ _ControlMessage = (
 _CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
 
 
-# Callers get a status that says what to do; the finer reasons stay on the
-# wire, in logs and in metric labels. Each worker reports its own health: a
-# block the source could not serve is UNAVAILABLE here, a source-side fault is
-# a transfer that did not happen (ABORTED), and FAILED is kept for faults on
-# this worker, including any reason not listed.
+# The status describes the operation, not the reporting worker: an expected
+# miss or no usable route is UNAVAILABLE, a deadline is TIMEOUT, an interruption
+# is ABORTED and an unexpected error on either side is FAILED. The same reason
+# gets the same status whether the source reports it for one block or for the
+# whole write, and the reason travels with the result.
 _STATUS_BY_REASON = {
     Reason.NOT_RESIDENT: OpEntryStatus.UNAVAILABLE,
     Reason.REMEMBERED_MISS: OpEntryStatus.UNAVAILABLE,
     Reason.HINT_UNAVAILABLE: OpEntryStatus.UNAVAILABLE,
     Reason.HINT_INVALIDATED: OpEntryStatus.UNAVAILABLE,
-    Reason.PIN_FAILED: OpEntryStatus.UNAVAILABLE,
-    Reason.LAYOUT_MISMATCH: OpEntryStatus.UNAVAILABLE,
     Reason.DEADLINE: OpEntryStatus.TIMEOUT,
     Reason.SOURCE_STALLED: OpEntryStatus.TIMEOUT,
     Reason.CANCELLED: OpEntryStatus.ABORTED,
@@ -103,50 +101,49 @@ _STATUS_BY_REASON = {
     Reason.REFUSED: OpEntryStatus.ABORTED,
     Reason.SOURCE_RESTARTED: OpEntryStatus.ABORTED,
     Reason.METADATA_REQUIRED: OpEntryStatus.ABORTED,
-    Reason.CREATE_ERROR: OpEntryStatus.ABORTED,
-    Reason.TRANSFER_FAILED: OpEntryStatus.ABORTED,
-    Reason.SETUP_FAILED: OpEntryStatus.ABORTED,
-    Reason.MALFORMED: OpEntryStatus.ABORTED,
-    Reason.REMOTE_FAILURE: OpEntryStatus.ABORTED,
-    Reason.UNKNOWN: OpEntryStatus.ABORTED,
+    Reason.PIN_FAILED: OpEntryStatus.FAILED,
+    Reason.LAYOUT_MISMATCH: OpEntryStatus.FAILED,
+    Reason.CREATE_ERROR: OpEntryStatus.FAILED,
+    Reason.TRANSFER_FAILED: OpEntryStatus.FAILED,
+    Reason.SETUP_FAILED: OpEntryStatus.FAILED,
+    Reason.MALFORMED: OpEntryStatus.FAILED,
+    Reason.REMOTE_FAILURE: OpEntryStatus.FAILED,
+    Reason.CONTROL_ERROR: OpEntryStatus.FAILED,
+    Reason.INVALID_NOTIFICATION: OpEntryStatus.FAILED,
 }
+# One immutable result per known reason; per-key results select from here.
 _RESULTS = {
-    reason.wire: OpEntryResult(status) for reason, status in _STATUS_BY_REASON.items()
+    reason.wire: OpEntryResult(status, reason=reason.wire)
+    for reason, status in _STATUS_BY_REASON.items()
 }
+# An unserved block whose cause the source did not specify.
 _UNAVAILABLE_RESULT = OpEntryResult(OpEntryStatus.UNAVAILABLE)
 _MISS_REASONS = frozenset((Reason.NOT_RESIDENT.wire, Reason.REMEMBERED_MISS.wire))
-# Duration result labels: "failed" is kept for this worker's own faults.
 _LABEL_BY_STATUS = {
     OpEntryStatus.UNAVAILABLE: "unavailable",
     OpEntryStatus.TIMEOUT: "timeout",
     OpEntryStatus.ABORTED: "aborted",
+    OpEntryStatus.FAILED: "failed",
 }
-# The source labels these as its own faults; the target does not (see above).
-_SOURCE_FAULTS = frozenset(
-    reason.wire
-    for reason in (
-        Reason.PIN_FAILED,
-        Reason.LAYOUT_MISMATCH,
-        Reason.CREATE_ERROR,
-        Reason.TRANSFER_FAILED,
-        Reason.SETUP_FAILED,
-        Reason.MALFORMED,
-    )
-)
 
 
 def _failed_result(reason: str | None) -> OpEntryResult:
+    """Result for a write that did not happen; an unlisted reason is a failure."""
     return _RESULTS.get(reason or "", _FAILED_RESULT)
 
 
+def _unserved_result(reason: str) -> OpEntryResult:
+    """Result for one block the source left out; an unlisted reason is unavailable."""
+    return _RESULTS.get(reason, _UNAVAILABLE_RESULT)
+
+
+def _label(result: OpEntryResult) -> str:
+    """Duration result label; a miss is told apart from other unavailability."""
+    return "miss" if result.reason in _MISS_REASONS else _LABEL_BY_STATUS[result.status]
+
+
 def _outcome(reason: str | None) -> str:
-    if reason in _MISS_REASONS:
-        return "miss"
-    return _LABEL_BY_STATUS.get(_failed_result(reason).status, "failed")
-
-
-def _source_outcome(reason: str | None) -> str:
-    return "failed" if reason in _SOURCE_FAULTS else _outcome(reason)
+    return _label(_failed_result(reason))
 
 
 class _TargetPullState(Enum):
@@ -365,16 +362,16 @@ class _TargetPullOp(_RemoteOp):
                     len(completed_keys),
                     (scope,),
                 )
-            # Zero blocks from a source that answered: a miss, or unavailable
-            # when it held them but could not serve them.
+            # Zero blocks from a source that answered take the label of the
+            # most common reason it gave.
             result = (
                 "success"
                 if all_completed
                 else "partial"
                 if completed_keys
-                else "miss"
-                if success and _dominant_wire(self.unserved.values()) in _MISS_REASONS
-                else "unavailable"
+                else _label(
+                    _unserved_result(_dominant_wire(self.unserved.values()) or "")
+                )
                 if success
                 else _outcome(self.failure_reason)
             )
@@ -477,14 +474,14 @@ class _TargetPullOp(_RemoteOp):
         return counts
 
     def key_results(self) -> dict[BlockKey, OpEntryResult]:
-        """Per-key results: delivered, unavailable, or the operation's failure."""
+        """Per-key results: delivered, the block's own reason, or the write's."""
         completed = self.completed_keys if self.success else ()
         failure = _failed_result(self.failure_reason)
         return {
             key: _SUCCESS_RESULT
             if key in completed
-            else _UNAVAILABLE_RESULT
-            if key in self.unserved
+            else _unserved_result(reason)
+            if (reason := self.unserved.get(key)) is not None
             else failure
             for key in self.keys
         }
@@ -564,7 +561,7 @@ class _SourceWriteOp(_RemoteOp):
                 backend._record_progress_duration(
                     "source_write",
                     self.started_at,
-                    _source_outcome(_wire_reason(failure_reason)),
+                    _outcome(_wire_reason(failure_reason)),
                 )
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
@@ -596,7 +593,7 @@ class _SourceWriteOp(_RemoteOp):
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
                 # Nothing to write: a miss, or this source's own fault.
-                result = _source_outcome(
+                result = _outcome(
                     _dominant_wire(self._unserved_reasons()) or Reason.NOT_RESIDENT.wire
                 )
                 backend._record_progress_duration(
@@ -712,7 +709,7 @@ class _SourceWriteOp(_RemoteOp):
         result = (
             ("partial" if self.unserved else "success")
             if self.success
-            else _source_outcome(failure_reason)
+            else _outcome(failure_reason)
         )
         backend._record_progress_duration("source_write", self.started_at, result)
         self._log_completed(result)

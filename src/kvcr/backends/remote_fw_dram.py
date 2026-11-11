@@ -49,6 +49,7 @@ from .remote_ops import (
     _ControlMessage,
     _decode_notif,
     _failed_result,
+    _known_reason,
     _nvtx_reason,
     _NvtxState,
     _outcome,
@@ -710,7 +711,8 @@ class _RemoteFWDram:
         # start_write make a source write.
         self._refused_writes[("target", op_handle)] = {
             "success": False,
-            "reason": payload.reason or Reason.REFUSED.wire,
+            # Any refusal is an abort; an unrecognised reason is still a refusal.
+            "reason": _known_reason(payload.reason) or Reason.REFUSED.wire,
         }
 
     def _handle_target_metadata_ack(
