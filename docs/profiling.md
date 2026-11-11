@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # NVTX remote-delivery tracing
 
-Start here to enable and capture generic KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The example uses synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and identity availability.
+Start here to enable and capture KVCR/NIXL tracing for framework pins, source writes, target processing, hints and caller completion. The framework recipes below reuse the vLLM and SGLang quick starts; the standalone pin example uses synthetic framework bindings. Use the [event reference](nvtx-events.md) for event/payload semantics and identity availability.
 
 ## Enable tracing
 
@@ -38,6 +38,79 @@ KVCR_NVTX_LEVEL=low nsys profile \
 ```
 
 Set the level before constructing KVCR in each worker. Capture independently launched workers separately, using distinct report names. Open the `.nsys-rep` in Nsight Systems and follow the `KVCR` ranges using the [event reference](nvtx-events.md).
+
+## Capture vLLM and SGLang workers
+
+Use the pinned images, model, router, transfer configuration and verification requests from the [vLLM quick start](quick-start-vllm.md) or the [SGLang HiCache quick start](quick-start-sglang.md). These recipes require two GPUs. Profiling the frontend or state agent alone does not capture the KVCR worker processes.
+
+Before the quick start's container launch, prepare these optional mounts in the **host terminal** (adjust `NSYS_ROOT` to your installation):
+
+```bash
+export NSYS_ROOT=/opt/nvidia/nsight-systems/2025.3.2
+export KVCR_HOST_CAPTURE_DIR="$(mktemp -d /tmp/kvcr-framework-capture.XXXXXX)"
+KVCR_PROFILE_MOUNTS=(--volume "$NSYS_ROOT:/opt/kvcr-nsys:ro"
+  --volume "$KVCR_HOST_CAPTURE_DIR:/traces")
+```
+
+The quick-start `docker run` command expands this array. Verify that its serving user can write `/traces`. In each **worker terminal**, add the mounted CLI to `PATH`, then verify the dependencies. If `nvtx` is absent, run the installation as the container's root user, then return to its normal serving user:
+
+```bash
+export PATH=/opt/kvcr-nsys/bin:$PATH
+python3 -m pip install 'nvtx>=0.2.16,<0.3'
+python3 -c 'import nvtx, numpy; from importlib.metadata import version; print("nvtx", version("nvtx"), "numpy", numpy.__version__)'
+nsys --version
+```
+
+In the **worker terminal**, before running the quick start's worker block, set a fresh report path. Set `REPORT_NAME=vllm-ranks` for the two-rank vLLM launch. For SGLang, run this in both worker terminals with `REPORT_NAME=sglang-source` and `REPORT_NAME=sglang-target` respectively:
+
+```bash
+export REPORT_NAME=vllm-ranks
+export KVCR_NVTX_LEVEL=low
+KVCR_PROFILE=(nsys profile --trace=nvtx,cuda --sample=none --cpuctxsw=none
+  --start-later=true --session-new="$REPORT_NAME" --kill=none
+  --output="/traces/$REPORT_NAME")
+```
+
+The quick-start launch expands this Bash array immediately before `python3`. Leave it unset or use `KVCR_PROFILE=()` for an ordinary launch. Confirm vLLM's engine ranks or SGLang's scheduler children appear in the report: those processes own the KVCR instances.
+
+After readiness, warm up each worker with a different unrelated prefix so warm-up does not prefetch from its peer. Then start collection from another terminal in the same container:
+
+```bash
+export PATH=/opt/kvcr-nsys/bin:$PATH
+export REPORT_NAME=vllm-ranks
+nsys start --session=vllm-ranks
+# For SGLang, start both sessions instead:
+# nsys start --session=sglang-source
+# nsys start --session=sglang-target
+```
+
+Execute the quick start's **fresh-prefix, forced-destination** request pair and all its transfer/output checks. Preserve responses and both worker logs. Require matching successful source-write/target-read block totals, with no partial/failed delivery; compare byte totals where both sides expose them, as in vLLM. A cache-hit counter alone can reflect a warm destination. Generate a new prefix before every retry. Keep SGLang's `verify_transfer_bytes` enabled, including in comparisons. It logs digests: compare source-deposit and target-deliver digests by block key; equal byte counts alone do not establish equal contents.
+
+After the transfer's telemetry interval drains, stop each named capture and export it with the same Nsight version. Set `REPORT_NAME` to the corresponding session name in this terminal. `--kill=none` leaves workers running; stop only this run's processes/container after collecting evidence.
+
+```bash
+nsys stop --session="$REPORT_NAME"
+nsys export --type=sqlite --include-json=true \
+  --output="/traces/$REPORT_NAME.sqlite" \
+  "/traces/$REPORT_NAME.nsys-rep"
+```
+
+Inspect the following lanes using the [event identities](nvtx-events.md#payloads-and-identities), rather than proximity on the timeline:
+
+- Source: `source.write`, `nixl.write`, `nixl.done_observed`, `nixl.write.released`, and `source.write.completed`.
+- Target: `hint.submitted`/`hint.used`, `target.queued`, `target.start_write.enqueued`, `target.write_done.received`, and `target.main.consume`.
+- Caller: `op.deliver.lifecycle`, `op.completion_queued`, and `op.completion_returned`.
+- Framework pins, when the source uses framework-owned memory: `source.pin.framework`, `source.pin.wait`, and `source.pin.completed`. HiCache's KVCR-owned source pool need not emit framework-pin events.
+
+Check the report's collector diagnostics as well as the expected events. Missing-event or CUDA collection warnings limit trace coverage even when the tested KVCR operations close successfully; preserve the warnings and do not describe that capture as lossless.
+
+Join local events by `(instance_hi, instance_lo, trace_id)`, and cross-worker operations by the target agent/incarnation plus signed `op_handle`. Low-detail byte counts may be unknown; use the telemetry and digest checks above. These spans describe KVCR's observation boundaries. They do not time router lookup, SGLang byte verification, internal framework scheduling, or the complete model request. Missing inference identities or framework hand-back spans are evidence gaps to record, not identities to infer from operation handles.
+
+### Short tracing-off/low comparison
+
+Start a fresh container for each case, using the same image, model, memory settings, request sizes and verification checks. This also resets SGLang's multiprocess metrics and discovery state. Set `KVCR_PROFILE=()` in both cases and alternate `KVCR_NVTX_LEVEL=off` and `low`. Warm up each worker with a different unrelated prefix, then use a fresh shared prefix for the measured source/target pair. Record elapsed times and matching transfer results; keep startup/JIT time separate. This short annotation-cost comparison is a functional check, not a production-overhead result. Nsight collection adds separate overhead.
+
+Keep a receipt beside the reports: KVCR commit and dirty diff, immutable image ID, adapter/Dynamo revisions, installed package versions, driver/GPU and `nsys` versions, exact launch commands, tracing level, model revision, responses, and both worker logs. Record topology changes such as sharing one GPU explicitly; they do not validate the quick starts' two-GPU configuration or cross-host performance.
 
 ## Capture a real pin and transfer
 

@@ -50,10 +50,13 @@ No private-repository credentials are required. The first build uses pinned, tes
 
 Create a persistent model-cache volume, then start one container with host networking, all GPUs visible, and enough shared memory for both ranks' host allocations:
 
+For profiling, first prepare the optional [Nsight/report mounts](profiling.md#capture-vllm-and-sglang-workers) in this host terminal.
+
 ```bash
 docker volume create kvcr-hf-cache
 
 docker run --detach \
+  "${KVCR_PROFILE_MOUNTS[@]}" \
   --name kvcr-quick-start \
   --gpus all \
   --network host \
@@ -136,9 +139,11 @@ export KV_EVENTS_CONFIG='{
 
 Launch two data-parallel ranks with DEBUG logging to show transfer metrics even when the source rank is idle:
 
+For an NVTX capture, first follow the [framework profiling setup](profiling.md#capture-vllm-and-sglang-workers). The optional `KVCR_PROFILE` array below wraps this worker and its engine children; both ranks appear in the same report.
+
 ```bash
 env -u NATS_SERVER CUDA_VISIBLE_DEVICES=0,1 VLLM_LOGGING_LEVEL=DEBUG \
-  python3 -m dynamo.vllm \
+  "${KVCR_PROFILE[@]}" python3 -m dynamo.vllm \
   --model "$MODEL" \
   --tensor-parallel-size 1 \
   --data-parallel-size 2 \
