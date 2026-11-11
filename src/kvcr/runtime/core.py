@@ -255,6 +255,7 @@ class _KVCRCore:
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         # Preserve remote selections until a successful fetch or discard_hint().
         self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
+        self._no_retain: set[int] = set()
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
         self._outstanding_operations = 0
@@ -1002,6 +1003,7 @@ class _KVCRCore:
 
     def _close_main_resources(self) -> None:
         self._remote_delivery_keys.clear()
+        self._no_retain.clear()
         # Every stage runs even if an earlier one failed: skipping the rest
         # would leak files and pins for a failure that says nothing about them.
         first_error: BaseException | None = None

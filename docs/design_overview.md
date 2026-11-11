@@ -257,7 +257,7 @@ KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_
 
 ### KV transfer hints
 
-For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
+For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` marks the advertised hashes so later deposits of those blocks are dropped, except when filling an existing partial copy.
 
 The router may choose not to send a hint based on its internal cost model. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
@@ -269,6 +269,8 @@ KVCR-to-KVCR movement is destination-initiated for request-scoped hints. A reque
 
 `kv.evict_on_fetch` uses the same payload and request ID, but removes the source's eligible local DRAM copies of whole keys successfully retrieved through `fetch()` or `deliver()`. Destination cache hits and `deliver()` calls that request only part of a key leave the source unchanged. Framework-owned memory can supply the data and is always retained. G3 copies and local DRAM copies protected by `no_evict` are also retained.
 
+`kv.fetch` and `kv.evict_on_fetch` accept optional `no_retain`: `true` sets the mark, `false` clears it, and omission or `null` leaves it unchanged. The setting applies to all advertised hashes when the hint arrives, even if the request fails or never uses those hashes.
+
 Each hint in an envelope is parsed and handled independently. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole request's block hashes from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
 
 #### Independent hints
@@ -278,6 +280,10 @@ Each hint in an envelope is parsed and handled independently. `discard_hint` nor
 During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
 
 The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed.
+
+`kv.no_retain` acts on the receiving KVCR immediately: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
+
+`kv.invalidate` removes complete local DRAM copies identified by `block_hashes`, without transferring data. It honors `no_evict` and waits for existing readers to drain.
 
 ### Peer control and liveness
 
@@ -327,7 +333,7 @@ At initialization, an integration selects one built-in policy or supplies an ext
 
 Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
-Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. If it conflicts with a framework `no_evict` claim, `no_evict` wins until the framework calls `release` with the returned handle; policy may then honor or override `no_retain`.
+Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is a router retention rule enforced ahead of policy: marked deposits are dropped before `decide_ingest` runs unless `no_evict` protects them or they fill an existing incomplete copy. Existing copies stay intact, and marks persist until cleared, including across deposits and request cleanup.
 
 The policy methods are invoked as follows:
 
