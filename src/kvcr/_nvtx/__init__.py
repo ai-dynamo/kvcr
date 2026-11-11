@@ -15,8 +15,8 @@ from hashlib import blake2b
 from importlib import import_module
 from threading import Lock
 
-from ..types import OpEntryStatus
-from .payload import Reason, Status, _PayloadEmitter
+from ..types import OpEntryStatus, Reason
+from .payload import Status, _PayloadEmitter
 from .pin import _PinTrace
 
 # Zero blocks for one of these reasons is a miss; for any other, a failure.

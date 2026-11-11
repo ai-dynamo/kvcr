@@ -3,7 +3,7 @@
 """Runtime and policy value types for KVCR."""
 
 from collections.abc import Mapping
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Literal, NewType
 
 import msgspec
@@ -101,6 +101,56 @@ class OpEntryStatus(Enum):
     ABORTED = "ABORTED"
     # A fault on this worker.
     FAILED = "FAILED"
+
+
+class Reason(IntEnum):
+    """Why a transfer, or one of its blocks, did not complete.
+
+    The lower-cased name is the shared vocabulary on the wire
+    (``write_done.reason``, ``write_done.unserved``), in ``OpEntryResult.reason``,
+    in metric labels, in logs and in NVTX payloads. Values are NVTX codes.
+    """
+
+    UNKNOWN = 0
+    NONE = 1
+    CALLBACK_ERROR = 2
+    DUPLICATE_REQUEST = 3
+    INVALID_RESULT = 4
+    DEADLINE = 5
+    CANCELLED = 6
+    SHUTDOWN = 7
+    NO_WAITERS = 8
+    SUBMIT_REJECTED = 9
+    SUBMIT_AMBIGUOUS = 10
+    CREATE_ERROR = 11
+    PROGRESS_ERROR = 12
+    RELEASE_ERROR = 13
+    CONTROL_ERROR = 14
+    INVALID_NOTIFICATION = 15
+    REMOTE_FAILURE = 16
+    ROUTE_CHANGED = 17
+    SOURCE_STALLED = 18
+    HINT_UNAVAILABLE = 19
+    HINT_CONFLICT = 20
+    # Why a source left blocks out; names match the write_done unserved reasons.
+    NOT_RESIDENT = 21
+    PIN_FAILED = 22
+    LAYOUT_MISMATCH = 23
+    # Remaining write_done and pull reasons, so this enum is their only vocabulary.
+    STOPPING = 24
+    TRANSFER_FAILED = 25
+    MALFORMED = 26
+    SETUP_FAILED = 27
+    REMEMBERED_MISS = 28
+    HINT_INVALIDATED = 29
+    REFUSED = 30
+    METADATA_REQUIRED = 31
+    SOURCE_RESTARTED = 32
+
+    @property
+    def wire(self) -> str:
+        """Name used in write_done messages, logs and metric labels."""
+        return self.name.lower()
 
 
 class OpEntryResult(msgspec.Struct, frozen=True):

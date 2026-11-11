@@ -41,6 +41,7 @@ from ..types import (
     CacheTier,
     OpEntryResult,
     OpHandle,
+    Reason,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
 from .remote_ops import (
@@ -175,7 +176,7 @@ class _RemoteFWDram:
                     previous.trace.mark(
                         "hint.rejected",
                         status=_nvtx.Status.REJECTED,
-                        reason=_nvtx.Reason.HINT_CONFLICT,
+                        reason=Reason.HINT_CONFLICT,
                     )
                 return
             trace = None
@@ -242,15 +243,13 @@ class _RemoteFWDram:
                 scope,
                 started_at,
                 blocks,
-                _nvtx.Reason.HINT_INVALIDATED
+                Reason.HINT_INVALIDATED
                 if current_hint.failed
-                else _nvtx.Reason.REMEMBERED_MISS,
+                else Reason.REMEMBERED_MISS,
             )
 
         if current_hint is None or current_hint.source is None:
-            return self._reject_pull(
-                scope, started_at, blocks, _nvtx.Reason.HINT_UNAVAILABLE
-            )
+            return self._reject_pull(scope, started_at, blocks, Reason.HINT_UNAVAILABLE)
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
         kvcr._record_duration("hint_wait", current_hint.submitted_at, "complete")
         if request_id is not None:
@@ -270,7 +269,7 @@ class _RemoteFWDram:
             # Kept if the pull fails, so these keys still report the known miss.
             unserved=dict.fromkeys(
                 current_hint.missing_keys.intersection(blocks),
-                _nvtx.Reason.REMEMBERED_MISS.wire,
+                Reason.REMEMBERED_MISS.wire,
             ),
             request_id=request_id,
             key_layout=(
@@ -311,7 +310,7 @@ class _RemoteFWDram:
             kvcr._progress.submit(op)
         except Exception:
             if op.trace is not None:
-                op.trace.reject("target.queued.rejected", _nvtx.Reason.SUBMIT_REJECTED)
+                op.trace.reject("target.queued.rejected", Reason.SUBMIT_REJECTED)
                 op.trace.end("target.remote")
             raise
         if not local_fill and request_id is not None:
@@ -323,7 +322,7 @@ class _RemoteFWDram:
         scope: str,
         started_at: float | None,
         blocks: Collection[BlockKey],
-        reason: _nvtx.Reason,
+        reason: Reason,
     ) -> str:
         self._kvcr._record_duration(scope, started_at, _outcome(reason.wire))
         stats = self._kvcr._stats
@@ -434,9 +433,7 @@ class _RemoteFWDram:
         self._closed = True
         for hint in self._request_hints.values():
             if hint.trace is not None:
-                hint.trace.mark(
-                    "hint.discarded", once=True, reason=_nvtx.Reason.SHUTDOWN
-                )
+                hint.trace.mark("hint.discarded", once=True, reason=Reason.SHUTDOWN)
         self._request_hints.clear()
         self._sources.close()
 
@@ -569,7 +566,7 @@ class _RemoteFWDram:
                     cached[1],
                     handle,
                     False,
-                    reason=_nvtx.Reason.SHUTDOWN.wire,
+                    reason=Reason.SHUTDOWN.wire,
                 )
         self._pending_local_sources.clear()
         close_control = getattr(self._control, "close", None)
@@ -695,7 +692,7 @@ class _RemoteFWDram:
         incarnation = payload.sender_incarnation
         if (
             payload.reason
-            in (_nvtx.Reason.METADATA_REQUIRED.wire, _nvtx.Reason.SOURCE_RESTARTED.wire)
+            in (Reason.METADATA_REQUIRED.wire, Reason.SOURCE_RESTARTED.wire)
             and incarnation
             and not op.retried
             and op.state is _TargetPullState.WAITING_WRITE_DONE
@@ -713,7 +710,7 @@ class _RemoteFWDram:
         # start_write make a source write.
         self._refused_writes[("target", op_handle)] = {
             "success": False,
-            "reason": payload.reason or _nvtx.Reason.REFUSED.wire,
+            "reason": payload.reason or Reason.REFUSED.wire,
         }
 
     def _handle_target_metadata_ack(
@@ -784,7 +781,7 @@ class _RemoteFWDram:
         ):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(
-                progress, payload, op_handle, _nvtx.Reason.MALFORMED.wire
+                progress, payload, op_handle, Reason.MALFORMED.wire
             )
             return
 
@@ -814,7 +811,7 @@ class _RemoteFWDram:
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
             )
             self._notify_start_write_failure(
-                progress, payload, op_handle, _nvtx.Reason.SETUP_FAILED.wire
+                progress, payload, op_handle, Reason.SETUP_FAILED.wire
             )
             return
 
@@ -826,7 +823,7 @@ class _RemoteFWDram:
                     remote_agent,
                     op_handle,
                     False,
-                    reason=_nvtx.Reason.CANCELLED.wire,
+                    reason=Reason.CANCELLED.wire,
                 )
             return
         expected = payload.source_incarnation
@@ -834,14 +831,14 @@ class _RemoteFWDram:
             # Another process was quoted: refuse pre-submit so the target retries
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(
-                progress, payload, op_handle, _nvtx.Reason.SOURCE_RESTARTED.wire
+                progress, payload, op_handle, Reason.SOURCE_RESTARTED.wire
             )
             return
         if progress._stop_requested or not self._dangling_ops.check_source_progress():
             reason = (
-                _nvtx.Reason.STOPPING.wire
+                Reason.STOPPING.wire
                 if progress._stop_requested
-                else _nvtx.Reason.SOURCE_STALLED.wire
+                else Reason.SOURCE_STALLED.wire
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -937,9 +934,9 @@ class _RemoteFWDram:
                 op.source_keys = ()
                 op.dst_descriptors = ()
                 op.failure_reason = (
-                    _nvtx.Reason.DEADLINE
+                    Reason.DEADLINE
                     if self._kvcr._clock() >= op.deadline
-                    else _nvtx.Reason.ROUTE_CHANGED
+                    else Reason.ROUTE_CHANGED
                 )
                 op.progress(progress, None)
                 observed_work = True
@@ -969,7 +966,7 @@ class _RemoteFWDram:
             if self._framework_pinning:
                 return False
             selected = ()
-            unserved[_nvtx.Reason.NOT_RESIDENT.wire] = list(range(len(ordered_keys)))
+            unserved[Reason.NOT_RESIDENT.wire] = list(range(len(ordered_keys)))
         else:
             selected = local._pools.acquire_readers(
                 ordered_keys,
@@ -1042,7 +1039,7 @@ class _RemoteFWDram:
                 if isinstance(value, str):
                     setattr(peer, name, value)
         self._notify_start_write_failure(
-            progress, peer, op_handle, _nvtx.Reason.MALFORMED.wire
+            progress, peer, op_handle, Reason.MALFORMED.wire
         )
         return True
 
@@ -1074,7 +1071,7 @@ class _RemoteFWDram:
                 progress,
                 payload,
                 op_handle,
-                _nvtx.Reason.METADATA_REQUIRED.wire if retryable else None,
+                Reason.METADATA_REQUIRED.wire if retryable else None,
             )
             return
         self._send_write_done(progress, remote_agent, op_handle, False, reason=reason)

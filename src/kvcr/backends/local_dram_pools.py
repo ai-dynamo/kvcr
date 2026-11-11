@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import msgspec
 
-from .. import _nvtx
 from ..config import LocalDramOptions
 from ..runtime.policy_runtime import _EvictionQueue
 from ..runtime.progress import _TransferRef
@@ -24,6 +23,7 @@ from ..types import (
     OpEntryResult,
     OpEntryStatus,
     PlacementAction,
+    Reason,
     RegionDescriptor,
     ReleaseHandle,
     ReleaseResult,
@@ -315,18 +315,16 @@ class _LocalDramPools:
                 residency = state.index.get(key)
                 if residency is None:
                     if allow_missing and key not in state.index:
-                        skipped.setdefault(_nvtx.Reason.NOT_RESIDENT.wire, []).append(
-                            index
-                        )
+                        skipped.setdefault(Reason.NOT_RESIDENT.wire, []).append(index)
                         continue
                     return False
                 available = cast(tuple[_TransferRef, ...], residency.refs)
                 if key_layout and key_layout != residency.key_layout:
                     if allow_missing:
                         logger.debug("KVCR start_write layout mismatch key=%r", key)
-                        skipped.setdefault(
-                            _nvtx.Reason.LAYOUT_MISMATCH.wire, []
-                        ).append(index)
+                        skipped.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(
+                            index
+                        )
                         continue
                     return False
                 requested = [ref.label for ref in destination]
@@ -341,9 +339,9 @@ class _LocalDramPools:
                     if indices is None:
                         if allow_missing:
                             logger.debug("KVCR start_write layout mismatch key=%r", key)
-                            skipped.setdefault(
-                                _nvtx.Reason.LAYOUT_MISMATCH.wire, []
-                            ).append(index)
+                            skipped.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(
+                                index
+                            )
                             continue
                         return False
                     refs = tuple(available[index] for index in indices)

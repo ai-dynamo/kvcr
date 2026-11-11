@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from .. import _nvtx
 from ..runtime.core import logger
 from ..runtime.progress import _Op, _OpId, _TransferRef
-from ..types import BlockKey, MemoryRef, PinHandle, PinRequestId, PinResult
+from ..types import BlockKey, MemoryRef, PinHandle, PinRequestId, PinResult, Reason
 from .local_dram_pools import _layout_indices, _LocalDramState
 from .remote_ops import _NvtxState, _SourceWriteOp, _SourceWriteState
 
@@ -156,7 +156,7 @@ class _RemoteSources:
         source_pin: _SourcePinOp,
         *,
         force_failure: bool = False,
-        failure_reason: _nvtx.Reason = _nvtx.Reason.UNKNOWN,
+        failure_reason: Reason = Reason.UNKNOWN,
     ) -> None:
         kvcr = self._kvcr
         route_name, route_generation = source_pin.route
@@ -167,8 +167,8 @@ class _RemoteSources:
             # the same handle back for a reused name, so submitting would
             # write the dead generation's destinations through the new route.
             force_failure = True
-            if failure_reason is _nvtx.Reason.UNKNOWN:
-                failure_reason = _nvtx.Reason.ROUTE_CHANGED
+            if failure_reason is Reason.UNKNOWN:
+                failure_reason = Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.keys
         )
@@ -187,16 +187,16 @@ class _RemoteSources:
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
                 # Only a layout mismatch on an earlier pass removes keys.
-                unserved.setdefault(_nvtx.Reason.LAYOUT_MISMATCH.wire, []).append(index)
+                unserved.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(index)
                 continue
             residency = local_sources.get(key)
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
                 reason = (
-                    _nvtx.Reason.PIN_FAILED.wire
+                    Reason.PIN_FAILED.wire
                     if key in source_pin.pin_failed_keys
-                    else _nvtx.Reason.NOT_RESIDENT.wire
+                    else Reason.NOT_RESIDENT.wire
                 )
                 unserved.setdefault(reason, []).append(index)
                 continue
@@ -225,7 +225,7 @@ class _RemoteSources:
                 indices = _layout_indices(layout, labels)
             if indices is None:
                 mismatched += 1
-                unserved.setdefault(_nvtx.Reason.LAYOUT_MISMATCH.wire, []).append(index)
+                unserved.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(index)
                 source_pin.keys -= {key}
                 record = kvcr._block_record_map[key]
                 record.discard_in_flight_op(op_id)
@@ -319,7 +319,7 @@ class _RemoteSources:
             ]
             if not ops:
                 if wait is not None and wait.trace is not None:
-                    wait.trace.finish("cancelled", reason=_nvtx.Reason.NO_WAITERS)
+                    wait.trace.finish("cancelled", reason=Reason.NO_WAITERS)
                 self._discard_pin_result(result, wait.keys if wait is not None else ())
                 continue
 
@@ -347,11 +347,11 @@ class _RemoteSources:
                 if pin_failed
                 else "miss",
                 reason=(
-                    _nvtx.Reason.NONE
+                    Reason.NONE
                     if pin_handle is not None
-                    else _nvtx.Reason.INVALID_RESULT
+                    else Reason.INVALID_RESULT
                     if pin_failed
-                    else _nvtx.Reason.NOT_RESIDENT
+                    else Reason.NOT_RESIDENT
                 ),
                 completed_blocks=(
                     _nvtx.pin_result_blocks(result)
@@ -408,7 +408,7 @@ class _RemoteSources:
         )
         self._cancel_pending_pin_for_op(op_id, op, result="timeout")
         self._submit_prepared_source_write(
-            op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
+            op_id, op, force_failure=True, failure_reason=Reason.DEADLINE
         )
 
     def start_source_pin(self, op: _SourcePinOp) -> None:
@@ -423,7 +423,7 @@ class _RemoteSources:
         kvcr = self._kvcr
         if kvcr._clock() >= op.deadline:
             self._submit_prepared_source_write(
-                op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
+                op_id, op, force_failure=True, failure_reason=Reason.DEADLINE
             )
             return
 
@@ -550,14 +550,14 @@ class _RemoteSources:
         wait: _PendingPinWait | None,
         result: str,
         *,
-        reason: _nvtx.Reason | None = None,
+        reason: Reason | None = None,
         completed_blocks: int = -1,
     ) -> None:
         if wait is not None:
             if wait.trace is not None:
                 wait.trace.finish(
                     result,
-                    reason=_nvtx.Reason.SHUTDOWN if self._backend._closed else reason,
+                    reason=Reason.SHUTDOWN if self._backend._closed else reason,
                     completed_blocks=completed_blocks,
                 )
             self._kvcr._record_duration("framework_pin_wait", wait.started_at, result)
@@ -627,7 +627,7 @@ class _RemoteSources:
                 trace.request_id = request
             if request in self._pending_pin_ops:
                 if trace is not None:
-                    trace.finish("failed", reason=_nvtx.Reason.DUPLICATE_REQUEST)
+                    trace.finish("failed", reason=Reason.DUPLICATE_REQUEST)
                 logger.warning("KVCR reused pin request id %d", request)
                 return None
             wait = _PendingPinWait(request, keys, kvcr._timer(), trace=trace)
@@ -640,7 +640,7 @@ class _RemoteSources:
             return request
         except Exception:
             if trace is not None:
-                trace.finish("failed", reason=_nvtx.Reason.CALLBACK_ERROR)
+                trace.finish("failed", reason=Reason.CALLBACK_ERROR)
             return None
         finally:
             kvcr._record_duration("source_acquire", started_at, result)

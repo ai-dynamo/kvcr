@@ -8,9 +8,8 @@ from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from .. import _nvtx
 from ..runtime.core import logger
-from ..types import MemoryRef, OpHandle, TransferError
+from ..types import MemoryRef, OpHandle, Reason, TransferError
 from .remote_ops import _WriteProbe, _WriteProbeAck
 
 if TYPE_CHECKING:
@@ -228,7 +227,7 @@ class _DanglingOps:
             self.sources[endpoint] = incarnation
             self._backend._refused_writes[("target", handle)] = {
                 "success": False,
-                "reason": _nvtx.Reason.SOURCE_RESTARTED.wire,
+                "reason": Reason.SOURCE_RESTARTED.wire,
             }
         elif expected == incarnation and terminal:
             self._backend._refused_writes[("target", handle)] = {"success": False}

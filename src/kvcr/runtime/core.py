@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from .. import _nvtx
 from ..backends.local_disk import _G3, _G3Residency
 from ..backends.local_dram import _LocalDram
 from ..backends.local_dram_pools import (
@@ -44,6 +43,7 @@ from ..types import (
     PinHandle,
     PlacementDecision,
     QueryStatus,
+    Reason,
     RecoveryMirrorError,
     RegionDescriptor,
     ReleaseHandle,
@@ -625,7 +625,7 @@ class _KVCRCore:
         except Exception:
             self._nvtx_operations.pop(op_handle, None)
             if trace is not None:
-                trace.reject("op.rejected", _nvtx.Reason.UNKNOWN)
+                trace.reject("op.rejected", Reason.UNKNOWN)
             raise
         finally:
             if trace is not None:
