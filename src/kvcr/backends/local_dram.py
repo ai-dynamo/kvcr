@@ -317,6 +317,9 @@ class _LocalDram:
         dst_descriptors: list[_TransferRef] = []
         evicted: list[BlockKey] = []
         declared_local = list(op.key_layout) if op.key_layout is not None else None
+        no_retain = self._kvcr._no_retain
+        adapter = self._kvcr._key_adapter
+        lookup_failed = False
         for key in keys:
             if key in op.results or key in op.capacity_waiters or key in op.active_keys:
                 continue
@@ -337,7 +340,35 @@ class _LocalDram:
                 ):
                     op.results[key] = _FAILED_RESULT
                     continue
-            else:
+            marked = False
+            if no_retain and adapter is not None:
+                try:
+                    marked = adapter.encode_to_router(key) in no_retain
+                except Exception:
+                    if not lookup_failed:
+                        lookup_failed = True
+                        logger.warning(
+                            "KVCR no_retain lookup failed: %r", key, exc_info=True
+                        )
+            if marked:
+                declaration = op.key_layout
+                if residency is not None:
+                    declaration = residency.key_layout
+                    if _layout_indices(residency.layout, layout) is None:
+                        op.results[key] = _FAILED_RESULT
+                        continue
+                protected = op.claim_on_ready or bool(
+                    residency is not None and residency.retention_claims
+                )
+                if not protected:
+                    if declaration is not None and len(layout) != len(declaration):
+                        # A partial copy can remain allocated and non-evictable.
+                        logger.warning(
+                            "KVCR ignored partial no_retain deposit: %r", key
+                        )
+                    op.results[key] = _DROPPED_RESULT
+                    continue
+            if residency is None:
                 declaration = op.key_layout or tuple(layout)
                 local_layout = declared_local if declared_local is not None else layout
                 size_bytes = sum(

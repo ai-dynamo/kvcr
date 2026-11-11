@@ -16,6 +16,23 @@ if TYPE_CHECKING:
     from .hint_handler import _HintHandler
 
 
+class _HintAction(msgspec.Struct, frozen=True):
+    """One wire action; payload validation belongs to the shared parser."""
+
+    action_id: str | None
+    action_type: str
+    action_version: str
+    payload: dict[str, object]
+
+
+class KvHintsEnvelope(msgspec.Struct, frozen=True):
+    """The request-compatible envelope carried by hint messages."""
+
+    protocol_version: str
+    message_id: str
+    actions: list[_HintAction]
+
+
 class _Hint(msgspec.Struct, frozen=True):
     """Base for parsed hints; ``ACTION_TYPE`` selects the registered handler."""
 
@@ -30,6 +47,7 @@ class _KVFetchHint(_Hint):
 
     source_endpoint: str
     block_hashes: frozenset[int]
+    no_retain: bool | None = None
 
 
 class _KVEvictOnFetchHint(_KVFetchHint):
@@ -45,12 +63,22 @@ class _KVPrefetchHint(_Hint):
     block_hashes: frozenset[int]
 
 
-class _KVMoveHint(_Hint):
-    """A parsed ``kv.move`` hint, received by the source."""
-
+class _KVMoveHint(_KVPrefetchHint):
     ACTION_TYPE: ClassVar[str] = "kv.move"
 
-    destination_endpoint: str
+
+class _KVNoRetainHint(_Hint):
+    """Set or clear persistent retention advice on the receiving KVCR."""
+
+    ACTION_TYPE: ClassVar[str] = "kv.no_retain"
+
+    block_hashes: frozenset[int]
+    no_retain: bool
+
+
+class _KVInvalidateHint(_Hint):
+    ACTION_TYPE: ClassVar[str] = "kv.invalidate"
+
     block_hashes: frozenset[int]
 
 

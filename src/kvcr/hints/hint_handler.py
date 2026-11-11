@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The hint handlers: request-scoped advice stored at the destination, and the
-independent ``kv.prefetch`` / ``kv.move`` actions, which the source resolves
-and asks the named destination to fetch; the destination transfers and reports
-the outcome."""
+"""Request advice, independent transfers, and local cache hints."""
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -14,7 +12,13 @@ from typing import TYPE_CHECKING, cast
 
 import msgspec
 
-from .hint_types import _Hint, _KVFetchHint, _KVMoveHint, _KVPrefetchHint
+from .hint_types import (
+    _Hint,
+    _KVFetchHint,
+    _KVInvalidateHint,
+    _KVNoRetainHint,
+    _KVPrefetchHint,
+)
 from .parser import reject_hint
 from .results import HintResult, HintStatus
 
@@ -23,6 +27,8 @@ if TYPE_CHECKING:
     from ..runtime.core import _KVCRCore
     from ..types import BlockKey, OpEntryResult, OpHandle
     from .dispatcher import HintDispatcher
+
+logger = logging.getLogger(__name__)
 
 
 class _HintHandler(ABC):
@@ -45,11 +51,7 @@ class _HintHandler(ABC):
 
 
 class _FetchHintHandler(_HintHandler):
-    """Store ``kv.fetch`` / ``kv.evict_on_fetch`` advice at the destination.
-
-    Inline only: no state lock, no block records, and no transfer beyond the
-    store's own eager control connect.
-    """
+    """Store request advice and apply any retention setting immediately."""
 
     def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
         self._core = core  # backend access only
@@ -62,6 +64,7 @@ class _FetchHintHandler(_HintHandler):
         message_id: str | None,
     ) -> None:
         hint = cast(_KVFetchHint, hint)
+        _NoRetainHintHandler.apply(self._core, hint)
         # One store call per hint; the store's own rules apply (a later hint
         # replaces the request's hashes, a different source fails the request).
         self._core._remote_fw_dram.submit_hint(
@@ -81,6 +84,45 @@ class _FetchHintHandler(_HintHandler):
         )
 
 
+class _NoRetainHintHandler(_HintHandler):
+    """Set or clear retention advice on the receiving KVCR."""
+
+    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
+        self._core = core
+        self._dispatcher = dispatcher
+
+    def submit(
+        self,
+        hint: _Hint,
+        request_id: str | None,
+        message_id: str | None,
+    ) -> None:
+        hint = cast(_KVNoRetainHint, hint)
+        self.apply(self._core, hint)
+        self._dispatcher.report(
+            HintResult(
+                action_id=hint.action_id,
+                action_type=hint.ACTION_TYPE,
+                status=HintStatus.COMPLETED,
+                request_id=request_id,
+                message_id=message_id,
+            )
+        )
+
+    @staticmethod
+    def apply(core: _KVCRCore, hint: _KVFetchHint | _KVNoRetainHint) -> None:
+        """Record standalone or piggybacked advice; a rule is just a hash."""
+        if hint.no_retain is None:
+            return
+        if hint.no_retain and core._key_adapter is None:
+            # Deposits are keyed by BlockKey; matching them needs encode_to_router.
+            logger.warning("KVCR no_retain is not enforced without a key adapter")
+        if hint.no_retain:
+            core._no_retain.update(hint.block_hashes)
+        else:
+            core._no_retain.difference_update(hint.block_hashes)
+
+
 @dataclass
 class _PendingHint:
     receipt: HintResult
@@ -88,8 +130,7 @@ class _PendingHint:
 
 
 class _IndependentHintHandler(_HintHandler):
-    """Owner-thread lifecycle of ``kv.prefetch`` / ``kv.move`` on both peers;
-    the dispatcher's handler for both action types."""
+    """Resolve independent hints for transfers or local invalidation."""
 
     def __init__(self, core: _KVCRCore) -> None:
         self._core = core
@@ -107,7 +148,7 @@ class _IndependentHintHandler(_HintHandler):
         request_id: str | None,
         message_id: str | None,
     ) -> None:
-        """Resolve the hashes here and ask the destination to fetch the blocks.
+        """Resolve hashes for local invalidation or a destination fetch.
 
         Admission reports the hashes that did not resolve; the destination
         reports one combined outcome for all forwarded groups under the same
@@ -115,15 +156,13 @@ class _IndependentHintHandler(_HintHandler):
         """
         from ..backends.remote_ops import _FetchGroup, _KeysToFetch
 
-        hint = cast(_KVPrefetchHint | _KVMoveHint, hint)
+        hint = cast(_KVPrefetchHint | _KVInvalidateHint, hint)
         core = self._core
-        if core._local_dram is None or core._key_adapter is None:
-            reason = (
-                "source_has_no_managed_dram"
-                if core._local_dram is None
-                else "key_adapter_unavailable"
-            )
-        elif hint.destination_endpoint == getattr(
+        if core._local_dram is None:
+            reason = "source_has_no_managed_dram"
+        elif core._key_adapter is None:
+            reason = "key_adapter_unavailable"
+        elif isinstance(hint, _KVPrefetchHint) and hint.destination_endpoint == getattr(
             core.framework_control, "endpoint", None
         ):
             reason = "self_destination"
@@ -138,9 +177,21 @@ class _IndependentHintHandler(_HintHandler):
             return
         with core._state_lock:
             groups, failures = core.resolve_hashes(hint.block_hashes)
+            status = HintStatus.ACCEPTED if groups else HintStatus.FAILED
+            if isinstance(hint, _KVInvalidateHint):
+                # A resolved key without a complete READY copy, including one
+                # still filling, fails resolution as source_not_transferable.
+                by_key = {k: h for g in groups.values() for k, h in g.items()}
+                queued = set(core._invalidation_handler.submit(by_key))
+                for key, block_hash in by_key.items():
+                    if key not in queued:
+                        failures[block_hash] = "protected"
+                core._drain_invalidation()
+                # Removal is queued, not finished; no later report follows.
+                status = HintStatus.COMPLETED if queued else HintStatus.FAILED
         # Queue before reporting: a failed submission must raise before any
         # report. One-way: a send failure is logged, not reported.
-        if groups:
+        if groups and isinstance(hint, _KVPrefetchHint):
             core._progress.submit(
                 _KeysToFetch(
                     action_id=hint.action_id,
@@ -162,7 +213,7 @@ class _IndependentHintHandler(_HintHandler):
             HintResult(
                 action_id=hint.action_id,
                 action_type=hint.ACTION_TYPE,
-                status=HintStatus.ACCEPTED if groups else HintStatus.FAILED,
+                status=status,
                 request_id=request_id,
                 message_id=message_id,
                 failures=failures or None,

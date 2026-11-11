@@ -25,6 +25,8 @@ from kvcr.config import (
     LocalDramOptions,
     RemoteFWDramOptions,
 )
+from kvcr.hints.hint_types import KvHintsEnvelope as _HintEnvelope
+from kvcr.hints.hint_types import _HintAction
 from kvcr.hints.results import HintResult
 from kvcr.policy import FIFOPolicy
 from kvcr.runtime import progress as kvcr_progress
@@ -43,19 +45,6 @@ _OPEN_KVCRS: list[KVCR] = []
 
 
 _HANDED_OUT: set[int] = set()
-
-
-class _HintAction(msgspec.Struct, frozen=True):
-    action_id: str
-    action_type: str
-    action_version: str
-    payload: object
-
-
-class _HintEnvelope(msgspec.Struct, frozen=True):
-    protocol_version: str
-    message_id: str
-    actions: list[_HintAction]
 
 
 def _router_hint(
