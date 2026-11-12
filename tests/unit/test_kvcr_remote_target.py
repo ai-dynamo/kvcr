@@ -121,7 +121,8 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
     _poll_until(target, bool)
 
 
-def test_remote_fetch_uses_local_then_framework_sources() -> None:
+@pytest.mark.parametrize("action_type", ["kv.fetch", "kv.evict_on_fetch"])
+def test_remote_fetch_uses_local_then_framework_sources(action_type) -> None:
     block_size = 16
     source_primary = ctypes.create_string_buffer(b"b" * block_size)
     source_local = ctypes.create_string_buffer(block_size * 2)
@@ -174,7 +175,9 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     ]
     source_agent.state = "PROC"
 
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    hint = _router_hint("tcp://source:1")
+    hint.actions[0] = msgspec.structs.replace(hint.actions[0], action_type=action_type)
+    target.submit_hint(hint, request_id="req")
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -208,13 +211,16 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     source_now = 0.25
     source_agent.state = "DONE"
     assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
-    assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
+    if action_type == "kv.evict_on_fetch":
+        assert source.query((keys[0],)) == [(QueryStatus.MISS, None)]
+    else:
+        assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
     assert source_pinning.unpins == ["pin"]
     assert [
         (meta.access_count, meta.last_access)
         for meta, _ in source_policy.scored
         if meta.block_key == keys[0]
-    ] == [(0, 0.0), (1, 0.25)]
+    ] == ([(0, 0.0)] if action_type == "kv.evict_on_fetch" else [(0, 0.0), (1, 0.25)])
 
     target_agent.notifs["source"] = [notification]
     completed = dict(_poll_until(target, lambda results: bool(results)))
@@ -260,13 +266,16 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         ([("full", 16), ("swa", 8), ("swa", 8)], ["full", "swa", "swa"], True, True),
     ],
 )
+@pytest.mark.parametrize("action_type", ["kv.fetch", "kv.evict_on_fetch"])
 def test_remote_fetch_preserves_block_layout_and_bytes(
     layout: list[tuple[str, int]],
     expected_layout: list[str],
     success: bool,
     partial: bool,
+    action_type: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    evict = action_type == "kv.evict_on_fetch"
     payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
     pool_data = dict.fromkeys(dict(layout), b"")
     for (name, _), data in zip(layout, payloads, strict=True):
@@ -338,22 +347,31 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     source_agent.state = "PROC"
 
     if partial:
-        target_agent.state = "DONE"
+        target_agent.state = "PROC" if evict else "DONE"
         deposit = target.deposit(
             {key: [_mem_descriptor(0, label=layout[0][0])]},
             expected_layout=expected_layout,
         )
-        assert dict(_poll_until(target, bool))[deposit][key].success
+        if not evict:
+            assert dict(_poll_until(target, bool))[deposit][key].success
 
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    hint = _router_hint("tcp://source:1")
+    hint.actions[0] = msgspec.structs.replace(hint.actions[0], action_type=action_type)
+    target.submit_hint(hint, request_id="req")
     fetch = target.fetch((key,), "req", expected_layout=expected_layout)
+    if partial and evict:
+        assert not target._core._local_dram._pending_residency_ops[
+            ("fetch", fetch)
+        ].remote_fill_keys
+        target_agent.state = "DONE"
+        assert dict(_poll_until(target, bool))[deposit][key].success
     _wait_until(lambda: bool(target_control.sent))
     assert _decode_control_message(target_control.sent[-1][1])["key_layout"] == (
         expected_layout
     )
     source_control.incoming.extend(message for _, message in target_control.sent)
     if success:
-        _poll_until(source, lambda _: len(source_agent.xfers) == 2)
+        _wait_until(lambda: len(source_agent.xfers) == 2)
         source_xfer = source_agent.xfers[1]
         assert len(source_xfer[1]) == len(source_xfer[3]) == len(layout) - partial
         notification = source_xfer[5]
@@ -368,6 +386,8 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     assert result.success is success
     if success:
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
+    gone = success and evict
+    _poll_until(source, lambda _: (key not in source._core._block_record_map) is gone)
 
 
 @pytest.mark.parametrize("queued_success", [False, True])

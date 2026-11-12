@@ -40,6 +40,7 @@ from ..runtime.progress import (
 from ..types import (
     BlockKey,
     CacheTier,
+    OpEntryResult,
     OpHandle,
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
@@ -72,9 +73,15 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class _RequestHint:
+    request_id: str
     source: str | None
     block_hashes: frozenset[int]
     submitted_at: float | None
+    move: bool = False
+    no_retain: bool = False
+    no_retain_keys: set[BlockKey] | None = field(
+        default=None, repr=False, compare=False
+    )
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
@@ -163,6 +170,9 @@ class _RemoteFWDram:
         src: str | None,
         block_hashes: frozenset[int],
         request_id: str | None,
+        *,
+        move: bool = False,
+        no_retain: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -185,9 +195,16 @@ class _RemoteFWDram:
                     previous.trace.mark("hint.replaced", once=True)
                 if trace is not None:
                     trace.mark("hint.submitted")
+            marked = previous.no_retain_keys if previous is not None else None
+            if no_retain and marked is None:
+                marked = set()
             self._request_hints[request_id] = _RequestHint(
+                request_id=request_id,
                 source=src,
                 block_hashes=block_hashes,
+                move=move,
+                no_retain=no_retain,
+                no_retain_keys=marked,
                 submitted_at=(
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
@@ -211,11 +228,16 @@ class _RemoteFWDram:
         ):
             return False
         if (
-            not self._options.opportunistic_query
-            and adapter.encode_to_router(key) not in request_hint.block_hashes
-        ):
+            request_hint.move or not self._options.opportunistic_query
+        ) and adapter.encode_to_router(key) not in request_hint.block_hashes:
             return False
         return True
+
+    def is_move(self, request_id: str | None, named: "_NamedSource | None") -> bool:
+        if named is not None:
+            return named.move_keys is not None
+        hint = self._request_hints.get(request_id)
+        return hint is not None and hint.move and not hint.failed
 
     def _start_target_pull(
         self,
@@ -225,6 +247,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
+        allow_move: bool = True,
         named_source: "_NamedSource | None" = None,
     ) -> bool:
         kvcr = self._kvcr
@@ -233,6 +256,7 @@ class _RemoteFWDram:
         current_hint = None
         if named_source is not None:
             source, keys = named_source.source, tuple(blocks)
+            move = named_source.move_keys is not None
         else:
             current_hint = self._request_hints.get(request_id)
             if (
@@ -243,12 +267,17 @@ class _RemoteFWDram:
             ):
                 kvcr._record_duration(scope, started_at, "failed")
                 return False
-            source = current_hint.source
+            source, move = current_hint.source, allow_move and current_hint.move
             keys = (
                 tuple(key for key in blocks if key not in current_hint.missing_keys)
                 if current_hint.missing_keys
                 else tuple(blocks)
             )
+            if current_hint.move:
+                keys = tuple(key for key in keys if self.query(key, request_id))
+                if not keys:
+                    kvcr._record_duration(scope, started_at, "failed")
+                    return False
             if current_hint.submitted_at is not None:
                 self._request_hints[request_id] = replace(
                     current_hint, submitted_at=None
@@ -270,7 +299,7 @@ class _RemoteFWDram:
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             # Explicit operations have no request advice to update on completion.
             request_id=request_id if current_hint is not None else None,
-            move=named_source is not None and named_source.move_keys is not None,
+            move=move,
             g2_only=named_source is not None,
             key_layout=(
                 kvcr._block_record_map[keys[0]].local_dram.key_layout
@@ -356,6 +385,7 @@ class _RemoteFWDram:
         deadline: float,
         *,
         op_handle: OpHandle,
+        allow_move: bool,
         named_source: "_NamedSource | None" = None,
     ) -> bool:
         return self._start_target_pull(
@@ -364,6 +394,7 @@ class _RemoteFWDram:
             deadline,
             op_handle,
             local_fill=True,
+            allow_move=allow_move,
             named_source=named_source,
         )
 
@@ -409,9 +440,34 @@ class _RemoteFWDram:
         if not self._closed:
             self._sources.poll()
 
+    def mark_no_retain(
+        self, hint: _RequestHint, entries: Mapping[BlockKey, OpEntryResult]
+    ) -> None:
+        current = self._request_hints.get(hint.request_id)
+        marked = hint.no_retain_keys
+        if marked is None or current is None or current.no_retain_keys is not marked:
+            return
+        for key, result in entries.items():
+            if (
+                result.success
+                and self._kvcr._key_adapter.encode_to_router(key) in hint.block_hashes
+            ):
+                self._kvcr._no_retain.setdefault(key, set()).add(hint.request_id)
+                marked.add(key)
+
     def discard_hint(self, request_id: str) -> None:
         hint = self._request_hints.pop(request_id, None)
-        if hint is not None and hint.trace is not None:
+        if hint is None:
+            return
+        marked = self._kvcr._no_retain
+        for key in hint.no_retain_keys or ():
+            owners = marked.get(key)
+            if owners is None:
+                continue
+            owners.discard(request_id)
+            if not owners:
+                del marked[key]
+        if hint.trace is not None:
             hint.trace.mark("hint.discarded", once=True)
 
     def _fail_request_hint(self, request_id: str | None) -> None:
@@ -466,7 +522,8 @@ class _RemoteFWDram:
             ):
                 self._request_hints[op.request_id] = replace(
                     hint,
-                    missing_keys=(hint.missing_keys | op.keys) - completed_keys,
+                    missing_keys=hint.missing_keys.union(op.ordered_keys)
+                    - completed_keys,
                 )
             if op.local_fill:
                 if op.state is _TargetPullState.QUARANTINED:
@@ -770,6 +827,12 @@ class _RemoteFWDram:
     ) -> None:
         started_at = self._kvcr._timer()
         op_handle = payload.op_handle
+        if (
+            payload.move
+            and payload.sender_incarnation == self._dangling_ops.incarnation
+        ):
+            self._refuse_start_write(progress, payload, op_handle, "self_source")
+            return
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
         dst_descriptors = payload.dst_descriptors
@@ -877,11 +940,12 @@ class _RemoteFWDram:
             if self._nvtx is not None
             else None,
         )
-        if payload.move:
+        if payload.move and payload.g2_only:
             # A move closes owner-side admission for its keys, so the owner
             # thread admits it; the write itself still runs on progress.
             self._queue_source_pin(source_write, payload.key_layout, move=True)
             return
+        source_write.evict = () if payload.move else None
         prepared = self._try_local_source_write(
             progress, source_write, payload.key_layout
         )
@@ -908,6 +972,7 @@ class _RemoteFWDram:
                 route=op.route,
                 nvtx_state=op.nvtx_state,
                 move=move,
+                evict=op.evict is not None,
             )
         )
 
@@ -997,6 +1062,12 @@ class _RemoteFWDram:
             return None
         if selected is False:
             return False
+        if source_write.evict is not None:
+            source_write.evict = tuple(
+                _Invalidate(keys=(ordered_keys[i],), key_layout=r.key_layout)
+                for i, r, _ in selected
+                if key_layout or len(dst_descriptors[i]) == len(r.key_layout)
+            )
         completed_indices = tuple(index for index, _, _ in selected)
         if len(selected) != len(ordered_keys):
             ordered_keys = tuple(ordered_keys[i] for i in completed_indices)
