@@ -50,7 +50,7 @@ defaults:
 jobs:
   prepare:
     name: Prepare version
-    runs-on: ubuntu-24.04
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
@@ -184,7 +184,7 @@ jobs:
     name: Ops gate
     needs: prepare
     if: needs.prepare.outputs.gate == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 5
     environment: automated-release
     permissions: {}
@@ -239,7 +239,7 @@ jobs:
       needs.prepare.result == 'success' &&
       needs.prepare.outputs.stage == 'true' &&
       (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
-    runs-on: ubuntu-24.04
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 5
     environment: automated-release
     permissions: {}
@@ -277,7 +277,7 @@ jobs:
       !cancelled() &&
       needs.prepare.result == 'success' &&
       (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
-    runs-on: ${{ needs.prepare.outputs.stage == 'true' && 'prod-kvcr-builder-v1' || 'ubuntu-24.04' }}
+    runs-on: prod-kvcr-builder-v1
     environment: ${{ needs.prepare.outputs.stage == 'true' && 'automated-release' || '' }}
     timeout-minutes: 60
     permissions:
@@ -401,7 +401,7 @@ jobs:
           version: ${{ needs.prepare.outputs.version }}
           mode: ${{ needs.prepare.outputs.mode }}
 
-  # Tests the staged bytes on a GitHub-hosted runner with a read-only token, because tests run third-party code.
+  # Tests the staged bytes with a read-only token in a job apart from the deploy token, because tests run third-party code.
   test:
     name: Test staged wheel
     needs: [prepare, build]
@@ -409,7 +409,7 @@ jobs:
       !cancelled() &&
       needs.prepare.outputs.stage == 'true' &&
       needs.build.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: prod-kvcr-builder-v1
     environment: wheel-read
     timeout-minutes: 60
     permissions:
@@ -497,7 +497,7 @@ jobs:
       needs.build.result == 'success' &&
       needs.test.result == 'success' &&
       (needs.e2e.result == 'success' || needs.prepare.outputs.e2e != 'blocking')
-    runs-on: ubuntu-24.04
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 5
     environment: manual-release-approval
     permissions: {}
@@ -601,7 +601,7 @@ jobs:
       (inputs.mode != 'nightly' || github.event_name == 'schedule' || needs.prepare.outputs.stage == 'true') &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
        (needs.prepare.outputs.stage == 'true' && needs.trigger-gitlab.result != 'success'))
-    runs-on: ubuntu-24.04
+    runs-on: prod-kvcr-builder-v1
     timeout-minutes: 5
     environment: automated-release
     permissions: {}
