@@ -4,12 +4,17 @@
 
 # The CI workflow resolves the selected serving image to a digest.
 ARG VLLM_IMAGE=vllm/vllm-openai:nightly
+
+# Empty unless the workflow passes the staged wheel as the kvcr-wheel build context.
+FROM scratch AS kvcr-wheel
+
 FROM ${VLLM_IMAGE}
 
 USER root
 ARG VLLM_IMAGE
 ARG DYNAMO_VERSION=nightly
 ARG KVCR_COMMIT
+ARG KVCR_WHEEL_SHA256=""
 LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/kvcr" \
       org.opencontainers.image.revision="${KVCR_COMMIT}" \
       org.opencontainers.image.base.name="${VLLM_IMAGE}"
@@ -20,8 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
 
 COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
 COPY src /opt/kvcr-src/src
+COPY --from=kvcr-wheel / /opt/kvcr-wheel/
 RUN python3 - <<'PY'
 from importlib import metadata
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -88,8 +95,20 @@ subprocess.check_call([
     "--report", "/opt/kvcr-dynamo-install-report.json",
     f"ai-dynamo=={dynamo_version}",
 ])
+wheels = sorted(Path("/opt/kvcr-wheel").glob("kvcr-*.whl"))
+expected_sha256 = os.environ.get("KVCR_WHEEL_SHA256", "")
+if expected_sha256:
+    if len(wheels) != 1:
+        raise RuntimeError(f"Expected one staged kvcr wheel, found {wheels}")
+    if hashlib.sha256(wheels[0].read_bytes()).hexdigest() != expected_sha256:
+        raise RuntimeError(f"{wheels[0].name} does not match the staged sha256")
+    kvcr_target = str(wheels[0])
+elif wheels:
+    raise RuntimeError("A kvcr wheel was passed without KVCR_WHEEL_SHA256")
+else:
+    kvcr_target = "/opt/kvcr-src"
 subprocess.check_call([
-    sys.executable, "-m", "pip", "install", "--no-cache-dir", "/opt/kvcr-src",
+    sys.executable, "-m", "pip", "install", "--no-cache-dir", kvcr_target,
     "--constraint", str(constraints),
 ])
 restore = [
@@ -114,6 +133,7 @@ packages = {
 }
 Path("/opt/kvcr-build-metadata.json").write_text(json.dumps({
     "kvcr_sha": os.environ.get("KVCR_COMMIT", ""),
+    "kvcr_wheel_sha256": expected_sha256,
     "base_image": os.environ["VLLM_IMAGE"],
     "requested_dynamo_version": requested_dynamo_version,
     "packages": packages,
@@ -127,15 +147,6 @@ PY
 RUN kvcr-service --help
 RUN python3 - <<'PY'
 from importlib import metadata
-
-# Use the public channel export in the adapter supplied by the base image.
-adapter = metadata.distribution("vllm").locate_file(
-    "vllm/v1/kv_offload/tiering/kvcr/manager.py"
-)
-adapter.write_text(adapter.read_text().replace(
-    "from kvcr.control_channels import ZmqPeerControlChannel",
-    "from kvcr import ZmqPeerControlChannel",
-))
 
 import kvcr
 import dynamo.vllm

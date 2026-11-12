@@ -31,7 +31,7 @@ on:
         type: number
         default: 0
       run_e2e:
-        description: Run the GPU end-to-end test and require it to pass before staging.
+        description: Run the GPU end-to-end test and require it to pass before approval. The wheel is staged first, so a fixed build needs the next rc.
         required: false
         type: boolean
         default: true
@@ -40,7 +40,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.mode == 'nightly' && github.run_id || inputs.version }}
+  group: release-${{ inputs.mode == 'nightly' && github.run_id || format('{0}-rc{1}', inputs.version, inputs.rc) }}
   cancel-in-progress: false
 
 defaults:
@@ -51,7 +51,7 @@ jobs:
   prepare:
     name: Prepare version
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       version: ${{ steps.plan.outputs.version }}
@@ -61,6 +61,8 @@ jobs:
       stage: ${{ steps.plan.outputs.stage }}
       publish: ${{ steps.plan.outputs.publish }}
       label: ${{ steps.plan.outputs.label }}
+      e2e: ${{ steps.plan.outputs.e2e }}
+      gate: ${{ steps.plan.outputs.gate }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +74,7 @@ jobs:
           STAGE: ${{ inputs.stage }}
           INPUT_VERSION: ${{ inputs.version }}
           RC: ${{ inputs.rc }}
+          RUN_E2E: ${{ inputs.run_e2e }}
           NIGHTLY_PUBLISH: ${{ vars.KVCR_NIGHTLY_PUBLISH }}
         run: |
           set -euo pipefail
@@ -126,12 +129,116 @@ jobs:
             echo "publish=${publish}"
             echo "label=${label}"
           } >> "${GITHUB_OUTPUT}"
-          echo "KVCR ${label} (stage=${stage}, publish=${publish})"
+          # The GPU test pulls the staged wheel, so it runs only when the wheel is staged.
+          e2e=off
+          if [ "${RUN_E2E}" = "true" ] && [ "${stage}" = "true" ]; then
+            e2e=advisory
+            [ "${MODE}" = "release" ] && e2e=blocking
+          fi
+          # Every staging run needs release ops, except the first attempt of the unattended scheduled nightly.
+          gate=false
+          if [ "${stage}" = "true" ] && { [ "${GITHUB_EVENT_NAME}" != "schedule" ] || [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; }; then
+            gate=true
+          fi
+          echo "e2e=${e2e}" >> "${GITHUB_OUTPUT}"
+          echo "gate=${gate}" >> "${GITHUB_OUTPUT}"
+          echo "KVCR ${label} (stage=${stage}, publish=${publish}, e2e=${e2e}, ops gate=${gate})"
+      - if: steps.plan.outputs.stage == 'true'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.6"
+          checksum: ${{ runner.arch == 'ARM64' && 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d' || '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477' }}
+          enable-cache: false
+      - name: Check the version against PyPI
+        if: steps.plan.outputs.stage == 'true'
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          PACKAGING_VERSION: "26.3"
+        run: |
+          uv run --no-project --python 3.12 --with "packaging==${PACKAGING_VERSION}" python - <<'EOF'
+          import json
+          import os
+          import urllib.request
+
+          from packaging.version import Version
+
+          version = Version(os.environ["VERSION"])
+          with urllib.request.urlopen("https://pypi.org/pypi/kvcr/json", timeout=30) as response:
+              released = [Version(v) for v in json.load(response)["releases"]]
+          if os.environ["MODE"] == "release" and version in released:
+              print(f"::error::kvcr {version} is already on PyPI. Bump [project].version and release that.")
+              raise SystemExit(1)
+          blocking = [v for v in released if v >= version]
+          if os.environ["MODE"] == "nightly" and blocking:
+              print(
+                  f"::error::kvcr {version} must sort above every PyPI release, but {max(blocking)} exists. "
+                  f"Bump [project].version on main above {max(blocking).base_version} right after each release."
+              )
+              raise SystemExit(1)
+          EOF
+
+  # Dynamo's ops gate. Its two steps are YAML anchors, repeated first in every job that stages or publishes,
+  # because "Re-run failed jobs" reuses this job's success without checking who re-ran.
+  authorize:
+    name: Ops gate
+    needs: prepare
+    if: needs.prepare.outputs.gate == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: automated-release
+    permissions: {}
+    steps:
+      - &ops-token
+        name: Mint an org members token
+        if: needs.prepare.outputs.gate == 'true' || (needs.prepare.outputs.stage == 'true' && github.run_attempt != '1')
+        id: ops-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-members: read
+      - &ops-check
+        name: Require release ops team membership
+        if: needs.prepare.outputs.gate == 'true' || (needs.prepare.outputs.stage == 'true' && github.run_attempt != '1')
+        env:
+          GH_TOKEN: ${{ steps.ops-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch | schedule) ;;
+            *) echo "::error::kvcr stages only from a manual dispatch or the nightly schedule, not ${GITHUB_EVENT_NAME}"; exit 1 ;;
+          esac
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${GH_TOKEN}" > "${auth}"
+          # A scheduled run's actor is whoever last edited the cron, so only the re-runner is checked there.
+          users="${TRIGGERING_ACTOR}"
+          if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
+            users="$(printf '%s\n%s\n' "${ACTOR}" "${TRIGGERING_ACTOR}" | sort -u)"
+          fi
+          for user in ${users}; do
+            code="$(curl -q -sS --max-time 30 -o "${RUNNER_TEMP}/membership.json" -w '%{http_code}' -H "@${auth}" \
+              -H 'Accept: application/vnd.github+json' "https://api.github.com/orgs/${ORG}/teams/devops/memberships/${user}")"
+            if [ "${code}" != "200" ] || ! grep -Eq '"state"[[:space:]]*:[[:space:]]*"active"' "${RUNNER_TEMP}/membership.json"; then
+              echo "::error::@${user} is not an active member of ${ORG}/devops (HTTP ${code}); only release ops can stage kvcr"
+              exit 1
+            fi
+            echo "@${user} is release ops"
+          done
 
   slack-start:
     name: Slack start message
-    needs: prepare
-    if: needs.prepare.outputs.stage == 'true'
+    needs: [prepare, authorize]
+    if: >-
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.stage == 'true' &&
+      (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: automated-release
@@ -162,185 +269,95 @@ jobs:
           fi
           echo "thread_ts=$(jq -r '.ts' <<< "${response}")" >> "${GITHUB_OUTPUT}"
 
-  # Releases and manual nightlies that would stage wait for a reviewer; scheduled runs do not, as in Dynamo.
-  approve:
-    name: Approval
-    needs: prepare
-    if: >-
-      needs.prepare.outputs.stage == 'true' &&
-      (needs.prepare.outputs.mode == 'release' || github.event_name != 'schedule')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    environment: manual-release-approval
-    permissions: {}
-    steps:
-      # GitHub creates a missing environment without reviewers, which would approve everything.
-      - name: Check that the approval environment has reviewers
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          reviewers="$(gh api "repos/${GITHUB_REPOSITORY}/environments/manual-release-approval" \
-            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers | length] | add // 0')"
-          [ "${reviewers}" -gt 0 ] || { echo "::error::the manual-release-approval environment has no required reviewers"; exit 1; }
-
+  # Built once with hash-pinned tooling only: no third-party runtime code shares a job with the deploy token.
   build:
-    name: Build and check wheel
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: ${{ needs.prepare.outputs.stage == 'true' && 'Build and stage wheel' || 'Build and test wheel' }}
+    needs: [prepare, authorize]
+    if: >-
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
+    runs-on: ${{ needs.prepare.outputs.stage == 'true' && 'prod-kvcr-builder-v1' || 'ubuntu-24.04' }}
+    environment: ${{ needs.prepare.outputs.stage == 'true' && 'automated-release' || '' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      wheel_sha256: ${{ steps.dist.outputs.wheel-sha256 }}
+      wheel_sha256: ${{ steps.dist.outputs.wheel_sha256 }}
     env:
-      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      MODE: ${{ needs.prepare.outputs.mode }}
       VERSION: ${{ needs.prepare.outputs.version }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
-      TWINE_VERSION: "7.0.0"
+      STAGE: ${{ needs.prepare.outputs.stage }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
     steps:
+      - *ops-token
+      - *ops-check
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.6"
+          checksum: ${{ runner.arch == 'ARM64' && 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d' || '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477' }}
+          enable-cache: false
+      - name: Stamp the version
+        run: |
+          python3 -I - <<'EOF'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          path = Path("pyproject.toml")
+          hatch = tomllib.loads(path.read_text()).get("tool", {}).get("hatch", {})
+
+          def has_hooks(node):
+              return isinstance(node, dict) and any(key == "hooks" or has_hooks(value) for key, value in node.items())
+
+          # This job holds the deploy token, so the build may run no in-tree code such as hatch hooks.
+          if has_hooks(hatch) or hatch.get("version", {}).get("source") == "code" or any(
+              Path(name).exists() for name in ("hatch.toml", "hatch_build.py")
+          ):
+              print("::error::in-tree build code would run next to the deploy token; move it out of the build or get an ops review")
+              raise SystemExit(1)
+          if os.environ["MODE"] == "nightly":
+              text, count = re.subn(r'(?m)^(version = )"[^"]+"', rf'\g<1>"{version}"', path.read_text(), count=1)
+              if count != 1:
+                  print("::error::could not stamp pyproject.toml")
+                  raise SystemExit(1)
+              path.write_text(text)
+          if tomllib.loads(path.read_text())["project"]["version"] != version:
+              print(f"::error::pyproject.toml does not hold version {version}")
+              raise SystemExit(1)
+          EOF
       - name: Build the wheel
         id: dist
-        uses: ./.github/actions/build-dist
-        with:
-          mode: ${{ needs.prepare.outputs.mode }}
-          version: ${{ needs.prepare.outputs.version }}
-          wheel: ${{ needs.prepare.outputs.wheel }}
-          check-pypi: ${{ needs.prepare.outputs.stage }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          # uv's own Python keeps the zlib, and so the bytes, the same on every runner.
+          uv build --wheel --python 3.12 --managed-python --no-config --out-dir dist \
+            --build-constraint .github/build-constraints.txt --require-hashes
+          test -f "dist/${WHEEL}" || { echo "::error::the build did not produce ${WHEEL}"; exit 1; }
+          echo "wheel_sha256=$(sha256sum "dist/${WHEEL}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
       - name: Check the contents, headers, license, and dependencies
         run: |
           set -euo pipefail
-          uvx "twine==${TWINE_VERSION}" check --strict "dist/${WHEEL}"
           # Anything that can reach PyPI must have every dependency reviewed.
           strict=()
           if [ "${PUBLISH}" = "true" ]; then
             strict=(--strict)
           fi
-          python3 .github/scripts/wheel_compliance.py wheel "dist/${WHEEL}" --version "${VERSION}" ${strict[@]+"${strict[@]}"}
-
-  verify:
-    name: Test wheel and licenses
-    needs: [prepare, build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      actions: read
-    env:
-      MODE: ${{ needs.prepare.outputs.mode }}
-      VERSION: ${{ needs.prepare.outputs.version }}
-      WHEEL: ${{ needs.prepare.outputs.wheel }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Rebuild the checked wheel
-        uses: ./.github/actions/build-dist
-        with:
-          mode: ${{ needs.prepare.outputs.mode }}
-          version: ${{ needs.prepare.outputs.version }}
-          wheel: ${{ needs.prepare.outputs.wheel }}
-          expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
-      - name: Check dependency licenses and test the installed wheel
-        run: |
-          set -euo pipefail
-          for py in 3.10 3.12; do
-            venv="${RUNNER_TEMP}/venv-${py}"
-            uv venv --python "${py}" "${venv}"
-            uv pip install --python "${venv}/bin/python" "dist/${WHEEL}[profiling]"
-            uv pip check --python "${venv}/bin/python"
-            # Inventory before pytest so test tooling stays out of the license evidence.
-            python3 .github/scripts/wheel_compliance.py licenses --python "${venv}/bin/python" \
-              --inventory "${RUNNER_TEMP}/inventory/py${py}.csv"
-            "${venv}/bin/python" -c 'import importlib.metadata as m, os, sys, kvcr; assert m.version("kvcr") == os.environ["VERSION"]; assert kvcr.__file__.startswith(sys.prefix), kvcr.__file__'
-            "${venv}/bin/kvcr-service" --help > /dev/null
-            uv pip install --python "${venv}/bin/python" "pytest>=8,<9"
-            "${venv}/bin/python" -m pytest tests/unit -q -p no:cacheprovider
-          done
-      - name: Write the license evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Releases diff against the previous release, whose evidence reached the open-source review.
-          if [ "${MODE}" = "release" ]; then
-            query="actions/workflows/release.yml/runs?event=workflow_dispatch&status=success&per_page=10"
-          else
-            query="actions/workflows/nightly.yml/runs?branch=main&event=schedule&status=success&per_page=10"
-          fi
-          prior=()
-          runs="$(gh api "repos/${GITHUB_REPOSITORY}/${query}" --jq '.workflow_runs[].id')" || runs=""
-          for run in ${runs}; do
-            dir="${RUNNER_TEMP}/prior-${run}"
-            if gh run download "${run}" -R "${GITHUB_REPOSITORY}" -n license-artifacts -D "${dir}" 2> /dev/null \
-              && [ -f "${dir}/deps.csv" ]; then
-              prior=(--prior "${dir}/deps.csv")
-              echo "Comparing with run ${run}"
-              break
-            fi
-          done
-          python3 .github/scripts/wheel_compliance.py evidence "${RUNNER_TEMP}"/inventory/py*.csv \
-            --out "${RUNNER_TEMP}/license-artifacts" ${prior[@]+"${prior[@]}"}
-      # The release pipeline attaches the one artifact whose name contains "license".
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: license-artifacts
-          path: ${{ runner.temp }}/license-artifacts/deps*.csv
-          if-no-files-found: error
-          retention-days: 90
-          overwrite: true
-
-  # Releases stage only after the GPU test passes, unless it was turned off.
-  e2e:
-    name: GPU end-to-end test
-    needs: prepare
-    if: inputs.run_e2e && needs.prepare.outputs.mode == 'release'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/docker-build.yml
-
-  # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
-  e2e-nightly:
-    name: GPU end-to-end test (non-blocking)
-    needs: prepare
-    if: inputs.run_e2e && needs.prepare.outputs.mode == 'nightly'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/docker-build.yml
-
-  stage:
-    name: Stage to Artifactory
-    needs: [prepare, approve, build, verify, e2e]
-    if: >-
-      !cancelled() &&
-      needs.prepare.outputs.stage == 'true' &&
-      needs.build.result == 'success' &&
-      needs.verify.result == 'success' &&
-      (needs.prepare.outputs.mode == 'nightly' || needs.e2e.result == 'success' || !inputs.run_e2e) &&
-      ((needs.prepare.outputs.mode == 'nightly' && github.event_name == 'schedule') || needs.approve.result == 'success')
-    runs-on: prod-kvcr-builder-v1
-    timeout-minutes: 15
-    environment: automated-release
-    permissions:
-      contents: read
-    env:
-      STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
-      WHEEL: ${{ needs.prepare.outputs.wheel }}
-      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Rebuild the checked wheel
-        uses: ./.github/actions/build-dist
-        with:
-          mode: ${{ needs.prepare.outputs.mode }}
-          version: ${{ needs.prepare.outputs.version }}
-          wheel: ${{ needs.prepare.outputs.wheel }}
-          expect-wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+          python3 -I .github/scripts/wheel_compliance.py wheel "dist/${WHEEL}" --version "${VERSION}" ${strict[@]+"${strict[@]}"}
       - name: Stage in Artifactory
+        if: env.STAGE == 'true'
         env:
+          WHEEL_SHA256: ${{ steps.dist.outputs.wheel_sha256 }}
           ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
@@ -356,7 +373,6 @@ jobs:
           auth="$(mktemp -p "${RUNNER_TEMP}")"
           trap 'rm -f "${auth}"' EXIT
           printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_TOKEN}" > "${auth}"
-          [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${WHEEL}"; exit 1; }
           dest="${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
           status="$(curl -q -sS --max-time 30 --head -o "${RUNNER_TEMP}/head.txt" -w '%{http_code}' -H "@${auth}" "${dest}")"
           staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
@@ -377,14 +393,134 @@ jobs:
           esac
           curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
           echo "${WHEEL_SHA256}  ${RUNNER_TEMP}/staged" | sha256sum --check
+      # Pull request checks hold no secrets, so they test the wheel in this job.
+      - if: env.STAGE != 'true'
+        uses: ./.github/actions/test-wheel
+        with:
+          wheel: dist/${{ needs.prepare.outputs.wheel }}
+          version: ${{ needs.prepare.outputs.version }}
+          mode: ${{ needs.prepare.outputs.mode }}
+
+  # Tests the staged bytes on a GitHub-hosted runner with a read-only token, because tests run third-party code.
+  test:
+    name: Test staged wheel
+    needs: [prepare, build]
+    if: >-
+      !cancelled() &&
+      needs.prepare.outputs.stage == 'true' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: wheel-read
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+      STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.6"
+          checksum: ${{ runner.arch == 'ARM64' && 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d' || '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477' }}
+          enable-cache: false
+      - name: Fetch the staged wheel
+        env:
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_READ_TOKEN: ${{ secrets.ARTIFACTORY_READ_TOKEN }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          for name in ARTIFACTORY_URL ARTIFACTORY_READ_TOKEN ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || { echo "::error::secret ${name} is not set in the wheel-read environment"; exit 1; }
+          done
+          [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${WHEEL}"; exit 1; }
+          host="${ARTIFACTORY_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_READ_TOKEN}" > "${auth}"
+          mkdir -p dist
+          curl -q -fsS --retry 3 --max-time 120 -o "dist/${WHEEL}" -H "@${auth}" \
+            "${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
+          echo "${WHEEL_SHA256}  dist/${WHEEL}" | sha256sum --check
+      - uses: ./.github/actions/test-wheel
+        with:
+          wheel: dist/${{ needs.prepare.outputs.wheel }}
+          version: ${{ needs.prepare.outputs.version }}
+          mode: ${{ needs.prepare.outputs.mode }}
+
+  # Releases wait for this GPU test before approval, unless it was turned off.
+  e2e:
+    name: GPU end-to-end test
+    needs: [prepare, build]
+    # Explicit, because the implicit success() also sees the skipped ops gate on scheduled runs.
+    if: "!cancelled() && needs.build.result == 'success' && needs.prepare.outputs.e2e == 'blocking'"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-build.yml
+    secrets: inherit
+    with:
+      wheel: ${{ needs.prepare.outputs.wheel }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      stage_path: ${{ needs.prepare.outputs.stage_path }}
+      # Release pins: no stable vLLM supports this kvcr API yet, so test a known-good nightly stack.
+      base_image: vllm/vllm-openai@sha256:390a656b54e12144ad15ff32244c6e848408b0ee94f2c4c5a84451e7430f1aa7
+      dynamo_version: 1.7.0.dev20261110
+
+  # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
+  e2e-nightly:
+    name: GPU end-to-end test (non-blocking)
+    needs: [prepare, build]
+    if: "!cancelled() && needs.build.result == 'success' && needs.prepare.outputs.e2e == 'advisory'"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-build.yml
+    secrets: inherit
+    with:
+      wheel: ${{ needs.prepare.outputs.wheel }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      stage_path: ${{ needs.prepare.outputs.stage_path }}
+
+  # A reviewer approves the tested wheel. Only the first attempt of a scheduled nightly skips this.
+  approve:
+    name: Approval
+    needs: [prepare, build, test, e2e]
+    if: >-
+      !cancelled() &&
+      needs.prepare.outputs.stage == 'true' &&
+      (github.event_name != 'schedule' || github.run_attempt != '1') &&
+      needs.build.result == 'success' &&
+      needs.test.result == 'success' &&
+      (needs.e2e.result == 'success' || needs.prepare.outputs.e2e != 'blocking')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: manual-release-approval
+    permissions: {}
+    steps:
+      # GitHub creates a missing environment without reviewers, which would approve everything.
+      - name: Check that the approval environment has reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewers="$(gh api "repos/${GITHUB_REPOSITORY}/environments/manual-release-approval" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers | length] | add // 0')"
+          [ "${reviewers}" -gt 0 ] || { echo "::error::the manual-release-approval environment has no required reviewers"; exit 1; }
 
   trigger-gitlab:
     name: Trigger GitLab pipeline
-    needs: [prepare, approve, slack-start, stage]
+    needs: [prepare, slack-start, build, test, approve]
     if: >-
       !cancelled() &&
-      needs.stage.result == 'success' &&
-      ((needs.prepare.outputs.mode == 'nightly' && github.event_name == 'schedule') || needs.approve.result == 'success')
+      needs.prepare.outputs.stage == 'true' &&
+      needs.build.result == 'success' &&
+      needs.test.result == 'success' &&
+      ((github.event_name == 'schedule' && github.run_attempt == '1') || needs.approve.result == 'success')
     runs-on:
       group: gitlab_ci_runners
     timeout-minutes: 10
@@ -396,10 +532,13 @@ jobs:
       NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
       RC: ${{ inputs.rc }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
       SLACK_THREAD_TS: ${{ needs.slack-start.outputs.thread_ts }}
       # TEMP: always a dry run during PR verification; restore the expression before merge.
       DRY_RUN: "true"
     steps:
+      - *ops-token
+      - *ops-check
       - name: Trigger the release pipeline
         env:
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
@@ -433,6 +572,7 @@ jobs:
             "RC_NUMBER=${rc_number}"
             "WHEEL_VERSION=${VERSION}"
             "STAGED_WHEELS=${WHEEL}"
+            "WHEEL_SHA256=${WHEEL_SHA256}"
             "GITHUB_RUN_ID=${GITHUB_RUN_ID}"
             "COMMIT_SHA=${GITHUB_SHA}"
             ARTIFACTS=wheel
@@ -453,13 +593,14 @@ jobs:
 
   notify-failure:
     name: Slack failure alert
-    needs: [prepare, slack-start, approve, build, verify, e2e, e2e-nightly, stage, trigger-gitlab]
-    # Timed-out jobs end as cancelled; ignore cancels only when the whole run was cancelled.
+    needs: [prepare, authorize, slack-start, build, test, e2e, e2e-nightly, approve, trigger-gitlab]
+    # Quiet when the run was cancelled; timed-out jobs end as cancelled, and a planned GitLab trigger that never ran alerts.
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name != 'pull_request' &&
       (inputs.mode != 'nightly' || github.event_name == 'schedule' || needs.prepare.outputs.stage == 'true') &&
-      (contains(needs.*.result, 'failure') || (!cancelled() && contains(needs.*.result, 'cancelled')))
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
+       (needs.prepare.outputs.stage == 'true' && needs.trigger-gitlab.result != 'success'))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: automated-release
@@ -475,6 +616,7 @@ jobs:
           set -euo pipefail
           [ -n "${WEBHOOK_URL}" ] || { echo "::warning::secret SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL is not set; no Slack alert sent"; exit 0; }
           failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<< "${NEEDS}")"
+          [ -n "${failed}" ] || failed="trigger-gitlab did not run"
           mentions=""
           IFS=',' read -ra ids <<< "${MENTION_IDS}"
           for id in "${ids[@]}"; do
