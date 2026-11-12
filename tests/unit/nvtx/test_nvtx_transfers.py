@@ -292,7 +292,8 @@ def test_local_source_reuses_nvtx_state_on_both_write_paths(
     source.deposit({key: [_mem_descriptor(end_point_name="source")]})
     _poll_until(source, bool)
     control.incoming.append(_start_write_message(12, key))
-    _wait_until(lambda: len(writes) == 1)  # Inline progress needs no caller polling.
+    _wait_until(lambda: len(agent.released_xfers) == 2)  # No caller polling.
+    assert not pins
     _poll_until(source, lambda _: not source._core._local_dram_sources_by_op)
     monkeypatch.setattr(
         source._core._remote_fw_dram, "_try_local_source_write", lambda *args: False
@@ -300,10 +301,13 @@ def test_local_source_reuses_nvtx_state_on_both_write_paths(
     control.incoming.append(_start_write_message(13, key))
     _poll_until(
         source,
-        lambda _: len(writes) == 2 and not source._core._local_dram_sources_by_op,
+        lambda _: (
+            len(agent.released_xfers) == 3
+            and not source._core._local_dram_sources_by_op
+        ),
     )
     assert len(agent.released_xfers) == 3
-    assert pins.keys() == writes.keys() and len(pins) == 2
+    assert pins.keys() < writes.keys() and len(pins) == 1 and len(writes) == 2
     for op_id, state in pins.items():
         assert writes[op_id] is state
         assert (state is None) == (level == "off")

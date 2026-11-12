@@ -14,7 +14,7 @@ import msgspec
 from .. import _nvtx
 from ..runtime.core import TRANSFER_BLOCKS_METRIC, logger
 from ..runtime.progress import _KVCRProgress, _ProgressOp, _RegionMaps, _TransferRef
-from ..types import BlockKey, OpHandle, PinHandle
+from ..types import BlockKey, OpHandle
 
 if TYPE_CHECKING:
     from .local_dram_pools import _LocalDramResidency
@@ -37,6 +37,34 @@ class _StartWrite(_PeerMessage, tag="start_write"):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     key_layout: tuple[str, ...] = ()
     source_incarnation: str | None = None
+    move: bool = False
+    # Independent operations must not acquire or reuse framework memory.
+    g2_only: bool = False
+
+
+class _FetchGroup(msgspec.Struct, frozen=True):
+    """Resolved keys sharing one layout and its piece sizes."""
+
+    keys: tuple[BlockKey, ...]
+    block_hashes: tuple[int, ...]
+    key_layout: tuple[str, ...]
+    sizes: tuple[int, ...]
+
+
+class _KeysToFetch(_PeerMessage, tag="keys_to_fetch"):
+    """All resolved layout groups for one independent hint."""
+
+    action_id: str | None
+    message_id: str | None
+    move: bool
+    groups: tuple[_FetchGroup, ...]
+
+
+class _Invalidate(_PeerMessage, tag="invalidate"):
+    """Remove eligible source G2 copies already held completely at the destination."""
+
+    keys: tuple[BlockKey, ...]
+    key_layout: tuple[str, ...]
 
 
 class _TargetMetadata(_PeerMessage, tag="target_metadata"):
@@ -65,6 +93,8 @@ class _WriteProbeAck(_PeerMessage, tag="write_probe_ack"):
 
 _ControlMessage = (
     _StartWrite
+    | _Invalidate
+    | _KeysToFetch
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused
@@ -111,6 +141,8 @@ class _TargetPullOp(_RemoteOp):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     request_id: str | None = None
     key_layout: tuple[str, ...] = ()
+    move: bool = False
+    g2_only: bool = False
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     probe_sent: bool = False
@@ -180,6 +212,8 @@ class _TargetPullOp(_RemoteOp):
                     keys=self.ordered_keys,
                     dst_descriptors=self.dst_descriptors,
                     key_layout=self.key_layout if self.local_fill else (),
+                    move=self.move,
+                    g2_only=self.g2_only,
                 ),
             )
             if not sent:
@@ -367,14 +401,18 @@ class _SourceWriteOp(_RemoteOp):
     source_keys: tuple[BlockKey, ...]
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
-    framework_pins: set[PinHandle] = field(default_factory=set)
     src_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
+    # Retain the source restriction across progress retries and owner admission.
+    g2_only: bool = False
     transfer_id: int | None = None
     success: bool = False
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
-    local_sources: tuple["_LocalDramResidency", ...] = ()
+    # Keys this move marked pending at the source; reopened if the write fails.
+    moving: tuple[BlockKey, ...] = ()
+    # None uses caller cleanup; a tuple (even empty) is owned by progress.
+    local_sources: tuple["_LocalDramResidency", ...] | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -390,8 +428,7 @@ class _SourceWriteOp(_RemoteOp):
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
         if self.transfer_id is None:
-            source_responsive = backend._dangling_ops.check_source_progress()
-            if not source_responsive or status.cancel_requested:
+            if status.cancel_requested:
                 self.state = _SourceWriteState.NOTIFY_FAILURE
             if (
                 self.state is _SourceWriteState.NOTIFY_FAILURE
@@ -400,8 +437,6 @@ class _SourceWriteOp(_RemoteOp):
                 if trace is not None:
                     if status.cancel_requested:
                         failure_reason = _nvtx.Reason.CANCELLED
-                    elif not source_responsive:
-                        failure_reason = _nvtx.Reason.SOURCE_STALLED
                     elif self.state is _SourceWriteState.NOTIFY_FAILURE:
                         failure_reason = nvtx_state.failure_reason
                     else:
@@ -448,8 +483,8 @@ class _SourceWriteOp(_RemoteOp):
                     trace.complete_source(False, 0, reason=_nvtx.Reason.UNKNOWN)
                 return True, True
             submit_started_at = backend._kvcr._timer()
-            status.submitted = True
             try:
+                status.submitted = True
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
                     tuple(chain.from_iterable(self.src_descriptors)),

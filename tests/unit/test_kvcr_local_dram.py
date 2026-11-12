@@ -830,11 +830,11 @@ def test_eviction_preserves_reader_claimed_during_policy_decision(monkeypatch):
     try:
         assert _poll_until(kvcr, bool) == [(rejected, _op_entries({incoming: False}))]
         assert len(agent.transfers) == 1
-        assert claimed[0][0].source_readers == 1
+        assert claimed[0][1].source_readers == 1
         assert memory.raw == b"a" * 16
         assert kvcr.query((resident,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     finally:
-        local.release_readers((resident,), (claimed[0][0],), success=True)
+        local.release_readers((resident,), (claimed[0][1],), success=True)
 
     replacement = kvcr.deposit({incoming: [_mem_descriptor(1)]})
     assert _poll_until(kvcr, bool) == [(replacement, _op_entries({incoming: True}))]
@@ -887,19 +887,19 @@ def test_source_completions_refresh_lru_before_resuming_capacity_waiters(
         kvcr.align_sequence([retiring])
 
     now = 0.3
-    local.release_readers((retiring,), (retiring_source[0][0],), success=False)
+    local.release_readers((retiring,), (retiring_source[0][1],), success=False)
     if completion_order == "during_admission":
         decide_ingest = kvcr._core._policy.decide_ingest
 
         def complete_reader(*args, **kwargs):
             # Finish after the admission's initial completion drain.
             monkeypatch.setattr(kvcr._core._policy, "decide_ingest", decide_ingest)
-            local.release_readers((recent,), (recent_source[0][0],), success=True)
+            local.release_readers((recent,), (recent_source[0][1],), success=True)
             return decide_ingest(*args, **kwargs)
 
         monkeypatch.setattr(kvcr._core._policy, "decide_ingest", complete_reader)
     else:
-        local.release_readers((recent,), (recent_source[0][0],), success=True)
+        local.release_readers((recent,), (recent_source[0][1],), success=True)
     if completion_order != "spill_first":
         local.release_sources((retiring,))
     duplicate = kvcr.deposit(blocks)

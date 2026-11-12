@@ -38,6 +38,10 @@ class _SourcePinOp(_Op):
     dst_descriptors: tuple[tuple[_TransferRef, ...], ...]
     route: tuple[str, int] = ("", 0)
     key_layout: tuple[str, ...] = ()
+    move: bool = False
+    g2_only: bool = False
+    # Keys this move marked pending; reopened if they are not written.
+    moving: tuple[BlockKey, ...] = ()
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -84,7 +88,7 @@ class _RemoteSources:
             _SourceWriteState.FINISHED,
             _SourceWriteState.CANCEL_PENDING,
         ):
-            if item.local_sources:
+            if item.local_sources is not None:
                 # local.poll_main drains reader releases with their access
                 # accounting and reclamation.
                 # TODO: Skip queued local handoffs if useful; keep TransferError events.
@@ -93,6 +97,8 @@ class _RemoteSources:
             # KVCR-owned contents stay claimed until native quiescence.
             pins = self._fw_pins_by_op.pop(item.op_id, None)
             if item.state is _SourceWriteState.FINISHED:
+                if item.moving and not item.success:
+                    self._kvcr._invalidation_handler.reopen(item.moving)
                 self._kvcr._remove_block_dependencies(item)
                 if item.success:
                     self._kvcr._record_access(
@@ -166,7 +172,8 @@ class _RemoteSources:
         framework_sources = {
             key: record.fw_mem.descriptors
             for key in source_pin.keys
-            if key not in local_sources
+            if not source_pin.g2_only
+            and key not in local_sources
             and (record := kvcr._block_record_map.get(key)) is not None
             and record.fw_mem is not None
         }
@@ -177,6 +184,8 @@ class _RemoteSources:
             if key not in source_pin.keys:
                 continue
             residency = local_sources.get(key)
+            if source_pin.g2_only and (residency is None or residency.pending_labels):
+                continue
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
@@ -221,11 +230,33 @@ class _RemoteSources:
                 if residency is not None
                 else tuple(source[span] for span in indices)
             )
+        if not waiting and not force_failure and not self._backend._framework_pinning:
+            # Validate once, after selection: the selected destinations, or the
+            # whole request when nothing was selected so a bad peer is refused.
+            if not self._backend._pinless_destinations_valid(
+                source_pin.op_handle,
+                route_name,
+                [source_pin.dst_descriptors[i] for i in completed_indices]
+                if completed_indices
+                else source_pin.dst_descriptors,
+            ):
+                force_failure = True
+                failure_reason = _nvtx.Reason.INVALID_RESULT
+                completed_indices.clear()
+                selected_sources.clear()
         completed_keys = tuple(
             source_pin.ordered_keys[index] for index in completed_indices
         )
 
         retained_keys = source_pin.keys if waiting else set(completed_keys)
+        if source_pin.moving:
+            omitted = [key for key in source_pin.moving if key not in retained_keys]
+            # Forget rejected keys before reopening them; later retries must not
+            # cancel a newer invalidation for the same key.
+            source_pin.moving = tuple(
+                key for key in source_pin.moving if key in retained_keys
+            )
+            kvcr._invalidation_handler.reopen(omitted)
         kvcr._release_local_dram_sources(op_id, local_sources.keys() - retained_keys)
         relevant_pins = {
             record.fw_mem.pin_handle
@@ -267,17 +298,20 @@ class _RemoteSources:
             route=source_pin.route,
             nvtx_state=source_pin.nvtx_state,
             _backend=self._backend,
-            framework_pins=framework_pins,
+            g2_only=source_pin.g2_only,
             source_keys=completed_keys,
             src_descriptors=tuple(selected_sources),
             completed_indices=tuple(completed_indices),
+            moving=source_pin.moving,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
-        self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
+        self._fw_pins_by_op[source_write.op_id] = framework_pins
         kvcr._progress.submit(source_write)
         self._release_framework_pins(unused_pins)
 
     def _poll_framework_pin_results(self) -> Iterator[tuple[PinRequestId, PinResult]]:
+        if not self._backend._framework_pinning:
+            return
         try:
             yield from self._kvcr._poll_pin_results_callback()
         except Exception:
@@ -382,9 +416,44 @@ class _RemoteSources:
 
     def start_source_pin(self, op: _SourcePinOp) -> None:
         kvcr = self._kvcr
+        # Decide admission once; retries retain the original request positions.
+        pending = kvcr._invalidation_handler._pending
+        if pending:
+            op.keys = op.keys.difference(pending)
+        if op.move and kvcr._local_dram is not None:
+            # Closing admission must not strand a producer of missing pieces.
+            # Reject busy keys before claiming them or marking removal pending.
+            busy = set()
+            producers = kvcr._local_dram._pending_residency_ops
+            for key in op.keys:
+                record = kvcr._block_record_map.get(key)
+                if record is None:
+                    continue
+                residency = record.local_dram
+                if residency is not None:
+                    if residency.pending_labels or residency.pending_deposits:
+                        busy.add(key)
+                elif any(
+                    producer_id[0] == "deposit"
+                    and (producer := producers.get(producer_id)) is not None
+                    and key not in producer.results
+                    for producer_id in record.active_op_ids
+                ):
+                    busy.add(key)
+            if busy:
+                op.keys = op.keys.difference(busy)
         kvcr._add_block_dependencies(op, new_operation=True)
+        if op.move:
+            # Reject new reads and deposits of these keys while they move.
+            op.moving = kvcr._invalidation_handler.submit(
+                op.keys, key_layout=op.key_layout
+            )
         self._source_pin_ops[op.op_id] = op
-        self._resume_source_pin(op.op_id, op)
+        if op.ordered_keys and not op.keys:
+            # Every requested key was rejected; send failure without a transfer.
+            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+        else:
+            self._resume_source_pin(op.op_id, op)
 
     def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         if self._source_pin_ops.get(op_id) is not op:
@@ -394,6 +463,10 @@ class _RemoteSources:
             self._submit_prepared_source_write(
                 op_id, op, force_failure=True, failure_reason=_nvtx.Reason.DEADLINE
             )
+            return
+
+        if op.g2_only:
+            self._submit_prepared_source_write(op_id, op)
             return
 
         local_sources = kvcr._claim_local_dram_sources(
@@ -426,6 +499,7 @@ class _RemoteSources:
     def _remove_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         self._cancel_pending_pin_for_op(op_id, op)
         self._source_pin_ops.pop(op_id, None)
+        self._kvcr._invalidation_handler.reopen(op.moving)
         self._kvcr._remove_block_dependencies(op)
         self._kvcr._release_local_dram_sources(op.op_id)
         framework_pins = set(op.framework_pins)
@@ -671,6 +745,8 @@ class _RemoteSources:
         | _PendingFrameworkSources
         | None
     ):
+        if not self._backend._framework_pinning:
+            return None
         kvcr = self._kvcr
         started_at = kvcr._timer()
         keys_to_pin: list[BlockKey] = []

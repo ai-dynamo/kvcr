@@ -139,7 +139,7 @@ Until safety is established, KVCR prevents affected allocations in its own pool 
 
 A transport error, a missed heartbeat, or a replacement peer at the same address does not prove that access has stopped. Confirmed death of the original source, for example through its KVCR Guard, permits reclamation only when the transport guarantees that its accesses have ended.
 
-Some underlying failures may require restarting the affected process. KVCR makes a best effort to complete cleanup without a restart, but unresolved memory may remain unavailable indefinitely. A stalled source stops accepting new writes until restart while cleanup continues. If a Guard takes over, it serves new requests and fails old operations without replaying them.
+Some underlying failures may require restarting the affected process. KVCR makes a best effort to complete cleanup without a restart, but unresolved memory may remain unavailable indefinitely. After progress resumes, expired operations fail while fresh requests remain eligible. If a Guard takes over, it serves new requests and fails old operations without replaying them.
 
 ---
 
@@ -216,6 +216,8 @@ These statuses describe current KVCR knowledge, not a reservation or guarantee. 
 
 To serve from framework-owned memory, the KVCR acquires a pin asynchronously through `request_pin` and `poll_pin_results`, reusing covered keys and requesting only the remainder; the framework keeps it valid until `release_pin` accepts release. `release_pin` must be safely retryable: `False` or an exception leaves release pending; `True` means the framework accepts responsibility for completing release, including retaining uncertain allocations until the matching `quiesced` event.
 
+If framework pinning is not needed, for example when framework DRAM is used only for staging, omit the pin callbacks from `KVCRBindings`.
+
 A deployment may choose to use only framework-owned memory. In that case, it uses the pinning mechanism together with `deliver` and does not use `deposit`, `fetch`, or `release`.
 
 **Completion and cancellation**
@@ -253,15 +255,27 @@ Framework-owned memory is reported through the framework's existing router event
 
 KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
 
-### Request-scoped hints
+### KV transfer hints
 
 For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
 
-KVCR-to-KVCR movement is destination-initiated. A router hint gives the destination the source node and KVCR control endpoint. `mode=copy` retains the source copy, while `mode=move` permits source eviction only after successful completion. Timeout or cancellation keeps the source copy. When the hint has no source control endpoint, the destination uses its local storage information or checks object storage when enabled. The router does not need object-store inventory for locality decisions, but may track object presence to issue source hints.
+The router may choose not to send a hint based on its internal cost model. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
-`submit_hint` may establish the peer connection, but does not start data movement or remote pinning yet. Each hint in an envelope is parsed and handled independently; proactive fetching, staging, or pinning may be added later as new hint types. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole `BlockKeyList` from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
+#### Request-scoped hints
 
-The router may choose not to send a hint based on its internal cost model. Router hints may later be extended to request proactive copy or move for cache rebalancing, which may require periodic utilization reports from KVCR. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
+KVCR-to-KVCR movement is destination-initiated for request-scoped hints. A request-scoped `kv.fetch` gives the destination the source node, KVCR control endpoint, and advertised block hashes. It provides advice for copying and does not request source removal. When the hint has no source control endpoint, the destination uses its local storage information or checks object storage when enabled. The router does not need object-store inventory for locality decisions, but may track object presence to issue source hints.
+
+`submit_hint` may establish the peer connection, but does not start data movement or remote pinning yet. The framework initiates copying through `fetch()` or `deliver()` with the same request ID; the configured key adapter matches its full `BlockKey` values against the hint hashes.
+
+Each hint in an envelope is parsed and handled independently. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole request's block hashes from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
+
+#### Independent hints
+
+`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Hints are sent to the source with `destination_control_endpoint` and `block_hashes`. They run independently of their carrier request's keys and lifetime, work without a request ID, and can share an envelope with request advice.
+
+During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
+
+The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed.
 
 ### Peer control and liveness
 

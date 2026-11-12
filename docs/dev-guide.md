@@ -2,7 +2,7 @@
 
 This guide is for developers who are comfortable with Python, Linux, and inference engines such as vLLM, but are new to KV Cache Runner (KVCR). It covers the local development path from environment setup through standalone validation.
 
-To try the integrated stack without modifying source, follow the [vLLM quick start](quick-start-vllm.md) or [SGLang HiCache quick start](quick-start-sglang.md).
+To try the integrated stack without modifying source, follow the [vLLM quick start](quick-start-vllm.md) or [SGLang quick start](quick-start-sglang.md).
 
 ---
 
@@ -160,6 +160,8 @@ For `on_resilience_event` and optional framework-memory quarantine, see the [res
 
 See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
+For `kv.prefetch` and `kv.move`, configure the key adapter's reverse lookup at the source and keep polling both peers. See [independent hints](design_overview.md#independent-hints) for the payload and managed-G2 contract.
+
 ### Development loop
 
 Run a focused test while iterating, then the complete standalone validation before finishing. If an adapter or router contract changed, run the optional integration validation separately.
@@ -308,7 +310,7 @@ Validate that counters increase on both success and failure paths, byte counts a
 
 Complete standalone setup and validation first. Use a separate shared environment for Dynamo, vLLM, and KVCR to keep integration dependencies out of the standalone development loop.
 
-Select a vLLM revision that includes the merged KVCR 0.2.0 secondary-tier adapter (`"type": "kvcr"`), starting with [`fed7de9`](https://github.com/vllm-project/vllm/commit/fed7de909f894fbee0c45130376aed2e2c9bf0d3) on `main`. Pair it with a landed Dynamo revision such as [`701da25`](https://github.com/ai-dynamo/dynamo/commit/701da25292ecca8f64d770cc0b17d389200019a1), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
+Select a vLLM revision that includes the merged KVCR 0.2.0 secondary-tier adapter (`"type": "kvcr"`), starting with [`a5db4c9`](https://github.com/vllm-project/vllm/commit/a5db4c9ff58a0ec4dc20594ba5cea9f776dcd693) on `main` (the first revision implementing the `KeyAdapter` API of KVCR #161). Pair it with a landed Dynamo revision such as [`318ab03`](https://github.com/ai-dynamo/dynamo/commit/318ab0390d8e3e1fa7517ea6a1ebf46a7854c236), which supports the versioned KV hint contract and one KVCR control port per local data-parallel rank. The [vLLM quick start](quick-start-vllm.md) records a pinned combination for its container.
 
 ### Build the integration environment
 

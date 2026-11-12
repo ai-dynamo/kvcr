@@ -106,15 +106,28 @@ class TelemetryStats(Protocol):
 class FrameworkControl(Protocol):
     def send(self, endpoint: str, message: bytes) -> bool: ...
 
-    def recv(self) -> list[bytes]: ...
+    def recv(self) -> list[tuple[bytes, float]]:
+        """Return messages with their local time.monotonic() receipt timestamps."""
+        ...
 
 
 class KeyAdapter(Protocol):
-    """Framework-specific key conversion."""
+    """Convert between KVCR storage keys and external key representations.
 
-    def encode(self, framework_key: object) -> BlockKey: ...
+    ``BlockKey`` is the key KVCR uses for storage. A framework key is the key
+    the framework uses to identify its stored blocks. Here, a router key means
+    the external block hash published to the router (e.g. in Dynamo router, this
+    is currently an unsigned 64-bit integer). Router's internal keys can be
+    separate from this published hash.
+    """
 
-    def decode(self, key: BlockKey) -> int | bytes: ...
+    def encode_to_framework(self, key: BlockKey) -> object: ...
+
+    def decode_from_framework(self, framework_key: object) -> BlockKey: ...
+
+    def encode_to_router(self, key: BlockKey) -> int | bytes: ...
+
+    def decode_from_router(self, router_key: int | bytes) -> BlockKey: ...
 
 
 class KVCRConfig(msgspec.Struct, frozen=True):
