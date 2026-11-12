@@ -6,18 +6,21 @@ name: KVCR vLLM E2E
 on:
   workflow_call:
     inputs:
-      image:
-        description: Published KVCR image reference, preferably pinned by digest
+      image_digest:
+        description: Digest of the published KVCR CI image (sha256:...)
         required: true
         type: string
       model:
         required: false
         type: string
         default: Qwen/Qwen3-0.6B
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
   workflow_dispatch:
     inputs:
-      image:
-        description: Published KVCR image reference, preferably pinned by digest
+      image_digest:
+        description: Digest of the published KVCR CI image (sha256:...), from the Docker Build run summary
         required: true
         type: string
       model:
@@ -31,28 +34,37 @@ permissions:
 jobs:
   peer-transfer:
     runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    # Holds the registry variable, so no other job receives it.
+    environment: gpu-e2e
     container:
-      image: ${{ inputs.image }}
+      # GitHub allows no secrets here, so the registry comes from a variable; the AWS_ACCOUNT_ID secret keeps the account masked.
+      image: ${{ vars.KVCR_ECR_REGISTRY }}/ai-dynamo/kvcr@${{ inputs.image_digest }}
     timeout-minutes: 30
     env:
       HF_HOME: /scratch/huggingface
       VLLM_CACHE_ROOT: /scratch/vllm
       XDG_CACHE_HOME: /scratch/cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the account secret
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: '[ -n "$AWS_ACCOUNT_ID" ] || { echo "::error::repository secret AWS_ACCOUNT_ID is not set"; exit 1; }'
       - name: Show NVIDIA devices
         run: nvidia-smi
       - name: Verify cross-rank KVCR reuse
         shell: bash
         env:
           MODEL: ${{ inputs.model }}
-          KVCR_TEST_IMAGE: ${{ inputs.image }}
+          KVCR_TEST_IMAGE: ai-dynamo/kvcr@${{ inputs.image_digest }}
         run: |
           set -euo pipefail
           python3 -u tests/e2e/run_vllm_kvcr.py --model "$MODEL"
       - name: Save serving logs and responses
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kvcr-vllm-e2e-${{ github.run_attempt }}
           path: e2e-artifacts/

@@ -1,0 +1,636 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+run-name: Release ${{ inputs.version }} rc${{ inputs.rc }} (by @${{ github.actor }})
+
+on:
+  # nightly.yml calls this for nightlies and pull-request wheel checks.
+  workflow_call:
+    inputs:
+      mode:
+        required: true
+        type: string
+      stage:
+        required: false
+        type: boolean
+        default: false
+      run_e2e:
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release. It must equal [project].version in pyproject.toml.
+        required: true
+        type: string
+      rc:
+        description: Release-candidate round. Stage a fixed build as the next round.
+        required: true
+        type: number
+        default: 0
+      run_e2e:
+        description: Run the GPU end-to-end test and require it to pass before approval. The wheel is staged first, so a fixed build needs the next rc.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.mode == 'nightly' && github.run_id || format('{0}-rc{1}', inputs.version, inputs.rc) }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Prepare version
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      wheel: ${{ steps.plan.outputs.wheel }}
+      nightly_tag: ${{ steps.plan.outputs.nightly_tag }}
+      stage_path: ${{ steps.plan.outputs.stage_path }}
+      stage: ${{ steps.plan.outputs.stage }}
+      publish: ${{ steps.plan.outputs.publish }}
+      label: ${{ steps.plan.outputs.label }}
+      e2e: ${{ steps.plan.outputs.e2e }}
+      gate: ${{ steps.plan.outputs.gate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plan the version and release mode
+        id: plan
+        env:
+          MODE: ${{ inputs.mode || 'release' }}
+          STAGE: ${{ inputs.stage }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RC: ${{ inputs.rc }}
+          RUN_E2E: ${{ inputs.run_e2e }}
+          NIGHTLY_PUBLISH: ${{ vars.KVCR_NIGHTLY_PUBLISH }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          base="$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' pyproject.toml)"
+          [ -n "${base}" ] || fail "pyproject.toml [project].version must be a plain X.Y.Z release"
+          case "${MODE}" in
+            nightly)
+              # TEMP: pull-request/66 is allowed for the dry run; remove before merge.
+              if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ "${GITHUB_REF}" != "refs/heads/main" ] \
+                && [ "${GITHUB_REF}" != "refs/heads/pull-request/66" ]; then
+                fail "nightlies run only on main"
+              fi
+              date="$(date -u +%Y%m%d)"
+              version="${base}.dev${date}"
+              nightly_tag="${date}-${GITHUB_SHA:0:7}"
+              stage_path="nightly/${GITHUB_RUN_ID}"
+              label="nightly ${version}"
+              stage="${STAGE}"
+              publish=false
+              if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+                publish=true
+              fi
+              ;;
+            release)
+              [[ "${INPUT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version '${INPUT_VERSION}' must be X.Y.Z"
+              [ "${INPUT_VERSION}" = "${base}" ] \
+                || fail "version ${INPUT_VERSION} does not match pyproject.toml ${base} on ${GITHUB_REF_NAME}"
+              case "${GITHUB_REF}" in
+                refs/heads/main | "refs/heads/release/${INPUT_VERSION}") ;;
+                *) fail "release ${INPUT_VERSION} runs from main or release/${INPUT_VERSION}, not ${GITHUB_REF}" ;;
+              esac
+              [[ "${RC}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || fail "rc '${RC}' must be a whole number below 1000"
+              version="${base}"
+              nightly_tag=""
+              stage_path="release/${version}/rc${RC}"
+              label="release ${version} rc${RC}"
+              stage=true
+              publish=true
+              ;;
+            *)
+              fail "mode '${MODE}' must be nightly or release"
+              ;;
+          esac
+          {
+            echo "mode=${MODE}"
+            echo "version=${version}"
+            echo "wheel=kvcr-${version}-py3-none-any.whl"
+            echo "nightly_tag=${nightly_tag}"
+            echo "stage_path=${stage_path}"
+            echo "stage=${stage}"
+            echo "publish=${publish}"
+            echo "label=${label}"
+          } >> "${GITHUB_OUTPUT}"
+          # The GPU test pulls the staged wheel, so it runs only when the wheel is staged.
+          e2e=off
+          if [ "${RUN_E2E}" = "true" ] && [ "${stage}" = "true" ]; then
+            e2e=advisory
+            [ "${MODE}" = "release" ] && e2e=blocking
+          fi
+          # Every staging run needs release ops, except the first attempt of the unattended scheduled nightly.
+          gate=false
+          if [ "${stage}" = "true" ] && { [ "${GITHUB_EVENT_NAME}" != "schedule" ] || [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; }; then
+            gate=true
+          fi
+          echo "e2e=${e2e}" >> "${GITHUB_OUTPUT}"
+          echo "gate=${gate}" >> "${GITHUB_OUTPUT}"
+          echo "KVCR ${label} (stage=${stage}, publish=${publish}, e2e=${e2e}, ops gate=${gate})"
+      - if: steps.plan.outputs.stage == 'true'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.6"
+          checksum: ${{ runner.arch == 'ARM64' && 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d' || '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477' }}
+          enable-cache: false
+      - name: Check the version against PyPI
+        if: steps.plan.outputs.stage == 'true'
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          PACKAGING_VERSION: "26.3"
+        run: |
+          uv run --no-project --python 3.12 --with "packaging==${PACKAGING_VERSION}" python - <<'EOF'
+          import json
+          import os
+          import urllib.request
+
+          from packaging.version import Version
+
+          version = Version(os.environ["VERSION"])
+          with urllib.request.urlopen("https://pypi.org/pypi/kvcr/json", timeout=30) as response:
+              released = [Version(v) for v in json.load(response)["releases"]]
+          if os.environ["MODE"] == "release" and version in released:
+              print(f"::error::kvcr {version} is already on PyPI. Bump [project].version and release that.")
+              raise SystemExit(1)
+          blocking = [v for v in released if v >= version]
+          if os.environ["MODE"] == "nightly" and blocking:
+              print(
+                  f"::error::kvcr {version} must sort above every PyPI release, but {max(blocking)} exists. "
+                  f"Bump [project].version on main above {max(blocking).base_version} right after each release."
+              )
+              raise SystemExit(1)
+          EOF
+
+  # Dynamo's ops gate. Its two steps are YAML anchors, repeated first in every job that stages or publishes,
+  # because "Re-run failed jobs" reuses this job's success without checking who re-ran.
+  authorize:
+    name: Ops gate
+    needs: prepare
+    if: needs.prepare.outputs.gate == 'true'
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 5
+    environment: automated-release
+    permissions: {}
+    steps:
+      - &ops-token
+        name: Mint an org members token
+        if: needs.prepare.outputs.gate == 'true' || (needs.prepare.outputs.stage == 'true' && github.run_attempt != '1')
+        id: ops-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-members: read
+      - &ops-check
+        name: Require release ops team membership
+        if: needs.prepare.outputs.gate == 'true' || (needs.prepare.outputs.stage == 'true' && github.run_attempt != '1')
+        env:
+          GH_TOKEN: ${{ steps.ops-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch | schedule) ;;
+            *) echo "::error::kvcr stages only from a manual dispatch or the nightly schedule, not ${GITHUB_EVENT_NAME}"; exit 1 ;;
+          esac
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${GH_TOKEN}" > "${auth}"
+          # A scheduled run's actor is whoever last edited the cron, so only the re-runner is checked there.
+          users="${TRIGGERING_ACTOR}"
+          if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
+            users="$(printf '%s\n%s\n' "${ACTOR}" "${TRIGGERING_ACTOR}" | sort -u)"
+          fi
+          for user in ${users}; do
+            code="$(curl -q -sS --max-time 30 -o "${RUNNER_TEMP}/membership.json" -w '%{http_code}' -H "@${auth}" \
+              -H 'Accept: application/vnd.github+json' "https://api.github.com/orgs/${ORG}/teams/devops/memberships/${user}")"
+            if [ "${code}" != "200" ] || ! grep -Eq '"state"[[:space:]]*:[[:space:]]*"active"' "${RUNNER_TEMP}/membership.json"; then
+              echo "::error::@${user} is not an active member of ${ORG}/devops (HTTP ${code}); only release ops can stage kvcr"
+              exit 1
+            fi
+            echo "@${user} is release ops"
+          done
+
+  slack-start:
+    name: Slack start message
+    needs: [prepare, authorize]
+    if: >-
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.stage == 'true' &&
+      (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 5
+    environment: automated-release
+    permissions: {}
+    outputs:
+      thread_ts: ${{ steps.post.outputs.thread_ts }}
+    steps:
+      - name: Start the Slack thread
+        id: post
+        continue-on-error: true
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_RELEASE_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+          LABEL: ${{ needs.prepare.outputs.label }}
+          ICON: ${{ needs.prepare.outputs.mode == 'release' && ':package:' || ':crescent_moon:' }}
+        run: |
+          set -euo pipefail
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${SLACK_BOT_TOKEN}" > "${auth}"
+          text="${ICON} *KVCR ${LABEL}* started from \`${GITHUB_SHA:0:7}\` <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|GitHub run>"
+          response="$(jq -n --arg channel "${SLACK_CHANNEL_ID}" --arg text "${text}" '{channel: $channel, text: $text}' \
+            | curl -q -fsS --max-time 15 --retry 2 -H "@${auth}" -H 'Content-Type: application/json; charset=utf-8' \
+              --data @- https://slack.com/api/chat.postMessage)"
+          if [ "$(jq -r '.ok' <<< "${response}")" != "true" ]; then
+            echo "::error::Slack chat.postMessage failed: $(jq -r '.error // "unknown"' <<< "${response}")"
+            exit 1
+          fi
+          echo "thread_ts=$(jq -r '.ts' <<< "${response}")" >> "${GITHUB_OUTPUT}"
+
+  # Built once with hash-pinned tooling only: no third-party runtime code shares a job with the deploy token.
+  build:
+    name: ${{ needs.prepare.outputs.stage == 'true' && 'Build and stage wheel' || 'Build and test wheel' }}
+    needs: [prepare, authorize]
+    if: >-
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
+    runs-on: prod-kvcr-builder-v1
+    environment: ${{ needs.prepare.outputs.stage == 'true' && 'automated-release' || '' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      wheel_sha256: ${{ steps.dist.outputs.wheel_sha256 }}
+    env:
+      MODE: ${{ needs.prepare.outputs.mode }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+      STAGE: ${{ needs.prepare.outputs.stage }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
+    steps:
+      - *ops-token
+      - *ops-check
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.6"
+          checksum: ${{ runner.arch == 'ARM64' && 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d' || '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477' }}
+          enable-cache: false
+      - name: Stamp the version
+        run: |
+          python3 -I - <<'EOF'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          path = Path("pyproject.toml")
+          hatch = tomllib.loads(path.read_text()).get("tool", {}).get("hatch", {})
+
+          def has_hooks(node):
+              return isinstance(node, dict) and any(key == "hooks" or has_hooks(value) for key, value in node.items())
+
+          # This job holds the deploy token, so the build may run no in-tree code such as hatch hooks.
+          if has_hooks(hatch) or hatch.get("version", {}).get("source") == "code" or any(
+              Path(name).exists() for name in ("hatch.toml", "hatch_build.py")
+          ):
+              print("::error::in-tree build code would run next to the deploy token; move it out of the build or get an ops review")
+              raise SystemExit(1)
+          if os.environ["MODE"] == "nightly":
+              text, count = re.subn(r'(?m)^(version = )"[^"]+"', rf'\g<1>"{version}"', path.read_text(), count=1)
+              if count != 1:
+                  print("::error::could not stamp pyproject.toml")
+                  raise SystemExit(1)
+              path.write_text(text)
+          if tomllib.loads(path.read_text())["project"]["version"] != version:
+              print(f"::error::pyproject.toml does not hold version {version}")
+              raise SystemExit(1)
+          EOF
+      - name: Build the wheel
+        id: dist
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          # uv's own Python keeps the zlib, and so the bytes, the same on every runner.
+          uv build --wheel --python 3.12 --managed-python --no-config --out-dir dist \
+            --build-constraint .github/build-constraints.txt --require-hashes
+          test -f "dist/${WHEEL}" || { echo "::error::the build did not produce ${WHEEL}"; exit 1; }
+          echo "wheel_sha256=$(sha256sum "dist/${WHEEL}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+      - name: Check the contents, headers, license, and dependencies
+        run: |
+          set -euo pipefail
+          # Anything that can reach PyPI must have every dependency reviewed.
+          strict=()
+          if [ "${PUBLISH}" = "true" ]; then
+            strict=(--strict)
+          fi
+          python3 -I .github/scripts/wheel_compliance.py wheel "dist/${WHEEL}" --version "${VERSION}" ${strict[@]+"${strict[@]}"}
+      - name: Stage in Artifactory
+        if: env.STAGE == 'true'
+        env:
+          WHEEL_SHA256: ${{ steps.dist.outputs.wheel_sha256 }}
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          for name in ARTIFACTORY_URL ARTIFACTORY_TOKEN ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || { echo "::error::secret ${name} is not set in the automated-release environment"; exit 1; }
+          done
+          # curl errors name the host, which a secret mask alone does not cover.
+          host="${ARTIFACTORY_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          # Tokens go through files so they never appear in argv.
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_TOKEN}" > "${auth}"
+          dest="${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
+          status="$(curl -q -sS --max-time 30 --head -o "${RUNNER_TEMP}/head.txt" -w '%{http_code}' -H "@${auth}" "${dest}")"
+          staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
+          case "${status}" in
+            200)
+              [ "${staged}" = "${WHEEL_SHA256}" ] || { echo "::error::a different ${WHEEL} is already staged at ${STAGE_PATH}; stage the next rc"; exit 1; }
+              echo "already staged: ${WHEEL}"
+              ;;
+            404)
+              curl -q -fsS --retry 3 --max-time 120 -o /dev/null -H "@${auth}" -H "X-Checksum-Sha256: ${WHEEL_SHA256}" \
+                --upload-file "dist/${WHEEL}" "${dest}"
+              echo "staged: ${WHEEL}"
+              ;;
+            *)
+              echo "::error::checking the staged ${WHEEL} returned HTTP ${status}"
+              exit 1
+              ;;
+          esac
+          curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
+          echo "${WHEEL_SHA256}  ${RUNNER_TEMP}/staged" | sha256sum --check
+      # Pull request checks hold no secrets, so they test the wheel in this job.
+      - if: env.STAGE != 'true'
+        uses: ./.github/actions/test-wheel
+        with:
+          wheel: dist/${{ needs.prepare.outputs.wheel }}
+          version: ${{ needs.prepare.outputs.version }}
+          mode: ${{ needs.prepare.outputs.mode }}
+
+  # Tests the staged bytes with a read-only token in a job apart from the deploy token, because tests run third-party code.
+  test:
+    name: Test staged wheel
+    needs: [prepare, build]
+    if: >-
+      !cancelled() &&
+      needs.prepare.outputs.stage == 'true' &&
+      needs.build.result == 'success'
+    runs-on: prod-kvcr-builder-v1
+    environment: wheel-read
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+      STAGE_PATH: ${{ needs.prepare.outputs.stage_path }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.6"
+          checksum: ${{ runner.arch == 'ARM64' && 'd58030acd26159499ac82f32da12d1b3c12a3a1bfc414232d9082070c03e128d' || '8681d8921e7d520fb368991dcf5f9c1905b80f5bf2a265a0ed085c8d8e342477' }}
+          enable-cache: false
+      - name: Fetch the staged wheel
+        env:
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_READ_TOKEN: ${{ secrets.ARTIFACTORY_READ_TOKEN }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          for name in ARTIFACTORY_URL ARTIFACTORY_READ_TOKEN ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || { echo "::error::secret ${name} is not set in the wheel-read environment"; exit 1; }
+          done
+          [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the build job did not output a sha256 for ${WHEEL}"; exit 1; }
+          host="${ARTIFACTORY_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_READ_TOKEN}" > "${auth}"
+          mkdir -p dist
+          curl -q -fsS --retry 3 --max-time 120 -o "dist/${WHEEL}" -H "@${auth}" \
+            "${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
+          echo "${WHEEL_SHA256}  dist/${WHEEL}" | sha256sum --check
+      - uses: ./.github/actions/test-wheel
+        with:
+          wheel: dist/${{ needs.prepare.outputs.wheel }}
+          version: ${{ needs.prepare.outputs.version }}
+          mode: ${{ needs.prepare.outputs.mode }}
+
+  # Releases wait for this GPU test before approval, unless it was turned off.
+  e2e:
+    name: GPU end-to-end test
+    needs: [prepare, build]
+    # Explicit, because the implicit success() also sees the skipped ops gate on scheduled runs.
+    if: "!cancelled() && needs.build.result == 'success' && needs.prepare.outputs.e2e == 'blocking'"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-build.yml
+    secrets: inherit
+    with:
+      wheel: ${{ needs.prepare.outputs.wheel }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      stage_path: ${{ needs.prepare.outputs.stage_path }}
+      # Release pins: no stable vLLM supports this kvcr API yet, so test a known-good nightly stack.
+      base_image: vllm/vllm-openai@sha256:390a656b54e12144ad15ff32244c6e848408b0ee94f2c4c5a84451e7430f1aa7
+      dynamo_version: 1.7.0.dev20261110
+
+  # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
+  e2e-nightly:
+    name: GPU end-to-end test (non-blocking)
+    needs: [prepare, build]
+    if: "!cancelled() && needs.build.result == 'success' && needs.prepare.outputs.e2e == 'advisory'"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-build.yml
+    secrets: inherit
+    with:
+      wheel: ${{ needs.prepare.outputs.wheel }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      stage_path: ${{ needs.prepare.outputs.stage_path }}
+
+  # A reviewer approves the tested wheel. Only the first attempt of a scheduled nightly skips this.
+  approve:
+    name: Approval
+    needs: [prepare, build, test, e2e]
+    if: >-
+      !cancelled() &&
+      needs.prepare.outputs.stage == 'true' &&
+      (github.event_name != 'schedule' || github.run_attempt != '1') &&
+      needs.build.result == 'success' &&
+      needs.test.result == 'success' &&
+      (needs.e2e.result == 'success' || needs.prepare.outputs.e2e != 'blocking')
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 5
+    environment: manual-release-approval
+    permissions: {}
+    steps:
+      # GitHub creates a missing environment without reviewers, which would approve everything.
+      - name: Check that the approval environment has reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewers="$(gh api "repos/${GITHUB_REPOSITORY}/environments/manual-release-approval" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers | length] | add // 0')"
+          [ "${reviewers}" -gt 0 ] || { echo "::error::the manual-release-approval environment has no required reviewers"; exit 1; }
+
+  trigger-gitlab:
+    name: Trigger GitLab pipeline
+    needs: [prepare, slack-start, build, test, approve]
+    if: >-
+      !cancelled() &&
+      needs.prepare.outputs.stage == 'true' &&
+      needs.build.result == 'success' &&
+      needs.test.result == 'success' &&
+      ((github.event_name == 'schedule' && github.run_attempt == '1') || needs.approve.result == 'success')
+    runs-on:
+      group: gitlab_ci_runners
+    timeout-minutes: 10
+    environment: automated-release
+    permissions: {}
+    env:
+      MODE: ${{ needs.prepare.outputs.mode }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
+      RC: ${{ inputs.rc }}
+      WHEEL: ${{ needs.prepare.outputs.wheel }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+      SLACK_THREAD_TS: ${{ needs.slack-start.outputs.thread_ts }}
+      # TEMP: always a dry run during PR verification; restore the expression before merge.
+      DRY_RUN: "true"
+    steps:
+      - *ops-token
+      - *ops-check
+      - name: Trigger the release pipeline
+        env:
+          GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
+          GITLAB_PIPELINE_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          for name in GITLAB_TRIGGER_TOKEN GITLAB_PIPELINE_URL SLACK_CHANNEL_ID ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || fail "${name} is not set in the automated-release environment"
+          done
+          host="${GITLAB_PIPELINE_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          release_type=nightly release_version="" rc_number=""
+          if [ "${MODE}" = "release" ]; then
+            release_type=ondemand release_version="${VERSION}" rc_number="${RC}"
+          fi
+          token="$(mktemp -p "${RUNNER_TEMP}")"
+          response="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${token}" "${response}"' EXIT
+          printf '%s' "${GITLAB_TRIGGER_TOKEN}" > "${token}"
+          # Unsent variables reach the release pipeline as a literal "$NAME", so every one it reads is sent.
+          variables=(
+            PROJECT=kvcr
+            PIPELINE_TYPE=security
+            "RELEASE_TYPE=${release_type}"
+            RC_TAG=
+            "NIGHTLY_TAG=${NIGHTLY_TAG}"
+            "RELEASE_VERSION=${release_version}"
+            "RC_NUMBER=${rc_number}"
+            "WHEEL_VERSION=${VERSION}"
+            "STAGED_WHEELS=${WHEEL}"
+            "WHEEL_SHA256=${WHEEL_SHA256}"
+            "GITHUB_RUN_ID=${GITHUB_RUN_ID}"
+            "COMMIT_SHA=${GITHUB_SHA}"
+            ARTIFACTS=wheel
+            "DRY_RUN=${DRY_RUN}"
+            "ARTIFACTORY_PYPI_REPO_NAME=${ARTIFACTORY_PYPI_REPO_NAME}"
+            "SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}"
+            "SLACK_THREAD_TS=${SLACK_THREAD_TS}"
+          )
+          form=()
+          for kv in "${variables[@]}"; do
+            form+=(--form-string "variables[${kv%%=*}]=${kv#*=}")
+          done
+          curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=pvijayakrish/onboard-kvcr \
+            "${form[@]}" "${GITLAB_PIPELINE_URL}"
+          # Only the id is printed; the response's URLs name an internal host.
+          pipeline_id="$(jq -e '.id | numbers' "${response}")" || fail "the release pipeline was not created"
+          echo "Release pipeline ${pipeline_id} triggered for ${VERSION} (${release_type}, DRY_RUN=${DRY_RUN})"
+
+  notify-failure:
+    name: Slack failure alert
+    needs: [prepare, authorize, slack-start, build, test, e2e, e2e-nightly, approve, trigger-gitlab]
+    # Quiet when the run was cancelled; timed-out jobs end as cancelled, and a planned GitLab trigger that never ran alerts.
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (inputs.mode != 'nightly' || github.event_name == 'schedule' || needs.prepare.outputs.stage == 'true') &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
+       (needs.prepare.outputs.stage == 'true' && needs.trigger-gitlab.result != 'success'))
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 5
+    environment: automated-release
+    permissions: {}
+    steps:
+      - name: Post the failure to Slack
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL }}
+          MENTION_IDS: ${{ secrets.SLACK_NOTIFY_MENTIONS }}
+          LABEL: ${{ needs.prepare.outputs.label || inputs.mode || 'release' }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          [ -n "${WEBHOOK_URL}" ] || { echo "::warning::secret SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL is not set; no Slack alert sent"; exit 0; }
+          failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<< "${NEEDS}")"
+          [ -n "${failed}" ] || failed="trigger-gitlab did not run"
+          mentions=""
+          IFS=',' read -ra ids <<< "${MENTION_IDS}"
+          for id in "${ids[@]}"; do
+            id="${id//[[:space:]]/}"
+            case "${id}" in
+              "") ;;
+              U*|W*) mentions+=" <@${id}>" ;;
+              S*) mentions+=" <!subteam^${id}>" ;;
+              *) mentions+=" ${id}" ;;
+            esac
+          done
+          config="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${config}"' EXIT
+          printf 'url = "%s"\n' "${WEBHOOK_URL}" > "${config}"
+          jq -n --arg text ":alert: *KVCR ${LABEL} failed* (${failed})${mentions} <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|GitHub run>" \
+            '{text: $text}' \
+            | curl -q -fsS --retry 3 --max-time 30 -o /dev/null -H 'Content-Type: application/json' --data @- --config "${config}"

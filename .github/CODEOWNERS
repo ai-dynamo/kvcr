@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Any workflow can bind the release environments, and pyproject.toml drives the staged build, so release ops own both, as in Dynamo.
+/.github/ @ai-dynamo/dynamo-ops-codeowners
+/pyproject.toml @ai-dynamo/dynamo-ops-codeowners
