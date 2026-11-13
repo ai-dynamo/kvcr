@@ -149,6 +149,7 @@ class _TargetPullOp(_RemoteOp):
     source_incarnation: str | None = None
     uncertain: bool = False
     retried: bool = False
+    liveness_deadline: float | None = None
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
@@ -158,6 +159,40 @@ class _TargetPullOp(_RemoteOp):
         if completed and self.trace is not None:
             self.trace.end("target.remote")
         return completed, did_work
+
+    def _await_source(
+        self, progress: _KVCRProgress, now: float, scope: str, timeout_ms: int
+    ) -> tuple[bool, bool]:
+        # A start_write to a source that is gone leaves its destinations
+        # uncertain until abandonment; before one is sent, failing exposes nothing.
+        backend = self._backend
+        endpoint = self.remote_ctrl_ep
+        if self.liveness_deadline is None:
+            self.liveness_deadline = now + timeout_ms / 1000
+            # The source acks only a target_metadata that carries metadata.
+            backend._metadata_acked_sources.discard(endpoint)
+        if now < self.liveness_deadline:
+            if now < backend._metadata_retry_after.get(endpoint, 0):
+                return False, False
+            if backend._send_control(progress, endpoint, _TargetMetadata()):
+                return False, True
+        logger.warning(
+            "KVCR source %s did not answer within %d ms; op=%d fails before "
+            "exposing its destinations",
+            endpoint,
+            timeout_ms,
+            self.op_id[1],
+        )
+        if self.trace is not None:
+            self.trace.reject(
+                "target.start_write.rejected",
+                _nvtx.Reason.CONTROL_ERROR,
+                status=_nvtx.Status.TIMEOUT,
+            )
+        self.success = False
+        self.state = _TargetPullState.FINISHED
+        backend._record_progress_duration(scope, self.started_at, "source_unresponsive")
+        return True, True
 
     def _progress(
         self, progress: _KVCRProgress, event: object | None
@@ -202,6 +237,11 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return True, True
+            timeout_ms = backend._options.source_liveness_timeout_ms
+            if timeout_ms is not None and backend._source_quiet(
+                self.remote_ctrl_ep, now
+            ):
+                return self._await_source(progress, now, scope, timeout_ms)
             sent = backend._send_control(
                 progress,
                 self.remote_ctrl_ep,

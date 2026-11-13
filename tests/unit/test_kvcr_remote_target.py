@@ -1183,6 +1183,73 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     ] == [handle, handle]
 
 
+@pytest.mark.parametrize("answers", [False, True])
+@pytest.mark.parametrize("acked_long_ago", [False, True])
+def test_quiet_source_must_answer_before_start_write(answers, acked_long_ago, caplog):
+    """A dead source costs a bounded miss, not uncertain destinations."""
+    caplog.set_level(logging.WARNING, logger="kvcr.runtime.core")
+    errors = []
+    now = [0.0]
+    agent, control = FakeNixlAgent(metadata=b"target-md"), FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", 16)],
+            operation_timeout_ms=1000,
+            abandon_timeout_ms=7000,
+        ),
+        remote_options=RemoteFWDramOptions(source_liveness_timeout_ms=200),
+        on_resilience_event=errors.append,
+    )
+    kvcr._core._clock = lambda: now[0]
+    source, key = "tcp://source:1", BlockKey(b"k1")
+    if acked_long_ago:
+        # A source that just answered gets its start_write without a round trip.
+        primed, wire = _acked_deliver(control, kvcr, source, BlockKey(b"k0"))
+        agent.notifs["source"] = [_write_done_notification(wire)]
+        assert _poll_until(kvcr, bool) == [
+            (primed, _op_entries({BlockKey(b"k0"): True}))
+        ]
+        now[0] = 1.0
+    control.sent.clear()
+
+    def sent_types():
+        return [_decode_control_message(raw)["type"] for _, raw in control.sent]
+
+    kvcr.submit_hint(_router_hint(source), request_id="load")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+    _wait_until(lambda: bool(control.sent))
+    time.sleep(0.01)
+    assert sent_types() == ["target_metadata"]
+    assert _decode_control_message(control.sent[0][1])["target_agent_metadata"] == (
+        b"target-md"
+    )
+
+    if answers:
+        ack = {
+            "type": "target_metadata_ack",
+            "sender_control_endpoint": source,
+            "sender_incarnation": "restarted" if acked_long_ago else "source",
+        }
+        control.incoming.append(msgspec.msgpack.encode(ack))
+        _wait_until(lambda: sent_types()[-1:] == ["start_write"])
+        start_write = _decode_control_message(control.sent[-1][1])
+        assert start_write["source_incarnation"] == ack["sender_incarnation"]
+        agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
+    else:
+        now[0] += 0.2
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+        assert sent_types() == ["target_metadata"]
+        assert kvcr._core._remote_fw_dram._request_hints["load"].failed
+        assert "did not answer within 200 ms" in caplog.text
+    assert errors == []
+    assert not _has_outstanding_operations(kvcr)
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
