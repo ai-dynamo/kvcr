@@ -1627,7 +1627,10 @@ def test_pending_pin_waiters_share_partial_results_and_request_uncovered_keys(
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
 
 
-def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
+@pytest.mark.parametrize("evict_on_finish", [False, True])
+def test_source_telemetry_precedes_release_and_is_not_duplicated(
+    evict_on_finish,
+) -> None:
     """Telemetry is captured once before a transfer handle is released."""
 
     class LifecycleAgent(FakeNixlAgent):
@@ -1651,7 +1654,9 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
     agent.state = "DONE"
     pinning = FakePrimaryPinning()
     control = FakeBytesControl()
-    control.incoming.append(_start_write_message(15, BlockKey(b"k0")))
+    request = _decode_control_message(_start_write_message(15, BlockKey(b"k0")))
+    request["move"] = evict_on_finish
+    control.incoming.append(msgspec.msgpack.encode(request))
     source = _new_kvcr(
         agent,
         pinning,
@@ -1665,6 +1670,7 @@ def test_source_telemetry_precedes_release_and_is_not_duplicated() -> None:
     )
 
     assert _poll_until(source, lambda _: pinning.unpins == ["pin"]) == []
+    assert not _has_outstanding_operations(source)  # Framework-only writes need no ACK.
     assert agent.lifecycle == [
         ("telemetry", 1),
         ("release", 1),

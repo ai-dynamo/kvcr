@@ -76,6 +76,7 @@ class _RequestHint:
     source: str | None
     block_hashes: frozenset[int]
     submitted_at: float | None
+    evict_on_finish: bool = False
     failed: bool = False
     missing_keys: frozenset[BlockKey] = frozenset()
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
@@ -167,6 +168,8 @@ class _RemoteFWDram:
         src: str | None,
         block_hashes: frozenset[int],
         request_id: str | None,
+        *,
+        evict_on_finish: bool = False,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -180,6 +183,13 @@ class _RemoteFWDram:
                         reason=_nvtx.Reason.HINT_CONFLICT,
                     )
                 return
+            if previous is not None and previous.evict_on_finish != evict_on_finish:
+                logger.debug(
+                    "KV hint eviction change ignored by existing operations; "
+                    "request_id=%s evict_on_finish=%s; applies to new operations",
+                    request_id,
+                    evict_on_finish,
+                )
             trace = None
             if self._nvtx is not None:
                 trace = self._nvtx.lifecycle(
@@ -192,6 +202,7 @@ class _RemoteFWDram:
             self._request_hints[request_id] = _RequestHint(
                 source=src,
                 block_hashes=block_hashes,
+                evict_on_finish=evict_on_finish,
                 submitted_at=(
                     previous.submitted_at
                     if previous is not None and previous.submitted_at is not None
@@ -214,12 +225,20 @@ class _RemoteFWDram:
             or adapter is None
         ):
             return False
+        # Evict-on-fetch is limited to advertised keys.
         if (
-            not self._options.opportunistic_query
-            and adapter.encode_to_router(key) not in request_hint.block_hashes
-        ):
+            request_hint.evict_on_finish or not self._options.opportunistic_query
+        ) and adapter.encode_to_router(key) not in request_hint.block_hashes:
             return False
         return True
+
+    def evicts_on_finish(
+        self, request_id: str | None, named: "_NamedSource | None"
+    ) -> bool:
+        if named is not None:
+            return named.move_keys is not None
+        hint = self._request_hints.get(request_id)
+        return hint is not None and hint.evict_on_finish and not hint.failed
 
     def _start_target_pull(
         self,
@@ -229,6 +248,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
+        evict_on_finish: bool,
         named_source: "_NamedSource | None" = None,
     ) -> bool:
         kvcr = self._kvcr
@@ -253,6 +273,11 @@ class _RemoteFWDram:
                 if current_hint.missing_keys
                 else tuple(blocks)
             )
+            if evict_on_finish:
+                keys = tuple(key for key in keys if self.query(key, request_id))
+                if not keys:
+                    kvcr._record_duration(scope, started_at, "failed")
+                    return False
             if current_hint.submitted_at is not None:
                 self._request_hints[request_id] = replace(
                     current_hint, submitted_at=None
@@ -275,7 +300,7 @@ class _RemoteFWDram:
             dst_descriptors=tuple(tuple(blocks[key]) for key in keys),
             # Explicit operations have no request advice to update on completion.
             request_id=request_id if current_hint is not None else None,
-            move=named_source is not None and named_source.move_keys is not None,
+            move=evict_on_finish,
             g2_only=named_source is not None,
             key_layout=(
                 kvcr._block_record_map[keys[0]].local_dram.key_layout
@@ -338,12 +363,14 @@ class _RemoteFWDram:
         if not blocks:
             kvcr._complete(op_handle, {})
             return
+        evict = self.evicts_on_finish(request_id, None)
         if self._start_target_pull(
             blocks,
             request_id,
             deadline,
             op_handle,
             local_fill=False,
+            evict_on_finish=evict,
         ):
             return
         trace = kvcr._nvtx_operations.get(op_handle)
@@ -361,6 +388,7 @@ class _RemoteFWDram:
         deadline: float,
         *,
         op_handle: OpHandle,
+        evict_on_finish: bool,
         named_source: "_NamedSource | None" = None,
     ) -> bool:
         return self._start_target_pull(
@@ -369,6 +397,7 @@ class _RemoteFWDram:
             deadline,
             op_handle,
             local_fill=True,
+            evict_on_finish=evict_on_finish,
             named_source=named_source,
         )
 
@@ -471,7 +500,8 @@ class _RemoteFWDram:
             ):
                 self._request_hints[op.request_id] = replace(
                     hint,
-                    missing_keys=(hint.missing_keys | op.keys) - completed_keys,
+                    missing_keys=hint.missing_keys.union(op.ordered_keys)
+                    - completed_keys,
                 )
             if op.local_fill:
                 if op.state is _TargetPullState.QUARANTINED:
@@ -806,6 +836,12 @@ class _RemoteFWDram:
     ) -> None:
         started_at = self._kvcr._timer()
         op_handle = payload.op_handle
+        if (
+            payload.move
+            and payload.sender_incarnation == self._dangling_ops.incarnation
+        ):
+            self._refuse_start_write(progress, payload, op_handle, "self_source")
+            return
         remaining_timeout_ms = payload.remaining_timeout_ms
         keys = payload.keys
         dst_descriptors = payload.dst_descriptors
@@ -915,11 +951,12 @@ class _RemoteFWDram:
             if self._nvtx is not None
             else None,
         )
-        if payload.move:
+        if payload.move and payload.g2_only:
             # A move closes owner-side admission for its keys, so the owner
             # thread admits it; the write itself still runs on progress.
             self._queue_source_pin(source_write, payload.key_layout, move=True)
             return
+        source_write.evictions = {} if payload.move else None
         prepared = self._try_local_source_write(
             progress, source_write, payload.key_layout
         )
@@ -946,6 +983,7 @@ class _RemoteFWDram:
                 route=op.route,
                 nvtx_state=op.nvtx_state,
                 move=move,
+                evict_on_finish=op.evictions is not None,
             )
         )
 
@@ -1035,6 +1073,12 @@ class _RemoteFWDram:
             return None
         if selected is False:
             return False
+        if source_write.evictions is not None:
+            for i, r, _ in selected:
+                if key_layout or len(dst_descriptors[i]) == len(r.key_layout):
+                    source_write.evictions.setdefault(r.key_layout, []).append(
+                        ordered_keys[i]
+                    )
         completed_indices = tuple(index for index, _, _ in selected)
         if len(selected) != len(ordered_keys):
             ordered_keys = tuple(ordered_keys[i] for i in completed_indices)

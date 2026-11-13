@@ -32,6 +32,10 @@ class _KVFetchHint(_Hint):
     block_hashes: frozenset[int]
 
 
+class _KVEvictOnFetchHint(_KVFetchHint):
+    ACTION_TYPE: ClassVar[str] = "kv.evict_on_fetch"
+
+
 class _KVPrefetchHint(_Hint):
     """A parsed ``kv.prefetch`` hint, received by the source."""
 

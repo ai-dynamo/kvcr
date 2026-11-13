@@ -509,7 +509,8 @@ class _KVCRCore:
     ) -> list[tuple[QueryStatus, CacheTier | None]]:
         """Return the best available local or remote path for each key.
 
-        Exact hint membership is used unless opportunistic querying is enabled.
+        Remote availability follows the hint's membership rules; ``kv.fetch``
+        may also use opportunistic querying when enabled.
         Usable remote selections persist until successful fetch or discard_hint.
         """
         statuses = []
@@ -831,6 +832,7 @@ class _KVCRCore:
                     key, request_id
                 ):
                     sources[key] = CacheTier.REMOTE_G2
+            evict = self._remote_fw_dram.evicts_on_finish(request_id, named_source)
             deadline = self._operation_deadline()
             destinations = local_dram.fetch(
                 op_handle,
@@ -840,6 +842,7 @@ class _KVCRCore:
                 deadline,
                 hints=hints,
                 layout=requested,
+                evict_on_finish=evict,
                 key_layout=declaration,
                 named_source=named_source,
             )
@@ -853,6 +856,7 @@ class _KVCRCore:
                     },
                     request_id,
                     deadline,
+                    evict_on_finish=evict,
                     named_source=named_source,
                 )
         return op_handle
@@ -1168,6 +1172,7 @@ class _KVCRCore:
         request_id: str | None,
         deadline: float,
         *,
+        evict_on_finish: bool,
         named_source: _NamedSource | None = None,
     ) -> None:
         if not blocks:
@@ -1187,6 +1192,7 @@ class _KVCRCore:
                 request_id,
                 deadline,
                 op_handle=fill_handle,
+                evict_on_finish=evict_on_finish,
                 named_source=named_source,
             )
         else:

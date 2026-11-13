@@ -84,6 +84,7 @@ class _NamedSource:
 class _PendingResidencyOp(_Op):
     deadline: float
     claim_on_ready: bool
+    evict_on_finish: bool = False
     request_id: str | None = None
     results: dict[BlockKey, OpEntryResult] = field(default_factory=dict)
     remote_fill_keys: set[BlockKey] = field(default_factory=set)
@@ -447,6 +448,7 @@ class _LocalDram:
         *,
         hints: object | None,
         layout: list[str],
+        evict_on_finish: bool,
         key_layout: tuple[str, ...] | None = None,
         named_source: "_NamedSource | None" = None,
     ) -> dict[BlockKey, list[_TransferRef]]:
@@ -459,6 +461,7 @@ class _LocalDram:
             keys=frozenset(ordered_keys),
             deadline=deadline,
             claim_on_ready=True,
+            evict_on_finish=evict_on_finish,
             request_id=request_id,
             requested_layout=layout,
             key_layout=key_layout,
@@ -532,13 +535,8 @@ class _LocalDram:
                 op.claimed_keys.add(key)
             if source is None or residency.remote_indices is not None:
                 return None
-            named = op.named_source
-            if (
-                named is not None
-                and named.move_keys is not None
-                and key in named.move_keys
-                and residency.pending_deposits
-            ):
+            evicting = source is CacheTier.REMOTE_G2 and op.evict_on_finish
+            if residency.pending_deposits and evicting:
                 # Source removal requires every piece outside this write to be ready.
                 return None
             # One remote fill owns these destinations until its native terminal.
@@ -867,6 +865,7 @@ class _LocalDram:
                 {key: refs},
                 residency_op.request_id,
                 residency_op.deadline,
+                evict_on_finish=residency_op.evict_on_finish,
                 named_source=residency_op.named_source,
             )
         return key in residency_op.results
