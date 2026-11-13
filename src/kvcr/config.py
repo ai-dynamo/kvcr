@@ -48,6 +48,9 @@ class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
+    # A source silent for this long must answer before a start_write exposes
+    # destinations; otherwise the operation fails unexposed. None never asks.
+    source_liveness_timeout_ms: int | None = None
 
 
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):

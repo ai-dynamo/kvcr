@@ -139,6 +139,8 @@ Until safety is established, KVCR prevents affected allocations in its own pool 
 
 A transport error, a missed heartbeat, or a replacement peer at the same address does not prove that access has stopped. Confirmed death of the original source, for example through its KVCR Guard, permits reclamation only when the transport guarantees that its accesses have ended.
 
+A source learns destinations only from a start_write, so a target can avoid this wait for a source that is already gone. With `RemoteFWDramOptions.source_liveness_timeout_ms` set, a target that has not heard from a source within that window first asks it to acknowledge, and sends the start_write only after it does. An operation whose source does not answer in time fails before anything is exposed, as an ordinary miss. A source that fails after answering still leaves its operations uncertain.
+
 Some underlying failures may require restarting the affected process. KVCR makes a best effort to complete cleanup without a restart, but unresolved memory may remain unavailable indefinitely. After progress resumes, expired operations fail while fresh requests remain eligible. If a Guard takes over, it serves new requests and fails old operations without replaying them.
 
 ---
