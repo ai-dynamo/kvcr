@@ -70,9 +70,9 @@ def _fetch_kvcr(monkeypatch):
     return kvcr, _record_hint_results(monkeypatch, kvcr)
 
 
-def _fetch(action_id: str, source: str, hashes) -> _HintAction:
+def _fetch(action_id: str, source: str, hashes, action_type="kv.fetch") -> _HintAction:
     return _HintAction(
-        action_id, "kv.fetch", "1.0",
+        action_id, action_type, "1.0",
         {"source_control_endpoint": source, "block_hashes": list(hashes)},
     )  # fmt: skip
 
@@ -207,13 +207,75 @@ def _idle(pair):
     assert not pair.target.results
 
 
+@pytest.mark.parametrize("operation", ["fetch", "deliver"])
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
+    pair, operation, succeeds
+):
+    source, target = pair.source, pair.target
+    source.deposit(_TAIL_KEY, 1)
+    target.kvcr._core._key_adapter = SimpleNamespace(
+        encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
+    )
+    remote = target.kvcr._core._remote_fw_dram
+    remote._options = msgspec.structs.replace(remote._options, opportunistic_query=True)
+    hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
+    target.kvcr.submit_hint(_envelope(hint), "req")
+    blocks = {_KEY: [target.ref()], _TAIL_KEY: [target.ref(1)]}
+    writes = len(source.agent.xfers)
+    handle = getattr(target.kvcr, operation)(blocks, "req")
+    pair.until(lambda: len(source.agent.xfers) > writes)
+    target.kvcr._core._clock = lambda: 0.9
+    source.agent.state = "DONE" if succeeds else "ERR"
+    if not succeeds:
+        pair.until(lambda: bool(source.agent.sent_notifs))
+        source.agent.state = "DONE"  # Native cleanup settles after reporting failure.
+    pair.until(lambda: handle in target.results and pair.idle())
+    results = target.results.pop(handle)
+    assert results[_KEY].success is succeeds and not results[_TAIL_KEY].success
+    kept = (QueryStatus.HIT, CacheTier.LOCAL_G2)
+    assert source.kvcr.query(blocks) == [_MISS if succeeds else kept, kept]
+    claim = results[_KEY].release_handle
+    if claim is not None:
+        assert target.kvcr.release([claim]) == [(claim, True)]
+    _idle(pair)
+
+
+@pytest.mark.parametrize(
+    "source_pieces,pieces", [(2, (0,)), (1, (0,)), (2, (0, 1)), (2, (1, 0))]
+)
+def test_evict_on_fetch_delivery_removes_only_complete_keys(source_pieces, pieces):
+    pair = _Pair()
+    source, target = pair.source, pair.target
+    source.agent.state = "DONE"
+    layout = ["", ":tail"]
+    refs = [source.ref(), source.ref(1, ":tail")][:source_pieces]
+    stored = source.kvcr.deposit({_KEY: refs}, expected_layout=layout)
+    assert dict(_poll_until(source.kvcr, bool))[stored][_KEY].success
+    target.kvcr._core._key_adapter = SimpleNamespace(encode_to_router=lambda key: 123)
+    hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
+    target.kvcr.submit_hint(_envelope(hint), "req")
+    destinations = [target.ref(i, layout[piece]) for i, piece in enumerate(pieces)]
+    handle = target.kvcr.deliver({_KEY: destinations}, "req")
+    pair.until(lambda: handle in target.results and pair.idle())
+    assert target.results.pop(handle)[_KEY].success
+    pair.until(lambda: (source.kvcr.query([_KEY]) == [_MISS]) is (len(pieces) == 2))
+    _idle(pair)
+
+
+@pytest.mark.parametrize("move", [False, True], ids=["evict_on_fetch", "move"])
 @pytest.mark.parametrize("ack", ["lost", "delayed_owner", "partial"])
-def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, ack):
+def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, move, ack):
     source, target = pair.source, pair.target
     source.deposit(_TAIL_KEY, 1)
     keys = (_KEY, _TAIL_KEY)
     core = target.kvcr._core
     endpoint = source.control.endpoint
+    core._key_adapter = SimpleNamespace(
+        encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
+    )
+    hint = _fetch("action", endpoint, (123, 124), "kv.evict_on_fetch")
+    target.kvcr.submit_hint(_envelope(hint), "req")
     held, send = [], target.control.send
 
     def hold_ack(endpoint, raw):
@@ -236,7 +298,9 @@ def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, ack
 
     monkeypatch.setattr(target.control, "send", hold_ack)
     monkeypatch.setattr(core._remote_fw_dram, "_finish_target_pull", finish_at_owner)
-    handle = core.fetch(keys, source_endpoint=endpoint, move=True)
+    handle = core.fetch(
+        keys, "req", source_endpoint=endpoint if move else None, move=move
+    )
     source.agent.state = "DONE"
     pair.until(lambda: handle in target.results and held)
     results = target.results.pop(handle)

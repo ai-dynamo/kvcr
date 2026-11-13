@@ -61,6 +61,8 @@ class _HintEnvelope(msgspec.Struct, frozen=True):
 def _router_hint(
     source: str | None,
     block_hashes: Collection[int] = (123,),
+    *,
+    action_type: str = "kv.fetch",
 ) -> _HintEnvelope:
     payload: dict[str, object] = {
         "block_hashes": list(block_hashes),
@@ -68,7 +70,7 @@ def _router_hint(
     if source is not None:
         payload["source_control_endpoint"] = source
     return _HintEnvelope(
-        "0.1", "test-message", [_HintAction("a1", "kv.fetch", "1.0", payload)]
+        "0.1", "test-message", [_HintAction("a1", action_type, "1.0", payload)]
     )
 
 

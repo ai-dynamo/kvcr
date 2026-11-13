@@ -419,6 +419,8 @@ class _SourceWriteOp(_RemoteOp):
     nvtx_state: _NvtxState | None = None
     # Pending move keys; unacknowledged keys are reopened at completion.
     moving: tuple[BlockKey, ...] = ()
+    # None means copy; else the keys to evict by layout, set at source preparation.
+    evictions: dict[tuple[str, ...], list[BlockKey]] | None = None
     # None uses caller cleanup; a tuple (even empty) is owned by progress.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
 
@@ -442,6 +444,12 @@ class _SourceWriteOp(_RemoteOp):
             elif accepted is None:
                 return False, False
             self.moving = tuple(key for key in self.moving if key not in accepted)
+            if self.evictions:
+                backend._progress_outbound.extend(
+                    _Invalidate(keys=retained, key_layout=layout)
+                    for layout, keys in self.evictions.items()
+                    if (retained := tuple(key for key in keys if key in accepted))
+                )
             self.state = _SourceWriteState.FINISHED
             backend._dangling_ops.finish_source(self)
             return True, True
@@ -514,7 +522,9 @@ class _SourceWriteOp(_RemoteOp):
                         True,
                         completed_indices=self.completed_indices,
                         source_incarnation=(
-                            backend._dangling_ops.incarnation if self.moving else None
+                            backend._dangling_ops.incarnation
+                            if self.moving or self.evictions
+                            else None
                         ),
                     ),
                     capture_telemetry=backend._telemetry_enabled,
@@ -607,7 +617,7 @@ class _SourceWriteOp(_RemoteOp):
                 else 0,
                 result,
             )
-        waiting_ack = self.success and bool(self.moving)
+        waiting_ack = self.success and bool(self.moving or self.evictions)
         self.state = (
             _SourceWriteState.WAITING_ACK if waiting_ack else _SourceWriteState.FINISHED
         )
