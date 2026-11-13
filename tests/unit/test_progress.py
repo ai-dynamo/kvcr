@@ -3,11 +3,13 @@
 
 import logging
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import zmq
 from nixl import nixlRemoteDisconnectError
 
 from kvcr.runtime import progress as progress_module
@@ -874,3 +876,63 @@ def test_loop_failure_is_reported_to_main() -> None:
     with pytest.raises(RuntimeError, match="loop failed") as exc_info:
         progress.close()
     assert exc_info.value is expected
+
+
+def test_idle_loop_wakes_promptly_on_submit(monkeypatch) -> None:
+    # After backing off, an idle loop still picks up a submission at once rather than
+    # when its current wait ends.
+    monkeypatch.setattr(progress_module, "_IDLE_WAIT_MAX_SECONDS", 10.0)
+    received = threading.Event()
+
+    def poll(_progress, items):
+        if items:
+            received.set()
+        return {}, False
+
+    progress = _KVCRProgress(lambda _: None, poll, list, lambda: None)
+    progress.start()
+    try:
+        # Long enough for the idle wait to back off past one second.
+        time.sleep(1.1)
+        submitted = time.monotonic()
+        progress.submit("item")
+        assert received.wait(5)
+        assert time.monotonic() - submitted < 0.5
+    finally:
+        progress.close()
+
+
+def test_idle_loop_wakes_promptly_on_idle_socket(monkeypatch) -> None:
+    # Peer control traffic arrives on a socket only the progress thread reads; it must end
+    # an idle wait as promptly as a local submission.
+    monkeypatch.setattr(progress_module, "_IDLE_WAIT_MAX_SECONDS", 10.0)
+    context = zmq.Context.instance()
+    pull = context.socket(zmq.PULL)
+    pull.linger = 0
+    port = pull.bind_to_random_port("tcp://127.0.0.1")
+    push = context.socket(zmq.PUSH)
+    push.linger = 0
+    push.connect(f"tcp://127.0.0.1:{port}")
+    received = threading.Event()
+
+    def poll(_progress, items):
+        if pull.poll(0):
+            pull.recv()
+            received.set()
+            return {}, True
+        return {}, False
+
+    progress = _KVCRProgress(
+        lambda _: None, poll, list, lambda: None, idle_sockets=lambda: [pull]
+    )
+    progress.start()
+    try:
+        time.sleep(1.1)
+        sent = time.monotonic()
+        push.send(b"peer")
+        assert received.wait(5)
+        assert time.monotonic() - sent < 0.5
+    finally:
+        progress.close()
+        push.close()
+        pull.close()

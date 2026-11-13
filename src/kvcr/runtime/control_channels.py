@@ -293,6 +293,13 @@ class ZmqPeerControlChannel:
             return False
         return True
 
+    def readable_socket(self) -> zmq.Socket | None:
+        """The receive socket, so the progress thread can wake on peer traffic.
+
+        Like ``recv``, it may only be used from the progress thread.
+        """
+        return self._socket
+
     def recv(self) -> list[tuple[bytes, float]]:
         socket = self._socket
         if socket is None:
