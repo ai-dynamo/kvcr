@@ -258,6 +258,7 @@ class _LocalDram:
         self._backend = region.backend
         self._pending_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         self._pending_deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
+        self._next_expiry = float("inf")
         self._capacity_waiters: deque[_CapacityWaiter] = deque()
         self._resuming_capacity_waiters = False
         self._abandon_grace = (
@@ -289,6 +290,7 @@ class _LocalDram:
             key_layout=key_layout,
         )
         self._pending_residency_ops[op.op_id] = op
+        self._next_expiry = min(self._next_expiry, deadline)
         self._admit(op)
         self._start_deposits(op, blocks)
 
@@ -502,6 +504,7 @@ class _LocalDram:
             named_source=named_source,
         )
         self._pending_residency_ops[op.op_id] = op
+        self._next_expiry = min(self._next_expiry, deadline)
         self._admit(op)
         destinations = {}
         for key in ordered_keys:
@@ -630,6 +633,7 @@ class _LocalDram:
             destinations=blocks,
         )
         self._pending_deliver_ops[op.op_id] = op
+        self._next_expiry = min(self._next_expiry, deadline)
         self._kvcr._add_block_dependencies(op, new_operation=True)
         self._start_deliveries(op, blocks)
 
@@ -661,7 +665,7 @@ class _LocalDram:
                 and not residency.pending_deposits
             ):
                 with state.lock:
-                    if self._kvcr.framework_control is not None:
+                    if key in state.index:
                         state.index[key] = None
                     residency.state = _LocalDramState.DISCARDING
             if residency.remote_indices is not None:
@@ -724,6 +728,8 @@ class _LocalDram:
                     op.results[key] = _FAILED_RESULT
                 if copy.uncertain:
                     op.active_keys.difference_update(copy.ordered_keys)
+                # A parked waiter can have an earlier deadline than its producer.
+                self._next_expiry = float("-inf")
                 self._finish_residency_if_ready(op)
             else:
                 op = self._pending_deliver_ops[copy.deliver_op_id]
@@ -923,6 +929,11 @@ class _LocalDram:
         key: BlockKey,
         residency_op: _PendingResidencyOp,
     ) -> bool:
+        # Caller-side release/fill can wake an independent hint.
+        if self._kvcr._independent_hint_handler.defer(key, residency_op):
+            return False
+        # A producer may have deferred expiry without satisfying every piece.
+        self._next_expiry = min(self._next_expiry, residency_op.deadline)
         refs = self._prepare_fetch(residency_op, key)
         if refs:
             self._kvcr._start_local_fill(
@@ -1081,12 +1092,17 @@ class _LocalDram:
         self._kvcr._complete(cast(OpHandle, op.op_id[1]), op.results)
 
     def _expire_pending_ops(self, now: float) -> None:
+        if now < self._next_expiry:
+            return
+        # Expired active transfers finish through native completion, not rescans.
+        self._next_expiry = float("inf")
         pending = list(self._pending_residency_ops.values())
         deposit_keys = None
         expired = []
         # Main expires work waiting to start; progress handles active transfer timeouts.
         for residency_op in pending:
             if now < residency_op.deadline:
+                self._next_expiry = min(self._next_expiry, residency_op.deadline)
                 continue
             expired.append(residency_op)
             if residency_op.op_id[0] == "deposit":
@@ -1127,6 +1143,7 @@ class _LocalDram:
 
         for deliver_op in list(self._pending_deliver_ops.values()):
             if now < deliver_op.deadline:
+                self._next_expiry = min(self._next_expiry, deliver_op.deadline)
                 continue
             waiting_keys = (
                 deliver_op.keys - deliver_op.results.keys() - deliver_op.active_keys
@@ -1177,6 +1194,11 @@ class _LocalDram:
                     self._capacity_waiters.rotate(-1)
                     continue
 
+                if op.sources is None and self._kvcr._independent_hint_handler.defer(
+                    waiter.key, op
+                ):
+                    # Progress resumes independent waiters; keep later ones behind.
+                    break
                 self._capacity_waiters.popleft()
                 op.capacity_waiters.remove(waiter.key)
                 if op.sources is not None:

@@ -8,6 +8,7 @@ import logging
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, Mock
 
@@ -443,7 +444,7 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
     if queued_success:
         local[16:] = primary[16:]
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
-        _wait_until(lambda: not target._core._progress._completed.empty())
+        _wait_until(lambda: bool(target._core._completion_queue))
     now = 1.5
     fetched = dict(_poll_until(target, bool))[fetch][key]
     assert fetched.success is queued_success
@@ -667,9 +668,9 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     now = deadline - 0.01
     assert list(target.poll_completed()) == []
     if resolution == "queued":
-        # Progress accepts success before expiry; main consumes it after expiry.
+        # Progress finalizes success before expiry; the caller collects it afterward.
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
-        _wait_until(lambda: not target._core._progress._completed.empty())
+        _wait_until(lambda: bool(target._core._completion_queue))
 
     now = deadline  # Expired, but still before abandonment.
     completed = dict(_poll_until(target, lambda completed: len(completed) == 2))
@@ -742,8 +743,17 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     assert local.raw == primary.raw
 
 
-def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted():
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("named_source", [False, True])
+def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted(
+    deferred, named_source
+):
     now, errors = 0.0, []
+
+    def notify(error):
+        assert target._core._block_record_map[key].local_dram is not None
+        errors.append(error)
+
     local = ctypes.create_string_buffer(16)
     agent, control = FakeNixlAgent(), FakeBytesControl()
     target = _new_kvcr(
@@ -757,7 +767,7 @@ def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted():
             abandon_timeout_ms=2000,
             enable_telemetry=True,
         ),
-        on_resilience_event=errors.append,
+        on_resilience_event=notify,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
@@ -765,29 +775,60 @@ def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted():
     target._core._clock = lambda: now
     key = BlockKey(b"k0")
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = target.fetch((key,), request_id="req")
+    fetch = (
+        target._core.fetch((key,), source_endpoint="tcp://source:1")
+        if named_source
+        else target.fetch((key,), request_id="req")
+    )
     _wait_until(lambda: bool(control.sent))
     handle = _decode_control_message(control.sent[0][1])["op_handle"]
     # A delivery of the same key waits for that fill.
-    delivery = target.deliver({key: [_mem_descriptor()]})
+    delivery = None if deferred else target.deliver({key: [_mem_descriptor()]})
 
-    # The source gives up before its transfer is known to be quiescent.
-    agent.notifs["source"] = [
-        _write_done_notif(handle, False, terminal=False, reason="cancelled")
-    ]
-    results = dict(_poll_until(target, bool))
-    assert results[fetch][key].status is OpEntryStatus.ABORTED
-    assert results[delivery][key] == results[fetch][key]
-    # The destination stays quarantined until the source proves quiescence.
-    now = 2.5
-    _poll_until(target, lambda _: bool(errors))
-    agent.notifs["source"] = [_write_done_notif(handle, False, reason="cancelled")]
-    _poll_until(target, lambda _: not _has_outstanding_operations(target))
-    assert [error.state for error in errors] == ["uncertain", "quiesced"]
-    # The block is counted once, when the pull is quarantined.
-    assert _unserved_counts(target.get_stats().records) == {
-        ("remote_fetch", "cancelled"): 1
-    }
+    core = target._core
+    terminal = _write_done_notif(handle, False, reason="cancelled")
+    with core._state_lock if deferred else nullcontext():
+        # The source gives up before its transfer is known to be quiescent.
+        agent.notifs["source"] = [
+            _write_done_notif(handle, False, terminal=False, reason="cancelled")
+        ]
+        if deferred:
+            _wait_until(lambda: core._independent_hint_handler._background_items)
+            now = 2.5
+            operation = core._progress._in_flight_ops[("target", handle)]
+            _wait_until(lambda: operation.uncertain)
+            delivery = target.deliver({key: [_mem_descriptor()]})
+            agent.notifs["source"] = [terminal]
+            _wait_until(lambda: not core._progress._in_flight_ops)
+            # A later control turn proves the uncertain final has been published.
+            control.incoming.append(msgspec.msgpack.encode({
+                "type": "target_metadata_ack", "sender_control_endpoint": "tcp://ack:1",
+            }))  # fmt: skip
+            _wait_until(
+                lambda: "tcp://ack:1" in core._remote_fw_dram._metadata_acked_sources
+            )
+        results = dict(_poll_until(target, bool))
+        assert results[fetch][key].status is OpEntryStatus.ABORTED
+        assert results[delivery][key] == results[fetch][key]
+        if not deferred:
+            # The destination stays quarantined until the source proves quiescence.
+            now = 2.5
+            _poll_until(target, lambda _: bool(errors))
+            agent.notifs["source"] = [terminal]
+        _poll_until(target, lambda _: not _has_outstanding_operations(target))
+        assert [error.state for error in errors] == ["uncertain", "quiesced"]
+        assert _unserved_counts(target.get_stats().records) == {
+            ("remote_fetch", "cancelled"): 1,
+        }
+        # Replace the same key before the old background snapshot can run.
+        target.submit_hint(_router_hint("tcp://source:1"), request_id="retry")
+        replacement = target.fetch((key,), request_id="retry")
+    _wait_until(lambda: bool(core._progress._in_flight_ops))
+    operation = next(iter(core._progress._in_flight_ops.values()))
+    agent.notifs["source"] = [_write_done_notification(operation.op_id[1])]
+    result = dict(_poll_until(target, bool))[replacement][key]
+    assert result.success
+    assert target.release([result.release_handle]) == [(result.release_handle, True)]
 
 
 @pytest.mark.parametrize("failure_first", [True, False])
@@ -2009,7 +2050,7 @@ def _unserved_counts(records) -> dict[tuple[str, ...], int]:
 
 
 class _Peer:
-    def __init__(self, name):
+    def __init__(self, name, *, key_adapter=None):
         self.name = name
         self.primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
         self.local = ctypes.create_string_buffer(32)
@@ -2021,6 +2062,7 @@ class _Peer:
             FakePrimaryPinning(),
             self.control,
             name=name,
+            key_adapter=key_adapter,
             framework_regions=[
                 _buffer_region(self.primary, 16),
                 _buffer_region(self.primary, 16, ":*"),
@@ -2045,16 +2087,18 @@ class _Peer:
 class _Pair:
     """Use real buffers; forward control and completed fake-native notifications."""
 
-    def __init__(self):
-        self.source, self.target = _Peer("source"), _Peer("target")
+    def __init__(self, *, key_adapter=None):
+        self.source = _Peer("source", key_adapter=key_adapter)
+        self.target = _Peer("target", key_adapter=key_adapter)
         self.offsets = [[0, 0], [0, 0]]
         self.delivered = set()
 
-    def pump(self):
+    def pump(self, *, poll=True):
         for index, (peer, other) in enumerate(
             ((self.source, self.target), (self.target, self.source))
         ):
-            peer.results.update(peer.kvcr.poll_completed())
+            if poll:
+                peer.results.update(peer.kvcr.poll_completed())
             sent, notified = self.offsets[index]
             # Only what is addressed to the other peer arrives there; a message
             # addressed elsewhere (a third endpoint, or the sender itself) is lost.
@@ -2077,9 +2121,9 @@ class _Pair:
                     if data[5] and peer.agent.state == "DONE":
                         other.agent.notifs.setdefault("peer", []).append(data[5])
 
-    def until(self, predicate):
+    def until(self, predicate, *, poll=True):
         def ready():
-            self.pump()
+            self.pump(poll=poll)
             return predicate()
 
         _wait_until(ready, timeout=3)
@@ -2088,6 +2132,9 @@ class _Pair:
         return not any(
             _has_outstanding_operations(peer.kvcr)
             or peer.kvcr._core._progress._in_flight_ops
+            or not peer.kvcr._core._hints_dispatcher._inbox.empty()
+            or peer.kvcr._core._hints_dispatcher._pending is not None
+            or peer.kvcr._core._independent_hint_handler._pending_operations
             for peer in (self.source, self.target)
         )
 
@@ -2158,12 +2205,12 @@ def test_move_rejects_invalid_source_before_admission(pair, endpoint):
     key = BlockKey(b"cached")
     target.deposit(key)
     core = target.kvcr._core
-    before = core._next_op_handle
+    before = next(core._op_handles)
     if endpoint == "self":
         endpoint = target.control.endpoint
     with pytest.raises(ValueError, match="move source"):
         core.fetch((key,), source_endpoint=endpoint, move=True)
-    assert core._next_op_handle == before and not target.control.sent
+    assert next(core._op_handles) == before + 1 and not target.control.sent
     assert target.kvcr.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert core._block_record_map[key].local_dram.claim_count == 0
 
@@ -2243,14 +2290,16 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     source = pair.source
     kvcr = source.kvcr
     key = BlockKey(b"reader")
-    source.deposit(key)
     other = BlockKey(b"other")
+    kvcr._core._key_adapter = SimpleNamespace(
+        encode_to_router={key: 123, other: 124}.__getitem__
+    )
+    source.deposit(key)
     source.deposit(other, 1)
     fetched = kvcr.fetch((key,))
     claim = dict(kvcr.poll_completed())[fetched][key].release_handle
-    kvcr._core._key_adapter = SimpleNamespace(decode_from_router={123: key}.__getitem__)
     kvcr.submit_hint(_router_hint(None, (123, 123), action_type="kv.invalidate"))
-    assert kvcr.query((key,)) == [(QueryStatus.MISS, None)]
+    _wait_until(lambda: kvcr.query((key,)) == [(QueryStatus.MISS, None)])
     handles = [
         kvcr.fetch((key,)),
         kvcr.deliver({key: [source.ref(1)]}),

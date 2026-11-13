@@ -3,6 +3,7 @@
 """Target events must retain asynchronous and caller completion boundaries."""
 
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import msgspec
@@ -128,7 +129,15 @@ def test_target_terminal_reason_preserves_cause(
 
 def test_shutdown_closes_unreturned_caller_range(recording):
     kvcr, _, _ = make_target()
-    handle = kvcr.deliver({})
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        with kvcr._core._state_lock:
+            pending = worker.submit(kvcr.deliver, {})
+            _wait_until(lambda: bool(spans(recording, "op.deliver", "push")))
+            assert len(spans(recording, "op.deliver.lifecycle")) == 1
+            assert not pending.done()
+            assert not payloads(recording, "op.dispatched")
+        handle = pending.result(timeout=1)
+    assert int(payloads(recording, "op.deliver")[0]["op_handle"]) == handle
     assert len(payloads(recording, "op.completion_queued")) == 1
     assert not payloads(recording, "op.completion_returned")
     kvcr.close()
@@ -140,6 +149,7 @@ def test_shutdown_closes_unreturned_caller_range(recording):
     assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not kvcr._core._nvtx_operations
     assert not recording.ranges
+    assert not recording.stack
 
 
 def test_rejected_progress_submission_closes_unaccepted_target_range(

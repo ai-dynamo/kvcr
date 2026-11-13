@@ -434,8 +434,12 @@ def test_local_reads_wait_for_later_piece_and_release_claims(monkeypatch, case):
     assert kvcr.query([key]) == [(QueryStatus.MISS, None)]
 
 
-def test_fetch_waiting_for_a_piece_follows_the_deposit_outcome() -> None:
-    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_fetch_waiting_for_a_piece_follows_the_deposit_outcome(monkeypatch, incomplete):
+    pools = [
+        ctypes.create_string_buffer(8),
+        ctypes.create_string_buffer(24 if incomplete else 16),
+    ]
     source = ctypes.create_string_buffer(b"_" * 8 + b"a" * 8 + b"b" * 8)
     agent = FakeNixlAgent()
     agent.state = "DONE"
@@ -443,10 +447,24 @@ def test_fetch_waiting_for_a_piece_follows_the_deposit_outcome() -> None:
     now = 0.0
     kvcr._core._clock = lambda: now
     key = BlockKey(b"partial")
-    layout = ["swa:a", "swa:b"]
+    layout = ["swa:a", "swa:b"] + (["swa:c"] if incomplete else [])
     first = kvcr.deposit({key: [_mem_descriptor(0, "swa:a")]}, expected_layout=layout)
     assert dict(_poll_until(kvcr, bool))[first][key].success
     fetches = [kvcr.fetch([key], expected_layout=layout) for _ in range(8)]
+    with monkeypatch.context() as patch:
+        patch.setattr(kvcr._core, "_operation_deadline", lambda: 0.25)
+        earlier = kvcr.fetch([key], expected_layout=layout)
+    now = 0.25
+    assert kvcr.poll_completed() == [
+        (earlier, _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")}))
+    ]
+    local = kvcr._core._local_dram
+    with kvcr._core._state_lock, monkeypatch.context() as patch:
+        for name in ("_pending_residency_ops", "_pending_deliver_ops"):
+            pending = Mock(wraps=getattr(local, name))
+            pending.values.side_effect = AssertionError("scanned before deadline")
+            patch.setattr(local, name, pending)
+        local._expire_pending_ops(0.5)
 
     now = 0.75
     agent.state = "PROC"
@@ -456,16 +474,66 @@ def test_fetch_waiting_for_a_piece_follows_the_deposit_outcome() -> None:
     now = 1.25
     assert kvcr.poll_completed() == []
     agent.state = "DONE"
-    _wait_until(lambda: not kvcr._core._progress._completed.empty())
-    now = 2.0
+    # Progress finalizes the copy; leave its public results queued for the late poll.
+    queued = 1 if incomplete else len(fetches) + 1
+    _wait_until(lambda: len(kvcr._core._completion_queue) >= queued)
+    if not incomplete:
+        now = 2.0
     completed = dict(_poll_until(kvcr, lambda done: len(done) == len(fetches) + 1))
     assert completed[deposit][key].success
     for fetch in fetches:
+        if incomplete:
+            assert completed[fetch] == _op_entries(
+                {key: (OpEntryStatus.TIMEOUT, "deadline")}
+            )
+            continue
         assert completed[fetch][key].success
         claim = completed[fetch][key].release_handle
         assert claim is not None
         assert kvcr.release([claim]) == [(claim, True)]
-    assert pools[1].raw == b"a" * 8 + b"b" * 8
+    assert kvcr._core._block_record_map[key].local_dram.claim_count == 0
+    assert pools[1].raw[:16] == b"a" * 8 + b"b" * 8
+
+
+def test_failed_deposit_copy_lets_waiting_fetches_time_out(monkeypatch) -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(b"_" * 8 + b"a" * 8 + b"b" * 8)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
+    core = kvcr._core
+    now = 0.0
+    core._clock = lambda: now
+    key = BlockKey(b"partial")
+    layout = ["swa:a", "swa:b"]
+    first = kvcr.deposit({key: [_mem_descriptor(0, "swa:a")]}, expected_layout=layout)
+    assert dict(_poll_until(kvcr, bool))[first][key].success
+    fetch = kvcr.fetch([key], expected_layout=layout)
+    now = 0.75
+    agent.state = "PROC"
+    transfer = agent.transfer
+
+    def ambiguous(handle):
+        transfer(handle)
+        raise RuntimeError("submission may have started")
+
+    monkeypatch.setattr(agent, "transfer", ambiguous)
+    try:
+        with core._state_lock:
+            deposit = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+            _wait_until(
+                lambda: any(
+                    op.failure_latched for op in core._progress._in_flight_ops.values()
+                )
+            )
+            now = 1.25  # Fetch expired at 1.0; its later producer expires at 1.75.
+            assert kvcr.poll_completed() == []
+        timeout = _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")})
+        assert _poll_until(kvcr, bool) == [(fetch, timeout)]
+        assert agent.released_xfers == [1]  # The failed copy still owns native memory.
+    finally:
+        agent.state = "DONE"
+    assert not dict(_poll_until(kvcr, bool))[deposit][key].success
 
 
 def test_local_dram_rejects_overlapping_pools() -> None:
@@ -1146,7 +1214,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
 
     now = 0.75
     agent.state = "DONE"
-    _wait_until(lambda: not kvcr._core._progress._completed.empty())
+    _wait_until(lambda: len(kvcr._core._completion_queue) == 2)
     now = 1.5
     completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
     deposit_result = completed[deposit][first_key]

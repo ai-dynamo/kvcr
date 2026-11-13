@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Caller-owned source acquisition and framework pin lifetime for remote writes."""
+"""Source acquisition under the core lock; framework pins remain caller-owned."""
 
 import logging
 from collections.abc import Collection, Iterator, Mapping
@@ -84,6 +84,7 @@ class _RemoteSources:
         # Pins retained while their source operations execute.
         self._fw_pins_by_op: dict[_OpId, set[PinHandle]] = {}
         self._releasing_framework_pins: set[PinHandle] = set()
+        self._uncertain_readers: dict[_OpId, _SourceWriteOp] = {}
 
     def retry_releases(self) -> None:
         self._release_framework_pins(tuple(self._releasing_framework_pins))
@@ -95,8 +96,10 @@ class _RemoteSources:
             _SourceWriteState.WAITING_ACK,
         ):
             if item.local_sources is not None:
-                # local.poll_main drains reader releases with their access
-                # accounting and reclamation.
+                if item.state is _SourceWriteState.FINISHED and item.uncertain:
+                    self._release_uncertain_readers(item.op_id)
+                # Locked cache maintenance drains reader releases with their
+                # access accounting and reclamation.
                 # TODO: Skip queued local handoffs if useful; keep TransferError events.
                 return
             # Framework ownership can be handed back after uncertainty;
@@ -119,6 +122,15 @@ class _RemoteSources:
                 f"in state {item.state.name}"
             )
 
+    def _release_uncertain_readers(self, op_id: _OpId) -> None:
+        # The caller has delivered this write's quiescence notification.
+        op = self._uncertain_readers.pop(op_id, None)
+        if op is not None:
+            pools = self._kvcr._local_dram._pools
+            pools.release_readers(op.source_keys, op.local_sources, success=op.success)
+            op.local_sources = ()
+            pools._drain_source_completions()
+
     def poll(self) -> None:
         self._process_pending_pin_results()
         now = self._kvcr._clock()
@@ -137,6 +149,9 @@ class _RemoteSources:
                 self._resume_source_pin(op_id, op)
 
     def close(self) -> None:
+        # Core shutdown has delivered all notifications before backend cleanup.
+        for op_id in tuple(self._uncertain_readers):
+            self._release_uncertain_readers(op_id)
         for op_id, op in list(self._source_pin_ops.items()):
             self._remove_source_pin(op_id, op)
 

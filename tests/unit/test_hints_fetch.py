@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock
 
 import msgspec
 import pytest
+import zmq
 from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
@@ -21,15 +22,22 @@ from _kvcr_test_utils import (
     _record_hint_results,
     _router_hint,
     _wait_until,
+    free_port,
 )
 from test_kvcr_remote_target import _Pair
 
-from kvcr.backends.remote_ops import _FetchGroup, _KeysToFetch, _TargetPullOp
+from kvcr import ZmqPeerControlChannel
+from kvcr.backends.remote_ops import (
+    _FetchGroup,
+    _KeysToFetch,
+    _TargetMetadataAck,
+    _TargetPullOp,
+)
 from kvcr.config import KVCRConfig, RemoteFWDramOptions
 from kvcr.hints.dispatcher import _LOGGED_HANDLER_ERRORS
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES
-from kvcr.hints.results import HintStatus
-from kvcr.types import BlockKey, CacheTier, OpEntryStatus, QueryStatus
+from kvcr.hints.results import HintResult, HintStatus
+from kvcr.types import BlockKey, CacheTier, InventoryEvent, OpEntryStatus, QueryStatus
 
 
 @pytest.fixture(autouse=True)
@@ -47,22 +55,22 @@ def _take(results) -> list[tuple[str | None, HintStatus, str | None]]:
     return taken
 
 
-class _PrefixAdapter:
+class _TestAdapter:
     def encode_to_router(self, key):
-        return int.from_bytes(key[:8], "big")
+        return {_KEY: 123, _TAIL_KEY: 124}.get(key, int.from_bytes(key[:8], "big"))
 
 
 def _key(block_hash: int) -> BlockKey:
     return BlockKey(block_hash.to_bytes(8, "big"))
 
 
-def _fetch_kvcr(monkeypatch):
+def _fetch_kvcr(monkeypatch, control=None):
     kvcr = _new_kvcr(
         FakeNixlAgent(),
         FakePrimaryPinning(),
-        FakeBytesControl(),
+        control if control is not None else FakeBytesControl(),
         KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)]),
-        key_adapter=_PrefixAdapter(),
+        key_adapter=_TestAdapter(),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=False, opportunistic_query=False
         ),
@@ -86,6 +94,13 @@ def _independent(action_id: str, destination: str, hashes, action_type) -> _Hint
 
 def _envelope(*hints: _HintAction) -> _HintEnvelope:
     return _HintEnvelope("0.1", "m1", list(hints))
+
+
+def _send(peer, envelope, carrier):
+    if carrier is None:
+        peer.control.incoming.append(msgspec.msgpack.encode(envelope))
+    else:
+        peer.kvcr.submit_hint(envelope, carrier)
 
 
 _FETCHABLE = (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
@@ -113,6 +128,37 @@ def test_fetch_hint_without_managed_dram(monkeypatch, no_retain, expected):
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, "req")]
 
 
+@pytest.mark.parametrize("selected", [False, True])
+def test_fetch_hint_takes_inline_path_without_lock(monkeypatch, selected):
+    kvcr, results = _fetch_kvcr(monkeypatch)
+    core, key = kvcr._core, _key(1)
+    remote_query = core._remote_fw_dram.query
+    envelope = _envelope(
+        _fetch("a1", "tcp://a:1", [1]),
+        _HintAction("f1", "kv.future_action", "1.0", {}),
+    )
+
+    def complete_during_query(key, request_id):
+        available = remote_query(key, request_id)
+        core._remote_delivery_keys[request_id].discard(key)
+        return available
+
+    with monkeypatch.context() as patch:
+        lock = MagicMock()
+        patch.setattr(core, "_state_lock", lock)
+        patch.setattr(core._remote_fw_dram, "query", complete_during_query)
+        kvcr.submit_hint(envelope, "req")
+        if selected:
+            core._remote_delivery_keys["req"] = {key}
+        assert kvcr.query((key,), "req") == [_FETCHABLE]
+        assert lock.mock_calls == []
+    assert not core._remote_delivery_keys["req"]
+    assert [(r.action_id, r.status, r.reason, r.request_id) for r in results] == [
+        ("f1", HintStatus.REJECTED, "unsupported_action_type", "req"),
+        ("a1", HintStatus.ACCEPTED, None, "req"),
+    ]
+
+
 def test_no_retain_without_key_adapter_records_and_warns(monkeypatch, caplog):
     """Rules are hashes and are recorded anyway; only enforcement needs the
     adapter, so both hints succeed and KVCR warns."""
@@ -125,11 +171,14 @@ def test_no_retain_without_key_adapter_records_and_warns(monkeypatch, caplog):
         "block_hashes": [2, 3], "no_retain": True,
     })  # fmt: skip
     kvcr.submit_hint(_envelope(hint, action), "req")
-    assert core._no_retain == {1, 2, 3}
+    assert {1, 2} <= core._no_retain
     assert "req" in core._remote_fw_dram._request_hints
+    _wait_until(lambda: len(results) == 2)
+    assert core._no_retain == {1, 2, 3}
     assert "not enforced without a key adapter" in caplog.text
     action.payload.update(block_hashes=[1], no_retain=False)
     kvcr.submit_hint(_envelope(action))
+    _wait_until(lambda: len(results) == 3)
     assert core._no_retain == {2, 3}
     assert [r.status for r in results] == [
         HintStatus.ACCEPTED, HintStatus.COMPLETED, HintStatus.COMPLETED,
@@ -158,22 +207,6 @@ def test_second_fetch_for_a_request(monkeypatch, one_envelope, second_source, ex
     assert kvcr._core._no_retain == {2}
 
 
-def test_mixed_valid_and_unknown_hints(monkeypatch):
-    kvcr, results = _fetch_kvcr(monkeypatch)
-    kvcr.submit_hint(
-        _envelope(
-            _fetch("a1", "tcp://a:1", [1]),
-            _HintAction("f1", "kv.future_action", "1.0", {}),
-        ),
-        "req",
-    )
-    assert kvcr.query((_key(1),), "req") == [_FETCHABLE]
-    assert set(_take(results)) == {
-        ("a1", HintStatus.ACCEPTED, None),
-        ("f1", HintStatus.REJECTED, "unsupported_action_type"),
-    }
-
-
 def test_all_invalid_envelope_does_not_raise_from_submit_hint(monkeypatch):
     kvcr, results = _fetch_kvcr(monkeypatch)
     bad = _HintAction("a1", "kv.fetch", "1.0", {"block_hashes": []})
@@ -188,7 +221,8 @@ def test_fetch_hint_without_request_id_is_accepted(monkeypatch):
     kvcr.submit_hint(envelope)
     assert [(r.status, r.request_id) for r in results] == [(HintStatus.ACCEPTED, None)]
     assert not kvcr._core._remote_fw_dram._request_hints
-    assert not kvcr._core._independent_hint_handler._received
+    assert kvcr._core._hints_dispatcher._inbox.empty()
+    assert not kvcr._core._independent_hint_handler._pending_operations
 
 
 _KEY = BlockKey(b"full-key-with-group")
@@ -206,10 +240,7 @@ def _group(**changes):
 def pair(monkeypatch):
     """Two peers with reverse lookup; the source holds _KEY and both record
     hint results: admission at the source, the transfer at the target."""
-    pair = _Pair()
-    pair.source.kvcr._core._key_adapter = SimpleNamespace(
-        decode_from_router={123: _KEY, 124: _TAIL_KEY}.__getitem__
-    )
+    pair = _Pair(key_adapter=_TestAdapter())
     pair.source.deposit(_KEY)
     pair.source_reports, pair.target_reports = (
         _record_hint_results(monkeypatch, peer.kvcr)
@@ -219,17 +250,18 @@ def pair(monkeypatch):
 
 
 def _submit(pair, action, carrier=None, hashes=(123,)):
-    """Independent hints reach the source and name the target as destination."""
+    """Submit to the source and await admission without owner polling."""
     hint = _independent("action", pair.target.control.endpoint, hashes, action)
+    before = len(pair.source_reports)
     pair.source.kvcr.submit_hint(_envelope(hint), carrier)
+    _wait_until(lambda: len(pair.source_reports) > before)
 
 
-def _idle(pair):
-    pair.until(pair.idle)
+def _idle(pair, *, poll=True):
+    pair.until(pair.idle, poll=poll)
     for peer in (pair.source, pair.target):
         core = peer.kvcr._core
-        handler = core._independent_hint_handler
-        assert not handler._received and not handler._pending_operations
+        assert not core._local_dram._pools._public_claims
         assert not core._framework_pin_keys and not core._local_dram_sources_by_op
         for record in core._block_record_map.values():
             if record.local_dram is not None:
@@ -251,9 +283,6 @@ def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
     source.deposit(_TAIL_KEY, 1)
     marked = target.kvcr._core._no_retain
     marked.update(() if no_retain else (123,))
-    target.kvcr._core._key_adapter = SimpleNamespace(
-        encode_to_router={_KEY: 123, _TAIL_KEY: 124}.__getitem__
-    )
     remote = target.kvcr._core._remote_fw_dram
     remote._options = msgspec.structs.replace(remote._options, opportunistic_query=True)
     hint = _fetch("action", source.control.endpoint, [123], "kv.evict_on_fetch")
@@ -408,11 +437,33 @@ def test_no_retain_applies_on_hint_submission(pair, enabled):
 @pytest.mark.parametrize(
     "existing,protected", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize(
+    "carrier", [None, "unrelated-request"], ids=["direct", "piggyback"]
+)
 def test_independent_no_retain_controls_full_and_partial_deposits(
-    pair, existing, protected
+    pair, existing, protected, carrier, monkeypatch
 ):
     target, core = pair.target, pair.target.kvcr._core
     kvcr, layout = target.kvcr, ["", ":tail"]
+    handlers = {
+        name: core._hints_dispatcher._handlers[name].submit
+        for name in ("kv.no_retain", "kv.invalidate")
+    }
+
+    def on_progress(hint, *args):
+        assert threading.get_ident() == core._progress._thread.ident
+        return handlers[hint.ACTION_TYPE](hint, *args)
+
+    def submit(hint, status=HintStatus.COMPLETED):
+        before = len(pair.target_reports)
+        _send(target, _envelope(hint), carrier)
+        _wait_until(lambda: len(pair.target_reports) == before + 1)
+        assert pair.target_reports[-1].status is status
+        assert pair.target_reports[-1].request_id == carrier
+
+    for name in handlers:
+        handler = core._hints_dispatcher._handlers[name]
+        monkeypatch.setattr(handler, "submit", on_progress)
     target.agent.state = "DONE"
     if existing:
         handle = kvcr.deposit({_KEY: [target.ref()]}, expected_layout=layout)
@@ -423,7 +474,7 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     action = _HintAction("nr", "kv.no_retain", "1.0", {
         "block_hashes": [123, 999, 123], "no_retain": True,
     })  # fmt: skip
-    kvcr.submit_hint(_envelope(action), "unrelated-request")
+    submit(action)
     claims = []
     for refs in ([target.ref(1, ":tail")], [target.ref(), target.ref(1, ":tail")]):
         handle = kvcr.deposit(
@@ -435,25 +486,145 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
         if entry.release_handle is not None:
             claims.append(entry.release_handle)
     invalidate = _HintAction("i", "kv.invalidate", "1.0", {"block_hashes": [123, 999]})
-    kvcr.submit_hint(_envelope(invalidate))
+    submit(invalidate, HintStatus.FAILED)
     report = pair.target_reports.pop()
     assert report.status is HintStatus.FAILED and report.failures == {
-        123: "protected" if protected else "source_not_transferable",
+        123: "protected" if protected else "not_found",
         999: "not_found",
     }
     kvcr.release(claims)
     kvcr.discard_hint("unrelated-request")
     assert core._no_retain == {123, 999} and bool(core._block_record_map) is existing
     action.payload.update(block_hashes=[123], no_retain=False)
-    kvcr.submit_hint(_envelope(action))
+    submit(action)
     handle = kvcr.deposit({_KEY: [target.ref(), target.ref(1, ":tail")]})
     assert dict(_poll_until(kvcr, bool))[handle][_KEY].success
     assert core._no_retain == {999}
-    kvcr.submit_hint(_envelope(invalidate))  # Complete and unprotected: removed.
+    submit(invalidate)  # Complete and unprotected: removal is queued.
     assert pair.target_reports[-1].failures == {999: "not_found"}
-    assert not core._block_record_map
+    _wait_until(lambda: not core._block_record_map)
     assert all(r.status is HintStatus.COMPLETED for r in pair.target_reports)
-    _idle(pair)
+    _idle(pair, poll=False)
+
+
+def _control_progress(peer, phase):
+    endpoint = f"tcp://{phase}:9"
+    peer.control.incoming.append(
+        msgspec.msgpack.encode(_TargetMetadataAck(sender_control_endpoint=endpoint))
+    )
+    _wait_until(
+        lambda: endpoint in peer.kvcr._core._remote_fw_dram._metadata_acked_sources
+    )
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_control_hint_backpressure_preserves_peer_control_and_advice(
+    pair, shutdown, monkeypatch
+):
+    core = pair.source.kvcr._core
+    destination = pair.target.kvcr._core
+    pending = destination._independent_hint_handler._background_items
+    dispatcher = core._hints_dispatcher
+    inbox = dispatcher._inbox
+    remote = core._remote_fw_dram
+    resolve_hashes = core.resolve_hashes
+
+    def resolve(hashes):
+        assert threading.get_ident() == core._progress._thread.ident
+        assert not core._state_lock._is_owned()
+        return resolve_hashes(hashes)
+
+    monkeypatch.setattr(core, "resolve_hashes", resolve)
+    remote.submit_hint("tcp://other:9", frozenset({456}), "req")
+    advice = dict(remote._request_hints)
+    envelope = _envelope(
+        _fetch("fetch", "tcp://replacement:9", [123]),
+        _fetch("evict", "tcp://replacement:9", [123], "kv.evict_on_fetch"),
+        _independent("good", pair.target.control.endpoint, [123], "kv.move"),
+        _HintAction("set", "kv.no_retain", "1.0", {
+            "block_hashes": [999], "no_retain": True,
+        }),
+    )  # fmt: skip
+    clear = _envelope(
+        _HintAction("clear", "kv.no_retain", "1.0", {
+            "block_hashes": [999], "no_retain": False,
+        }),
+    )  # fmt: skip
+    prefix = [
+        ("fetch", HintStatus.REJECTED, "request_scoped_hint"),
+        ("evict", HintStatus.REJECTED, "request_scoped_hint"),
+        ("good", HintStatus.ACCEPTED, None),
+    ]
+    overflow = _envelope(
+        _independent("overflow", pair.target.control.endpoint, [999], "kv.prefetch")
+    )
+    with core._state_lock, destination._state_lock:
+        with monkeypatch.context() as patch:
+            patch.setattr(dispatcher, "poll", lambda: None)
+            pair.source.control.incoming.extend(
+                [msgspec.msgpack.encode(envelope), msgspec.msgpack.encode(clear)]
+                + [msgspec.msgpack.encode(overflow)] * (inbox.maxsize - 1)
+            )
+            _control_progress(pair.source, "full")
+            assert inbox.full() and len(pair.source_reports) == 2
+            # Only the preexisting advice's eager metadata handshake is allowed.
+            assert all(
+                endpoint == "tcp://other:9"
+                and _decode_control_message(raw)["type"] == "target_metadata"
+                for endpoint, raw in pair.source.control.sent
+            )
+        _wait_until(lambda: dispatcher._pending is not None)
+        pair.until(
+            lambda: any(isinstance(item, _KeysToFetch) for item in pending), poll=False
+        )
+        for peer in (pair.source, pair.target):
+            _control_progress(peer, "admission")
+        assert not pair.target_reports and not pair.target.events
+        assert not core._no_retain
+        assert [
+            (r.action_id, r.status, r.reason) for r in pair.source_reports
+        ] == prefix
+        if shutdown:
+            apply = Mock(
+                side_effect=AssertionError("queued hint executed during close")
+            )
+            monkeypatch.setattr(dispatcher._handlers["kv.no_retain"], "submit", apply)
+            monkeypatch.setattr(destination, "fetch", apply)
+            for peer in (pair.source, pair.target):
+                peer.kvcr.close()
+                assert peer.kvcr._core.is_quiescent()
+            apply.assert_not_called()
+            assert inbox.empty() and dispatcher._pending is None and not pending
+            assert not pair.target_reports
+            assert _take(pair.source_reports) == prefix
+            return
+    _wait_until(lambda: len(pair.source_reports) == inbox.maxsize + 3)
+    assert all(r.failures == {999: "not_found"} for r in pair.source_reports[5:])
+    assert not core._no_retain and dispatcher._pending is None
+    assert remote._request_hints == advice
+    reports = _take(pair.source_reports)
+    assert reports[:5] == prefix + [
+        ("set", HintStatus.COMPLETED, None),
+        ("clear", HintStatus.COMPLETED, None),
+    ]
+    assert set(reports[5:]) == {("overflow", HintStatus.FAILED, None)}
+    pair.until(lambda: pair.target.local.raw[:16] == b"a" * 16, poll=False)
+    with destination._state_lock:
+        pair.source.agent.state = "DONE"
+        pair.until(
+            lambda: any(isinstance(item, _TargetPullOp) for item in pending), poll=False
+        )
+        _control_progress(pair.target, "finalization")
+        assert not pair.target_reports and not pair.target.events
+    pair.until(lambda: pair.target_reports, poll=False)
+    pair.until(lambda: pair.source.kvcr.query((_KEY,)) == [_MISS], poll=False)
+    assert pair.target_reports[-1].status is HintStatus.COMPLETED
+    assert pair.target.events == [InventoryEvent((_KEY,), CacheTier.LOCAL_G2, False)]
+    assert sum(
+        _decode_control_message(raw)["type"] == "keys_to_fetch"
+        for _, raw in pair.source.control.sent
+    ) == 1
+    _idle(pair, poll=False)
 
 
 @pytest.mark.parametrize(
@@ -472,25 +643,38 @@ def test_independent_hints_are_rejected_at_the_source_before_resolution(
 ):
     kvcr, results = pair.source.kvcr, pair.source_reports
     destination = pair.target.control.endpoint
+    request_id = None if reason == "source_has_no_managed_dram" else "req"
     if reason == "source_has_no_managed_dram":
-        kvcr, results = _fetch_kvcr(monkeypatch)
+        control = ZmqPeerControlChannel("127.0.0.1", free_port(), "127.0.0.1")
+        kvcr, results = _fetch_kvcr(monkeypatch, control)
     elif reason == "self_destination":
         destination = pair.source.control.endpoint
     elif reason == "key_adapter_unavailable":
         kvcr._core._key_adapter = None
-    hint = _independent("a1", destination, [1], action_type)
+    hint = _independent("a1", destination, [(1 << 64) - 1], action_type)
     if reason.startswith("no_retain"):
         hint.payload["no_retain"] = False
     if reason.startswith("destination-less"):
         hint.payload["source_control_endpoint"] = hint.payload.pop(
             "destination_control_endpoint"
         )
-    kvcr.submit_hint(_envelope(hint), "req")
+    remote = kvcr._core._remote_fw_dram
+    send = Mock(wraps=remote._control.send)
+    monkeypatch.setattr(remote._control, "send", send)
+    if request_id is None:
+        with zmq.Context.instance().socket(zmq.PUSH) as sender:
+            sender.linger = 0
+            sender.connect(control.endpoint)
+            sender.send(msgspec.msgpack.encode(_envelope(hint)), zmq.DONTWAIT)
+            _wait_until(lambda: results)
+    else:
+        kvcr.submit_hint(_envelope(hint), request_id)
+        _wait_until(lambda: results)
     assert [
         (r.action_type, r.status, r.reason, r.request_id, r.message_id) for r in results
-    ] == [(action_type, HintStatus.REJECTED, reason, "req", "m1")]
-    remote = kvcr._core._remote_fw_dram
-    assert not remote._request_hints and not remote._control.sent
+    ] == [(action_type, HintStatus.REJECTED, reason, request_id, "m1")]
+    assert not remote._request_hints
+    send.assert_not_called()
     assert kvcr._core._outstanding_operations == 0 and not kvcr.poll_completed()
 
 
@@ -567,64 +751,91 @@ def test_destination_rejects_unusable_requests(pair, changes, reason, monkeypatc
     _idle(pair)
 
 
-def test_all_failed_resolution_runs_under_the_owner_lock(pair, monkeypatch):
-    source = pair.source.kvcr._core
-    owner = threading.get_ident()
-
-    def decode(block_hash):
-        assert threading.get_ident() == owner and source._state_lock._is_owned()
-        raise KeyError(block_hash)
-
-    monkeypatch.setattr(source._key_adapter, "decode_from_router", decode)
-    _submit(pair, "kv.prefetch", hashes=(999,))
-    [result] = pair.source_reports
-    assert result.status is HintStatus.FAILED and result.failures == {999: "not_found"}
-    assert not pair.source.control.sent and not pair.target_reports
-    _idle(pair)
-
-
 @pytest.mark.parametrize("action", ["kv.prefetch", "kv.move"])
-@pytest.mark.parametrize("carrier", [None, "unrelated-request"])
+@pytest.mark.parametrize(
+    "carrier", [None, "unrelated-request"], ids=["direct", "piggyback"]
+)
 @pytest.mark.parametrize("cached", [False, True])
 def test_independent_transfer_preserves_carrier_and_releases_claims(
-    pair, action, carrier, cached
+    pair, action, carrier, cached, monkeypatch
 ):
-    """Mixed resolution preserves carrier advice and releases each hint's claims."""
+    """Idle execution preserves carrier advice, cache hits, inventory, and claims."""
+    target = pair.target.kvcr
     if cached:
         pair.target.deposit(_KEY)
+        remote_query = Mock(wraps=target._core._remote_fw_dram.query)
+        monkeypatch.setattr(target._core._remote_fw_dram, "query", remote_query)
+        target.submit_hint(_router_hint(pair.source.control.endpoint, (123,)), "local")
+        assert target.query((_KEY,), "local") == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+        remote_query.assert_not_called()
+        assert not target._core._remote_delivery_keys["local"]
+        target.discard_hint("local")
+        pair.target_reports.clear()
+    pair.source.events.clear()
+    pair.target.events.clear()
     remote = pair.source.kvcr._core._remote_fw_dram
     if carrier:
         remote.submit_hint("tcp://unrelated:9", frozenset({456}), carrier)
     advice = dict(remote._request_hints)
     before = len(pair.source.agent.xfers)
-    _submit(pair, action, carrier, (123, 999))
+    envelope = _envelope(
+        _independent("action", pair.target.control.endpoint, [123, 999], action)
+    )
+    if cached:
+        framework_handle = target.fetch((_KEY,))
+    # Both ingress paths must resolve and forward while the owner holds its lock.
+    with pair.source.kvcr._core._state_lock:
+        _send(pair.source, envelope, carrier)
+        _wait_until(lambda: pair.source_reports)
+        _wait_until(lambda: any(
+            _decode_control_message(raw)["type"] == "keys_to_fetch"
+            for _, raw in pair.source.control.sent
+        ))
     assert remote._request_hints == advice
     if carrier:
         pair.source.kvcr.discard_hint(carrier)
+    if not cached:
+        # The fake writes bytes at submission; completion still needs DONE.
+        pair.until(lambda: pair.target.local.raw[:16] == b"a" * 16, poll=False)
+        assert target.query((_KEY,)) == [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
+        assert not pair.target_reports and not pair.target.events
+        framework_handle = target.fetch((_KEY,))
+    pools = target._core._local_dram._pools
+    reclaim = Mock(wraps=pools._reclaimable_slots)
+    monkeypatch.setattr(target._core, "_capacity_needed_callback", Mock())
+    monkeypatch.setattr(pools, "_reclaimable_slots", reclaim)
     pair.source.agent.state = "DONE"
-    pair.until(lambda: pair.target_reports)
+    pair.until(lambda: pair.target_reports, poll=False)
+    expected = _MISS if action == "kv.move" else (QueryStatus.HIT, CacheTier.LOCAL_G2)
+    pair.until(lambda: pair.source.kvcr.query((_KEY,)) == [expected], poll=False)
+    pair.until(pair.idle, poll=False)
+    reclaim.assert_not_called()
+    assert target._core._block_record_map[_KEY].local_dram.claim_count == 1
+    [(handle, entries)] = target.poll_completed()
+    reclaim.assert_called()
+    assert handle == framework_handle and entries[_KEY].success
+    claim = entries[_KEY].release_handle
+    assert target.poll_completed() == []
+    assert target.release([claim]) == [(claim, True)]
+    _idle(pair, poll=False)
     [accepted], [result] = pair.source_reports, pair.target_reports
     assert accepted.status is HintStatus.ACCEPTED and accepted.request_id == carrier
     assert accepted.failures == {999: "not_found"}
-    assert result.status is HintStatus.COMPLETED and result.request_id is None
-    assert (result.action_id, result.action_type, result.message_id) == (
-        "action",
-        action,
-        "m1",
+    assert result == HintResult(
+        "action", action, HintStatus.COMPLETED, message_id="m1"
     )
-    assert result.failures is None
     assert not remote._request_hints
-    core = pair.target.kvcr._core
-    assert core._block_record_map[_KEY].local_dram.claim_count == 0
+    assert pair.target.kvcr.query((_KEY,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert len(pair.source.agent.xfers) - before == (0 if cached else 1)
-    expected = (
-        (QueryStatus.MISS, None)
-        if action == "kv.move"
-        else (QueryStatus.HIT, CacheTier.LOCAL_G2)
+    stored = InventoryEvent((_KEY,), CacheTier.LOCAL_G2, False)
+    removed = InventoryEvent((_KEY,), CacheTier.LOCAL_G2, True)
+    assert pair.target.events == ([] if cached else [stored])
+    assert pair.source.events == ([removed] if action == "kv.move" else [])
+    known = ({(("",), (16,)): {_KEY: 123}}, {})
+    assert pair.source.kvcr._core.resolve_hashes((123,)) == (
+        ({}, {123: "not_found"}) if action == "kv.move" else known
     )
-    pair.until(lambda: pair.source.kvcr.query((_KEY,)) == [expected])
-    _idle(pair)
-    assert len(pair.source_reports) == len(pair.target_reports) == 1
+    assert target._core.resolve_hashes((123,)) == known
 
 
 @pytest.mark.parametrize("at_submit", [False, True])
@@ -656,8 +867,8 @@ def test_nonfatal_error_reports_once_and_allows_later_work(
     _idle(pair)
 
 
-def test_fatal_fetch_submit_error_escapes_the_same_poll(pair, monkeypatch):
-    """Fail after real destination reservation, after poll's initial fatal check."""
+def test_fatal_background_fetch_failure_propagates_to_owner(pair, monkeypatch):
+    """A fatal failure after destination reservation is visible to the owner."""
     core = pair.target.kvcr._core
     progress = core._progress
     submit = progress.submit
@@ -679,65 +890,163 @@ def test_fatal_fetch_submit_error_escapes_the_same_poll(pair, monkeypatch):
     assert core.is_quiescent()
 
 
-@pytest.mark.parametrize("vanished", [False, True])
-def test_prefetch_keeps_named_g2_source_after_capacity_wait(
-    pair, vanished, monkeypatch
-):
+@pytest.mark.parametrize("outcome", ["ready", "vanished", "timeout", "newcomer"])
+def test_prefetch_keeps_named_g2_source_after_capacity_wait(pair, outcome, monkeypatch):
     """A pending eviction delays admission; resumption preserves source and policy."""
     occupied = (b"occupied-first", b"occupied-second")
-    for index, key in enumerate(occupied):
-        pair.target.deposit(key, index)
+    claim = pair.target.deposit(occupied[0], protected=True)
+    other_claim = pair.target.deposit(occupied[1], 1, protected=outcome == "newcomer")
     core = pair.target.kvcr._core
     pools = core._local_dram._pools
-    pools.acquire_sources(occupied[:1])
     pools._capacity_eviction_key = occupied[0]
     pools.retire_sources(occupied[:1])
     pins = Mock(wraps=pair.source.kvcr._core._request_pin_callback)
     monkeypatch.setattr(pair.source.kvcr._core, "_request_pin_callback", pins)
     _submit(pair, "kv.prefetch")
-    pair.until(lambda: bool(core._local_dram._capacity_waiters))
+    pair.until(lambda: bool(core._local_dram._capacity_waiters), poll=False)
+    with monkeypatch.context() as patch:
+        maintenance = Mock(wraps=core._local_dram.poll_main)
+        patch.setattr(core._local_dram, "poll_main", maintenance)
+        _control_progress(pair.target, "blocked")
+        _control_progress(pair.target, "still-blocked")
+        maintenance.assert_not_called()
     assert not pair.target_reports
     assert all(
         _decode_control_message(raw)["type"] != "start_write"
         for _, raw in pair.target.control.sent
     )
-    if vanished:
+    if outcome == "timeout":
+        deadline = next(iter(core._local_dram._pending_residency_ops.values())).deadline
+        core._clock = lambda: deadline + 1
+        pair.until(lambda: pair.target_reports, poll=False)
+        assert pair.target_reports[-1].status is HintStatus.FAILED
+        assert pair.target.kvcr.release([claim]) == [(claim, True)]
+        _idle(pair, poll=False)
+        return
+    if outcome == "vanished":
         _invalidate(pair.source.kvcr, (_KEY,))
-    pools.release_sources(occupied[:1])
+    start_fill, fill_threads = core._start_local_fill, []
+
+    def resumed_fill(*args, **kwargs):
+        fill_threads.append(threading.get_ident())
+        assert threading.get_ident() == core._progress._thread.ident
+        assert core._state_lock._is_owned()
+        return start_fill(*args, **kwargs)
+
+    monkeypatch.setattr(core, "_start_local_fill", resumed_fill)
+    # Releasing on the caller must hand the independent waiter back to progress.
+    with core._state_lock:
+        assert pair.target.kvcr.release([claim]) == [(claim, True)]
+        if outcome == "newcomer":
+            newcomer = BlockKey(b"newcomer")
+            deposit = pair.target.kvcr.deposit(
+                {newcomer: [pair.target.ref(1)]}, no_evict=True
+            )
     pair.source.agent.state = "DONE"
-    pair.until(lambda: pair.target_reports)
+    pair.until(lambda: pair.target_reports, poll=False)
+    assert fill_threads == [core._progress._thread.ident]
     assert pair.target_reports[-1].failures == (
-        {123: "operation_failed"} if vanished else None
+        {123: "operation_failed"} if outcome == "vanished" else None
     )
     requests = [_decode_control_message(raw) for _, raw in pair.target.control.sent]
     writes = [request for request in requests if request["type"] == "start_write"]
     assert len(writes) == 1 and writes[0]["g2_only"] is True
     assert writes[0]["source_control_endpoint"] == pair.source.control.endpoint
     pins.assert_not_called()
-    _idle(pair)
+    if outcome == "newcomer":
+        result = dict(_poll_until(pair.target.kvcr, bool))[deposit][newcomer]
+        assert not result.success and newcomer not in core._block_record_map
+        assert pair.target.kvcr.release([other_claim]) == [(other_claim, True)]
+    _idle(pair, poll=False)
+
+
+@pytest.mark.parametrize("producer", ["remote", "remote_finished", "deposit_timeout"])
+@pytest.mark.parametrize("carrier", [None, "request"], ids=["direct", "piggyback"])
+@pytest.mark.parametrize("action", ["kv.prefetch", "kv.move"])
+def test_hint_joining_framework_work_finishes_without_owner_poll(
+    pair, producer, carrier, action
+):
+    target, source = pair.target, pair.source
+    core, now = target.kvcr._core, 0.0
+    core._clock = lambda: now
+    timed_out = producer == "deposit_timeout"
+    before = len(source.agent.xfers)
+    if timed_out:
+        handle = target.kvcr.deposit({_KEY: [target.ref()]})
+        _wait_until(lambda: target.agent.transfers)
+    else:
+        target.kvcr.submit_hint(_router_hint(source.control.endpoint, (123,)), "req")
+        advice = core._remote_fw_dram._request_hints["req"]
+        pair.target_reports.clear()
+        handle = target.kvcr.fetch((_KEY,), "req")
+        pair.until(lambda: len(source.agent.xfers) > before, poll=False)
+        if producer == "remote_finished":
+            source.agent.state = "DONE"
+            pair.until(lambda: not core._progress._in_flight_ops, poll=False)
+    hint = _independent("joined", target.control.endpoint, [123], action)
+    _send(source, _envelope(hint), carrier)
+    if producer != "remote_finished":
+        pair.until(
+            lambda: core._independent_hint_handler._pending_operations, poll=False
+        )
+    if timed_out:
+        now = 1.5
+    else:
+        source.agent.state = "DONE"
+    pair.until(lambda: pair.target_reports, poll=False)
+    assert pair.target_reports[-1].status is (
+        HintStatus.FAILED if timed_out else HintStatus.COMPLETED
+    )
+    if timed_out:
+        assert target.agent.state == "PROC" and not target.agent.released_xfers
+        assert core._block_record_map[_KEY].local_dram.writers == [1]
+        assert not core._local_dram._pools._public_claims and not target.events
+        target.agent.state = "DONE"
+    else:
+        assert core._remote_fw_dram._request_hints["req"] is advice
+        assert target.events == [InventoryEvent((_KEY,), CacheTier.LOCAL_G2, False)]
+    pair.until(lambda: handle in dict(core._completion_queue), poll=False)
+    entries = dict(target.kvcr.poll_completed())[handle]
+    assert entries[_KEY].success is not timed_out
+    if not timed_out:
+        assert core._remote_fw_dram._request_hints["req"] is not advice
+        claim = entries[_KEY].release_handle
+        assert target.kvcr.release([claim]) == [(claim, True)]
+    _idle(pair, poll=False)
 
 
 @pytest.mark.parametrize(
-    "actions",
+    "actions,succeeds",
     [
-        ("kv.prefetch", "kv.move"),
-        ("kv.move", "kv.prefetch"),
-        ("kv.prefetch", "kv.prefetch"),
+        (("kv.prefetch", "kv.move"), True),
+        (("kv.move", "kv.prefetch"), True),
+        (("kv.prefetch", "kv.prefetch"), True),
+        (("kv.move",), False),
     ],
 )
-def test_overlapping_actions_share_one_transfer(pair, actions):
-    """Joining an existing fill still completes each hint and releases its claim."""
+def test_joined_transfer_and_failed_move_cleanup(pair, actions, succeeds):
+    """Joined copies/moves share completion; a failed move reopens its source."""
     core = pair.target.kvcr._core
+    source = pair.source.kvcr._core
+    pending = core._independent_hint_handler._pending_operations
     before = len(pair.source.agent.xfers)
     for action in actions:
         _submit(pair, action)
-    pair.until(lambda: len(core._independent_hint_handler._pending_operations) == 2)
-    pair.source.agent.state = "DONE"
-    pair.until(lambda: len(pair.target_reports) == 2)
-    assert all(r.status is HintStatus.COMPLETED for r in pair.target_reports)
+    pair.until(lambda: len(pending) == len(actions), poll=False)
+    pair.until(lambda: len(pair.source.agent.xfers) > before, poll=False)
+    if not succeeds:
+        assert source.resolve_hashes((123,)) == ({}, {123: "source_not_transferable"})
+    pair.source.agent.state = "DONE" if succeeds else "ERR"
+    pair.until(lambda: len(pair.target_reports) == len(actions), poll=False)
+    status = HintStatus.COMPLETED if succeeds else HintStatus.FAILED
+    assert all(r.status is status for r in pair.target_reports)
     assert sorted(r.action_type for r in pair.target_reports) == sorted(actions)
     assert len(pair.source.agent.xfers) - before == 1
-    _idle(pair)
+    pair.source.agent.state = "DONE"
+    _idle(pair, poll=False)
+    if not succeeds:
+        assert source.resolve_hashes((123,)) == ({(("",), (16,)): {_KEY: 123}}, {})
+        assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
 
 
 @pytest.mark.parametrize("action", ["kv.prefetch", "kv.move"])
@@ -752,6 +1061,10 @@ def test_layout_groups_share_one_message_and_final_result(
     )
     assert dict(_poll_until(pair.source.kvcr, bool))[handle][_TAIL_KEY].success
     core = pair.target.kvcr._core
+    pins = Mock(side_effect=AssertionError("independent hint used framework memory"))
+    monkeypatch.setattr(pair.source.kvcr._core, "_request_pin_callback", pins)
+    free = len(core._local_dram._pools._free_slots[""])
+    pair.target.events.clear()
     handler, fetch = core._independent_hint_handler, core.fetch
     requested = handler.requested
     received = []
@@ -784,18 +1097,26 @@ def test_layout_groups_share_one_message_and_final_result(
     before = len(pair.source.agent.xfers)
     pair.source.agent.state = "PROC"
     _submit(pair, action, hashes=(123, 124))
-    pair.until(lambda: len(pair.source.agent.xfers) > before)
+    pair.until(lambda: len(pair.source.agent.xfers) > before, poll=False)
     assert not pair.target_reports  # Includes synchronous layout/fetch rejection.
+    pair.source.agent.state = "DONE"
+    pair.until(lambda: pair.target_reports, poll=False)
+    _idle(pair, poll=False)
     [request] = received
     assert sorted(g.key_layout for g in request.groups) == [("",), (":tail",)]
     messages = [_decode_control_message(raw) for _, raw in pair.source.control.sent]
     assert sum(m["type"] == "keys_to_fetch" for m in messages) == 1
     assert len(pair.source_reports) == 1
-    pair.source.agent.state = "DONE"
-    pair.until(lambda: pair.target_reports)
     [result] = pair.target_reports
     reason = "incompatible_layout" if failure == "layout" else "operation_failed"
     assert result.status is (HintStatus.FAILED if failure else HintStatus.COMPLETED)
     assert result.failures == ({124: reason} if failure else None)
-    _idle(pair)
-    assert len(pair.target_reports) == 1
+    stored = (_KEY,) if failure else (_KEY, _TAIL_KEY)
+    assert sorted(pair.target.events, key=lambda event: event.keys) == [
+        InventoryEvent((key,), CacheTier.LOCAL_G2, False) for key in stored
+    ]
+    assert len(core._local_dram._pools._free_slots[""]) == free - len(stored)
+    if failure:
+        assert pair.target.kvcr.query((_TAIL_KEY,)) == [_MISS]
+        assert core.resolve_hashes((124,)) == ({}, {124: "not_found"})
+    pins.assert_not_called()

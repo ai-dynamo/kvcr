@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Hint dispatch infrastructure.
-
-``HintDispatcher`` owns the hint type table and reports every hint's
-result; core holds one dispatcher and delegates to it. ``_HINT_TYPES`` binds
-the supported hint types to their payload parsers and handlers.
-"""
+"""Hint parsing, dispatch, and bounded ingress for independent actions."""
 
 from __future__ import annotations
 
 import logging
+import queue
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -26,7 +22,13 @@ from .hint_types import (
     _KVNoRetainHint,
     _KVPrefetchHint,
 )
-from .parser import _parse_invalidate, _parse_payload, hint_message_id, parse_hints
+from .parser import (
+    _parse_invalidate,
+    _parse_payload,
+    hint_message_id,
+    parse_hints,
+    reject_hint,
+)
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
@@ -78,6 +80,8 @@ _HINT_TYPES: tuple[HintType, ...] = (
 logger = logging.getLogger(__name__)
 # Handlers run on hot paths; warn once per (phase, action type) about errors.
 _LOGGED_HANDLER_ERRORS: set[str] = set()
+_INBOX_CAPACITY = 256
+_POLL_HASH_BUDGET = 1 << 13  # Hashes dispatched per poll; the rest keep their order.
 
 
 def _warn_handler_error(action_type: str, phase: str) -> None:
@@ -95,12 +99,10 @@ def _warn_handler_error(action_type: str, phase: str) -> None:
 
 
 class HintDispatcher:
-    """Routes parsed hints to their handlers and reports their results.
+    """Parse on ingress; dispatch independent hints on progress.
 
-    Core owns one dispatcher and calls ``submit`` from the caller's thread and
-    ``close`` under its state lock once the progress loop is quiescent, with
-    the other main-thread resources. Which hint types exist is decided here,
-    by ``_HINT_TYPES``, not by core.
+    Independent retention and invalidation take the state lock; source resolution
+    uses its reader lock. Close handlers only after progress stops.
     """
 
     def __init__(self, core: _KVCRCore) -> None:
@@ -111,60 +113,109 @@ class HintDispatcher:
             for action_type, hint_type in self._types.items()
         }
         self._closed = False
+        # One batch per envelope, from either ingress path.
+        self._inbox: queue.Queue[tuple[list[_Hint], str | None, str | None]] = (
+            queue.Queue(_INBOX_CAPACITY)
+        )
+        self._pending: tuple[list[_Hint], str | None, str | None] | None = None
 
-    # Caller thread, no state lock.
+    def poll(self) -> None:
+        """Dispatch a bounded batch without blocking native or control progress."""
+        budget = _POLL_HASH_BUDGET
+        while budget > 0 and not self._core._progress._close_requested:
+            try:
+                batch = self._pending or self._inbox.get_nowait()
+            except queue.Empty:
+                break
+            hints, request_id, message_id = batch
+            self._pending = None
+            for index, hint in enumerate(hints):
+                locked = isinstance(hint, (_KVNoRetainHint, _KVInvalidateHint))
+                if budget <= 0 or (
+                    locked and not self._core._state_lock.acquire(blocking=False)
+                ):
+                    # Keep only the unprocessed tail, ahead of newer inbox work.
+                    hints = hints[index:] if index else hints
+                    self._pending = hints, request_id, message_id
+                    return
+                budget -= len(hint.block_hashes)
+                try:
+                    self._submit_to_handler(hint, request_id, message_id)
+                finally:
+                    if locked:
+                        self._core._state_lock.release()
 
     def submit(
         self,
         envelope: msgspec.Struct,
         request_id: str | None,
+        *,
+        direct: bool = False,
     ) -> None:
-        """Parse an envelope, report its rejections, dispatch its hints."""
+        """Parse either ingress; only independent actions enter the progress inbox."""
         self._core._progress.raise_if_failed()
+        if direct and self._inbox.full():
+            logger.debug("KV hint dropped; ingress limit reached")
+            return
         hints, rejected = parse_hints(envelope, self._types)
         for result in rejected:
             self.report(msgspec.structs.replace(result, request_id=request_id))
         message_id = hint_message_id(envelope)
+        independent = []
         for hint in hints:
-            handler = self._handlers[type(hint).ACTION_TYPE]
-            self._submit_to_handler(handler, hint, request_id, message_id)
+            if isinstance(hint, (_KVPrefetchHint, _KVNoRetainHint, _KVInvalidateHint)):
+                independent.append(hint)
+            elif direct:
+                result = reject_hint(
+                    hint.action_id, hint.ACTION_TYPE, "request_scoped_hint", message_id
+                )
+                self.report(result)
+            else:
+                self._submit_to_handler(hint, request_id, message_id)
+        if independent:
+            try:
+                self._inbox.put_nowait((independent, request_id, message_id))
+            except queue.Full:
+                for hint in independent:
+                    result = reject_hint(
+                        hint.action_id,
+                        hint.ACTION_TYPE,
+                        "ingress_full",
+                        message_id,
+                        request_id,
+                    )
+                    self.report(result)
 
     def _submit_to_handler(
         self,
-        handler: _HintHandler,
         hint: _Hint,
         request_id: str | None,
         message_id: str | None,
     ) -> None:
-        # Contract: a handler reports admission exactly once, or raises before
-        # doing so. ACCEPTED means admission, not asynchronous completion.
-        # A raise means REJECTED, unless it is the fatal progress-thread
-        # failure, which propagates to the caller as it does without hints.
+        # Handlers report admission once, or raise before reporting.
+        # Fatal progress failures propagate; other failures become REJECTED.
         try:
-            handler.submit(hint, request_id, message_id)
+            self._handlers[hint.ACTION_TYPE].submit(hint, request_id, message_id)
         except Exception:
             self._core._progress.raise_if_failed()
             _warn_handler_error(hint.ACTION_TYPE, "submit")
-            self.report(
-                HintResult(
-                    action_id=hint.action_id,
-                    action_type=hint.ACTION_TYPE,
-                    status=HintStatus.REJECTED,
-                    reason="handler_error",
-                    request_id=request_id,
-                    message_id=message_id,
-                )
+            result = HintResult(
+                action_id=hint.action_id,
+                action_type=hint.ACTION_TYPE,
+                status=HintStatus.REJECTED,
+                reason="handler_error",
+                request_id=request_id,
+                message_id=message_id,
             )
+            self.report(result)
 
     # Handlers warn through the dispatcher's once-per-issue logger.
     warn_handler_error = staticmethod(_warn_handler_error)
 
     def report(self, result: HintResult) -> None:
-        """Record a hint's result; called by handlers and by the dispatcher.
+        """Log debug results. No new metrics: integrations may reject unknown names.
 
-        Results are logged at debug level only; rejections and handler errors
-        already warn once per issue. No metric is emitted: integrations
-        forward KVCR stats and may reject names they do not declare.
+        Rejections and handler errors already warn once per issue.
         """
         logger.debug(
             "KV hint result; action_id=%s action_type=%s status=%s reason=%s "
@@ -183,6 +234,9 @@ class HintDispatcher:
         if self._closed:
             return
         self._closed = True
+        self._pending = None
+        while not self._inbox.empty():
+            self._inbox.get_nowait()
         closed: set[int] = set()
         for action_type, handler in self._handlers.items():
             if id(handler) in closed:

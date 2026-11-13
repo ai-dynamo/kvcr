@@ -120,7 +120,7 @@ Claims are attached to concrete residencies. They prevent KVCR-owned memory from
 
 ### Asynchronous Execution
 
-The event loop owns most KVCR metadata mutations and never performs blocking external calls. A dedicated progress thread owns the NIXL agent, submits and polls transfers, and posts completions back to the event loop. It may also claim ready local DRAM sources under a shared lock. Framework-agent and storage work follow the same asynchronous completion pattern.
+The event loop owns most KVCR metadata mutations and never performs blocking external calls. A dedicated progress thread owns the NIXL agent, submits and polls transfers, and posts completions back to the event loop. It may also claim ready local DRAM sources under a shared lock. It also applies deposit completions and independent hints under the core lock. Framework-agent and storage work follow the same asynchronous completion pattern.
 
 The active in-process KVCR owns the NIXL agent used for KVCR-owned memory and framework memory exposed through the KVCR bindings. A future integration may instead coordinate with a framework-owned agent. When resilience is enabled, the backup KVCR has its own agent but uses it only after a fenced takeover.
 
@@ -275,13 +275,13 @@ Each hint in an envelope is parsed and handled independently. `discard_hint` nor
 
 #### Independent hints
 
-`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Hints are sent to the source with `destination_control_endpoint` and `block_hashes`. They run independently of their carrier request's keys and lifetime, work without a request ID, and can share an envelope with request advice.
+`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Hints are sent to the source with `destination_control_endpoint` and `block_hashes`. They run independently of their carrier request's keys and lifetime, work without a request ID, and can share an envelope with request advice. The existing control socket also accepts request hint envelopes as MessagePack, rejecting request-scoped actions. Control-socket envelopes above 16 MiB, or arriving while 256 are queued, are dropped; senders must bound both. Both paths queue independent hints for the KVCR progress thread and can finish inventory updates and claim release without framework polling; results remain local debug reports.
 
-During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
+On the progress thread, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
 
-The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed.
+KVCR core maintains the hash-to-key map from inventory changes and recovered residency via the configured adapter's `encode_to_router()`. Resolution uses the source reader lock and no longer calls `decode_from_router()`; the adapter API is unchanged. Missing or ambiguous hashes fail individually while valid hashes proceed. Only complete KVCR-owned DRAM copies are transferable; lookup reserves nothing, so blocks may disappear before transfer. Guard takeover does not automatically preserve the adapter.
 
-`kv.no_retain` acts on the receiving KVCR immediately: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
+`kv.no_retain` runs on the receiving KVCR's progress thread: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
 
 `kv.invalidate` removes complete local DRAM copies identified by `block_hashes`, without transferring data. It honors `no_evict` and waits for existing readers to drain. `COMPLETED` means cleanup is queued; actual removals publish inventory events. Combine it with `kv.no_retain` to prevent later deposits from recreating the copies.
 

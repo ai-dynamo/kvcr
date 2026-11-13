@@ -8,6 +8,7 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
+from kvcr.backends.remote_ops import _decode_control_message
 from kvcr.hints.dispatcher import KV_FETCH, KV_INVALIDATE, KV_NO_RETAIN
 from kvcr.hints.hint_types import HintType, _Hint, _KVFetchHint, _KVInvalidateHint
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES, parse_hints
@@ -139,7 +140,8 @@ def test_rejection_dedupe_is_bounded_for_unregistered_types(
 
 
 @pytest.mark.parametrize("action_id", [None, 7, ["a"]])
-def test_non_string_action_id_is_rejected(action_id) -> None:
+@pytest.mark.parametrize("control", [False, True])
+def test_non_string_action_id_is_rejected(action_id, control) -> None:
     hint = _HintEnvelope(
         "0.1",
         "m",
@@ -148,6 +150,8 @@ def test_non_string_action_id_is_rejected(action_id) -> None:
             _fetch_hint("ok", "tcp://a:1", (1,)),
         ],
     )
+    if control:
+        hint = _decode_control_message(msgspec.msgpack.encode(hint))
     hints, rejected = parse_hints(hint, _types())
     assert [h.action_id for h in hints] == ["ok"]
     assert [(r.action_id, r.action_type, r.reason) for r in rejected] == [
@@ -176,6 +180,9 @@ def test_parser_exception_rejects_only_its_hint() -> None:
 @pytest.mark.parametrize(
     "fetch_payload",
     [
+        None,
+        [],
+        "bad",
         {"block_hashes": [1]},
         {"source_control_endpoint": "", "block_hashes": [1]},
         {"source_control_endpoint": "tcp://source:1", "block_hashes": []},
@@ -194,9 +201,13 @@ def test_kv_fetch_invalid_payload_is_rejected(fetch_payload: object) -> None:
     kv_hint.actions[0] = msgspec.structs.replace(
         kv_hint.actions[0], payload=fetch_payload
     )
+    kv_hint.actions.append(_fetch_hint("ok", "tcp://source:1", (1,)))
     hints, rejected = parse_hints(kv_hint, _types())
-    assert hints == []
+    assert hints == [_KVFetchHint("ok", "tcp://source:1", frozenset({1}))]
     assert len(rejected) == 1 and rejected[0].status is HintStatus.REJECTED
+    if not isinstance(fetch_payload, dict):
+        decoded = _decode_control_message(msgspec.msgpack.encode(kv_hint))
+        assert parse_hints(decoded, _types()) == (hints, rejected)
 
 
 def test_supplied_hint_type_is_parsed():

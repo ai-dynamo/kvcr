@@ -25,6 +25,10 @@ class _HintAction(msgspec.Struct, frozen=True):
     payload: dict[str, object]
 
 
+# Control-socket envelopes above this size are dropped without being decoded.
+MAX_HINT_MESSAGE_BYTES = 16 << 20
+
+
 class KvHintsEnvelope(msgspec.Struct, frozen=True):
     """The request-compatible envelope carried by hint messages."""
 

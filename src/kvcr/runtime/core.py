@@ -10,7 +10,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
-from itertools import islice
+from itertools import count, islice
 from math import ceil, gcd
 from typing import TYPE_CHECKING
 
@@ -224,6 +224,9 @@ class _KVCRCore:
         self._cancel_pin_request_callback = bindings.cancel_pin_request
         self.framework_control = bindings.framework_control
         self._key_adapter = bindings.key_adapter
+        self._source_index_enabled = (
+            self.framework_control is not None or self._key_adapter is not None
+        )
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
@@ -252,6 +255,8 @@ class _KVCRCore:
         # Serialize caller metadata transactions with progress-side source claims.
         self._state_lock = threading.RLock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
+        # G2/G3 identities share the source reader lock; sets hold collisions.
+        self._block_hash_map: dict[int | bytes, BlockKey | set[BlockKey]] = {}
         # Preserve remote selections until a successful fetch or discard_hint().
         self._remote_delivery_keys: dict[str, set[BlockKey]] = {}
         self._no_retain: set[int] = set()
@@ -272,7 +277,8 @@ class _KVCRCore:
         # Both seeded from the clock rather than a constant, so a refusal sent before a
         # restart cannot complete a different operation that reused the number.
         handle_seed = time.monotonic_ns()
-        self._next_op_handle: OpHandle = OpHandle(handle_seed)
+        # CPython advances integer count atomically across caller/progress threads.
+        self._op_handles = count(handle_seed)
         self._next_fill_handle: OpHandle = OpHandle(-handle_seed)
 
         # Operational clock and optional telemetry clock.
@@ -366,6 +372,7 @@ class _KVCRCore:
             self._remote_fw_dram.poll_progress,
             self._remote_fw_dram.flush_progress,
             close_progress,
+            consume_completed=self._independent_hint_handler.poll,
             nixl_agent_name=self.nixl_agent_name,
             nixl_listen_port=self.config.nixl_listen_port,
             dram_backends=list(dram_backends),
@@ -402,6 +409,7 @@ class _KVCRCore:
         local_dram._pools.adopt_recovery_slots(records)
         if g3 is not None:
             g3.adopt_recovery_slots(records)
+        self._update_block_hash_map(records)
 
         # One admission per block: _on_ingest fires only for a single-tier block,
         # so routing through it would skip everything recovered into both.
@@ -432,8 +440,9 @@ class _KVCRCore:
         self._hints_dispatcher.submit(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
-        self._remote_delivery_keys.pop(request_id, None)
-        self._remote_fw_dram.discard_hint(request_id)
+        with self._state_lock:
+            self._remote_delivery_keys.pop(request_id, None)
+            self._remote_fw_dram.discard_hint(request_id)
 
     def resolve_hashes(
         self, hashes: Collection[int]
@@ -441,54 +450,42 @@ class _KVCRCore:
         dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]],
         dict[int, str],
     ]:
-        """Resolve advisory identities under the owner lock; the later transfer
-        claims source memory. Returns the transferable blocks grouped by
+        """Snapshot advisory identities under the source reader lock; the later
+        transfer claims source memory. Returns transferable blocks grouped by
         (layout, piece sizes) as key -> hash, and the reason each other hash failed."""
-        adapter = self._key_adapter
-        if adapter is None:
+        if self._key_adapter is None:
             return {}, dict.fromkeys(hashes, "key_adapter_unavailable")
-        groups: dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]] = {}
+        if self._local_dram is None:
+            return {}, dict.fromkeys(hashes, "source_not_transferable")
+        state = self._local_dram._pools._source_state
         failures: dict[int, str] = {}
+        snapshots = []
+        pending = iter(hashes)
+        # Bounded holds; the snapshot is advisory.
+        while chunk := tuple(islice(pending, 4096)):
+            with state.lock:
+                for block_hash in chunk:
+                    entry = self._block_hash_map.get(block_hash)
+                    if entry is None:
+                        failures[block_hash] = "not_found"
+                    elif isinstance(entry, set):
+                        failures[block_hash] = "ambiguous_hash"
+                    else:
+                        key = entry
+                        local = state.index.get(key)
+                        if local is None:
+                            failures[block_hash] = "source_not_transferable"
+                        else:
+                            snapshots.append((block_hash, key, local.key_layout))
+        groups: dict[tuple[tuple[str, ...], tuple[int, ...]], dict[BlockKey, int]] = {}
         sizes_by_layout: dict[tuple[str, ...], tuple[int, ...]] = {}
-        lookup_failed = False
-        for block_hash in hashes:
-            try:
-                key = adapter.decode_from_router(block_hash)
-            except KeyError:
-                failures[block_hash] = "not_found"
-                continue
-            except ValueError:
-                failures[block_hash] = "ambiguous_hash"
-                continue
-            except Exception:
-                # An adapter error fails this hash, not the whole request.
-                if not lookup_failed:
-                    lookup_failed = True
-                    logger.warning("Hash metadata lookup failed", exc_info=True)
-                failures[block_hash] = "resolution_failed"
-                continue
-            record = self._block_record_map.get(key)
-            local = record.local_dram if record is not None else None
-            layout = local.key_layout if local is not None else None
-            if (
-                local is None
-                or record.pending_invalidation
-                or local.state is not _LocalDramState.READY
-                or local.pending_labels
-                or not layout
-            ):
-                failures[block_hash] = "source_not_transferable"
-                continue
+        for block_hash, key, layout in snapshots:
             sizes = sizes_by_layout.get(layout)
             if sizes is None:
                 sizes = sizes_by_layout[layout] = tuple(
                     self._block_sizes[label.partition(":")[0]] for label in layout
                 )
-            resolved = groups.setdefault((layout, sizes), {})
-            if key in resolved and resolved[key] != block_hash:
-                failures[block_hash] = "resolution_failed"
-            else:
-                resolved[key] = block_hash
+            groups.setdefault((layout, sizes), {})[key] = block_hash
         return groups, failures
 
     def _has_complete_local(self, key: BlockKey) -> bool:
@@ -514,51 +511,64 @@ class _KVCRCore:
         Remote availability follows the hint's membership rules; ``kv.fetch``
         may also use opportunistic querying when enabled.
         Usable remote selections persist until successful fetch or discard_hint.
+        Residency is advisory; fetch/deliver revalidate it before claiming storage.
         """
         statuses = []
-        remote_keys = self._remote_delivery_keys.get(request_id, ())
+        local_dram, remote = self._local_dram, self._remote_fw_dram
+        remote_keys = self._remote_delivery_keys.get(request_id)
+        if remote_keys is None and request_id in remote._request_hints:
+            remote_keys = self._remote_delivery_keys.setdefault(request_id, set())
         for key in keys:
-            record = self._block_record_map.get(key)
-            if record is not None and record.pending_invalidation:
-                statuses.append((QueryStatus.MISS, None))
-                continue
-            residency = record.local_dram if record is not None else None
-            if key in remote_keys:
-                fetching_locally = (
-                    residency is not None
-                    and residency.state is _LocalDramState.FILLING
-                    and any(
-                        op_id[0] == "fetch"
-                        and (op := self._local_dram._pending_residency_ops.get(op_id))
-                        is not None
-                        and op.request_id == request_id
-                        and key not in op.results
-                        for op_id in record.active_op_ids
-                    )
-                )
-                if not fetching_locally:
-                    if self._remote_fw_dram.query(key, request_id):
-                        statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
-                        continue
-                    if not self._has_complete_local(key):
-                        statuses.append((QueryStatus.MISS, None))
-                        continue
-            if residency is not None and residency.state is _LocalDramState.READY:
-                statuses.append((QueryStatus.HIT, CacheTier.LOCAL_G2))
-            elif residency is not None and residency.state is _LocalDramState.FILLING:
-                statuses.append((QueryStatus.FETCHING, CacheTier.LOCAL_G2))
-            elif record is not None and record.g3 is not None:
-                statuses.append((QueryStatus.FETCHABLE, CacheTier.G3))
-            # Remote hints are request-scoped and advisory, not block residency.
-            elif request_id is not None and self._remote_fw_dram.query(key, request_id):
-                statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
-                if not remote_keys:
-                    remote_keys = self._remote_delivery_keys.setdefault(
-                        request_id, set()
-                    )
+            keep_remote = remote_keys is not None and key in remote_keys
+            # Only the caller adds selections; progress may remove them. Insert
+            # before observing residency so a concurrent fetch completion wins.
+            if remote_keys is not None and not keep_remote:
                 remote_keys.add(key)
-            else:
-                statuses.append((QueryStatus.MISS, None))
+            try:
+                record = self._block_record_map.get(key)
+                if record is not None and record.pending_invalidation:
+                    statuses.append((QueryStatus.MISS, None))
+                    continue
+                residency = record.local_dram if record is not None else None
+                if keep_remote:
+                    fetching_locally = (
+                        residency is not None
+                        and residency.state is _LocalDramState.FILLING
+                        and any(
+                            op_id[0] == "fetch"
+                            and (op := local_dram._pending_residency_ops.get(op_id))
+                            is not None
+                            and op.request_id == request_id
+                            and key not in op.results
+                            for op_id in record.active_op_ids
+                        )
+                    )
+                    if not fetching_locally:
+                        if remote.query(key, request_id):
+                            statuses.append(
+                                (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+                            )
+                            continue
+                        if not self._has_complete_local(key):
+                            statuses.append((QueryStatus.MISS, None))
+                            continue
+                if residency is not None and residency.state is _LocalDramState.READY:
+                    statuses.append((QueryStatus.HIT, CacheTier.LOCAL_G2))
+                elif (
+                    residency is not None and residency.state is _LocalDramState.FILLING
+                ):
+                    statuses.append((QueryStatus.FETCHING, CacheTier.LOCAL_G2))
+                elif record is not None and record.g3 is not None:
+                    statuses.append((QueryStatus.FETCHABLE, CacheTier.G3))
+                # Remote hints are request-scoped and advisory, not block residency.
+                elif request_id is not None and remote.query(key, request_id):
+                    keep_remote = True
+                    statuses.append((QueryStatus.FETCHABLE, CacheTier.REMOTE_G2))
+                else:
+                    statuses.append((QueryStatus.MISS, None))
+            finally:
+                if remote_keys is not None and not keep_remote:
+                    remote_keys.discard(key)
         if self._query_diagnostics is not None:
             self._log_query_diagnostics(statuses, request_id)
         return statuses
@@ -628,8 +638,7 @@ class _KVCRCore:
         blocks: Mapping[BlockKey, list[MemoryRef]],
         request_id: str | None = None,
     ) -> OpHandle:
-        op_handle = self._next_op_handle
-        self._next_op_handle += 1
+        op_handle = next(self._op_handles)
         deadline = self._operation_deadline()
         local_dram = self._local_dram
         normalized = {
@@ -716,8 +725,6 @@ class _KVCRCore:
         expected_layout: list[str] | None = None,
     ) -> OpHandle:
         declaration = self._validate_expected_layout(expected_layout)
-        op_handle = self._next_op_handle
-        self._next_op_handle += 1
         if self._local_dram is not None:
             blocks = {
                 key: self._normalize_descriptors(descriptors)
@@ -739,6 +746,7 @@ class _KVCRCore:
                     raise ValueError(
                         "deposit pieces must belong to the local key layout"
                     )
+        op_handle = next(self._op_handles)
         with self._state_lock:
             if self._local_dram is None:
                 self._complete(
@@ -780,6 +788,7 @@ class _KVCRCore:
         *,
         source_endpoint: str | None = None,
         move: bool = False,
+        _op_handle: OpHandle | None = None,
     ) -> OpHandle:
         if move:
             if not isinstance(source_endpoint, str) or not source_endpoint:
@@ -790,10 +799,10 @@ class _KVCRCore:
             [""] if expected_layout is None else expected_layout
         )
         requested = list(declaration)
-        op_handle = self._next_op_handle
-        self._next_op_handle += 1
         local_dram = self._local_dram
         ordered_keys = tuple(dict.fromkeys(keys))
+        # Independent callers register their handle before a synchronous hit.
+        op_handle = next(self._op_handles) if _op_handle is None else _op_handle
         with self._state_lock:
             if local_dram is None:
                 self._complete(
@@ -885,11 +894,8 @@ class _KVCRCore:
                     progress_items = self._local_dram.poll_main(progress_items)
                 self._remote_fw_dram.poll_main(progress_items)
                 self._drain_invalidation()
-        self._independent_hint_handler.poll()
-        completed = self._completion_queue
-        self._completion_queue = []
-        if self._independent_hint_handler._pending_operations:
-            completed = self._independent_hint_handler.finish(completed)
+            completed = self._completion_queue
+            self._completion_queue = []
         if self._nvtx_operations:
             for handle, _ in completed:
                 trace = self._nvtx_operations.pop(handle, None)
@@ -924,10 +930,11 @@ class _KVCRCore:
 
     def get_stats(self) -> TelemetryStats | None:
         self._progress.raise_if_failed()
-        stats = self._stats
-        if stats is None:
+        if self._stats is None:
             return None
+        replacement = self._stats_factory() if self._stats_factory else None
         with self._state_lock:
+            stats, self._stats = self._stats, replacement
             resources = {
                 "block_records": len(self._block_record_map),
                 "in_flight_ops": self._outstanding_operations,
@@ -943,7 +950,6 @@ class _KVCRCore:
                 resources.update(self._g3.telemetry_state())
         for resource, value in resources.items():
             stats.set_gauge(STATE_METRIC, value, (resource,))
-        self._stats = self._stats_factory() if self._stats_factory else None
         return stats
 
     def close(self) -> None:
@@ -1031,7 +1037,7 @@ class _KVCRCore:
         request_id: str | None,
     ) -> None:
         if self._query_diagnostics is not None and logger.isEnabledFor(logging.DEBUG):
-            # query() takes no lock; unlocked, callers share an ordinal.
+            # Keep diagnostic ordinals independent of metadata transactions.
             with self._query_diagnostics_lock:
                 ordinal = self._query_diagnostics.get(request_id, 0) + 1
                 self._query_diagnostics[request_id] = min(ordinal, 4)
@@ -1061,6 +1067,50 @@ class _KVCRCore:
                     hint.failed if hint is not None else None,
                 )
 
+    def _update_block_hash_map(self, keys: Iterable[BlockKey]) -> None:
+        """Encode core-locked residency; update the map under the reader lock."""
+        adapter = self._key_adapter
+        if adapter is None:
+            return
+        encoded = []
+        for key in keys:
+            try:
+                block_hash = adapter.encode_to_router(key)
+                if not isinstance(block_hash, (int, bytes)):
+                    raise TypeError("block hashes must be int or bytes")
+            except Exception:
+                logger.warning(
+                    "KVCR block hash encoding failed for %r", key, exc_info=True
+                )
+                continue
+            record = self._block_record_map.get(key)
+            local = record.local_dram if record is not None else None
+            # Invalidating/retiring copies retain identity until actually removed.
+            resident = record is not None and (
+                record.g3 is not None
+                or local is not None
+                and local.state is _LocalDramState.READY
+                and not local.pending_labels
+            )
+            encoded.append((block_hash, key, resident))
+        with self._local_dram._pools._source_state.lock:
+            block_hash_map = self._block_hash_map
+            for block_hash, key, resident in encoded:
+                entry = block_hash_map.get(block_hash)
+                if isinstance(entry, set):
+                    if resident:
+                        entry.add(key)
+                    else:
+                        entry.discard(key)
+                    if len(entry) == 1:
+                        block_hash_map[block_hash] = next(iter(entry))
+                elif resident:
+                    block_hash_map[block_hash] = (
+                        key if entry is None or entry == key else {entry, key}
+                    )
+                elif entry == key:
+                    del block_hash_map[block_hash]
+
     def _publish_inventory(
         self,
         keys: Collection[BlockKey],
@@ -1071,6 +1121,7 @@ class _KVCRCore:
         if not keys:
             return True
         event = InventoryEvent(tuple(keys), tier, removed)
+        self._update_block_hash_map(event.keys)
         callback = self._inventory_sink_callback
         kind = "removed" if removed else "stored"
         if callback is None:
@@ -1445,7 +1496,10 @@ class _KVCRCore:
         trace = self._nvtx_operations.get(op_handle)
         if trace is not None:
             trace.completed(entries)
-        self._completion_queue.append((op_handle, entries))
+        if op_handle in self._independent_hint_handler._pending_operations:
+            self._independent_hint_handler._completed.append((op_handle, entries))
+        else:
+            self._completion_queue.append((op_handle, entries))
 
     # Timing and telemetry helpers.
 

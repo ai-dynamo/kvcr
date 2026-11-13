@@ -140,6 +140,7 @@ class _KVCRProgress:
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
+        consume_completed: Callable[[list[object]], list[object]] | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -147,6 +148,7 @@ class _KVCRProgress:
         self._poll = poll
         self._flush = flush
         self._close = close
+        self._consume_completed = consume_completed
         self._batch_size = batch_size or sys.maxsize
         self._nixl_agent_name = nixl_agent_name
         self._nixl_agent: Any | None = None
@@ -728,7 +730,16 @@ class _KVCRProgress:
                 self._in_flight_ops.pop(op_id)
                 completed_ops.append(op)
         completed = self._flush()
+        if self._completed_backlog:
+            # Native failure snapshots must reach the same consumer as finals.
+            completed[:0] = self._completed_backlog
+            self._completed_backlog.clear()
         completed.extend(completed_ops)
+        if self._consume_completed is not None:
+            backend_work |= bool(completed)
+            # Empty turns also retry work deferred by lock contention.
+            completed = self._consume_completed(completed)
+            backend_work |= not self._submissions.empty()
         self._completed_backlog.extend(completed)
         published += self._publish_completed(self._batch_size - published)
         return bool(submissions) or backend_work or bool(completed) or published > 0
