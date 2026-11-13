@@ -97,9 +97,9 @@ class OpEntryStatus(Enum):
     # on this worker broke, so the caller just recomputes.
     UNAVAILABLE = "UNAVAILABLE"
     TIMEOUT = "TIMEOUT"
-    # Given up deliberately, or the peer could not run the transfer.
+    # Interrupted before it finished (cancelled, shutdown, route change, refusal).
     ABORTED = "ABORTED"
-    # A fault on this worker.
+    # An unexpected error on either side (pin, create, transfer or setup).
     FAILED = "FAILED"
 
 

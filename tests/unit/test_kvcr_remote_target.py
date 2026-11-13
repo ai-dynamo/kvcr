@@ -439,11 +439,11 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
     caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     block_size = 16
-    local = ctypes.create_string_buffer(block_size * 3)
+    local = ctypes.create_string_buffer(block_size * 4)
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     events: list[InventoryEvent] = []
-    keys = tuple(BlockKey(f"k{i}".encode()) for i in range(3))
+    keys = tuple(BlockKey(f"k{i}".encode()) for i in range(4))
     target = _new_kvcr(
         agent,
         FakePrimaryPinning(),
@@ -455,9 +455,11 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     )
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert (
-        target.query(keys, "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)] * 3
+        target.query(keys, "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)] * 4
     )
     fetch = target.fetch(keys, request_id="req")
+    # A second fetch of the same request shares the fill and its failures.
+    second = target.fetch(keys, request_id="req")
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
     assert message["key_layout"] == [""]  # One declaration for the whole batch.
@@ -470,29 +472,35 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
         for handle in (str(message["op_handle"]), float("inf"))
     ] + [
         _write_done_notif(
-            message["op_handle"], True, (0, 2), unserved={"not_resident": [1]}
+            message["op_handle"],
+            True,
+            (0, 2),
+            unserved={"not_resident": [1], "pin_failed": [3]},
         )
     ]
 
     completed = _poll_until(target, lambda results: bool(results))
-    assert len(completed) == 1 and completed[0][0] == fetch
-    results = completed[0][1]
+    assert [handle for handle, _ in completed] == [fetch, second]
     available = (keys[0], keys[2])
     release_handles = []
-    for key in keys:
-        if key in available:
-            assert results[key].success
-            assert results[key].release_handle is not None
-            release_handles.append(results[key].release_handle)
-        else:
-            # The fill reports the source's per-key reason, as deliver does.
-            assert results[key] == OpEntryResult(
-                OpEntryStatus.UNAVAILABLE, reason="not_resident"
-            )
+    for _, results in completed:
+        for key in keys:
+            if key in available:
+                assert results[key].success
+                assert results[key].release_handle is not None
+                release_handles.append(results[key].release_handle)
+        # Both callers get the source's per-key reason, as deliver does.
+        assert results[keys[1]] == OpEntryResult(
+            OpEntryStatus.UNAVAILABLE, reason="not_resident"
+        )
+        assert results[keys[3]] == OpEntryResult(
+            OpEntryStatus.FAILED, reason="pin_failed"
+        )
     assert target.query(keys, "req") == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.MISS, None),
     ]
     assert events == [InventoryEvent(available, CacheTier.LOCAL_G2, False)]
     (fetched,) = [
@@ -613,8 +621,8 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     now = 1.5  # Past T, but still inside the destination's grace period.
     # Both waiters learn that the shared fill timed out, whichever side noticed.
     assert dict(_poll_until(target, lambda completed: len(completed) == 2)) == {
-        fetch: _op_entries({key: OpEntryStatus.TIMEOUT}),
-        second_fetch: _op_entries({key: OpEntryStatus.TIMEOUT}),
+        fetch: _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")}),
+        second_fetch: _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")}),
     }
     if resolution != "queued":
         assert target.query((key,), "req") == [

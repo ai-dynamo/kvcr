@@ -683,6 +683,7 @@ class _LocalDram:
             )
             # This copy holds a writer count, so writers cannot have been settled.
             writers = cast(list[int], residency.writers)
+            owner_requests: set[str | None] = set()
             for index in indices:
                 writers[index] -= 1
                 if writers[index] < 0:
@@ -740,6 +741,7 @@ class _LocalDram:
                     op = self._pending_residency_ops.get(op_id)
                     if op is not None and key in op.remote_fill_keys:
                         op.remote_fill_keys.remove(key)
+                        owner_requests.add(op.request_id)
                         if not key_success:
                             op.results[key] = failure
                             affected_residency_ops[op_id] = op
@@ -761,6 +763,19 @@ class _LocalDram:
                 ):
                     if residency_op.sources is not None:
                         queued_deposits.setdefault(op_id, []).append(key)
+                        continue
+                    if (
+                        not key_success
+                        and failures
+                        and key in failures
+                        and residency_op.request_id is not None
+                        and residency_op.request_id in owner_requests
+                    ):
+                        # Same request, same hint: a retry would only see the
+                        # hint this failure invalidated, so share the failure.
+                        # Other requests retry with their own hint.
+                        residency_op.results[key] = failure
+                        affected_residency_ops[op_id] = residency_op
                         continue
                     if not self._resolve_fetch_waiter(key, residency_op):
                         continue

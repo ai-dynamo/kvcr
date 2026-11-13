@@ -24,7 +24,9 @@ from ..types import BlockKey, OpEntryResult, OpEntryStatus, Reason, RegionDescri
 logger = logging.getLogger(__name__)
 _SUCCESS_RESULT = OpEntryResult(OpEntryStatus.SUCCESS)
 _FAILED_RESULT = OpEntryResult(OpEntryStatus.FAILED)
-_TIMEOUT_RESULT = OpEntryResult(OpEntryStatus.TIMEOUT)
+_TIMEOUT_RESULT = OpEntryResult(
+    OpEntryStatus.TIMEOUT, reason=Reason.DEADLINE.wire
+)
 _DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
