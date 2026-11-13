@@ -412,9 +412,9 @@ def test_missing_hint_has_specific_reason(recording):
     handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
     result = dict(kvcr.poll_completed())
     assert not result[handle][BlockKey(b"k")].success
-    assert int(payloads(recording, "op.completion_returned")[0]["reason"]) == int(
-        _nvtx.Reason.HINT_UNAVAILABLE
-    )
+    [returned] = payloads(recording, "op.completion_returned")
+    assert int(returned["reason"]) == int(_nvtx.Reason.HINT_UNAVAILABLE)
+    assert int(returned["status"]) == _nvtx.Status.REJECTED  # No source answered.
 
 
 def test_failed_hint_rejection_names_its_reason(recording):

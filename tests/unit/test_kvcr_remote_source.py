@@ -1367,6 +1367,8 @@ def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(kvcr_caplog
     control = FakeBytesControl()
     key = BlockKey(b"k0")
     kvcr = _new_kvcr(source_agent, pinning, control, name="source")
+    now = 0.0
+    kvcr._core._clock = lambda: now
 
     control.incoming.append(_start_write_message(5, key))
     _poll_until(
@@ -1378,11 +1380,18 @@ def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(kvcr_caplog
     )
     assert source_agent.released_xfers == []
     assert pinning.unpins == []
+    # Cleanup past the deadline must not change the cause already reported.
+    now = 1e6
     source_agent.state = "DONE"
     assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
     assert source_agent.released_xfers == [1]
     assert pinning.unpins == ["pin"]
-    assert _decode_notif(source_agent.sent_notifs[-1][1]) == {
+    notices = [_decode_notif(raw) for _, raw in source_agent.sent_notifs]
+    assert [(n.get("terminal", True), n["reason"]) for n in notices] == [
+        (False, "transfer_failed"),
+        (True, "transfer_failed"),
+    ]
+    assert notices[-1] == {
         "type": "write_done",
         "op_handle": 5,
         "success": False,

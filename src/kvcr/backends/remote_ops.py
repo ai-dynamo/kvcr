@@ -4,7 +4,7 @@
 
 import logging
 from collections import Counter
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -593,18 +593,15 @@ class _SourceWriteOp(_RemoteOp):
                 self.success = True
                 self.state = _SourceWriteState.FINISHED
                 # Nothing to write: a miss, or this source's own fault.
-                result = _outcome(
-                    _dominant_wire(self._unserved_reasons()) or Reason.NOT_RESIDENT.wire
-                )
+                largest = _largest_group(self.unserved)
+                result = _outcome(largest or Reason.NOT_RESIDENT.wire)
                 backend._record_progress_duration(
                     "source_write", self.started_at, result
                 )
                 self._log_completed(result)
                 backend._dangling_ops.finish_source(self)
                 if trace is not None:
-                    trace.complete_source(
-                        True, 0, reason=_dominant_reason(self._unserved_reasons())
-                    )
+                    trace.complete_source(True, 0, reason=_nvtx_reason(largest))
                 return True, True
             submit_started_at = backend._kvcr._timer()
             status.submitted = True
@@ -625,11 +622,10 @@ class _SourceWriteOp(_RemoteOp):
                     trace=trace,
                 )
                 self.transfer_id = transfer_id
-                self.state = (
-                    _SourceWriteState.WRITING
-                    if submitted
-                    else _SourceWriteState.CANCEL_PENDING
-                )
+                if submitted:
+                    self.state = _SourceWriteState.WRITING
+                else:
+                    self._begin_cancel(Reason.TRANSFER_FAILED)
                 result = "success" if submitted else "failed"
                 backend._record_progress_duration(
                     "transfer_submit", submit_started_at, result
@@ -672,7 +668,9 @@ class _SourceWriteOp(_RemoteOp):
         if self.state is not _SourceWriteState.CANCEL_PENDING and (
             status.cancel_requested or backend._kvcr._clock() >= self.deadline
         ):
-            self.state = _SourceWriteState.CANCEL_PENDING
+            self._begin_cancel(
+                Reason.CANCELLED if status.cancel_requested else Reason.DEADLINE
+            )
             if trace is not None:
                 trace.cancel_requested(
                     "source.write.cancel_requested", status.cancel_requested
@@ -684,7 +682,7 @@ class _SourceWriteOp(_RemoteOp):
         )
         if transfer_result is None:
             if progress._active_transfers[transfer_id].outcome is False:
-                self.state = _SourceWriteState.CANCEL_PENDING
+                self._begin_cancel(Reason.TRANSFER_FAILED)
             return False, observed_work
         self.transfer_id = None
         success, telemetry = transfer_result
@@ -698,7 +696,7 @@ class _SourceWriteOp(_RemoteOp):
                 ("source_write",),
             )
         else:
-            failure_reason = self.abort_reason(status.cancel_requested)
+            failure_reason = self.abort_reason()
             backend._send_write_done(
                 progress,
                 self.remote_agent,
@@ -719,15 +717,11 @@ class _SourceWriteOp(_RemoteOp):
             trace.complete_source(
                 self.success,
                 len(self.source_keys),
-                reason=_dominant_reason(self._unserved_reasons())
+                reason=_nvtx_reason(_largest_group(self.unserved))
                 if self.success and self.unserved
                 else None,
             )
         return True, True
-
-    def _unserved_reasons(self) -> Iterator[str]:
-        for reason, indices in self.unserved.items():
-            yield from (reason,) * len(indices)
 
     def _log_completed(self, result: str) -> None:
         if not logger.isEnabledFor(logging.DEBUG):
@@ -750,13 +744,15 @@ class _SourceWriteOp(_RemoteOp):
             ),
         )
 
-    def abort_reason(self, cancel_requested: bool) -> str:
-        # A failed transfer also passes through CANCEL_PENDING.
-        if cancel_requested:
-            return Reason.CANCELLED.wire
-        if self._backend._kvcr._clock() >= self.deadline:
-            return Reason.DEADLINE.wire
-        return Reason.TRANSFER_FAILED.wire
+    def _begin_cancel(self, cause: Reason) -> None:
+        # A failed transfer also passes through CANCEL_PENDING. The first cause
+        # stays the reported one however long cleanup takes.
+        self.state = _SourceWriteState.CANCEL_PENDING
+        if self.failure_reason is Reason.UNKNOWN:
+            self.failure_reason = cause
+
+    def abort_reason(self) -> str:
+        return self.failure_reason.wire
 
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
@@ -828,6 +824,11 @@ def _nvtx_reason(reason: str | None) -> Reason:
 def _dominant_wire(reasons: Iterable[str]) -> str | None:
     most_common = Counter(reasons).most_common(1)
     return most_common[0][0] if most_common else None
+
+
+def _largest_group(unserved: Mapping[str, list[int]]) -> str | None:
+    """The reason with the most indices; the first wins a tie."""
+    return max(unserved, key=lambda reason: len(unserved[reason]), default=None)
 
 
 def _dominant_reason(reasons: Iterable[str]) -> Reason:

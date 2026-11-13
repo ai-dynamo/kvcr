@@ -798,6 +798,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         (QueryStatus.MISS, None),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
     ]
+
     assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
     assert not source._core._remote_fw_dram._dangling_ops.source_writes
 
@@ -843,6 +844,31 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert target.query((key,), "req") == [(QueryStatus.MISS, None)]
     assert not _has_outstanding_operations(target)
 
+    # The source then fails a pull of the other key; the miss is still remembered.
+    failed_handle = target.deliver(
+        {key: [_mem_descriptor()], other_group: [_mem_descriptor()]}, request_id="req"
+    )
+    _wait_until(lambda: len(target_control.sent) == 2)
+    assert _decode_control_message(target_control.sent[1][1])["keys"] == [other_group]
+    target_agent.notifs["source"] = [
+        _write_done_notif(failed_handle, False, reason="deadline")
+    ]
+    assert _poll_until(target, bool) == [
+        (
+            failed_handle,
+            _op_entries(
+                {
+                    key: (OpEntryStatus.UNAVAILABLE, "remembered_miss"),
+                    other_group: (OpEntryStatus.TIMEOUT, "deadline"),
+                }
+            ),
+        )
+    ]
+    # Rejections before a pull starts are counted too.
+    target.deliver({key: [_mem_descriptor()]}, "req")
+    target.deliver({key: [_mem_descriptor()]}, "no-hint")
+    _poll_until(target, lambda done: len(done) == 2)
+
     target.submit_hint(_router_hint("tcp://source:1"), request_id="other")
     assert target.query((key,), "other") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
@@ -857,12 +883,15 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert ("remote_deliver", "failed") not in _duration_labels(target_records)
     # Only the target counts undelivered blocks; the source has its result label.
     assert not any(name == UNSERVED_BLOCKS_METRIC for _, name, _, _ in source_records)
-    assert (
-        "counter",
-        UNSERVED_BLOCKS_METRIC,
-        1,
-        ("remote_deliver", "not_resident"),
-    ) in target_records
+    # A source timeout is labelled as one; every block is counted once, by reason.
+    assert ("remote_deliver", "timeout") in _duration_labels(target_records)
+    assert _unserved_counts(target_records) == {
+        ("remote_deliver", "not_resident"): 1,
+        ("remote_deliver", "remembered_miss"): 3,
+        ("remote_deliver", "deadline"): 1,
+        ("remote_deliver", "hint_invalidated"): 1,
+        ("remote_deliver", "hint_unavailable"): 1,
+    }
 
 
 def _duration_labels(records) -> set[tuple[str, ...]]:
@@ -1926,59 +1955,6 @@ def test_dead_source_probe_refusal_names_the_restart():
     )
     assert backend._refused_writes == {
         ("target", 7): {"success": False, "reason": "source_restarted"}
-    }
-
-
-def test_remembered_miss_survives_a_failed_pull():
-    agent, control = FakeNixlAgent(), FakeBytesControl()
-    kvcr = _new_kvcr(
-        agent,
-        FakePrimaryPinning(),
-        control,
-        KVCRConfig(
-            nixl_agent_name="target", pool_layouts=[("", 16)], enable_telemetry=True
-        ),
-        key_adapter=_ConstantHashAdapter(),
-        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
-    )
-    served, missing = BlockKey(b"a"), BlockKey(b"b")
-    blocks = {served: [_mem_descriptor()], missing: [_mem_descriptor()]}
-    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-
-    first = kvcr.deliver(blocks, "req")
-    _wait_until(lambda: len(control.sent) == 1)
-    agent.notifs["source"] = [_write_done_notif(first, True, (0,))]
-    assert dict(_poll_until(kvcr, bool))[first][served].success
-
-    # Only the served key is requested again; the source then fails the pull.
-    second = kvcr.deliver(blocks, "req")
-    _wait_until(lambda: len(control.sent) == 2)
-    assert _decode_control_message(control.sent[1][1])["keys"] == [served]
-    agent.notifs["source"] = [_write_done_notif(second, False, reason="deadline")]
-    results = dict(_poll_until(kvcr, bool))[second]
-    assert results[served].status is OpEntryStatus.TIMEOUT
-    assert results[missing].status is OpEntryStatus.UNAVAILABLE
-    # Every requested key is counted once, by its own reason.
-    records = kvcr.get_stats().records
-    # A source timeout is labelled as one, not as a failure.
-    assert ("remote_deliver", "timeout") in _duration_labels(records)
-    assert ("remote_deliver", "failed") not in _duration_labels(records)
-    assert _unserved_counts(records) == {
-        ("remote_deliver", "unknown"): 1,
-        ("remote_deliver", "remembered_miss"): 1,
-        ("remote_deliver", "deadline"): 1,
-    }
-
-    # Rejections before a pull starts are counted too.
-    kvcr.deliver({missing: [_mem_descriptor()]}, "req")
-    kvcr.deliver({missing: [_mem_descriptor()]}, "no-hint")
-    _poll_until(kvcr, lambda done: len(done) == 2)
-    records = kvcr.get_stats().records
-    assert ("remote_deliver", "unavailable") in _duration_labels(records)
-    assert ("remote_deliver", "failed") not in _duration_labels(records)
-    assert _unserved_counts(records) == {
-        ("remote_deliver", "hint_invalidated"): 1,
-        ("remote_deliver", "hint_unavailable"): 1,
     }
 
 

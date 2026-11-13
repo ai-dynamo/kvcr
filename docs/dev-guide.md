@@ -508,7 +508,25 @@ A successful control acknowledgement does not prove payload correctness. A succe
 
 ### Remote delivery is partial
 
-Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks. `OpEntryResult.status` says what the caller should do: `UNAVAILABLE` means an expected miss or no usable route; `TIMEOUT` means the deadline passed; `ABORTED` means the transfer was cancelled or interrupted; `FAILED` means an unexpected error on either worker. `OpEntryResult.reason` carries the cause (`pin_failed`, `not_resident`, ...) or `None` when unspecified. The target counts every undelivered block once in `kvcr_unserved_blocks{scope, reason}`. See [remote-outcomes.md](remote-outcomes.md) for the reason-to-status mapping.
+Partial delivery is expected when only part of a prefix remains readable. The integration should consume the longest valid delivered prefix, recompute the missing suffix, and preserve output correctness. Diagnose reductions at each stage: router-planned blocks, source-resident blocks, pinned blocks, submitted blocks, completed blocks, and destination-published blocks. `OpEntryResult.status` says what the caller should do: `UNAVAILABLE` means an expected miss or no usable route; `TIMEOUT` means the deadline passed; `ABORTED` means the transfer was cancelled or interrupted; `FAILED` means an unexpected error on either worker. `OpEntryResult.reason` carries the cause (`pin_failed`, `not_resident`, ...) or `None` when unspecified. The target counts every undelivered block once in `kvcr_unserved_blocks{scope, reason}`.
+
+#### Remote outcome reporting
+
+The status describes the operation, not the reporting worker, and it only answers what the caller should do: use the block, or recompute it. The reason is detail and never widens the status set. One reason vocabulary (`kvcr.types.Reason`, lower-cased) is used on the wire (`write_done.reason`, `write_done.unserved`), in `OpEntryResult.reason`, in metric labels, in logs and in NVTX. A known reason maps to the same status whether the source reports it for one block or for the whole write, and a target accepts only known names from a peer. A block the source left out without a reason is `UNAVAILABLE` with no reason. Words such as failed or error are reserved for unexpected errors: an expected cache miss is `UNAVAILABLE`, and the duration label is `miss`.
+
+| Reason | Status | Duration label | Target action |
+|---|---|---|---|
+| `not_resident` | `UNAVAILABLE` | `miss` | Remember the miss for this request |
+| `remembered_miss` | `UNAVAILABLE` | `miss` | Skip without asking the source |
+| `hint_unavailable`, `hint_invalidated` | `UNAVAILABLE` | `unavailable` | Nothing to pull |
+| `deadline`, `source_stalled` | `TIMEOUT` | `timeout` | Drop the route for this request |
+| `cancelled`, `stopping`, `shutdown`, `route_changed` | `ABORTED` | `aborted` | Drop the route |
+| `refused`, `source_restarted`, `metadata_required` | `ABORTED` | `aborted` | Re-exchange metadata |
+| `pin_failed`, `layout_mismatch` | `FAILED` | `failed` | Remember the miss; keep the route |
+| `create_error`, `transfer_failed`, `setup_failed`, `malformed`, `remote_failure` | `FAILED` | `failed` | Drop the route |
+| `control_error`, `invalid_notification` | `FAILED` | `failed` | Drop the route; WARNING log |
+
+Each block keeps its own result. When nothing was delivered, the operation's duration label comes from the most common reason the source gave; when some blocks were delivered it is `partial`. For example, 8 blocks all reported `pin_failed` give `failed` and 8 × `FAILED`/`pin_failed`; 5 written and 3 `not_resident` give `partial`, 5 × `SUCCESS` and 3 × `UNAVAILABLE`/`not_resident`. The target is the only side that counts undelivered blocks (`kvcr_unserved_blocks{scope, reason}`), because it requested every block exactly once and sees early rejections the source never hears about; the source reports its own `source_write{result}` label and logs its own faults. NVTX adds status `10 MISS` for a source that answered but held none of the blocks, never for a missing route.
 
 ### Operations time out or fail slowly
 

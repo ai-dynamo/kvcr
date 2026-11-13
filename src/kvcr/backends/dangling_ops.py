@@ -85,7 +85,7 @@ class _DanglingOps:
                 op.op_handle,
                 False,
                 terminal=False,
-                reason=op.abort_reason(status.cancel_requested),
+                reason=op.abort_reason(),
             )
         result = progress.poll_transfer(
             cast(int, op.transfer_id), require_completion=True

@@ -315,6 +315,16 @@ class _LifecycleTrace:
             reason=Reason.CANCELLED if cancelled else Reason.DEADLINE,
         )
 
+    @staticmethod
+    def _unavailable_status(entries):
+        # No source answered when there was no route to ask; that is not a miss.
+        no_route = (Reason.HINT_UNAVAILABLE.wire, Reason.HINT_INVALIDATED.wire)
+        return (
+            Status.REJECTED
+            if all(entry.reason in no_route for entry in entries.values())
+            else Status.MISS
+        )
+
     def completed(self, entries):
         try:
             completed = sum(entry.success for entry in entries.values())
@@ -324,7 +334,7 @@ class _LifecycleTrace:
                 if all_completed
                 else Status.PARTIAL
                 if completed
-                else Status.MISS
+                else self._unavailable_status(entries)
                 if entries
                 and all(
                     entry.status is OpEntryStatus.UNAVAILABLE
