@@ -563,7 +563,9 @@ class _LocalDram:
                 )
         return None
 
-    def complete_fill(self, keys: Collection[BlockKey], *, success: bool) -> None:
+    def complete_fill(
+        self, keys: Collection[BlockKey], *, success: bool
+    ) -> list[BlockKey]:
         ordered_keys = tuple(keys)
         indices = []
         for key in ordered_keys:
@@ -572,7 +574,7 @@ class _LocalDram:
             if residency is None or residency.remote_indices is None:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             indices.append(residency.remote_indices)
-        self._apply_fill_result(
+        return self._apply_fill_result(
             ordered_keys, tuple(indices), success, CacheTier.REMOTE_G2
         )
 
@@ -716,7 +718,7 @@ class _LocalDram:
         *,
         writer: _PendingResidencyOp | None = None,
         dst_descriptors: tuple[_TransferRef, ...] = (),
-    ) -> None:
+    ) -> list[BlockKey]:
         committed: list[BlockKey] = []
         failed: list[BlockKey] = []
         affected_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -851,6 +853,7 @@ class _LocalDram:
         for key in failed:
             self._kvcr._prune_block_record(key)
         self._resume_capacity_waiters()
+        return committed
 
     def _resolve_fetch_waiter(
         self,

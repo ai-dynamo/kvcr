@@ -87,6 +87,7 @@ class _RemoteSources:
         if item.state in (
             _SourceWriteState.FINISHED,
             _SourceWriteState.CANCEL_PENDING,
+            _SourceWriteState.WAITING_ACK,
         ):
             if item.local_sources is not None:
                 # local.poll_main drains reader releases with their access
@@ -97,7 +98,7 @@ class _RemoteSources:
             # KVCR-owned contents stay claimed until native quiescence.
             pins = self._fw_pins_by_op.pop(item.op_id, None)
             if item.state is _SourceWriteState.FINISHED:
-                if item.moving and not item.success:
+                if item.moving:
                     self._kvcr._invalidation_handler.reopen(item.moving)
                 self._kvcr._remove_block_dependencies(item)
                 if item.success:

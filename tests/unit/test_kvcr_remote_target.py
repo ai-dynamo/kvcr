@@ -572,7 +572,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
     operation = progress._in_flight_ops[("target", message["op_handle"])]
     deadline = 1.0
-    assert operation.deadline == deadline
+    assert operation.deadline == deadline and operation.abandon_deadline == 2.0
     assert not operation.close(progress)
     with pytest.raises(RuntimeError, match="unresolved operations"):
         progress._close_nixl()
@@ -1780,6 +1780,7 @@ class _Pair:
     def idle(self):
         return not any(
             _has_outstanding_operations(peer.kvcr)
+            or peer.kvcr._core._progress._in_flight_ops
             for peer in (self.source, self.target)
         )
 

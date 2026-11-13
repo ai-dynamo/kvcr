@@ -59,6 +59,7 @@ from .remote_ops import (
     _TargetPullOp,
     _TargetPullState,
     _write_done_notif,
+    _WriteAccepted,
     _WriteProbe,
     _WriteProbeAck,
     _WriteRefused,
@@ -128,6 +129,9 @@ class _RemoteFWDram:
             )
         self._kvcr = kvcr
         self._options = options
+        self._abandon_grace = (
+            kvcr.config.abandon_timeout_ms - kvcr.config.operation_timeout_ms
+        ) / 1000
         self._nvtx = _nvtx.create_tracer()
 
         # Main-thread state: request hints, source ownership, and progress state.
@@ -263,6 +267,7 @@ class _RemoteFWDram:
             keys=frozenset(blocks),
             started_at=started_at,
             deadline=deadline,
+            abandon_deadline=deadline + self._abandon_grace,
             op_id=("target", op_handle),
             remote_ctrl_ep=source,
             _backend=self,
@@ -472,8 +477,9 @@ class _RemoteFWDram:
                 if op.state is _TargetPullState.QUARANTINED:
                     # DISCARDING already failed callers, but still owns the slots.
                     return
+                accepted_keys = []
                 if completed_keys:
-                    kvcr._complete_local_dram_fill(
+                    accepted_keys = kvcr._complete_local_dram_fill(
                         tuple(key for key in op.ordered_keys if key in completed_keys),
                         success=True,
                     )
@@ -482,14 +488,26 @@ class _RemoteFWDram:
                         op.keys - completed_keys,
                         success=False,
                     )
-                return
-            kvcr._complete(
-                cast(OpHandle, op.op_id[1]),
-                {
-                    key: _SUCCESS_RESULT if key in completed_keys else _FAILED_RESULT
-                    for key in op.keys
-                },
-            )
+            else:
+                accepted_keys = completed_keys
+                kvcr._complete(
+                    cast(OpHandle, op.op_id[1]),
+                    {
+                        key: _SUCCESS_RESULT
+                        if key in completed_keys
+                        else _FAILED_RESULT
+                        for key in op.keys
+                    },
+                )
+            if op.move:
+                kvcr._progress.submit(
+                    _WriteAccepted(
+                        op_handle=op.op_id[1],
+                        keys=tuple(accepted_keys),
+                        source_incarnation=op.source_incarnation,
+                        source_control_endpoint=op.remote_ctrl_ep,
+                    )
+                )
         finally:
             if trace is not None:
                 trace.tracer.pop(pushed)
@@ -518,7 +536,7 @@ class _RemoteFWDram:
                 ):
                     continue
                 self._send_control(progress, item.endpoint, _TargetMetadata())
-            elif isinstance(item, (_Invalidate, _KeysToFetch)):
+            elif isinstance(item, (_Invalidate, _KeysToFetch, _WriteAccepted)):
                 # One-way: no reply is awaited and no public result depends on it.
                 if not self._send_control(progress, item.source_control_endpoint, item):
                     logger.warning(
@@ -596,6 +614,18 @@ class _RemoteFWDram:
             elif isinstance(payload, (_Invalidate, _KeysToFetch)):
                 # Owner-thread work: the main poll applies or starts it.
                 self._progress_outbound.append(payload)
+            elif isinstance(payload, _WriteAccepted):
+                status = self._dangling_ops.source_writes.get(
+                    (payload.target_agent, payload.op_handle)
+                )
+                if (
+                    status is not None
+                    and status.accepted_keys is None
+                    and payload.sender_incarnation
+                    and payload.sender_incarnation == status.target_incarnation
+                    and payload.source_incarnation == self._dangling_ops.incarnation
+                ):
+                    status.accepted_keys = set(payload.keys)
             elif isinstance(payload, _TargetMetadata):
                 self._handle_target_metadata(progress, payload)
             elif isinstance(payload, _TargetMetadataAck):
@@ -634,7 +664,13 @@ class _RemoteFWDram:
         includes_metadata = (
             not isinstance(
                 payload,
-                (_TargetMetadataAck, _WriteRefused, _Invalidate, _KeysToFetch),
+                (
+                    _TargetMetadataAck,
+                    _WriteRefused,
+                    _Invalidate,
+                    _KeysToFetch,
+                    _WriteAccepted,
+                ),
             )
             and endpoint not in self._metadata_acked_sources
             and (
@@ -836,7 +872,9 @@ class _RemoteFWDram:
                 )
             self._send_write_done(progress, remote_agent, op_handle, False)
             return
-        self._dangling_ops.source_writes[write_id] = _SourceWriteStatus()
+        self._dangling_ops.source_writes[write_id] = _SourceWriteStatus(
+            target_incarnation=payload.sender_incarnation
+        )
         op_id = ("source", self._next_source_op_id)
         self._next_source_op_id += 1
 

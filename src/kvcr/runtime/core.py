@@ -832,12 +832,6 @@ class _KVCRCore:
                 ):
                     sources[key] = CacheTier.REMOTE_G2
             deadline = self._operation_deadline()
-            if move:
-                # Accept delayed completion using the existing abandonment budget.
-                # The source independently caps its native transfer timeout.
-                deadline += (
-                    self.config.abandon_timeout_ms - self.config.operation_timeout_ms
-                ) / 1000
             destinations = local_dram.fetch(
                 op_handle,
                 ordered_keys,
@@ -1323,10 +1317,10 @@ class _KVCRCore:
 
     def _complete_local_dram_fill(
         self, keys: Collection[BlockKey], *, success: bool
-    ) -> None:
+    ) -> list[BlockKey]:
         if self._local_dram is None:
             raise RuntimeError("remote fetch completed without local DRAM")
-        self._local_dram.complete_fill(keys, success=success)
+        return self._local_dram.complete_fill(keys, success=success)
 
     def _discard_local_dram_fill(self, keys: Collection[BlockKey]) -> None:
         if self._local_dram is None:

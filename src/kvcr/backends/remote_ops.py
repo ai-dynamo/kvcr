@@ -80,6 +80,12 @@ class _WriteRefused(_PeerMessage, tag="write_refused"):
     reason: str | None = None
 
 
+class _WriteAccepted(_PeerMessage, tag="write_accepted"):
+    op_handle: OpHandle
+    keys: tuple[BlockKey, ...]
+    source_incarnation: str | None = None
+
+
 class _WriteProbe(_PeerMessage, tag="write_probe"):
     op_handle: OpHandle
     source_incarnation: str | None = None
@@ -98,6 +104,7 @@ _ControlMessage = (
     | _TargetMetadata
     | _TargetMetadataAck
     | _WriteRefused
+    | _WriteAccepted
     | _WriteProbe
     | _WriteProbeAck
 )
@@ -117,6 +124,7 @@ class _SourceWriteState(Enum):
     NOTIFY_FAILURE = auto()
     WRITING = auto()
     CANCEL_PENDING = auto()
+    WAITING_ACK = auto()
     FINISHED = auto()
 
 
@@ -135,6 +143,7 @@ class _TargetPullOp(_RemoteOp):
     state: _TargetPullState
     local_fill: bool
     remote_ctrl_ep: str
+    abandon_deadline: float
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     # Keys sent to the source; keys also includes remembered misses.
     ordered_keys: tuple[BlockKey, ...] = ()
@@ -249,6 +258,8 @@ class _TargetPullOp(_RemoteOp):
                 self.state = _TargetPullState.FINISHED
                 return True, True
             # After cancellation, native success only permits cleanup.
+            if isinstance(incarnation := event.get("source_incarnation"), str):
+                self.source_incarnation = incarnation
             success = (
                 event.get("success") is True
                 and not cancelled
@@ -333,10 +344,8 @@ class _TargetPullOp(_RemoteOp):
             # elapsed time alone cannot make its destination safe to reuse.
             return False, backend._dangling_ops.poll_target(progress, self)
 
-        if now >= self.deadline or (
-            cancelled and self.state is _TargetPullState.WAITING_WRITE_DONE
-        ):
-            if self.state is _TargetPullState.WAITING_TERMINAL:
+        if self.state is _TargetPullState.WAITING_TERMINAL:
+            if now >= self.abandon_deadline:
                 self.state = _TargetPullState.QUARANTINED
                 if trace is not None:
                     trace.mark(
@@ -349,13 +358,16 @@ class _TargetPullOp(_RemoteOp):
                 backend._dangling_ops.poll_target(progress, self)
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
+            if not self.probe_sent:
+                # Retry failed enqueues without extending either deadline.
+                self.probe_sent = backend._dangling_ops.probe(progress, self)
+                return False, self.probe_sent
+            return False, False
+
+        if now >= self.deadline or cancelled:
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
                 trace.cancel_requested("target.cancel_requested", cancelled)
-            config = backend._kvcr.config
-            self.deadline += (
-                config.abandon_timeout_ms - config.operation_timeout_ms
-            ) / 1000
             backend._invalidate_control_peer(self.remote_ctrl_ep)
             self.probe_sent = backend._dangling_ops.probe(progress, self)
             if self.local_fill:
@@ -366,10 +378,6 @@ class _TargetPullOp(_RemoteOp):
                     )
                 )
             return False, True
-        if self.state is _TargetPullState.WAITING_TERMINAL and not self.probe_sent:
-            # Retry failed enqueues without extending the grace period.
-            self.probe_sent = backend._dangling_ops.probe(progress, self)
-            return False, self.probe_sent
         return False, False
 
     def close(self, progress: _KVCRProgress) -> bool:
@@ -409,7 +417,7 @@ class _SourceWriteOp(_RemoteOp):
     completed_indices: tuple[int, ...] = ()
     route: tuple[str, int] = ("", 0)
     nvtx_state: _NvtxState | None = None
-    # Keys this move marked pending at the source; reopened if the write fails.
+    # Pending move keys; unacknowledged keys are reopened at completion.
     moving: tuple[BlockKey, ...] = ()
     # None uses caller cleanup; a tuple (even empty) is owned by progress.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
@@ -427,6 +435,16 @@ class _SourceWriteOp(_RemoteOp):
         observed_work = False
         write_id = (self.route[0], self.op_handle)
         status = backend._dangling_ops.source_writes[write_id]
+        if self.state is _SourceWriteState.WAITING_ACK:
+            accepted = status.accepted_keys
+            if status.cancel_requested or backend._kvcr._clock() >= self.deadline:
+                accepted = set()
+            elif accepted is None:
+                return False, False
+            self.moving = tuple(key for key in self.moving if key not in accepted)
+            self.state = _SourceWriteState.FINISHED
+            backend._dangling_ops.finish_source(self)
+            return True, True
         if self.transfer_id is None:
             if status.cancel_requested:
                 self.state = _SourceWriteState.NOTIFY_FAILURE
@@ -495,6 +513,9 @@ class _SourceWriteOp(_RemoteOp):
                         self.op_handle,
                         True,
                         completed_indices=self.completed_indices,
+                        source_incarnation=(
+                            backend._dangling_ops.incarnation if self.moving else None
+                        ),
                     ),
                     capture_telemetry=backend._telemetry_enabled,
                     trace=trace,
@@ -586,14 +607,26 @@ class _SourceWriteOp(_RemoteOp):
                 else 0,
                 result,
             )
-        self.state = _SourceWriteState.FINISHED
+        waiting_ack = self.success and bool(self.moving)
+        self.state = (
+            _SourceWriteState.WAITING_ACK if waiting_ack else _SourceWriteState.FINISHED
+        )
         backend._dangling_ops.finish_source(self)
         if trace is not None:
             trace.complete_source(self.success, len(self.source_keys))
+        if waiting_ack:
+            self.deadline += backend._abandon_grace
+            # Release framework pins now; keep move dependencies until acceptance.
+            backend._progress_outbound.append(replace(self))
+            return False, True
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
+        if self.state is _SourceWriteState.WAITING_ACK:
+            self.state = _SourceWriteState.FINISHED
+            self._backend._dangling_ops.finish_source(self)
+            return True
         if self.transfer_id is not None:
             if (
                 progress.poll_transfer(self.transfer_id, require_completion=True)
@@ -627,6 +660,7 @@ def _write_done_notif(
     completed_indices: tuple[int, ...] = (),
     *,
     terminal: bool = True,
+    source_incarnation: str | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": "write_done",
@@ -635,6 +669,8 @@ def _write_done_notif(
     }
     if success:
         payload["completed_indices"] = completed_indices
+    if source_incarnation is not None:
+        payload["source_incarnation"] = source_incarnation
     if not terminal:
         payload["terminal"] = False
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)

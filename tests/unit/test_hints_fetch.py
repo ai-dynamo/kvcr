@@ -207,6 +207,71 @@ def _idle(pair):
     assert not pair.target.results
 
 
+@pytest.mark.parametrize("ack", ["lost", "delayed_owner", "partial"])
+def test_source_eviction_waits_for_destination_acceptance(pair, monkeypatch, ack):
+    source, target = pair.source, pair.target
+    source.deposit(_TAIL_KEY, 1)
+    keys = (_KEY, _TAIL_KEY)
+    core = target.kvcr._core
+    endpoint = source.control.endpoint
+    held, send = [], target.control.send
+
+    def hold_ack(endpoint, raw):
+        message = _decode_control_message(raw)
+        if message["type"] == "write_accepted":
+            held.append(message)
+            return True
+        return send(endpoint, raw)
+
+    finish = core._remote_fw_dram._finish_target_pull
+
+    def finish_at_owner(op):
+        assert op.success  # Native success is already queued for the owner.
+        if ack == "delayed_owner":
+            core._clock = lambda: op.deadline + 1
+            core._local_dram._expire_pending_ops(core._clock())
+        elif ack == "partial":
+            core._local_dram.discard_fill((_TAIL_KEY,))
+        finish(op)
+
+    monkeypatch.setattr(target.control, "send", hold_ack)
+    monkeypatch.setattr(core._remote_fw_dram, "_finish_target_pull", finish_at_owner)
+    handle = core.fetch(keys, source_endpoint=endpoint, move=True)
+    source.agent.state = "DONE"
+    pair.until(lambda: handle in target.results and held)
+    results = target.results.pop(handle)
+    accepted = keys[:1] if ack == "partial" else keys
+    assert {key for key, result in results.items() if result.success} == set(accepted)
+    [message] = held
+    assert set(message["keys"]) == set(accepted)
+    for key in keys:
+        residency = source.kvcr._core._block_record_map[key].local_dram
+        assert residency is not None and residency.source_readers == 0
+    if ack == "lost":
+        source.kvcr._core._clock = lambda: 100
+    else:
+        # Stale destination/source incarnations must not consume the one ACK slot.
+        source.control.incoming.extend(
+            msgspec.msgpack.encode(dict(message, **{field: "stale", "keys": ()}))
+            for field in ("sender_incarnation", "source_incarnation")
+        )
+        source.control.incoming.append(msgspec.msgpack.encode(message))
+    claims = [results[key].release_handle for key in accepted]
+    assert target.kvcr.release(claims) == [(claim, True) for claim in claims]
+    _idle(pair)
+    expected = [
+        _MISS
+        if key in accepted and ack != "lost"
+        else (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        for key in keys
+    ]
+    assert source.kvcr.query(keys) == expected
+    # Duplicate/late ACKs cannot remove keys rejected by the owner or reopened.
+    source.control.incoming.append(msgspec.msgpack.encode(dict(message, keys=keys)))
+    pair.until(lambda: not source.control.incoming)
+    assert source.kvcr.query(keys) == expected
+
+
 @pytest.mark.parametrize(
     "reason",
     [
