@@ -400,25 +400,33 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
     if queued_success:
+        local[16:] = primary[16:]
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         _wait_until(lambda: not target._core._progress._completed.empty())
     now = 1.5
-    assert not dict(_poll_until(target, bool))[fetch][key].success
+    fetched = dict(_poll_until(target, bool))[fetch][key]
+    assert fetched.success is queued_success
+    if queued_success:
+        claim = fetched.release_handle
+        assert claim is not None
+        assert target.release([claim]) == [(claim, True)]
     assert target._core._block_record_map[key].local_dram is residency
     assert (residency.remote_indices is not None) is not queued_success
-    assert "p:b" in residency.pending_labels
+    assert ("p:b" in (residency.pending_labels or ())) is not queued_success
     primary[:16] = b"\0" * 16
     cached = target.deliver({key: [_mem_descriptor(0, label="p:a")]})
     result = dict(_poll_until(target, bool))[cached][key]
     assert result.success and primary.raw[:16] == b"a" * 16
-    assert events == []
+    assert events == (
+        [InventoryEvent((key,), CacheTier.LOCAL_G2, False)] if queued_success else []
+    )
     if not queued_success:
         agent.notifs["source"] = [
             _write_done_notification(message["op_handle"], success=False)
         ]
         _poll_until(target, lambda _: not _has_outstanding_operations(target))
-    retry = target.deposit({key: [_mem_descriptor(1, label="p:b")]})
-    assert dict(_poll_until(target, bool))[retry][key].success
+        retry = target.deposit({key: [_mem_descriptor(1, label="p:b")]})
+        assert dict(_poll_until(target, bool))[retry][key].success
     assert local.raw == primary.raw
     assert events == [InventoryEvent((key,), CacheTier.LOCAL_G2, False)]
 
@@ -563,6 +571,8 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     progress = target._core._progress
     _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
     operation = progress._in_flight_ops[("target", message["op_handle"])]
+    deadline = 1.0
+    assert operation.deadline == deadline
     assert not operation.close(progress)
     with pytest.raises(RuntimeError, match="unresolved operations"):
         progress._close_nixl()
@@ -579,22 +589,35 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
             )
         )
         _wait_until(lambda: operation.source_incarnation == "source")
+    now = deadline - 0.01
+    assert list(target.poll_completed()) == []
     if resolution == "queued":
         # Progress accepts success before expiry; main consumes it after expiry.
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         _wait_until(lambda: not target._core._progress._completed.empty())
 
-    now = 1.5  # Past T, but still inside the destination's grace period.
-    assert dict(_poll_until(target, lambda completed: len(completed) == 2)) == {
-        fetch: _op_entries({key: False}),
-        second_fetch: _op_entries({key: False}),
-    }
-    if resolution != "queued":
+    now = deadline  # Expired, but still before abandonment.
+    completed = dict(_poll_until(target, lambda completed: len(completed) == 2))
+    if resolution == "queued":
+        assert set(completed) == {fetch, second_fetch}
+        for result in completed.values():
+            assert result[key].success
+            claim = result[key].release_handle
+            assert claim is not None
+            assert target.release([claim]) == [(claim, True)]
+        assert target.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+        assert not errors
+    else:
+        assert completed == {
+            fetch: _op_entries({key: False}),
+            second_fetch: _op_entries({key: False}),
+        }
         assert target.query((key,), "req") == [
             (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
         ]
         assert _has_outstanding_operations(target)
         assert not operation.close(progress)
+        assert not errors
         if resolution != "late":
             now = 2.0
             assert _poll_until(target, lambda _: bool(errors)) == []
@@ -633,7 +656,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
             assert error.destination_owner == "kvcr"
             assert error.source_blocks is error.source_owners is None
     assert not _has_outstanding_operations(target)
-    assert key not in target._core._block_record_map
+    assert (key in target._core._block_record_map) is (resolution == "queued")
     assert operation.close(progress)
 
     # The terminal completion makes the single slot reusable.
@@ -1767,6 +1790,57 @@ def pair():
     yield pair
     pair.source.agent.state = pair.target.agent.state = "DONE"
     pair.until(pair.idle)
+
+
+def test_expired_fetch_does_not_evict_another_cached_key(pair):
+    """Expiry during the first allocation must prevent the next allocation."""
+    target = pair.target
+    cached = (BlockKey(b"cached-a"), BlockKey(b"cached-b"))
+    for key in cached:
+        target.deposit(key)
+    now = [0.0]
+    target.kvcr._core._clock = lambda: now[0]
+    target.kvcr._core._key_adapter = _ConstantHashAdapter()
+    target.kvcr.submit_hint(_router_hint(pair.source.control.endpoint), "req")
+
+    def expire_after_eviction(event):
+        if event.removed:
+            now[0] = 1.5
+
+    target.kvcr._core._inventory_sink_callback = expire_after_eviction
+    handle = target.kvcr.fetch((BlockKey(b"new-a"), BlockKey(b"new-b")), "req")
+    pair.until(lambda: handle in target.results and pair.idle())
+    assert all(not entry.success for entry in target.results[handle].values())
+    assert target.kvcr.query(cached).count((QueryStatus.HIT, CacheTier.LOCAL_G2)) == 1
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write"
+        for _, raw in target.control.sent
+    )
+
+
+def test_expired_fetch_waiter_does_not_fail_request_advice(pair):
+    """A failed deposit must not wake an expired fetch into a dead remote pull."""
+    target = pair.target
+    key = BlockKey(b"waiting")
+    now = [0.0]
+    target.kvcr._core._clock = lambda: now[0]
+    target.kvcr._core._key_adapter = _ConstantHashAdapter()
+    target.kvcr.submit_hint(_router_hint(pair.source.control.endpoint), "req")
+    deposit = target.kvcr.deposit({key: [target.ref()]})
+    fetch = target.kvcr.fetch((key,), "req")
+    _wait_until(lambda: bool(target.agent.transfers))
+    now[0] = 1.5
+    target.agent.state = "DONE"
+    pair.until(lambda: {deposit, fetch} <= target.results.keys() and pair.idle())
+    assert not target.results[deposit][key].success
+    assert not target.results[fetch][key].success
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write"
+        for _, raw in target.control.sent
+    )
+    assert target.kvcr.query((key,), "req") == [
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+    ]
 
 
 @pytest.mark.parametrize("endpoint", [None, "", 123, "self"])

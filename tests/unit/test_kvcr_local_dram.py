@@ -434,6 +434,40 @@ def test_local_reads_wait_for_later_piece_and_release_claims(monkeypatch, case):
     assert kvcr.query([key]) == [(QueryStatus.MISS, None)]
 
 
+def test_fetch_waiting_for_a_piece_follows_the_deposit_outcome() -> None:
+    pools = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(16)]
+    source = ctypes.create_string_buffer(b"_" * 8 + b"a" * 8 + b"b" * 8)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools, source, labeled=True)
+    now = 0.0
+    kvcr._core._clock = lambda: now
+    key = BlockKey(b"partial")
+    layout = ["swa:a", "swa:b"]
+    first = kvcr.deposit({key: [_mem_descriptor(0, "swa:a")]}, expected_layout=layout)
+    assert dict(_poll_until(kvcr, bool))[first][key].success
+    fetches = [kvcr.fetch([key], expected_layout=layout) for _ in range(8)]
+
+    now = 0.75
+    agent.state = "PROC"
+    deposit = kvcr.deposit({key: [_mem_descriptor(1, "swa:b")]})
+    _wait_until(lambda: len(agent.transfers) == 2)
+    # The producer completes inside its deadline, after the waiter's deadline.
+    now = 1.25
+    assert kvcr.poll_completed() == []
+    agent.state = "DONE"
+    _wait_until(lambda: not kvcr._core._progress._completed.empty())
+    now = 2.0
+    completed = dict(_poll_until(kvcr, lambda done: len(done) == len(fetches) + 1))
+    assert completed[deposit][key].success
+    for fetch in fetches:
+        assert completed[fetch][key].success
+        claim = completed[fetch][key].release_handle
+        assert claim is not None
+        assert kvcr.release([claim]) == [(claim, True)]
+    assert pools[1].raw == b"a" * 8 + b"b" * 8
+
+
 def test_local_dram_rejects_overlapping_pools() -> None:
     memory = ctypes.create_string_buffer(16)
     address = ctypes.addressof(memory)
@@ -1110,7 +1144,10 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     assert kvcr.query((first_key,)) == [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
     assert list(kvcr.poll_completed()) == []
 
+    now = 0.75
     agent.state = "DONE"
+    _wait_until(lambda: not kvcr._core._progress._completed.empty())
+    now = 1.5
     completed = dict(_poll_until(kvcr, lambda results: len(results) == 2))
     deposit_result = completed[deposit][first_key]
     assert deposit_result.success
@@ -1151,7 +1188,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     assert list(kvcr.poll_completed()) == [(blocked, _op_entries({second_key: False}))]
 
     agent.state = "DONE"
-    now = 0.25
+    now += 0.25
     assert _poll_until(kvcr, lambda results: bool(results)) == [
         (deliver, _op_entries({first_key: True, second_key: False}))
     ]
@@ -1163,7 +1200,7 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
         (meta.access_count, meta.last_access)
         for meta, _ in policy.scored
         if meta.block_key == first_key
-    ] == [(3, 0.25)]
+    ] == [(3, now)]
     assert [meta.block_key for meta, *_ in policy.ingested] == [first_key]
     assert policy.removed == []
 
@@ -1284,6 +1321,11 @@ def test_local_copy_timeout_retains_memory_until_completion(
     op_handle = getattr(kvcr, kind)({key: [_mem_descriptor()]})
     _wait_until(lambda: len(agent.transfers) > len(released))
     native_handle = agent.transfers[-1]
+    fetches = (
+        [kvcr.fetch((key,)) for _ in range(2)]
+        if kind == "deposit" and failure == "timeout"
+        else []
+    )
     expired = (
         kvcr.deposit({key: [_mem_descriptor()]})
         if duplicate and failure == "timeout"
@@ -1296,12 +1338,20 @@ def test_local_copy_timeout_retains_memory_until_completion(
     if failure != "discard":
         _wait_until(lambda: copy.failure_latched)
 
-    assert list(kvcr.poll_completed()) == (
-        [(expired, _op_entries({key: False}))] if expired is not None else []
-    )
+    expected = {handle: _op_entries({key: False}) for handle in fetches}
+    if expired is not None:
+        expected[expired] = _op_entries({key: False})
+    assert dict(_poll_until(kvcr, lambda done: len(done) >= len(expected))) == expected
     residency = kvcr._core._block_record_map[key].local_dram
     assert residency is not None
     assert agent.released_xfers == released
+    assert residency.claim_count > 0 and copy.transfer_id in progress._active_transfers
+    assert errors == []
+    if fetches:
+        late = kvcr.fetch((key,))
+        assert kvcr.poll_completed() == []
+        now = 3.1
+        assert dict(kvcr.poll_completed()) == {late: _op_entries({key: False})}
     if duplicate:
         now = 4.5 if failure == "timeout" else 0.0
         second = kvcr.deposit({key: [_mem_descriptor()]})
