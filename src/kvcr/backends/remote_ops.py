@@ -696,6 +696,9 @@ class _SourceWriteOp(_RemoteOp):
                 ("source_write",),
             )
         else:
+            if self.failure_reason is Reason.UNKNOWN:
+                # Native completion failed (or disconnected) with no earlier cause.
+                self.failure_reason = Reason.TRANSFER_FAILED
             failure_reason = self.abort_reason()
             backend._send_write_done(
                 progress,
@@ -770,14 +773,21 @@ class _SourceWriteOp(_RemoteOp):
             self.remote_agent,
             self.op_handle,
             False,
-            reason=_wire_reason(Reason.SHUTDOWN),
+            # Shutdown is only the fallback; a recorded cause stays the reason.
+            reason=_wire_reason(
+                Reason.SHUTDOWN
+                if self.failure_reason is Reason.UNKNOWN
+                else self.failure_reason
+            ),
         )
         self._backend._dangling_ops.finish_source(self)
         if trace is not None:
             trace.complete_source(
                 False,
                 0,
-                reason=trace.failure_reason
+                reason=self.failure_reason
+                if self.failure_reason is not Reason.UNKNOWN
+                else trace.failure_reason
                 if trace.failure_reason is not Reason.UNKNOWN
                 else Reason.SHUTDOWN,
             )
@@ -855,6 +865,8 @@ def _notification_unserved(
     missing: Collection[BlockKey],
 ) -> dict[BlockKey, str]:
     """Return why each missing key was not written; malformed input is ignored."""
+    if not missing:
+        return {}
     sent = set(ordered_keys)
     unserved = {
         key: Reason.UNKNOWN.wire if key in sent else Reason.REMEMBERED_MISS.wire

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import msgspec
 import pytest
+from nixl import nixlRemoteDisconnectError
 from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
@@ -1355,10 +1356,15 @@ def test_framework_pin_poll_failures_are_logged_without_escaping(kvcr_caplog):
     assert any("framework pin result polling failed" in message for message in warnings)
 
 
-def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(kvcr_caplog):
+@pytest.mark.parametrize("ending", ["cleanup", "shutdown", "disconnect"])
+def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(
+    kvcr_caplog, ending
+):
     class RaisingAgent(FakeNixlAgent):
         def check_xfer_state(self, handle):
             if self.state != "DONE":
+                if ending == "disconnect":
+                    raise nixlRemoteDisconnectError("gone")
                 raise RuntimeError("boom")
             return self.state
 
@@ -1378,12 +1384,25 @@ def test_kvcr_source_poll_failure_waits_for_quiescence_and_is_logged(kvcr_caplog
             for rec in kvcr_caplog.records
         ),
     )
+    if ending == "disconnect":
+        # Terminal at once, with no earlier cause to retain.
+        _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
+        notices = [_decode_notif(raw) for _, raw in source_agent.sent_notifs]
+        assert [n["reason"] for n in notices] == ["transfer_failed"]
+        return
     assert source_agent.released_xfers == []
     assert pinning.unpins == []
     # Cleanup past the deadline must not change the cause already reported.
     now = 1e6
-    source_agent.state = "DONE"
-    assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
+    if ending == "shutdown":
+        # Nor may shutdown replace a recorded cause.
+        kvcr._core._progress._submissions.put(_STOP)
+        _wait_until(lambda: kvcr._core._progress._startup_stage == "cleanup")
+        source_agent.state = "DONE"
+        kvcr.close()
+    else:
+        source_agent.state = "DONE"
+        assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
     assert source_agent.released_xfers == [1]
     assert pinning.unpins == ["pin"]
     notices = [_decode_notif(raw) for _, raw in source_agent.sent_notifs]

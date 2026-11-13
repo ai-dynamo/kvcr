@@ -473,7 +473,6 @@ class _RemoteFWDram:
                     hint,
                     missing_keys=(hint.missing_keys | op.keys) - completed_keys,
                 )
-            results = op.key_results()
             if op.local_fill:
                 if op.state is _TargetPullState.QUARANTINED:
                     # DISCARDING already failed callers, but still owns the slots.
@@ -483,15 +482,19 @@ class _RemoteFWDram:
                         tuple(key for key in op.ordered_keys if key in completed_keys),
                         success=True,
                     )
+                if len(completed_keys) == len(op.keys):
+                    return  # Fully served: nothing failed, so no results to build.
                 failures = {
-                    key: result for key, result in results.items() if not result.success
+                    key: result
+                    for key, result in op.key_results().items()
+                    if not result.success
                 }
                 if failures:
                     kvcr._complete_local_dram_fill(
                         failures.keys(), success=False, failures=failures
                     )
                 return
-            kvcr._complete(cast(OpHandle, op.op_id[1]), results)
+            kvcr._complete(cast(OpHandle, op.op_id[1]), op.key_results())
         finally:
             if trace is not None:
                 trace.tracer.pop(pushed)
