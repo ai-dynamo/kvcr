@@ -143,7 +143,6 @@ class _TargetPullOp(_RemoteOp):
     state: _TargetPullState
     local_fill: bool
     remote_ctrl_ep: str
-    abandon_deadline: float
     _backend: "_RemoteFWDram" = field(repr=False, compare=False)
     # Keys sent to the source; keys also includes remembered misses.
     ordered_keys: tuple[BlockKey, ...] = ()
@@ -345,7 +344,7 @@ class _TargetPullOp(_RemoteOp):
             return False, backend._dangling_ops.poll_target(progress, self)
 
         if self.state is _TargetPullState.WAITING_TERMINAL:
-            if now >= self.abandon_deadline:
+            if now >= self.deadline:
                 self.state = _TargetPullState.QUARANTINED
                 if trace is not None:
                     trace.mark(
@@ -359,7 +358,7 @@ class _TargetPullOp(_RemoteOp):
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 return False, True
             if not self.probe_sent:
-                # Retry failed enqueues without extending either deadline.
+                # Retry failed enqueues without extending the deadline.
                 self.probe_sent = backend._dangling_ops.probe(progress, self)
                 return False, self.probe_sent
             return False, False
@@ -368,6 +367,10 @@ class _TargetPullOp(_RemoteOp):
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
                 trace.cancel_requested("target.cancel_requested", cancelled)
+            config = backend._kvcr.config
+            self.deadline += (
+                config.abandon_timeout_ms - config.operation_timeout_ms
+            ) / 1000
             backend._invalidate_control_peer(self.remote_ctrl_ep)
             self.probe_sent = backend._dangling_ops.probe(progress, self)
             if self.local_fill:
@@ -625,7 +628,10 @@ class _SourceWriteOp(_RemoteOp):
         if trace is not None:
             trace.complete_source(self.success, len(self.source_keys))
         if waiting_ack:
-            self.deadline += backend._abandon_grace
+            config = backend._kvcr.config
+            self.deadline += (
+                config.abandon_timeout_ms - config.operation_timeout_ms
+            ) / 1000
             # Release framework pins now; keep move dependencies until acceptance.
             backend._progress_outbound.append(replace(self))
             return False, True

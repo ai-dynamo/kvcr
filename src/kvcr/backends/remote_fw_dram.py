@@ -130,9 +130,6 @@ class _RemoteFWDram:
             )
         self._kvcr = kvcr
         self._options = options
-        self._abandon_grace = (
-            kvcr.config.abandon_timeout_ms - kvcr.config.operation_timeout_ms
-        ) / 1000
         self._nvtx = _nvtx.create_tracer()
 
         # Main-thread state: request hints, source ownership, and progress state.
@@ -292,7 +289,6 @@ class _RemoteFWDram:
             keys=frozenset(blocks),
             started_at=started_at,
             deadline=deadline,
-            abandon_deadline=deadline + self._abandon_grace,
             op_id=("target", op_handle),
             remote_ctrl_ep=source,
             _backend=self,

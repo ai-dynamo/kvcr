@@ -98,7 +98,6 @@ def test_target_terminal_reason_preserves_cause(
         keys=frozenset({key}),
         started_at=0.0,
         deadline=1.0,
-        abandon_deadline=2.0,
         state=_TargetPullState.WAITING_WRITE_DONE
         if prior is _nvtx.Reason.UNKNOWN
         else _TargetPullState.WAITING_TERMINAL,
