@@ -22,6 +22,7 @@ from _kvcr_test_utils import (
     _poll_until,
     _recovered_record,
     _router_hint,
+    _wait_until,
     _write_done_notification,
 )
 
@@ -1036,6 +1037,8 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
 
     for index, key in enumerate((first, second, third, fourth)):
         assert _deposit(kvcr, key, index).success
+    now = 0.0
+    kvcr._core._clock = lambda: now
     fetch = kvcr.fetch((first, second))
     assert (
         len([op for op in kvcr._core._g3._active.values() if op.kind == "store"]) == 1
@@ -1054,7 +1057,10 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
     assert all(op_id[1] < 0 for op_id in fill_ids)
     assert fetch not in dict(kvcr.poll_completed())
 
+    now = 0.75
     agent.allow_reads = True
+    _wait_until(lambda: kvcr._core._progress._completed.qsize() == len(fill_ids))
+    now = 1.5
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert all(entry.success for entry in result[fetch].values())
 
@@ -1159,13 +1165,16 @@ def test_g3_spill_waits_until_local_source_claim_is_released(tmp_path) -> None:
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
 
 
-@pytest.mark.parametrize("queued_deposit", [False, True])
+@pytest.mark.parametrize(
+    "queued_deposit,submission", [(False, "PROC"), (True, "PROC"), (False, "ERR")]
+)
 def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
     tmp_path,
     queued_deposit,
+    submission,
 ) -> None:
     class _StuckReadAgent(_FakeG3Agent):
-        """Keep a G3 read in flight so its fill is abandoned, not resolved."""
+        """Keep a G3 read in flight while its fill is discarded."""
 
         def __init__(self):
             super().__init__()
@@ -1180,7 +1189,7 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
 
         def transfer(self, handle):
             result = super().transfer(handle)
-            return "PROC" if self._is_stuck_read(handle) else result
+            return submission if self._is_stuck_read(handle) else result
 
         def check_xfer_state(self, handle):
             return "PROC" if self._is_stuck_read(handle) else "DONE"
@@ -1226,17 +1235,20 @@ def test_fetch_falls_back_to_g3_while_a_local_fill_is_discarding(
         hold = kvcr.fetch((fourth,))
         claim = dict(kvcr.poll_completed())[hold][fourth].release_handle
         _poll_until(kvcr, lambda _: kvcr._core._block_record_map[fourth].g3 is not None)
-    _poll_until(
-        kvcr,
-        lambda _: any(
-            agent.xfers[handle - 1][0] == "READ" for handle in agent.transfers
-        ),
+    result = dict(
+        _poll_until(
+            kvcr,
+            lambda _: any(
+                agent.xfers[handle - 1][0] == "READ" for handle in agent.transfers
+            ),
+        )
     )
     native_handle = next(
         handle for handle in agent.transfers if agent.xfers[handle - 1][0] == "READ"
     )
     now[0] = 1.1
-    result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
+    if fetch not in result:
+        result.update(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert not result[fetch][first].success
 
     record = kvcr._core._block_record_map[first]

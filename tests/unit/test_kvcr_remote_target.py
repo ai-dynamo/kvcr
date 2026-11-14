@@ -121,7 +121,8 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
     _poll_until(target, bool)
 
 
-def test_remote_fetch_uses_local_then_framework_sources() -> None:
+@pytest.mark.parametrize("action_type", ["kv.fetch", "kv.evict_on_fetch"])
+def test_remote_fetch_uses_local_then_framework_sources(action_type) -> None:
     block_size = 16
     source_primary = ctypes.create_string_buffer(b"b" * block_size)
     source_local = ctypes.create_string_buffer(block_size * 2)
@@ -174,7 +175,9 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     ]
     source_agent.state = "PROC"
 
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    hint = _router_hint("tcp://source:1")
+    hint.actions[0] = msgspec.structs.replace(hint.actions[0], action_type=action_type)
+    target.submit_hint(hint, request_id="req")
     assert target.query(keys, "req") == [
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
         (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2),
@@ -207,17 +210,26 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
     assert notification is not None
     source_now = 0.25
     source_agent.state = "DONE"
-    assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
-    assert source._core._block_record_map[keys[0]].local_dram.claim_count == 0
+    assert _poll_until(source, lambda _: bool(source_pinning.unpins)) == []
+    assert source.query((keys[0],)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
     assert source_pinning.unpins == ["pin"]
     assert [
         (meta.access_count, meta.last_access)
         for meta, _ in source_policy.scored
         if meta.block_key == keys[0]
-    ] == [(0, 0.0), (1, 0.25)]
+    ] == ([(0, 0.0)] if action_type == "kv.evict_on_fetch" else [(0, 0.0), (1, 0.25)])
 
     target_agent.notifs["source"] = [notification]
     completed = dict(_poll_until(target, lambda results: bool(results)))
+    if action_type == "kv.evict_on_fetch":
+        _wait_until(lambda: len(target_control.sent) == 2)
+        source_control.incoming.append(target_control.sent[-1][1])
+    _poll_until(source, lambda _: not _has_outstanding_operations(source))
+    assert source.query((keys[0],)) == [
+        (QueryStatus.MISS, None)
+        if action_type == "kv.evict_on_fetch"
+        else (QueryStatus.HIT, CacheTier.LOCAL_G2)
+    ]
     assert set(completed) == {fetch}
     assert all(result.success for result in completed[fetch].values())
     assert all(
@@ -260,13 +272,16 @@ def test_remote_fetch_uses_local_then_framework_sources() -> None:
         ([("full", 16), ("swa", 8), ("swa", 8)], ["full", "swa", "swa"], True, True),
     ],
 )
+@pytest.mark.parametrize("action_type", ["kv.fetch", "kv.evict_on_fetch"])
 def test_remote_fetch_preserves_block_layout_and_bytes(
     layout: list[tuple[str, int]],
     expected_layout: list[str],
     success: bool,
     partial: bool,
+    action_type: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    evict = action_type == "kv.evict_on_fetch"
     payloads = [bytes([index + 1]) * size for index, (_, size) in enumerate(layout)]
     pool_data = dict.fromkeys(dict(layout), b"")
     for (name, _), data in zip(layout, payloads, strict=True):
@@ -338,22 +353,31 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     source_agent.state = "PROC"
 
     if partial:
-        target_agent.state = "DONE"
+        target_agent.state = "PROC" if evict else "DONE"
         deposit = target.deposit(
             {key: [_mem_descriptor(0, label=layout[0][0])]},
             expected_layout=expected_layout,
         )
-        assert dict(_poll_until(target, bool))[deposit][key].success
+        if not evict:
+            assert dict(_poll_until(target, bool))[deposit][key].success
 
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    hint = _router_hint("tcp://source:1")
+    hint.actions[0] = msgspec.structs.replace(hint.actions[0], action_type=action_type)
+    target.submit_hint(hint, request_id="req")
     fetch = target.fetch((key,), "req", expected_layout=expected_layout)
+    if partial and evict:
+        assert not target._core._local_dram._pending_residency_ops[
+            ("fetch", fetch)
+        ].remote_fill_keys
+        target_agent.state = "DONE"
+        assert dict(_poll_until(target, bool))[deposit][key].success
     _wait_until(lambda: bool(target_control.sent))
     assert _decode_control_message(target_control.sent[-1][1])["key_layout"] == (
         expected_layout
     )
     source_control.incoming.extend(message for _, message in target_control.sent)
     if success:
-        _poll_until(source, lambda _: len(source_agent.xfers) == 2)
+        _wait_until(lambda: len(source_agent.xfers) == 2)
         source_xfer = source_agent.xfers[1]
         assert len(source_xfer[1]) == len(source_xfer[3]) == len(layout) - partial
         notification = source_xfer[5]
@@ -366,8 +390,13 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     target_agent.notifs["source"] = [notification]
     result = dict(_poll_until(target, bool))[fetch][key]
     assert result.success is success
+    if evict:
+        _wait_until(lambda: len(target_control.sent) == 2)
+        source_control.incoming.append(target_control.sent[-1][1])
     if success:
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
+    gone = success and evict
+    _poll_until(source, lambda _: (key not in source._core._block_record_map) is gone)
 
 
 @pytest.mark.parametrize("queued_success", [False, True])
@@ -400,25 +429,33 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
     _wait_until(lambda: bool(control.sent))
     message = _decode_control_message(control.sent[0][1])
     if queued_success:
+        local[16:] = primary[16:]
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         _wait_until(lambda: not target._core._progress._completed.empty())
     now = 1.5
-    assert not dict(_poll_until(target, bool))[fetch][key].success
+    fetched = dict(_poll_until(target, bool))[fetch][key]
+    assert fetched.success is queued_success
+    if queued_success:
+        claim = fetched.release_handle
+        assert claim is not None
+        assert target.release([claim]) == [(claim, True)]
     assert target._core._block_record_map[key].local_dram is residency
     assert (residency.remote_indices is not None) is not queued_success
-    assert "p:b" in residency.pending_labels
+    assert ("p:b" in (residency.pending_labels or ())) is not queued_success
     primary[:16] = b"\0" * 16
     cached = target.deliver({key: [_mem_descriptor(0, label="p:a")]})
     result = dict(_poll_until(target, bool))[cached][key]
     assert result.success and primary.raw[:16] == b"a" * 16
-    assert events == []
+    assert events == (
+        [InventoryEvent((key,), CacheTier.LOCAL_G2, False)] if queued_success else []
+    )
     if not queued_success:
         agent.notifs["source"] = [
             _write_done_notification(message["op_handle"], success=False)
         ]
         _poll_until(target, lambda _: not _has_outstanding_operations(target))
-    retry = target.deposit({key: [_mem_descriptor(1, label="p:b")]})
-    assert dict(_poll_until(target, bool))[retry][key].success
+        retry = target.deposit({key: [_mem_descriptor(1, label="p:b")]})
+        assert dict(_poll_until(target, bool))[retry][key].success
     assert local.raw == primary.raw
     assert events == [InventoryEvent((key,), CacheTier.LOCAL_G2, False)]
 
@@ -525,8 +562,10 @@ def test_remote_completion_rejects_invalid_notification(
 @pytest.mark.parametrize(
     "resolution", ["queued", "late", "notification", "probe", "guard", "unknown"]
 )
+@pytest.mark.parametrize("hint_type", ["kv.fetch", "kv.evict_on_fetch"])
 def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     resolution,
+    hint_type,
 ) -> None:
     errors = []
     now = 0.0
@@ -553,7 +592,9 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
         framework_regions=[_buffer_region(primary, block_size)],
     )
     target._core._clock = lambda: now
-    target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+    hint = _router_hint("tcp://source:1")
+    hint.actions[0] = msgspec.structs.replace(hint.actions[0], action_type=hint_type)
+    target.submit_hint(hint, request_id="req")
     fetch = target.fetch((key,), request_id="req")
     # Both callers share the pending fill and must each complete once.
     second_fetch = target.fetch((key,), request_id="req")
@@ -563,6 +604,8 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     progress = target._core._progress
     _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
     operation = progress._in_flight_ops[("target", message["op_handle"])]
+    deadline = 1.0
+    assert operation.deadline == deadline
     assert not operation.close(progress)
     with pytest.raises(RuntimeError, match="unresolved operations"):
         progress._close_nixl()
@@ -579,22 +622,35 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
             )
         )
         _wait_until(lambda: operation.source_incarnation == "source")
+    now = deadline - 0.01
+    assert list(target.poll_completed()) == []
     if resolution == "queued":
         # Progress accepts success before expiry; main consumes it after expiry.
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
         _wait_until(lambda: not target._core._progress._completed.empty())
 
-    now = 1.5  # Past T, but still inside the destination's grace period.
-    assert dict(_poll_until(target, lambda completed: len(completed) == 2)) == {
-        fetch: _op_entries({key: False}),
-        second_fetch: _op_entries({key: False}),
-    }
-    if resolution != "queued":
+    now = deadline  # Expired, but still before abandonment.
+    completed = dict(_poll_until(target, lambda completed: len(completed) == 2))
+    if resolution == "queued":
+        assert set(completed) == {fetch, second_fetch}
+        for result in completed.values():
+            assert result[key].success
+            claim = result[key].release_handle
+            assert claim is not None
+            assert target.release([claim]) == [(claim, True)]
+        assert target.query((key,)) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+        assert not errors
+    else:
+        assert completed == {
+            fetch: _op_entries({key: False}),
+            second_fetch: _op_entries({key: False}),
+        }
         assert target.query((key,), "req") == [
             (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
         ]
         assert _has_outstanding_operations(target)
         assert not operation.close(progress)
+        assert not errors
         if resolution != "late":
             now = 2.0
             assert _poll_until(target, lambda _: bool(errors)) == []
@@ -633,7 +689,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
             assert error.destination_owner == "kvcr"
             assert error.source_blocks is error.source_owners is None
     assert not _has_outstanding_operations(target)
-    assert key not in target._core._block_record_map
+    assert (key in target._core._block_record_map) is (resolution == "queued")
     assert operation.close(progress)
 
     # The terminal completion makes the single slot reusable.
@@ -1232,7 +1288,10 @@ def test_remote_write_cancellation_and_late_completion(
         notifications = [_write_done_notification(handle)]
         if outcome == "cancelled":
             agent.notifs["source"] = [cancelled]
-            _wait_until(lambda: not agent.notifs)
+            _wait_until(lambda: len(control.sent) == 2)
+            assert _decode_control_message(control.sent[-1][1])["type"] == "write_probe"
+            op = kvcr._core._progress._in_flight_ops[("target", handle)]
+            assert op.deadline == 5.0  # Early cancellation keeps the original cutoff.
             assert list(kvcr.poll_completed()) == []
         elif outcome == "failed_first":
             notifications.insert(0, cancelled)
@@ -1757,6 +1816,7 @@ class _Pair:
     def idle(self):
         return not any(
             _has_outstanding_operations(peer.kvcr)
+            or peer.kvcr._core._progress._in_flight_ops
             for peer in (self.source, self.target)
         )
 
@@ -1767,6 +1827,57 @@ def pair():
     yield pair
     pair.source.agent.state = pair.target.agent.state = "DONE"
     pair.until(pair.idle)
+
+
+def test_expired_fetch_does_not_evict_another_cached_key(pair):
+    """Expiry during the first allocation must prevent the next allocation."""
+    target = pair.target
+    cached = (BlockKey(b"cached-a"), BlockKey(b"cached-b"))
+    for key in cached:
+        target.deposit(key)
+    now = [0.0]
+    target.kvcr._core._clock = lambda: now[0]
+    target.kvcr._core._key_adapter = _ConstantHashAdapter()
+    target.kvcr.submit_hint(_router_hint(pair.source.control.endpoint), "req")
+
+    def expire_after_eviction(event):
+        if event.removed:
+            now[0] = 1.5
+
+    target.kvcr._core._inventory_sink_callback = expire_after_eviction
+    handle = target.kvcr.fetch((BlockKey(b"new-a"), BlockKey(b"new-b")), "req")
+    pair.until(lambda: handle in target.results and pair.idle())
+    assert all(not entry.success for entry in target.results[handle].values())
+    assert target.kvcr.query(cached).count((QueryStatus.HIT, CacheTier.LOCAL_G2)) == 1
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write"
+        for _, raw in target.control.sent
+    )
+
+
+def test_expired_fetch_waiter_does_not_fail_request_advice(pair):
+    """A failed deposit must not wake an expired fetch into a dead remote pull."""
+    target = pair.target
+    key = BlockKey(b"waiting")
+    now = [0.0]
+    target.kvcr._core._clock = lambda: now[0]
+    target.kvcr._core._key_adapter = _ConstantHashAdapter()
+    target.kvcr.submit_hint(_router_hint(pair.source.control.endpoint), "req")
+    deposit = target.kvcr.deposit({key: [target.ref()]})
+    fetch = target.kvcr.fetch((key,), "req")
+    _wait_until(lambda: bool(target.agent.transfers))
+    now[0] = 1.5
+    target.agent.state = "DONE"
+    pair.until(lambda: {deposit, fetch} <= target.results.keys() and pair.idle())
+    assert not target.results[deposit][key].success
+    assert not target.results[fetch][key].success
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write"
+        for _, raw in target.control.sent
+    )
+    assert target.kvcr.query((key,), "req") == [
+        (QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)
+    ]
 
 
 @pytest.mark.parametrize("endpoint", [None, "", 123, "self"])

@@ -8,8 +8,8 @@ from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from ..runtime.core import logger
-from ..types import MemoryRef, OpHandle, TransferError
-from .remote_ops import _WriteProbe, _WriteProbeAck
+from ..types import BlockKey, MemoryRef, OpHandle, TransferError
+from .remote_ops import _SourceWriteState, _WriteProbe, _WriteProbeAck
 
 if TYPE_CHECKING:
     from ..runtime.progress import _KVCRProgress
@@ -32,6 +32,8 @@ class _SourceWriteStatus:
     cancel_requested: bool = False
     cancel_deadline: float | None = None
     abandoned: bool = False
+    target_incarnation: str | None = None
+    accepted_keys: set[BlockKey] | None = None
 
 
 class _DanglingOps:
@@ -72,11 +74,17 @@ class _DanglingOps:
         return result
 
     def finish_source(self, op: "_SourceWriteOp") -> None:
-        status = self.source_writes.pop((op.route[0], op.op_handle), None)
+        write_id = (op.route[0], op.op_handle)
+        status = self.source_writes.get(write_id)
+        if op.state is not _SourceWriteState.WAITING_ACK:
+            self.source_writes.pop(write_id, None)
+        elif status is not None:
+            status.submitted = False  # Native access ended; probes can confirm it.
         if status is not None and op.local_sources:
             self._backend._kvcr._local_dram._pools.release_readers(
                 op.source_keys, op.local_sources, success=op.success
             )
+            op.local_sources = ()
         if status is not None and status.abandoned:
             self.report_source(op, "quiesced")
 

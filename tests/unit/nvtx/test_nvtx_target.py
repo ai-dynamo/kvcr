@@ -391,7 +391,7 @@ def test_cancellation_cause_survives_grace_deadline(recording):
 
 def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     test_kvcr_remote_target.test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
-        "guard"
+        "guard", "kv.fetch"
     )
     [queued] = payloads(recording, "target.queued")
     assert int(queued["op_handle"]) < 0

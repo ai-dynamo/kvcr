@@ -84,6 +84,7 @@ class _NamedSource:
 class _PendingResidencyOp(_Op):
     deadline: float
     claim_on_ready: bool
+    evict_on_finish: bool = False
     request_id: str | None = None
     results: dict[BlockKey, OpEntryResult] = field(default_factory=dict)
     remote_fill_keys: set[BlockKey] = field(default_factory=set)
@@ -169,6 +170,9 @@ class _LocalCopyOp(_ProgressOp):
             logger.debug("KVCR_EVENT local_copy_deadline_expired op=%s", self.op_id)
             self.failure_latched = True
             observed_work = True
+        if self.failure_latched and observed_work and self.deliver_op_id is None:
+            # Let expired fetch waiters fail while the deposit retains its buffers.
+            progress._completed_backlog.append(replace(self))
         # shortcut: cached generic errors retain memory until exit; reclaim only
         # after backend-specific error handling proves native access has stopped.
         result = progress.poll_transfer(
@@ -444,6 +448,7 @@ class _LocalDram:
         *,
         hints: object | None,
         layout: list[str],
+        evict_on_finish: bool,
         key_layout: tuple[str, ...] | None = None,
         named_source: "_NamedSource | None" = None,
     ) -> dict[BlockKey, list[_TransferRef]]:
@@ -456,6 +461,7 @@ class _LocalDram:
             keys=frozenset(ordered_keys),
             deadline=deadline,
             claim_on_ready=True,
+            evict_on_finish=evict_on_finish,
             request_id=request_id,
             requested_layout=layout,
             key_layout=key_layout,
@@ -482,9 +488,6 @@ class _LocalDram:
         record = self._kvcr._block_record(key)
         residency = record.local_dram
         source = op.fill_sources.get(key)
-        if self._kvcr._clock() >= op.deadline:
-            op.results[key] = _FAILED_RESULT
-            return None
         if residency is not None and residency.state is _LocalDramState.DISCARDING:
             if source is not None:
                 self._enqueue_capacity_waiter(op, key)
@@ -492,7 +495,7 @@ class _LocalDram:
                 op.results[key] = _FAILED_RESULT
             return None
         if residency is None:
-            if source is None:
+            if source is None or self._kvcr._clock() >= op.deadline:
                 op.results[key] = _FAILED_RESULT
                 return None
             reserved, waiting = self._reserve_fill(key, op, source)
@@ -532,13 +535,8 @@ class _LocalDram:
                 op.claimed_keys.add(key)
             if source is None or residency.remote_indices is not None:
                 return None
-            named = op.named_source
-            if (
-                named is not None
-                and named.move_keys is not None
-                and key in named.move_keys
-                and residency.pending_deposits
-            ):
+            evicting = source is CacheTier.REMOTE_G2 and op.evict_on_finish
+            if residency.pending_deposits and evicting:
                 # Source removal requires every piece outside this write to be ready.
                 return None
             # One remote fill owns these destinations until its native terminal.
@@ -548,7 +546,10 @@ class _LocalDram:
                 if residency.slots[index][0] in residency.pending_labels
                 and not residency.writers[index]
             ]
-            if missing:
+            if missing and self._kvcr._clock() >= op.deadline:
+                # Expired while waiting: do not start a fill that cannot finish.
+                op.results[key] = _FAILED_RESULT
+            elif missing:
                 self._pools._remove_evictable(key, residency)
                 residency.remote_indices = tuple(missing)
                 for index in missing:
@@ -560,7 +561,9 @@ class _LocalDram:
                 )
         return None
 
-    def complete_fill(self, keys: Collection[BlockKey], *, success: bool) -> None:
+    def complete_fill(
+        self, keys: Collection[BlockKey], *, success: bool
+    ) -> list[BlockKey]:
         ordered_keys = tuple(keys)
         indices = []
         for key in ordered_keys:
@@ -569,7 +572,7 @@ class _LocalDram:
             if residency is None or residency.remote_indices is None:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             indices.append(residency.remote_indices)
-        self._apply_fill_result(
+        return self._apply_fill_result(
             ordered_keys, tuple(indices), success, CacheTier.REMOTE_G2
         )
 
@@ -622,16 +625,20 @@ class _LocalDram:
                 if (
                     residency_op is not None
                     and key in residency_op.keys
-                    and key not in residency_op.results
+                    and (
+                        key not in residency_op.results
+                        or key in residency_op.active_keys
+                    )
                     # Capacity waiters never owned this fill, and the slot it
                     # holds is exactly what they are queued for.
                     and key not in residency_op.capacity_waiters
                     and (
-                        key in residency_op.remote_fill_keys
+                        residency_op.sources is None
                         or residency.state is _LocalDramState.DISCARDING
                     )
                 ):
                     residency_op.results[key] = _FAILED_RESULT
+                    residency_op.active_keys.discard(key)
                     residency_ops[op_id] = residency_op
                 deliver_op = self._pending_deliver_ops.get(op_id)
                 if (
@@ -664,10 +671,12 @@ class _LocalDram:
     def _finish_copy(self, copy: _LocalCopyOp) -> None:
         if copy.transfer_id is not None:
             if copy.deliver_op_id is None:
-                # Fail this writer, retaining its slots and any committed pieces.
+                # Record failure while retaining slots and any committed pieces.
                 op = copy.deposit_op
                 for key in copy.ordered_keys:
                     op.results[key] = _FAILED_RESULT
+                if copy.uncertain:
+                    op.active_keys.difference_update(copy.ordered_keys)
                 self._finish_residency_if_ready(op)
             else:
                 op = self._pending_deliver_ops[copy.deliver_op_id]
@@ -707,7 +716,7 @@ class _LocalDram:
         *,
         writer: _PendingResidencyOp | None = None,
         dst_descriptors: tuple[_TransferRef, ...] = (),
-    ) -> None:
+    ) -> list[BlockKey]:
         committed: list[BlockKey] = []
         failed: list[BlockKey] = []
         affected_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -736,7 +745,7 @@ class _LocalDram:
                 if writers[index] < 0:
                     raise RuntimeError("local DRAM writer ownership lost")
             if writer is not None:
-                writer.active_keys.remove(key)
+                writer.active_keys.discard(key)
                 residency.pending_deposits -= 1
             else:
                 residency.remote_indices = None
@@ -782,7 +791,7 @@ class _LocalDram:
                         if key_success
                         else _FAILED_RESULT
                     )
-                    affected_residency_ops[writer.op_id] = writer
+                affected_residency_ops[writer.op_id] = writer
             else:
                 for op_id in record.active_op_ids:
                     op = self._pending_residency_ops.get(op_id)
@@ -842,6 +851,7 @@ class _LocalDram:
         for key in failed:
             self._kvcr._prune_block_record(key)
         self._resume_capacity_waiters()
+        return committed
 
     def _resolve_fetch_waiter(
         self,
@@ -855,6 +865,7 @@ class _LocalDram:
                 {key: refs},
                 residency_op.request_id,
                 residency_op.deadline,
+                evict_on_finish=residency_op.evict_on_finish,
                 named_source=residency_op.named_source,
             )
         return key in residency_op.results
@@ -977,6 +988,7 @@ class _LocalDram:
         if (
             len(op.results) != len(op.keys)
             or self._pending_residency_ops.get(op.op_id) is not op
+            or op.active_keys
         ):
             return
         if op.op_id[0] == "fetch":
@@ -1004,29 +1016,49 @@ class _LocalDram:
         self._kvcr._complete(cast(OpHandle, op.op_id[1]), op.results)
 
     def _expire_pending_ops(self, now: float) -> None:
-        for residency_op in list(self._pending_residency_ops.values()):
-            # discard_fill() can finish other operations from this snapshot.
-            if residency_op.op_id not in self._pending_residency_ops:
-                continue
+        pending = list(self._pending_residency_ops.values())
+        deposit_keys = None
+        expired = []
+        # Main expires work waiting to start; progress handles active transfer timeouts.
+        for residency_op in pending:
             if now < residency_op.deadline:
                 continue
+            expired.append(residency_op)
             if residency_op.op_id[0] == "deposit":
                 for key in residency_op.keys - residency_op.results.keys():
                     if key not in residency_op.active_keys:
                         residency_op.capacity_waiters.discard(key)
                         residency_op.results[key] = _FAILED_RESULT
-                self._finish_residency_if_ready(residency_op)
                 continue
             if residency_op.op_id[0] != "fetch":
                 continue
+            if deposit_keys is None:
+                deposit_keys = {
+                    key
+                    for op in pending
+                    for key in op.active_keys
+                    if key not in op.results
+                }
             waiting_keys = residency_op.keys - residency_op.results.keys()
-            remote_fill_keys = waiting_keys & residency_op.remote_fill_keys
-            for key in waiting_keys - remote_fill_keys:
+            for key in waiting_keys:
+                record = self._kvcr._block_record_map.get(key)
+                local = record.local_dram if record is not None else None
+                # Progress decides the outcome of work already in flight.
+                if (
+                    key not in residency_op.capacity_waiters
+                    and local is not None
+                    and local.state is not _LocalDramState.DISCARDING
+                    and (
+                        local.remote_indices is not None
+                        and not local.remote_cancelled
+                        or key in deposit_keys
+                    )
+                ):
+                    continue
                 residency_op.results[key] = _FAILED_RESULT
-            if remote_fill_keys:
-                self.discard_fill(remote_fill_keys)
-            else:
-                self._finish_residency_if_ready(residency_op)
+
+        for residency_op in expired:
+            self._finish_residency_if_ready(residency_op)
 
         for deliver_op in list(self._pending_deliver_ops.values()):
             if now < deliver_op.deadline:
