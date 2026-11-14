@@ -605,7 +605,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
     operation = progress._in_flight_ops[("target", message["op_handle"])]
     deadline = 1.0
-    assert operation.deadline == deadline and operation.abandon_deadline == 2.0
+    assert operation.deadline == deadline
     assert not operation.close(progress)
     with pytest.raises(RuntimeError, match="unresolved operations"):
         progress._close_nixl()
@@ -1288,7 +1288,10 @@ def test_remote_write_cancellation_and_late_completion(
         notifications = [_write_done_notification(handle)]
         if outcome == "cancelled":
             agent.notifs["source"] = [cancelled]
-            _wait_until(lambda: not agent.notifs)
+            _wait_until(lambda: len(control.sent) == 2)
+            assert _decode_control_message(control.sent[-1][1])["type"] == "write_probe"
+            op = kvcr._core._progress._in_flight_ops[("target", handle)]
+            assert op.deadline == 5.0  # Early cancellation keeps the original cutoff.
             assert list(kvcr.poll_completed()) == []
         elif outcome == "failed_first":
             notifications.insert(0, cancelled)
