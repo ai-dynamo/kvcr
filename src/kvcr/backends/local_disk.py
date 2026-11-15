@@ -123,6 +123,9 @@ class _G3TransferOp(_ProgressOp):
         if not self.failure_latched and self.clock() >= self.deadline:
             self.failure_latched = True
             observed_work = True
+        if self.kind == "fill" and self.failure_latched and observed_work:
+            # Main fails the waiting fetches; the slots stay until the read ends.
+            progress._completed_backlog.append(replace(self))
         # TODO shortcut: cached ERR retains G3 resources until process exit,
         # handle quiesced GDS_MT errors before enabling full G3 support.
         result = progress.poll_transfer(
@@ -438,6 +441,9 @@ class _G3:
         for item in items:
             if not isinstance(item, _G3TransferOp):
                 unhandled.append(item)
+                continue
+            if item.kind == "fill" and item.transfer_id is not None:
+                self._kvcr._discard_local_dram_fill(item.ordered_keys)
                 continue
             if item.uncertain and item.transfer_id is not None:
                 if item.op_id not in self._active:
