@@ -32,6 +32,8 @@ Standard GitHub PR workflow:
 4. Sign off your commits (see [Signing Your Work](#signing-your-work) below).
 5. Open the PR. CI must pass.
 
+For PR titles and descriptions, see the [PR writing guide](.agents/skills/pr-writing/SKILL.md).
+
 For security disclosures, do **not** open a public issue or pull request - see
 [SECURITY.md](SECURITY.md).
 
