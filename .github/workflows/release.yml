@@ -91,7 +91,7 @@ jobs:
               label="nightly ${version}"
               stage="${STAGE}"
               publish=false
-              if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              if [ "${stage}" = "true" ] && [ "${NIGHTLY_PUBLISH}" = "true" ]; then
                 publish=true
               fi
               ;;
@@ -495,7 +495,9 @@ jobs:
     runs-on: prod-kvcr-builder-v1
     timeout-minutes: 5
     environment: manual-release-approval
-    permissions: {}
+    # Reading an environment needs actions: read.
+    permissions:
+      actions: read
     steps:
       # GitHub creates a missing environment without reviewers, which would approve everything.
       - name: Check that the approval environment has reviewers
