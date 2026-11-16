@@ -7,6 +7,8 @@ from itertools import count
 from threading import local
 from uuid import uuid4
 
+from ..types import Reason
+
 
 class Status(IntEnum):
     PENDING = 1
@@ -18,29 +20,8 @@ class Status(IntEnum):
     REJECTED = 7
     AMBIGUOUS = 8
     UNRESOLVED = 9
-
-
-class Reason(IntEnum):
-    UNKNOWN = 0
-    NONE = 1
-    CALLBACK_ERROR = 2
-    DUPLICATE_REQUEST = 3
-    INVALID_RESULT = 4
-    DEADLINE = 5
-    CANCELLED = 6
-    SHUTDOWN = 7
-    NO_WAITERS = 8
-    SUBMIT_REJECTED = 9
-    SUBMIT_AMBIGUOUS = 10
-    CREATE_ERROR = 11
-    PROGRESS_ERROR = 12
-    RELEASE_ERROR = 13
-    CONTROL_ERROR = 14
-    INVALID_NOTIFICATION = 15
-    REMOTE_FAILURE = 16
-    ROUTE_CHANGED = 17
-    HINT_UNAVAILABLE = 19
-    HINT_CONFLICT = 20
+    # The source answered but served none of the blocks; nothing broke.
+    MISS = 10
 
 
 class _ThreadBuffers(local):

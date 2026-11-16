@@ -26,14 +26,14 @@ from kvcr.config import LocalDramOptions
 from kvcr.types import BlockKey
 
 
-def test_zero_selected_source_is_failed_without_posting(recording):
+def test_zero_selected_source_is_a_miss_without_posting(recording):
     source, agent, pinning = make_source()
     pinning.complete(0, missing_indices=(0,))
     event = wait_for_payload(
         source, recording, "source.write.completed", ended="source.write"
     )
-    assert int(event["status"]) == 4
-    assert int(event["reason"]) == 0
+    assert int(event["status"]) == int(_nvtx.Status.MISS)
+    assert int(event["reason"]) == int(_nvtx.Reason.NOT_RESIDENT)
     assert int(event["requested_blocks"]) == 1
     assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
     assert not agent.xfers
@@ -45,7 +45,7 @@ def test_zero_selected_source_is_failed_without_posting(recording):
     "success,requested,completed,status,reason",
     [
         (True, 0, 0, 2, 1),
-        (True, 2, 0, 4, 0),
+        (True, 2, 0, 10, 0),
         (True, 2, 1, 3, 0),
         (True, 2, 2, 2, 1),
         (False, 2, 2, 4, 0),

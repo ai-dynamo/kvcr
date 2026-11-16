@@ -1190,7 +1190,15 @@ def test_local_claims_fetch_deliver_release_and_capacity() -> None:
     agent.state = "DONE"
     now += 0.25
     assert _poll_until(kvcr, lambda results: bool(results)) == [
-        (deliver, _op_entries({first_key: True, second_key: False}))
+        (
+            deliver,
+            _op_entries(
+                {
+                    first_key: True,
+                    second_key: (OpEntryStatus.UNAVAILABLE, "hint_unavailable"),
+                }
+            ),
+        )
     ]
     assert destination.raw[:block_size] == b"a" * block_size
     assert agent.xfer_backends and all(
@@ -1338,7 +1346,10 @@ def test_local_copy_timeout_retains_memory_until_completion(
     if failure != "discard":
         _wait_until(lambda: copy.failure_latched)
 
-    expected = {handle: _op_entries({key: False}) for handle in fetches}
+    expected = {
+        handle: _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")})
+        for handle in fetches
+    }
     if expired is not None:
         expected[expired] = _op_entries({key: False})
     assert dict(_poll_until(kvcr, lambda done: len(done) >= len(expected))) == expected
@@ -1351,7 +1362,9 @@ def test_local_copy_timeout_retains_memory_until_completion(
         late = kvcr.fetch((key,))
         assert kvcr.poll_completed() == []
         now = 3.1
-        assert dict(kvcr.poll_completed()) == {late: _op_entries({key: False})}
+        assert dict(kvcr.poll_completed()) == {
+        late: _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")})
+    }
     if duplicate:
         now = 4.5 if failure == "timeout" else 0.0
         second = kvcr.deposit({key: [_mem_descriptor()]})

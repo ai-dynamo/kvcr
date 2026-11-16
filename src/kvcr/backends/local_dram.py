@@ -14,6 +14,7 @@ from ..runtime.progress import (
     _DROPPED_RESULT,
     _FAILED_RESULT,
     _SUCCESS_RESULT,
+    _TIMEOUT_RESULT,
     _KVCRProgress,
     _Op,
     _OpId,
@@ -562,7 +563,11 @@ class _LocalDram:
         return None
 
     def complete_fill(
-        self, keys: Collection[BlockKey], *, success: bool
+        self,
+        keys: Collection[BlockKey],
+        *,
+        success: bool,
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
     ) -> list[BlockKey]:
         ordered_keys = tuple(keys)
         indices = []
@@ -573,7 +578,11 @@ class _LocalDram:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             indices.append(residency.remote_indices)
         return self._apply_fill_result(
-            ordered_keys, tuple(indices), success, CacheTier.REMOTE_G2
+            ordered_keys,
+            tuple(indices),
+            success,
+            CacheTier.REMOTE_G2,
+            failures=failures,
         )
 
     def deliver(
@@ -593,7 +602,12 @@ class _LocalDram:
         self._kvcr._add_block_dependencies(op, new_operation=True)
         self._start_deliveries(op, blocks)
 
-    def discard_fill(self, keys: Collection[BlockKey]) -> None:
+    def discard_fill(
+        self,
+        keys: Collection[BlockKey],
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
+    ) -> None:
+        """Abandon remote fills; ``failures`` is what their waiters are told."""
         state = self._pools._source_state
         residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
@@ -637,7 +651,12 @@ class _LocalDram:
                         or residency.state is _LocalDramState.DISCARDING
                     )
                 ):
-                    residency_op.results[key] = _FAILED_RESULT
+                    # Every waiter here was waiting on the abandoned fill.
+                    residency_op.results[key] = (
+                        failures.get(key, _FAILED_RESULT)
+                        if failures
+                        else _FAILED_RESULT
+                    )
                     residency_op.active_keys.discard(key)
                     residency_ops[op_id] = residency_op
                 deliver_op = self._pending_deliver_ops.get(op_id)
@@ -716,7 +735,9 @@ class _LocalDram:
         *,
         writer: _PendingResidencyOp | None = None,
         dst_descriptors: tuple[_TransferRef, ...] = (),
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
     ) -> list[BlockKey]:
+        """Settle a fill; ``failures`` carries a source's per-key failure status."""
         committed: list[BlockKey] = []
         failed: list[BlockKey] = []
         affected_residency_ops: dict[_OpId, _PendingResidencyOp] = {}
@@ -733,6 +754,7 @@ class _LocalDram:
             if record is None or residency is None:
                 raise RuntimeError(f"local DRAM fill state lost for {key!r}")
             was_ready = residency.state is _LocalDramState.READY
+            failure = failures.get(key, _FAILED_RESULT) if failures else _FAILED_RESULT
             key_success = (
                 success
                 and residency.state is not _LocalDramState.DISCARDING
@@ -740,6 +762,7 @@ class _LocalDram:
             )
             # This copy holds a writer count, so writers cannot have been settled.
             writers = cast(list[int], residency.writers)
+            owner_request: str | None = None  # One fill owner per key.
             for index in indices:
                 writers[index] -= 1
                 if writers[index] < 0:
@@ -789,7 +812,7 @@ class _LocalDram:
                         if key_success and writer.claim_on_ready
                         else _SUCCESS_RESULT
                         if key_success
-                        else _FAILED_RESULT
+                        else failure
                     )
                 affected_residency_ops[writer.op_id] = writer
             else:
@@ -797,8 +820,9 @@ class _LocalDram:
                     op = self._pending_residency_ops.get(op_id)
                     if op is not None and key in op.remote_fill_keys:
                         op.remote_fill_keys.remove(key)
+                        owner_request = op.request_id
                         if not key_success:
-                            op.results[key] = _FAILED_RESULT
+                            op.results[key] = failure
                             affected_residency_ops[op_id] = op
             self._pools._release_claim(key, residency)
             if record.local_dram is None:
@@ -819,6 +843,19 @@ class _LocalDram:
                     if residency_op.sources is not None:
                         queued_deposits.setdefault(op_id, []).append(key)
                         continue
+                    if (
+                        not key_success
+                        and failures
+                        and key in failures
+                        and residency_op.request_id is not None
+                        and residency_op.request_id == owner_request
+                    ):
+                        # Same request, same hint: a retry would only see the
+                        # hint this failure invalidated, so share the failure.
+                        # Other requests retry with their own hint.
+                        residency_op.results[key] = failure
+                        affected_residency_ops[op_id] = residency_op
+                        continue
                     if not self._resolve_fetch_waiter(key, residency_op):
                         continue
                     affected_residency_ops[op_id] = residency_op
@@ -832,7 +869,7 @@ class _LocalDram:
                     if record.local_dram is not None:
                         deliver_keys.setdefault(op_id, []).append(key)
                     else:
-                        deliver_op.results[key] = _FAILED_RESULT
+                        deliver_op.results[key] = failure
                     affected_deliver_ops[op_id] = deliver_op
 
         self._pools._update_capacity_pressure()
@@ -1055,7 +1092,7 @@ class _LocalDram:
                     )
                 ):
                     continue
-                residency_op.results[key] = _FAILED_RESULT
+                residency_op.results[key] = _TIMEOUT_RESULT
 
         for residency_op in expired:
             self._finish_residency_if_ready(residency_op)

@@ -23,6 +23,7 @@ from _nvtx_test_utils import make_target, payloads, spans, wait_for_payload
 
 from kvcr import _nvtx
 from kvcr.backends.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
+from kvcr.backends.remote_ops import _write_done_notif
 from kvcr.config import LocalDramOptions, RemoteFWDramOptions
 from kvcr.types import BlockKey, RegionDescriptor
 
@@ -411,9 +412,23 @@ def test_missing_hint_has_specific_reason(recording):
     handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]})
     result = dict(kvcr.poll_completed())
     assert not result[handle][BlockKey(b"k")].success
-    assert int(payloads(recording, "op.completion_returned")[0]["reason"]) == int(
-        _nvtx.Reason.HINT_UNAVAILABLE
-    )
+    [returned] = payloads(recording, "op.completion_returned")
+    assert int(returned["reason"]) == int(_nvtx.Reason.HINT_UNAVAILABLE)
+    assert int(returned["status"]) == _nvtx.Status.REJECTED  # No source answered.
+
+
+def test_failed_hint_rejection_names_its_reason(recording):
+    kvcr, agent, control = make_target()
+    kvcr.submit_hint(_router_hint("tcp://source:1"), "req")
+    key = BlockKey(b"k")
+    first = kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [_write_done_notification(first, success=False)]
+    _poll_until(kvcr, bool)
+    kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    assert not list(kvcr.poll_completed())[0][1][key].success
+    [rejected] = payloads(recording, "target.rejected")
+    assert int(rejected["reason"]) == _nvtx.Reason.HINT_INVALIDATED
 
 
 @pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "end"])
@@ -450,8 +465,10 @@ def test_off_skips_annotation_work_but_preserves_results(
             return super().pop(*args)
 
     class Reasons:
+        # Members also name wire reasons, so only reason mapping counts as work.
         def __getattr__(self, name):
-            accesses.append(name)
+            if name not in reasons.__members__:
+                accesses.append(name)
             return getattr(reasons, name)
 
     monkeypatch.setenv("KVCR_NVTX_LEVEL", "off")
@@ -473,3 +490,19 @@ def test_off_skips_annotation_work_but_preserves_results(
     assert not list(kvcr.poll_completed())
     assert accesses == []
     assert not recording.events
+
+
+def test_source_holding_nothing_is_a_miss_not_a_failure(recording):
+    kvcr, agent, control = make_target()
+    kvcr.submit_hint(_router_hint("tcp://source:1"), "req")
+    key = BlockKey(b"k")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, "req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [
+        _write_done_notif(handle, True, (), unserved={"not_resident": [0]})
+    ]
+    _poll_until(kvcr, bool)
+    for name in ("target.write_done.received", "op.completion_returned"):
+        [event] = payloads(recording, name)
+        assert int(event["status"]) == _nvtx.Status.MISS
+        assert int(event["reason"]) == _nvtx.Reason.NOT_RESIDENT

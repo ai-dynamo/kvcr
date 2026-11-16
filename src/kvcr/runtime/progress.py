@@ -19,11 +19,14 @@ import numpy as np
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
 from .. import _nvtx
-from ..types import BlockKey, OpEntryResult, OpEntryStatus, RegionDescriptor
+from ..types import BlockKey, OpEntryResult, OpEntryStatus, Reason, RegionDescriptor
 
 logger = logging.getLogger(__name__)
 _SUCCESS_RESULT = OpEntryResult(OpEntryStatus.SUCCESS)
 _FAILED_RESULT = OpEntryResult(OpEntryStatus.FAILED)
+_TIMEOUT_RESULT = OpEntryResult(
+    OpEntryStatus.TIMEOUT, reason=Reason.DEADLINE.wire
+)
 _DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -237,7 +240,7 @@ class _KVCRProgress:
                         once=True,
                         transfer_id=transfer_id,
                         status=_nvtx.Status.FAILED,
-                        reason=_nvtx.Reason.PROGRESS_ERROR,
+                        reason=Reason.PROGRESS_ERROR,
                     )
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
             # its completion signal. Retain it until native access has stopped.
@@ -341,16 +344,16 @@ class _KVCRProgress:
                 logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
             if trace is not None:
                 if submitted:
-                    post_status, post_reason = _nvtx.Status.PENDING, _nvtx.Reason.NONE
+                    post_status, post_reason = _nvtx.Status.PENDING, Reason.NONE
                 elif state.outcome is False:
                     post_status, post_reason = (
                         _nvtx.Status.REJECTED,
-                        _nvtx.Reason.SUBMIT_REJECTED,
+                        Reason.SUBMIT_REJECTED,
                     )
                 else:
                     post_status, post_reason = (
                         _nvtx.Status.AMBIGUOUS,
-                        _nvtx.Reason.SUBMIT_AMBIGUOUS,
+                        Reason.SUBMIT_AMBIGUOUS,
                     )
                 trace.mark(
                     "nixl.write.posted",
@@ -369,7 +372,7 @@ class _KVCRProgress:
             return transfer_id, submitted
         except Exception:
             if trace is not None:
-                trace.reject("nixl.write.rejected", _nvtx.Reason.CREATE_ERROR)
+                trace.reject("nixl.write.rejected", Reason.CREATE_ERROR)
             raise
         finally:
             if trace is not None:
@@ -513,7 +516,7 @@ class _KVCRProgress:
                     detail=True,
                     transfer_id=transfer_id,
                     status=_nvtx.Status.UNRESOLVED,
-                    reason=_nvtx.Reason.RELEASE_ERROR,
+                    reason=Reason.RELEASE_ERROR,
                 )
             return False
         self._active_transfers.pop(transfer_id, None)
@@ -523,7 +526,7 @@ class _KVCRProgress:
                 once=True,
                 transfer_id=transfer_id,
                 status=_nvtx.Status.SUCCESS if state.outcome else _nvtx.Status.FAILED,
-                reason=_nvtx.Reason.NONE if state.outcome else _nvtx.Reason.UNKNOWN,
+                reason=Reason.NONE if state.outcome else Reason.UNKNOWN,
             )
             state.trace.end("nixl.write")
         return True

@@ -23,6 +23,7 @@ from .runtime.core import (  # noqa: F401 - public re-exports
     STATE_METRIC,
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
+    UNSERVED_BLOCKS_METRIC,
     _KVCRCore,
 )
 from .service import recovery_journal as _recovery
