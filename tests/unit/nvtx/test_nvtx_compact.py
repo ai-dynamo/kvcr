@@ -54,7 +54,7 @@ def test_immutable_context_is_not_repeated_on_transitions(recording):
         requested_blocks=7,
     )
     trace.mark("source.write.completed", status=2, completed_blocks=7)
-    trace.mark("nixl.done_observed", transfer_id=8)
+    trace.mark("nixl.write.released", transfer_id=8)
     contexts = payloads(recording, "request.context")
     assert len(contexts) == 1
     assert int(contexts[0]["op_handle"]) == 41
@@ -100,17 +100,17 @@ def test_low_avoids_descriptor_diagnostics(recording, monkeypatch, level, scanne
 
 def test_repeated_events_reuse_attributes_and_preserve_snapshots(recording):
     trace = _nvtx.create_tracer().lifecycle(op_handle=4)
-    trace.mark("nixl.done_observed", transfer_id=1)
+    trace.mark("nixl.write.released", transfer_id=1)
     recording.fail = "attributes"
-    trace.mark("nixl.done_observed", transfer_id=2)
-    events = payloads(recording, "nixl.done_observed")
+    trace.mark("nixl.write.released", transfer_id=2)
+    events = payloads(recording, "nixl.write.released")
     assert [int(e["transfer_id"]) for e in events] == [1, 2]
 
 
 @pytest.mark.parametrize("context", [False, True], ids=["compact", "context"])
 def test_reentrant_emission_does_not_overwrite_outer_payload(recording, context):
     tracer = _nvtx.create_tracer()
-    name = "request.context" if context else "nixl.done_observed"
+    name = "request.context" if context else "nixl.write.released"
     field = "requested_blocks" if context else "transfer_id"
     original = recording.mark
     entering = False

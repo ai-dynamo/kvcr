@@ -20,7 +20,7 @@ uv sync --extra profiling
 | Value | Behavior |
 | --- | --- |
 | `off` (default) | No optional NVTX backend loading, trace objects, payload construction, or NIXL trace-info queries. |
-| `low` | Essential identities, pin/transfer/target/caller lifetimes, hints, transitions and outcomes. |
+| `low` | Essential identities, pin/source/target/caller lifetimes, transfer correlation/release, hints and outcomes. |
 | `medium` | Low plus descriptor byte/tier/memory diagnostics, bounded request display labels, waiter detachment and native release retries. |
 
 Without the optional dependencies, tracing is a no-op. An explicit request for tracing with an unavailable backend warns once. An unsupported level warns once and disables tracing. There is no `high` level in this checkpoint.
@@ -29,7 +29,7 @@ Tracing is independent of KVCR telemetry and is not gated on profiler attachment
 
 For native transport detail and `nixl.write.correlated`, NIXL must include [#2526](https://github.com/ai-dynamo/nixl/pull/2526), be built with `-Dwith_trace=true -Dtrace_backends=nvtx`, and run with `NIXL_TRACE_BACKENDS=nvtx NIXL_TRACE_SAMPLE_RATIO=1`. Add those two environment assignments to the capture command. These controls are independent of `KVCR_NVTX_LEVEL`; KVCR does not enable native tracing itself. A source build may also require `NIXL_PLUGIN_DIR` pointing to its installed plugins. The current NIXL 1.5.0 dependency keeps KVCR lifetimes and outcomes functional but lacks the correlation getter. Verify the getter and native trace export in the anticipated NIXL 1.6.0 release before changing the pin or relying on released-wheel support.
 
-Native spans now supply synchronous creation/post detail; KVCR no longer emits `nixl.write.submit`, `nixl.write.posted`, or `nixl.write.rejected`. KVCR retains its asynchronous `nixl.write` range through successful handle release, observed DONE, release retries, and source/target/caller outcomes. Missing native correlation is a diagnostic limitation, not a transfer failure.
+Native events supply creation/post and completion/error detail; KVCR retains source/target/caller lifetimes, failure causes, correlation and release markers. There is no separate KVCR `nixl.write` range or DONE/error observation marker. Without native tracing, transfer detail is reduced; operation lifetimes, outcomes and safe cleanup remain. See the [event reference](nvtx-events.md) for the retained release observations and native export limits.
 
 ## Capture an application run
 
