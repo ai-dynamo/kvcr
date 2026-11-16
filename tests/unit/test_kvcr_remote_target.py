@@ -937,6 +937,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     assert not any(name == UNSERVED_BLOCKS_METRIC for _, name, _, _ in source_records)
     # A source timeout is labelled as one; every block is counted once, by reason.
     assert ("remote_deliver", "timeout") in _duration_labels(target_records)
+    assert ("remote_deliver", "unavailable") in _duration_labels(target_records)
     assert _unserved_counts(target_records) == {
         ("remote_deliver", "not_resident"): 1,
         ("remote_deliver", "remembered_miss"): 3,
