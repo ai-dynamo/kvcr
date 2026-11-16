@@ -224,22 +224,8 @@ class _KVCRProgress:
                 if state.outcome is not False:
                     logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
-            if state.trace is not None:
-                if xfer_state == "DONE":
-                    state.trace.mark(
-                        "nixl.done_observed",
-                        once=True,
-                        transfer_id=transfer_id,
-                        status=_nvtx.Status.SUCCESS,
-                    )
-                elif xfer_state not in ("PROC", "PEND"):
-                    state.trace.mark(
-                        "nixl.write.error",
-                        once=True,
-                        transfer_id=transfer_id,
-                        status=_nvtx.Status.FAILED,
-                        reason=Reason.PROGRESS_ERROR,
-                    )
+            if state.trace is not None and xfer_state not in ("DONE", "PROC", "PEND"):
+                state.trace.failure_reason = Reason.PROGRESS_ERROR
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
             # its completion signal. Retain it until native access has stopped.
             # TODO: Enable timeout cancellation for NIXL backends that guarantee
@@ -318,8 +304,6 @@ class _KVCRProgress:
             handle, remote_side_agent, capture_telemetry, trace=trace
         )
         self._active_transfers[transfer_id] = state
-        if trace is not None:
-            trace.start("nixl.write", transfer_id=transfer_id)
         try:
             post_state = agent.transfer(handle)
             submitted = post_state in ("DONE", "PROC", "PEND")
@@ -350,13 +334,6 @@ class _KVCRProgress:
                     )
             except Exception:
                 pass  # Native diagnostics cannot affect transfer ownership.
-            if state.outcome is True:
-                trace.mark(
-                    "nixl.done_observed",
-                    once=True,
-                    transfer_id=transfer_id,
-                    status=_nvtx.Status.SUCCESS,
-                )
         return transfer_id, submitted
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
@@ -509,7 +486,6 @@ class _KVCRProgress:
                 status=_nvtx.Status.SUCCESS if state.outcome else _nvtx.Status.FAILED,
                 reason=Reason.NONE if state.outcome else Reason.UNKNOWN,
             )
-            state.trace.end("nixl.write")
         return True
 
     def start(self) -> None:
