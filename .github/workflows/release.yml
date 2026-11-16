@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Release
-run-name: Release ${{ inputs.version }} rc${{ inputs.rc }} (by @${{ github.actor }})
+run-name: Release ${{ inputs.release_version }} rc${{ inputs.rc_round }} (by @${{ github.actor }})
 
 on:
-  # nightly.yml calls this for nightlies and pull-request wheel checks.
+  # nightly.yml calls this for nightlies.
   workflow_call:
     inputs:
       mode:
@@ -21,17 +21,17 @@ on:
         default: true
   workflow_dispatch:
     inputs:
-      version:
-        description: Version to release. It must equal [project].version in pyproject.toml.
+      release_version:
+        description: Version to publish, X.Y.Z. Run this from the release/X.Y.Z branch, whose pyproject.toml holds the same version.
         required: true
         type: string
-      rc:
-        description: Release-candidate round. Stage a fixed build as the next round.
+      rc_round:
+        description: Staging rc round, <round> or <round>.<sub> (e.g. 2 or 2.1). Staging is immutable, so re-stage a failed round as a sub-round. No GitHub tag is created.
         required: true
-        type: number
-        default: 0
+        type: string
+        default: "0"
       run_e2e:
-        description: Run the GPU end-to-end test and require it to pass before approval. The wheel is staged first, so a fixed build needs the next rc.
+        description: Run the GPU end-to-end test and require it to pass before approval. The wheel is staged first, so a fixed build needs the next rc round.
         required: false
         type: boolean
         default: true
@@ -40,7 +40,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.mode == 'nightly' && github.run_id || format('{0}-rc{1}', inputs.version, inputs.rc) }}
+  group: release-${{ inputs.mode == 'nightly' && github.run_id || format('{0}-rc{1}', inputs.release_version, inputs.rc_round) }}
   cancel-in-progress: false
 
 defaults:
@@ -72,8 +72,8 @@ jobs:
         env:
           MODE: ${{ inputs.mode || 'release' }}
           STAGE: ${{ inputs.stage }}
-          INPUT_VERSION: ${{ inputs.version }}
-          RC: ${{ inputs.rc }}
+          INPUT_VERSION: ${{ inputs.release_version }}
+          RC: ${{ inputs.rc_round }}
           RUN_E2E: ${{ inputs.run_e2e }}
           NIGHTLY_PUBLISH: ${{ vars.KVCR_NIGHTLY_PUBLISH }}
         run: |
@@ -83,11 +83,7 @@ jobs:
           [ -n "${base}" ] || fail "pyproject.toml [project].version must be a plain X.Y.Z release"
           case "${MODE}" in
             nightly)
-              # TEMP: pull-request/66 is allowed for the dry run; remove before merge.
-              if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ "${GITHUB_REF}" != "refs/heads/main" ] \
-                && [ "${GITHUB_REF}" != "refs/heads/pull-request/66" ]; then
-                fail "nightlies run only on main"
-              fi
+              [ "${GITHUB_REF}" = "refs/heads/main" ] || fail "nightlies run only on main"
               date="$(date -u +%Y%m%d)"
               version="${base}.dev${date}"
               nightly_tag="${date}-${GITHUB_SHA:0:7}"
@@ -103,11 +99,10 @@ jobs:
               [[ "${INPUT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version '${INPUT_VERSION}' must be X.Y.Z"
               [ "${INPUT_VERSION}" = "${base}" ] \
                 || fail "version ${INPUT_VERSION} does not match pyproject.toml ${base} on ${GITHUB_REF_NAME}"
-              case "${GITHUB_REF}" in
-                refs/heads/main | "refs/heads/release/${INPUT_VERSION}") ;;
-                *) fail "release ${INPUT_VERSION} runs from main or release/${INPUT_VERSION}, not ${GITHUB_REF}" ;;
-              esac
-              [[ "${RC}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || fail "rc '${RC}' must be a whole number below 1000"
+              [ "${GITHUB_REF}" = "refs/heads/release/${INPUT_VERSION}" ] \
+                || fail "release ${INPUT_VERSION} runs only from release/${INPUT_VERSION}, not ${GITHUB_REF}"
+              [[ "${RC}" =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2}))?$ ]] \
+                || fail "rc round '${RC}' must be <round> or <round>.<sub>, each below 1000"
               version="${base}"
               nightly_tag=""
               stage_path="release/${version}/rc${RC}"
@@ -378,7 +373,7 @@ jobs:
           staged="$(tr -d '\r' < "${RUNNER_TEMP}/head.txt" | awk 'tolower($1) == "x-checksum-sha256:" {print $2}')"
           case "${status}" in
             200)
-              [ "${staged}" = "${WHEEL_SHA256}" ] || { echo "::error::a different ${WHEEL} is already staged at ${STAGE_PATH}; stage the next rc"; exit 1; }
+              [ "${staged}" = "${WHEEL_SHA256}" ] || { echo "::error::a different ${WHEEL} is already staged at ${STAGE_PATH}; stage the next rc round"; exit 1; }
               echo "already staged: ${WHEEL}"
               ;;
             404)
@@ -393,7 +388,7 @@ jobs:
           esac
           curl -q -fsS --retry 3 --max-time 120 -o "${RUNNER_TEMP}/staged" -H "@${auth}" "${dest}"
           echo "${WHEEL_SHA256}  ${RUNNER_TEMP}/staged" | sha256sum --check
-      # Pull request checks hold no secrets, so they test the wheel in this job.
+      # Unstaged runs hold no secrets, so they test the wheel in this job.
       - if: env.STAGE != 'true'
         uses: ./.github/actions/test-wheel
         with:
@@ -530,12 +525,11 @@ jobs:
       MODE: ${{ needs.prepare.outputs.mode }}
       VERSION: ${{ needs.prepare.outputs.version }}
       NIGHTLY_TAG: ${{ needs.prepare.outputs.nightly_tag }}
-      RC: ${{ inputs.rc }}
+      RC: ${{ inputs.rc_round }}
       WHEEL: ${{ needs.prepare.outputs.wheel }}
       WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
       SLACK_THREAD_TS: ${{ needs.slack-start.outputs.thread_ts }}
-      # TEMP: always a dry run during PR verification; restore the expression before merge.
-      DRY_RUN: "true"
+      DRY_RUN: ${{ needs.prepare.outputs.publish == 'true' && 'false' || 'true' }}
     steps:
       - *ops-token
       - *ops-check
@@ -585,7 +579,7 @@ jobs:
           for kv in "${variables[@]}"; do
             form+=(--form-string "variables[${kv%%=*}]=${kv#*=}")
           done
-          curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=pvijayakrish/onboard-kvcr \
+          curl -q -fsS --max-time 60 -o "${response}" --form "token=<${token}" --form-string ref=main \
             "${form[@]}" "${GITLAB_PIPELINE_URL}"
           # Only the id is printed; the response's URLs name an internal host.
           pipeline_id="$(jq -e '.id | numbers' "${response}")" || fail "the release pipeline was not created"
@@ -597,7 +591,6 @@ jobs:
     # Quiet when the run was cancelled; timed-out jobs end as cancelled, and a planned GitLab trigger that never ran alerts.
     if: >-
       !cancelled() &&
-      github.event_name != 'pull_request' &&
       (inputs.mode != 'nightly' || github.event_name == 'schedule' || needs.prepare.outputs.stage == 'true') &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
        (needs.prepare.outputs.stage == 'true' && needs.trigger-gitlab.result != 'success'))
