@@ -104,12 +104,7 @@ class OpEntryStatus(Enum):
 
 
 class Reason(IntEnum):
-    """Why a transfer, or one of its blocks, did not complete.
-
-    The lower-cased name is the shared vocabulary on the wire
-    (``write_done.reason``, ``write_done.unserved``), in ``OpEntryResult.reason``,
-    in metric labels, in logs and in NVTX payloads. Values are NVTX codes.
-    """
+    """Why a transfer, or one of its blocks, did not complete."""
 
     UNKNOWN = 0
     NONE = 1
@@ -157,8 +152,7 @@ class OpEntryResult(msgspec.Struct, frozen=True):
     # Fetch locations in KVCR-owned memory, valid until release.
     descriptors: list[MemoryRef] | None = None
     release_handle: ReleaseHandle | None = None
-    # Why the block was not delivered: a lower-cased ``Reason`` name, or None
-    # when the cause is unspecified. Detail only; ``status`` says what to do.
+    # Why the block was not delivered: a lower-cased ``Reason`` name, or None.
     reason: str | None = None
 
     @property
