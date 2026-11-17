@@ -91,16 +91,14 @@ class TransferError(RuntimeError):
 
 
 class OpEntryStatus(Enum):
+    """Outcome for one block."""
+
     SUCCESS = "SUCCESS"
     DROPPED = "DROPPED"
-    # Not deliverable (miss, no route, or the peer could not serve it); nothing
-    # on this worker broke, so the caller just recomputes.
-    UNAVAILABLE = "UNAVAILABLE"
-    TIMEOUT = "TIMEOUT"
-    # Interrupted before it finished (cancelled, shutdown, route change, refusal).
-    ABORTED = "ABORTED"
-    # An unexpected error on either side (pin, create, transfer or setup).
-    FAILED = "FAILED"
+    UNAVAILABLE = "UNAVAILABLE"  # Expected miss or no usable source.
+    TIMEOUT = "TIMEOUT"  # Operation deadline expired.
+    ABORTED = "ABORTED"  # Cancelled or interrupted.
+    FAILED = "FAILED"  # Unexpected error on either worker.
 
 
 class Reason(IntEnum):
