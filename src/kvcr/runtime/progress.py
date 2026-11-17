@@ -689,6 +689,9 @@ class _KVCRProgress:
                 if self._run_one_iteration():
                     idle_wait = _IDLE_WAIT_SECONDS
                     continue
+                if self._stop_requested:
+                    # The iteration consumed a stop request; exit without waiting.
+                    break
                 if (
                     self._in_flight_ops
                     or self._active_transfers

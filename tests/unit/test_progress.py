@@ -998,3 +998,17 @@ def test_pending_work_keeps_the_short_poll_interval(monkeypatch, work) -> None:
         assert waits.long_wait.wait(5)
     finally:
         progress.close()
+
+
+def test_close_exits_without_another_idle_wait(monkeypatch) -> None:
+    # The iteration that consumes the stop request finds no other work, so the
+    # loop must exit then rather than start another idle wait.
+    waits = _WaitRecorder(monkeypatch)
+    progress = _KVCRProgress(
+        lambda _: None, lambda _, __: ({}, False), list, lambda: None
+    )
+    progress.start()
+    assert waits.long_wait.wait(5)
+    started = len(waits.waits)
+    progress.close()
+    assert waits.waits[started:] == []
