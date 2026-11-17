@@ -32,7 +32,6 @@ from _kvcr_test_utils import (
     _poll_until,
     _RecordingFIFOPolicy,
     _router_hint,
-    _start_write_message,
     _wait_until,
     _write_done_notification,
 )
@@ -52,7 +51,6 @@ from kvcr.backends.remote_ops import (
     _WriteProbeAck,
 )
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
-from kvcr.runtime.progress import _TransferRef
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -2266,7 +2264,8 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     kvcr = source.kvcr
     key = BlockKey(b"reader")
     source.deposit(key)
-    source.deposit(BlockKey(b"other"), 1)
+    other = BlockKey(b"other")
+    source.deposit(other, 1)
     fetched = kvcr.fetch((key,))
     claim = dict(kvcr.poll_completed())[fetched][key].release_handle
     _invalidate(kvcr, (key, key))
@@ -2280,12 +2279,25 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     assert all(not results[handle][key].success for handle in handles)
     assert kvcr._core._invalidation_handler.has_pending()
     assert not any(event.removed for event in source.events)
+    # A remote move of the pending key is unavailable; the readable one moves.
+    target = pair.target
+    moved = target.kvcr._core.fetch(
+        (key, other), source_endpoint=source.control.endpoint, move=True
+    )
+    source.agent.state = "DONE"
+    pair.until(lambda: moved in target.results)
+    result = target.results[moved][key]
+    assert (result.status, result.reason) == (OpEntryStatus.UNAVAILABLE, "not_resident")
+    claim_other = target.results[moved][other].release_handle
+    assert claim_other is not None
+    assert target.kvcr.release((claim_other,)) == [(claim_other, True)]
     assert kvcr.release((claim,)) == [(claim, True)]
+    pair.until(pair.idle)
     assert key not in kvcr._core._block_record_map
     assert not kvcr._core._invalidation_handler.has_pending()
     assert Counter(
         k for event in source.events if event.removed for k in event.keys
-    ) == Counter((key,))
+    ) == Counter((key, other))
     source.deposit(BlockKey(b"replacement"))
     assert kvcr.query((BlockKey(b"replacement"),)) == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2)
@@ -2307,37 +2319,6 @@ def test_move_reports_a_block_the_source_lacks_as_not_resident(pair):
         OpEntryStatus.UNAVAILABLE,
         "not_resident",
     )
-
-
-def test_move_reports_a_key_another_move_owns_as_not_resident():
-    source = _Peer("source")
-    target_buffer = ctypes.create_string_buffer(32)
-    owned, free = BlockKey(b"owned"), BlockKey(b"free")
-    source.deposit(owned)
-    source.deposit(free, 1)
-
-    def move(op_handle, keys):
-        payload = msgspec.msgpack.decode(
-            _start_write_message(op_handle, keys[0], target_agent="target")
-        )
-        payload["keys"] = list(keys)
-        payload["dst_descriptors"] = [
-            [_TransferRef("target", i)] for i in range(len(keys))
-        ]
-        payload.update(move=True, g2_only=True, key_layout=[""])
-        region = msgspec.to_builtins(_buffer_region(target_buffer, 16))
-        payload["target_regions"] = [{"": region}, {}]
-        source.control.incoming.append(msgspec.msgpack.encode(payload))
-
-    move(1, [owned])
-    _poll_until(source.kvcr, lambda _: len(source.agent.xfers) == 3)
-    move(2, [owned, free])
-    _poll_until(source.kvcr, lambda _: len(source.agent.xfers) == 4)
-    notification = _decode_notif(source.agent.xfers[3][5])
-    # Another move holds the first block; that is not a layout failure.
-    assert notification["success"]
-    assert notification["unserved"] == {"not_resident": [0]}
-    source.agent.state = "DONE"
 
 
 @pytest.mark.parametrize("incomplete", [False, True])

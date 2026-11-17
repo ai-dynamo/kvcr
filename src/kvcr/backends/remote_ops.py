@@ -962,7 +962,7 @@ def _notification_unserved(
     unknown, miss = Reason.UNKNOWN.wire, Reason.REMEMBERED_MISS.wire
     unserved = {
         key: excluded.get(key, unknown if key in sent else miss)
-        for key in dict.fromkeys((*ordered_keys, *excluded, *missing))  # Stable ties.
+        for key in chain(ordered_keys, excluded, missing)  # Stable ties.
         if key in missing
     }
     reported = payload.get("unserved")

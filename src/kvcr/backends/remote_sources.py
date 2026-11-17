@@ -177,7 +177,7 @@ class _RemoteSources:
             # the same handle back for a reused name, so submitting would
             # write the dead generation's destinations through the new route.
             force_failure = True
-            if failure_reason in (Reason.UNKNOWN, Reason.NOT_RESIDENT):
+            if failure_reason is Reason.UNKNOWN:
                 failure_reason = Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.keys
@@ -499,13 +499,7 @@ class _RemoteSources:
                 op.keys, key_layout=op.key_layout
             )
         self._source_pin_ops[op.op_id] = op
-        if op.ordered_keys and not op.keys:
-            # Every requested key was rejected; send failure without a transfer.
-            self._submit_prepared_source_write(
-                op.op_id, op, force_failure=True, failure_reason=Reason.NOT_RESIDENT
-            )
-        else:
-            self._resume_source_pin(op.op_id, op)
+        self._resume_source_pin(op.op_id, op)
 
     def _resume_source_pin(self, op_id: _OpId, op: _SourcePinOp) -> None:
         if self._source_pin_ops.get(op_id) is not op:
