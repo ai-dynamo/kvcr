@@ -11,6 +11,7 @@ from contextlib import closing, suppress
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 from _kvcr_test_utils import (
     FakeBytesControl,
@@ -761,6 +762,58 @@ def test_lru_float_score_uses_small_tail_first_bias() -> None:
     assert score(timestamp, 2) < score(timestamp, 1) < score(timestamp, 0)
     assert score(timestamp, 0) < score(timestamp + 0.001, 4096)
     assert score(None, 1) < score(None, 0) < score(0, 4096)
+
+
+class _ScorePolicy(FIFOPolicy):
+    def __init__(self, score):
+        self.score = score
+
+    def eviction_score(self, meta, source):
+        return self.score
+
+
+@pytest.mark.parametrize(
+    ("score", "expected"),
+    [
+        (np.float64(1.5), 1.5),
+        (np.float32(0.5), 0.5),
+        (np.int64(3), 3.0),
+        (True, None),
+        (np.bool_(True), None),
+        (np.float64("nan"), None),
+        ("1.0", None),
+    ],
+    ids=["np-float64", "np-float32", "np-int64", "bool", "np-bool", "np-nan", "str"],
+)
+def test_eviction_score_accepts_real_numbers(score, expected) -> None:
+    policy = _PolicyInvoker(_ScorePolicy(score))
+    meta = BlockMeta(BlockKey(b"key"), 16, 0, None, frozenset())
+    result = policy.eviction_score(meta, CacheTier.LOCAL_G2)
+    assert result == expected
+    assert result is None or type(result) is float
+
+
+def test_numpy_eviction_score_keeps_full_pool_evictable() -> None:
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 3)
+    local = ctypes.create_string_buffer(block_size * 2)
+    agent = FakeNixlAgent()
+    kvcr = _new_local_kvcr(
+        agent,
+        local,
+        2,
+        policy=_ScorePolicy(np.float64(0.0)),
+        framework_regions=[_buffer_region(primary, block_size)],
+    )
+    keys = tuple(BlockKey(f"k{index}".encode()) for index in range(3))
+    kvcr.deposit({key: [_mem_descriptor(i)] for i, key in enumerate(keys[:2])})
+    _wait_until(lambda: len(agent.transfers) == 1)
+    agent.state = "DONE"
+    _poll_until(kvcr, bool)
+
+    replacement = kvcr.deposit({keys[2]: [_mem_descriptor(2)]})
+
+    assert dict(_poll_until(kvcr, bool))[replacement] == _op_entries({keys[2]: True})
 
 
 @pytest.mark.parametrize(
