@@ -12,7 +12,7 @@ from _kvcr_test_utils import (
     _wait_until,
     _write_done_notification,
 )
-from _nvtx_test_utils import make_target, payloads
+from _nvtx_test_utils import make_target, payloads, reason_of
 
 from kvcr import _nvtx
 from kvcr.hints.results import HintStatus
@@ -77,7 +77,7 @@ def test_batch_hint_traces(recording, monkeypatch, level, scenario):
     for event in used + rejected:
         assert int(event["trace_id"]) == int(submitted[-1]["trace_id"])
     if rejected:
-        assert int(rejected[0]["reason"]) == _nvtx.Reason.HINT_CONFLICT
+        assert reason_of(rejected[0]) == _nvtx.Reason.HINT_CONFLICT
         assert int(rejected[0]["status"]) == _nvtx.Status.REJECTED
     [discarded] = payloads(recording, "hint.discarded")
     assert (

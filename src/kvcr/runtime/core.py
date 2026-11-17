@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from .. import _nvtx
 from ..backends.local_disk import _G3, _G3Residency
 from ..backends.local_dram import _LocalDram, _NamedSource
 from ..backends.local_dram_pools import (
@@ -45,6 +44,7 @@ from ..types import (
     PinHandle,
     PlacementDecision,
     QueryStatus,
+    Reason,
     RecoveryMirrorError,
     RegionDescriptor,
     ReleaseHandle,
@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 DURATION_METRIC = "kvcr_duration_seconds"
 TRANSFER_BYTES_METRIC = "kvcr_transfer_bytes"
 TRANSFER_BLOCKS_METRIC = "kvcr_transfer_blocks"
+UNSERVED_BLOCKS_METRIC = "kvcr_unserved_blocks"
 STATE_METRIC = "kvcr_state"
 
 _Timer = Callable[[], float | None]
@@ -698,7 +699,7 @@ class _KVCRCore:
         except Exception:
             self._nvtx_operations.pop(op_handle, None)
             if trace is not None:
-                trace.reject("op.rejected", _nvtx.Reason.UNKNOWN)
+                trace.reject("op.rejected", Reason.UNKNOWN)
             raise
         finally:
             if trace is not None:
@@ -1043,7 +1044,7 @@ class _KVCRCore:
                     "query_ordinal=%d sample_cap=4 sample_scope=request_lru128 "
                     "local_ready=%d local_filling=%d g3_fetchable=%d "
                     "remote_fetchable=%d misses=%d opportunistic=%s "
-                    "hint_present=%s hint_failed=%s",
+                    "hint_present=%s hint_invalidated=%s",
                     request_id,
                     self.nixl_agent_name,
                     len(statuses),
@@ -1179,15 +1180,17 @@ class _KVCRCore:
             return
         fill_handle = self._next_fill_handle
         self._next_fill_handle -= 1
+        failure: OpEntryResult | None = _FAILED_RESULT
         if source is CacheTier.G3:
-            started = self._g3 is not None and self._g3.start_fill(
+            if self._g3 is not None and self._g3.start_fill(
                 fill_handle,
                 blocks,
                 deadline,
-            )
+            ):
+                failure = None
         elif source is CacheTier.REMOTE_G2:
             # Independent operations retain their named source across deferral.
-            started = self._remote_fw_dram.fetch(
+            failure = self._remote_fw_dram.fetch(
                 blocks,
                 request_id,
                 deadline,
@@ -1197,8 +1200,10 @@ class _KVCRCore:
             )
         else:
             raise ValueError(f"unsupported local fill source {source.value}")
-        if not started:
-            self._complete_local_dram_fill(blocks, success=False)
+        if failure is not None:
+            self._complete_local_dram_fill(
+                blocks, success=False, failures=dict.fromkeys(blocks, failure)
+            )
 
     def _claim_local_dram_sources(
         self,
@@ -1322,16 +1327,24 @@ class _KVCRCore:
             self._local_dram_sources_by_op.pop(op_id)
 
     def _complete_local_dram_fill(
-        self, keys: Collection[BlockKey], *, success: bool
+        self,
+        keys: Collection[BlockKey],
+        *,
+        success: bool,
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
     ) -> list[BlockKey]:
         if self._local_dram is None:
             raise RuntimeError("remote fetch completed without local DRAM")
-        return self._local_dram.complete_fill(keys, success=success)
+        return self._local_dram.complete_fill(keys, success=success, failures=failures)
 
-    def _discard_local_dram_fill(self, keys: Collection[BlockKey]) -> None:
+    def _discard_local_dram_fill(
+        self,
+        keys: Collection[BlockKey],
+        failures: Mapping[BlockKey, OpEntryResult] | None = None,
+    ) -> None:
         if self._local_dram is None:
             raise RuntimeError("remote fetch update without local DRAM")
-        self._local_dram.discard_fill(keys)
+        self._local_dram.discard_fill(keys, failures)
 
     def _block_record(self, key: BlockKey) -> _BlockRecord:
         record = self._block_record_map.get(key)

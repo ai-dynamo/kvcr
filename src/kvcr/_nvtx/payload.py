@@ -7,6 +7,8 @@ from itertools import count
 from threading import local
 from uuid import uuid4
 
+from ..types import Reason
+
 
 class Status(IntEnum):
     PENDING = 1
@@ -18,29 +20,13 @@ class Status(IntEnum):
     REJECTED = 7
     AMBIGUOUS = 8
     UNRESOLVED = 9
+    # The source answered but served none of the blocks; nothing broke.
+    MISS = 10
 
 
-class Reason(IntEnum):
-    UNKNOWN = 0
-    NONE = 1
-    CALLBACK_ERROR = 2
-    DUPLICATE_REQUEST = 3
-    INVALID_RESULT = 4
-    DEADLINE = 5
-    CANCELLED = 6
-    SHUTDOWN = 7
-    NO_WAITERS = 8
-    SUBMIT_REJECTED = 9
-    SUBMIT_AMBIGUOUS = 10
-    CREATE_ERROR = 11
-    PROGRESS_ERROR = 12
-    RELEASE_ERROR = 13
-    CONTROL_ERROR = 14
-    INVALID_NOTIFICATION = 15
-    REMOTE_FAILURE = 16
-    ROUTE_CHANGED = 17
-    HINT_UNAVAILABLE = 19
-    HINT_CONFLICT = 20
+# Reasons are emitted by name, zero-padded to this many bytes.
+_REASON_WIDTH = 24
+assert max(len(reason.value) for reason in Reason) <= _REASON_WIDTH
 
 
 class _ThreadBuffers(local):
@@ -57,6 +43,12 @@ class _PayloadEmitter:
         self.category = domain.get_category_id("framework_pin")
         self.lifecycle_category = domain.get_category_id("remote_deliver")
         self._thread = _ThreadBuffers()
+        self._reasons = {
+            reason: numpy.frombuffer(
+                reason.value.encode().ljust(_REASON_WIDTH, b"\0"), dtype="u1"
+            )
+            for reason in Reason
+        }
         # Shared with target/caller tracing, which supplies local_fill and
         # medium-detail requested_bytes and destination_memory. Session IDs and
         # numeric native errors have no producer; their known flags stay zero.
@@ -90,7 +82,7 @@ class _PayloadEmitter:
                 ("selected_bytes", "i8"),
                 ("completed_bytes", "i8"),
                 ("status", "u1"),
-                ("reason", "u1"),
+                ("reason", "u1", (_REASON_WIDTH,)),
                 ("local_fill", "u1"),
                 ("source_tier", "u1"),
                 ("destination_tier", "u1"),
@@ -111,12 +103,12 @@ class _PayloadEmitter:
             ]
         )
         self._defaults = dict(
-            schema_version=3,
+            schema_version=4,
             instance_hi=self.instance_hi,
             instance_lo=self.instance_lo,
             trace_id=0,
             status=Status.PENDING,
-            reason=Reason.NONE,
+            reason=self._reasons[Reason.NONE],
         )
         template = numpy.zeros((), dtype=self.context_dtype)
         count_fields = [
@@ -171,6 +163,8 @@ class _PayloadEmitter:
                 views[field_names] = updates
             if context:
                 payload[()] = self._context_template
+            if "reason" in fields:
+                fields = {**fields, "reason": self._reasons[fields["reason"]]}
             updates[()] = (trace_id, *fields.values())
             return method(attributes)
         finally:
