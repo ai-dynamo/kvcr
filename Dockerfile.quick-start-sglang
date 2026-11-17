@@ -24,6 +24,10 @@ RUN case "${QS_MODE}" in \
  && git -C /src/dynamo fetch --depth 1 origin "${ref}" \
  && git -C /src/dynamo checkout --detach FETCH_HEAD \
  && test "$(git -C /src/dynamo rev-parse HEAD)" = "${ref}"
+COPY patches/dynamo-sglang-compat.patch /tmp/dynamo-sglang-compat.patch
+RUN if [ "${QS_MODE}" = hicache ]; then \
+      git -C /src/dynamo apply --unidiff-zero /tmp/dynamo-sglang-compat.patch; \
+    fi
 RUN python3 -m venv /venv \
  && /venv/bin/pip install --no-cache-dir 'maturin[patchelf]==1.9.6'
 ENV CARGO_BUILD_JOBS=4
@@ -39,7 +43,7 @@ RUN test "$(uname -m)" = x86_64 \
     git curl libatomic1 libhwloc15 libnuma1 libssl3t64 libudev1 \
  && rm -rf /var/lib/apt/lists/*
 RUN case "${QS_MODE}" in \
-      hicache) ref=24a3a79ed3ed3ee5811f78ba2c4cbd5ceaac27d1 ;; \
+      hicache) ref=85b08fe82e812af7b89b41944d3e869efc3272fb ;; \
       linker) ref=002d6d8d1df91a58695a8868ce2c2db590809f75 ;; \
     esac \
  && git init /opt/sglang-src \
@@ -47,6 +51,10 @@ RUN case "${QS_MODE}" in \
  && git -C /opt/sglang-src fetch --depth 1 origin "${ref}" \
  && git -C /opt/sglang-src checkout --detach FETCH_HEAD \
  && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${ref}"
+COPY patches/sglang-logging-import.patch /tmp/sglang-logging-import.patch
+RUN if [ "${QS_MODE}" = hicache ]; then \
+      git -C /opt/sglang-src apply --unidiff-zero /tmp/sglang-logging-import.patch; \
+    fi
 # Install KVCR from the checkout used as the Docker build context.
 COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
 COPY src /opt/kvcr-src/src
@@ -54,10 +62,7 @@ COPY --from=sglang-dynamo-builder /wheels /tmp/dynamo-wheels
 COPY <<'EOF' /opt/sglang-constraints.txt
 torch==2.14.1
 transformers==5.19.0
-flashinfer-python==0.7.2
 nvidia-cutlass-dsl==4.8.0
-sgl-deep-gemm==0.2.3
-sglang-kernel==0.4.10
 apache-tvm-ffi==0.1.11
 nixl==1.5.0
 msgspec==0.22.0
@@ -65,6 +70,10 @@ pyzmq==27.1.0
 numpy==2.3.5
 protobuf==7.36.2
 EOF
+RUN case "${QS_MODE}" in \
+      hicache) printf '%s\n' 'flashinfer-python==0.7.4' 'sgl-deep-gemm==0.2.8' 'sglang-kernel==0.4.11' ;; \
+      linker) printf '%s\n' 'flashinfer-python==0.7.2' 'sgl-deep-gemm==0.2.3' 'sglang-kernel==0.4.10' ;; \
+    esac >> /opt/sglang-constraints.txt
 ENV SGLANG_BUILD_RUST_EXTS=none SGLANG_RUST_BUILD_MODE=never \
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-scm==9.2.2' 'hatchling==1.27.0' \
@@ -74,10 +83,11 @@ RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-
       --find-links https://pypi.nvidia.com/aisimulate/ \
       /opt/sglang-src/python /opt/kvcr-src /tmp/dynamo-wheels/*.whl \
       'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
+ && case "${QS_MODE}" in hicache) flashinfer_version=0.7.4 ;; linker) flashinfer_version=0.7.2 ;; esac \
  && python3 -m pip install --no-cache-dir --no-deps \
-      --index-url https://flashinfer.ai/whl 'flashinfer-cubin==0.7.2' \
+      --index-url https://flashinfer.ai/whl "flashinfer-cubin==${flashinfer_version}" \
  && python3 -m pip install --no-cache-dir --no-deps \
-      --index-url https://flashinfer.ai/whl/cu130 'flashinfer-jit-cache==0.7.2'
+      --index-url https://flashinfer.ai/whl/cu130 "flashinfer-jit-cache==${flashinfer_version}"
 COPY <<'EOF' /opt/sglang-router-policy.yaml
 worker_selection:
   aggregated: two-tier
@@ -115,14 +125,19 @@ assert torch.version.cuda == '13.0'
 assert KV_HINT_TRANSFER_CAPABILITY_KEY == 'router_hint'
 assert callable(ZmqPeerControlChannel)
 if os.environ['QS_MODE'] == 'hicache':
+    from inspect import signature
     from dynamo.sglang import kv_hints
     from dynamo.sglang.state_agent import StateAgentLifecycle
+    from sglang.srt.entrypoints.engine import Engine
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
     from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
     from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
 
     assert callable(KVCRStore.batch_get_v1)
     assert callable(HiCacheStorage.get_kv_hint_source)
     assert callable(StateAgentLifecycle.start)
+    assert 'routed_dp_rank' in signature(Engine.async_generate).parameters
+    assert callable(MultimodalProcessorOutput.build_padded_input_ids)
 else:
     from dynamo.sglang.kv_hints import is_supported_kvcr_linker_topology
     from dynamo.sglang.state_agent import state_agent_descriptors

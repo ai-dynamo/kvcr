@@ -1,0 +1,29 @@
+diff --git a/components/src/dynamo/sglang/_compat.py b/components/src/dynamo/sglang/_compat.py
+index aeeeebc5d4..9bf11148b9 100644
+--- a/components/src/dynamo/sglang/_compat.py
++++ b/components/src/dynamo/sglang/_compat.py
+@@ -402,2 +402,5 @@ def supports_external_mm_hashes(engine: Any) -> bool:
+-    # Deferred: schedule_batch imports torch and other SGLang runtime modules.
+-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
++    # Deferred: importing SGLang runtime modules loads torch.
++    try:
++        from sglang.srt.managers.req_types import MultimodalProcessorOutput
++    except ImportError:
++        from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+diff --git a/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py b/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
+index cfbbc895dd..23111c39ca 100644
+--- a/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
++++ b/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
+@@ -822 +822 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+-                data_parallel_rank=dp_rank,
++                routed_dp_rank=dp_rank,
+@@ -925 +925 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+-                data_parallel_rank=dp_rank,
++                routed_dp_rank=dp_rank,
+diff --git a/components/src/dynamo/sglang/request_handlers/llm/prefill_handler.py b/components/src/dynamo/sglang/request_handlers/llm/prefill_handler.py
+index fd6af54ff2..1c517e3130 100644
+--- a/components/src/dynamo/sglang/request_handlers/llm/prefill_handler.py
++++ b/components/src/dynamo/sglang/request_handlers/llm/prefill_handler.py
+@@ -262 +262 @@ class PrefillWorkerHandler(BaseWorkerHandler):
+-                data_parallel_rank=dp_rank,
++                routed_dp_rank=dp_rank,

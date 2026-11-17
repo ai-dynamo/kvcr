@@ -40,7 +40,7 @@ DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
 export QS_IMAGE_ID="$(docker image inspect "$QS_TAG" --format '{{.Id}}')"
 ```
 
-The Dockerfile pins the SGLang and Dynamo revisions for each mode; mismatched SGLang and KVCR revisions silently drop peer hints. KVCR is installed from the local checkout used as the build context (`.`), including any local changes. Continue only if the final import/version checks pass.
+The Dockerfile pins the SGLang and Dynamo revisions for each mode; mismatched SGLang and KVCR revisions silently drop peer hints. For HiCache it also applies the included compatibility patches to those pinned sources. KVCR is installed from the local checkout used as the build context (`.`), including any local changes. Continue only if the final import/version checks pass.
 
 ## 2. Start the container
 
