@@ -24,6 +24,11 @@ class Status(IntEnum):
     MISS = 10
 
 
+# Reasons are emitted by name, zero-padded to this many bytes.
+_REASON_WIDTH = 24
+assert max(len(reason.value) for reason in Reason) <= _REASON_WIDTH
+
+
 class _ThreadBuffers(local):
     def __init__(self):
         self.buffers = {}
@@ -38,6 +43,12 @@ class _PayloadEmitter:
         self.category = domain.get_category_id("framework_pin")
         self.lifecycle_category = domain.get_category_id("remote_deliver")
         self._thread = _ThreadBuffers()
+        self._reasons = {
+            reason: numpy.frombuffer(
+                reason.value.encode().ljust(_REASON_WIDTH, b"\0"), dtype="u1"
+            )
+            for reason in Reason
+        }
         # Shared with target/caller tracing, which supplies local_fill and
         # medium-detail requested_bytes and destination_memory. Session IDs and
         # numeric native errors have no producer; their known flags stay zero.
@@ -71,7 +82,7 @@ class _PayloadEmitter:
                 ("selected_bytes", "i8"),
                 ("completed_bytes", "i8"),
                 ("status", "u1"),
-                ("reason", "u1"),
+                ("reason", "u1", (_REASON_WIDTH,)),
                 ("local_fill", "u1"),
                 ("source_tier", "u1"),
                 ("destination_tier", "u1"),
@@ -92,12 +103,12 @@ class _PayloadEmitter:
             ]
         )
         self._defaults = dict(
-            schema_version=3,
+            schema_version=4,
             instance_hi=self.instance_hi,
             instance_lo=self.instance_lo,
             trace_id=0,
             status=Status.PENDING,
-            reason=Reason.NONE,
+            reason=self._reasons[Reason.NONE],
         )
         template = numpy.zeros((), dtype=self.context_dtype)
         count_fields = [
@@ -152,6 +163,8 @@ class _PayloadEmitter:
                 views[field_names] = updates
             if context:
                 payload[()] = self._context_template
+            if "reason" in fields:
+                fields = {**fields, "reason": self._reasons[fields["reason"]]}
             updates[()] = (trace_id, *fields.values())
             return method(attributes)
         finally:

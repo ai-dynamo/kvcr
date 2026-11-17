@@ -318,7 +318,7 @@ class _LifecycleTrace:
     @staticmethod
     def _unavailable_status(entries):
         # No source answered when there was no route to ask; that is not a miss.
-        no_route = (Reason.HINT_UNAVAILABLE.wire, Reason.HINT_INVALIDATED.wire)
+        no_route = (Reason.HINT_UNAVAILABLE.value, Reason.HINT_INVALIDATED.value)
         return (
             Status.REJECTED
             if all(entry.reason in no_route for entry in entries.values())

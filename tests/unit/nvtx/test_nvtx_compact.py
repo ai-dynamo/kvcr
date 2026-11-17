@@ -6,7 +6,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from _nvtx_test_utils import payloads
+from _nvtx_test_utils import payloads, reason_of
 
 from kvcr import _nvtx
 
@@ -214,7 +214,7 @@ def test_reused_context_clears_optional_values_without_rebinding(recording):
     ) == (123, 1, 2, 3)
     assert int(first["requested_bytes"]) == 65536
     assert first["value_utf8"].tobytes() == b"c" * 256
-    assert int(second["schema_version"]) == 3
+    assert int(second["schema_version"]) == 4
     assert int(second["instance_hi"]) == tracer.instance_hi
     assert int(second["instance_lo"]) == tracer.instance_lo
     for fields, expected in (
@@ -232,7 +232,7 @@ def test_reused_context_clears_optional_values_without_rebinding(recording):
         assert all(int(second[field]) == expected for field in fields.split())
     assert second["value_utf8"].tobytes() == bytes(256)
     assert int(second["status"]) == _nvtx.Status.PENDING
-    assert int(second["reason"]) == _nvtx.Reason.NONE
+    assert reason_of(second) == _nvtx.Reason.NONE
 
 
 def test_context_recovers_after_partial_assignment_failure(recording):

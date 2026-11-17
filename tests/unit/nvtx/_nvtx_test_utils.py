@@ -77,6 +77,11 @@ def spans(domain, name, kind="start"):
     return [event for event in domain.events if event[0] == kind and event[1] == name]
 
 
+def reason_of(event) -> str:
+    """Decode the zero-padded reason name of one payload."""
+    return bytes(event["reason"]).rstrip(b"\0").decode()
+
+
 def payloads(domain, name):
     contexts = {}
     for _, message, payload, _ in domain.events:
@@ -90,7 +95,7 @@ def payloads(domain, name):
         if message != name:
             continue
         event = {f: payload[f] for f in payload.dtype.names}
-        if int(event["schema_version"]) == 3 and "trace_id" in event:
+        if int(event["schema_version"]) == 4 and "trace_id" in event:
             key = tuple(
                 int(event[f]) for f in ("instance_hi", "instance_lo", "trace_id")
             )

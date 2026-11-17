@@ -294,9 +294,9 @@ class _RemoteFWDram:
             if len(keys) != len(blocks):
                 kept = set(keys)
                 unserved = {
-                    key: Reason.REMEMBERED_MISS.wire
+                    key: Reason.REMEMBERED_MISS.value
                     if key in current_hint.missing_keys
-                    else Reason.HINT_UNAVAILABLE.wire
+                    else Reason.HINT_UNAVAILABLE.value
                     for key in blocks
                     if key not in kept
                 }
@@ -380,13 +380,13 @@ class _RemoteFWDram:
         blocks: Collection[BlockKey],
         reason: Reason,
     ) -> str:
-        self._kvcr._record_duration(scope, started_at, _outcome(reason.wire))
+        self._kvcr._record_duration(scope, started_at, _outcome(reason.value))
         stats = self._kvcr._stats
         if stats is not None:
             stats.increase_counter(
-                UNSERVED_BLOCKS_METRIC, len(blocks), (scope, reason.wire)
+                UNSERVED_BLOCKS_METRIC, len(blocks), (scope, reason.value)
             )
-        return reason.wire
+        return reason.value
 
     def deliver(
         self,
@@ -658,7 +658,7 @@ class _RemoteFWDram:
                     cached[1],
                     handle,
                     False,
-                    reason=Reason.SHUTDOWN.wire,
+                    reason=Reason.SHUTDOWN.value,
                 )
         self._pending_local_sources.clear()
         close_control = getattr(self._control, "close", None)
@@ -808,7 +808,7 @@ class _RemoteFWDram:
         incarnation = payload.sender_incarnation
         if (
             payload.reason
-            in (Reason.METADATA_REQUIRED.wire, Reason.SOURCE_RESTARTED.wire)
+            in (Reason.METADATA_REQUIRED.value, Reason.SOURCE_RESTARTED.value)
             and incarnation
             and not op.retried
             and op.state is _TargetPullState.WAITING_WRITE_DONE
@@ -827,7 +827,7 @@ class _RemoteFWDram:
         self._refused_writes[("target", op_handle)] = {
             "success": False,
             # Any refusal is an abort; an unrecognised reason is still a refusal.
-            "reason": _known_reason(payload.reason) or Reason.REFUSED.wire,
+            "reason": _known_reason(payload.reason) or Reason.REFUSED.value,
         }
 
     def _handle_target_metadata_ack(
@@ -903,7 +903,7 @@ class _RemoteFWDram:
         ):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(
-                progress, payload, op_handle, Reason.MALFORMED.wire
+                progress, payload, op_handle, Reason.MALFORMED.value
             )
             return
 
@@ -929,7 +929,7 @@ class _RemoteFWDram:
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
             )
             self._notify_start_write_failure(
-                progress, payload, op_handle, Reason.SETUP_FAILED.wire
+                progress, payload, op_handle, Reason.SETUP_FAILED.value
             )
             return
 
@@ -941,7 +941,7 @@ class _RemoteFWDram:
                     remote_agent,
                     op_handle,
                     False,
-                    reason=Reason.CANCELLED.wire,
+                    reason=Reason.CANCELLED.value,
                 )
             return
         expected = payload.source_incarnation
@@ -949,16 +949,16 @@ class _RemoteFWDram:
             # Another process was quoted: refuse pre-submit so the target retries
             # once quoting us, instead of failing the request natively.
             self._refuse_start_write(
-                progress, payload, op_handle, Reason.SOURCE_RESTARTED.wire
+                progress, payload, op_handle, Reason.SOURCE_RESTARTED.value
             )
             return
         # Duplicate requests above must not terminate an already submitted write.
         # Refuse expiry before claiming sources or handing a move to the owner.
         if progress._stop_requested or self._kvcr._clock() >= deadline:
             reason = (
-                Reason.STOPPING.wire
+                Reason.STOPPING.value
                 if progress._stop_requested
-                else Reason.DEADLINE.wire
+                else Reason.DEADLINE.value
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -1129,7 +1129,7 @@ class _RemoteFWDram:
             if framework_pinning:
                 return False
             selected = ()
-            unserved[Reason.NOT_RESIDENT.wire] = list(range(len(ordered_keys)))
+            unserved[Reason.NOT_RESIDENT.value] = list(range(len(ordered_keys)))
         else:
             selected = local._pools.acquire_readers(
                 ordered_keys,
@@ -1222,7 +1222,7 @@ class _RemoteFWDram:
                 if isinstance(value, str):
                     setattr(peer, name, value)
         self._notify_start_write_failure(
-            progress, peer, op_handle, Reason.MALFORMED.wire
+            progress, peer, op_handle, Reason.MALFORMED.value
         )
         return True
 
@@ -1254,7 +1254,7 @@ class _RemoteFWDram:
                 progress,
                 payload,
                 op_handle,
-                Reason.METADATA_REQUIRED.wire if retryable else None,
+                Reason.METADATA_REQUIRED.value if retryable else None,
             )
             return
         self._send_write_done(progress, remote_agent, op_handle, False, reason=reason)

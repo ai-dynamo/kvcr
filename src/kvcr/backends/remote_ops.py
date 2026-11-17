@@ -150,12 +150,12 @@ _STATUS_BY_REASON = {
 }
 # One immutable result per known reason; per-key results select from here.
 _RESULTS = {
-    reason.wire: OpEntryResult(status, reason=reason.wire)
+    reason.value: OpEntryResult(status, reason=reason.value)
     for reason, status in _STATUS_BY_REASON.items()
 }
 # An unserved block whose cause the source did not specify.
 _UNAVAILABLE_RESULT = OpEntryResult(OpEntryStatus.UNAVAILABLE)
-_MISS_REASONS = frozenset((Reason.NOT_RESIDENT.wire, Reason.REMEMBERED_MISS.wire))
+_MISS_REASONS = frozenset((Reason.NOT_RESIDENT.value, Reason.REMEMBERED_MISS.value))
 _LABEL_BY_STATUS = {
     OpEntryStatus.UNAVAILABLE: "unavailable",
     OpEntryStatus.TIMEOUT: "timeout",
@@ -282,7 +282,7 @@ class _TargetPullOp(_RemoteOp):
                         status=_nvtx.Status.TIMEOUT,
                     )
                 self.success = False
-                self.failure_reason = Reason.DEADLINE.wire
+                self.failure_reason = Reason.DEADLINE.value
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "timeout")
                 self._record_unserved(scope)
@@ -305,7 +305,7 @@ class _TargetPullOp(_RemoteOp):
                 if trace is not None:
                     trace.reject("target.start_write.rejected", Reason.CONTROL_ERROR)
                 self.success = False
-                self.failure_reason = Reason.CONTROL_ERROR.wire
+                self.failure_reason = Reason.CONTROL_ERROR.value
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
                 self._record_unserved(scope)
@@ -387,12 +387,12 @@ class _TargetPullOp(_RemoteOp):
                 )
             elif self.failure_reason is None:
                 self.failure_reason = (
-                    Reason.INVALID_NOTIFICATION.wire
+                    Reason.INVALID_NOTIFICATION.value
                     if invalid
-                    else Reason.DEADLINE.wire
+                    else Reason.DEADLINE.value
                     if event.get("success") is True and not cancelled
                     else _known_reason(event.get("reason"))
-                    or Reason.REMOTE_FAILURE.wire
+                    or Reason.REMOTE_FAILURE.value
                 )
             unserved_counts = self._record_unserved(scope)
             # The reason that left the most blocks unserved labels a zero-block
@@ -482,9 +482,9 @@ class _TargetPullOp(_RemoteOp):
 
         if now >= self.deadline or cancelled:
             self.failure_reason = (
-                (_known_reason(event.get("reason")) or Reason.REMOTE_FAILURE.wire)
+                (_known_reason(event.get("reason")) or Reason.REMOTE_FAILURE.value)
                 if cancelled
-                else Reason.DEADLINE.wire
+                else Reason.DEADLINE.value
             )
             self.state = _TargetPullState.WAITING_TERMINAL
             if trace is not None:
@@ -518,7 +518,7 @@ class _TargetPullOp(_RemoteOp):
         """Count every requested key that was not written, by reason."""
         counts = Counter(self.unserved.values())
         if not self.success:
-            failure = self.failure_reason or Reason.UNKNOWN.wire
+            failure = self.failure_reason or Reason.UNKNOWN.value
             counts[failure] += len(self.keys) - len(self.unserved)
         for reason, count in counts.items():
             self._backend._record_progress_counter(
@@ -666,7 +666,7 @@ class _SourceWriteOp(_RemoteOp):
                 self.state = _SourceWriteState.FINISHED
                 # Nothing to write: a miss, or this source's own fault.
                 largest = _largest_group(self.unserved)
-                result = _outcome(largest or Reason.NOT_RESIDENT.wire)
+                result = _outcome(largest or Reason.NOT_RESIDENT.value)
                 backend._record_progress_duration(
                     "source_write", self.started_at, result
                 )
@@ -843,7 +843,7 @@ class _SourceWriteOp(_RemoteOp):
             self.failure_reason = cause
 
     def abort_reason(self) -> str:
-        return self.failure_reason.wire
+        return self.failure_reason.value
 
     def close(self, progress: _KVCRProgress) -> bool:
         trace = self.nvtx_state.trace if self.nvtx_state is not None else None
@@ -923,7 +923,10 @@ def _format_counts(counts: Mapping[str, int]) -> str:
 
 
 def _nvtx_reason(reason: str | None) -> Reason:
-    return Reason.__members__.get((reason or "").upper(), Reason.UNKNOWN)
+    try:
+        return Reason(reason)
+    except ValueError:
+        return Reason.UNKNOWN
 
 
 def _largest_group(unserved: Mapping[str, list[int]]) -> str | None:
@@ -932,12 +935,12 @@ def _largest_group(unserved: Mapping[str, list[int]]) -> str | None:
 
 
 def _wire_reason(reason: Reason) -> str | None:
-    return None if reason is Reason.UNKNOWN else reason.wire
+    return None if reason is Reason.UNKNOWN else reason.value
 
 
 # Peer-supplied reasons reach logs and metric labels, so only known names pass.
 _KNOWN_REASONS = frozenset(
-    reason.wire for reason in Reason if reason not in (Reason.UNKNOWN, Reason.NONE)
+    reason.value for reason in Reason if reason not in (Reason.UNKNOWN, Reason.NONE)
 )
 
 
@@ -959,7 +962,7 @@ def _notification_unserved(
     if not missing:
         return {}
     sent = set(ordered_keys)
-    unknown, miss = Reason.UNKNOWN.wire, Reason.REMEMBERED_MISS.wire
+    unknown, miss = Reason.UNKNOWN.value, Reason.REMEMBERED_MISS.value
     unserved = {
         key: excluded.get(key, unknown if key in sent else miss)
         for key in chain(ordered_keys, excluded, missing)  # Stable ties.

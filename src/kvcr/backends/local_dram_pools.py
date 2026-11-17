@@ -324,14 +324,14 @@ class _LocalDramPools:
                 residency = state.index.get(key)
                 if residency is None:
                     if allow_missing and key not in state.index:
-                        skipped.setdefault(Reason.NOT_RESIDENT.wire, []).append(index)
+                        skipped.setdefault(Reason.NOT_RESIDENT.value, []).append(index)
                         continue
                     return False
                 available = cast(tuple[_TransferRef, ...], residency.refs)
                 if key_layout and key_layout != residency.key_layout:
                     if allow_missing:
                         logger.debug("KVCR start_write layout mismatch key=%r", key)
-                        skipped.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(
+                        skipped.setdefault(Reason.LAYOUT_MISMATCH.value, []).append(
                             index
                         )
                         continue
@@ -348,7 +348,7 @@ class _LocalDramPools:
                     if indices is None:
                         if allow_missing:
                             logger.debug("KVCR start_write layout mismatch key=%r", key)
-                            skipped.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(
+                            skipped.setdefault(Reason.LAYOUT_MISMATCH.value, []).append(
                                 index
                             )
                             continue

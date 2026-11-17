@@ -204,19 +204,19 @@ class _RemoteSources:
                     if key in source_pin.excluded
                     else Reason.LAYOUT_MISMATCH
                 )
-                unserved.setdefault(reason.wire, []).append(index)
+                unserved.setdefault(reason.value, []).append(index)
                 continue
             residency = local_sources.get(key)
             if source_pin.g2_only and (residency is None or residency.pending_labels):
-                unserved.setdefault(Reason.NOT_RESIDENT.wire, []).append(index)
+                unserved.setdefault(Reason.NOT_RESIDENT.value, []).append(index)
                 continue
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
             if residency is None and source is None:
                 reason = (
-                    Reason.PIN_FAILED.wire
+                    Reason.PIN_FAILED.value
                     if key in source_pin.pin_failed_keys
-                    else Reason.NOT_RESIDENT.wire
+                    else Reason.NOT_RESIDENT.value
                 )
                 unserved.setdefault(reason, []).append(index)
                 continue
@@ -245,7 +245,7 @@ class _RemoteSources:
                 indices = _layout_indices(layout, labels)
             if indices is None:
                 mismatched += 1
-                unserved.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(index)
+                unserved.setdefault(Reason.LAYOUT_MISMATCH.value, []).append(index)
                 source_pin.keys -= {key}
                 record = kvcr._block_record_map[key]
                 record.discard_in_flight_op(op_id)

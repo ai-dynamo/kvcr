@@ -3,7 +3,7 @@
 """Runtime and policy value types for KVCR."""
 
 from collections.abc import Mapping
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Literal, NewType
 
 import msgspec
@@ -101,48 +101,44 @@ class OpEntryStatus(Enum):
     FAILED = "FAILED"  # Unexpected error on either worker.
 
 
-class Reason(IntEnum):
+class Reason(str, Enum):
     """Why a transfer, or one of its blocks, did not complete."""
 
-    UNKNOWN = 0
-    NONE = 1
-    CALLBACK_ERROR = 2
-    DUPLICATE_REQUEST = 3
-    INVALID_RESULT = 4
-    DEADLINE = 5
-    CANCELLED = 6
-    SHUTDOWN = 7
-    NO_WAITERS = 8
-    SUBMIT_REJECTED = 9
-    SUBMIT_AMBIGUOUS = 10
-    CREATE_ERROR = 11
-    PROGRESS_ERROR = 12
-    RELEASE_ERROR = 13
-    CONTROL_ERROR = 14
-    INVALID_NOTIFICATION = 15
-    REMOTE_FAILURE = 16
-    ROUTE_CHANGED = 17
-    HINT_UNAVAILABLE = 19
-    HINT_CONFLICT = 20
-    # Why a source left blocks out; names match the write_done unserved reasons.
-    NOT_RESIDENT = 21
-    PIN_FAILED = 22
-    LAYOUT_MISMATCH = 23
-    # Remaining write_done and pull reasons, so this enum is their only vocabulary.
-    STOPPING = 24
-    TRANSFER_FAILED = 25
-    MALFORMED = 26
-    SETUP_FAILED = 27
-    REMEMBERED_MISS = 28
-    HINT_INVALIDATED = 29
-    REFUSED = 30
-    METADATA_REQUIRED = 31
-    SOURCE_RESTARTED = 32
+    UNKNOWN = "unknown"
+    NONE = "none"
+    CALLBACK_ERROR = "callback_error"
+    DUPLICATE_REQUEST = "duplicate_request"
+    INVALID_RESULT = "invalid_result"
+    DEADLINE = "deadline"
+    CANCELLED = "cancelled"
+    SHUTDOWN = "shutdown"
+    NO_WAITERS = "no_waiters"
+    SUBMIT_REJECTED = "submit_rejected"
+    SUBMIT_AMBIGUOUS = "submit_ambiguous"
+    CREATE_ERROR = "create_error"
+    PROGRESS_ERROR = "progress_error"
+    RELEASE_ERROR = "release_error"
+    CONTROL_ERROR = "control_error"
+    INVALID_NOTIFICATION = "invalid_notification"
+    REMOTE_FAILURE = "remote_failure"
+    ROUTE_CHANGED = "route_changed"
+    HINT_UNAVAILABLE = "hint_unavailable"
+    HINT_CONFLICT = "hint_conflict"
+    NOT_RESIDENT = "not_resident"
+    PIN_FAILED = "pin_failed"
+    LAYOUT_MISMATCH = "layout_mismatch"
+    STOPPING = "stopping"
+    TRANSFER_FAILED = "transfer_failed"
+    MALFORMED = "malformed"
+    SETUP_FAILED = "setup_failed"
+    REMEMBERED_MISS = "remembered_miss"
+    HINT_INVALIDATED = "hint_invalidated"
+    REFUSED = "refused"
+    METADATA_REQUIRED = "metadata_required"
+    SOURCE_RESTARTED = "source_restarted"
 
-    @property
-    def wire(self) -> str:
-        """Name used in write_done messages, logs and metric labels."""
-        return self.name.lower()
+    def __str__(self) -> str:
+        return self.value
 
 
 class OpEntryResult(msgspec.Struct, frozen=True):

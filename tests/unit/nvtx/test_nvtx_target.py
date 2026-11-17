@@ -19,7 +19,7 @@ from _kvcr_test_utils import (
     _wait_until,
     _write_done_notification,
 )
-from _nvtx_test_utils import make_target, payloads, spans, wait_for_payload
+from _nvtx_test_utils import make_target, payloads, reason_of, spans, wait_for_payload
 
 from kvcr import _nvtx
 from kvcr.backends.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
@@ -118,7 +118,7 @@ def test_target_terminal_reason_preserves_cause(
     assert op.state is _TargetPullState.FINISHED
     assert op.success is (reason is _nvtx.Reason.NONE)
     [received] = payloads(recording, "target.write_done.received")
-    assert int(received["reason"]) == reason
+    assert reason_of(received) == reason
     assert int(received["status"]) == (
         _nvtx.Status.SUCCESS if op.success else _nvtx.Status.FAILED
     )
@@ -136,7 +136,7 @@ def test_shutdown_closes_unreturned_caller_range(recording):
     [unreturned] = payloads(recording, "op.shutdown_unreturned")
     assert int(unreturned["op_handle"]) == handle
     assert int(unreturned["status"]) == _nvtx.Status.UNRESOLVED
-    assert int(unreturned["reason"]) == _nvtx.Reason.SHUTDOWN
+    assert reason_of(unreturned) == _nvtx.Reason.SHUTDOWN
     assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not kvcr._core._nvtx_operations
     assert not recording.ranges
@@ -195,7 +195,7 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
     assert int(rejected["status"]) == int(
         _nvtx.Status.TIMEOUT if failure == "expired" else _nvtx.Status.REJECTED
     )
-    assert int(rejected["reason"]) == int(
+    assert reason_of(rejected) == (
         _nvtx.Reason.DEADLINE if failure == "expired" else _nvtx.Reason.CONTROL_ERROR
     )
     assert len(control.sent) == (failure != "expired")
@@ -337,7 +337,7 @@ def test_public_mixed_delivery_waits_for_both_branches(
     assert int(returned["status"]) == int(
         _nvtx.Status.SUCCESS if remote_success else _nvtx.Status.PARTIAL
     )
-    assert int(returned["reason"]) == (
+    assert reason_of(returned) == (
         _nvtx.Reason.NONE if remote_success else _nvtx.Reason.REMOTE_FAILURE
     )
     assert (
@@ -361,7 +361,7 @@ def test_timeout_quarantine_and_late_quiescence_have_distinct_events(recording):
         if int(p["op_handle"]) == handle
     ]
     assert int(returned["status"]) == int(_nvtx.Status.FAILED)
-    assert int(returned["reason"]) == int(_nvtx.Reason.DEADLINE)
+    assert reason_of(returned) == _nvtx.Reason.DEADLINE
 
 
 def test_cancellation_cause_survives_grace_deadline(recording):
@@ -379,7 +379,7 @@ def test_cancellation_cause_survives_grace_deadline(recording):
     result = dict(_poll_until(kvcr, bool))
     assert not result[handle][BlockKey(b"k")].success
     assert len(payloads(recording, "target.quarantined")) == 1
-    reason = int(payloads(recording, "op.completion_returned")[0]["reason"])
+    reason = reason_of(payloads(recording, "op.completion_returned")[0])
     assert len(spans(recording, "op.deliver.lifecycle", "end")) == 1
     assert not spans(recording, "target.remote", "end")
     agent.notifs["source"] = [_write_done_notification(handle)]
@@ -387,7 +387,7 @@ def test_cancellation_cause_survives_grace_deadline(recording):
     assert len(spans(recording, "target.remote", "end")) == 1
     assert len(payloads(recording, "op.completion_returned")) == 1
     kvcr.close()
-    assert reason == int(_nvtx.Reason.CANCELLED)
+    assert reason == _nvtx.Reason.CANCELLED
 
 
 def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
@@ -400,7 +400,7 @@ def test_negative_fill_handle_and_copy_do_not_duplicate_completion(recording):
     assert len(payloads(recording, "target.quiesced")) == 1
     [unresolved] = payloads(recording, "target.shutdown_unresolved")
     assert int(unresolved["status"]) == _nvtx.Status.UNRESOLVED
-    assert int(unresolved["reason"]) == _nvtx.Reason.SHUTDOWN
+    assert reason_of(unresolved) == _nvtx.Reason.SHUTDOWN
     events = [name for kind, name, *_ in recording.events if kind in ("mark", "end")]
     assert events.index("target.shutdown_unresolved") < events.index("target.quiesced")
     assert events.index("target.quiesced") < events.index("target.remote")
@@ -413,7 +413,7 @@ def test_missing_hint_has_specific_reason(recording):
     result = dict(kvcr.poll_completed())
     assert not result[handle][BlockKey(b"k")].success
     [returned] = payloads(recording, "op.completion_returned")
-    assert int(returned["reason"]) == int(_nvtx.Reason.HINT_UNAVAILABLE)
+    assert reason_of(returned) == _nvtx.Reason.HINT_UNAVAILABLE
     assert int(returned["status"]) == _nvtx.Status.REJECTED  # No source answered.
 
 
@@ -428,7 +428,7 @@ def test_failed_hint_rejection_names_its_reason(recording):
     kvcr.deliver({key: [_mem_descriptor()]}, "req")
     assert not list(kvcr.poll_completed())[0][1][key].success
     [rejected] = payloads(recording, "target.rejected")
-    assert int(rejected["reason"]) == _nvtx.Reason.HINT_INVALIDATED
+    assert reason_of(rejected) == _nvtx.Reason.HINT_INVALIDATED
 
 
 @pytest.mark.parametrize("failure", ["attributes", "push", "mark", "pop", "end"])
@@ -505,4 +505,4 @@ def test_source_holding_nothing_is_a_miss_not_a_failure(recording):
     for name in ("target.write_done.received", "op.completion_returned"):
         [event] = payloads(recording, name)
         assert int(event["status"]) == _nvtx.Status.MISS
-        assert int(event["reason"]) == _nvtx.Reason.NOT_RESIDENT
+        assert reason_of(event) == _nvtx.Reason.NOT_RESIDENT

@@ -59,6 +59,7 @@ from kvcr.types import (
     OpEntryStatus,
     PlacementAction,
     QueryStatus,
+    Reason,
 )
 
 
@@ -2339,7 +2340,7 @@ def test_move_rejects_busy_source_without_blocking_deposit(pair, incomplete):
     )
     pair.until(lambda: moved in target.results)
     assert not target.results[moved][key].success
-    assert target.results[moved][key].reason == "not_resident"
+    assert target.results[moved][key].reason == Reason.NOT_RESIDENT
     assert not source.kvcr._core._invalidation_handler.has_pending()
     source.agent.state = "DONE"
     if incomplete:

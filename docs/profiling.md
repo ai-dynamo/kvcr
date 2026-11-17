@@ -92,14 +92,15 @@ Pin events use the [schema 3 context join](nvtx-events.md#payloads-and-identitie
 | `pin_request_known`, `pin_request_id` | Context records the accepted signed int64 request ID and availability flag. The flag is zero if no ID was returned or its integer is outside int64. Zero is a valid request ID when known. |
 | `source_op_id`, `op_handle` | Signed int64 source and target operation handles. Zero denotes unavailable context in direct helper calls. The source path carries these even if the pin callback fails before registration. |
 | `requested_blocks`, `completed_blocks` | Requested count and count of non-missing entries in an accepted result. `-1` means the completed count is unavailable. |
-| `status`, `reason` | Bounded codes below. |
+| `status` | Bounded code below. |
+| `reason` | Reason name as zero-padded ASCII bytes (24), e.g. `pin_failed`; `none` on success, `unknown` when no cause is known. |
 | `fw_dram_utilization_known` | Always zero in this checkpoint: no framework utilization source is exposed by the current bindings. |
 
 Join pins by `(instance_hi, instance_lo, pin_id)`, not framework request ID alone. Handles are not globally unique across targets; no request, session or parent identity is inferred from them.
 
-Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`, `6=cancelled`, `10=miss`. For a nonempty request, a pin or source that answered with zero usable blocks is a miss when the reason is a miss (not resident or unknown) and failed when it is the framework's or source's fault (pin failed, layout mismatch); a positive subset is partial. An empty request with zero completed blocks remains success. The reason code carries the most common reason the source reported for missing blocks (`21=not_resident`, `22=pin_failed`, `23=layout_mismatch`), or `0=unknown` when none was reported.
+Status codes: `1=pending`, `2=success`, `3=partial`, `4=failed`, `5=timeout`, `6=cancelled`, `10=miss`. For a nonempty request, a pin or source that answered with zero usable blocks is a miss when the reason is a miss (not resident or unknown) and failed when it is the framework's or source's fault (pin failed, layout mismatch); a positive subset is partial. An empty request with zero completed blocks remains success. The reason carries the most common reason the source reported for missing blocks (`not_resident`, `pin_failed`, `layout_mismatch`), or `unknown` when none was reported.
 
-Reason codes: `0=unknown`, `1=none`, `2=callback_error`, `3=duplicate_request`, `4=invalid_result`, `5=deadline`, `6=cancelled`, `7=shutdown`, `8=no_waiters`. A framework result of `None` gives no failure cause: it is **not** evidence of cache pressure. Callback errors identify the stage, not an underlying diagnosis. Exception strings are not recorded.
+Reasons include `unknown`, `none`, `callback_error`, `duplicate_request`, `invalid_result`, `deadline`, `cancelled`, `shutdown` and `no_waiters`; the full list is `kvcr.types.Reason`. A framework result of `None` gives no failure cause: it is **not** evidence of cache pressure. Callback errors identify the stage, not an underlying diagnosis. Exception strings are not recorded.
 
 The pin hooks can also be encountered by remote fetch. They do not provide full fetch fan-out correlation. No production-overhead acceptance threshold has been established by this example.
 
