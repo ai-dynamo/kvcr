@@ -288,8 +288,15 @@ class _RemoteFWDram:
             if evict_on_finish:
                 keys = tuple(key for key in keys if self.query(key, request_id))
                 if not keys:
+                    # Keep remembered misses distinct from unadvertised keys.
                     return self._reject_pull(
-                        scope, started_at, blocks, Reason.HINT_UNAVAILABLE
+                        scope,
+                        started_at,
+                        blocks,
+                        Reason.HINT_UNAVAILABLE,
+                        remembered=sum(
+                            key in current_hint.missing_keys for key in blocks
+                        ),
                     )
             if len(keys) != len(blocks):
                 kept = set(keys)
@@ -379,13 +386,19 @@ class _RemoteFWDram:
         started_at: float | None,
         blocks: Collection[BlockKey],
         reason: Reason,
+        remembered: int = 0,
     ) -> str:
         self._kvcr._record_duration(scope, started_at, _outcome(reason.value))
         stats = self._kvcr._stats
         if stats is not None:
-            stats.increase_counter(
-                UNSERVED_BLOCKS_METRIC, len(blocks), (scope, reason.value)
-            )
+            for count, why in (
+                (remembered, Reason.REMEMBERED_MISS),
+                (len(blocks) - remembered, reason),
+            ):
+                if count:
+                    stats.increase_counter(
+                        UNSERVED_BLOCKS_METRIC, count, (scope, why.value)
+                    )
         return reason.value
 
     def deliver(

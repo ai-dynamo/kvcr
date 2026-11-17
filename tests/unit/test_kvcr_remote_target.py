@@ -952,6 +952,21 @@ def test_kvcr_deliver_propagates_source_pin_miss():
     }
 
 
+def test_reject_pull_splits_remembered_misses_from_unadvertised_keys():
+    stats = Mock()
+    backend = SimpleNamespace(
+        _kvcr=SimpleNamespace(_record_duration=Mock(), _stats=stats)
+    )
+    reason = _RemoteFWDram._reject_pull(
+        backend, "remote_deliver", 0.0, (b"a", b"b", b"c"), Reason.HINT_UNAVAILABLE, 1
+    )
+    assert reason == "hint_unavailable"
+    assert [c.args for c in stats.increase_counter.call_args_list] == [
+        (UNSERVED_BLOCKS_METRIC, 1, ("remote_deliver", "remembered_miss")),
+        (UNSERVED_BLOCKS_METRIC, 2, ("remote_deliver", "hint_unavailable")),
+    ]
+
+
 def _duration_labels(records) -> set[tuple[str, ...]]:
     return {
         labels
