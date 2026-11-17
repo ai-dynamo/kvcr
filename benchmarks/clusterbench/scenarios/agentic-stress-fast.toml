@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# agentic-stress pushed until KVCR is what limits a rank. In agentic-stress the
+# modelled GPU is the limit (about two requests a second per rank). Here the
+# forward pass, the answers and the think time are cut down so the engine
+# thread spends most of its time inside KVCR calls: about 20 requests a second
+# per rank on Grace cores. Contexts, tiers, sessions and migration are those
+# of agentic-stress, so a fetch is still about a thousand blocks.
+name = "agentic-stress-fast"
+
+[tiers]
+g2_blocks = 16384
+
+[engine]
+step_ms = 0.2
+prefill_us_per_token = 0.15
+
+[workload]
+sessions_per_worker = 16
+output_tokens_median = 8
+output_tokens_sigma = 0.5
+think_median_s = 0.1
+think_cap_s = 1.5
+
+[router]
+migration_prob = 0.25
+
+[phases]
+fill_s = 30.0
+measure_s = 60.0
+min_primary_occupancy = 0.9

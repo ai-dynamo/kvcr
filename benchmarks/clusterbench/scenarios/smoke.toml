@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# A few seconds on a handful of workers: every path once, every byte checked.
+name = "smoke"
+
+[tiers]
+block_bytes = 4096
+gpu_blocks = 2048
+primary_blocks = 1024
+g2_blocks = 4096
+
+[engine]
+step_ms = 2.0
+prefill_us_per_token = 1.0
+verify = "full"
+
+[workload]
+sessions_per_worker = 3
+system_prefix_tokens = 4096
+initial_context_median = 2000
+turn_tokens_median = 400
+output_tokens_median = 60
+output_tokens_sigma = 0.5
+think_median_s = 0.05
+think_sigma = 0.5
+think_cap_s = 0.5
+max_context_tokens = 40000
+reset_context_median = 2000
+ramp_s = 0.5
+
+[router]
+migration_prob = 0.3
+
+[phases]
+fill_s = 3.0
+measure_s = 6.0
+drain_s = 5.0

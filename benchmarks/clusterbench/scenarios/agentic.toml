@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# The baseline: coding-agent sessions on engine ranks sized like the team's
+# lower-tier benchmarks (64-token blocks; a 32,768-block device cache, an
+# 8,192-block CPU tier and a 65,536-block KVCR pool per rank).
+#
+# Sessions carry a 32k-token system/tool prefix and contexts up to 200k
+# tokens, add a median 600 tokens per turn, and think for a median second.
+# One turn in twenty lands on another worker, which then pulls the session's
+# context from wherever it lives.
+name = "agentic"
+
+[workload]
+sessions_per_worker = 8
+
+[router]
+migration_prob = 0.05
+
+[phases]
+fill_s = 45.0
+measure_s = 60.0
+min_primary_occupancy = 0.9
