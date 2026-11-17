@@ -177,7 +177,7 @@ class _RemoteSources:
             # the same handle back for a reused name, so submitting would
             # write the dead generation's destinations through the new route.
             force_failure = True
-            if failure_reason is Reason.UNKNOWN:
+            if failure_reason in (Reason.UNKNOWN, Reason.NOT_RESIDENT):
                 failure_reason = Reason.ROUTE_CHANGED
         local_sources = kvcr._claim_local_dram_sources(
             source_pin.op_id, source_pin.keys

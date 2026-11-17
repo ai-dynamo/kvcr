@@ -51,6 +51,7 @@ from kvcr.types import (
     OpEntryStatus,
     PinHandle,
     PinRequestId,
+    Reason,
     RegionDescriptor,
 )
 
@@ -1877,6 +1878,44 @@ def test_a_resumed_write_holds_a_pin_another_operation_acquired(
     assert backend._sources._fw_pins_by_op[submitted.op_id] == expected_pins
     # And the one it acquired but does not read through is handed back.
     assert released == [stale]
+
+
+def test_a_route_change_outranks_an_admission_miss() -> None:
+    backend = object.__new__(_RemoteFWDram)
+    backend._route_generation = {"target": 1}
+    backend._framework_pinning = True
+    kvcr = object.__new__(_KVCRCore)
+    kvcr._block_record_map = {}
+    kvcr._framework_pin_keys = {}
+    kvcr._local_dram_sources_by_op = {}
+    kvcr._progress = Mock()
+    kvcr._add_block_dependencies = Mock()
+    kvcr._remove_block_dependencies = Mock()
+    kvcr._claim_local_dram_sources = Mock(return_value={})
+    kvcr._release_local_dram_sources = Mock()
+    backend._kvcr = kvcr
+    backend._sources = _RemoteSources(backend, kvcr)
+    key = BlockKey(b"k")
+    op = _SourcePinOp(
+        started_at=0.0,
+        deadline=10.0,
+        remote_agent="peer",
+        op_handle=1,
+        ordered_keys=(key,),
+        dst_descriptors=((),),
+        op_id=("source", 1),
+        keys=frozenset(),
+        route=("target", 0),
+        excluded={key},
+    )
+    backend._sources._source_pin_ops[op.op_id] = op
+
+    backend._sources._submit_prepared_source_write(
+        op.op_id, op, force_failure=True, failure_reason=Reason.NOT_RESIDENT
+    )
+
+    submitted = kvcr._progress.submit.call_args.args[0]
+    assert submitted.failure_reason is Reason.ROUTE_CHANGED
 
 
 def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> None:

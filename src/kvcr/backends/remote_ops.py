@@ -397,7 +397,11 @@ class _TargetPullOp(_RemoteOp):
             unserved_counts = self._record_unserved(scope)
             # The reason that left the most blocks unserved labels a zero-block
             # completion.
-            dominant = unserved_counts.most_common(1)[0][0] if unserved_counts else None
+            dominant = (
+                unserved_counts.most_common(1)[0][0]
+                if success and unserved_counts
+                else None
+            )
             if trace is not None:
                 if not success and reason is Reason.REMOTE_FAILURE:
                     reason = _nvtx_reason(self.failure_reason)
@@ -957,7 +961,9 @@ def _notification_unserved(
     sent = set(ordered_keys)
     unknown, miss = Reason.UNKNOWN.wire, Reason.REMEMBERED_MISS.wire
     unserved = {
-        key: excluded.get(key, unknown if key in sent else miss) for key in missing
+        key: excluded.get(key, unknown if key in sent else miss)
+        for key in dict.fromkeys((*ordered_keys, *excluded, *missing))  # Stable ties.
+        if key in missing
     }
     reported = payload.get("unserved")
     if not isinstance(reported, Mapping):
