@@ -347,7 +347,8 @@ class _KVCRProgress:
                     else Reason.SUBMIT_AMBIGUOUS
                 )
             try:
-                info = agent.get_xfer_trace_info(handle)
+                get_trace_info = getattr(agent, "get_xfer_trace_info", None)
+                info = get_trace_info(handle) if get_trace_info is not None else None
                 if info is not None:
                     trace.mark(
                         "nixl.write.correlated",
@@ -501,14 +502,6 @@ class _KVCRProgress:
                 )
             return False
         self._active_transfers.pop(transfer_id, None)
-        if state.trace is not None:
-            state.trace.mark(
-                "nixl.write.released",
-                once=True,
-                transfer_id=transfer_id,
-                status=_nvtx.Status.SUCCESS if state.outcome else _nvtx.Status.FAILED,
-                reason=Reason.NONE if state.outcome else Reason.UNKNOWN,
-            )
         return True
 
     def start(self) -> None:
