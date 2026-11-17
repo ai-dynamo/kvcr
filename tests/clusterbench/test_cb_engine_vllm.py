@@ -526,3 +526,67 @@ def test_what_if_aligning_only_at_finish_drops_the_mid_request_aligns():
     # The deposit still happens; only the align after it completes is gone.
     assert len(kvcr.of("deposit")) == 1
     assert [(a[1], a[2]) for a in kvcr.of("align")] == [(KEYS, True)]
+
+
+# Trace replay: a prompt is the branch-free runs on its path through the
+# session's prefix tree, and the answer's block opens the run the next
+# request continues on.
+PATH = [(900, 0, 2), (901, 0, 1), (902, 0, 3), (903, 0, 1), (904, 0, 2)]
+PATH_KEYS = [id_to_key(bid) for bid in segment_ids(PATH)]
+
+
+def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
+    engine, kvcr, _ = _engine()
+    kvcr.remote_ok = set(PATH_KEYS[:4])
+    engine.submit(
+        Request(
+            rid=1,
+            session=0,
+            segments=PATH,
+            tail=(905, 0, 1),
+            prompt_tokens=9 * BLOCK + 10,
+            output_tokens=3,
+            hint_source=1,
+            hint_blocks=4,
+        )
+    )
+    # The hint names the first four blocks of the path, across three streams.
+    (hint,) = kvcr.of("submit_hint")
+    assert hint[2]["block_hashes"] == [
+        block_id(900, 0),
+        block_id(900, 1),
+        block_id(901, 0),
+        block_id(902, 0),
+    ]
+    done, _ = _run(engine, kvcr)
+    (deliver,) = kvcr.of("deliver")
+    assert list(deliver[1]) == PATH_KEYS  # path order, root first
+    (deposit,) = kvcr.of("deposit")
+    assert list(deposit[1]) == PATH_KEYS[4:]
+    assert (done.prompt_blocks, done.remote_blocks) == (9, 4)
+
+    # One run per stream, in both tiers; the answer's stream on the device.
+    deltas = engine.take_inventory()
+    runs = [(stream, 0, end, False) for stream, _, end in PATH]
+    assert sorted(d[1:] for d in deltas if d[0] == TIER_PRIMARY) == runs
+    assert sorted(d[1:] for d in deltas if d[0] == TIER_DEVICE) == [
+        *runs,
+        (905, 0, 1, False),
+    ]
+
+    # The next turn names the answer's stream as prompt and adds no block.
+    kvcr.calls.clear()
+    engine.submit(
+        Request(
+            rid=2,
+            session=0,
+            segments=[*PATH, (905, 0, 3)],
+            tail=(905, 3, 3),
+            prompt_tokens=12 * BLOCK + 5,
+            output_tokens=2,
+        )
+    )
+    done, _ = _run(engine, kvcr)
+    assert done.gpu_blocks == 10  # the whole old path and the answer's block
+    assert [key_to_id(q[1][0]) for q in kvcr.of("query")] == [block_id(905, 1)]
+    assert (TIER_DEVICE, 905, 1, 3, False) in engine.take_inventory()

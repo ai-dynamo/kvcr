@@ -763,3 +763,67 @@ def test_what_if_larger_deposits():
     drain(port, kvcr)
     assert [len(refs) for _, refs in kvcr.of("deposit")] == [128, 72]
     assert kvcr.max_deposits == 1
+
+
+# Trace replay: a prompt is the branch-free runs on its path through the
+# session's prefix tree, and the answer's page opens the run the next
+# request continues on.
+PATH = [(900, 0, 2), (901, 0, 1), (902, 0, 3), (903, 0, 1), (904, 0, 2)]
+
+
+def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another(
+    rig_factory,
+):
+    rig = rig_factory()
+    kvcr = rig.kvcr
+    blocks = segment_ids(PATH)
+    scope = f"32:{1:032x}:0"
+    kvcr.fetchable[scope] = {key(b) for b in blocks[:4]}
+    rig.engine.submit(
+        Request(
+            rid=1,
+            session=1,
+            segments=PATH,
+            tail=(905, 0, 1),
+            prompt_tokens=9 * PAGE + 10,
+            output_tokens=PAGE,
+            hint_source=1,
+            hint_blocks=4,
+        )
+    )
+    rig.finish(1)
+
+    # The hint names the first four pages of the path, across three streams.
+    ((_, _, hint),) = kvcr.of("submit_hint")
+    assert hint["block_hashes"] == blocks[:4]
+    assert kvcr.of("query")[0] == ("query", [key(b) for b in blocks], scope)
+    assert all(
+        list(refs) == [key(b) for b in blocks[:4]] for _, refs, _ in kvcr.of("deliver")
+    )
+    assert rig.dones[0].remote_blocks == 4 and not rig.dones[0].aborted
+    # Every page of the path is backed up, and the answer's page after them.
+    backed_up = deposited(kvcr)
+    assert sorted(backed_up[:-1]) == sorted(key(b) for b in blocks)
+    assert backed_up[-1] == key(905 << 24)
+    # The router hears one root-aligned run per stream, in both tiers.
+    for stream, _, end in [*PATH, (905, 0, 1)]:
+        assert rig.held(TIER_DEVICE, stream) == end
+        assert rig.held(TIER_G2, stream) == end
+
+    # The next turn names the answer's stream as prompt and adds no page.
+    kvcr.calls.clear()
+    rig.engine.submit(
+        Request(
+            rid=2,
+            session=1,
+            segments=[*PATH, (905, 0, 3)],
+            tail=(905, 3, 3),
+            prompt_tokens=12 * PAGE + 5,
+            output_tokens=5,
+        )
+    )
+    rig.finish(2)
+    assert rig.dones[1].gpu_blocks == 10  # the whole old path and the answer
+    looked = [key((905 << 24) + i) for i in (1, 2)]
+    assert kvcr.of("query") == [("query", looked, f"32:{2:032x}:0")]
+    assert deposited(kvcr) == looked

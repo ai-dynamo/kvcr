@@ -223,3 +223,12 @@ def test_device_cache_ignores_blocks_that_are_not_root_aligned():
     cache = StreamCache(10)
     cache.insert([(5, 2, 4)], cache.new_rank())
     assert len(cache) == 0 and cache.prefix([(5, 0, 4)]) == 0
+
+
+def test_device_cache_survives_an_empty_segment_on_a_stream_it_lacks():
+    cache = StreamCache(8)
+    # An answer under one block: the tail names a stream but no blocks.
+    cache.insert([(1, 0, 8), (2, 0, 0)], cache.new_rank())
+    cache.insert([(3, 0, 4)], cache.new_rank())  # eviction walks past stream 2
+    assert cache.held(1) == 4 and cache.held(2) == 0 and cache.held(3) == 4
+    assert len(cache) == 8

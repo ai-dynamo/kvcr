@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Replays the AgentX trace: recorded Claude Code sessions with their real
+# contexts (1,400 blocks at the median, up to 256k tokens), branches,
+# compactions and sub-agents. Compile the corpus once, then point at the file:
+#
+#   python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
+#   ... --config scenarios/agentx.toml --set workload.trace=/path/agentx-062126.cbtrace
+#
+# The GPU is modelled and waits are the recorded ones, capped at 10 s as AgentX
+# caps idle time, so a rank's GPU is the limit, as in a real deployment. Ranks
+# are sized like the baseline: a 32,768-block device cache, an 8,192-block CPU
+# tier and a 65,536-block KVCR pool.
+name = "agentx"
+
+[workload]
+trace = "agentx-062126.cbtrace"
+sessions_per_worker = 8
+think_cap_s = 10.0
+
+[router]
+migration_prob = 0.05
+
+[phases]
+# Every initial play prefills its whole context once before the window opens.
+fill_s = 90.0
+measure_s = 120.0

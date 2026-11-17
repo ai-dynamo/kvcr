@@ -78,3 +78,17 @@ def test_aged_sessions_start_mid_life_with_grown_contexts():
     assert mean(aged) > 2 * mean(fresh)
     cap = config.max_context_tokens
     assert all(t.prompt_tokens + t.output_tokens <= cap for t in aged)
+
+
+def test_a_completed_turn_wakes_its_session_or_the_replacement():
+    workload = Workload(WorkloadConfig(turns_median=2, turns_sigma=0.01), BLOCK)
+    session = workload.new_session()
+    first = workload.next_turn(session.id)
+    assert workload.completed(first) == (((first.think_s, session.id),), ())
+    last = workload.next_turn(session.id)
+    assert last.last
+    # The session is over: a fresh one takes its place after the think time.
+    step = workload.completed(last)
+    assert step.ended == (session.id,)
+    assert step.wake == ((last.think_s, session.id + 1),)
+    assert workload.started == 2 and workload.next_turn(session.id + 1).turn == 0

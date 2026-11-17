@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Whole cells on one machine with real KVCR, NIXL/UCX and ZMQ."""
 
+import itertools
 import json
 import os
+import random
 import subprocess
 import sys
 
 import pytest
 from clusterbench.config import load_config
 from clusterbench.launch_local import run_local
+from clusterbench.trace import compile_corpus
 
 _PROBE = (
     "import nixl._api as api;"
@@ -139,3 +142,91 @@ def test_sglang_workers_restore_pages_from_each_other(real_nixl, tmp_path):
     ]
     assert not hard, hard
     assert len(list((tmp_path / "reports").glob("*.json"))) == 3
+
+
+def _corpus(path, sessions=6, turns=40):
+    """A small corpus in the AgentX trace format, with sub-agents."""
+    rng = random.Random(7)
+    with open(path, "w") as file:
+        for n in range(sessions):
+            fresh = itertools.count(1)
+
+            def new(count):
+                return [next(fresh) for _ in range(count)]
+
+            def request(t, ids, out):
+                return {
+                    "t": t,
+                    "type": "s",
+                    "in": 64 * len(ids),
+                    "out": 64 * out,
+                    "hash_ids": list(ids),
+                    "api_time": 0.05,
+                }
+
+            system = new(24)
+            context, requests, t = list(system), [], 0.0
+            for turn in range(turns):
+                out = rng.randint(1, 2)
+                requests.append(request(t, context, out))
+                t += 0.1
+                if turn % 6 == 2:  # a sub-agent with a context of its own
+                    side, inner = new(8), []
+                    for step in range(3):
+                        inner.append(request(t + 0.1 * step, side, 1))
+                        side = side + new(3)
+                    group = {"type": "subagent", "t": t, "status": "completed"}
+                    requests.append({**group, "requests": inner})
+                    t += 0.4
+                if turn % 15 == 14:  # compaction: back to the system prompt
+                    context = system + new(6)
+                else:
+                    context = context + new(out + rng.randint(2, 6))
+            trace = {"id": f"s{n}", "block_size": 64, "hash_id_scope": "local"}
+            file.write(json.dumps({**trace, "requests": requests}) + "\n")
+
+
+@pytest.mark.parametrize(
+    "profile,profile_overrides",
+    [
+        ("vllm", []),
+        (
+            "sglang",
+            ["engine.profile=sglang", "tiers.layers=8", "tiers.gpu_blocks=2048"],
+        ),
+    ],
+)
+def test_a_replayed_trace_moves_blocks_between_workers(
+    real_nixl, tmp_path, profile, profile_overrides
+):
+    _corpus(tmp_path / "source.jsonl")
+    stats = compile_corpus(tmp_path / "source.jsonl", tmp_path / "replay.cbtrace")
+    assert stats.groups and stats.tail_blocks
+    overrides = [
+        f"name=trace-{profile}",
+        *OVERRIDES,
+        "tiers.g2_blocks=8192",
+        f"workload.trace={tmp_path / 'replay.cbtrace'}",
+        *profile_overrides,
+    ]
+    out = tmp_path / "run"
+    summary = run_local(load_config(None, overrides), out, nodes=3, per_node=1)
+    logs = "".join(p.read_text()[-2000:] for p in (out / "logs").glob("*.log"))
+    assert summary["workers"] == 3 and summary["profile"] == profile, logs
+    workload = summary["workload"]
+    # Nine plays of six traces: sub-agents ran beside their parents.
+    assert workload["kind"] == "trace" and workload["traces"] == 6
+    assert workload["plays_started"] >= 9 and workload["child_turns"] > 0
+    assert workload["inflight_max"] > 1
+    counters = summary["counters"]
+    # Sessions moved, and every block a peer delivered had its bytes.
+    assert counters["deliver_blocks_remote"] > 50, summary["flags"]
+    assert counters["bytes_checked"] >= counters["deliver_blocks_remote"]
+    assert counters.get("bytes_mismatch", 0) == 0
+    assert summary["completed"]["completed"] > 50
+    hard = [
+        f
+        for f in summary["flags"]
+        if "waited for a CPU" not in f and "dispatch lag" not in f
+    ]
+    assert not hard, hard

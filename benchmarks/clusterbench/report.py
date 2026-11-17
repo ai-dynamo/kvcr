@@ -242,6 +242,11 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "valid": not flags,
         "flags": flags,
         "headline": headline,
+        "workload": {
+            **tally.get("workload", {"kind": "synthetic"}),
+            "sessions_started": tally.get("sessions_started", 0),
+            "inflight_max": tally.get("inflight_max", 0),
+        },
         "offered": {
             k: tally[k]
             for k in (
@@ -377,6 +382,16 @@ def format_summary(summary: dict) -> str:
         f"{'KVCR call':<16}{'calls':>10}{'items':>12}{'us/call':>10}"
         f"{'us/item':>10}{'share':>9}",
     ]
+    workload = summary.get("workload", {})
+    if workload.get("kind") == "trace":
+        lines.insert(
+            2,
+            f"trace {workload['trace']} ({workload['sha256'][:12]}, "
+            f"{workload['traces']} traces): {workload['plays_started']} plays "
+            f"started, {workload['plays_finished']} finished, "
+            f"{workload['turns']} turns sent ({workload['child_turns']} by "
+            f"sub-agents), at most {workload['inflight_max']} requests in flight",
+        )
     for name, call in summary["engine_calls"].items():
         lines.append(
             f"{name:<16}{call['calls']:>10,.0f}{call['items']:>12,.0f}"

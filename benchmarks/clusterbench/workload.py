@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Sequence
 from typing import NamedTuple
 
-from .config import WorkloadConfig
+from .config import RunConfig, WorkloadConfig
 from .ids import Segment, session_stream, system_stream
 
 
@@ -28,6 +29,13 @@ class Turn(NamedTuple):
     output_tokens: int
     think_s: float  # wait after this turn completes before the next one
     last: bool
+
+
+class Step(NamedTuple):
+    """What a completed turn sets off."""
+
+    wake: Sequence[tuple[float, int]]  # (delay in seconds, session) now due
+    ended: Sequence[int]  # sessions that will not be scheduled again
 
 
 def _lognormal(rng: random.Random, median: float, sigma: float) -> float:
@@ -132,6 +140,25 @@ class Workload:
             del self._sessions[session]
         return turn
 
+    def completed(self, turn: Turn) -> Step:
+        """The same session after its think time, or a fresh one if it ended."""
+        if not turn.last:
+            return Step(((turn.think_s, turn.session),), ())
+        self._sessions.pop(turn.session, None)
+        return Step(((turn.think_s, self.new_session().id),), (turn.session,))
+
+    def summary(self) -> dict:
+        return {"kind": "synthetic"}
+
     @property
     def started(self) -> int:
         return self._next_session
+
+
+def make_workload(config: RunConfig):
+    """The synthetic generator, or a trace replay if ``workload.trace`` is set."""
+    if config.workload.trace:
+        from .trace import TraceWorkload
+
+        return TraceWorkload(config)
+    return Workload(config.workload, config.tiers.tokens_per_block)

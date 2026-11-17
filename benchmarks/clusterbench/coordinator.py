@@ -23,7 +23,7 @@ from .ids import segment_blocks
 from .metrics import LogHist
 from .report import summarize
 from .router import Router
-from .workload import Workload
+from .workload import make_workload
 
 
 class RunFailed(RuntimeError):
@@ -35,6 +35,8 @@ class Coordinator:
         self.config = config
         self.out = Path(out_dir)
         self.arm = arm
+        # First, so a bad trace file fails before any worker is started.
+        self._workload = make_workload(config)
         self._context = zmq.Context()
         self._sock = self._context.socket(zmq.ROUTER)
         self._sock.setsockopt(zmq.ROUTER_MANDATORY, 1)
@@ -196,8 +198,7 @@ class Coordinator:
     def _drive(self, router: Router, nodes: list[str]) -> dict:
         config, phases = self.config, self.config.phases
         workers = self._workers
-        block = config.tiers.tokens_per_block
-        workload = Workload(config.workload, block)
+        workload = self._workload
         rng = random.Random(config.workload.seed)
         clock = time.monotonic
         due: list[tuple[float, int]] = []
@@ -208,6 +209,7 @@ class Coordinator:
                 due, (start + rng.random() * config.workload.ramp_s, session.id)
             )
         inflight: dict[int, tuple] = {}
+        inflight_max = 0
         next_rid = 0
         measuring = False
         measure_acks: set[int] = set()
@@ -228,16 +230,20 @@ class Coordinator:
                 entry = inflight.pop(message.rid, None)
                 if entry is None:
                     return
-                session, think, last, source, hinted, t_sent = entry
+                turn, source, hinted = entry
                 router.done(message.rid)
                 if measuring and not stopped:
                     self._tally_done(tally, message, worker, source, hinted, nodes)
                 if stopped:
                     return
-                if last:
+                # The workload says what this sets off: the session's next
+                # turn, sub-agents starting, a parent resuming, a new session.
+                step = workload.completed(turn)
+                for session in step.ended:
                     router.forget(session)
-                    session = workload.new_session().id
-                heapq.heappush(due, (clock() + think, session))
+                now = clock()
+                for delay, session in step.wake:
+                    heapq.heappush(due, (now + delay, session))
             elif isinstance(message, protocol.Ready) and message.phase == "measure":
                 measure_acks.add(worker)
                 occupancy = message.info.get("primary_occupancy", 1.0)
@@ -283,14 +289,9 @@ class Coordinator:
                             hint_blocks=route.hint_blocks,
                         ),
                     )
-                    inflight[rid] = (
-                        turn.session,
-                        turn.think_s,
-                        turn.last,
-                        route.hint_source,
-                        route.hint_blocks,
-                        now,
-                    )
+                    inflight[rid] = (turn, route.hint_source, route.hint_blocks)
+                    if len(inflight) > inflight_max:
+                        inflight_max = len(inflight)
                     if measuring:
                         tally["dispatched"] += 1
                         tally["dispatched_blocks"] += blocks
@@ -337,6 +338,8 @@ class Coordinator:
         tally["lag"] = lag.to_json()
         tally["sessions_started"] = workload.started
         tally["inflight_at_stop"] = len(inflight)
+        tally["inflight_max"] = inflight_max
+        tally["workload"] = workload.summary()
         tally["ttft"] = tally["ttft"].to_json()
         tally["ttft_remote"] = tally["ttft_remote"].to_json()
         return tally

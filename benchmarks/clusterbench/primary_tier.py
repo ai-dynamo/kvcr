@@ -89,8 +89,11 @@ class StreamCache:
         length, codes, heap, events = self._length, self._code, self._heap, self.events
         for place, (stream, start, end) in enumerate(segments):
             held = length.get(stream, 0)
-            if start > held:
-                continue  # not root-aligned: it could never be found again
+            if start > held or end <= start:
+                # Not root-aligned, so it could never be found again; or no
+                # blocks at all (an answer under one block), which must not
+                # rank a stream the cache holds nothing of.
+                continue
             if end > held:
                 length[stream] = end
                 self._blocks += end - held

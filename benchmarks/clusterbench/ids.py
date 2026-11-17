@@ -21,11 +21,13 @@ INDEX_BITS = 24
 INDEX_MASK = (1 << INDEX_BITS) - 1
 MAX_STREAM = (1 << (64 - INDEX_BITS)) - 1
 
-# Stream id ranges. Sessions get ``SESSION_BASE + session * GENERATIONS + gen``.
+# Stream id ranges. Sessions get ``SESSION_BASE + session * GENERATIONS + gen``;
+# each play of a replayed trace takes the next free ids from ``TRACE_BASE`` up.
 SYSTEM_BASE = 1
 WARM_BASE = 1 << 20
 SESSION_BASE = 1 << 24
 GENERATIONS = 64
+TRACE_BASE = 1 << 32
 
 Segment = tuple[int, int, int]  # stream, start index, end index (exclusive)
 

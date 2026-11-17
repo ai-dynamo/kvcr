@@ -7,6 +7,7 @@ ab           interleaved local A/B (or A/A) between KVCR source trees
 coordinator  run the coordinator of a multi-node cell
 worker       run one worker (started by a launcher)
 report       print one run's summary, or compare runs
+trace        compile a recorded corpus (AgentX / Weka format) for replay
 """
 
 from __future__ import annotations
@@ -126,6 +127,15 @@ def _report(args) -> int:
     return 0
 
 
+def _trace(args) -> int:
+    from .trace import compile_corpus
+
+    stats = compile_corpus(args.source, args.out, limit=args.limit)
+    print(stats.format())
+    print(f"\nreplay it with: --set workload.trace={args.out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="clusterbench",
@@ -214,6 +224,12 @@ def main(argv: list[str] | None = None) -> int:
         help="compare arms; the first is the baseline",
     )
     report.set_defaults(func=_report)
+
+    trace = sub.add_parser("trace", help="compile a recorded corpus for replay")
+    trace.add_argument("source", help="Weka-format traces.jsonl, one trace per line")
+    trace.add_argument("-o", "--out", required=True, help="compiled replay file")
+    trace.add_argument("--limit", type=int, help="compile only the first N traces")
+    trace.set_defaults(func=_trace)
 
     args = parser.parse_args(argv)
     return args.func(args)

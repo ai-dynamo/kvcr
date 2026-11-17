@@ -153,6 +153,63 @@ the chosen worker holds, exactly as Dynamo does. Two ways to choose:
   arms of an A/B are offered the same work.
 - `cost`: Dynamo's default KV-router formula.
 
+### Trace replay
+
+Instead of generating sessions, the coordinator can replay recorded ones: the
+AgentX trace, which is SemiAnalysis's corpus of Claude Code sessions in the
+"Weka" format (`semianalysisai/cc-traces-weka-062126` on Hugging Face: 393
+sessions, 68,266 requests, 58% of them made by sub-agents). Each request
+carries the hashes of the 64-token blocks of its whole prompt, so the replay
+has the real contexts (1,400 blocks at the median, 256k tokens at most), the
+real branches and compactions, and the real answer lengths and waits.
+
+Compile the corpus once (a few seconds), then give the file to any scenario:
+
+```bash
+python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
+python -m clusterbench local --config benchmarks/clusterbench/scenarios/agentx-fast.toml \
+  --set workload.trace=$PWD/agentx-062126.cbtrace --nodes 2 --per-node 4
+```
+
+The compiled file is a few megabytes and is all a run needs; only the
+coordinator reads it. `trace` prints what to size a scenario by (blocks per
+request, new blocks per turn, how many sub-agents start at once).
+
+How a session is replayed, following aiperf's AgentX rules:
+
+- Closed loop. A request goes out the recorded gap after the request it
+  depends on has finished (`workload.trace_think_scale` multiplies the gap,
+  `workload.think_cap_s` caps it), so the offered work does not depend on how
+  fast the system is.
+- Sub-agents start after the parent turn before them and run side by side;
+  the parent's next turn waits for all of them. The router places a sub-agent
+  as a new session, on the least busy worker: it shares no block with its
+  parent.
+- `workload.sessions_per_worker` is the number of sessions replayed at once
+  per worker. When one ends, the next one starts; a session replayed again
+  gets block ids of its own, so nothing is shared between plays (AgentX's
+  cache-bust rule). With `workload.aged_start` the first sessions start
+  part-way through their recording.
+- A request's blocks are the runs of the session's prefix tree on its path.
+  The blocks its answer adds are the first blocks of the next request that
+  extends its prompt.
+
+What the replay does not reproduce:
+
+- The requests inside one sub-agent run one after another; aiperf splits some
+  sub-agents further into parallel streams.
+- About 13% of answer blocks never appear in a later prompt (thinking, for example).
+  They are not cached, which slightly understates device-cache pressure.
+- Where a later request branches off is known in advance, so on the SGLang
+  profile a cold prompt enters the tree as one node per run where SGLang would
+  insert one node and split it later.
+- No block is shared between sessions. That is true of the trace itself: its
+  hashes are local to a session.
+
+The trace must fit the tiers: the coordinator refuses a run whose longest
+request exceeds `tiers.gpu_blocks`, or on the vLLM profile
+`tiers.primary_blocks`, because the modelled engine would never start it.
+
 ## Scenarios
 
 | File | What it is |
@@ -162,6 +219,8 @@ the chosen worker holds, exactly as Dynamo does. Two ways to choose:
 | `agentic-stress.toml` | Twice the sessions, fast turns, a quarter migrating, a KVCR pool that evicts |
 | `agentic-stress-fast.toml` | `agentic-stress` with the modelled GPU and think time compressed, so a rank's engine thread is the limit rather than its GPU |
 | `peer-only.toml` | No KVCR pool: peers are served from pinned engine memory |
+| `agentx.toml` | The AgentX trace with the modelled GPU and recorded waits (capped at 10 s); needs `workload.trace` |
+| `agentx-fast.toml` | The AgentX trace with the GPU, the answers and the waits compressed, twice the sessions and half the KVCR pool, so KVCR limits a rank; needs `workload.trace` |
 
 How many requests a rank completes is set by the modelled GPU
 (`engine.step_ms`, `engine.prefill_us_per_token`) and the think time, and the
@@ -280,5 +339,6 @@ should advertise.
 
 Kubernetes launch, SGLang's HiCache storage backend and its TP>1 or
 sliding-window layouts, `kv.prefetch` and
-`kv.move` hints (Dynamo does not emit them today), trace replay, sub-agent
-fan-out, the G3 disk tier, the Guard service and fault injection.
+`kv.move` hints (Dynamo does not emit them today), open-loop replay by
+recorded timestamp, a recorded initial placement, the G3 disk tier, the Guard
+service and fault injection.

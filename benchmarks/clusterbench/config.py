@@ -107,6 +107,17 @@ class WorkloadConfig(msgspec.Struct, frozen=True, kw_only=True):
     # tiers reach their steady state within the fill phase. Sessions that
     # replace ended ones always start fresh.
     aged_start: bool = True
+    # Replay a compiled trace (``python -m clusterbench trace``) instead of
+    # generating sessions. Of the fields above only ``seed``,
+    # ``sessions_per_worker`` (live plays), ``think_cap_s``, ``ramp_s`` and
+    # ``aged_start`` (start part-way through the trace) then apply; recorded
+    # waits are multiplied by ``trace_think_scale`` before the cap, and answer
+    # lengths by ``trace_output_scale`` (below 1 a rank spends less of its
+    # time decoding; the blocks a shortened answer no longer covers are
+    # computed as part of the next prompt instead).
+    trace: str = ""
+    trace_think_scale: float = 1.0
+    trace_output_scale: float = 1.0
 
 
 class RouterConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -209,6 +220,12 @@ def validate(config: RunConfig) -> None:
         raise ValueError("engine.linker_* counts must be at least 1")
     if engine.verify not in ("none", "sample", "full"):
         raise ValueError("engine.verify must be none, sample or full")
+    # The trace file itself is opened by the coordinator only: workers decode
+    # the same config on nodes that need not have it.
+    if config.workload.trace_think_scale < 0:
+        raise ValueError("workload.trace_think_scale must not be negative")
+    if config.workload.trace_output_scale <= 0:
+        raise ValueError("workload.trace_output_scale must be positive")
     if config.router.mode not in ("sticky", "cost"):
         raise ValueError("router.mode must be sticky or cost")
     if config.phases.mesh_warm not in ("full", "none"):
