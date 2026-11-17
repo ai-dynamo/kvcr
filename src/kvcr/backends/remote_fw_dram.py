@@ -52,7 +52,6 @@ from .remote_ops import (
     _Invalidate,
     _KeysToFetch,
     _known_reason,
-    _nvtx_reason,
     _NvtxState,
     _outcome,
     _PeerMessage,
@@ -426,7 +425,7 @@ class _RemoteFWDram:
             return
         trace = kvcr._nvtx_operations.get(op_handle)
         if trace is not None:
-            trace.reject("target.rejected", _nvtx_reason(reason))
+            trace.reject("target.rejected", _nvtx.reason_from_name(reason))
         kvcr._complete(
             op_handle,
             dict.fromkeys(blocks, _failed_result(reason)),

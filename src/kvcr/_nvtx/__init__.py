@@ -211,6 +211,14 @@ class _PinTracer(_PayloadEmitter):
             return None
 
 
+def reason_from_name(name):
+    """The Reason with this name; anything else is UNKNOWN."""
+    try:
+        return Reason(name)
+    except ValueError:
+        return Reason.UNKNOWN
+
+
 def identity(value):
     """Stable 128-bit label identity; no Python hash randomization or truncation."""
     if value is None:
