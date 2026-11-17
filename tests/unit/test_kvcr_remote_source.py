@@ -155,23 +155,24 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "keys,completed_indices,source_case,unserved",
+    "keys,completed_indices,source_case,unserved,expected",
     [
-        ([b"local"], [0], "ready", {}),
+        ([b"local"], [0], "ready", {}, "success"),
         (
             [b"missing", b"local", b"absent"],
             [1],
             "ready",
             {"not_resident": [0, 2]},
+            "partial",
         ),
-        ([b"missing"], [], "ready", {"not_resident": [0]}),
-        ([b"local"], [], "no_local", {"not_resident": [0]}),
-        ([b"local"], [], "key_layout", {"layout_mismatch": [0]}),
-        ([b"local"], [], "requested_labels", {"layout_mismatch": [0]}),
+        ([b"missing"], [], "ready", {"not_resident": [0]}, "miss"),
+        ([b"local"], [], "no_local", {"not_resident": [0]}, "miss"),
+        ([b"local"], [], "key_layout", {"layout_mismatch": [0]}, "failed"),
+        ([b"local"], [], "requested_labels", {"layout_mismatch": [0]}, "failed"),
     ],
 )
 def test_framework_pinning_disabled(
-    keys, completed_indices, source_case, unserved, kvcr_caplog
+    keys, completed_indices, source_case, unserved, expected, kvcr_caplog
 ):
     kvcr_caplog.set_level(logging.DEBUG, logger="kvcr.backends.local_dram_pools")
     pinning = SimpleNamespace(
@@ -236,15 +237,6 @@ def test_framework_pinning_disabled(
     records = source.get_stats().records
     # The source labels its own view: a layout mismatch is its fault, a block it
     # does not hold is a miss. Undelivered blocks are counted on the target only.
-    expected = (
-        "success"
-        if not unserved
-        else "partial"
-        if completed_indices
-        else "miss"
-        if "not_resident" in unserved
-        else "failed"
-    )
     assert ("source_write", expected) in {
         labels for _, name, _, labels in records if name == DURATION_METRIC
     }

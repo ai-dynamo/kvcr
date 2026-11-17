@@ -43,10 +43,9 @@ from kvcr import (
     UNSERVED_BLOCKS_METRIC,
 )
 from kvcr.backends.dangling_ops import _DanglingOps
-from kvcr.backends.remote_fw_dram import _RemoteFWDram, _TargetPullOp, _TargetPullState
+from kvcr.backends.remote_fw_dram import _RemoteFWDram, _TargetPullState
 from kvcr.backends.remote_ops import (
     _known_reason,
-    _notification_unserved,
     _write_done_notif,
     _WriteProbeAck,
 )
@@ -477,11 +476,11 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     monkeypatch.setenv("KVCR_KEY_HISTORY", "1")
     caplog.set_level(logging.DEBUG, logger="kvcr.runtime.core")
     block_size = 16
-    local = ctypes.create_string_buffer(block_size * 4)
+    local = ctypes.create_string_buffer(block_size * 5)
     agent = FakeNixlAgent()
     control = FakeBytesControl()
     events: list[InventoryEvent] = []
-    keys = tuple(BlockKey(f"k{i}".encode()) for i in range(4))
+    keys = tuple(BlockKey(f"k{i}".encode()) for i in range(5))
     target = _new_kvcr(
         agent,
         FakePrimaryPinning(),
@@ -493,7 +492,7 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     )
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     assert (
-        target.query(keys, "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)] * 4
+        target.query(keys, "req") == [(QueryStatus.FETCHABLE, CacheTier.REMOTE_G2)] * 5
     )
     fetch = target.fetch(keys, request_id="req")
     # A second fetch of the same request shares the fill and its failures.
@@ -513,7 +512,14 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
             message["op_handle"],
             True,
             (0, 2),
-            unserved={"not_resident": [1], "pin_failed": [3]},
+            # Unreported, "none", unknown-name and out-of-range entries leave
+            # the block with an unspecified miss.
+            unserved={
+                "not_resident": [1],
+                "pin_failed": [3, 9],
+                "none": [4],
+                "bad": [4],
+            },
         )
     ]
 
@@ -534,10 +540,15 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
         assert results[keys[3]] == OpEntryResult(
             OpEntryStatus.FAILED, reason="pin_failed"
         )
+        assert (
+            results[keys[4]]
+            == _op_entries({keys[4]: OpEntryStatus.UNAVAILABLE})[keys[4]]
+        )
     assert target.query(keys, "req") == [
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
         (QueryStatus.MISS, None),
         (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.MISS, None),
         (QueryStatus.MISS, None),
     ]
     assert events == [InventoryEvent(available, CacheTier.LOCAL_G2, False)]
@@ -1149,7 +1160,6 @@ def test_kvcr_metadata_ack_retry_lifecycle():
 
 @pytest.mark.parametrize("terminal,success", [(True, True), (False, False)])
 def test_native_terminal_or_cancellation_outranks_metadata_retry(terminal, success):
-    from kvcr.backends.remote_fw_dram import _TargetPullState
 
     control, agent = FakeBytesControl(), FakeNixlAgent(metadata=b"target-md")
     kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
@@ -1953,59 +1963,6 @@ def test_remote_framework_dram_transfers_available_keys(
     assert any(
         "source_transfer_completed" in event and event.endswith(f"unserved={unserved}")
         for event in events
-    )
-
-
-def test_write_done_carries_failure_and_unserved_reasons():
-    failed = _decode_notif(_write_done_notif(7, False, reason="deadline"))
-    assert failed["reason"] == "deadline"
-    served = _decode_notif(
-        _write_done_notif(
-            7, True, (1,), unserved={"pin_failed": [0, 9], "none": [2], "bad": [1]}
-        )
-    )
-    # Unreported, unknown-reason and out-of-range entries fall back.
-    assert _notification_unserved(
-        served, (b"a", b"b", b"c"), {b"a", b"c", b"d"}, {}
-    ) == {
-        b"a": "pin_failed",
-        b"c": "unknown",
-        b"d": "remembered_miss",
-    }
-
-
-def test_key_results_keep_each_block_s_own_reason():
-    op = _TargetPullOp(
-        op_id=("target", 1),
-        keys=frozenset({b"a", b"b", b"c"}),
-        started_at=None,
-        deadline=0.0,
-        state=_TargetPullState.FINISHED,
-        local_fill=False,
-        remote_ctrl_ep="",
-        _backend=Mock(),
-        success=True,
-        completed_keys={b"a"},
-        unserved={b"b": "pin_failed", b"c": "unknown"},
-    )
-    # A known per-block cause maps like the same operation-wide cause; an
-    # unspecified one is unavailable.
-    assert op.key_results() == _op_entries(
-        {
-            b"a": True,
-            b"b": (OpEntryStatus.FAILED, "pin_failed"),
-            b"c": OpEntryStatus.UNAVAILABLE,
-        }
-    )
-    # A failed write reports its reason, except for blocks already known missing.
-    op.success, op.failure_reason = False, "deadline"
-    op.unserved = {b"c": "remembered_miss"}
-    assert op.key_results() == _op_entries(
-        {
-            b"a": (OpEntryStatus.TIMEOUT, "deadline"),
-            b"b": (OpEntryStatus.TIMEOUT, "deadline"),
-            b"c": (OpEntryStatus.UNAVAILABLE, "remembered_miss"),
-        }
     )
 
 

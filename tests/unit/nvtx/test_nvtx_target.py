@@ -205,16 +205,18 @@ def test_target_rejection_before_control_enqueue(recording, monkeypatch, failure
 
 
 @pytest.mark.parametrize(
-    "indices,expected,retry",
+    "indices,unserved,expected,retry",
     [
-        ((0, 1), _nvtx.Status.SUCCESS, False),
-        ((0,), _nvtx.Status.PARTIAL, False),
-        ((9,), _nvtx.Status.FAILED, False),
-        ((0, 1), _nvtx.Status.SUCCESS, True),
+        ((0, 1), None, _nvtx.Status.SUCCESS, False),
+        ((0,), None, _nvtx.Status.PARTIAL, False),
+        ((9,), None, _nvtx.Status.FAILED, False),
+        ((0, 1), None, _nvtx.Status.SUCCESS, True),
+        # A source holding nothing answered; that is a miss, not a failure.
+        ((), {"not_resident": [0, 1]}, _nvtx.Status.MISS, False),
     ],
 )
 def test_target_receipt_consumption_and_caller_return(
-    recording, indices, expected, retry
+    recording, indices, unserved, expected, retry
 ):
     kvcr, agent, control = make_target()
     request = "real-request-α"
@@ -234,7 +236,7 @@ def test_target_receipt_consumption_and_caller_return(
         assert set(recording.ranges) == ranges
         assert not payloads(recording, "target.write_done.received")
     agent.notifs["source"] = [
-        _write_done_notification(handle, completed_indices=indices)
+        _write_done_notif(handle, True, indices, unserved=unserved)
     ]
     _wait_until(lambda: ("target", handle) not in kvcr._core._progress._in_flight_ops)
     [received] = payloads(recording, "target.write_done.received")
@@ -254,6 +256,9 @@ def test_target_receipt_consumption_and_caller_return(
         assert int(event["op_handle"]) == handle
     returned = payloads(recording, "op.completion_returned")[0]
     assert int(returned["status"]) == int(expected)
+    if expected is _nvtx.Status.MISS:
+        assert int(received["status"]) == int(expected)
+        assert reason_of(received) == reason_of(returned) == _nvtx.Reason.NOT_RESIDENT
     assert (int(returned["request_hi"]), int(returned["request_lo"])) == _nvtx.identity(
         request
     )
@@ -490,19 +495,3 @@ def test_off_skips_annotation_work_but_preserves_results(
     assert not list(kvcr.poll_completed())
     assert accesses == []
     assert not recording.events
-
-
-def test_source_holding_nothing_is_a_miss_not_a_failure(recording):
-    kvcr, agent, control = make_target()
-    kvcr.submit_hint(_router_hint("tcp://source:1"), "req")
-    key = BlockKey(b"k")
-    handle = kvcr.deliver({key: [_mem_descriptor()]}, "req")
-    _wait_until(lambda: bool(control.sent))
-    agent.notifs["source"] = [
-        _write_done_notif(handle, True, (), unserved={"not_resident": [0]})
-    ]
-    _poll_until(kvcr, bool)
-    for name in ("target.write_done.received", "op.completion_returned"):
-        [event] = payloads(recording, name)
-        assert int(event["status"]) == _nvtx.Status.MISS
-        assert reason_of(event) == _nvtx.Reason.NOT_RESIDENT
