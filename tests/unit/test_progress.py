@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import zmq
+from _kvcr_test_utils import _wait_until
 from nixl import nixlRemoteDisconnectError
 
 from kvcr.runtime import progress as progress_module
@@ -878,34 +879,46 @@ def test_loop_failure_is_reported_to_main() -> None:
     assert exc_info.value is expected
 
 
-def test_idle_loop_wakes_promptly_on_submit(monkeypatch) -> None:
-    # After backing off, an idle loop still picks up a submission at once rather than
-    # when its current wait ends.
-    monkeypatch.setattr(progress_module, "_IDLE_WAIT_MAX_SECONDS", 10.0)
-    received = threading.Event()
+class _WaitRecorder:
+    """Record the progress thread's waits and signal when a long idle wait begins."""
 
-    def poll(_progress, items):
-        if items:
-            received.set()
-        return {}, False
+    LONG_WAIT_SECONDS = 0.5
 
-    progress = _KVCRProgress(lambda _: None, poll, list, lambda: None)
-    progress.start()
-    try:
-        # Long enough for the idle wait to back off past one second.
-        time.sleep(1.1)
-        submitted = time.monotonic()
-        progress.submit("item")
-        assert received.wait(5)
-        assert time.monotonic() - submitted < 0.5
-    finally:
-        progress.close()
+    def __init__(self, monkeypatch) -> None:
+        self.waits: list[float] = []
+        self.long_wait_woken: list[bool] = []
+        self.long_wait = threading.Event()
+        recorder, real_sleep = self, time.sleep
+
+        class Poller(zmq.Poller):
+            def poll(self, timeout=None):
+                seconds = timeout / 1000
+                recorder.waits.append(seconds)
+                long = seconds >= recorder.LONG_WAIT_SECONDS
+                if long:
+                    recorder.long_wait.set()
+                events = super().poll(timeout)
+                if long:
+                    recorder.long_wait_woken.append(bool(events))
+                return events
+
+        def sleep(seconds: float) -> None:
+            recorder.waits.append(seconds)
+            real_sleep(seconds)
+
+        monkeypatch.setattr(progress_module.zmq, "Poller", Poller)
+        monkeypatch.setattr(
+            progress_module, "time", SimpleNamespace(**{**vars(time), "sleep": sleep})
+        )
+        # Let an idle wait back off far enough that only a wakeup ends it early.
+        monkeypatch.setattr(progress_module, "_IDLE_WAIT_MAX_SECONDS", 10.0)
 
 
-def test_idle_loop_wakes_promptly_on_idle_socket(monkeypatch) -> None:
-    # Peer control traffic arrives on a socket only the progress thread reads; it must end
-    # an idle wait as promptly as a local submission.
-    monkeypatch.setattr(progress_module, "_IDLE_WAIT_MAX_SECONDS", 10.0)
+@pytest.mark.parametrize("wake", ["submit", "peer"])
+def test_idle_wait_backs_off_until_a_wakeup(monkeypatch, wake) -> None:
+    # Peer control traffic arrives on a socket only the progress thread reads, so it
+    # must end an idle wait just as a local submission does.
+    waits = _WaitRecorder(monkeypatch)
     context = zmq.Context.instance()
     pull = context.socket(zmq.PULL)
     pull.linger = 0
@@ -916,23 +929,72 @@ def test_idle_loop_wakes_promptly_on_idle_socket(monkeypatch) -> None:
     received = threading.Event()
 
     def poll(_progress, items):
-        if pull.poll(0):
-            pull.recv()
-            received.set()
-            return {}, True
-        return {}, False
+        try:
+            pull.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            if not items:
+                return {}, False
+        received.set()
+        return {}, True
 
     progress = _KVCRProgress(
         lambda _: None, poll, list, lambda: None, idle_sockets=lambda: [pull]
     )
     progress.start()
     try:
-        time.sleep(1.1)
-        sent = time.monotonic()
-        push.send(b"peer")
+        assert waits.long_wait.wait(5)
+        if wake == "submit":
+            progress.submit("item")
+        else:
+            push.send(b"peer")
         assert received.wait(5)
-        assert time.monotonic() - sent < 0.5
+        # The wakeup, not the timeout, ended the long wait.
+        assert waits.long_wait_woken[:1] == [True]
     finally:
         progress.close()
         push.close()
         pull.close()
+
+
+@pytest.mark.parametrize("work", ["operation", "backend_retry"])
+def test_pending_work_keeps_the_short_poll_interval(monkeypatch, work) -> None:
+    # Work that only advances when polled, such as a retry nothing will signal, must
+    # not let the loop back off.
+    waits = _WaitRecorder(monkeypatch)
+    pending, retrying = threading.Event(), threading.Event()
+    polled_at: list[int] = []
+
+    class Operation(_ProgressOp):
+        def progress(self, _progress, _event) -> tuple[bool, bool]:
+            polled_at.append(len(waits.waits))
+            return not pending.is_set(), False
+
+    def poll(_progress, items):
+        if retrying.is_set():
+            polled_at.append(len(waits.waits))
+        return {}, bool(items)
+
+    progress = _KVCRProgress(
+        lambda _: None, poll, list, lambda: None, needs_poll=retrying.is_set
+    )
+    progress.start()
+    try:
+        assert waits.long_wait.wait(5)
+        pending.set()
+        if work == "operation":
+            progress.submit(Operation(op_id=("test", 1), keys=frozenset()))
+        else:
+            retrying.set()
+            progress.submit("retry")
+        _wait_until(lambda: len(polled_at) >= 20, timeout=5)
+        while_pending = waits.waits[polled_at[0] : polled_at[19]]
+        assert len(while_pending) >= 15
+        assert set(while_pending) == {progress_module._IDLE_WAIT_SECONDS}
+
+        # With nothing pending, the loop backs off again.
+        waits.long_wait.clear()
+        pending.clear()
+        retrying.clear()
+        assert waits.long_wait.wait(5)
+    finally:
+        progress.close()

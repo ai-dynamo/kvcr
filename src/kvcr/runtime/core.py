@@ -375,6 +375,7 @@ class _KVCRCore:
             memory_regions=self._memory_regions,
             startup_timeout_seconds=startup_timeout_seconds,
             idle_sockets=idle_sockets,
+            needs_poll=self._remote_fw_dram.needs_progress_poll,
         )
 
     def start(self) -> None:

@@ -146,6 +146,7 @@ class _KVCRProgress:
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
         idle_sockets: Callable[[], Sequence[object]] | None = None,
+        needs_poll: Callable[[], bool] | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -177,12 +178,17 @@ class _KVCRProgress:
         self._ready = threading.Event()
         self._prepare_ready = threading.Event()
         self._activate = threading.Event()
-        # Sockets whose readability should end an idle wait (for example the peer control
-        # channel), resolved on first idle wait because they exist only after initialize.
+        # Sockets whose readability should end an idle wait (for example the peer
+        # control channel), resolved on first idle wait because they exist only after
+        # initialize.
         self._idle_sockets = idle_sockets
         self._idle_poller: zmq.Poller | None = None
-        # Self-pipe that ends an idle wait. It exists only while the thread runs; the lock keeps
-        # a submitter from writing to a descriptor number the thread has just closed.
+        # Backend work outside the ops and transfers below that still needs polling,
+        # such as a retry that nothing will signal.
+        self._needs_poll = needs_poll
+        # Self-pipe that ends an idle wait. It exists only while the thread runs; the
+        # lock keeps a submitter from writing to a descriptor number the thread has
+        # just closed.
         self._wake_lock = threading.Lock()
         self._wake_read: int | None = None
         self._wake_write: int | None = None
@@ -683,8 +689,12 @@ class _KVCRProgress:
                 if self._run_one_iteration():
                     idle_wait = _IDLE_WAIT_SECONDS
                     continue
-                if self._in_flight_ops or self._active_transfers:
-                    # In-flight NIXL work only completes by polling.
+                if (
+                    self._in_flight_ops
+                    or self._active_transfers
+                    or (self._needs_poll is not None and self._needs_poll())
+                ):
+                    # In-flight NIXL work and backend retries only advance by polling.
                     idle_wait = _IDLE_WAIT_SECONDS
                     time.sleep(_IDLE_WAIT_SECONDS)
                     continue
@@ -731,12 +741,15 @@ class _KVCRProgress:
     def _wait_for_work(self, timeout: float) -> None:
         """Block until a submission, a readable idle socket, or the timeout.
 
-        Polling every millisecond while idle costs the host process a GIL handoff per wakeup.
+        Polling every millisecond while idle costs the host process a GIL handoff per
+        wakeup.
         """
         if self._idle_poller is None:
             self._idle_poller = zmq.Poller()
             self._idle_poller.register(self._wake_read, zmq.POLLIN)
-            for idle_socket in self._idle_sockets() if self._idle_sockets is not None else ():
+            for idle_socket in (
+                self._idle_sockets() if self._idle_sockets is not None else ()
+            ):
                 if idle_socket is not None:
                     self._idle_poller.register(idle_socket, zmq.POLLIN)
         self._idle_poller.poll(timeout * 1000)
