@@ -83,7 +83,7 @@ All annotations use the `KVCR` domain: pin events use `framework_pin`, and lifec
 
 The wait range includes the callback and observed asynchronous wait, including delay until KVCR polls the framework. It is not the framework's internal execution time. A cancellation marker reports KVCR's decision; it does not establish native transfer quiescence or permission to reuse a buffer. Late results are still discarded/released by the existing lifecycle and do not emit a second completion.
 
-Pin events use the [schema 3 context join](nvtx-events.md#payloads-and-identities); `pin_id` equals the independent `trace_id`. Context can follow the callback's range start, so collect context before reconstructing events.
+Pin events use the [schema 4 context join](nvtx-events.md#payloads-and-identities); `pin_id` equals the independent `trace_id`. Context can follow the callback's range start, so collect context before reconstructing events.
 
 | Field | Interpretation |
 | --- | --- |
