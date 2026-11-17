@@ -525,7 +525,7 @@ The status describes the operation, not the reporting worker, and it only answer
 | `cancelled`, `stopping`, `shutdown`, `route_changed` | `ABORTED` | `aborted` | Drop the route |
 | `refused`, `source_restarted`, `metadata_required` | `ABORTED` | `aborted` | Re-exchange metadata |
 | `pin_failed`, `layout_mismatch` | `FAILED` | `failed` | Remember the miss; keep the route |
-| `create_error`, `transfer_failed`, `setup_failed`, `malformed`, `remote_failure` | `FAILED` | `failed` | Drop the route |
+| `create_error`, `transfer_failed`, `setup_failed`, `invalid_result`, `malformed`, `remote_failure` | `FAILED` | `failed` | Drop the route |
 | `control_error`, `invalid_notification` | `FAILED` | `failed` | Drop the route; WARNING log |
 
 Each block keeps its own result. When nothing was delivered, the operation's duration label comes from the most common reason the source gave; when some blocks were delivered it is `partial`. For example, 8 blocks all reported `pin_failed` give `failed` and 8 × `FAILED`/`pin_failed`; 5 written and 3 `not_resident` give `partial`, 5 × `SUCCESS` and 3 × `UNAVAILABLE`/`not_resident`. The target is the only side that counts undelivered blocks (`kvcr_unserved_blocks{scope, reason}`), because it requested every block exactly once and sees early rejections the source never hears about; the source reports its own `source_write{result}` label and logs its own faults. NVTX adds status `10 MISS` for a source that answered but held none of the blocks, never for a missing route.

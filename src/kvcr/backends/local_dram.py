@@ -608,6 +608,7 @@ class _LocalDram:
         failures: Mapping[BlockKey, OpEntryResult] | None = None,
     ) -> None:
         """Abandon remote fills; ``failures`` is what their waiters are told."""
+        failures = failures or {}
         state = self._pools._source_state
         residency_ops: dict[_OpId, _PendingResidencyOp] = {}
         deliver_ops: dict[_OpId, _PendingDeliverOp] = {}
@@ -652,11 +653,7 @@ class _LocalDram:
                     )
                 ):
                     # Every waiter here was waiting on the abandoned fill.
-                    residency_op.results[key] = (
-                        failures.get(key, _FAILED_RESULT)
-                        if failures
-                        else _FAILED_RESULT
-                    )
+                    residency_op.results[key] = failures.get(key, _FAILED_RESULT)
                     residency_op.active_keys.discard(key)
                     residency_ops[op_id] = residency_op
                 deliver_op = self._pending_deliver_ops.get(op_id)
@@ -666,7 +663,7 @@ class _LocalDram:
                     and key not in deliver_op.results
                     and residency.state is _LocalDramState.DISCARDING
                 ):
-                    deliver_op.results[key] = _FAILED_RESULT
+                    deliver_op.results[key] = failures.get(key, _FAILED_RESULT)
                     deliver_ops[op_id] = deliver_op
 
         for residency_op in residency_ops.values():

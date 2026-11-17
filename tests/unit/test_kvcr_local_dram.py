@@ -1363,8 +1363,8 @@ def test_local_copy_timeout_retains_memory_until_completion(
         assert kvcr.poll_completed() == []
         now = 3.1
         assert dict(kvcr.poll_completed()) == {
-        late: _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")})
-    }
+            late: _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")})
+        }
     if duplicate:
         now = 4.5 if failure == "timeout" else 0.0
         second = kvcr.deposit({key: [_mem_descriptor()]})

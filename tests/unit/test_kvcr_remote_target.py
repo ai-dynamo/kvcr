@@ -32,6 +32,7 @@ from _kvcr_test_utils import (
     _poll_until,
     _RecordingFIFOPolicy,
     _router_hint,
+    _start_write_message,
     _wait_until,
     _write_done_notification,
 )
@@ -51,6 +52,7 @@ from kvcr.backends.remote_ops import (
     _WriteProbeAck,
 )
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
+from kvcr.runtime.progress import _TransferRef
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -756,12 +758,16 @@ def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted():
     fetch = target.fetch((key,), request_id="req")
     _wait_until(lambda: bool(control.sent))
     handle = _decode_control_message(control.sent[0][1])["op_handle"]
+    # A delivery of the same key waits for that fill.
+    delivery = target.deliver({key: [_mem_descriptor()]})
 
     # The source gives up before its transfer is known to be quiescent.
     agent.notifs["source"] = [
         _write_done_notif(handle, False, terminal=False, reason="cancelled")
     ]
-    assert dict(_poll_until(target, bool))[fetch][key].status is OpEntryStatus.ABORTED
+    results = dict(_poll_until(target, bool))
+    assert results[fetch][key].status is OpEntryStatus.ABORTED
+    assert results[delivery][key] == results[fetch][key]
     # The destination stays quarantined until the source proves quiescence.
     now = 2.5
     _poll_until(target, lambda _: bool(errors))
@@ -1945,7 +1951,9 @@ def test_write_done_carries_failure_and_unserved_reasons():
         )
     )
     # Unreported, unknown-reason and out-of-range entries fall back.
-    assert _notification_unserved(served, (b"a", b"b", b"c"), {b"a", b"c", b"d"}) == {
+    assert _notification_unserved(
+        served, (b"a", b"b", b"c"), {b"a", b"c", b"d"}, {}
+    ) == {
         b"a": "pin_failed",
         b"c": "unknown",
         b"d": "remembered_miss",
@@ -2284,6 +2292,54 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     ]
 
 
+def test_move_reports_a_block_the_source_lacks_as_not_resident(pair):
+    source, target = pair.source, pair.target
+    free, absent = BlockKey(b"free"), BlockKey(b"absent")
+    source.deposit(free)
+    source.agent.state = "DONE"
+    moved = target.kvcr._core.fetch(
+        (free, absent), source_endpoint=source.control.endpoint, move=True
+    )
+    pair.until(lambda: moved in target.results)
+    assert target.results[moved][free].success
+    result = target.results[moved][absent]
+    assert (result.status, result.reason) == (
+        OpEntryStatus.UNAVAILABLE,
+        "not_resident",
+    )
+
+
+def test_move_reports_a_key_another_move_owns_as_not_resident():
+    source = _Peer("source")
+    target_buffer = ctypes.create_string_buffer(32)
+    owned, free = BlockKey(b"owned"), BlockKey(b"free")
+    source.deposit(owned)
+    source.deposit(free, 1)
+
+    def move(op_handle, keys):
+        payload = msgspec.msgpack.decode(
+            _start_write_message(op_handle, keys[0], target_agent="target")
+        )
+        payload["keys"] = list(keys)
+        payload["dst_descriptors"] = [
+            [_TransferRef("target", i)] for i in range(len(keys))
+        ]
+        payload.update(move=True, g2_only=True, key_layout=[""])
+        region = msgspec.to_builtins(_buffer_region(target_buffer, 16))
+        payload["target_regions"] = [{"": region}, {}]
+        source.control.incoming.append(msgspec.msgpack.encode(payload))
+
+    move(1, [owned])
+    _poll_until(source.kvcr, lambda _: len(source.agent.xfers) == 3)
+    move(2, [owned, free])
+    _poll_until(source.kvcr, lambda _: len(source.agent.xfers) == 4)
+    notification = _decode_notif(source.agent.xfers[3][5])
+    # Another move holds the first block; that is not a layout failure.
+    assert notification["success"]
+    assert notification["unserved"] == {"not_resident": [0]}
+    source.agent.state = "DONE"
+
+
 @pytest.mark.parametrize("incomplete", [False, True])
 def test_move_rejects_busy_source_without_blocking_deposit(pair, incomplete):
     source, target = pair.source, pair.target
@@ -2302,6 +2358,7 @@ def test_move_rejects_busy_source_without_blocking_deposit(pair, incomplete):
     )
     pair.until(lambda: moved in target.results)
     assert not target.results[moved][key].success
+    assert target.results[moved][key].reason == "not_resident"
     assert not source.kvcr._core._invalidation_handler.has_pending()
     source.agent.state = "DONE"
     if incomplete:

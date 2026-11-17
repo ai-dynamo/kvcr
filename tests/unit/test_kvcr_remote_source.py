@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, Mock, patch
 
 import msgspec
 import pytest
-from nixl import nixlRemoteDisconnectError
 from _kvcr_test_utils import (
     FakeBytesControl,
     FakeNixlAgent,
@@ -30,6 +29,7 @@ from _kvcr_test_utils import (
     _start_write_message,
     _wait_until,
 )
+from nixl import nixlRemoteDisconnectError
 
 from kvcr import (
     DURATION_METRIC,
@@ -39,13 +39,20 @@ from kvcr import (
 )
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.backends.remote_fw_dram import _RemoteFWDram
-from kvcr.backends.remote_ops import _CONTROL_DECODER, _TargetMetadata
+from kvcr.backends.remote_ops import _CONTROL_DECODER, _failed_result, _TargetMetadata
 from kvcr.backends.remote_sources import _FwMemResidency, _RemoteSources, _SourcePinOp
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.runtime.core import _BlockRecord, _KVCRCore
 from kvcr.runtime.progress import _STOP, _TransferRef
 from kvcr.service.recovery_journal import install_recovery_records
-from kvcr.types import BlockKey, PinHandle, PinRequestId, RegionDescriptor
+from kvcr.types import (
+    BlockKey,
+    OpEntryResult,
+    OpEntryStatus,
+    PinHandle,
+    PinRequestId,
+    RegionDescriptor,
+)
 
 
 @pytest.mark.parametrize(
@@ -305,7 +312,14 @@ def test_pinless_write_validates_only_claimed_destinations(
             )
             source._core._progress.raise_if_failed()
         notification = agent.xfers[-1][5] if accepted else agent.sent_notifs[-1][1]
-        assert _decode_notif(notification)["success"] is accepted
+        decoded = _decode_notif(notification)
+        assert decoded["success"] is accepted
+        if not accepted:
+            # The target reports the refusal under its own reason, not a bare failure.
+            assert decoded["reason"] == "invalid_result"
+            assert _failed_result("invalid_result") == OpEntryResult(
+                OpEntryStatus.FAILED, reason="invalid_result"
+            )
         assert [call.args[0] for call in validate.call_args_list] == [
             tuple(payload["dst_descriptors"][validated])
         ]
@@ -373,9 +387,7 @@ def test_pending_pinless_source_validates_before_native_submission():
             source.poll_completed()
         assert validate.call_count == 0
         agent.state = "DONE"
-        _poll_until(
-            source, lambda _: bool(agent.sent_notifs) and len(agent.xfers) == 2
-        )
+        _poll_until(source, lambda _: bool(agent.sent_notifs) and len(agent.xfers) == 2)
         # Op 12 is refused; op 13 reaches a native write (its success notification
         # rides on that write, not on sent_notifs).
         assert [_decode_notif(n)["op_handle"] for _, n in agent.sent_notifs] == [12]

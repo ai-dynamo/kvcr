@@ -4,7 +4,7 @@
 
 import logging
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from itertools import chain
@@ -138,6 +138,7 @@ _STATUS_BY_REASON = {
     Reason.SOURCE_RESTARTED: OpEntryStatus.ABORTED,
     Reason.METADATA_REQUIRED: OpEntryStatus.ABORTED,
     Reason.PIN_FAILED: OpEntryStatus.FAILED,
+    Reason.INVALID_RESULT: OpEntryStatus.FAILED,
     Reason.LAYOUT_MISMATCH: OpEntryStatus.FAILED,
     Reason.CREATE_ERROR: OpEntryStatus.FAILED,
     Reason.TRANSFER_FAILED: OpEntryStatus.FAILED,
@@ -379,7 +380,10 @@ class _TargetPullOp(_RemoteOp):
             self.completed_keys = completed_keys
             if success:
                 self.unserved = _notification_unserved(
-                    event, self.ordered_keys, self.keys - completed_keys
+                    event,
+                    self.ordered_keys,
+                    self.keys - completed_keys,
+                    self.unserved,
                 )
             elif self.failure_reason is None:
                 self.failure_reason = (
@@ -390,13 +394,17 @@ class _TargetPullOp(_RemoteOp):
                     else _known_reason(event.get("reason"))
                     or Reason.REMOTE_FAILURE.wire
                 )
+            unserved_counts = self._record_unserved(scope)
+            # The reason that left the most blocks unserved labels a zero-block
+            # completion.
+            dominant = unserved_counts.most_common(1)[0][0] if unserved_counts else None
             if trace is not None:
                 if not success and reason is Reason.REMOTE_FAILURE:
                     reason = _nvtx_reason(self.failure_reason)
                     if reason is Reason.UNKNOWN:
                         reason = Reason.REMOTE_FAILURE
                 elif success and not all_completed:
-                    reason = _dominant_reason(self.unserved.values())
+                    reason = _nvtx_reason(dominant)
                 trace.target_result(self, reason)
             self.state = _TargetPullState.FINISHED
             if completed_keys:
@@ -412,14 +420,11 @@ class _TargetPullOp(_RemoteOp):
                 if all_completed
                 else "partial"
                 if completed_keys
-                else _label(
-                    _unserved_result(_dominant_wire(self.unserved.values()) or "")
-                )
+                else _label(_unserved_result(dominant or ""))
                 if success
                 else _outcome(self.failure_reason)
             )
             backend._record_progress_duration(scope, self.started_at, result)
-            unserved_counts = self._record_unserved(scope)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "KVCR_EVENT target_transfer_completed scope=%s request_id=%s "
@@ -917,18 +922,9 @@ def _nvtx_reason(reason: str | None) -> Reason:
     return Reason.__members__.get((reason or "").upper(), Reason.UNKNOWN)
 
 
-def _dominant_wire(reasons: Iterable[str]) -> str | None:
-    most_common = Counter(reasons).most_common(1)
-    return most_common[0][0] if most_common else None
-
-
 def _largest_group(unserved: Mapping[str, list[int]]) -> str | None:
     """The reason with the most indices; the first wins a tie."""
     return max(unserved, key=lambda reason: len(unserved[reason]), default=None)
-
-
-def _dominant_reason(reasons: Iterable[str]) -> Reason:
-    return _nvtx_reason(_dominant_wire(reasons))
 
 
 def _wire_reason(reason: Reason) -> str | None:
@@ -949,14 +945,19 @@ def _notification_unserved(
     payload: Mapping[str, Any],
     ordered_keys: tuple[BlockKey, ...],
     missing: Collection[BlockKey],
+    excluded: Mapping[BlockKey, str],
 ) -> dict[BlockKey, str]:
-    """Return why each missing key was not written; malformed input is ignored."""
+    """Return why each missing key was not written; malformed input is ignored.
+
+    ``excluded`` holds the reasons for keys left out of the request; they were
+    never attempted, so the source's outcome does not change them.
+    """
     if not missing:
         return {}
     sent = set(ordered_keys)
+    unknown, miss = Reason.UNKNOWN.wire, Reason.REMEMBERED_MISS.wire
     unserved = {
-        key: Reason.UNKNOWN.wire if key in sent else Reason.REMEMBERED_MISS.wire
-        for key in missing
+        key: excluded.get(key, unknown if key in sent else miss) for key in missing
     }
     reported = payload.get("unserved")
     if not isinstance(reported, Mapping):

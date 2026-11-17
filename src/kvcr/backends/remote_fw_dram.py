@@ -48,9 +48,9 @@ from .remote_ops import (
     _CONTROL_DECODER,
     _ControlMessage,
     _decode_notif,
+    _failed_result,
     _Invalidate,
     _KeysToFetch,
-    _failed_result,
     _known_reason,
     _nvtx_reason,
     _NvtxState,
@@ -292,12 +292,13 @@ class _RemoteFWDram:
                         scope, started_at, blocks, Reason.HINT_UNAVAILABLE
                     )
             if len(keys) != len(blocks):
+                kept = set(keys)
                 unserved = {
                     key: Reason.REMEMBERED_MISS.wire
                     if key in current_hint.missing_keys
                     else Reason.HINT_UNAVAILABLE.wire
                     for key in blocks
-                    if key not in keys
+                    if key not in kept
                 }
             if current_hint.submitted_at is not None:
                 self._request_hints[request_id] = replace(

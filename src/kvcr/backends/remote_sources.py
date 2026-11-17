@@ -43,6 +43,8 @@ class _SourcePinOp(_Op):
     # Keys this move marked pending; reopened if they are not written.
     moving: tuple[BlockKey, ...] = ()
     evict_on_finish: bool = False
+    # Keys admission turned away (another move owns them, or they are busy).
+    excluded: set[BlockKey] = field(default_factory=set)
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     framework_acquire_attempted: bool = False
@@ -196,11 +198,17 @@ class _RemoteSources:
         waiting = False
         for index, key in enumerate(() if force_failure else source_pin.ordered_keys):
             if key not in source_pin.keys:
-                # Only a layout mismatch on an earlier pass removes keys.
-                unserved.setdefault(Reason.LAYOUT_MISMATCH.wire, []).append(index)
+                # Admission or a layout mismatch on an earlier pass removed it.
+                reason = (
+                    Reason.NOT_RESIDENT
+                    if key in source_pin.excluded
+                    else Reason.LAYOUT_MISMATCH
+                )
+                unserved.setdefault(reason.wire, []).append(index)
                 continue
             residency = local_sources.get(key)
             if source_pin.g2_only and (residency is None or residency.pending_labels):
+                unserved.setdefault(Reason.NOT_RESIDENT.wire, []).append(index)
                 continue
             source = framework_sources.get(key)
             destination = source_pin.dst_descriptors[index]
@@ -459,6 +467,7 @@ class _RemoteSources:
         # Decide admission once; retries retain the original request positions.
         pending = kvcr._invalidation_handler._pending
         if pending:
+            op.excluded.update(op.keys.intersection(pending))
             op.keys = op.keys.difference(pending)
         if op.move and kvcr._local_dram is not None:
             # Closing admission must not strand a producer of missing pieces.
@@ -481,6 +490,7 @@ class _RemoteSources:
                 ):
                     busy.add(key)
             if busy:
+                op.excluded.update(busy)
                 op.keys = op.keys.difference(busy)
         kvcr._add_block_dependencies(op, new_operation=True)
         if op.move:
@@ -491,7 +501,9 @@ class _RemoteSources:
         self._source_pin_ops[op.op_id] = op
         if op.ordered_keys and not op.keys:
             # Every requested key was rejected; send failure without a transfer.
-            self._submit_prepared_source_write(op.op_id, op, force_failure=True)
+            self._submit_prepared_source_write(
+                op.op_id, op, force_failure=True, failure_reason=Reason.NOT_RESIDENT
+            )
         else:
             self._resume_source_pin(op.op_id, op)
 

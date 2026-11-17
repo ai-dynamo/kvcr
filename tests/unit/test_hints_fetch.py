@@ -233,6 +233,9 @@ def test_evict_on_fetch_filters_hashes_and_handles_transfer_failure(
     pair.until(lambda: handle in target.results and pair.idle())
     results = target.results.pop(handle)
     assert results[_KEY].success is succeeds and not results[_TAIL_KEY].success
+    if operation == "deliver":
+        # Never attempted, whatever happened to the block that was.
+        assert results[_TAIL_KEY].reason == "hint_unavailable"
     kept = (QueryStatus.HIT, CacheTier.LOCAL_G2)
     assert source.kvcr.query(blocks) == [_MISS if succeeds else kept, kept]
     claim = results[_KEY].release_handle
