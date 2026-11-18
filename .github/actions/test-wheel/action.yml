@@ -24,6 +24,16 @@ runs:
         WHEEL: ${{ inputs.wheel }}
         TWINE_VERSION: "7.0.0"
       run: uvx "twine==${TWINE_VERSION}" check --strict "${WHEEL}"
+    - name: Install libatomic
+      shell: bash
+      run: |
+        set -euo pipefail
+        # kvcr loads the system libatomic at runtime, and the kvcr runner image lacks it.
+        if ! /sbin/ldconfig -p | grep -q 'libatomic\.so\.1'; then
+          sudo=""; [ "$(id -u)" = "0" ] || sudo="sudo"
+          ${sudo} apt-get update -q
+          ${sudo} apt-get install -y -q --no-install-recommends libatomic1
+        fi
     - name: Check dependency licenses and test the installed wheel
       shell: bash
       env:
