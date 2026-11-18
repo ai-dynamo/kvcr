@@ -596,8 +596,9 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
 
 # ---- why a block asked of a peer failed ---------------------------------------
 #
-# KVCR reports success or failure per key and nothing more. It fails a deliver
-# before its operation timeout only when the source answered (it no longer held
+# Older KVCR trees report success or failure per key and nothing more, and the
+# engine reads nothing more from newer ones. KVCR fails a deliver before its
+# operation timeout only when the source answered (it no longer held
 # the block) or the fetch failed at once, so the engine sorts failures by how
 # long the deliver ran, counted from before the call as KVCR counts it.
 

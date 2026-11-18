@@ -123,12 +123,14 @@ class Telemetry:
         return not (self.counters or self.observations or self.gauges)
 
 
-# kvcr_duration_seconds labels of peer transfers that did not fully succeed.
-_PEER_FAILURES = frozenset(
-    (scope, result)
-    for scope in ("remote_deliver", "remote_fetch")
-    for result in ("failed", "partial")
-)
+_PEER_SCOPES = frozenset(("remote_deliver", "remote_fetch"))
+
+
+def _peer_shortfall(key: tuple) -> bool:
+    """Whether a kvcr_duration_seconds series (name, scope, result) times peer
+    transfers that did not fully succeed: "failed" or "partial", and on KVCR
+    trees that name the reason, "timeout", "unavailable" and "aborted" too."""
+    return len(key) == 3 and key[1] in _PEER_SCOPES and key[2] != "success"
 
 
 class Window:
@@ -189,7 +191,7 @@ class Window:
             hist = hists["|".join(key)]
             for value in values:
                 hist.add(value)
-            if late and key[1:] in _PEER_FAILURES:
+            if late and _peer_shortfall(key):
                 self.counters["kvcr_peer_ops_past_timeout"] += sum(
                     1 for value in values if value >= late
                 )

@@ -139,10 +139,10 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         else 0,
     }
 
-    # Why blocks asked of a peer failed. KVCR reports only success or failure,
-    # so the engines sort failures by how long the deliver ran: at least the
-    # operation timeout, or less (the source answered that it no longer held
-    # the block, or the fetch failed at once).
+    # Why blocks asked of a peer failed. Older KVCR trees report only success
+    # or failure, so the engines sort failures by how long the deliver ran: at
+    # least the operation timeout, or less (the source answered that it no
+    # longer held the block, or the fetch failed at once).
     from_peer = counters.get("deliver_blocks_failed_peer", 0)
     from_peer_hinted = counters.get("deliver_blocks_failed_peer_hinted", 0)
     timed_out = counters.get("deliver_blocks_timed_out", 0)

@@ -151,8 +151,10 @@ engine's own bookkeeping ("harness"), the modelled forward pass and idle. KVCR
 is the bottleneck when its share dominates. On the SGLang profile the KVCR
 calls are on the owner thread, which gets a split of its own.
 
-**Failed blocks.** KVCR reports only success or failure per key, so the failed
-blocks that were asked of a peer are sorted by how long their `deliver` ran:
+**Failed blocks.** The failed blocks that were asked of a peer are sorted by
+how long their `deliver` ran. (That works on KVCR trees that report only
+success or failure per key; the per-block status newer trees return is not
+read yet.)
 
 - *timed out*: at least `engine.operation_timeout_ms`;
 - *no longer on the source*: less, and the hint named the block (evicted since
