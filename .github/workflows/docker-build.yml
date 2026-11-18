@@ -15,6 +15,26 @@ on:
       - pyproject.toml
       - src/**
       - tests/e2e/**
+  # The nightly and release workflows call this to test the wheel they staged.
+  workflow_call:
+    inputs:
+      wheel:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
+      stage_path:
+        required: true
+        type: string
+      base_image:
+        required: false
+        type: string
+        default: vllm/vllm-openai:nightly
+      dynamo_version:
+        required: false
+        type: string
+        default: nightly
   # Manual runs can override the vLLM image, Dynamo wheel, and KVCR ref.
   workflow_dispatch:
     inputs:
@@ -34,8 +54,8 @@ on:
         type: string
 
 concurrency:
-  # Runs for the same PR branch cancel each other.
-  group: docker-build-${{ github.ref_name }}
+  # Runs for the same PR branch cancel each other; every other run is isolated.
+  group: docker-build-${{ github.workflow }}-${{ github.event_name == 'push' && github.ref_name || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -44,24 +64,53 @@ permissions:
 jobs:
   build:
     runs-on: prod-kvcr-builder-v1
+    environment: ${{ inputs.wheel != '' && 'wheel-read' || '' }}
     timeout-minutes: 45
     env:
       AWS_DEFAULT_REGION: us-west-2
-      ECR_REGISTRY: 210086341041.dkr.ecr.us-west-2.amazonaws.com
       ECR_REPOSITORY: ai-dynamo/kvcr
       BUILDER_NAME: kvcr-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
-      image: ${{ steps.published.outputs.image }}
-      image_tag: ${{ steps.source.outputs.image_tag }}
+      digest: ${{ steps.published.outputs.digest }}
     steps:
       - name: Check out CI recipe
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check out KVCR source to test
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.kvcr_ref || github.sha }}
           path: kvcr-source
+          persist-credentials: false
+
+      # Nightly and release runs test the exact wheel they staged; other runs build from source in the image.
+      - name: Fetch the staged wheel
+        if: inputs.wheel != ''
+        env:
+          WHEEL: ${{ inputs.wheel }}
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+          STAGE_PATH: ${{ inputs.stage_path }}
+          WHEEL_DIR: ${{ runner.temp }}/kvcr-wheel
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_READ_TOKEN: ${{ secrets.ARTIFACTORY_READ_TOKEN }}
+          ARTIFACTORY_PYPI_REPO_NAME: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          for name in ARTIFACTORY_URL ARTIFACTORY_READ_TOKEN ARTIFACTORY_PYPI_REPO_NAME; do
+            [ -n "${!name}" ] || { echo "::error::secret ${name} is not set in the wheel-read environment"; exit 1; }
+          done
+          [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no sha256 was given for ${WHEEL}"; exit 1; }
+          host="${ARTIFACTORY_URL#*://}"
+          echo "::add-mask::${host%%[/:]*}"
+          auth="$(mktemp -p "${RUNNER_TEMP}")"
+          trap 'rm -f "${auth}"' EXIT
+          printf 'Authorization: Bearer %s\n' "${ARTIFACTORY_READ_TOKEN}" > "${auth}"
+          mkdir -p "${WHEEL_DIR}"
+          curl -q -fsS --retry 3 --max-time 120 -o "${WHEEL_DIR}/${WHEEL}" -H "@${auth}" \
+            "${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
+          echo "${WHEEL_SHA256}  ${WHEEL_DIR}/${WHEEL}" | sha256sum --check
 
       - name: Inspect build environment
         run: |
@@ -73,8 +122,13 @@ jobs:
       # remote BuildKit pod, which performs the push.
       - name: Log in to ECR
         shell: bash
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || { echo "::error::repository secret AWS_ACCOUNT_ID is not set to an account ID"; exit 1; }
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+          echo "ECR_REGISTRY=${ECR_REGISTRY}" >> "$GITHUB_ENV"
           aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
             | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
@@ -116,7 +170,7 @@ jobs:
       # one).
       - name: Build and publish integration image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           builder: ${{ env.BUILDER_NAME }}
           context: ./kvcr-source
@@ -125,26 +179,23 @@ jobs:
           push: true
           load: false
           tags: ${{ steps.source.outputs.image_tag }}
+          build-contexts: ${{ inputs.wheel != '' && format('kvcr-wheel={0}/kvcr-wheel', runner.temp) || '' }}
           build-args: |
             VLLM_IMAGE=${{ steps.source.outputs.base_image }}
             DYNAMO_VERSION=${{ inputs.dynamo_version || 'nightly' }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
+            KVCR_WHEEL_SHA256=${{ inputs.wheel_sha256 }}
 
       - name: Record published image
         id: published
         shell: bash
         env:
-          IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          : "${IMAGE_DIGEST:?Build did not return a published image digest}"
-          image="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
-          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
-          {
-            printf 'Published tag: `%s`\n\n' "$IMAGE_TAG"
-            printf 'Image for downstream tests: `%s`\n' "$image"
-          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Build did not return a published image digest"; exit 1; }
+          printf 'digest=%s\n' "$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'Image for downstream tests: `%s@%s`\n' "$ECR_REPOSITORY" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove builder configuration
         if: always() && (steps.builder.outcome == 'success' || steps.builder.outcome == 'failure')
@@ -159,4 +210,6 @@ jobs:
     needs: build
     uses: ./.github/workflows/vllm-e2e.yml
     with:
-      image: ${{ needs.build.outputs.image }}
+      image_digest: ${{ needs.build.outputs.digest }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}

@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Test the kvcr wheel
+description: Check, install and unit-test one built wheel, then upload its license evidence. Runs third-party code, so never use it in a job that holds release credentials.
+
+inputs:
+  wheel:
+    description: Path to the wheel
+    required: true
+  version:
+    description: Version the wheel must report
+    required: true
+  mode:
+    description: nightly or release, which picks the license baseline
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check the package metadata
+      shell: bash
+      env:
+        WHEEL: ${{ inputs.wheel }}
+        TWINE_VERSION: "7.0.0"
+      run: uvx "twine==${TWINE_VERSION}" check --strict "${WHEEL}"
+    - name: Check dependency licenses and test the installed wheel
+      shell: bash
+      env:
+        WHEEL: ${{ inputs.wheel }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        for py in 3.10 3.12; do
+          venv="${RUNNER_TEMP}/venv-${py}"
+          uv venv --python "${py}" "${venv}"
+          uv pip install --python "${venv}/bin/python" "${WHEEL}[profiling]"
+          uv pip check --python "${venv}/bin/python"
+          # Inventory before pytest so test tooling stays out of the license evidence.
+          python3 .github/scripts/wheel_compliance.py licenses --python "${venv}/bin/python" \
+            --inventory "${RUNNER_TEMP}/inventory/py${py}.csv"
+          "${venv}/bin/python" -c 'import importlib.metadata as m, os, sys, kvcr; assert m.version("kvcr") == os.environ["VERSION"]; assert kvcr.__file__.startswith(sys.prefix), kvcr.__file__'
+          "${venv}/bin/kvcr-service" --help > /dev/null
+          uv pip install --python "${venv}/bin/python" "pytest>=8,<9"
+          "${venv}/bin/python" -m pytest tests/unit -q -p no:cacheprovider
+        done
+    - name: Write the license evidence
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        # Nightlies skip the run status, which an advisory GPU failure turns red; evidence only exists after a passed license check.
+        if [ "${MODE}" = "release" ]; then
+          query="actions/workflows/release.yml/runs?event=workflow_dispatch&status=success&per_page=20"
+        else
+          query="actions/workflows/nightly.yml/runs?branch=main&event=schedule&per_page=20"
+        fi
+        prior=()
+        baseline="none found; every dependency is listed as added"
+        runs="$(gh api "repos/${GITHUB_REPOSITORY}/${query}" --jq '.workflow_runs[].id')" || runs=""
+        for run in ${runs}; do
+          [ "${run}" = "${GITHUB_RUN_ID}" ] && continue
+          dir="${RUNNER_TEMP}/prior-${run}"
+          if gh run download "${run}" -R "${GITHUB_REPOSITORY}" -n license-artifacts -D "${dir}" 2> /dev/null \
+            && [ -f "${dir}/deps.csv" ]; then
+            prior=(--prior "${dir}/deps.csv")
+            baseline="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run}"
+            break
+          fi
+        done
+        echo "Diff baseline: ${baseline}"
+        out="${RUNNER_TEMP}/license-artifacts"
+        python3 .github/scripts/wheel_compliance.py evidence "${RUNNER_TEMP}"/inventory/py*.csv \
+          --out "${out}" ${prior[@]+"${prior[@]}"}
+        mkdir -p "${out}/baseline"
+        printf '# Diff baseline\n\nThis run: %s\nCompared with: %s\n' \
+          "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" "${baseline}" > "${out}/baseline/BASELINE.md"
+    # The release pipeline attaches the one artifact whose name contains "license".
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: license-artifacts
+        path: |
+          ${{ runner.temp }}/license-artifacts/deps*.csv
+          ${{ runner.temp }}/license-artifacts/baseline/BASELINE.md
+        if-no-files-found: error
+        retention-days: 90
+        overwrite: true
