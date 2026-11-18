@@ -139,6 +139,37 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         else 0,
     }
 
+    # Why blocks asked of a peer failed. KVCR reports only success or failure,
+    # so the engines sort failures by how long the deliver ran: at least the
+    # operation timeout, or less (the source answered that it no longer held
+    # the block, or the fetch failed at once).
+    from_peer = counters.get("deliver_blocks_failed_peer", 0)
+    from_peer_hinted = counters.get("deliver_blocks_failed_peer_hinted", 0)
+    timed_out = counters.get("deliver_blocks_timed_out", 0)
+    timed_out_hinted = counters.get("deliver_blocks_timed_out_hinted", 0)
+    pin_timeouts = kvcr_hists.get("kvcr_duration_seconds|framework_pin_wait|timeout")
+    failures = {
+        "timed_out": timed_out,
+        "gone_from_source": from_peer_hinted - timed_out_hinted,
+        "beyond_hint": from_peer - from_peer_hinted - (timed_out - timed_out_hinted),
+        "local": counters.get("deliver_blocks_failed", 0) - from_peer,
+        # Cross-check from KVCR's own timings of peer operations.
+        "kvcr_peer_ops_past_timeout": counters.get("kvcr_peer_ops_past_timeout", 0),
+        "failed_deliver_p50_ms": hists["deliver_peer_failed"].quantile(0.5) * 1e3,
+        "failed_deliver_p99_ms": hists["deliver_peer_failed"].quantile(0.99) * 1e3,
+        # The source side, where sources serve from pinned engine memory.
+        "pin_requests": counters.get("pin_requests", 0),
+        "pin_misses": counters.get("pin_misses", 0),
+        "pin_wait_timeouts": pin_timeouts.n if pin_timeouts is not None else 0,
+    }
+    hinted_asked = remote + from_peer_hinted
+    headline["hinted_timeout_rate"] = (
+        timed_out_hinted / hinted_asked if hinted_asked else 0
+    )
+    headline["hinted_gone_rate"] = (
+        failures["gone_from_source"] / hinted_asked if hinted_asked else 0
+    )
+
     profile = config.get("engine", {}).get("profile", "vllm")
     aborted = counters.get("aborted_requests", 0)
     if profile == "sglang":
@@ -242,6 +273,7 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "valid": not flags,
         "flags": flags,
         "headline": headline,
+        "failures": failures,
         "workload": {
             **tally.get("workload", {"kind": "synthetic"}),
             "sessions_started": tally.get("sessions_started", 0),
@@ -273,6 +305,7 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
                 "remote_blocks_same_node",
                 "remote_blocks_cross_node",
                 "failed_blocks",
+                "timed_out_blocks",
                 "prefill_tokens",
             )
         },
@@ -382,6 +415,25 @@ def format_summary(summary: dict) -> str:
         f"{'KVCR call':<16}{'calls':>10}{'items':>12}{'us/call':>10}"
         f"{'us/item':>10}{'share':>9}",
     ]
+    failures = summary.get("failures")
+    if failures:
+        at = lines.index("", 3)  # after the blocks and latency lines
+        cause = (
+            f"blocks a peer failed to deliver: timed out "
+            f"{failures['timed_out']:.0f} ({h['hinted_timeout_rate']:.2%} of "
+            f"hinted blocks), no longer on the source "
+            f"{failures['gone_from_source']:.0f} ({h['hinted_gone_rate']:.2%}), "
+            f"beyond the hint {failures['beyond_hint']:.0f}; KVCR timed "
+            f"{failures['kvcr_peer_ops_past_timeout']:.0f} peer operations past "
+            f"its timeout"
+        )
+        if failures["pin_requests"]:
+            cause += (
+                f"; source pins {failures['pin_requests']:.0f} requested, "
+                f"{failures['pin_misses']:.0f} missed, "
+                f"{failures['pin_wait_timeouts']:.0f} timed out"
+            )
+        lines.insert(at, cause)
     workload = summary.get("workload", {})
     if workload.get("kind") == "trace":
         lines.insert(
@@ -470,6 +522,8 @@ AB_METRICS = (
     ("remote_resolve_p99_ms", "remote resolve p99 ms"),
     ("ttft_p99_ms", "ttft p99 ms"),
     ("hinted_block_failure_rate", "hinted-block failure rate"),
+    ("hinted_timeout_rate", "hinted blocks timed out"),
+    ("hinted_gone_rate", "hinted blocks gone from source"),
     ("requests_per_s", "requests / s"),
     ("remote_blocks_per_s", "remote blocks / s"),
 )
@@ -520,7 +574,10 @@ def compare(arms: dict[str, list[dict]]) -> str:
 
     for key, label in AB_METRICS:
         lines.append(
-            row(label, {n: [s["headline"][key] for s in arms[n]] for n in names})
+            row(
+                label,
+                {n: [s["headline"].get(key, 0.0) for s in arms[n]] for n in names},
+            )
         )
     lines.append("engine thread, by KVCR call:")
     for call in KVCR_CALLS:

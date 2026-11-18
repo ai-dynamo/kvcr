@@ -106,6 +106,11 @@ def test_workers_pull_blocks_from_each_other(real_nixl, tmp_path, mode, tier_ove
     for name in ("config.json", "workers.json", "coordinator.json", "summary.json"):
         assert json.loads((tmp_path / name).read_text())
     assert len(list((tmp_path / "reports").glob("*.json"))) == 3
+    # The request log has the blocks each request got from a peer.
+    log = (tmp_path / "requests.jsonl").read_text().splitlines()
+    header, *rows = map(json.loads, log)
+    remote = header["fields"].index("remote_blocks")
+    assert sum(row[remote] for row in rows if len(row) > remote) > 100
 
 
 def test_sglang_workers_restore_pages_from_each_other(real_nixl, tmp_path):
@@ -230,3 +235,25 @@ def test_a_replayed_trace_moves_blocks_between_workers(
         if "waited for a CPU" not in f and "dispatch lag" not in f
     ]
     assert not hard, hard
+
+
+def test_transfers_that_run_into_the_timeout_are_reported_as_timeouts(
+    real_nixl, tmp_path
+):
+    overrides = [
+        "name=timeouts",
+        *OVERRIDES,
+        "tiers.g2_blocks=8192",
+        # No mesh warm: the first transfer to each peer has to connect first,
+        # which takes far longer than two milliseconds.
+        "phases.mesh_warm=none",
+        "engine.operation_timeout_ms=2",
+        "engine.abandon_timeout_ms=1000",
+    ]
+    summary = run_local(load_config(None, overrides), tmp_path, nodes=3, per_node=1)
+    failures = summary["failures"]
+    assert failures["timed_out"] > 0, summary["counters"]
+    # KVCR's own clock agrees that peer operations ran past the timeout.
+    assert failures["kvcr_peer_ops_past_timeout"] > 0
+    assert summary["completed"]["timed_out_blocks"] > 0
+    assert summary["headline"]["hinted_timeout_rate"] > 0

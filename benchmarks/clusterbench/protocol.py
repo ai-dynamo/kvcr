@@ -59,6 +59,8 @@ class Done(_Msg):
     recomputed_tokens: int
     # The engine dropped the request (SGLang: a cache load in its batch failed).
     aborted: bool = False
+    # Of the failed blocks, those whose transfer ran into the operation timeout.
+    timed_out_blocks: int = 0
 
 
 class Inventory(_Msg):

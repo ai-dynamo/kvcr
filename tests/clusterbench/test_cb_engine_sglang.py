@@ -243,7 +243,7 @@ def test_a_load_is_one_deliver_per_layer_at_most_four_outstanding():
         }
     assert port.finish_layer_wise_loading(index) is True
     assert port.pop_completed_load() == ["r"]
-    assert port.batch_info[index][0] == 0
+    assert not port.batch_info[index].failed
 
 
 def test_one_failed_key_fails_every_load_in_the_batch():
@@ -256,7 +256,8 @@ def test_one_failed_key_fails_every_load_in_the_batch():
     drain(port, kvcr)
     assert port.finish_layer_wise_loading(index) is False
     assert port.pop_completed_load() == ["a", "b"]
-    assert port.batch_info[index][0] == 1
+    assert len(port.batch_info[index].failed) == 1
+    assert not port.batch_info[index].late  # it failed at once
     # The other layers of the failed batch are not attempted.
     assert len(kvcr.of("deliver")) < 2 * LAYERS
 
@@ -356,7 +357,12 @@ class Rig:
         self.window = Window()
         self.engine = SglangEngine(self.config, self.window, worker=0)
         self.engine.set_peers([("n0", "tcp://self:1"), ("n1", "tcp://peer:1")])
-        port = LinkerPort(StubHost(self.kvcr), telemetry=False, call_timeout_s=10)
+        port = LinkerPort(
+            StubHost(self.kvcr),
+            telemetry=False,
+            call_timeout_s=10,
+            operation_timeout_s=self.config.engine.operation_timeout_ms / 1e3,
+        )
         self.engine.attach(port._host, port)
         self.port = port
         self.dones = []
@@ -827,3 +833,85 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another(
     looked = [key((905 << 24) + i) for i in (1, 2)]
     assert kvcr.of("query") == [("query", looked, f"32:{2:032x}:0")]
     assert deposited(kvcr) == looked
+
+
+# ---- why a page asked of a peer failed ----------------------------------------
+
+
+def test_a_failed_key_is_tagged_by_how_long_its_own_deliver_ran():
+    kvcr = StubKvcr(auto=False)
+    port = LinkerPort(
+        StubHost(kvcr), inline=True, telemetry=False, operation_timeout_s=0.02
+    )
+    for rid, bid, slot in (("a", 5, 40), ("b", 9, 41)):
+        port.set_request_context(Handle(rid, 0), None)
+        port.load(rid, [page_hash(bid)], [slot])
+    kvcr.fail = {key(9)}
+    index = port.start_layer_wise_loading()
+    port.progress()  # the first layers go out
+    time.sleep(0.03)  # ... and outlive KVCR's operation timeout
+    drain(port, kvcr)
+    info = port.batch_info[index]
+    assert info.failed == info.late == {key(9)}
+    assert info.failed_seconds and min(info.failed_seconds) >= 0.02
+
+
+def _two_loads_one_failing(rig):
+    for rid, session in ((1, 70), (2, 80)):
+        pages = segment_ids([(SYSTEM, 0, 4), (session, 0, 6)])
+        rig.kvcr.fetchable[f"32:{rid:032x}:0"] = set(map(key, pages[:8]))
+        rig.engine.submit(
+            Request(
+                rid=rid,
+                session=rid,
+                segments=[(SYSTEM, 0, 4), (session, 0, 6)],
+                tail=(session, 6, 7),
+                prompt_tokens=10 * PAGE + 10,
+                output_tokens=PAGE,
+                hint_source=1,
+                hint_blocks=8,
+            )
+        )
+    rig.kvcr.fail = {key((80 << 24) + 2)}
+    rig.finish_requests(2)
+    return {done.rid: done for done in rig.dones}, rig.window.counters
+
+
+def test_a_quick_failure_of_a_peers_page_is_not_a_timeout(rig_factory):
+    by_rid, counters = _two_loads_one_failing(rig_factory())
+    assert by_rid[1].aborted and by_rid[2].aborted
+    assert counters["deliver_blocks_failed"] == 1
+    assert counters["deliver_blocks_failed_peer"] == 1
+    assert counters["deliver_blocks_timed_out"] == 0
+    assert by_rid[2].timed_out_blocks == 0
+
+
+def test_a_page_whose_deliver_ran_into_the_timeout_is_a_timeout(rig_factory):
+    rig = rig_factory("engine.operation_timeout_ms=20", "engine.abandon_timeout_ms=40")
+    issue = rig.kvcr.deliver
+
+    def slow(blocks, request_id=None):
+        time.sleep(0.03)  # inside the call, where KVCR's deadline starts
+        return issue(blocks, request_id=request_id)
+
+    rig.kvcr.deliver = slow
+    by_rid, counters = _two_loads_one_failing(rig)
+    assert counters["deliver_blocks_failed_peer"] == 1
+    assert counters["deliver_blocks_timed_out"] == 1
+    assert counters["deliver_blocks_timed_out_hinted"] == 1
+    # The page belonged to the second request.
+    assert (by_rid[1].timed_out_blocks, by_rid[2].timed_out_blocks) == (0, 1)
+    assert rig.window.hists["deliver_peer_failed"].n >= 1
+
+
+def test_the_engine_gives_its_port_kvcrs_operation_timeout():
+    config = load_config(None, [*OVERRIDES, "engine.operation_timeout_ms=250"])
+    window = Window()
+    engine = SglangEngine(config, window, worker=0)
+    engine.set_peers([("n0", "tcp://self:1")])
+    engine.attach(StubHost(StubKvcr()))
+    try:
+        assert engine._linker._operation_timeout == 0.25
+        assert window.late_after == 0.25
+    finally:
+        engine.close()

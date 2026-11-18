@@ -127,7 +127,11 @@ class _Batch:
     error: BaseException | None = None
     started: float = field(default_factory=time.perf_counter)
     completion: Future = field(default_factory=Future)
-    failed_keys: set = field(default_factory=set)  # instrumentation
+    # Instrumentation: the keys that failed, those whose own deliver ran into
+    # KVCR's operation timeout, and how long each failed deliver ran.
+    failed_keys: set = field(default_factory=set)
+    late_keys: set = field(default_factory=set)
+    failed_seconds: list = field(default_factory=list)
 
 
 @dataclass
@@ -147,6 +151,16 @@ class _Operation:
     keys: set[bytes]
     layer: int | None = None
     result: object = None
+    started: float = 0.0  # instrumentation: taken before the KVCR call
+
+
+class BatchInfo(NamedTuple):
+    """Instrumentation: how a finished load batch went."""
+
+    failed: frozenset  # keys
+    seconds: float
+    late: frozenset  # failed keys whose deliver ran into the operation timeout
+    failed_seconds: tuple  # how long each failed deliver ran
 
 
 class LayerCounter:
@@ -212,8 +226,12 @@ class LinkerPort:
         layers_per_deliver: int = 1,
         max_deliveries: int = MAX_DELIVERIES,
         deposit_pieces: int = MAX_DEPOSIT_DESCRIPTORS,
+        operation_timeout_s: float = 1.0,
     ) -> None:
         self._host = host
+        # Instrumentation: KVCR's operation timeout, to tell a failed deliver
+        # that ran into it from one the source answered.
+        self._operation_timeout = operation_timeout_s
         self._inline = inline
         self._telemetry = telemetry
         self._timing = timing
@@ -261,7 +279,7 @@ class LinkerPort:
         self._swap_box: Future | None = None
         self._empty_polls = 0
         self._empty_poll_seconds = 0.0
-        self.batch_info: dict[int, tuple[int, float]] = {}
+        self.batch_info: dict[int, BatchInfo] = {}
         self.resilience_samples: list[str] = []
         self.native_id = 0
         self._started: Future = Future()
@@ -773,9 +791,15 @@ class LinkerPort:
             ):
                 owner = operation.owner
                 if isinstance(owner, _Batch):
-                    owner.failed_keys.update(
-                        key for key, entry in result.items() if not entry.success
-                    )
+                    ran = time.perf_counter() - operation.started
+                    late = ran >= self._operation_timeout
+                    owner.failed_seconds.append(ran)
+                    for key, entry in result.items():
+                        # Several layers name a page: its first failure counts.
+                        if not entry.success and key not in owner.failed_keys:
+                            owner.failed_keys.add(key)
+                            if late:
+                                owner.late_keys.add(key)
                     self._fail_batch(
                         owner, RuntimeError(f"KVCR delivery {handle} failed")
                     )
@@ -812,7 +836,9 @@ class LinkerPort:
                 self._stats.call(
                     "deliver", time.perf_counter() - started, 1, len(blocks)
                 )
-                operations[handle] = _Operation(batch, set(blocks), layer)
+                operations[handle] = _Operation(
+                    batch, set(blocks), layer, started=started
+                )
                 batch.active += 1
                 batch.remaining[layer] += 1
                 deliveries += 1
@@ -824,9 +850,11 @@ class LinkerPort:
                 del self._loads[load.rid]
             self._completed_loads.put([load.rid for load in batch.loads])
             self._cleanup_scopes()
-            self.batch_info[batch.index] = (
-                len(batch.failed_keys),
+            self.batch_info[batch.index] = BatchInfo(
+                frozenset(batch.failed_keys),
                 time.perf_counter() - batch.started,
+                frozenset(batch.late_keys),
+                tuple(batch.failed_seconds),
             )
             if not batch.completion.done():
                 batch.completion.set_result(batch.error is None)

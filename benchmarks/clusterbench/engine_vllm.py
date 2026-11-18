@@ -100,24 +100,28 @@ class _Req:
         "rid", "req_id", "keys", "all_keys", "prompt_tokens", "output_tokens",
         "arrived", "started", "first_token", "rank", "gpu_rank", "gpu_hit",
         "computed", "sched", "next_stored", "promote",
-        "local_ok", "remote_ok", "failed", "primary_hit", "prefill_tokens",
-        "lookups", "hinted", "looked", "segments", "all_segments",
+        "local_ok", "remote_ok", "failed", "timed_out", "primary_hit",
+        "prefill_tokens", "lookups", "hinted", "looked", "segments", "all_segments",
     )  # fmt: skip
 
 
 class _Job:
-    __slots__ = ("kind", "req", "keys", "remaining", "ok", "bad", "end",
+    __slots__ = ("kind", "req", "keys", "remaining", "ok", "bad", "late", "end",
                  "started", "remote", "hinted", "warm")  # fmt: skip
 
-    def __init__(self, kind, req, keys, end, remote=None, hinted=None):
+    def __init__(self, kind, req, keys, end, remote=None, hinted=None, started=None):
         self.kind = kind
         self.req = req
         self.keys = keys
         self.remaining = len(keys)
         self.ok: list[bytes] = []
         self.bad: list[bytes] = []
+        # Failed keys that came back at or after KVCR's operation timeout.
+        self.late: list[bytes] = []
         self.end = end
-        self.started = time.perf_counter()
+        # A load is timed from before its deliver call, where KVCR starts the
+        # operation's deadline.
+        self.started = time.perf_counter() if started is None else started
         self.remote = remote
         self.hinted = hinted
         self.warm = None
@@ -132,6 +136,8 @@ class VllmEngine:
         self._worker = worker
         self._block_tokens = tiers.tokens_per_block
         self._verify = engine.verify
+        self._timeout_s = engine.operation_timeout_ms / 1e3
+        window.late_after = self._timeout_s
         self._warm_slots = config.phases.warm_concurrency
         # Slot 0 holds this worker's warm block; the next ones are warm scratch.
         self._primary = PrimaryTier(tiers.primary_blocks, 1 + self._warm_slots)
@@ -239,7 +245,7 @@ class VllmEngine:
         r.gpu_rank = self._gpu.new_rank()
         r.gpu_hit = r.computed = r.sched = r.next_stored = 0
         r.promote = []
-        r.local_ok = r.remote_ok = r.failed = r.primary_hit = 0
+        r.local_ok = r.remote_ok = r.failed = r.timed_out = r.primary_hit = 0
         r.prefill_tokens = r.lookups = r.hinted = 0
         if request.hint_source >= 0 and request.hint_blocks > 0:
             r.hinted = request.hint_blocks
@@ -479,7 +485,7 @@ class VllmEngine:
             # query the rest of the prompt is requested too and cannot succeed.
             hinted = {key for key, _, _, position in promote if position < r.hinted}
             end = max(position for _, _, _, position in promote)
-            self._jobs[op] = _Job(_LOAD, r, keys, end, remote, hinted)
+            self._jobs[op] = _Job(_LOAD, r, keys, end, remote, hinted, t)
 
     def _poll(self) -> None:
         """``KVCRSecondaryTierManager._poll_finished_jobs`` and its completions."""
@@ -498,11 +504,20 @@ class VllmEngine:
                     continue
                 job.remaining -= len(entries)
                 ok, bad = job.ok, job.bad
+                failed_before = len(bad)
                 for key, entry in entries.items():
                     if entry.success:
                         ok.append(key)
                     else:
                         bad.append(key)
+                if (
+                    len(bad) > failed_before
+                    and job.kind == _LOAD
+                    and perf() - job.started >= self._timeout_s
+                ):
+                    # KVCR fails a deliver before the timeout only if it failed
+                    # at once or the source answered; these ran into it.
+                    job.late.extend(bad[failed_before:])
                 if job.remaining > 0:
                     continue
                 del self._jobs[op]
@@ -559,6 +574,22 @@ class VllmEngine:
             window.counters[
                 "deliver_ops_partial" if job.ok else "deliver_ops_failed"
             ] += 1
+            # Why blocks asked of a peer failed: by how long the deliver ran.
+            peers = job.remote
+            from_peer = [key for key in job.bad if key in peers]
+            if from_peer:
+                late = [key for key in job.late if key in peers]
+                counters = window.counters
+                counters["deliver_blocks_failed_peer"] += len(from_peer)
+                counters["deliver_blocks_failed_peer_hinted"] += sum(
+                    1 for key in from_peer if key in hinted
+                )
+                counters["deliver_blocks_timed_out"] += len(late)
+                counters["deliver_blocks_timed_out_hinted"] += sum(
+                    1 for key in late if key in hinted
+                )
+                r.timed_out += len(late)
+                window.hists["deliver_peer_failed"].add(elapsed)
         if self._verify != "none" and job.ok:
             check = job.ok if self._verify == "full" else job.ok[:1]
             host, slot = self._host, self._primary.slot
@@ -631,6 +662,7 @@ class VllmEngine:
             remote_blocks=r.remote_ok,
             failed_blocks=r.failed,
             recomputed_tokens=r.prefill_tokens,
+            timed_out_blocks=r.timed_out,
         )
 
     # ---- mesh warm ---------------------------------------------------------

@@ -7,6 +7,8 @@ exact calls per step. If one fails after an engine change, compare against
 vLLM's KVCRSecondaryTierManager before touching the expectation.
 """
 
+import time
+
 from clusterbench.config import EngineConfig, PhaseConfig, RunConfig, TierConfig
 from clusterbench.engine_vllm import VllmEngine, _encode
 from clusterbench.ids import block_id, id_to_key, key_to_id, segment_ids
@@ -590,3 +592,65 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
     assert done.gpu_blocks == 10  # the whole old path and the answer's block
     assert [key_to_id(q[1][0]) for q in kvcr.of("query")] == [block_id(905, 1)]
     assert (TIER_DEVICE, 905, 1, 3, False) in engine.take_inventory()
+
+
+# ---- why a block asked of a peer failed ---------------------------------------
+#
+# KVCR reports success or failure per key and nothing more. It fails a deliver
+# before its operation timeout only when the source answered (it no longer held
+# the block) or the fetch failed at once, so the engine sorts failures by how
+# long the deliver ran, counted from before the call as KVCR counts it.
+
+
+def _failures(window):
+    c = window.counters
+    return (
+        c["deliver_blocks_failed"],
+        c["deliver_blocks_failed_peer"],
+        c["deliver_blocks_failed_peer_hinted"],
+        c["deliver_blocks_timed_out"],
+        c["deliver_blocks_timed_out_hinted"],
+    )
+
+
+def test_a_peer_failure_before_the_timeout_is_not_a_timeout():
+    engine, kvcr, window = _engine()
+    kvcr.remote_ok = set(KEYS[:3])
+    engine.submit(_request(1, hint_source=1, hint_blocks=6))
+    done, _ = _run(engine, kvcr)
+    # Seven blocks failed: three the hint named and four beyond it.
+    assert _failures(window) == (7, 7, 3, 0, 0)
+    assert (done.failed_blocks, done.timed_out_blocks) == (7, 0)
+    assert window.hists["deliver_peer_failed"].n == 1
+
+
+def test_a_peer_failure_at_the_timeout_is_a_timeout():
+    engine, kvcr, window = _engine(operation_timeout_ms=20, abandon_timeout_ms=40)
+    kvcr.remote_ok = set(KEYS[:3])
+    # The time inside the deliver call counts: KVCR's deadline starts there.
+    kvcr.on_deliver = lambda: time.sleep(0.03)
+    engine.submit(_request(1, hint_source=1, hint_blocks=6))
+    done, _ = _run(engine, kvcr)
+    assert _failures(window) == (7, 7, 3, 7, 3)
+    assert (done.failed_blocks, done.timed_out_blocks) == (7, 7)
+    assert window.hists["deliver_peer_failed"].max >= 0.03
+
+
+def test_a_failed_local_block_is_not_blamed_on_a_peer():
+    engine, kvcr, window = _engine(operation_timeout_ms=20, abandon_timeout_ms=40)
+    asked = set()
+
+    def query(keys, request_id=None):
+        """Every block is in this worker's own pool, the first time it is asked."""
+        kvcr.calls.append(("query", tuple(keys), request_id))
+        fresh = [key not in asked for key in keys]
+        asked.update(keys)
+        hit = (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        return [hit if new else (QueryStatus.MISS, None) for new in fresh]
+
+    kvcr.query = query
+    kvcr.on_deliver = lambda: time.sleep(0.03)
+    engine.submit(_request(1))
+    done, _ = _run(engine, kvcr)
+    assert _failures(window) == (10, 0, 0, 0, 0)
+    assert (done.failed_blocks, done.timed_out_blocks) == (10, 0)

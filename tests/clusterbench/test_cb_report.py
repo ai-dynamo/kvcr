@@ -143,3 +143,38 @@ def test_compare_reports_change_against_the_first_arm_and_work_mismatch():
         line for line in text.splitlines() if line.startswith("  query us / item")
     )
     assert row.rstrip().endswith("+100.0%")
+
+
+def test_failed_peer_blocks_are_split_by_cause():
+    config, coord, reports = _inputs()
+    for report in reports:
+        report["counters"].update(
+            deliver_blocks_failed=30,
+            deliver_blocks_failed_peer=25,
+            deliver_blocks_failed_peer_hinted=15,
+            deliver_blocks_timed_out=6,
+            deliver_blocks_timed_out_hinted=4,
+            kvcr_peer_ops_past_timeout=3,
+            pin_requests=40,
+            pin_misses=9,
+        )
+    summary = summarize(config, coord, reports)
+    failures = summary["failures"]
+    assert failures["timed_out"] == 12
+    assert failures["gone_from_source"] == 22  # hinted, and failed before the deadline
+    assert failures["beyond_hint"] == 16  # asked for past what the router named
+    assert failures["local"] == 10  # this worker's own pool, no peer involved
+    assert (
+        sum(failures[k] for k in ("timed_out", "gone_from_source", "beyond_hint")) == 50
+    )
+    # Of the 2,030 hinted blocks asked of a peer.
+    assert abs(summary["headline"]["hinted_timeout_rate"] - 8 / 2030) < 1e-12
+    assert abs(summary["headline"]["hinted_gone_rate"] - 22 / 2030) < 1e-12
+    text = format_summary(summary)
+    assert (
+        "blocks a peer failed to deliver: timed out 12 (0.39% of hinted blocks), "
+        "no longer on the source 22 (1.08%), beyond the hint 16; "
+        "KVCR timed 6 peer operations past its timeout; "
+        "source pins 80 requested, 18 missed, 0 timed out"
+    ) in text
+    assert "hinted blocks timed out" in compare({"a": [summary], "b": [summary]})

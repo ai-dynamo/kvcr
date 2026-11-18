@@ -123,12 +123,23 @@ class Telemetry:
         return not (self.counters or self.observations or self.gauges)
 
 
+# kvcr_duration_seconds labels of peer transfers that did not fully succeed.
+_PEER_FAILURES = frozenset(
+    (scope, result)
+    for scope in ("remote_deliver", "remote_fetch")
+    for result in ("failed", "partial")
+)
+
+
 class Window:
     """Everything a worker accumulates over the measurement window."""
 
     def __init__(self) -> None:
         self._gc_started = 0.0
         self._gc_on = False
+        # KVCR's operation timeout in seconds, set by the engine: peer
+        # transfers KVCR itself timed past it are counted as a cross-check.
+        self.late_after = 0.0
         self.reset()
 
     def reset(self) -> None:
@@ -173,10 +184,15 @@ class Window:
         for key, value in stats.counters.items():
             counters["|".join(key)] += value
         hists = self.kvcr_hists
+        late = self.late_after
         for key, values in stats.observations.items():
             hist = hists["|".join(key)]
             for value in values:
                 hist.add(value)
+            if late and key[1:] in _PEER_FAILURES:
+                self.counters["kvcr_peer_ops_past_timeout"] += sum(
+                    1 for value in values if value >= late
+                )
         for key, value in stats.gauges.items():
             self.gauges["|".join(key)] = value
 

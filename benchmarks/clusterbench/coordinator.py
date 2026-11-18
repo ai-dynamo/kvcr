@@ -25,6 +25,19 @@ from .report import summarize
 from .router import Router
 from .workload import make_workload
 
+# requests.jsonl: a header naming these fields, then one row per request. A
+# request the run ended on has no outcome, so its row stops at held_blocks.
+REQUEST_LOG = "requests.jsonl"
+REQUEST_FIELDS = (
+    "session", "turn", "worker", "hint_source", "hint_blocks",
+    "t_ms",  # sent this long after the workload started
+    "in_window",
+    "prompt_blocks",
+    "held_blocks",  # of the prompt, what the router believed the worker held
+    "remote_blocks", "failed_blocks", "timed_out_blocks", "load_ms", "ttft_ms",
+    "aborted",
+)  # fmt: skip
+
 
 class RunFailed(RuntimeError):
     pass
@@ -223,6 +236,9 @@ class Coordinator:
         report_deadline = None
         lag = LogHist()
         tally = self._new_tally()
+        log = open(self.out / REQUEST_LOG, "wb")
+        encode = msgspec.json.Encoder().encode
+        log.write(encode({"clusterbench_requests": 1, "fields": REQUEST_FIELDS}))
 
         def on_message(worker, message) -> None:
             nonlocal measuring, stop_at, waiting_before
@@ -230,7 +246,17 @@ class Coordinator:
                 entry = inflight.pop(message.rid, None)
                 if entry is None:
                     return
-                turn, source, hinted = entry
+                turn, sent = entry
+                source, hinted = sent[3], sent[4]
+                outcome = (
+                    message.remote_blocks,
+                    message.failed_blocks,
+                    message.timed_out_blocks,
+                    round(message.load_ms, 3),
+                    round(message.ttft_ms, 3),
+                    message.aborted,
+                )
+                log.write(b"\n" + encode(sent + outcome))
                 router.done(message.rid)
                 if measuring and not stopped:
                     self._tally_done(tally, message, worker, source, hinted, nodes)
@@ -289,7 +315,20 @@ class Coordinator:
                             hint_blocks=route.hint_blocks,
                         ),
                     )
-                    inflight[rid] = (turn, route.hint_source, route.hint_blocks)
+                    inflight[rid] = (
+                        turn,
+                        (
+                            turn.session,
+                            turn.turn,
+                            route.worker,
+                            route.hint_source,
+                            route.hint_blocks,
+                            round((now - start) * 1e3, 3),
+                            measuring,
+                            blocks,
+                            route.local_blocks,
+                        ),
+                    )
                     if len(inflight) > inflight_max:
                         inflight_max = len(inflight)
                     if measuring:
@@ -335,6 +374,10 @@ class Coordinator:
                 on_message(*received)
                 received = self._recv(0)
 
+        for _, sent in inflight.values():
+            log.write(b"\n" + encode(sent))
+        log.write(b"\n")
+        log.close()
         tally["lag"] = lag.to_json()
         tally["sessions_started"] = workload.started
         tally["inflight_at_stop"] = len(inflight)
@@ -358,6 +401,7 @@ class Coordinator:
                 "hinted_cross_node",
                 "completed",
                 "aborted",
+                "timed_out_blocks",
                 "remote_blocks_same_node",
                 "remote_blocks_cross_node",
                 "remote_requests",
@@ -389,6 +433,7 @@ class Coordinator:
         tally["primary_blocks"] += done.primary_blocks
         tally["local_blocks"] += done.local_blocks
         tally["failed_blocks"] += done.failed_blocks
+        tally["timed_out_blocks"] += done.timed_out_blocks
         tally["prefill_tokens"] += done.recomputed_tokens
         tally["ttft"].add(done.ttft_ms / 1e3)
         if source >= 0:

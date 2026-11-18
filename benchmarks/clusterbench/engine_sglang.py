@@ -68,7 +68,7 @@ class _Req:
         "total_pages", "arrived", "looked", "started", "first_token", "device_hit",
         "host_hit", "remote_pages", "slots", "path", "computed", "sched",
         "inserted", "walked", "lookups", "hinted", "prefill_tokens", "loaded",
-        "contexts",
+        "contexts", "remote_flags", "timed_out",
     )  # fmt: skip
 
 
@@ -129,6 +129,7 @@ class SglangEngine:
         self._worker = worker
         self._page_tokens = tiers.tokens_per_block
         self._layers = tiers.layers
+        window.late_after = engine.operation_timeout_ms / 1e3
         self._warm_slots = config.phases.warm_concurrency
         # Slot 0 holds this worker's warm page; the next ones are warm scratch.
         self._tree = DeviceTree(tiers.gpu_blocks, 1 + self._warm_slots)
@@ -190,6 +191,7 @@ class SglangEngine:
             layers_per_deliver=self._cfg.linker_layers_per_deliver,
             max_deliveries=self._cfg.linker_max_deliveries,
             deposit_pieces=self._cfg.linker_deposit_pieces,
+            operation_timeout_s=self._cfg.operation_timeout_ms / 1e3,
         )
         host.pin_scheduler()
         # The linker freezes the heap and all but disables full collections
@@ -245,6 +247,8 @@ class SglangEngine:
         r.lookups = r.hinted = r.prefill_tokens = 0
         r.loaded = False
         r.contexts = 0
+        r.remote_flags = ()
+        r.timed_out = 0
         r.hint = None
         if request.hint_source >= 0 and request.hint_blocks > 0:
             r.hinted = request.hint_blocks
@@ -405,6 +409,7 @@ class SglangEngine:
         device = min(self._tree.prefix(r.segments), r.match_pages)
         r.device_hit = device
         r.host_hit = r.remote_pages = 0
+        r.remote_flags = ()
         if device >= r.match_pages:
             return  # the device covers it, or the tail is under one page
         if not r.lookups:
@@ -418,7 +423,8 @@ class SglangEngine:
         )
         if valid:
             r.host_hit = valid[-1]
-            r.remote_pages = sum(remote[: r.host_hit])
+            r.remote_flags = remote[: r.host_hit]
+            r.remote_pages = sum(r.remote_flags)
 
     def _admit(self, r: _Req) -> bool:
         """``add_one_req``: device slots for everything new, then the load."""
@@ -452,16 +458,42 @@ class SglangEngine:
     ) -> None:
         window = self._window
         counters = window.counters
-        failed_keys, duration = self._linker.batch_info.pop(index, (0, 0.0))
+        info = self._linker.batch_info.pop(index, None)
+        duration = info.seconds if info else 0.0
         remote = sum(r.remote_pages for r in loaders)
         pages = sum(r.host_hit for r in loaders)
         counters["load_batches"] += 1
         window.hists["deliver_remote" if remote else "deliver_local"].add(duration)
         if failed:
+            failed_keys = info.failed if info else frozenset()
             counters["load_batches_failed"] += 1
-            counters["deliver_blocks_failed"] += failed_keys
-            counters["deliver_blocks_failed_hinted"] += failed_keys
+            counters["deliver_blocks_failed"] += len(failed_keys)
+            counters["deliver_blocks_failed_hinted"] += len(failed_keys)
             counters["aborted_pages"] += pages
+            # Why pages asked of a peer failed: by how long their deliver ran.
+            # The linker only loads what KVCR called restorable, so every page
+            # from a peer was named by the hint.
+            encode = self._linker.encode_key
+            late_keys = info.late if info else frozenset()
+            peers: set[bytes] = set()
+            for r in loaders:
+                hashes = r.hashes[r.device_hit : r.device_hit + r.host_hit]
+                mine = {
+                    encode(page)
+                    for page, is_remote in zip(hashes, r.remote_flags)
+                    if is_remote
+                }
+                r.timed_out = len(mine & late_keys)
+                peers |= mine
+            from_peer = len(failed_keys & peers)
+            if from_peer:
+                late = len(late_keys & peers)
+                counters["deliver_blocks_failed_peer"] += from_peer
+                counters["deliver_blocks_failed_peer_hinted"] += from_peer
+                counters["deliver_blocks_timed_out"] += late
+                counters["deliver_blocks_timed_out_hinted"] += late
+                for seconds in info.failed_seconds:
+                    window.hists["deliver_peer_failed"].add(seconds)
             return
         counters["deliver_blocks_remote"] += remote
         counters["deliver_blocks_local"] += pages - remote
@@ -658,6 +690,7 @@ class SglangEngine:
             remote_blocks=0,
             failed_blocks=r.host_hit,
             recomputed_tokens=0,
+            timed_out_blocks=r.timed_out,
             aborted=True,
         )
 
