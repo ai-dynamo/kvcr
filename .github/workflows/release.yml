@@ -404,7 +404,10 @@ jobs:
       !cancelled() &&
       needs.prepare.outputs.stage == 'true' &&
       needs.build.result == 'success'
-    runs-on: prod-kvcr-builder-v1
+    # The NIXL service tests crash on the 1-CPU builder pod; this runner has the memory and /dev/shm they need.
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     environment: wheel-read
     timeout-minutes: 60
     permissions:
