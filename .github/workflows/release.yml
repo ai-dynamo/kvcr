@@ -446,11 +446,23 @@ jobs:
           curl -q -fsS --retry 3 --max-time 120 -o "dist/${WHEEL}" -H "@${auth}" \
             "${ARTIFACTORY_URL%/}/${ARTIFACTORY_PYPI_REPO_NAME}/${STAGE_PATH}/${WHEEL}"
           echo "${WHEEL_SHA256}  dist/${WHEEL}" | sha256sum --check
-      - uses: ./.github/actions/test-wheel
+      # This runner cannot load local actions, so the job calls the script the test-wheel action wraps.
+      - name: Check, install and test the wheel, then write its license evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+        run: .github/scripts/test-wheel.sh "dist/${WHEEL}" "${VERSION}" "${MODE}"
+      # The release pipeline attaches the one artifact whose name contains "license".
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          wheel: dist/${{ needs.prepare.outputs.wheel }}
-          version: ${{ needs.prepare.outputs.version }}
-          mode: ${{ needs.prepare.outputs.mode }}
+          name: license-artifacts
+          path: |
+            ${{ runner.temp }}/license-artifacts/deps*.csv
+            ${{ runner.temp }}/license-artifacts/baseline/BASELINE.md
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
 
   # Releases wait for this GPU test before approval, unless it was turned off.
   e2e:

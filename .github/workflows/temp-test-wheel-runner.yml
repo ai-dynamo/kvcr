@@ -35,8 +35,18 @@ jobs:
           uv build --wheel --out-dir dist
           echo "wheel=$(cd dist && ls kvcr-*.whl)" >> "${GITHUB_OUTPUT}"
           echo "version=$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')" >> "${GITHUB_OUTPUT}"
-      - uses: ./.github/actions/test-wheel
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          WHEEL: dist/${{ steps.build.outputs.wheel }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: .github/scripts/test-wheel.sh "${WHEEL}" "${VERSION}" nightly
+      # The release pipeline attaches the one artifact whose name contains "license".
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          wheel: dist/${{ steps.build.outputs.wheel }}
-          version: ${{ steps.build.outputs.version }}
-          mode: nightly
+          name: license-artifacts
+          path: |
+            ${{ runner.temp }}/license-artifacts/deps*.csv
+            ${{ runner.temp }}/license-artifacts/baseline/BASELINE.md
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
