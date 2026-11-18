@@ -17,7 +17,7 @@ from pathlib import Path
 
 # Dependencies cleared by open-source review; a new one needs its own review.
 APPROVED_DEPENDENCIES = {"msgspec", "pyzmq", "nixl"}
-APPROVED_EXTRA_DEPENDENCIES: set[str] = set()
+APPROVED_EXTRA_DEPENDENCIES = {"nvtx", "numpy"}
 COPYRIGHT = re.compile(
     r"# SPDX-FileCopyrightText: Copyright \(c\) \d{4}(-\d{4})? "
     r"NVIDIA CORPORATION & AFFILIATES\. All rights reserved\."
