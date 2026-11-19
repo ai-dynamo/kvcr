@@ -91,10 +91,54 @@ class TransferError(RuntimeError):
 
 
 class OpEntryStatus(Enum):
-    # TODO: Add specific statuses for timeout, abort, capacity, and unavailable sources.
+    """Outcome for one block."""
+
     SUCCESS = "SUCCESS"
     DROPPED = "DROPPED"
-    FAILED = "FAILED"
+    UNAVAILABLE = "UNAVAILABLE"  # Expected miss or no usable source.
+    TIMEOUT = "TIMEOUT"  # Operation deadline expired.
+    ABORTED = "ABORTED"  # Cancelled or interrupted.
+    FAILED = "FAILED"  # Unexpected error on either worker.
+
+
+class Reason(str, Enum):
+    """Why a transfer, or one of its blocks, did not complete."""
+
+    UNKNOWN = "unknown"
+    NONE = "none"
+    CALLBACK_ERROR = "callback_error"
+    DUPLICATE_REQUEST = "duplicate_request"
+    INVALID_RESULT = "invalid_result"
+    DEADLINE = "deadline"
+    CANCELLED = "cancelled"
+    SHUTDOWN = "shutdown"
+    NO_WAITERS = "no_waiters"
+    SUBMIT_REJECTED = "submit_rejected"
+    SUBMIT_AMBIGUOUS = "submit_ambiguous"
+    CREATE_ERROR = "create_error"
+    PROGRESS_ERROR = "progress_error"
+    RELEASE_ERROR = "release_error"
+    CONTROL_ERROR = "control_error"
+    INVALID_NOTIFICATION = "invalid_notification"
+    REMOTE_FAILURE = "remote_failure"
+    ROUTE_CHANGED = "route_changed"
+    HINT_UNAVAILABLE = "hint_unavailable"
+    HINT_CONFLICT = "hint_conflict"
+    NOT_RESIDENT = "not_resident"
+    PIN_FAILED = "pin_failed"
+    LAYOUT_MISMATCH = "layout_mismatch"
+    STOPPING = "stopping"
+    TRANSFER_FAILED = "transfer_failed"
+    MALFORMED = "malformed"
+    SETUP_FAILED = "setup_failed"
+    REMEMBERED_MISS = "remembered_miss"
+    HINT_INVALIDATED = "hint_invalidated"
+    REFUSED = "refused"
+    METADATA_REQUIRED = "metadata_required"
+    SOURCE_RESTARTED = "source_restarted"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class OpEntryResult(msgspec.Struct, frozen=True):
@@ -102,6 +146,8 @@ class OpEntryResult(msgspec.Struct, frozen=True):
     # Fetch locations in KVCR-owned memory, valid until release.
     descriptors: list[MemoryRef] | None = None
     release_handle: ReleaseHandle | None = None
+    # Why the block was not delivered: a lower-cased ``Reason`` name, or None.
+    reason: str | None = None
 
     @property
     def success(self) -> bool:

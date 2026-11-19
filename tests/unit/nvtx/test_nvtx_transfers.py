@@ -18,7 +18,7 @@ from _kvcr_test_utils import (
     _start_write_message,
     _wait_until,
 )
-from _nvtx_test_utils import make_source, payloads, spans, wait_for_payload
+from _nvtx_test_utils import make_source, payloads, reason_of, spans, wait_for_payload
 from test_progress import _mem, _transfer_progress, _TransferAgent
 
 from kvcr import _nvtx
@@ -26,14 +26,14 @@ from kvcr.config import LocalDramOptions
 from kvcr.types import BlockKey
 
 
-def test_zero_selected_source_is_failed_without_posting(recording):
+def test_zero_selected_source_is_a_miss_without_posting(recording):
     source, agent, pinning = make_source()
     pinning.complete(0, missing_indices=(0,))
     event = wait_for_payload(
         source, recording, "source.write.completed", ended="source.write"
     )
-    assert int(event["status"]) == 4
-    assert int(event["reason"]) == 0
+    assert int(event["status"]) == int(_nvtx.Status.MISS)
+    assert reason_of(event) == _nvtx.Reason.NOT_RESIDENT
     assert int(event["requested_blocks"]) == 1
     assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
     assert not agent.xfers
@@ -44,11 +44,11 @@ def test_zero_selected_source_is_failed_without_posting(recording):
 @pytest.mark.parametrize(
     "success,requested,completed,status,reason",
     [
-        (True, 0, 0, 2, 1),
-        (True, 2, 0, 4, 0),
-        (True, 2, 1, 3, 0),
-        (True, 2, 2, 2, 1),
-        (False, 2, 2, 4, 0),
+        (True, 0, 0, 2, _nvtx.Reason.NONE),
+        (True, 2, 0, 10, _nvtx.Reason.UNKNOWN),
+        (True, 2, 1, 3, _nvtx.Reason.UNKNOWN),
+        (True, 2, 2, 2, _nvtx.Reason.NONE),
+        (False, 2, 2, 4, _nvtx.Reason.UNKNOWN),
     ],
 )
 def test_completion_status_and_counts(
@@ -65,7 +65,7 @@ def test_completion_status_and_counts(
     source = payloads(recording, "source.write.completed")[0]
     for event in (pin, source):
         assert int(event["status"]) == status
-        assert int(event["reason"]) == reason
+        assert reason_of(event) == reason
     assert int(pin["completed_blocks"]) == completed
     assert int(source["completed_blocks"]) == (completed if success else 0)
     assert int(source["completed_bytes"]) == (completed * 16 if success else 0)
@@ -143,7 +143,7 @@ def test_source_deadline_and_unresolved_close_are_not_native_completion(recordin
     final = wait_for_payload(
         source, recording, "source.write.completed", ended="source.write"
     )
-    assert int(final["reason"]) == int(_nvtx.Reason.DEADLINE)
+    assert reason_of(final) == _nvtx.Reason.DEADLINE
     assert not backend._sources._pending_pin_ops
     for name in ("source.write", "nixl.write"):
         assert len(spans(recording, name, "end")) == 1
@@ -191,7 +191,12 @@ def test_source_path_connects_pin_to_transfer(recording, monkeypatch, level):
 
 
 @pytest.mark.parametrize(
-    "cause,reason", [("timeout", 5), ("route", 17), ("timeout+route", 5)]
+    "cause,reason",
+    [
+        ("timeout", _nvtx.Reason.DEADLINE),
+        ("route", _nvtx.Reason.ROUTE_CHANGED),
+        ("timeout+route", _nvtx.Reason.DEADLINE),
+    ],
 )
 def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
     source, agent, pinning = make_source()
@@ -207,7 +212,7 @@ def test_pending_pin_failure_preserves_source_cause(recording, cause, reason):
         source, recording, "source.write.completed", ended="source.write"
     )
     assert int(event["status"]) == 4
-    assert int(event["reason"]) == reason
+    assert reason_of(event) == reason
     assert int(event["completed_blocks"]) == int(event["completed_bytes"]) == 0
     assert not agent.xfers
     assert pinning.cancelled == ([0] if "timeout" in cause else [])
@@ -235,9 +240,8 @@ def test_route_refusal_preserves_cause_at_source_completion(recording, monkeypat
     wait_for_payload(source, recording, "source.write.completed", ended="source.write")
     assert len(payloads(recording, "source.write.refused")) == 1
     assert not payloads(recording, "nixl.write.posted")
-    assert int(payloads(recording, "source.write.completed")[0]["reason"]) == int(
-        _nvtx.Reason.ROUTE_CHANGED
-    )
+    completed = payloads(recording, "source.write.completed")[0]
+    assert reason_of(completed) == _nvtx.Reason.ROUTE_CHANGED
 
 
 def test_failed_source_trace_initialization_is_not_retried(recording, monkeypatch):
