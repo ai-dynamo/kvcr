@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .config import RunConfig
 from .coordinator import Coordinator
+from .kvcr_host import core_groups
 
 BENCHMARKS = Path(__file__).resolve().parents[1]
 
@@ -41,18 +42,7 @@ def _free_port_base(count: int) -> int:
 
 def _cpu_sets(workers: int, cores_per_worker: int) -> list[list[int]]:
     """Disjoint blocks of physical cores per worker, or no pinning if short."""
-    cores: dict[tuple[int, int], list[int]] = {}
-    for cpu in sorted(os.sched_getaffinity(0)):
-        base = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            key = (
-                int((base / "physical_package_id").read_text()),
-                int((base / "core_id").read_text()),
-            )
-        except (OSError, ValueError):
-            key = (0, cpu)
-        cores.setdefault(key, []).append(cpu)
-    groups = [cores[key] for key in sorted(cores)]
+    groups = core_groups(os.sched_getaffinity(0))
     if cores_per_worker < 3 or len(groups) < workers * cores_per_worker:
         return [[] for _ in range(workers)]
     return [
@@ -75,6 +65,12 @@ def run_local(
     arm: str = "",
     cores_per_worker: int = 0,
 ) -> dict:
+    expect_kvcr = ""
+    if kvcr_src:
+        # Checked first: a wrong path would silently test the installed kvcr.
+        expect_kvcr = str(Path(kvcr_src).resolve() / "src")
+        if not (Path(expect_kvcr) / "kvcr" / "__init__.py").is_file():
+            raise ValueError(f"{kvcr_src} is not a KVCR checkout: no src/kvcr in it")
     out = Path(out_dir)
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -86,8 +82,8 @@ def run_local(
 
     env = dict(os.environ)
     paths = [str(BENCHMARKS)]
-    if kvcr_src:
-        paths.append(str(Path(kvcr_src).resolve() / "src"))
+    if expect_kvcr:
+        paths.append(expect_kvcr)
     if env.get("PYTHONPATH"):
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)
@@ -128,7 +124,7 @@ def run_local(
                 )
             )
             log.close()
-        return coordinator.run(expect=workers)
+        return coordinator.run(expect=workers, expect_kvcr=expect_kvcr)
     finally:
         coordinator.close()
         for child in children:

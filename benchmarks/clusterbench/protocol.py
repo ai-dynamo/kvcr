@@ -48,7 +48,6 @@ class Done(_Msg):
 
     rid: int
     ttft_ms: float
-    total_ms: float
     load_ms: float
     prompt_blocks: int
     gpu_blocks: int
@@ -59,7 +58,7 @@ class Done(_Msg):
     recomputed_tokens: int
     # The engine dropped the request (SGLang: a cache load in its batch failed).
     aborted: bool = False
-    # Of the failed blocks, those whose transfer ran into the operation timeout.
+    # Of the failed blocks, those KVCR reported as timed out.
     timed_out_blocks: int = 0
 
 
@@ -91,7 +90,7 @@ class Configure(_Msg):
 
 
 class Phase(_Msg):
-    name: str  # "warm", "fill", "measure", "stop"
+    name: str  # "warm", "measure", "stop", "exit"
 
 
 class Request(_Msg):

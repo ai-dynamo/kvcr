@@ -28,23 +28,22 @@ What KVCR sees, and must keep seeing if this file changes:
   request that stores, and at schedule end if it has not run yet.
 - Pins are resolved once per step from the primary tier and released at the
   next poll. ``get_stats`` runs every step.
+
+The device tier is bookkeeping: a request is admitted when all of its blocks
+fit beside the running requests', first come first served, and every token a
+step computes, prompt or answer, comes out of ``max_batched_tokens``.
 """
 
 from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Iterable
-from itertools import islice
-
-import msgspec
 
 from kvcr.types import CacheTier, MemoryRef, QueryStatus
 
 from .config import RunConfig
+from .engine import count_failure, failure_cause, fetch_hint
 from .ids import (
-    INDEX_BITS,
-    INDEX_MASK,
     KeyCache,
     block_id,
     id_to_key,
@@ -63,6 +62,7 @@ from .protocol import (
     InventoryDelta,
     Request,
 )
+from .router import PrefixTracker
 
 _LOAD, _STORE, _WARM = 0, 1, 2
 _WARM_ATTEMPTS = 5
@@ -75,26 +75,6 @@ _REMOTE = CacheTier.REMOTE_G2
 _LOCAL_G2 = CacheTier.LOCAL_G2
 
 
-class _HintAction(msgspec.Struct, frozen=True):
-    action_id: str
-    action_type: str
-    action_version: str
-    payload: dict
-
-
-class _HintEnvelope(msgspec.Struct, frozen=True):
-    protocol_version: str
-    message_id: str
-    actions: list[_HintAction]
-
-
-def fetch_hint(message_id: str, endpoint: str, hashes: list[int]) -> _HintEnvelope:
-    """The envelope Dynamo's router attaches (one ``kv.fetch`` action)."""
-    payload = {"source_control_endpoint": endpoint, "block_hashes": hashes}
-    action = _HintAction("a1", "kv.fetch", "1.0", payload)
-    return _HintEnvelope("0.1", message_id, [action])
-
-
 class _Req:
     __slots__ = (
         "rid", "req_id", "keys", "all_keys", "prompt_tokens", "output_tokens",
@@ -102,26 +82,23 @@ class _Req:
         "computed", "sched", "next_stored", "promote",
         "local_ok", "remote_ok", "failed", "timed_out", "primary_hit",
         "prefill_tokens", "lookups", "hinted", "looked", "segments", "all_segments",
+        "pins", "need",
     )  # fmt: skip
 
 
 class _Job:
-    __slots__ = ("kind", "req", "keys", "remaining", "ok", "bad", "late", "end",
+    __slots__ = ("kind", "req", "keys", "remaining", "ok", "bad", "end",
                  "started", "remote", "hinted", "warm")  # fmt: skip
 
-    def __init__(self, kind, req, keys, end, remote=None, hinted=None, started=None):
+    def __init__(self, kind, req, keys, end, remote=None, hinted=None):
         self.kind = kind
         self.req = req
         self.keys = keys
         self.remaining = len(keys)
         self.ok: list[bytes] = []
-        self.bad: list[bytes] = []
-        # Failed keys that came back at or after KVCR's operation timeout.
-        self.late: list[bytes] = []
+        self.bad: dict[bytes, object] = {}  # failed key -> KVCR's result entry
         self.end = end
-        # A load is timed from before its deliver call, where KVCR starts the
-        # operation's deadline.
-        self.started = time.perf_counter() if started is None else started
+        self.started = time.perf_counter()
         self.remote = remote
         self.hinted = hinted
         self.warm = None
@@ -136,8 +113,6 @@ class VllmEngine:
         self._worker = worker
         self._block_tokens = tiers.tokens_per_block
         self._verify = engine.verify
-        self._timeout_s = engine.operation_timeout_ms / 1e3
-        window.late_after = self._timeout_s
         self._warm_slots = config.phases.warm_concurrency
         # Slot 0 holds this worker's warm block; the next ones are warm scratch.
         self._primary = PrimaryTier(tiers.primary_blocks, 1 + self._warm_slots)
@@ -158,6 +133,9 @@ class VllmEngine:
         self._pins: dict[str, list[bytes]] = {}
         self._pin_released: list[list[bytes]] = []
         self._g2_events: list[KeyEvent] = []
+        # What the router is told the host tiers hold.
+        self._primary_seen = PrefixTracker(TIER_PRIMARY)
+        self._g2_seen = PrefixTracker(TIER_G2)
         self._resilience: list[str] = []
         # Mesh warm.
         self._warm_queue: deque[tuple[int, str, int]] = deque()
@@ -247,6 +225,13 @@ class VllmEngine:
         r.promote = []
         r.local_ok = r.remote_ok = r.failed = r.timed_out = r.primary_hit = 0
         r.prefill_tokens = r.lookups = r.hinted = 0
+        r.pins = ()
+        r.need = 0
+        if len(r.all_keys) > self._gpu.capacity:
+            raise ValueError(
+                f"request {r.rid} needs {len(r.all_keys)} device blocks, more "
+                f"than tiers.gpu_blocks ({self._gpu.capacity})"
+            )
         if request.hint_source >= 0 and request.hint_blocks > 0:
             r.hinted = request.hint_blocks
             # vLLM on_new_request: submit_hint only when the router sent one.
@@ -272,27 +257,43 @@ class VllmEngine:
 
         # Schedule: running requests first, then the waiting queue.
         for r in self._running:
+            if budget <= 0:
+                break
             remaining = r.prompt_tokens - r.computed
             if remaining > 0:
                 n = min(remaining, budget)
-                if n <= 0:
-                    continue
-                budget -= n
                 prefill += n
             else:
-                n = 1
+                n = 1  # a decode step is one token of the budget
+            budget -= n
             r.sched = n
             scheduled.append(r)
         if self._waiting:
             waiting = []
+            admitting = True
             for r in self._waiting:
-                if len(self._running) >= cfg.max_running or budget <= 0:
+                if (
+                    not admitting
+                    or len(self._running) >= cfg.max_running
+                    or budget <= 0
+                ):
                     waiting.append(r)
                     continue
                 hit = self._lookup(r)
                 if hit is None:
                     waiting.append(r)  # deferred: retried next step
                     continue
+                need = len(r.all_keys) - r.gpu_hit
+                pins = self._gpu.admit(r.segments, need)
+                if pins is None:
+                    # No room on the device: it waits, and so does every
+                    # request behind it. That wait is not cache resolution.
+                    admitting = False
+                    r.looked = 0.0
+                    window.counters["device_alloc_failures"] += 1
+                    waiting.append(r)
+                    continue
+                r.pins, r.need = pins, need
                 self._start(r, hit)
                 n = min(r.prompt_tokens - r.computed, budget)
                 budget -= n
@@ -363,7 +364,7 @@ class VllmEngine:
         keys = r.keys
         gpu = self._gpu.prefix(r.segments)
         r.gpu_hit = gpu
-        if not r.lookups:
+        if not r.looked:
             r.looked = perf()
         r.lookups += 1
         end = len(keys)
@@ -427,19 +428,18 @@ class VllmEngine:
         self._running.append(r)
 
     def _build_store(self, r: _Req) -> None:
-        tokens = r.computed + r.sched
-        if self._cfg.offload_prompt_only:
-            limit = min(tokens // self._block_tokens, len(r.keys))
-        else:
-            limit = min(tokens // self._block_tokens, len(r.all_keys))
+        # Prompt blocks only (vLLM's ``offload_prompt_only`` default).
+        limit = min((r.computed + r.sched) // self._block_tokens, len(r.keys))
         start = r.next_stored
         if limit <= start:
             return
-        r.next_stored = limit
-        keys = r.all_keys[start:limit]
+        keys = r.keys[start:limit]
         # TieringOffloadingManager.prepare_store polls unconditionally.
         self._poll()
         taken = self._primary.prepare_write(keys, r.rank, range(start, limit))
+        if taken is None:
+            return  # the CPU tier is full: the range is tried again next step
+        r.next_stored = limit
         self._primary.access(keys, r.rank, start)
         if taken:
             self._stores.append((r, taken, limit - 1))
@@ -485,7 +485,7 @@ class VllmEngine:
             # query the rest of the prompt is requested too and cannot succeed.
             hinted = {key for key, _, _, position in promote if position < r.hinted}
             end = max(position for _, _, _, position in promote)
-            self._jobs[op] = _Job(_LOAD, r, keys, end, remote, hinted, t)
+            self._jobs[op] = _Job(_LOAD, r, keys, end, remote, hinted)
 
     def _poll(self) -> None:
         """``KVCRSecondaryTierManager._poll_finished_jobs`` and its completions."""
@@ -504,20 +504,11 @@ class VllmEngine:
                     continue
                 job.remaining -= len(entries)
                 ok, bad = job.ok, job.bad
-                failed_before = len(bad)
                 for key, entry in entries.items():
                     if entry.success:
                         ok.append(key)
                     else:
-                        bad.append(key)
-                if (
-                    len(bad) > failed_before
-                    and job.kind == _LOAD
-                    and perf() - job.started >= self._timeout_s
-                ):
-                    # KVCR fails a deliver before the timeout only if it failed
-                    # at once or the source answered; these ran into it.
-                    job.late.extend(bad[failed_before:])
+                        bad[key] = entry
                 if job.remaining > 0:
                     continue
                 del self._jobs[op]
@@ -542,8 +533,6 @@ class VllmEngine:
                 if aligned and aligned[-1][0] is r:
                     end = max(end, aligned.pop()[1])
                 aligned.append((r, end))
-            if self._cfg.align_on_finish_only:
-                aligned = []  # what-if: recency only at request finish
             for r, end in aligned:
                 # Earlier resident keys are included even when only the tail moved.
                 keys = r.all_keys[: end + 1]
@@ -567,29 +556,22 @@ class VllmEngine:
         window.counters["deliver_blocks_local"] += local
         window.counters["deliver_blocks_failed"] += len(job.bad)
         if job.bad:
-            hinted = job.hinted
-            window.counters["deliver_blocks_failed_hinted"] += sum(
-                1 for key in job.bad if key in hinted
-            )
-            window.counters[
-                "deliver_ops_partial" if job.ok else "deliver_ops_failed"
-            ] += 1
-            # Why blocks asked of a peer failed: by how long the deliver ran.
-            peers = job.remote
-            from_peer = [key for key in job.bad if key in peers]
-            if from_peer:
-                late = [key for key in job.late if key in peers]
-                counters = window.counters
-                counters["deliver_blocks_failed_peer"] += len(from_peer)
-                counters["deliver_blocks_failed_peer_hinted"] += sum(
-                    1 for key in from_peer if key in hinted
-                )
-                counters["deliver_blocks_timed_out"] += len(late)
-                counters["deliver_blocks_timed_out_hinted"] += sum(
-                    1 for key in late if key in hinted
-                )
-                r.timed_out += len(late)
-                window.hists["deliver_peer_failed"].add(elapsed)
+            counters = window.counters
+            counters["deliver_ops_partial" if job.ok else "deliver_ops_failed"] += 1
+            # Blocks asked of a peer. Those the hint named are counted by
+            # KVCR's status; the opportunistic query asks the peer for the
+            # rest of the prompt too, which it cannot have.
+            peers, hinted = job.remote, job.hinted
+            for key, entry in job.bad.items():
+                if key not in peers:
+                    continue
+                if key in hinted:
+                    cause = count_failure(counters, entry)
+                else:
+                    counters["deliver_blocks_failed_beyond_hint"] += 1
+                    cause = failure_cause(entry)
+                if cause == "timeout":
+                    r.timed_out += 1
         if self._verify != "none" and job.ok:
             check = job.ok if self._verify == "full" else job.ok[:1]
             host, slot = self._host, self._primary.slot
@@ -624,7 +606,7 @@ class VllmEngine:
     def _finish(self, r: _Req, now: float) -> Done:
         self._running.remove(r)
         window = self._window
-        keys = r.keys if self._cfg.offload_prompt_only else r.all_keys
+        keys = r.keys
         # on_request_finished: final recency, then drop the request's hints.
         if keys:
             t = time.perf_counter()
@@ -634,6 +616,7 @@ class VllmEngine:
         self._kvcr.discard_hint(r.req_id)
         window.call("discard_hint", time.perf_counter() - t)
         # Everything the request computed is now in the device cache.
+        self._gpu.release(r.pins, r.need)
         self._gpu.insert(r.all_segments, r.gpu_rank)
         ttft = r.first_token - r.arrived
         # Queueing for the engine's token budget is not KVCR's doing; the time
@@ -653,7 +636,6 @@ class VllmEngine:
         return Done(
             rid=r.rid,
             ttft_ms=ttft * 1e3,
-            total_ms=(now - r.arrived) * 1e3,
             load_ms=load * 1e3,
             prompt_blocks=len(r.keys),
             gpu_blocks=r.gpu_hit,
@@ -708,17 +690,17 @@ class VllmEngine:
     # ---- reporting ---------------------------------------------------------
 
     def take_inventory(self) -> list[InventoryDelta]:
-        out: list[InventoryDelta] = []
-        events = self._primary.take_events()
-        if events:
-            _encode(out, TIER_PRIMARY, events)
         gpu = self._gpu
-        if gpu.events:
-            out.extend((TIER_DEVICE, *event) for event in gpu.events)
-            gpu.events = []
-        if self._g2_events:
-            events, self._g2_events = self._g2_events, []
-            _encode(out, TIER_G2, events)
+        out: list[InventoryDelta] = [(TIER_DEVICE, *event) for event in gpu.events]
+        gpu.events = []
+        g2_events, self._g2_events = self._g2_events, []
+        for tracker, events in (
+            (self._primary_seen, self._primary.take_events()),
+            (self._g2_seen, g2_events),
+        ):
+            for removed, keys in events:
+                tracker.apply(removed, keys_to_ids(keys))
+            out.extend(tracker.take())
         return out
 
     def abort_requests(self) -> None:
@@ -729,6 +711,8 @@ class VllmEngine:
             # Slots reserved for promotions that were never delivered.
             primary.complete_write([key for key, _, _, _ in r.promote], False)
             r.promote = []
+            self._gpu.release(r.pins, r.need)
+            r.pins, r.need = (), 0
         self._waiting = []
         self._running = []
         # Stores whose device->CPU copy will now never finish.
@@ -760,6 +744,7 @@ class VllmEngine:
             "primary_evictions": primary.evictions,
             "primary_alloc_failures": primary.allocation_failures,
             "gpu_blocks": len(self._gpu),
+            "gpu_reserved": self._gpu.live,
         }
 
     def resilience_samples(self) -> list[str]:
@@ -776,76 +761,3 @@ class VllmEngine:
 
     def close(self) -> None:
         pass
-
-
-def _encode(out: list[InventoryDelta], tier: int, events: Iterable[KeyEvent]) -> None:
-    """Encode ordered key events of one tier as inventory deltas.
-
-    Additions become runs of consecutive blocks. The router only keeps how
-    long a stream's root-aligned prefix is, and any removal cuts that prefix
-    at its lowest block, so all of a stream's removals up to its next addition
-    travel as one delta however scattered they were.
-    """
-    cuts: dict[int, int] = {}  # stream -> index in out of its open removal
-    for removed, keys in events:
-        if not keys:
-            continue
-        ids = keys_to_ids(keys)
-        first, last, count = ids[0], ids[-1], len(ids)
-        if last - first == count - 1 and (
-            count < 3 or ids == list(range(first, last + 1))
-        ):
-            _run(out, cuts, tier, first, last + 1, removed)
-        elif (
-            removed
-            and first - last == count - 1
-            and (count < 3 or ids == list(range(first, last - 1, -1)))
-        ):
-            _run(out, cuts, tier, last, first + 1, removed)  # tail-first eviction
-        else:
-            low = high = first
-            for bid in islice(ids, 1, None):
-                if bid == high + 1:
-                    high = bid
-                elif removed and bid == low - 1:
-                    low = bid
-                else:
-                    _run(out, cuts, tier, low, high + 1, removed)
-                    low = high = bid
-            _run(out, cuts, tier, low, high + 1, removed)
-
-
-def _run(
-    out: list[InventoryDelta],
-    cuts: dict[int, int],
-    tier: int,
-    low: int,
-    high: int,
-    removed: bool,
-) -> None:
-    """Append block ids ``[low, high)`` to ``out``, joining earlier deltas."""
-    while low < high:
-        stream, start = low >> INDEX_BITS, low & INDEX_MASK
-        end = min(start + high - low, INDEX_MASK + 1)
-        low += end - start
-        if removed:
-            index = cuts.get(stream)
-            if index is None:
-                cuts[stream] = len(out)
-                out.append((tier, stream, start, end, True))
-            else:
-                cut = out[index]
-                out[index] = (tier, stream, min(cut[2], start), max(cut[3], end), True)
-            continue
-        cuts.pop(stream, None)
-        if out:
-            last = out[-1]
-            if (
-                last[0] == tier
-                and last[1] == stream
-                and last[3] == start
-                and not last[4]
-            ):
-                out[-1] = (tier, stream, last[2], end, False)
-                continue
-        out.append((tier, stream, start, end, False))

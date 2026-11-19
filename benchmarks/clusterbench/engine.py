@@ -10,9 +10,55 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import msgspec
+
 from .config import RunConfig
 from .metrics import Window
 from .protocol import Done, InventoryDelta, Request
+
+
+class HintAction(msgspec.Struct, frozen=True, kw_only=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict = {}
+
+
+class HintEnvelope(msgspec.Struct, frozen=True, kw_only=True):
+    """The ``kv_hints`` envelope a router attaches to a request."""
+
+    protocol_version: str
+    message_id: str
+    actions: list[HintAction] = []
+
+
+def fetch_hint(message_id: str, endpoint: str, hashes: list[int]) -> HintEnvelope:
+    """The envelope Dynamo's router attaches (one ``kv.fetch`` action)."""
+    payload = {"source_control_endpoint": endpoint, "block_hashes": hashes}
+    action = HintAction(
+        action_id="a1", action_type="kv.fetch", action_version="1.0", payload=payload
+    )
+    return HintEnvelope(protocol_version="0.1", message_id=message_id, actions=[action])
+
+
+def failure_cause(entry) -> str:
+    """Why KVCR did not deliver a block: its result's status in lower case
+    (``timeout``, ``unavailable``, ``aborted``, ``failed``), or
+    ``unclassified`` on an older tree, whose results have no reason and call
+    every failure ``FAILED``."""
+    if not hasattr(entry, "reason"):
+        return "unclassified"
+    return entry.status.name.lower()
+
+
+def count_failure(counters, entry) -> str:
+    """Count one hinted block that a peer did not deliver; returns its cause."""
+    cause = failure_cause(entry)
+    counters[f"hinted_failed|{cause}"] += 1
+    reason = getattr(entry, "reason", None)
+    if reason:
+        counters[f"hinted_failed_reason|{reason}"] += 1
+    return cause
 
 
 class Engine(Protocol):

@@ -9,7 +9,7 @@ from pathlib import Path
 import msgspec
 
 
-class TierConfig(msgspec.Struct, frozen=True, kw_only=True):
+class TierConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     # Bytes KVCR moves per block. Host-path cost scales with block count, so
     # the default is far below a real KV block (several MiB) to fit many
     # workers per node; raise it for a data-plane calibration cell.
@@ -36,10 +36,10 @@ class TierConfig(msgspec.Struct, frozen=True, kw_only=True):
         return self.block_bytes // self.pieces
 
 
-class EngineConfig(msgspec.Struct, frozen=True, kw_only=True):
-    # "vllm": vLLM's KVCR offload tier. "sglang": SGLang's KVCR direct linker,
-    # which fixes several of the options below itself (no source pins, no
-    # opportunistic query, prompt and output both backed up).
+class EngineConfig(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
+    # "vllm": vLLM's KVCR offload tier. "sglang": SGLang's KVCR direct linker.
     profile: str = "vllm"
     # Modelled forward pass, GIL released: step_ms + prefill_us_per_token * tokens.
     step_ms: float = 20.0
@@ -47,35 +47,15 @@ class EngineConfig(msgspec.Struct, frozen=True, kw_only=True):
     idle_sleep_ms: float = 1.0
     max_batched_tokens: int = 8192
     max_running: int = 64
-    offload_prompt_only: bool = True
-    # vLLM adapter defaults.
     operation_timeout_ms: int = 1000
     abandon_timeout_ms: int = 5000
-    eager_ctrl_connect: bool = True
-    opportunistic_query: bool = True
-    metadata_retry_interval_ms: int = 100
     # Check delivered bytes: "none", "sample" (first block per load) or "full".
     verify: str = "sample"
-    # SGLang profile: its scheduler loop spins when it has nothing to run
-    # (``--sleep-on-idle`` off, the default); True sleeps ``idle_sleep_ms``.
-    sleep_on_idle: bool = False
-    # What-if switches. The defaults are what the engines do today; anything
-    # else measures a change to the engine's integration, not to KVCR.
-    # vLLM: align a request's sequence only when it finishes, not after every
-    # completed deliver or deposit as well.
-    align_on_finish_only: bool = False
-    # SGLang linker: layers named by one deliver (upstream 1), deliver
-    # operations outstanding at once (upstream 4), and whether pages just
-    # restored from KVCR are backed up again (upstream: yes).
-    linker_layers_per_deliver: int = 1
-    linker_max_deliveries: int = 4
-    linker_backup_restored: bool = True
-    # SGLang linker: pieces per deposit (upstream 4096, which is 32 pages of a
-    # 64-layer model; upstream's 512 MiB bound gives the same 32 real pages).
-    linker_deposit_pieces: int = 4096
 
 
-class WorkloadConfig(msgspec.Struct, frozen=True, kw_only=True):
+class WorkloadConfig(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
     """Closed-loop agent sessions. Sizes are lognormal(median, sigma) in tokens.
 
     Defaults follow the Claude Code traces the team replays (64-token blocks):
@@ -103,56 +83,46 @@ class WorkloadConfig(msgspec.Struct, frozen=True, kw_only=True):
     reset_context_median: int = 8000
     # Spread session starts over this long so workers do not all prefill at once.
     ramp_s: float = 5.0
-    # Start the initial sessions mid-life (contexts already grown), so the
-    # tiers reach their steady state within the fill phase. Sessions that
-    # replace ended ones always start fresh.
-    aged_start: bool = True
     # Replay a compiled trace (``python -m clusterbench trace``) instead of
     # generating sessions. Of the fields above only ``seed``,
-    # ``sessions_per_worker`` (live plays), ``think_cap_s``, ``ramp_s`` and
-    # ``aged_start`` (start part-way through the trace) then apply; recorded
-    # waits are multiplied by ``trace_think_scale`` before the cap, and answer
-    # lengths by ``trace_output_scale`` (below 1 a rank spends less of its
-    # time decoding; the blocks a shortened answer no longer covers are
-    # computed as part of the next prompt instead).
+    # ``sessions_per_worker`` (live plays), ``think_cap_s`` and ``ramp_s``
+    # then apply. Recorded waits are multiplied by ``trace_think_scale``
+    # before the cap, and answer lengths by ``trace_output_scale`` (below 1 a
+    # rank spends less of its time decoding; the blocks a shortened answer no
+    # longer covers are computed as part of the next prompt instead).
     trace: str = ""
     trace_think_scale: float = 1.0
     trace_output_scale: float = 1.0
 
 
-class RouterConfig(msgspec.Struct, frozen=True, kw_only=True):
-    # "sticky": a session stays on its home worker and moves with
-    # migration_prob per turn, independent of load (same offered work in both
-    # A/B arms). "cost": Dynamo's default KV-router formula.
-    mode: str = "sticky"
+class RouterConfig(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
+    # A session stays on its home worker and moves with this probability per
+    # turn, whatever the load, so both A/B arms are offered the same work.
     migration_prob: float = 0.05
     # A migrating session goes to the emptiest worker; when several are equally
     # empty, the probability that it picks one on its own node.
     same_node_prob: float = 0.0
-    hints: bool = True
-    device_credit: float = 1.0
-    host_credit: float = 0.75
     seed: int = 0
 
 
-class PhaseConfig(msgspec.Struct, frozen=True, kw_only=True):
+class PhaseConfig(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
     # "full": every ordered pair exchanges one block before the workload
     # starts, so the window does not measure first-contact peer setup.
     mesh_warm: str = "full"
     warm_concurrency: int = 8
-    warm_timeout_s: float = 300.0
     fill_s: float = 20.0
     measure_s: float = 60.0
     drain_s: float = 10.0
-    stats_interval_s: float = 1.0
-    inventory_flush_ms: float = 50.0
-    register_timeout_s: float = 300.0
     # Flag the run if any worker's CPU tier is emptier than this when the
     # window opens: the fill phase was too short to reach steady state.
     min_primary_occupancy: float = 0.0
 
 
-class RunConfig(msgspec.Struct, frozen=True, kw_only=True):
+class RunConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     name: str = "run"
     tiers: TierConfig = TierConfig()
     engine: EngineConfig = EngineConfig()
@@ -187,7 +157,10 @@ def load_config(path: str | Path | None, overrides: list[str] = ()) -> RunConfig
         for section in sections:
             node = node.setdefault(section, {})
         node[field] = _coerce(value)
-    config = msgspec.convert(data, RunConfig)
+    try:
+        config = msgspec.convert(data, RunConfig)
+    except msgspec.ValidationError as error:  # an unknown option, or a bad type
+        raise ValueError(f"bad config: {error}") from None
     validate(config)
     return config
 
@@ -212,12 +185,6 @@ def validate(config: RunConfig) -> None:
         raise ValueError("a worker with no G2 pool and no pinning cannot be a source")
     if engine.abandon_timeout_ms < 2 * engine.operation_timeout_ms:
         raise ValueError("engine.abandon_timeout_ms must be >= 2x operation timeout")
-    if (
-        engine.linker_layers_per_deliver < 1
-        or engine.linker_max_deliveries < 1
-        or engine.linker_deposit_pieces < 1
-    ):
-        raise ValueError("engine.linker_* counts must be at least 1")
     if engine.verify not in ("none", "sample", "full"):
         raise ValueError("engine.verify must be none, sample or full")
     # The trace file itself is opened by the coordinator only: workers decode
@@ -226,8 +193,6 @@ def validate(config: RunConfig) -> None:
         raise ValueError("workload.trace_think_scale must not be negative")
     if config.workload.trace_output_scale <= 0:
         raise ValueError("workload.trace_output_scale must be positive")
-    if config.router.mode not in ("sticky", "cost"):
-        raise ValueError("router.mode must be sticky or cost")
     if config.phases.mesh_warm not in ("full", "none"):
         raise ValueError("phases.mesh_warm must be full or none")
 

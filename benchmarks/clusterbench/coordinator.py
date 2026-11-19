@@ -39,6 +39,10 @@ REQUEST_FIELDS = (
 )  # fmt: skip
 
 
+REGISTER_TIMEOUT_S = 300.0
+WARM_TIMEOUT_S = 300.0
+
+
 class RunFailed(RuntimeError):
     pass
 
@@ -109,7 +113,15 @@ class Coordinator:
 
     # ---- run ---------------------------------------------------------------
 
-    def run(self, expect: int, expect_sha: str = "", per_node: int = 0) -> dict:
+    def run(
+        self,
+        expect: int,
+        expect_sha: str = "",
+        per_node: int = 0,
+        expect_kvcr: str = "",
+    ) -> dict:
+        """Run the cell. ``expect_kvcr`` is the directory every worker must
+        have imported ``kvcr`` from (an arm's ``src``)."""
         config, phases = self.config, self.config.phases
         self.out.mkdir(parents=True, exist_ok=True)
         (self.out / "config.json").write_bytes(
@@ -119,7 +131,7 @@ class Coordinator:
         # Register.
         self._ids = {}
         hellos: dict[bytes, protocol.Hello] = {}
-        deadline = time.monotonic() + phases.register_timeout_s
+        deadline = time.monotonic() + REGISTER_TIMEOUT_S
         while len(hellos) < expect:
             left = deadline - time.monotonic()
             if left <= 0:
@@ -146,6 +158,11 @@ class Coordinator:
             raise RunFailed(f"expected {per_node} workers per node, got {counts}")
         if expect_sha and shas != [expect_sha]:
             raise RunFailed(f"expected KVCR {expect_sha}, workers run {shas}")
+        if expect_kvcr:
+            # A wrong path falls back to the installed kvcr without a sound.
+            root = Path(expect_kvcr).resolve()
+            if any(root not in Path(file).parents for file in files):
+                raise RunFailed(f"workers loaded KVCR from {files}, not from {root}")
         (self.out / "workers.json").write_text(
             json.dumps([msgspec.to_builtins(h) for h in hello], indent=1)
         )
@@ -159,14 +176,14 @@ class Coordinator:
         self._reports: dict[int, dict] = {}
         for worker in range(workers):
             self._send(worker, protocol.Configure(worker, blob, peers))
-        self._barrier("configure", phases.register_timeout_s, self._background)
+        self._barrier("configure", REGISTER_TIMEOUT_S, self._background)
 
         # Mesh warm.
         warm = {}
         if phases.mesh_warm == "full" and workers > 1:
             for worker in range(workers):
                 self._send(worker, protocol.Phase("warm"))
-            warm = self._barrier("warm", phases.warm_timeout_s, self._background)
+            warm = self._barrier("warm", WARM_TIMEOUT_S, self._background)
 
         summary = self._drive(router, nodes)
         self._timeseries.close()
@@ -217,7 +234,9 @@ class Coordinator:
         due: list[tuple[float, int]] = []
         start = clock()
         for _ in range(max(1, round(config.workload.sessions_per_worker * workers))):
-            session = workload.new_session(aged=config.workload.aged_start)
+            # The first sessions start mid-life (contexts already grown), so
+            # the tiers reach their steady state within the fill phase.
+            session = workload.new_session(aged=True)
             heapq.heappush(
                 due, (start + rng.random() * config.workload.ramp_s, session.id)
             )
@@ -247,7 +266,6 @@ class Coordinator:
                 if entry is None:
                     return
                 turn, sent = entry
-                source, hinted = sent[3], sent[4]
                 outcome = (
                     message.remote_blocks,
                     message.failed_blocks,
@@ -257,9 +275,8 @@ class Coordinator:
                     message.aborted,
                 )
                 log.write(b"\n" + encode(sent + outcome))
-                router.done(message.rid)
                 if measuring and not stopped:
-                    self._tally_done(tally, message, worker, source, hinted, nodes)
+                    self._tally_done(tally, message, worker, sent[3], nodes)
                 if stopped:
                     return
                 # The workload says what this sets off: the session's next
@@ -279,7 +296,6 @@ class Coordinator:
                 if len(measure_acks) == workers:
                     measuring = True
                     stop_at = clock() + phases.measure_s
-                    tally["measure_started"] = time.time()
                     waiting_before = waiting
             else:
                 self._background(worker, message)
@@ -294,14 +310,14 @@ class Coordinator:
                         router.forget(session)
                         heapq.heappush(due, (now, workload.new_session().id))
                         continue
-                    lag.add(now - when)
-                    route = router.route(
-                        turn.session, turn.turn, turn.segments, turn.prompt_tokens
-                    )
+                    route = router.route(turn.session, turn.segments)
                     rid = next_rid
                     next_rid += 1
                     blocks = segment_blocks(turn.segments)
-                    router.dispatched(rid, route, blocks, turn.prompt_tokens)
+                    # Per request: turns that fall due together still go out
+                    # one after another.
+                    sent_at = clock()
+                    lag.add(sent_at - when)
                     self._send(
                         route.worker,
                         protocol.Request(
@@ -323,7 +339,7 @@ class Coordinator:
                             route.worker,
                             route.hint_source,
                             route.hint_blocks,
-                            round((now - start) * 1e3, 3),
+                            round((sent_at - start) * 1e3, 3),
                             measuring,
                             blocks,
                             route.local_blocks,
@@ -380,11 +396,8 @@ class Coordinator:
         log.close()
         tally["lag"] = lag.to_json()
         tally["sessions_started"] = workload.started
-        tally["inflight_at_stop"] = len(inflight)
         tally["inflight_max"] = inflight_max
         tally["workload"] = workload.summary()
-        tally["ttft"] = tally["ttft"].to_json()
-        tally["ttft_remote"] = tally["ttft_remote"].to_json()
         return tally
 
     @staticmethod
@@ -411,18 +424,15 @@ class Coordinator:
                 "primary_blocks",
                 "prompt_blocks",
                 "prefill_tokens",
-                "hinted_blocks_completed",
             ),
             0,
         )
-        tally["ttft"] = LogHist()
-        tally["ttft_remote"] = LogHist()
         tally["primary_occupancy_min"] = 1.0  # emptiest host tier at window start
         tally["busy_s"] = 0.0  # window time not spent waiting
         return tally
 
     @staticmethod
-    def _tally_done(tally, done, worker, source, hinted, nodes) -> None:
+    def _tally_done(tally, done, worker, source, nodes) -> None:
         if done.aborted:
             # Dropped by the engine: no first token and nothing reused.
             tally["aborted"] += 1
@@ -435,12 +445,8 @@ class Coordinator:
         tally["failed_blocks"] += done.failed_blocks
         tally["timed_out_blocks"] += done.timed_out_blocks
         tally["prefill_tokens"] += done.recomputed_tokens
-        tally["ttft"].add(done.ttft_ms / 1e3)
-        if source >= 0:
-            tally["hinted_blocks_completed"] += hinted
         if done.remote_blocks:
             tally["remote_requests"] += 1
-            tally["ttft_remote"].add(done.ttft_ms / 1e3)
             same = source >= 0 and nodes[worker] == nodes[source]
             tally[
                 "remote_blocks_same_node" if same else "remote_blocks_cross_node"

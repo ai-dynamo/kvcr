@@ -78,18 +78,25 @@ def kvcr_identity() -> tuple[str, str]:
         return str(path), "unknown"
 
 
-def _core_groups(cpus: list[int]) -> list[list[int]]:
-    """The CPUs grouped by physical core, in (package, core) order."""
+def physical_cores(cpus) -> dict[tuple[int, int], list[int]]:
+    """The CPUs by physical core: (package, core id) -> its hyperthreads."""
     cores: dict[tuple[int, int], list[int]] = {}
-    for cpu in cpus:
+    for cpu in sorted(cpus):
         base = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
         try:
-            core = int((base / "core_id").read_text())
-            package = int((base / "physical_package_id").read_text())
+            key = (
+                int((base / "physical_package_id").read_text()),
+                int((base / "core_id").read_text()),
+            )
         except (OSError, ValueError):
-            core, package = cpu, 0
-        cores.setdefault((package, core), []).append(cpu)
-    return [sorted(group) for _, group in sorted(cores.items())]
+            key = (0, cpu)
+        cores.setdefault(key, []).append(cpu)
+    return cores
+
+
+def core_groups(cpus) -> list[list[int]]:
+    """The CPUs grouped by physical core, in (package, core) order."""
+    return [group for _, group in sorted(physical_cores(cpus).items())]
 
 
 def plan_affinity(cpus: list[int]) -> tuple[int | None, int | None, list[int]]:
@@ -99,7 +106,7 @@ def plan_affinity(cpus: list[int]) -> tuple[int | None, int | None, list[int]]:
     own physical core and its sibling is left idle; everything else (NIXL, UCX
     and ZMQ threads) shares the remaining cores.
     """
-    groups = _core_groups(cpus)
+    groups = core_groups(cpus)
     if len(groups) < 3:
         return None, None, sorted(cpus)
     native = [cpu for group in groups[2:] for cpu in group]
@@ -114,7 +121,7 @@ def plan_linker_affinity(
     Returns (scheduler, owner, kvcr-progress, native). The owner spins while
     transfers are pending, so it must not share a core with the scheduler.
     """
-    groups = _core_groups(cpus)
+    groups = core_groups(cpus)
     if len(groups) < 4:
         return None, None, None, sorted(cpus)
     native = [cpu for group in groups[3:] for cpu in group]
@@ -128,22 +135,14 @@ def auto_cpus(local_id: int, per_node: int, reserve: int = 2) -> tuple[list[int]
     physical cores (all hyperthreads). The first ``reserve`` cores of every
     socket are left for the OS, the coordinator and profilers.
     """
-    sockets: dict[int, dict[int, list[int]]] = {}
-    for cpu in sorted(os.sched_getaffinity(0)):
-        base = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = int((base / "physical_package_id").read_text())
-            core = int((base / "core_id").read_text())
-        except (OSError, ValueError):
-            package, core = 0, cpu
-        sockets.setdefault(package, {}).setdefault(core, []).append(cpu)
+    sockets: dict[int, list[list[int]]] = {}
+    for (package, _), group in sorted(physical_cores(os.sched_getaffinity(0)).items()):
+        sockets.setdefault(package, []).append(group)
     packages = sorted(sockets)
     socket = local_id % len(packages)
     slot = local_id // len(packages)
     per_socket = -(-per_node // len(packages))
-    cores = [
-        sockets[packages[socket]][core] for core in sorted(sockets[packages[socket]])
-    ]
+    cores = sockets[packages[socket]]
     usable = cores[reserve:] if len(cores) > reserve + 3 * per_socket else cores
     width = len(usable) // per_socket
     if width < 3:
@@ -202,7 +201,6 @@ class Host:
             local_dram = LocalDramOptions(pools=[("", g2_addr, len(self.g2))])
 
         self.control = ZmqPeerControlChannel(bind_host, control_port, advertise_host)
-        self.endpoint = self.control.endpoint
 
         remote = {}
         pins = dict(
@@ -255,9 +253,10 @@ class Host:
                 local_dram=local_dram,
                 remote_fw_dram=_filtered(
                     RemoteFWDramOptions,
-                    eager_ctrl_connect=engine.eager_ctrl_connect,
-                    opportunistic_query=engine.opportunistic_query,
-                    metadata_retry_interval_ms=engine.metadata_retry_interval_ms,
+                    # vLLM's adapter defaults.
+                    eager_ctrl_connect=True,
+                    opportunistic_query=True,
+                    metadata_retry_interval_ms=100,
                     **remote,
                 ),
             ),
@@ -314,7 +313,6 @@ class LinkerHost:
     ) -> None:
         self.agent_name = agent_name
         self.piece_bytes = piece = tiers.piece_bytes
-        self.pages = tiers.gpu_blocks
         layers = tiers.layers
         self.pool = f"kv_{piece}"
         # Upstream labels: ``<pool>:c<component>.b<buffer>``; K is component 0.
@@ -341,7 +339,6 @@ class LinkerHost:
             "native": native,
         }
         self.kvcr = None
-        self.endpoint = f"tcp://{advertise_host}:{control_port}"
         self._closed = False
 
     def bind(self, port) -> None:
@@ -381,7 +378,6 @@ class LinkerHost:
             # Threads KVCR and NIXL start inherit this mask.
             os.sched_setaffinity(0, native)
         self.control = ZmqPeerControlChannel(bind_host, control_port, advertise_host)
-        self.endpoint = self.control.endpoint
         self.kvcr = KVCR(
             KVCRConfig(
                 nixl_agent_name=self.agent_name,

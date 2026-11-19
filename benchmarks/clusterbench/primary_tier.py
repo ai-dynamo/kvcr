@@ -7,7 +7,10 @@ Both evict like vLLM's ``LRUCachePolicy``: every block is ranked
 request, the tail goes before the head. What survives is a root-aligned
 prefix, which a plain per-block LRU would not give.
 
-``StreamCache`` is the device tier: membership only, tracked per stream.
+``StreamCache`` is the device tier: membership only, tracked per stream. A
+running request reserves room for all of its blocks when it is admitted and
+pins the cached prefix it reuses. vLLM allocates as a request grows and
+preempts when it runs out; that is not modelled.
 
 ``PrimaryTier`` is the CPU offload tier (vLLM
 ``CPUPrimaryTierOffloadingManager``): slots and reference counts, -1 while a
@@ -52,6 +55,11 @@ class StreamCache:
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
+        # Blocks reserved by running requests, beyond the prefix they reuse.
+        self.live = 0
+        # Per stream, the leading blocks each running request reuses.
+        self._pins: dict[int, list[int]] = {}
+        self._pinned = 0  # blocks no eviction may take: the longest pin per stream
         self._length: dict[int, int] = {}
         self._code: dict[int, int] = {}  # rank << 8 | (255 - place in request)
         self._heap: list[tuple[int, int]] = []  # (code, stream), stale ones skipped
@@ -106,30 +114,86 @@ class StreamCache:
             if codes.get(stream, -1) < code:
                 codes[stream] = code
                 heapq.heappush(heap, (code, stream))
-        if self._blocks > self.capacity:
+        if self._blocks + self.live > self.capacity:
             self._evict()
         if len(heap) > 4 * len(codes) + 1024:
             self._heap = [(code, stream) for stream, code in codes.items()]
             heapq.heapify(self._heap)
 
+    def admit(
+        self, segments: Iterable[Segment], need: int
+    ) -> list[tuple[int, int]] | None:
+        """Make room for a request that is about to run.
+
+        ``need`` is its blocks beyond the cached prefix, which is pinned until
+        ``release``. Unpinned blocks are evicted to fit them. Returns the pins
+        to hand back, or None, with nothing evicted, if the request does not
+        fit beside the ones running.
+        """
+        length = self._length
+        pins: list[tuple[int, int]] = []
+        for stream, start, end in segments:
+            held = length.get(stream, 0)
+            if held <= start:
+                break
+            pins.append((stream, min(held, end)))
+            if held < end:
+                break
+        self._repin(pins, True)
+        if self._pinned + self.live + need > self.capacity:
+            self._repin(pins, False)
+            return None
+        self.live += need
+        if self._blocks + self.live > self.capacity:
+            self._evict()
+        return pins
+
+    def release(self, pins: Iterable[tuple[int, int]], need: int) -> None:
+        """Undo ``admit``: the request finished or was dropped."""
+        self._repin(pins, False)
+        self.live -= need
+
+    def _repin(self, pins: Iterable[tuple[int, int]], add: bool) -> None:
+        held = self._pins
+        for stream, floor in pins:
+            floors = held.get(stream)
+            before = max(floors) if floors else 0
+            if add:
+                if floors is None:
+                    floors = held[stream] = []
+                floors.append(floor)
+            else:
+                floors.remove(floor)
+                if not floors:
+                    del held[stream]
+            self._pinned += (max(floors) if floors else 0) - before
+
     def _evict(self) -> None:
-        length, codes, heap = self._length, self._code, self._heap
-        over = self._blocks - self.capacity
+        length, codes, heap, pins = self._length, self._code, self._heap, self._pins
+        over = self._blocks + self.live - self.capacity
+        pinned: list[tuple[int, int]] = []
         while over > 0 and heap:
             code, stream = heap[0]
             if codes.get(stream) != code:
                 heapq.heappop(heap)  # the stream was used again, or is gone
                 continue
             held = length[stream]
-            take = min(over, held)
+            floors = pins.get(stream)
+            take = min(over, held - max(floors)) if floors else min(over, held)
             if take == held:
                 heapq.heappop(heap)
                 del length[stream], codes[stream]
-            else:
+            elif take:
                 length[stream] = held - take
-            self.events.append((stream, held - take, held, True))
-            self._blocks -= take
-            over -= take
+            if take:
+                self.events.append((stream, held - take, held, True))
+                self._blocks -= take
+                over -= take
+            if over > 0 and take < held:
+                # Down to its pinned blocks: look past it, and keep its place.
+                pinned.append(heapq.heappop(heap))
+        for entry in pinned:
+            heapq.heappush(heap, entry)
 
 
 class PrimaryTier:
@@ -232,9 +296,8 @@ class PrimaryTier:
         self._victim_rank = -1
         self._bucket_limit = max(_MIN_BUCKET_LIMIT, 2 * len(buckets))
 
-    def _take_slot(self) -> int | None:
-        if self._free:
-            return self._free.pop()
+    def _next_victim(self) -> bytes | None:
+        """Take the next key to evict off the queues; it stays in the tier."""
         codes, ref, ranks = self._codes, self._ref, self._bucket_ranks
         while True:
             victims = self._victims
@@ -246,11 +309,20 @@ class PrimaryTier:
             code = codes.get(key)
             if code is None or code >> _SHIFT != self._victim_rank or ref[key] != 0:
                 continue  # stale entry, or no longer evictable
-            slot = self._slot.pop(key)
-            del ref[key], codes[key]
-            self._evicted.append(key)
-            self.evictions += 1
-            return slot
+            return key
+
+    def _evict(self, key: bytes) -> int:
+        slot = self._slot.pop(key)
+        del self._ref[key], self._codes[key]
+        self._evicted.append(key)
+        self.evictions += 1
+        return slot
+
+    def _take_slot(self) -> int | None:
+        if self._free:
+            return self._free.pop()
+        key = self._next_victim()
+        return None if key is None else self._evict(key)
 
     # ---- lookups -----------------------------------------------------------
 
@@ -321,21 +393,41 @@ class PrimaryTier:
     ) -> list[tuple[bytes, int]] | None:
         """Allocate slots for keys not yet present; None if the tier is full.
 
-        Nothing is allocated on failure, like vLLM's all-or-nothing store.
+        All or nothing, like vLLM's store: the victims are chosen first, never
+        from ``keys``, and evicted only if there are enough of them.
         """
-        taken: list[tuple[bytes, int]] = []
         ref, codes, slots, free = self._ref, self._codes, self._slot, self._free
-        base = (rank << _SHIFT) | _MASK
+        missing: list[tuple[bytes, int]] = []
+        present: set[bytes] = set()
         for key, position in zip(keys, positions):
             if key in ref:
-                continue
-            slot = free.pop() if free else self._take_slot()
-            if slot is None:
-                for done, done_slot in taken:
-                    del slots[done], ref[done], codes[done]
-                    free.append(done_slot)
+                present.add(key)
+            else:
+                missing.append((key, position))
+        short = len(missing) - len(free)
+        if short > 0:
+            victims: list[bytes] = []
+            spared: list[bytes] = []
+            seen: set[bytes] = set()
+            while len(victims) < short:
+                key = self._next_victim()
+                if key is None:
+                    spared += victims  # too few: none of them goes
+                    break
+                if key in seen:
+                    continue  # a key can be queued more than once
+                seen.add(key)
+                (spared if key in present else victims).append(key)
+            for key in spared:
+                self._bucket(codes[key] >> _SHIFT).append(key)  # back in the queue
+            if len(victims) < short:
                 self.allocation_failures += 1
                 return None
+            free.extend(self._evict(key) for key in victims)
+        base = (rank << _SHIFT) | _MASK
+        taken: list[tuple[bytes, int]] = []
+        for key, position in missing:
+            slot = free.pop()
             slots[key] = slot
             ref[key] = _WRITING
             codes[key] = base - position

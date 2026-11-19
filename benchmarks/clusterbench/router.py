@@ -3,16 +3,17 @@
 """Synthetic KV router: a global inventory, worker selection and fetch hints.
 
 The inventory keeps, per worker, tier and stream, the length of the
-root-aligned run it holds. That matches how the workload uses streams and how
-the engines evict (tail first), and it is all a prefix-overlap router needs.
+root-aligned run it holds. That matches how the workload uses streams, and it
+is all a prefix-overlap router needs. Workers report a tier that can have
+gaps through a ``PrefixTracker``.
 
-Selection is either "sticky" (session affinity with a seeded migration
-probability, independent of how busy workers are) or "cost" (Dynamo's default
-KV-router formula). A migrating session goes to the worker with the fewest
-sessions, as any load-aware router would send it: uniformly random targets
-pile sessions onto a few workers, whose caches then thrash while the rest sit
-idle. The hint rule is Dynamo's: after selection, name the peer holding the
-longest root-aligned prefix if that beats what the chosen worker holds.
+Selection is sticky: a session stays on its home worker and moves with a
+seeded probability per turn, however busy workers are. A migrating session
+goes to the worker with the fewest sessions, as any load-aware router would
+send it: uniformly random targets pile sessions onto a few workers, whose
+caches then thrash while the rest sit idle. The hint rule is Dynamo's: after
+selection, name the peer holding the longest root-aligned prefix if that beats
+what the chosen worker holds.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
 from .config import RouterConfig, TierConfig
-from .ids import Segment, segment_blocks
+from .ids import INDEX_BITS, INDEX_MASK, Segment
 from .protocol import TIER_DEVICE, TIER_G2, TIER_PRIMARY, InventoryDelta
 
 
@@ -85,6 +86,94 @@ class Inventory:
         return total
 
 
+class PrefixTracker:
+    """A worker's view of one tier, reported as root-aligned prefix changes.
+
+    ``Inventory`` keeps one prefix length per stream, but a host tier can lose
+    a block from the middle of a stream and get it back (a pinned tail, or
+    KVCR evicting in access order). The tracker knows every block and reports
+    only changes to the true prefix.
+    """
+
+    def __init__(self, tier: int) -> None:
+        self._tier = tier
+        self._blocks: dict[int, set[int]] = {}
+        self._prefix: dict[int, int] = {}
+        self.count = 0
+        self._deltas: list[InventoryDelta] = []
+
+    def take(self) -> list[InventoryDelta]:
+        deltas, self._deltas = self._deltas, []
+        return deltas
+
+    def apply(self, removed: bool, ids: Sequence[int]) -> None:
+        """Block ids that entered or left the tier, in the order they did."""
+        if removed:
+            for bid in ids:
+                self.remove(bid >> INDEX_BITS, bid & INDEX_MASK)
+            return
+        first = previous = None
+        for bid in ids:
+            if first is None:
+                first = bid
+            elif bid != previous + 1 or not bid & INDEX_MASK:
+                self._add_run(first, previous)
+                first = bid
+            previous = bid
+        if first is not None:
+            self._add_run(first, previous)
+
+    def _add_run(self, first: int, last: int) -> None:
+        start = first & INDEX_MASK
+        self.add(first >> INDEX_BITS, start, start + last - first + 1)
+
+    def add(self, stream: int, start: int, end: int) -> None:
+        blocks = self._blocks.get(stream)
+        if blocks is None:
+            blocks = self._blocks[stream] = set()
+        before = len(blocks)
+        blocks.update(range(start, end))
+        self.count += len(blocks) - before
+        prefix = self._prefix.get(stream, 0)
+        if start <= prefix:
+            new = max(prefix, end)
+            while new in blocks:
+                new += 1
+            if new > prefix:
+                self._prefix[stream] = new
+                self._delta(stream, prefix, new, False)
+
+    def remove(self, stream: int, index: int) -> None:
+        blocks = self._blocks.get(stream)
+        if blocks is None or index not in blocks:
+            return
+        blocks.remove(index)
+        self.count -= 1
+        prefix = self._prefix.get(stream, 0)
+        if index < prefix:
+            self._delta(stream, index, prefix, True)
+            if index:
+                self._prefix[stream] = index
+            else:
+                del self._prefix[stream]
+        if not blocks:
+            del self._blocks[stream]
+
+    def _delta(self, stream: int, start: int, end: int, removed: bool) -> None:
+        deltas = self._deltas
+        if deltas:
+            # A run added or evicted block by block travels as one delta.
+            _, last_stream, last_start, last_end, last_removed = deltas[-1]
+            if last_stream == stream and last_removed == removed:
+                if removed and end == last_start:
+                    deltas[-1] = (self._tier, stream, start, last_end, True)
+                    return
+                if not removed and start == last_end:
+                    deltas[-1] = (self._tier, stream, last_start, end, False)
+                    return
+        deltas.append((self._tier, stream, start, end, removed))
+
+
 class Route(NamedTuple):
     worker: int
     local_blocks: int  # prefix the chosen worker already holds
@@ -100,7 +189,6 @@ class Router:
         self._config = config
         self._nodes = list(nodes)
         self._workers = len(nodes)
-        self._block = tiers.tokens_per_block
         self.inventory = Inventory(self._workers)
         self._local_tiers = (TIER_DEVICE, TIER_PRIMARY, TIER_G2)
         # A peer can only serve what it holds in host memory it can expose.
@@ -111,13 +199,8 @@ class Router:
             source_tiers.append(TIER_G2)
         self._source_tiers = tuple(source_tiers)
         self._home: dict[int, int] = {}
-        self._resident = [0] * self._workers  # sticky mode: sessions per worker
+        self._resident = [0] * self._workers  # sessions per worker
         self._rngs: dict[int, random.Random] = {}
-        self._tie_rng = random.Random(config.seed)
-        # Cost-mode load: projected active blocks and queued prefill tokens.
-        self._active_blocks = [0] * self._workers
-        self._prefill_tokens = [0] * self._workers
-        self._inflight: dict[int, tuple[int, int, int]] = {}
 
     def same_node(self, a: int, b: int) -> bool:
         return self._nodes[a] == self._nodes[b]
@@ -129,7 +212,7 @@ class Router:
             rng = self._rngs[session] = random.Random(seed)
         return rng
 
-    def _sticky(self, session: int, turn: int) -> tuple[int, bool]:
+    def _place(self, session: int) -> tuple[int, bool]:
         home = self._home.get(session)
         resident = self._resident
         if home is None:
@@ -163,40 +246,11 @@ class Router:
         self._home[session] = target
         return target, True
 
-    def _cost(self, segments: Sequence[Segment], prompt_tokens: int) -> int:
-        config = self._config
-        request_blocks = segment_blocks(segments)
-        best: list[int] = []
-        best_cost = float("inf")
-        for worker in range(self._workers):
-            device = self.inventory.prefix(worker, segments, (TIER_DEVICE,))
-            local = self.inventory.prefix(worker, segments, self._local_tiers)
-            credit = config.device_credit * device + config.host_credit * max(
-                0, local - device
-            )
-            prefill = (self._prefill_tokens[worker] + prompt_tokens) / self._block
-            cost = max(0.0, prefill - credit)
-            cost += self._active_blocks[worker] + request_blocks
-            if cost < best_cost:
-                best, best_cost = [worker], cost
-            elif cost == best_cost:
-                best.append(worker)
-        return best[0] if len(best) == 1 else self._tie_rng.choice(best)
-
-    def route(
-        self, session: int, turn: int, segments: Sequence[Segment], prompt_tokens: int
-    ) -> Route:
-        migrated = False
-        if self._config.mode == "cost":
-            previous = self._home.get(session)
-            worker = self._cost(segments, prompt_tokens)
-            migrated = previous is not None and previous != worker
-            self._home[session] = worker
-        else:
-            worker, migrated = self._sticky(session, turn)
+    def route(self, session: int, segments: Sequence[Segment]) -> Route:
+        worker, migrated = self._place(session)
         local = self.inventory.prefix(worker, segments, self._local_tiers)
         source, source_blocks = -1, local
-        if self._config.hints and self._source_tiers:
+        if self._source_tiers:
             # To hold a longer prefix a peer must hold the block the chosen
             # worker stops at, so only holders of that block's stream can win.
             inventory = self.inventory
@@ -214,21 +268,8 @@ class Router:
         hint_blocks = source_blocks if source >= 0 else 0
         return Route(worker, local, source, hint_blocks, migrated)
 
-    def dispatched(self, rid: int, route: Route, blocks: int, tokens: int) -> None:
-        uncached = max(0, tokens - route.local_blocks * self._block)
-        self._inflight[rid] = (route.worker, blocks, uncached)
-        self._active_blocks[route.worker] += blocks
-        self._prefill_tokens[route.worker] += uncached
-
-    def done(self, rid: int) -> None:
-        entry = self._inflight.pop(rid, None)
-        if entry is not None:
-            worker, blocks, uncached = entry
-            self._active_blocks[worker] -= blocks
-            self._prefill_tokens[worker] -= uncached
-
     def forget(self, session: int) -> None:
         home = self._home.pop(session, None)
-        if home is not None and self._config.mode != "cost":
+        if home is not None:
             self._resident[home] -= 1
         self._rngs.pop(session, None)

@@ -24,9 +24,10 @@ This file is the scheduler side. One iteration, in SGLang's order:
    admission until a running request leaves; with nothing running it is
    matched again on every iteration. An admitted request with a host hit
    gets one ``load``.
-4. A new prefill batch starts its queued loads, runs its forward waiting on
-   every layer, then waits for the batch to drain. If the batch failed, every
-   request that loaded in it is aborted: nothing is recomputed.
+4. A new prefill batch starts its queued loads and runs its forward, in which
+   each layer waits for its own K and V, so the layers before it compute
+   while it loads. Then it waits for the batch to drain. If the batch failed,
+   every request that loaded in it is aborted: nothing is recomputed.
 5. Results: finished prefills and finished requests insert their pages, and
    every node on the request's path that KVCR does not hold is offloaded,
    including pages just restored from KVCR.
@@ -45,18 +46,21 @@ from collections import deque
 
 from .config import RunConfig
 from .device_tree import DeviceTree, Node
+from .engine import count_failure, failure_cause, fetch_hint
 from .ids import (
     INDEX_BITS,
-    INDEX_MASK,
     HashCache,
     block_id,
+    hash_to_id,
     page_hash,
     segment_ids,
+    split_id,
     warm_stream,
 )
-from .linker_port import Handle, LinkerPort, fetch_hint
+from .linker_port import Handle, LinkerPort
 from .metrics import Window
 from .protocol import TIER_DEVICE, TIER_G2, Done, InventoryDelta, Request
+from .router import PrefixTracker
 
 _WARM_ATTEMPTS = 5
 
@@ -68,56 +72,8 @@ class _Req:
         "total_pages", "arrived", "looked", "started", "first_token", "device_hit",
         "host_hit", "remote_pages", "slots", "path", "computed", "sched",
         "inserted", "walked", "lookups", "hinted", "prefill_tokens", "loaded",
-        "contexts", "remote_flags", "timed_out",
+        "contexts", "remote_flags", "failed", "timed_out",
     )  # fmt: skip
-
-
-class _G2Prefix:
-    """KVCR-held pages per stream, reported as root-aligned prefix changes.
-
-    The router keeps one prefix length per stream. KVCR evicts in access
-    order here (the linker never aligns a sequence), so pages can go from the
-    middle or the head and come back; only changes to the true prefix are
-    reported.
-    """
-
-    def __init__(self) -> None:
-        self._pages: dict[int, set[int]] = {}
-        self._prefix: dict[int, int] = {}
-        self.count = 0
-        self.deltas: list[InventoryDelta] = []
-
-    def add(self, stream: int, start: int, end: int) -> None:
-        pages = self._pages.get(stream)
-        if pages is None:
-            pages = self._pages[stream] = set()
-        before = len(pages)
-        pages.update(range(start, end))
-        self.count += len(pages) - before
-        prefix = self._prefix.get(stream, 0)
-        if start <= prefix:
-            new = max(prefix, end)
-            while new in pages:
-                new += 1
-            if new > prefix:
-                self._prefix[stream] = new
-                self.deltas.append((TIER_G2, stream, prefix, new, False))
-
-    def remove(self, stream: int, index: int) -> None:
-        pages = self._pages.get(stream)
-        if pages is None or index not in pages:
-            return
-        pages.remove(index)
-        self.count -= 1
-        prefix = self._prefix.get(stream, 0)
-        if index < prefix:
-            self.deltas.append((TIER_G2, stream, index, prefix, True))
-            if index:
-                self._prefix[stream] = index
-            else:
-                del self._prefix[stream]
-        if not pages:
-            del self._pages[stream]
 
 
 class SglangEngine:
@@ -129,12 +85,13 @@ class SglangEngine:
         self._worker = worker
         self._page_tokens = tiers.tokens_per_block
         self._layers = tiers.layers
-        window.late_after = engine.operation_timeout_ms / 1e3
         self._warm_slots = config.phases.warm_concurrency
         # Slot 0 holds this worker's warm page; the next ones are warm scratch.
         self._tree = DeviceTree(tiers.gpu_blocks, 1 + self._warm_slots)
         self._hash_cache = HashCache()
-        self._g2 = _G2Prefix()
+        # KVCR evicts in access order here (the linker never aligns a
+        # sequence), so its pool can lose a page from the middle of a stream.
+        self._g2 = PrefixTracker(TIER_G2)
         pieces = tiers.pieces
         if engine.verify == "full":
             self._stamped = range(pieces)
@@ -186,12 +143,7 @@ class SglangEngine:
     def attach(self, host, linker: LinkerPort | None = None) -> None:
         self._host = host
         self._linker = linker or LinkerPort(
-            host,
-            call_timeout_s=60.0 + self._cfg.abandon_timeout_ms / 1e3,
-            layers_per_deliver=self._cfg.linker_layers_per_deliver,
-            max_deliveries=self._cfg.linker_max_deliveries,
-            deposit_pieces=self._cfg.linker_deposit_pieces,
-            operation_timeout_s=self._cfg.operation_timeout_ms / 1e3,
+            host, call_timeout_s=60.0 + self._cfg.abandon_timeout_ms / 1e3
         )
         host.pin_scheduler()
         # The linker freezes the heap and all but disables full collections
@@ -248,7 +200,7 @@ class SglangEngine:
         r.loaded = False
         r.contexts = 0
         r.remote_flags = ()
-        r.timed_out = 0
+        r.failed = r.timed_out = 0
         r.hint = None
         if request.hint_source >= 0 and request.hint_blocks > 0:
             r.hinted = request.hint_blocks
@@ -324,21 +276,27 @@ class SglangEngine:
             # ready_to_load_host_cache: once per new prefill batch.
             index = self._call(linker.start_layer_wise_loading)
             loaders = [r for r in batch if r.host_hit and not r.loaded]
+            tokens = sum(r.sched for r in batch)
+            compute = cfg.step_ms / 1e3 + tokens * cfg.prefill_us_per_token / 1e6
             t0 = perf()
+            end = t0 + compute
             if index >= 0:
-                # Every attention layer waits for its K and its V buffer.
+                # Every attention layer waits for its K and its V buffer, so
+                # a layer computes once it has loaded and the one before it
+                # has computed. One timeline, slept out at the end.
                 counter = linker.layer_done_counter
                 counter.set_consumer(index)
                 wait_until = counter.wait_until
+                per_layer = compute / self._layers
+                end = t0
                 for layer in range(self._layers):
                     wait_until(layer)
                     wait_until(layer)
-                load_wait += perf() - t0
-            t1 = perf()
-            tokens = sum(r.sched for r in batch)
-            time.sleep(cfg.step_ms / 1e3 + tokens * cfg.prefill_us_per_token / 1e6)
+                    end = max(end, perf()) + per_layer
+                load_wait += max(0.0, end - t0 - compute)
+            time.sleep(max(0.0, end - perf()))
             t2 = perf()
-            forward = t2 - t1
+            forward = t2 - t0 - load_wait
             failed = False
             if loaders:
                 blocked = self._blocked
@@ -378,8 +336,7 @@ class SglangEngine:
                 else:
                     still.append(r)
             self._running = still
-        elif cfg.sleep_on_idle:
-            time.sleep(cfg.idle_sleep_ms / 1e3)
+        # With nothing to run the loop spins, as SGLang's does by default.
 
         total = perf() - t_step
         counters = window.counters
@@ -465,35 +422,29 @@ class SglangEngine:
         counters["load_batches"] += 1
         window.hists["deliver_remote" if remote else "deliver_local"].add(duration)
         if failed:
-            failed_keys = info.failed if info else frozenset()
+            failures = info.failed if info else {}
             counters["load_batches_failed"] += 1
-            counters["deliver_blocks_failed"] += len(failed_keys)
-            counters["deliver_blocks_failed_hinted"] += len(failed_keys)
-            counters["aborted_pages"] += pages
-            # Why pages asked of a peer failed: by how long their deliver ran.
-            # The linker only loads what KVCR called restorable, so every page
-            # from a peer was named by the hint.
+            counters["deliver_blocks_failed"] += len(failures)
+            # Each request's own failed pages, from KVCR's results. The linker
+            # only loads what KVCR called restorable, so a page from a peer
+            # was named by the hint.
             encode = self._linker.encode_key
-            late_keys = info.late if info else frozenset()
-            peers: set[bytes] = set()
+            from_peer: dict[bytes, object] = {}
             for r in loaders:
                 hashes = r.hashes[r.device_hit : r.device_hit + r.host_hit]
-                mine = {
-                    encode(page)
-                    for page, is_remote in zip(hashes, r.remote_flags)
-                    if is_remote
-                }
-                r.timed_out = len(mine & late_keys)
-                peers |= mine
-            from_peer = len(failed_keys & peers)
-            if from_peer:
-                late = len(late_keys & peers)
-                counters["deliver_blocks_failed_peer"] += from_peer
-                counters["deliver_blocks_failed_peer_hinted"] += from_peer
-                counters["deliver_blocks_timed_out"] += late
-                counters["deliver_blocks_timed_out_hinted"] += late
-                for seconds in info.failed_seconds:
-                    window.hists["deliver_peer_failed"].add(seconds)
+                for page, is_remote in zip(hashes, r.remote_flags):
+                    key = encode(page)
+                    entry = failures.get(key)
+                    if entry is None:
+                        continue
+                    r.failed += 1
+                    if is_remote:
+                        from_peer[key] = entry
+                        r.timed_out += failure_cause(entry) == "timeout"
+            for entry in from_peer.values():
+                count_failure(counters, entry)
+            # Pages that had not failed go with the batch all the same.
+            counters["aborted_pages"] += pages - sum(r.failed for r in loaders)
             return
         counters["deliver_blocks_remote"] += remote
         counters["deliver_blocks_local"] += pages - remote
@@ -547,16 +498,6 @@ class SglangEngine:
                         stamp_ids.extend(range(first_id, first_id + len(slots) - skip))
                     parent = r.parents.get(stream)
                     restored = max(0, min(high, restored_end) - low)
-                    if restored and not self._cfg.linker_backup_restored:
-                        # What-if: restored pages form their own node, which
-                        # counts as held by KVCR and is not offloaded again.
-                        node = tree.insert(stream, page, slots[:restored], parent)
-                        if node is not None:
-                            node.stored = True
-                            new_nodes.append(node)
-                        page += restored
-                        slots = slots[restored:]
-                        restored = 0
                     node = tree.insert(stream, page, slots, parent) if slots else None
                     if node is not None:
                         new_nodes.append(node)
@@ -621,8 +562,7 @@ class SglangEngine:
         if removals:
             tree, g2 = self._tree, self._g2
             for storage_hash in removals:
-                bid = int(storage_hash[:16], 16)
-                stream, index = bid >> INDEX_BITS, bid & INDEX_MASK
+                stream, index = split_id(hash_to_id(storage_hash))
                 node = tree.node_at(stream, index)
                 if node is not None:
                     node.stored = False
@@ -656,7 +596,6 @@ class SglangEngine:
         return Done(
             rid=r.rid,
             ttft_ms=ttft * 1e3,
-            total_ms=(now - r.arrived) * 1e3,
             load_ms=(r.started - r.looked) * 1e3 if r.looked else 0.0,
             prompt_blocks=r.prompt_pages,
             gpu_blocks=r.device_hit,
@@ -681,14 +620,13 @@ class SglangEngine:
         return Done(
             rid=r.rid,
             ttft_ms=0.0,
-            total_ms=(now - r.arrived) * 1e3,
             load_ms=(now - r.looked) * 1e3 if r.looked else 0.0,
             prompt_blocks=r.prompt_pages,
             gpu_blocks=r.device_hit,
             primary_blocks=0,
             local_blocks=0,
             remote_blocks=0,
-            failed_blocks=r.host_hit,
+            failed_blocks=r.failed,
             recomputed_tokens=0,
             timed_out_blocks=r.timed_out,
             aborted=True,
@@ -766,10 +704,7 @@ class SglangEngine:
         out: list[InventoryDelta] = [
             (TIER_DEVICE, *event) for event in self._tree.take_events()
         ]
-        g2 = self._g2
-        if g2.deltas:
-            out.extend(g2.deltas)
-            g2.deltas = []
+        out.extend(self._g2.take())
         return out
 
     def abort_requests(self) -> None:

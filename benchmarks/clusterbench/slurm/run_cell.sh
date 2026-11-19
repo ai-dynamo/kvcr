@@ -37,7 +37,8 @@ sha=$(cat "$CB_ROOT/src/$ARM/.kvcr-sha")
 srun --jobid "$JOB" --overlap -N1 -n1 -w "$head_node" --cpu-bind=none \
   env PYTHONPATH="$pypath" taskset -c 0-1 python3 -m clusterbench coordinator \
   --config "$CONFIG" --bind "tcp://0.0.0.0:$port" --expect $((NODES * PER_NODE)) \
-  --per-node "$PER_NODE" --expect-sha "$sha" --arm "$ARM" --out "$RUN" "$@" \
+  --per-node "$PER_NODE" --expect-sha "$sha" --expect-kvcr "$CB_ROOT/src/$ARM/src" \
+  --arm "$ARM" --out "$RUN" "$@" \
   > "$RUN/coordinator.log" 2>&1 &
 coordinator=$!
 srun --jobid "$JOB" --overlap -N "$NODES" -w "$nodelist" --ntasks-per-node="$PER_NODE" \

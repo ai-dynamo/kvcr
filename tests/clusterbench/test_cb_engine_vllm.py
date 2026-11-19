@@ -7,16 +7,16 @@ exact calls per step. If one fails after an engine change, compare against
 vLLM's KVCRSecondaryTierManager before touching the expectation.
 """
 
-import time
+from types import SimpleNamespace
 
 from clusterbench.config import EngineConfig, PhaseConfig, RunConfig, TierConfig
-from clusterbench.engine_vllm import VllmEngine, _encode
+from clusterbench.engine_vllm import VllmEngine
 from clusterbench.ids import block_id, id_to_key, key_to_id, segment_ids
 from clusterbench.metrics import Window
-from clusterbench.protocol import TIER_DEVICE, TIER_PRIMARY, Request
+from clusterbench.protocol import TIER_DEVICE, TIER_G2, TIER_PRIMARY, Request
 from clusterbench.router import Inventory
 
-from kvcr.types import CacheTier, QueryStatus
+from kvcr.types import CacheTier, OpEntryResult, OpEntryStatus, QueryStatus
 
 BLOCK = 64
 SEGMENTS = [(1, 0, 4), (70, 0, 6)]
@@ -25,9 +25,7 @@ KEYS = [id_to_key(bid) for bid in segment_ids(SEGMENTS)]
 PROMPT = 10 * BLOCK + 10
 
 
-class _Entry:
-    def __init__(self, success):
-        self.success = success
+OK = OpEntryResult(OpEntryStatus.SUCCESS)
 
 
 class StubKvcr:
@@ -39,6 +37,8 @@ class StubKvcr:
         self.hinted = set()  # request ids with a usable hint
         self.remote_ok = set()  # keys a peer can serve
         self.deposit_ok = True
+        # What a key no peer can serve comes back as.
+        self.failure = OpEntryResult(OpEntryStatus.UNAVAILABLE, reason="not_resident")
         self._failed = set()
         self._pending = []
         self._next = 100
@@ -81,7 +81,7 @@ class StubKvcr:
         entries = {}
         for key, refs in blocks.items():
             ok = key in self.remote_ok
-            entries[key] = _Entry(ok)
+            entries[key] = OK if ok else self.failure
             if ok:  # the peer's bytes land in the destination slot
                 self.host.stamp(refs[0].element_index, key_to_id(key))
             else:
@@ -90,7 +90,8 @@ class StubKvcr:
 
     def deposit(self, blocks):
         self.calls.append(("deposit", dict(blocks)))
-        return self._op({key: _Entry(self.deposit_ok) for key in blocks})
+        failed = OpEntryResult(OpEntryStatus.FAILED, reason="transfer_failed")
+        return self._op({key: OK if self.deposit_ok else failed for key in blocks})
 
     def poll_completed(self):
         self.calls.append(("poll",))
@@ -264,7 +265,8 @@ def test_hinted_request_promotes_through_one_deliver_and_keeps_the_prefix():
     assert (done.remote_blocks, done.failed_blocks, done.primary_blocks) == (6, 4, 0)
     assert done.recomputed_tokens == PROMPT - 6 * BLOCK
     counters = window.counters
-    assert counters["deliver_blocks_failed_hinted"] == 0  # all past the hint
+    assert counters["deliver_blocks_failed_beyond_hint"] == 4  # all past the hint
+    assert not any(name.startswith("hinted_failed") for name in counters)
     assert counters["bytes_checked"] == 6 and not counters["bytes_mismatch"]
 
 
@@ -278,7 +280,7 @@ def test_failures_inside_the_hint_and_wrong_bytes_are_counted():
     kvcr.host.stamp = original
     done, _ = _run(engine, kvcr)
     assert (done.remote_blocks, done.failed_blocks) == (3, 7)
-    assert window.counters["deliver_blocks_failed_hinted"] == 3
+    assert window.counters["hinted_failed|unavailable"] == 3
     assert window.counters["bytes_mismatch"] == 3
 
 
@@ -345,35 +347,6 @@ def test_pins_are_resolved_before_promotions_are_delivered():
     assert seen == [1]
 
 
-def test_decode_blocks_are_deposited_when_prompt_only_is_off():
-    engine, kvcr, _ = _engine(offload_prompt_only=False)
-    request = Request(
-        rid=6,
-        session=0,
-        segments=[(70, 0, 2)],
-        tail=(70, 2, 4),
-        prompt_tokens=2 * BLOCK,
-        output_tokens=2 * BLOCK + 1,
-    )
-    engine.submit(request)
-    done, _ = _run(engine, kvcr, steps=400)
-    deposits = [[key_to_id(k) for k in call[1]] for call in kvcr.of("deposit")]
-    assert deposits == [
-        [block_id(70, 0), block_id(70, 1)],  # the prompt
-        [block_id(70, 2)],  # one deposit per block the decode completes
-        [block_id(70, 3)],
-    ]
-    # The last block's deposit is issued in the step the request finishes
-    # and completes afterwards; that completion still aligns the prefix.
-    engine.step()
-    assert [(len(a[1]), a[2]) for a in kvcr.of("align")] == [
-        (2, False),
-        (3, False),
-        (4, True),
-        (4, False),
-    ]
-
-
 def test_idle_steps_still_poll_and_report_stats():
     engine, kvcr, window = _engine()
     for _ in range(3):
@@ -403,41 +376,6 @@ def _key(stream, index):
     return id_to_key(block_id(stream, index))
 
 
-def test_inventory_events_are_run_length_encoded_in_order():
-    out = []
-    events = [
-        (False, [_key(5, 0), _key(5, 1), _key(5, 2)]),
-        (True, [_key(5, 2)]),
-        (True, [_key(5, 1)]),  # tail-first eviction, joined to the one before
-        (False, [_key(6, 0)]),
-        (False, [_key(5, 1)]),
-    ]
-    _encode(out, TIER_PRIMARY, events)
-    assert out == [
-        (TIER_PRIMARY, 5, 0, 3, False),
-        (TIER_PRIMARY, 5, 1, 3, True),
-        (TIER_PRIMARY, 6, 0, 1, False),
-        (TIER_PRIMARY, 5, 1, 2, False),
-    ]
-
-
-def test_one_inventory_event_can_hold_several_runs():
-    out = []
-    crossing = [_key(5, 8), _key(5, 9), _key(6, 0), _key(6, 1), _key(6, 2)]
-    downward = [_key(6, 2), _key(6, 1), _key(6, 0), _key(5, 9), _key(5, 3)]
-    _encode(out, TIER_PRIMARY, [(False, crossing), (True, downward), (False, [])])
-    assert out == [
-        (TIER_PRIMARY, 5, 8, 10, False),
-        (TIER_PRIMARY, 6, 0, 3, False),
-        (TIER_PRIMARY, 6, 0, 3, True),
-        (TIER_PRIMARY, 5, 3, 10, True),  # one cut at the lowest block removed
-    ]
-    # Blocks added tail first are not one root-aligned run for the router.
-    out = []
-    _encode(out, TIER_PRIMARY, [(False, [_key(5, 2), _key(5, 1), _key(5, 0)])])
-    assert out == [(TIER_PRIMARY, 5, index, index + 1, False) for index in (2, 1, 0)]
-
-
 def test_time_outside_kvcr_and_the_harness_is_split_into_forward_and_idle():
     engine, _, window = _engine()
     engine.step()  # nothing to run
@@ -446,37 +384,6 @@ def test_time_outside_kvcr_and_the_harness_is_split_into_forward_and_idle():
     engine.submit(_request(1))
     engine.step()
     assert window.counters["forward_seconds"] >= 0.0
-
-
-def test_scattered_removals_of_a_stream_travel_as_one_delta():
-    out = []
-    events = [
-        (True, [_key(5, 9)]),
-        (True, [_key(6, 4)]),
-        (True, [_key(5, 2)]),  # not next to block 9: still the same cut
-        (True, [_key(6, 7)]),
-        (False, [_key(5, 2)]),  # the stream grows again
-        (True, [_key(5, 1)]),  # so this is a new cut, after the addition
-    ]
-    _encode(out, TIER_PRIMARY, events)
-    assert out == [
-        (TIER_PRIMARY, 5, 2, 10, True),
-        (TIER_PRIMARY, 6, 4, 8, True),
-        (TIER_PRIMARY, 5, 2, 3, False),
-        (TIER_PRIMARY, 5, 1, 2, True),
-    ]
-    # The router ends up where applying every event one by one would.
-    one_by_one = []
-    for event in events:
-        _encode(one_by_one, TIER_PRIMARY, [event])
-    for deltas in (out, one_by_one):
-        inventory = Inventory(1)
-        inventory.apply(
-            0, [(TIER_PRIMARY, 5, 0, 12, False), (TIER_PRIMARY, 6, 0, 12, False)]
-        )
-        inventory.apply(0, deltas)
-        assert inventory.prefix(0, [(5, 0, 12)], (TIER_PRIMARY,)) == 1
-        assert inventory.prefix(0, [(6, 0, 12)], (TIER_PRIMARY,)) == 4
 
 
 def test_inventory_reports_the_device_tier_by_stream():
@@ -519,15 +426,6 @@ def test_aborting_requests_frees_slots_reserved_for_unfinished_writes():
     engine.abort_requests()
     assert len(primary) == before
     assert not engine.busy()
-
-
-def test_what_if_aligning_only_at_finish_drops_the_mid_request_aligns():
-    engine, kvcr, _ = _engine(align_on_finish_only=True)
-    engine.submit(_request(1))
-    _run(engine, kvcr)
-    # The deposit still happens; only the align after it completes is gone.
-    assert len(kvcr.of("deposit")) == 1
-    assert [(a[1], a[2]) for a in kvcr.of("align")] == [(KEYS, True)]
 
 
 # Trace replay: a prompt is the branch-free runs on its path through the
@@ -595,50 +493,54 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
 
 
 # ---- why a block asked of a peer failed ---------------------------------------
-#
-# Older KVCR trees report success or failure per key and nothing more, and the
-# engine reads nothing more from newer ones. KVCR fails a deliver before its
-# operation timeout only when the source answered (it no longer held
-# the block) or the fetch failed at once, so the engine sorts failures by how
-# long the deliver ran, counted from before the call as KVCR counts it.
 
 
-def _failures(window):
-    c = window.counters
-    return (
-        c["deliver_blocks_failed"],
-        c["deliver_blocks_failed_peer"],
-        c["deliver_blocks_failed_peer_hinted"],
-        c["deliver_blocks_timed_out"],
-        c["deliver_blocks_timed_out_hinted"],
-    )
+def _hinted_failures(window):
+    return {
+        name.partition("|")[2]: count
+        for name, count in window.counters.items()
+        if name.startswith("hinted_failed|")
+    }
 
 
-def test_a_peer_failure_before_the_timeout_is_not_a_timeout():
+def test_hinted_blocks_a_peer_did_not_deliver_are_counted_by_kvcr_status():
     engine, kvcr, window = _engine()
     kvcr.remote_ok = set(KEYS[:3])
     engine.submit(_request(1, hint_source=1, hint_blocks=6))
     done, _ = _run(engine, kvcr)
     # Seven blocks failed: three the hint named and four beyond it.
-    assert _failures(window) == (7, 7, 3, 0, 0)
+    counters = window.counters
+    assert counters["deliver_blocks_failed"] == 7
+    assert counters["deliver_blocks_failed_beyond_hint"] == 4
+    assert _hinted_failures(window) == {"unavailable": 3}
+    assert counters["hinted_failed_reason|not_resident"] == 3
     assert (done.failed_blocks, done.timed_out_blocks) == (7, 0)
-    assert window.hists["deliver_peer_failed"].n == 1
 
 
-def test_a_peer_failure_at_the_timeout_is_a_timeout():
-    engine, kvcr, window = _engine(operation_timeout_ms=20, abandon_timeout_ms=40)
+def test_a_timeout_is_what_kvcr_calls_one():
+    engine, kvcr, window = _engine()
     kvcr.remote_ok = set(KEYS[:3])
-    # The time inside the deliver call counts: KVCR's deadline starts there.
-    kvcr.on_deliver = lambda: time.sleep(0.03)
+    kvcr.failure = OpEntryResult(OpEntryStatus.TIMEOUT, reason="deadline")
     engine.submit(_request(1, hint_source=1, hint_blocks=6))
     done, _ = _run(engine, kvcr)
-    assert _failures(window) == (7, 7, 3, 7, 3)
+    assert _hinted_failures(window) == {"timeout": 3}
+    # The request's own count covers the blocks beyond the hint too.
     assert (done.failed_blocks, done.timed_out_blocks) == (7, 7)
-    assert window.hists["deliver_peer_failed"].max >= 0.03
+
+
+def test_a_result_without_a_reason_is_left_unclassified():
+    engine, kvcr, window = _engine()
+    kvcr.remote_ok = set(KEYS[:3])
+    # KVCR trees before per-block reasons: every failure is FAILED.
+    kvcr.failure = SimpleNamespace(success=False, status=OpEntryStatus.FAILED)
+    engine.submit(_request(1, hint_source=1, hint_blocks=6))
+    done, _ = _run(engine, kvcr)
+    assert _hinted_failures(window) == {"unclassified": 3}
+    assert done.timed_out_blocks == 0
 
 
 def test_a_failed_local_block_is_not_blamed_on_a_peer():
-    engine, kvcr, window = _engine(operation_timeout_ms=20, abandon_timeout_ms=40)
+    engine, kvcr, window = _engine()
     asked = set()
 
     def query(keys, request_id=None):
@@ -650,8 +552,133 @@ def test_a_failed_local_block_is_not_blamed_on_a_peer():
         return [hit if new else (QueryStatus.MISS, None) for new in fresh]
 
     kvcr.query = query
-    kvcr.on_deliver = lambda: time.sleep(0.03)
+    kvcr.failure = OpEntryResult(OpEntryStatus.TIMEOUT, reason="deadline")
     engine.submit(_request(1))
     done, _ = _run(engine, kvcr)
-    assert _failures(window) == (10, 0, 0, 0, 0)
+    counters = window.counters
+    assert counters["deliver_blocks_failed"] == 10
+    assert not _hinted_failures(window)
+    assert "deliver_blocks_failed_beyond_hint" not in counters
     assert (done.failed_blocks, done.timed_out_blocks) == (10, 0)
+
+
+# ---- the device and the step budget -------------------------------------------
+
+
+def _long(rid, stream, blocks=40):
+    """A request of ``blocks`` device blocks on a stream of its own."""
+    return Request(
+        rid=rid,
+        session=rid,
+        segments=[(stream, 0, blocks - 1)],
+        tail=(stream, blocks - 1, blocks),
+        prompt_tokens=(blocks - 1) * BLOCK + 5,
+        output_tokens=3,
+    )
+
+
+def test_a_request_waits_until_the_device_has_room_for_all_of_it():
+    engine, kvcr, window = _engine()  # a 64-block device
+    engine.submit(_long(1, 100))
+    engine.submit(_long(2, 200))
+    engine.submit(_request(3))  # would fit beside request 1, but came after 2
+    finished = [done.rid for done in engine.step()]
+    assert [r.rid for r in engine._running] == [1]
+    assert window.counters["device_alloc_failures"] == 1
+    # Nothing behind the request that did not fit was looked up.
+    assert {query[2] for query in kvcr.of("query")} == {"r1", "r2"}
+    for _ in range(20):
+        finished += [done.rid for done in engine.step()]
+    assert finished == [1, 2, 3]
+    gpu = engine._gpu
+    assert gpu.live == 0 and not gpu._pins and len(gpu) <= 64
+    # Making room evicted request 1's blocks, tail first.
+    assert (TIER_DEVICE, 100, 24, 40, True) in engine.take_inventory()
+
+
+def test_a_running_requests_cached_prefix_is_not_evicted_to_admit_another():
+    engine, kvcr, _ = _engine()
+    engine.submit(_long(1, 100, blocks=30))
+    _run(engine, kvcr)
+    grown = Request(
+        rid=2,
+        session=1,
+        segments=[(100, 0, 30), (101, 0, 9)],
+        tail=(101, 9, 10),
+        prompt_tokens=39 * BLOCK + 5,
+        output_tokens=200,
+    )
+    engine.submit(grown)  # reuses the 30 cached blocks and needs 10 more
+    engine.step()
+    engine.submit(_long(3, 300, blocks=30))  # 30 + 10 + 30 > 64
+    engine.step()
+    assert [r.rid for r in engine._running] == [2]
+    assert engine._gpu.prefix([(100, 0, 30)]) == 30
+    engine.abort_requests()
+    assert engine._gpu.live == 0 and not engine._gpu._pins
+
+
+def test_a_request_the_device_could_never_hold_is_refused():
+    engine, _, _ = _engine()
+    try:
+        engine.submit(_long(1, 100, blocks=65))
+    except ValueError as error:
+        assert "tiers.gpu_blocks" in str(error)
+    else:
+        raise AssertionError("a 65-block request was accepted by a 64-block device")
+
+
+def test_decode_tokens_come_out_of_the_step_budget():
+    engine, _, _ = _engine(max_batched_tokens=100)
+    decoding = Request(
+        rid=1,
+        session=0,
+        segments=[(70, 0, 1)],
+        tail=(70, 1, 1),
+        prompt_tokens=BLOCK + 5,
+        output_tokens=50,
+    )
+    engine.submit(decoding)
+    engine.step()  # its whole prompt: it decodes from here on
+    prefilling = Request(
+        rid=2,
+        session=1,
+        segments=[(71, 0, 4)],
+        tail=(71, 4, 4),
+        prompt_tokens=4 * BLOCK + 5,
+        output_tokens=2,
+    )
+    engine.submit(prefilling)
+    engine.step()
+    first, second = engine._running
+    assert (first.sched, second.sched) == (1, 99)
+
+
+def test_a_store_the_cpu_tier_has_no_room_for_is_tried_again():
+    engine, kvcr, _ = _engine()
+    primary = engine._primary
+    free, primary._free = primary._free, []
+    engine.submit(_request(1))
+    engine.step()
+    assert primary.allocation_failures == 1 and not kvcr.of("deposit")
+    primary._free = free
+    engine.step()
+    (deposit,) = kvcr.of("deposit")
+    assert list(deposit[1]) == KEYS
+
+
+def test_the_kvcr_pool_is_reported_with_its_gaps_closed():
+    engine, _, _ = _engine()
+    router = Inventory(1)
+
+    def kvcr_says(removed, *indexes):
+        keys = [_key(5, index) for index in indexes]
+        engine.record_inventory(
+            SimpleNamespace(tier=CacheTier.LOCAL_G2, removed=removed, keys=keys)
+        )
+        router.apply(0, engine.take_inventory())
+        return router.prefix(0, [(5, 0, 10)], (TIER_G2,))
+
+    assert kvcr_says(False, *range(10)) == 10
+    assert kvcr_says(True, 3) == 3  # one block from the middle
+    assert kvcr_says(False, 3) == 10  # it is back: the rest never left

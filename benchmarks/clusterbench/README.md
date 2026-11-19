@@ -32,12 +32,14 @@ PYTHONPATH=benchmarks uv run python -m clusterbench ab \
   --arm base=/path/to/kvcr-main --arm cand=/path/to/kvcr-branch
 ```
 
-An arm is a KVCR checkout (the directory holding `src/kvcr`). The harness
-always comes from this checkout, so every arm is driven identically. Local
-numbers show correctness and rough direction; quote cluster numbers.
+An arm is a KVCR checkout (the directory holding `src/kvcr`); a run fails if
+its workers loaded KVCR from anywhere else. The harness always comes from this
+checkout, so every arm is driven identically. Local numbers show correctness
+and rough direction; quote cluster numbers.
 
 Any option can be set with `--set section.field=value`; `config.py` documents
-them all. Tests: `uv run pytest tests/clusterbench`.
+them all, and an option it does not have is refused. Tests:
+`uv run pytest tests/clusterbench`.
 
 ## Scenarios
 
@@ -58,15 +60,10 @@ until KVCR's time on the engine thread is what limits a rank.
 | Option | Default | Meaning |
 |---|---|---|
 | `engine.profile` | `vllm` | `sglang` swaps in SGLang's direct linker |
-| `router.mode` | `sticky` | `sticky`: a session moves with `router.migration_prob` per turn, to the worker with the fewest sessions, whatever the system's speed. `cost`: Dynamo's default KV-router formula |
+| `router.migration_prob` | 0.05 | Chance per turn that a session moves, to the worker with the fewest sessions, whatever the system's speed |
 | `tiers.block_bytes` | 16 KiB | Bytes KVCR moves per block. Far smaller than a real KV block so that many ranks fit on a node; host cost follows the number of blocks, not their size |
 | `tiers.tokens_per_block` | 64 | Tokens per block |
 | `workload.trace` | none | Replay a compiled trace instead of generating sessions |
-
-`engine.align_on_finish_only` and `engine.linker_*` are what-if switches: they
-make the fake engine differ from the real integration, to estimate what an
-engine-side change would be worth. A run with one set does not describe a real
-deployment.
 
 ## How it works
 
@@ -79,11 +76,13 @@ deployment.
   it. Host mappings stand in for engine memory and KVCR's DRAM pool.
 - **vLLM profile** (`engine_vllm.py`): vLLM's KVCR tier. One `query` per key
   on a CPU-tier miss, one `deliver` per request per step, a `deposit` per
-  stored block, `align_sequence` after each.
+  stored block, `align_sequence` after each. A request runs once the device
+  has room for all of it.
 - **SGLang profile** (`engine_sglang.py`, `linker_port.py`, `device_tree.py`):
   the direct linker of SGLang PR #45650. An owner thread makes every KVCR
-  call: a batched `query`, one `deliver` per layer, `deposit` batches, no
-  `align_sequence`. A failed key aborts the requests loading in its batch.
+  call: a batched `query`, one `deliver` per layer (a layer computes while
+  the later ones load), `deposit` batches, no `align_sequence`. A failed key
+  aborts the requests loading in its batch.
 - **Router:** tracks how much of each stream's prefix every worker holds.
   After choosing a worker it hints the peer with the longest prefix, if that
   beats what the chosen worker holds. That is Dynamo's rule.
@@ -113,8 +112,8 @@ The replay follows aiperf's AgentX rules:
 - A request goes out the recorded gap after the one it depends on finishes
   (`workload.trace_think_scale` scales the gap, `workload.think_cap_s` caps
   it).
-- Sub-agents run side by side as sessions of their own; the parent's next turn
-  waits for them.
+- Sub-agents run side by side as sessions of their own. The first parent turn
+  recorded at or after a sub-agent's end waits for it; earlier ones do not.
 - `workload.sessions_per_worker` sessions play at once per worker. Each play
   gets block ids of its own, so plays share nothing.
 
@@ -151,19 +150,13 @@ engine's own bookkeeping ("harness"), the modelled forward pass and idle. KVCR
 is the bottleneck when its share dominates. On the SGLang profile the KVCR
 calls are on the owner thread, which gets a split of its own.
 
-**Failed blocks.** The failed blocks that were asked of a peer are sorted by
-how long their `deliver` ran. (That works on KVCR trees that report only
-success or failure per key; the per-block status newer trees return is not
-read yet.)
-
-- *timed out*: at least `engine.operation_timeout_ms`;
-- *no longer on the source*: less, and the hint named the block (evicted since
-  the router last heard, or a pin on the source failed);
-- *beyond the hint*: less, and the hint did not name it. vLLM's opportunistic
-  query asks the peer for the rest of the prompt too, which it cannot have.
-
-On the vLLM profile a failure just before the deadline can be counted as a
-timeout, never the reverse.
+**Failed blocks.** Hinted blocks that a peer did not deliver are counted by
+the status KVCR returns for them: `timeout`, `unavailable` (the source no
+longer held the block, or could not pin it), `aborted` or `failed`.
+`report --detail` has KVCR's reasons. A KVCR tree that returns no reason shows
+them as `unclassified`. Blocks *beyond the hint* are counted apart: vLLM's
+opportunistic query asks the peer for the rest of the prompt too, which it
+cannot have.
 
 **Request log.** `requests.jsonl` starts with a header naming its fields:
 session, turn, worker, hint source (-1: none), hint blocks, send time, whether
@@ -183,7 +176,8 @@ outcome.
   opened;
 - KVCR raised resilience events, or operations were still in flight at exit.
 
-`report --arm` also warns when arms were offered different amounts of work.
+`report --arm` compares valid runs only and fails if an arm has none. It warns
+when arms were offered different amounts of work.
 `CB_PROFILE_DIR=<dir>` makes every worker write a cProfile of the window (it
 slows the run).
 
@@ -224,6 +218,10 @@ touch $CB_ROOT/control/release-$JOB
   and `kv.move` hints.
 - SGLang's HiCache storage backend and its TP>1 and sliding-window layouts.
 - Forcing evictions or timeouts: they are reported, not injected.
+- vLLM's preemption: it allocates device blocks as a request grows and
+  preempts when they run out; here a request waits until all of it fits.
+- Load-aware routing such as Dynamo's cost formula: sessions are sticky and
+  migrate at a fixed rate.
 - In trace replay, a sub-agent's requests run one after another (aiperf splits
   some into parallel streams), and the 13% of answer blocks that never
   reappear in a prompt are not cached.

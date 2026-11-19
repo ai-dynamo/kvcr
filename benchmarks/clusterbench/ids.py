@@ -32,7 +32,6 @@ TRACE_BASE = 1 << 32
 Segment = tuple[int, int, int]  # stream, start index, end index (exclusive)
 
 _KEY = struct.Struct(">Q24xI")
-KEY_BYTES = _KEY.size
 _ID = struct.Struct(">Q")
 _KEY_IDS = struct.Struct(">Q28x")
 

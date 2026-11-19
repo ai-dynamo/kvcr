@@ -3,9 +3,6 @@
 """The SGLang profile's device radix tree."""
 
 from clusterbench.device_tree import DeviceTree
-from clusterbench.engine_sglang import _G2Prefix
-from clusterbench.protocol import TIER_G2
-from clusterbench.router import Inventory
 
 SYSTEM, A, B = 1, 100, 200
 
@@ -80,29 +77,6 @@ def test_reserved_slots_are_never_handed_out():
     tree = DeviceTree(8, reserved=3)
     assert sorted(tree.allocate(5)) == [3, 4, 5, 6, 7]
     assert tree.allocate(1) is None
-
-
-def test_kvcr_prefix_survives_head_eviction_and_refill():
-    g2, router = _G2Prefix(), Inventory(1)
-
-    def flush():
-        router.apply(0, g2.deltas)
-        g2.deltas = []
-        return router.prefix(0, [(A, 0, 10)], (TIER_G2,))
-
-    g2.add(A, 0, 6)
-    assert flush() == 6
-    g2.remove(A, 0)  # KVCR evicts in access order: the head can go first
-    assert flush() == 0
-    g2.add(A, 0, 1)  # backed up again: pages 1..5 never left
-    assert flush() == 6
-    g2.remove(A, 3)
-    assert flush() == 3
-    g2.add(A, 6, 9)  # not contiguous with the prefix: not reported yet
-    assert flush() == 3
-    g2.add(A, 3, 4)
-    assert flush() == 9
-    assert g2.count == 9
 
 
 def test_a_lock_covers_the_ancestry_and_refuses_before_evicting():

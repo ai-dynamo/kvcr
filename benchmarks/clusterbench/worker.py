@@ -32,6 +32,9 @@ from .kvcr_host import (
 )
 from .metrics import Telemetry, Window, rss_bytes, thread_delta, thread_snapshot
 
+INVENTORY_FLUSH_S = 0.05
+STATS_INTERVAL_S = 1.0
+
 
 def parse_cpus(spec: str) -> list[int]:
     cpus: set[int] = set()
@@ -121,7 +124,6 @@ def run_worker(args) -> int:
         # CB_PROFILE_DIR: profile the engine thread over the measured window.
         profile_dir = os.environ.get("CB_PROFILE_DIR")
         profiler = None
-        flush_s = phases.inventory_flush_ms / 1e3
         next_inventory = next_stats = perf()
         while True:
             while True:
@@ -204,7 +206,7 @@ def run_worker(args) -> int:
                 deltas = engine.take_inventory()
                 if deltas:
                     send(encode(protocol.Inventory(deltas)))
-                next_inventory = now + flush_s
+                next_inventory = now + INVENTORY_FLUSH_S
             if now >= next_stats:
                 values = engine.gauges()
                 for key, value in window.gauges.items():
@@ -212,7 +214,7 @@ def run_worker(args) -> int:
                         values[key.partition("|")[2]] = value
                 values["rss_mb"] = rss_bytes() / 1e6
                 send(encode(protocol.Stats(time.time(), values)))
-                next_stats = now + phases.stats_interval_s
+                next_stats = now + STATS_INTERVAL_S
             if stop_deadline is not None and (not engine.busy() or now > stop_deadline):
                 # Report, then keep serving peers until the coordinator says
                 # every worker is done: closing KVCR while a peer still has an

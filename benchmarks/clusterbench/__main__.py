@@ -53,7 +53,6 @@ def _local(args) -> int:
 def _ab(args) -> int:
     from .config import load_config
     from .launch_local import run_local
-    from .report import compare
 
     config = load_config(args.config, args.set)
     arms = [item.partition("=")[::2] for item in args.arm]
@@ -78,8 +77,18 @@ def _ab(args) -> int:
                     cores_per_worker=args.cores_per_worker,
                 )
             )
-    print(compare(results))
-    print(f"\nrun directories under: {root}")
+    print(f"run directories under: {root}\n")
+    return _print_comparison(results)
+
+
+def _print_comparison(arms: dict[str, list[dict]]) -> int:
+    from .report import compare
+
+    try:
+        print(compare(arms))
+    except ValueError as error:  # an arm with no valid run
+        print(error)
+        return 2
     return 0
 
 
@@ -93,7 +102,10 @@ def _coordinator(args) -> int:
     try:
         coordinator.bind(args.bind)
         summary = coordinator.run(
-            expect=args.expect, expect_sha=args.expect_sha, per_node=args.per_node
+            expect=args.expect,
+            expect_sha=args.expect_sha,
+            per_node=args.per_node,
+            expect_kvcr=args.expect_kvcr,
         )
     finally:
         coordinator.close()
@@ -108,15 +120,14 @@ def _worker(args) -> int:
 
 
 def _report(args) -> int:
-    from .report import compare, format_detail, format_summary, load
+    from .report import format_detail, format_summary, load
 
     if args.arm:
         arms = {}
         for item in args.arm:
             name, _, dirs = item.partition("=")
             arms[name] = [load(d) for d in dirs.split(",") if d]
-        print(compare(arms))
-        return 0
+        return _print_comparison(arms)
     for run in args.runs:
         summary = load(run)
         print(format_summary(summary))
@@ -184,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
     coord.add_argument("--expect", type=int, required=True, help="worker count")
     coord.add_argument("--per-node", type=int, default=0, help="workers per node")
     coord.add_argument("--expect-sha", default="")
+    coord.add_argument(
+        "--expect-kvcr", default="", help="the src directory workers must import from"
+    )
     coord.add_argument("--out", required=True)
     coord.add_argument("--arm", default="")
     coord.add_argument("--allow-invalid", action="store_true")

@@ -80,15 +80,52 @@ def test_fill_level_stays_full_once_the_tier_has_evicted():
     assert tier.occupancy() == 0.5 and tier.fill_level() == 1.0
 
 
-def test_failed_allocation_takes_nothing():
-    tier = PrimaryTier(2)
-    held = _keys("h", 2)
+def test_a_store_that_does_not_fit_evicts_nothing():
+    tier = PrimaryTier(4)
+    held = _keys("h", 4)
     _store(tier, held, tier.new_rank())
-    tier.prepare_read(held[:1])
-    before = len(tier)
-    assert tier.prepare_write(_keys("x", 2), tier.new_rank(), [0, 1]) is None
-    assert len(tier) == before - 1  # the evictable one was evicted, nothing added
-    assert all(tier.lookup(k) == MISS for k in _keys("x", 2))
+    tier.prepare_read(held[:2])
+    _events(tier)
+    # Three slots are needed and only two keys can go.
+    assert tier.prepare_write(_keys("x", 3), tier.new_rank(), range(3)) is None
+    assert tier.allocation_failures == 1 and tier.evictions == 0
+    assert [tier.lookup(k) for k in held] == [HIT] * 4 and not _events(tier)
+    assert all(tier.lookup(k) == MISS for k in _keys("x", 3))
+    # The two that were looked at are still next in line, tail first.
+    _store(tier, _keys("y", 2), tier.new_rank())
+    assert _events(tier)[:2] == [(held[3], True), (held[2], True)]
+
+
+def test_a_key_queued_for_eviction_twice_is_evicted_once():
+    tier = PrimaryTier(2)
+    keys = _keys("k", 2)
+    _store(tier, keys, tier.new_rank())
+    tier.prepare_read(keys)
+    tier.complete_read(keys)  # evictable again: a second entry in the queue
+    taken = tier.prepare_write(_keys("x", 2), tier.new_rank(), range(2))
+    assert len(taken) == 2 and tier.evictions == 2
+    # The same when the store fails: both keys are still there, and still go.
+    tier.complete_write(_keys("x", 2), True)
+    tier.prepare_read(_keys("x", 2))
+    tier.complete_read(_keys("x", 2))
+    assert tier.prepare_write(_keys("y", 3), tier.new_rank(), range(3)) is None
+    assert _store(tier, _keys("z", 2), tier.new_rank()) and tier.evictions == 4
+
+
+def test_a_store_never_evicts_its_own_keys():
+    tier = PrimaryTier(4)
+    keys = _keys("k", 6)
+    _store(tier, keys[:2], tier.new_rank())  # the oldest: first in line to go
+    _store(tier, _keys("o", 2), tier.new_rank())
+    # The store names the two oldest keys again and two new ones.
+    taken = tier.prepare_write(keys[:4], tier.new_rank(), range(4))
+    assert [key for key, _ in taken] == keys[2:4]
+    assert [tier.lookup(k) for k in keys[:2]] == [HIT, HIT]
+    assert all(tier.lookup(k) == MISS for k in _keys("o", 2))
+    tier.complete_write(keys[2:4], True)
+    # With only its own keys left to evict, a larger store gets nothing.
+    assert tier.prepare_write(keys, tier.new_rank(), range(6)) is None
+    assert [tier.lookup(k) for k in keys[:4]] == [HIT] * 4
 
 
 def test_present_keys_are_skipped_by_prepare_write():
@@ -232,3 +269,48 @@ def test_device_cache_survives_an_empty_segment_on_a_stream_it_lacks():
     cache.insert([(3, 0, 4)], cache.new_rank())  # eviction walks past stream 2
     assert cache.held(1) == 4 and cache.held(2) == 0 and cache.held(3) == 4
     assert len(cache) == 8
+
+
+def test_device_cache_admits_a_request_only_if_all_of_it_fits():
+    cache = StreamCache(10)
+    cache.insert([(1, 0, 4), (8, 0, 4)], cache.new_rank())
+    cache.events.clear()
+    # A request reusing stream 1 and needing five more blocks: stream 8 goes.
+    pins = cache.admit([(1, 0, 4), (9, 0, 5)], 5)
+    assert pins == [(1, 4)] and cache.live == 5
+    assert cache.events == [(8, 1, 4, True)]
+    # Another needing six: 4 pinned + 5 reserved + 6 is over, so nothing moves.
+    cache.events.clear()
+    assert cache.admit([(2, 0, 6)], 6) is None
+    assert cache.live == 5 and not cache.events and cache.held(8) == 1
+    # The first one finishes: its blocks become cache, and the other fits.
+    cache.release(pins, 5)
+    cache.insert([(1, 0, 4), (9, 0, 5)], cache.new_rank())
+    assert cache.live == 0 and len(cache) == 10
+    assert cache.admit([(2, 0, 6)], 6) == []
+    assert len(cache) + cache.live == 10
+
+
+def test_device_cache_evicts_a_stream_again_once_it_is_unpinned():
+    cache = StreamCache(8)
+    cache.insert([(1, 0, 4)], cache.new_rank())
+    cache.insert([(2, 0, 4)], cache.new_rank())
+    pins = cache.admit([(1, 0, 4)], 2)  # stream 1 is the oldest, and pinned
+    assert cache.held(1) == 4 and cache.held(2) == 2
+    cache.release(pins, 2)
+    assert cache.admit([(3, 0, 6)], 6) == []
+    assert cache.held(1) == 0 and cache.held(2) == 2  # oldest first again
+
+
+def test_device_cache_pins_only_the_blocks_a_request_reuses():
+    cache = StreamCache(10)
+    cache.insert([(1, 0, 8)], cache.new_rank())
+    # A rewind to block 3 of the stream: the other five can make room.
+    pins = cache.admit([(1, 0, 3)], 7)
+    assert pins == [(1, 3)] and cache.held(1) == 3
+    # Two requests on one stream: the longer pin holds until both are gone.
+    longer = cache.admit([(1, 0, 3)], 0)
+    cache.release(pins, 7)
+    assert cache.admit([(2, 0, 8)], 8) is None
+    cache.release(longer, 0)
+    assert cache.admit([(2, 0, 8)], 8) == [] and cache.held(1) == 2

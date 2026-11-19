@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import msgspec
+import pytest
 from clusterbench.config import RunConfig
 from clusterbench.coordinator import Coordinator
 from clusterbench.metrics import LogHist, Window
@@ -13,9 +14,7 @@ def _inputs(**phases):
     tally = Coordinator._new_tally()
     lag = LogHist()
     lag.add(20e-6)
-    tally.update(
-        lag=lag.to_json(), ttft=LogHist().to_json(), ttft_remote=LogHist().to_json()
-    )
+    tally.update(lag=lag.to_json())
     tally.update(dispatched=100, dispatched_blocks=50_000, hinted=10, completed=100)
     coord = {
         "name": "t",
@@ -145,36 +144,57 @@ def test_compare_reports_change_against_the_first_arm_and_work_mismatch():
     assert row.rstrip().endswith("+100.0%")
 
 
-def test_failed_peer_blocks_are_split_by_cause():
+def test_only_valid_runs_are_compared():
+    good = summarize(*_inputs())
+    config, coord, reports = _inputs()
+    for report in reports:
+        report["secs"]["query"] *= 5
+        report["counters"]["bytes_mismatch"] = 1  # which makes the run invalid
+    bad = summarize(config, coord, reports)
+    assert not bad["valid"]
+    # Two invalid outliers of three do not move the arm.
+    text = compare({"base": [good], "cand": [bad, good, bad]})
+    assert "cand: 3 runs, kvcr abc, 2 INVALID and left out" in text
+    row = next(
+        line for line in text.splitlines() if line.startswith("  query us / item")
+    )
+    assert row.rstrip().endswith("+0.0%")
+    # An arm with nothing valid cannot be compared at all.
+    with pytest.raises(ValueError, match="cand has no valid run"):
+        compare({"base": [good], "cand": [bad, bad]})
+    with pytest.raises(ValueError, match="cand has no valid run"):
+        compare({"base": [good], "cand": []})
+
+
+def test_hinted_blocks_a_peer_did_not_deliver_are_reported_by_kvcr_status():
     config, coord, reports = _inputs()
     for report in reports:
         report["counters"].update(
-            deliver_blocks_failed=30,
-            deliver_blocks_failed_peer=25,
-            deliver_blocks_failed_peer_hinted=15,
-            deliver_blocks_timed_out=6,
-            deliver_blocks_timed_out_hinted=4,
-            kvcr_peer_ops_past_timeout=3,
-            pin_requests=40,
-            pin_misses=9,
+            {
+                "deliver_blocks_failed": 30,
+                "hinted_failed|timeout": 4,
+                "hinted_failed|unavailable": 9,
+                "hinted_failed|aborted": 2,
+                "hinted_failed_reason|not_resident": 9,
+                "deliver_blocks_failed_beyond_hint": 10,
+                "pin_requests": 40,
+                "pin_misses": 9,
+            }
         )
     summary = summarize(config, coord, reports)
     failures = summary["failures"]
-    assert failures["timed_out"] == 12
-    assert failures["gone_from_source"] == 22  # hinted, and failed before the deadline
-    assert failures["beyond_hint"] == 16  # asked for past what the router named
+    assert failures["causes"] == {"timeout": 8, "unavailable": 18, "aborted": 4}
+    assert failures["beyond_hint"] == 20  # asked for past what the router named
     assert failures["local"] == 10  # this worker's own pool, no peer involved
-    assert (
-        sum(failures[k] for k in ("timed_out", "gone_from_source", "beyond_hint")) == 50
-    )
     # Of the 2,030 hinted blocks asked of a peer.
-    assert abs(summary["headline"]["hinted_timeout_rate"] - 8 / 2030) < 1e-12
-    assert abs(summary["headline"]["hinted_gone_rate"] - 22 / 2030) < 1e-12
+    headline = summary["headline"]
+    assert abs(headline["hinted_block_failure_rate"] - 30 / 2030) < 1e-12
+    assert abs(headline["hinted_timeout_rate"] - 8 / 2030) < 1e-12
+    assert abs(headline["hinted_unavailable_rate"] - 18 / 2030) < 1e-12
     text = format_summary(summary)
     assert (
-        "blocks a peer failed to deliver: timed out 12 (0.39% of hinted blocks), "
-        "no longer on the source 22 (1.08%), beyond the hint 16; "
-        "KVCR timed 6 peer operations past its timeout; "
-        "source pins 80 requested, 18 missed, 0 timed out"
+        "hinted blocks a peer did not deliver, by KVCR status: timeout 8 "
+        "(0.39% of hinted blocks), unavailable 18 (0.89%), aborted 4; "
+        "beyond the hint 20; source pins 80 requested, 18 missed, 0 timed out"
     ) in text
     assert "hinted blocks timed out" in compare({"a": [summary], "b": [summary]})

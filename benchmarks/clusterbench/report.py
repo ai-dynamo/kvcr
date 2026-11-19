@@ -33,6 +33,17 @@ KVCR_CALLS = (
 )
 
 
+def _ratio(part: float, whole: float) -> float:
+    return part / whole if whole else 0.0
+
+
+def _p50_p99(hist: LogHist, name: str) -> dict[str, float]:
+    return {
+        f"{name}_p50_ms": hist.quantile(0.5) * 1e3,
+        f"{name}_p99_ms": hist.quantile(0.99) * 1e3,
+    }
+
+
 def _merge_hists(reports: list[dict], section: str) -> dict[str, LogHist]:
     merged: dict[str, LogHist] = defaultdict(LogHist)
     for report in reports:
@@ -68,9 +79,9 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
             "seconds": secs[name],
             "calls": calls.get(name, 0),
             "items": items.get(name, 0),
-            "us_per_call": secs[name] / calls[name] * 1e6 if calls.get(name) else 0,
-            "us_per_item": secs[name] / items[name] * 1e6 if items.get(name) else 0,
-            "share": secs[name] / window if window else 0,
+            "us_per_call": _ratio(secs[name], calls.get(name, 0)) * 1e6,
+            "us_per_item": _ratio(secs[name], items.get(name, 0)) * 1e6,
+            "share": _ratio(secs[name], window),
         }
     kvcr_seconds = sum(secs.values())
     if "engine_harness_seconds" in counters:
@@ -91,9 +102,9 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     thread_summary = {
         role: {
             "cpu_s": entry["cpu_s"],
-            "cores_per_worker": entry["cpu_s"] / window if window else 0,
-            "run_delay_share": entry["delay_s"] / window if window else 0,
-            "threads_per_worker": entry["threads"] / len(reports) if reports else 0,
+            "cores_per_worker": _ratio(entry["cpu_s"], window),
+            "run_delay_share": _ratio(entry["delay_s"], window),
+            "threads_per_worker": _ratio(entry["threads"], len(reports)),
         }
         for role, entry in threads.items()
     }
@@ -101,74 +112,54 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     requests = counters.get("requests", 0)
     remote = counters.get("deliver_blocks_remote", 0)
     local = counters.get("deliver_blocks_local", 0)
-    failed = counters.get("deliver_blocks_failed_hinted", 0)
     deposited = counters.get("deposit_blocks_ok", 0)
     moved = remote + local + deposited
     progress_cpu = threads.get("progress", {}).get("cpu_s", 0.0)
     native_cpu = threads.get("native", {}).get("cpu_s", 0.0)
 
-    headline = {
-        "requests_per_s": requests / mean_window if mean_window else 0,
-        "remote_blocks_per_s": remote / mean_window if mean_window else 0,
-        "engine_kvcr_share": kvcr_seconds / window if window else 0,
-        "engine_harness_share": harness_seconds / window if window else 0,
-        # The modelled forward pass, and steps with nothing to run.
-        "engine_forward_share": counters.get("forward_seconds", 0) / window
-        if window
-        else 0,
-        "engine_idle_share": counters.get("idle_seconds", 0) / window if window else 0,
-        "engine_kvcr_us_per_request": kvcr_seconds / requests * 1e6 if requests else 0,
-        "engine_harness_us_per_request": harness_seconds / requests * 1e6
-        if requests
-        else 0,
-        "engine_kvcr_us_per_moved_block": kvcr_seconds / moved * 1e6 if moved else 0,
-        "progress_us_per_moved_block": progress_cpu / moved * 1e6 if moved else 0,
-        "native_us_per_moved_block": native_cpu / moved * 1e6 if moved else 0,
-        "step_kvcr_p50_ms": hists["step_kvcr"].quantile(0.5) * 1e3,
-        "step_kvcr_p99_ms": hists["step_kvcr"].quantile(0.99) * 1e3,
-        "ttft_p50_ms": hists["ttft"].quantile(0.5) * 1e3,
-        "ttft_p99_ms": hists["ttft"].quantile(0.99) * 1e3,
-        "remote_resolve_p50_ms": hists["cache_resolve_remote"].quantile(0.5) * 1e3,
-        "remote_resolve_p99_ms": hists["cache_resolve_remote"].quantile(0.99) * 1e3,
-        "deliver_remote_p50_ms": hists["deliver_remote"].quantile(0.5) * 1e3,
-        "deliver_remote_p99_ms": hists["deliver_remote"].quantile(0.99) * 1e3,
-        # Hinted blocks only: blocks past the hint are requested too (vLLM's
-        # opportunistic query) and are expected to fail.
-        "hinted_block_failure_rate": failed / (remote + failed)
-        if remote + failed
-        else 0,
+    # Hinted blocks a peer did not deliver, by KVCR's status ("unclassified"
+    # on a tree that reports none). Blocks past the hint are asked for too
+    # (vLLM's opportunistic query) and are expected to fail.
+    causes = {
+        name.partition("|")[2]: value
+        for name, value in counters.items()
+        if name.startswith("hinted_failed|")
     }
-
-    # Why blocks asked of a peer failed. Older KVCR trees report only success
-    # or failure, so the engines sort failures by how long the deliver ran: at
-    # least the operation timeout, or less (the source answered that it no
-    # longer held the block, or the fetch failed at once).
-    from_peer = counters.get("deliver_blocks_failed_peer", 0)
-    from_peer_hinted = counters.get("deliver_blocks_failed_peer_hinted", 0)
-    timed_out = counters.get("deliver_blocks_timed_out", 0)
-    timed_out_hinted = counters.get("deliver_blocks_timed_out_hinted", 0)
+    hinted_failed = sum(causes.values())
+    hinted_asked = remote + hinted_failed
+    beyond_hint = counters.get("deliver_blocks_failed_beyond_hint", 0)
     pin_timeouts = kvcr_hists.get("kvcr_duration_seconds|framework_pin_wait|timeout")
     failures = {
-        "timed_out": timed_out,
-        "gone_from_source": from_peer_hinted - timed_out_hinted,
-        "beyond_hint": from_peer - from_peer_hinted - (timed_out - timed_out_hinted),
-        "local": counters.get("deliver_blocks_failed", 0) - from_peer,
-        # Cross-check from KVCR's own timings of peer operations.
-        "kvcr_peer_ops_past_timeout": counters.get("kvcr_peer_ops_past_timeout", 0),
-        "failed_deliver_p50_ms": hists["deliver_peer_failed"].quantile(0.5) * 1e3,
-        "failed_deliver_p99_ms": hists["deliver_peer_failed"].quantile(0.99) * 1e3,
+        "causes": causes,
+        "beyond_hint": beyond_hint,
+        "local": counters.get("deliver_blocks_failed", 0) - hinted_failed - beyond_hint,
         # The source side, where sources serve from pinned engine memory.
         "pin_requests": counters.get("pin_requests", 0),
         "pin_misses": counters.get("pin_misses", 0),
         "pin_wait_timeouts": pin_timeouts.n if pin_timeouts is not None else 0,
     }
-    hinted_asked = remote + from_peer_hinted
-    headline["hinted_timeout_rate"] = (
-        timed_out_hinted / hinted_asked if hinted_asked else 0
-    )
-    headline["hinted_gone_rate"] = (
-        failures["gone_from_source"] / hinted_asked if hinted_asked else 0
-    )
+
+    headline = {
+        "requests_per_s": _ratio(requests, mean_window),
+        "remote_blocks_per_s": _ratio(remote, mean_window),
+        "engine_kvcr_share": _ratio(kvcr_seconds, window),
+        "engine_harness_share": _ratio(harness_seconds, window),
+        # The modelled forward pass, and steps with nothing to run.
+        "engine_forward_share": _ratio(counters.get("forward_seconds", 0), window),
+        "engine_idle_share": _ratio(counters.get("idle_seconds", 0), window),
+        "engine_kvcr_us_per_request": _ratio(kvcr_seconds, requests) * 1e6,
+        "engine_harness_us_per_request": _ratio(harness_seconds, requests) * 1e6,
+        "engine_kvcr_us_per_moved_block": _ratio(kvcr_seconds, moved) * 1e6,
+        "progress_us_per_moved_block": _ratio(progress_cpu, moved) * 1e6,
+        "native_us_per_moved_block": _ratio(native_cpu, moved) * 1e6,
+        **_p50_p99(hists["step_kvcr"], "step_kvcr"),
+        **_p50_p99(hists["ttft"], "ttft"),
+        **_p50_p99(hists["cache_resolve_remote"], "remote_resolve"),
+        **_p50_p99(hists["deliver_remote"], "deliver_remote"),
+        "hinted_block_failure_rate": _ratio(hinted_failed, hinted_asked),
+        "hinted_timeout_rate": _ratio(causes.get("timeout", 0), hinted_asked),
+        "hinted_unavailable_rate": _ratio(causes.get("unavailable", 0), hinted_asked),
+    }
 
     profile = config.get("engine", {}).get("profile", "vllm")
     aborted = counters.get("aborted_requests", 0)
@@ -177,49 +168,31 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         # blocks on linker calls and on loads.
         idle = counters.get("owner_idle_seconds", 0)
         spin = counters.get("owner_spin_seconds", 0)
-        batches = counters.get("load_batches", 0)
+        linker_wait = counters.get("linker_wait_seconds", 0)
+        load_wait = counters.get("load_wait_seconds", 0)
         headline.update(
             {
-                "linker_wait_share": counters.get("linker_wait_seconds", 0) / window
-                if window
-                else 0,
-                "load_wait_share": counters.get("load_wait_seconds", 0) / window
-                if window
-                else 0,
-                "linker_wait_us_per_request": counters.get("linker_wait_seconds", 0)
-                / requests
-                * 1e6
-                if requests
-                else 0,
-                "load_wait_us_per_request": counters.get("load_wait_seconds", 0)
-                / requests
-                * 1e6
-                if requests
-                else 0,
-                "owner_linker_share": max(0.0, window - idle - spin - kvcr_seconds)
-                / window
-                if window
-                else 0,
-                "owner_spin_share": spin / window if window else 0,
-                "owner_idle_share": idle / window if window else 0,
-                "owner_loops_per_s": counters.get("owner_loops", 0) / window
-                if window
-                else 0,
-                "abort_rate": aborted / (aborted + requests)
-                if aborted + requests
-                else 0,
-                "load_batch_failure_rate": counters.get("load_batches_failed", 0)
-                / batches
-                if batches
-                else 0,
-                "step_load_wait_p50_ms": hists["step_load_wait"].quantile(0.5) * 1e3,
-                "step_load_wait_p99_ms": hists["step_load_wait"].quantile(0.99) * 1e3,
-                "offload_p50_ms": hists["deposit"].quantile(0.5) * 1e3,
-                "offload_p99_ms": hists["deposit"].quantile(0.99) * 1e3,
-                "reoffered_restored_share": counters.get("reoffered_restored_pages", 0)
-                / counters["offload_pages"]
-                if counters.get("offload_pages")
-                else 0,
+                "linker_wait_share": _ratio(linker_wait, window),
+                "load_wait_share": _ratio(load_wait, window),
+                "linker_wait_us_per_request": _ratio(linker_wait, requests) * 1e6,
+                "load_wait_us_per_request": _ratio(load_wait, requests) * 1e6,
+                "owner_linker_share": _ratio(
+                    max(0.0, window - idle - spin - kvcr_seconds), window
+                ),
+                "owner_spin_share": _ratio(spin, window),
+                "owner_idle_share": _ratio(idle, window),
+                "owner_loops_per_s": _ratio(counters.get("owner_loops", 0), window),
+                "abort_rate": _ratio(aborted, aborted + requests),
+                "load_batch_failure_rate": _ratio(
+                    counters.get("load_batches_failed", 0),
+                    counters.get("load_batches", 0),
+                ),
+                **_p50_p99(hists["step_load_wait"], "step_load_wait"),
+                **_p50_p99(hists["deposit"], "offload"),
+                "reoffered_restored_share": _ratio(
+                    counters.get("reoffered_restored_pages", 0),
+                    counters.get("offload_pages", 0),
+                ),
             }
         )
 
@@ -240,7 +213,7 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     if lag.quantile(0.99) > MAX_COORDINATOR_LAG_P99_S:
         flags.append(f"coordinator dispatch lag p99 {lag.quantile(0.99) * 1e3:.2f} ms")
     measure_s = tally.get("measure_s", 0)
-    coordinator_busy = tally.get("busy_s", 0) / measure_s if measure_s else 0.0
+    coordinator_busy = _ratio(tally.get("busy_s", 0), measure_s)
     if coordinator_busy > MAX_COORDINATOR_BUSY:
         flags.append(f"the coordinator was busy {coordinator_busy:.0%} of the window")
     for role in ("engine", "owner", "progress"):
@@ -416,17 +389,17 @@ def format_summary(summary: dict) -> str:
         f"{'us/item':>10}{'share':>9}",
     ]
     failures = summary.get("failures")
-    if failures:
+    if failures and "causes" in failures:
         at = lines.index("", 3)  # after the blocks and latency lines
+        causes = dict(failures["causes"])
         cause = (
-            f"blocks a peer failed to deliver: timed out "
-            f"{failures['timed_out']:.0f} ({h['hinted_timeout_rate']:.2%} of "
-            f"hinted blocks), no longer on the source "
-            f"{failures['gone_from_source']:.0f} ({h['hinted_gone_rate']:.2%}), "
-            f"beyond the hint {failures['beyond_hint']:.0f}; KVCR timed "
-            f"{failures['kvcr_peer_ops_past_timeout']:.0f} peer operations past "
-            f"its timeout"
+            f"hinted blocks a peer did not deliver, by KVCR status: timeout "
+            f"{causes.pop('timeout', 0):.0f} ({h['hinted_timeout_rate']:.2%} of "
+            f"hinted blocks), unavailable {causes.pop('unavailable', 0):.0f} "
+            f"({h['hinted_unavailable_rate']:.2%})"
         )
+        cause += "".join(f", {name} {n:.0f}" for name, n in sorted(causes.items()))
+        cause += f"; beyond the hint {failures['beyond_hint']:.0f}"
         if failures["pin_requests"]:
             cause += (
                 f"; source pins {failures['pin_requests']:.0f} requested, "
@@ -523,27 +496,36 @@ AB_METRICS = (
     ("ttft_p99_ms", "ttft p99 ms"),
     ("hinted_block_failure_rate", "hinted-block failure rate"),
     ("hinted_timeout_rate", "hinted blocks timed out"),
-    ("hinted_gone_rate", "hinted blocks gone from source"),
+    ("hinted_unavailable_rate", "hinted blocks unavailable"),
     ("requests_per_s", "requests / s"),
     ("remote_blocks_per_s", "remote blocks / s"),
 )
 
 
 def compare(arms: dict[str, list[dict]]) -> str:
-    """A/B (or A/A) table: median per arm, spread, and change versus the first."""
+    """A/B (or A/A) table: median per arm, spread, and change versus the first.
+
+    Only valid runs are compared; an arm without one raises ``ValueError``.
+    """
     names = list(arms)
     base = names[0]
     lines = []
+    valid: dict[str, list[dict]] = {}
     for name in names:
         runs = arms[name]
+        valid[name] = [s for s in runs if s["valid"]]
         invalid = [s for s in runs if not s["valid"]]
         shas = sorted({s["kvcr_sha"] for s in runs})
         lines.append(
             f"{name}: {len(runs)} runs, kvcr {','.join(shas)}"
-            + (f", {len(invalid)} INVALID" if invalid else "")
+            + (f", {len(invalid)} INVALID and left out" if invalid else "")
         )
         for s in invalid:
             lines.append(f"    {s['name']}: " + "; ".join(s["flags"]))
+        if not valid[name]:
+            lines.append(f"{name} has no valid run: nothing to compare")
+            raise ValueError("\n".join(lines))
+    arms = valid
     offered = {
         name: statistics.median(s["offered"]["dispatched_blocks"] for s in arms[name])
         for name in names

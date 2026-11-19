@@ -8,6 +8,7 @@ import os
 import random
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from clusterbench.config import load_config
@@ -18,6 +19,8 @@ _PROBE = (
     "import nixl._api as api;"
     "api.nixl_agent('cb-probe', api.nixl_agent_config(backends=['UCX']))"
 )
+
+REPO = str(Path(__file__).parents[2])
 
 OVERRIDES = [
     "tiers.block_bytes=4096",
@@ -70,7 +73,8 @@ def real_nixl():
 )
 def test_workers_pull_blocks_from_each_other(real_nixl, tmp_path, mode, tier_overrides):
     config = load_config(None, [f"name={mode}", *OVERRIDES, *tier_overrides])
-    summary = run_local(config, tmp_path, nodes=3, per_node=1)
+    # Named as an arm's checkout, so the workers must have loaded this tree.
+    summary = run_local(config, tmp_path, nodes=3, per_node=1, kvcr_src=REPO)
     logs = "".join(p.read_text()[-2000:] for p in (tmp_path / "logs").glob("*.log"))
     assert summary["workers"] == 3 and summary["nodes"] == 3, logs
     counters = summary["counters"]
@@ -237,9 +241,7 @@ def test_a_replayed_trace_moves_blocks_between_workers(
     assert not hard, hard
 
 
-def test_transfers_that_run_into_the_timeout_are_reported_as_timeouts(
-    real_nixl, tmp_path
-):
+def test_transfers_kvcr_times_out_are_reported_as_timeouts(real_nixl, tmp_path):
     overrides = [
         "name=timeouts",
         *OVERRIDES,
@@ -251,9 +253,10 @@ def test_transfers_that_run_into_the_timeout_are_reported_as_timeouts(
         "engine.abandon_timeout_ms=1000",
     ]
     summary = run_local(load_config(None, overrides), tmp_path, nodes=3, per_node=1)
-    failures = summary["failures"]
-    assert failures["timed_out"] > 0, summary["counters"]
-    # KVCR's own clock agrees that peer operations ran past the timeout.
-    assert failures["kvcr_peer_ops_past_timeout"] > 0
+    causes = summary["failures"]["causes"]
+    assert causes.get("timeout", 0) > 0, summary["counters"]
+    # This tree's KVCR names a status for every block it does not deliver.
+    assert "unclassified" not in causes
+    assert summary["counters"]["hinted_failed_reason|deadline"] > 0
     assert summary["completed"]["timed_out_blocks"] > 0
     assert summary["headline"]["hinted_timeout_rate"] > 0

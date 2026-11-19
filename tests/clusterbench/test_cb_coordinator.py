@@ -8,10 +8,17 @@ import json
 import threading
 import time
 
+import pytest
 import zmq
 from clusterbench import protocol
 from clusterbench.config import load_config
-from clusterbench.coordinator import REQUEST_FIELDS, REQUEST_LOG, Coordinator
+from clusterbench.coordinator import (
+    REQUEST_FIELDS,
+    REQUEST_LOG,
+    Coordinator,
+    RunFailed,
+)
+from clusterbench.launch_local import run_local
 from clusterbench.metrics import Window
 
 OVERRIDES = [
@@ -94,7 +101,6 @@ class Workers(threading.Thread):
                     done = protocol.Done(
                         rid=message.rid,
                         ttft_ms=self._service_s * 1e3,
-                        total_ms=self._service_s * 1e3,
                         load_ms=0.0,
                         prompt_blocks=blocks,
                         gpu_blocks=blocks,
@@ -158,12 +164,17 @@ def _run(out, service_ms, *overrides, stall=None):
     return summary
 
 
+def _rows(out):
+    """The request log as one dict per request."""
+    header, *rows = map(json.loads, (out / REQUEST_LOG).read_text().splitlines())
+    assert header == {"clusterbench_requests": 1, "fields": list(REQUEST_FIELDS)}
+    return [dict(zip(REQUEST_FIELDS, row)) for row in rows]
+
+
 def test_every_request_is_logged_with_where_it_went_and_how_it_ended(tmp_path):
     # Session 0's first request does not come back before the run ends.
     summary = _run(tmp_path, 20, stall={0: 60.0})
-    header, *rows = map(json.loads, (tmp_path / REQUEST_LOG).read_text().splitlines())
-    assert header == {"clusterbench_requests": 1, "fields": list(REQUEST_FIELDS)}
-    rows = [dict(zip(REQUEST_FIELDS, row)) for row in rows]
+    rows = _rows(tmp_path)
     assert len({(row["session"], row["turn"]) for row in rows}) == len(rows) > 100
     assert {row["worker"] for row in rows} == set(range(WORKERS))
     assert sum(row["in_window"] for row in rows) == summary["offered"]["dispatched"]
@@ -173,3 +184,30 @@ def test_every_request_is_logged_with_where_it_went_and_how_it_ended(tmp_path):
     # A request the run ended on is logged with no outcome.
     (stuck,) = [row for row in rows if row["session"] == 0]
     assert list(stuck) == list(REQUEST_FIELDS[:9])
+
+
+def test_requests_that_fall_due_together_are_timed_one_by_one(tmp_path):
+    # No ramp: every session's first request is due at the same instant.
+    _run(tmp_path, 20, "workload.ramp_s=0")
+    burst = sorted(row["t_ms"] for row in _rows(tmp_path))[: 2 * WORKERS]
+    assert len(set(burst)) == len(burst)
+
+
+def test_workers_that_loaded_another_kvcr_tree_fail_the_run(tmp_path):
+    coordinator = Coordinator(load_config(None, OVERRIDES), tmp_path)
+    endpoint = coordinator.bind("tcp://127.0.0.1:*")
+    Workers(endpoint, 0.02).start()  # they report kvcr from /k
+    try:
+        with pytest.raises(RunFailed, match="not from /checkout/src"):
+            coordinator.run(expect=WORKERS, expect_kvcr="/checkout/src")
+    finally:
+        coordinator.close()
+
+
+def test_a_path_that_is_not_a_kvcr_checkout_is_refused_before_anything_starts(
+    tmp_path,
+):
+    config = load_config(None, OVERRIDES)
+    with pytest.raises(ValueError, match="not a KVCR checkout"):
+        run_local(config, tmp_path / "run", kvcr_src=str(tmp_path))
+    assert not (tmp_path / "run").exists()

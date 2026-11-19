@@ -60,24 +60,3 @@ def test_thread_delta_attributes_cpu_to_the_engine_thread():
     roles = thread_delta(before, thread_snapshot())
     assert roles["engine"]["cpu_s"] > 0
     assert roles["engine"]["threads"] == 1
-
-
-def test_peer_operations_kvcr_timed_past_its_timeout_are_counted():
-    window = Window()
-    stats = Telemetry()
-    name = "kvcr_duration_seconds"
-    for seconds in (0.2, 1.01, 1.2):
-        stats.observe_histogram(name, seconds, ("remote_deliver", "failed"))
-    stats.observe_histogram(name, 1.5, ("remote_deliver", "partial"))
-    stats.observe_histogram(name, 0.5, ("remote_deliver", "partial"))
-    stats.observe_histogram(name, 3.0, ("remote_deliver", "success"))
-    stats.observe_histogram(name, 3.0, ("source_write", "failed"))
-    # KVCR trees that name the reason label these instead of "failed".
-    stats.observe_histogram(name, 1.1, ("remote_fetch", "timeout"))
-    stats.observe_histogram(name, 0.3, ("remote_deliver", "unavailable"))
-    window.merge_telemetry(stats)
-    assert "kvcr_peer_ops_past_timeout" not in window.counters  # no timeout known
-    window.late_after = 1.0
-    window.merge_telemetry(stats)
-    # Only peer transfers that did not fully succeed, at or past the timeout.
-    assert window.counters["kvcr_peer_ops_past_timeout"] == 4
