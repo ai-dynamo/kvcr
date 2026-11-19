@@ -131,9 +131,9 @@ def check_wheel(
     found = f"{metadata['Name']} {metadata['Version']}"
     if found != f"kvcr {version}":
         errors.append(f"METADATA names {found}, expected kvcr {version}")
-    expression = metadata["License-Expression"]
-    if expression != "Apache-2.0":
-        errors.append(f"License-Expression is {expression!r}, expected 'Apache-2.0'")
+    declared = metadata["License"]
+    if declared != "Apache-2.0":
+        errors.append(f"License is {declared!r}, expected 'Apache-2.0'")
     runtime, extras = set(), set()
     for req in metadata.get_all("Requires-Dist") or []:
         name = normalize(re.match(r"[A-Za-z0-9._-]+", req).group(0))
