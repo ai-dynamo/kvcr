@@ -19,8 +19,9 @@ key, which cannot change once a peer holds it.
 ``TraceWorkload`` replays the compiled file closed loop, following aiperf's
 AgentX rules: a request goes out the recorded gap after its latest dependency
 ends, a sub-agent starts after the parent turn before it and runs beside its
-siblings, the next parent turn waits for them, and every play of a trace gets
-block ids of its own.
+siblings and the parent turns that follow, the first of those recorded at or
+after the sub-agent's end waits for it, and every play of a trace gets block
+ids of its own.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import random
 from bisect import bisect_left
+from collections import Counter
 from pathlib import Path
 
 import msgspec
@@ -36,11 +38,14 @@ from .config import RunConfig
 from .ids import MAX_STREAM, TRACE_BASE, Segment
 from .workload import Step, Turn
 
-FORMAT = 1
+FORMAT = 2
 # Ints per turn: lane, last stream, blocks used of it, tail stream, tail start,
 # tail end, prompt tokens, output tokens, wait (ms), recorded time (ms).
 _ROW = 10
 MAX_SEGMENTS = 255  # the device cache orders a request's streams in one byte
+# A parent turn recorded this close before a sub-agent's end still joins it;
+# mirrors aiperf's join epsilon.
+_JOIN_EPSILON_S = 1e-6
 
 
 class TraceError(ValueError):
@@ -67,6 +72,10 @@ class Compiled(msgspec.Struct, array_like=True):
     edges: list[int]
     # Per lane, the main-lane turn it starts after (-1 for the main lane).
     spawn: list[int]
+    # Per lane, the main-lane turn that waits for it: the first one after
+    # ``spawn`` recorded at or after the lane's end (-1 for the main lane and
+    # for a lane no later turn waits for).
+    join: list[int]
     # ``_ROW`` ints per turn, lane by lane.
     rows: list[int]
 
@@ -378,15 +387,22 @@ def compile_trace(trace: dict, stats: Stats | None = None) -> Compiled | None:
             stats.tail_blocks += kept
             row.tail = (edge, start, start + kept)
 
-    # Waits: the recorded gap after a turn's latest dependency ended.
-    children: dict[int, list[int]] = {}
-    for lane in range(1, len(lanes)):
-        children.setdefault(spawn[lane], []).append(lane)
+    # Joins. Recorded times need not rise, so each lane scans from its spawn.
     main = lanes[0]
+    join = [-1] * len(lanes)
+    joined: dict[int, float] = {}  # main turn -> latest end of the lanes it joins
+    for lane in range(1, len(lanes)):
+        end = max(row.end for row in lanes[lane])
+        for index in range(spawn[lane] + 1, len(main)):
+            if main[index].t + _JOIN_EPSILON_S >= end:
+                join[lane] = index
+                joined[index] = max(end, joined.get(index, end))
+                break
+
+    # Waits: the recorded gap after a turn's latest dependency ended.
     for index in range(1, len(main)):
         latest = main[index - 1].end
-        for lane in children.get(index - 1, ()):
-            latest = max(latest, max(row.end for row in lanes[lane]))
+        latest = max(latest, joined.get(index, latest))
         main[index].wait = max(0.0, main[index].t - latest)
     for lane in range(1, len(lanes)):
         before = main[spawn[lane]].end
@@ -418,9 +434,9 @@ def compile_trace(trace: dict, stats: Stats | None = None) -> Compiled | None:
     stats.child_turns += sum(len(rows) for rows in lanes[1:])
     stats.groups += len(lanes) - 1
     stats.streams.append(len(parents))
-    stats.fanout.extend(len(group) for group in children.values())
+    stats.fanout.extend(Counter(spawn[1:]).values())
     edges = [value for pair in zip(parents, lengths) for value in pair]
-    return Compiled(tid, edges, spawn, flat)
+    return Compiled(tid, edges, spawn, join, flat)
 
 
 def compile_corpus(
@@ -473,8 +489,8 @@ def compile_corpus(
 
 class _Trace:
     __slots__ = (
-        "id", "parents", "lengths", "spawn", "lanes", "rows", "children", "paths",
-        "streams", "main", "at_ms",
+        "id", "parents", "lengths", "spawn", "join", "lanes", "rows", "children",
+        "paths", "streams", "main", "at_ms",
     )  # fmt: skip
 
     def __init__(self, compiled: Compiled) -> None:
@@ -482,6 +498,7 @@ class _Trace:
         self.parents = compiled.edges[0::2]
         self.lengths = compiled.edges[1::2]
         self.spawn = compiled.spawn
+        self.join = compiled.join
         rows = self.rows = compiled.rows
         # (first row, turns) per lane.
         counts = [0] * len(compiled.spawn)
@@ -546,14 +563,16 @@ def load(path: str | Path) -> tuple[Header, list[_Trace]]:
 class _Play:
     """One replay of one trace: a main lane and its sub-agent lanes."""
 
-    __slots__ = ("trace", "base", "id", "cursor", "waiting", "live")
+    __slots__ = ("trace", "base", "id", "cursor", "blocked", "live")
 
     def __init__(self, trace: _Trace, base: int, first_session: int) -> None:
         self.trace = trace
         self.base = base
         self.id = first_session  # lane n is session ``id + n``
         self.cursor = [0] * len(trace.lanes)
-        self.waiting = 0  # sub-agents the next main turn is waiting for
+        # Main turn -> what it still waits for: the turn before it and the
+        # sub-agents it joins. A turn that joins none has no entry.
+        self.blocked: dict[int, int] = {}
         self.live = 0  # lanes that have not ended
 
 
@@ -639,8 +658,16 @@ class TraceWorkload:
             target = rng.random() * trace.at_ms[-1]
             start = min(bisect_left(trace.at_ms, target), trace.main - 1)
         play.cursor[0] = start
-        # Sub-agents that started before that point are over.
-        play.live = 1 + sum(1 for after in trace.spawn[1:] if after >= start)
+        # Sub-agents that started before that point are over: no turn waits
+        # for them.
+        play.live = 1
+        blocked = play.blocked
+        for lane in range(1, len(trace.spawn)):
+            if trace.spawn[lane] >= start:
+                play.live += 1
+                at = trace.join[lane]
+                if at >= 0:
+                    blocked[at] = blocked.get(at, 1) + 1
         self._lanes[play.id] = (play, 0)
         return play
 
@@ -690,6 +717,15 @@ class TraceWorkload:
         wait_ms = trace.rows[(trace.lanes[lane][0] + at) * _ROW + 8]
         return min(self._cap, wait_ms * 1e-3 * self._scale)
 
+    def _release(self, play: _Play, at: int, wake: list[tuple[float, int]]) -> None:
+        """Main turn ``at`` waits for one thing less; the last one wakes it."""
+        left = play.blocked.get(at, 1) - 1
+        if left:
+            play.blocked[at] = left
+        else:
+            play.blocked.pop(at, None)
+            wake.append((self._wait(play.trace, 0, at), play.id))
+
     def completed(self, turn: Turn) -> Step:
         session = turn.session
         play, lane = self._lanes[session]
@@ -697,24 +733,21 @@ class TraceWorkload:
         wake: list[tuple[float, int]] = []
         ended: list[int] = []
         if lane == 0:
-            started = trace.children.get(turn.turn, ())
-            for child in started:
+            for child in trace.children.get(turn.turn, ()):
                 self._lanes[play.id + child] = (play, child)
                 wake.append((self._wait(trace, child, 0), play.id + child))
             if turn.turn + 1 >= trace.main:
                 ended.append(session)
-            elif started:
-                play.waiting = len(started)  # the next turn joins them
             else:
-                wake.append((self._wait(trace, 0, turn.turn + 1), session))
+                self._release(play, turn.turn + 1, wake)
         elif play.cursor[lane] < trace.lanes[lane][1]:
             wake.append((self._wait(trace, lane, play.cursor[lane]), session))
         else:
             ended.append(session)
-            if play.waiting and trace.spawn[lane] == play.cursor[0] - 1:
-                play.waiting -= 1
-                if not play.waiting:
-                    wake.append((self._wait(trace, 0, play.cursor[0]), play.id))
+            # The main lane may be parked at the join turn or still running
+            # the turn before it: the cursor cannot tell, the count can.
+            if trace.join[lane] >= 0:
+                self._release(play, trace.join[lane], wake)
         for gone in ended:
             del self._lanes[gone]
             play.live -= 1

@@ -375,6 +375,19 @@ AGENTS = [
     group(9.5, [req(9.5, [30], api=1.0)]),
 ]
 
+# A sub-agent that ends at 9, after the parent turn that follows its start.
+OVERLAP = [
+    req(0, [1, 2], api=1.0),
+    group(2, [req(2, [10], api=7.0)]),
+    req(6, [1, 2, 3], api=1.0),
+    req(12, [1, 2, 3, 4], api=1.0),
+]
+
+
+def _waits(compiled):
+    rows = compiled.rows
+    return [(rows[o], rows[o + 8]) for o in range(0, len(rows), _ROW)]
+
 
 def _config(path, **workload):
     return RunConfig(workload=WorkloadConfig(trace=str(path), **workload))
@@ -396,13 +409,11 @@ def _workload(tmp_path, traces, **workload):
 def test_waits_are_the_recorded_gap_after_the_latest_dependency():
     compiled = compile_trace(trace(AGENTS))
     assert compiled.spawn == [-1, 0, 0, 2]
-    waits = [
-        (compiled.rows[o], compiled.rows[o + 8])
-        for o in range(0, len(compiled.rows), _ROW)
-    ]
+    # Both early sub-agents end before the turn at 6; no turn follows the last.
+    assert compiled.join == [-1, 1, 1, -1]
     # Main lane: nothing, then 6 - 4 (the slower sub-agent), then 8 - 7.
     # Sub-agents: after the parent turn ended at 1, then after their own turns.
-    assert waits == [
+    assert _waits(compiled) == [
         (0, 0),
         (0, 2000),
         (0, 1000),
@@ -411,6 +422,24 @@ def test_waits_are_the_recorded_gap_after_the_latest_dependency():
         (2, 1000),
         (3, 500),
     ]
+
+
+def test_a_sub_agent_joins_the_first_parent_turn_recorded_at_or_after_its_end():
+    compiled = compile_trace(trace(OVERLAP))
+    assert (compiled.spawn, compiled.join) == ([-1, 0], [-1, 2])
+    # The turn at 6 follows turn 0 alone: 6 - 1. The turn at 12 follows the
+    # sub-agent, which ended at 9, later than the turn at 6 did: 12 - 9.
+    assert _waits(compiled) == [(0, 0), (0, 5000), (0, 3000), (1, 1000)]
+    # A turn at 6 that ends at 11 is the later of the two: 12 - 11.
+    slow = [*OVERLAP[:2], req(6, [1, 2, 3], api=5.0), OVERLAP[3]]
+    assert _waits(compile_trace(trace(slow)))[2] == (0, 1000)
+
+    def join(api):
+        child = group(2, [req(2, [10], api=api)])
+        return compile_trace(trace([OVERLAP[0], child, *OVERLAP[2:]])).join
+
+    assert join(4.0) == [-1, 1]  # ends at 6, as the next parent turn starts
+    assert join(10.5) == [-1, -1]  # ends after the last parent turn starts
 
 
 def test_inner_times_relative_to_the_group_are_shifted():
@@ -444,6 +473,28 @@ def test_sub_agents_run_together_and_the_parent_waits_for_all_of_them(tmp_path, 
     assert late.wake == [(2.0, main)] and sorted(early.ended + late.ended) == [a, b]
     turn = workload.next_turn(main)
     assert turn.turn == 1 and turn.segments == ((TRACE_BASE, 0, 3),)
+
+
+@pytest.mark.parametrize("first", ["child", "parent"])
+def test_a_parent_turn_before_the_join_runs_beside_the_sub_agent(tmp_path, first):
+    workload = _workload(tmp_path, [trace(OVERLAP)])
+    main = workload.new_session().id
+    child = main + 1
+    step = workload.completed(workload.next_turn(main))
+    # The turn at 6 is due without the sub-agent having run.
+    assert sorted(step.wake) == [(1.0, child), (5.0, main)] and not step.ended
+    running = workload.next_turn(child)
+    beside = workload.next_turn(main)
+    assert beside.turn == 1
+    order = (running, beside) if first == "child" else (beside, running)
+    early, late = workload.completed(order[0]), workload.completed(order[1])
+    # The turn at 12 waits for both; the later one releases it.
+    assert early.wake == [] and late.wake == [(3.0, main)]
+    assert early.ended + late.ended == [child]
+    last = workload.next_turn(main)
+    assert last.turn == 2
+    step = workload.completed(last)
+    assert step.ended == [main] and workload.started == 2
 
 
 def test_a_play_is_replaced_only_when_every_lane_has_ended(tmp_path):
@@ -549,6 +600,19 @@ def test_a_play_that_starts_past_a_sub_agent_does_not_wait_for_it(tmp_path):
     assert play.live == 1  # the sub-agent after turn 2 is over
 
 
+def test_a_play_that_starts_between_a_spawn_and_its_join_does_not_wait(tmp_path):
+    workload = _workload(tmp_path, [trace(OVERLAP)])
+    play = workload.new_session(aged=True)
+    turn = workload.next_turn(play.id)
+    while turn.turn != 1:  # the turn at 6: after the spawn, before the join
+        play = workload.new_session(aged=True)
+        turn = workload.next_turn(play.id)
+    assert play.live == 1
+    # The sub-agent is over: the turn at 12 follows the turn at 6 alone.
+    assert workload.completed(turn) == ([(3.0, play.id)], [])
+    assert workload.next_turn(play.id).turn == 2
+
+
 # ---- files and errors -----------------------------------------------------------
 
 
@@ -649,7 +713,7 @@ def test_unreadable_trace_files_say_what_to_do(tmp_path):
     header = msgspec.json.decode(lines[0], type=Header)
     old = msgspec.structs.replace(header, clusterbench_trace=0)
     path.write_bytes(msgspec.json.encode(old) + b"\n" + lines[1] + b"\n")
-    with pytest.raises(TraceError, match="format 0, this build reads 1"):
+    with pytest.raises(TraceError, match="format 0, this build reads 2"):
         TraceWorkload(_config(path))
     path.write_bytes(b"not json\n")
     with pytest.raises(TraceError, match="not a compiled trace"):
