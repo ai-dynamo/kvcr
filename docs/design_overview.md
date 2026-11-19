@@ -255,6 +255,8 @@ Framework-owned memory is reported through the framework's existing router event
 
 KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_hint` in the normal case. KVCR deliberately reports only the affected keys, tier, and whether the residency was removed. KVCR delivers each event to `inventory_sink`; the framework or local indexer owns any buffering or batching for publication. Each event may contain multiple keys and is tier-specific because one block may be present in several tiers at once.
 
+The identity of a stored block is a `SharedBlockId`: record version 1, the framework `BlockKey`, the block size, and the storage prefix. The prefix is one optional path segment (letters, digits, `_`, or `-`). File paths, object keys, and the block header use that same segment; an empty prefix adds none. KVCR does not read the block bytes to decide identity. A block extent has no name, so it stores that id as a fixed 1 KiB header and rejects a header that differs.
+
 ### KV transfer hints
 
 For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
