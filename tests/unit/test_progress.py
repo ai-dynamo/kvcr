@@ -899,6 +899,8 @@ class _WaitRecorder:
             self.waits.append(timeout)
             long = timeout >= self.LONG_WAIT_SECONDS
             if long:
+                # Only a wakeup ends the wait, however late the test thread runs.
+                timeout = progress_module._IDLE_WAIT_MAX_SECONDS
                 self.long_wait.set()
             woken = wait_for_input(wake_fd, timeout)
             if long:
