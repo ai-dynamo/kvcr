@@ -50,8 +50,7 @@ class _PayloadEmitter:
             for reason in Reason
         }
         # Shared with target/caller tracing, which supplies local_fill and
-        # medium-detail requested_bytes and destination_memory. Session IDs and
-        # numeric native errors have no producer; their known flags stay zero.
+        # medium-detail requested_bytes and destination_memory.
         self.context_dtype = numpy.dtype(
             [
                 ("schema_version", "u2"),
@@ -61,8 +60,6 @@ class _PayloadEmitter:
                 ("request_hi", "u8"),
                 ("request_lo", "u8"),
                 ("request_known", "u1"),
-                ("session_known", "u1"),
-                ("parent_session_known", "u1"),
                 ("op_handle", "i8"),
                 ("source_op_id", "i8"),
                 ("target_agent_hi", "u8"),
@@ -71,6 +68,8 @@ class _PayloadEmitter:
                 ("target_incarnation_lo", "u8"),
                 ("route_generation", "u8"),
                 ("transfer_id", "u8"),
+                ("nixl_request_id", "u8"),
+                ("nixl_execution", "u8"),
                 ("hint_trace_id", "u8"),
                 ("local_blocks", "i8"),
                 ("remote_blocks", "i8"),
@@ -88,14 +87,11 @@ class _PayloadEmitter:
                 ("destination_tier", "u1"),
                 ("source_memory", "u1"),
                 ("destination_memory", "u1"),
-                ("native_error_known", "u1"),
-                ("native_error", "i8"),
                 # Nsight 2025.3 exports NumPy Unicode as empty strings. Bounded
                 # bytes and an explicit length also preserve embedded NULs.
                 ("pin_id", "u8"),
                 ("pin_request_known", "u1"),
                 ("pin_request_id", "i8"),
-                ("fw_dram_utilization_known", "u1"),
                 ("request_display_known", "u1"),
                 ("length", "u2"),
                 ("truncated", "u1"),
