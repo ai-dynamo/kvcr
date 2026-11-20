@@ -44,6 +44,8 @@ The Dockerfile pins the SGLang and Dynamo revisions for each mode; mismatched SG
 
 ## 2. Start the container
 
+For profiling, first prepare the optional [Nsight/report mounts](profiling.md#capture-vllm-and-sglang-workers) in this host terminal.
+
 Select two available GPUs; this example uses `0,1`. No host ports are published.
 
 ```bash
@@ -55,6 +57,7 @@ esac
 export QS_NAME="kvcr-sgl-$QS_MODE-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 docker volume create "$QS_NAME-models"
 export QS_CID="$(docker run --detach --init --name "$QS_NAME" \
+  "${KVCR_PROFILE_MOUNTS[@]}" \
   --gpus '"device=0,1"' --shm-size 8g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --env QS_MODE="$QS_MODE" --env MODEL="$QS_MODEL" --env MODEL_PATH=/model \
@@ -93,6 +96,8 @@ The KV router supplies source hints; a round-robin router does not demonstrate r
 ## 5. Start two workers
 
 Run this block in **each** worker terminal, setting `RANK=0` in the first and `RANK=1` in the second. Keep both running throughout verification.
+
+For an NVTX capture, first follow the [framework profiling setup](profiling.md#capture-vllm-and-sglang-workers) in each terminal, using separate source and target report names. The optional `KVCR_PROFILE` array wraps only this worker and its children. Start with `QS_MODE=hicache`.
 
 ```bash
 set -euo pipefail
@@ -136,7 +141,7 @@ else
     --enable-unified-cache-external-linker --unified-cache-external-linker-backend kvcr)
 fi
 env -u NATS_SERVER CUDA_VISIBLE_DEVICES="$RANK" DYN_SYSTEM_PORT="$((24001 + RANK))" \
-  python3 -m dynamo.sglang --endpoint dyn://kvcrqs.backend.generate \
+  "${KVCR_PROFILE[@]}" python3 -m dynamo.sglang --endpoint dyn://kvcrqs.backend.generate \
   --model-path "$MODEL_PATH" --served-model-name "$MODEL" --tp-size 1 \
   --host 127.0.0.1 --port "$((24010 + RANK))" \
   --dtype bfloat16 --attention-backend trtllm_mha \
