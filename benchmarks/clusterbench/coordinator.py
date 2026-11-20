@@ -36,7 +36,6 @@ REQUEST_FIELDS = (
     "prompt_blocks",
     "held_blocks",  # of the prompt, what the router believed the worker held
     "remote_blocks", "failed_blocks", "timed_out_blocks", "load_ms", "ttft_ms",
-    "aborted",
 )  # fmt: skip
 
 
@@ -276,7 +275,6 @@ class Coordinator:
                     message.timed_out_blocks,
                     round(message.load_ms, 3),
                     round(message.ttft_ms, 3),
-                    message.aborted,
                 )
                 log.write(b"\n" + encode(sent + outcome))
                 if measuring and not stopped:
@@ -420,7 +418,6 @@ class Coordinator:
         )
         completed = (
             "completed",
-            "aborted",
             "prompt_blocks",
             "gpu_blocks",
             "primary_blocks",
@@ -444,10 +441,6 @@ class Coordinator:
     def _tally_done(completed, done, worker, source, nodes) -> None:
         completed["failed_blocks"] += done.failed_blocks
         completed["timed_out_blocks"] += done.timed_out_blocks
-        if done.aborted:
-            # Dropped by the engine: no first token and nothing reused.
-            completed["aborted"] += 1
-            return
         completed["completed"] += 1
         completed["prompt_blocks"] += done.prompt_blocks
         completed["gpu_blocks"] += done.gpu_blocks

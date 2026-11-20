@@ -16,7 +16,6 @@ from clusterbench.config import (
     load_config,
 )
 from clusterbench.coordinator import Coordinator
-from clusterbench.device_tree import DeviceTree
 from clusterbench.ids import TRACE_BASE
 from clusterbench.primary_tier import StreamCache
 from clusterbench.trace import (
@@ -255,20 +254,6 @@ def _replay_stream_cache(view):
     return hits
 
 
-def _replay_device_tree(view):
-    tree = DeviceTree(1 << 16)
-    hits = []
-    for _, _, _, segments, tail in view.turns:
-        hits.append(tree.prefix(segments))
-        parent = None
-        for stream, start, end in [*segments, tail]:
-            held = tree.held(stream)
-            if end > held >= start:
-                tree.insert(stream, held, tree.allocate(end - held), parent)
-            parent = stream
-    return hits
-
-
 @pytest.mark.parametrize("seed", range(20))
 def test_replayed_caches_hit_what_the_true_answers_would_give(seed):
     requests, truth = _conversation(random.Random(seed), 40)
@@ -278,7 +263,6 @@ def test_replayed_caches_hit_what_the_true_answers_would_give(seed):
         held = [earlier + answer for earlier, answer in truth[:index]]
         expected.append(max((common(prompt, path) for path in held), default=0))
     assert _replay_stream_cache(view) == expected
-    assert _replay_device_tree(view) == expected
     # A request that is extended got its whole answer, in order.
     block_of = {}
     for (_, blocks, _, _, _), (prompt, _) in zip(view.turns, truth):
@@ -692,17 +676,6 @@ def test_a_trace_that_does_not_fit_the_run_is_refused(tmp_path):
     TraceWorkload(run(primary_blocks=330 + reserved))
     with pytest.raises(TraceError, match="longest prompt is 330 .*primary_blocks"):
         TraceWorkload(run(primary_blocks=329 + reserved))
-    sglang = load_config(
-        None,
-        [
-            "engine.profile=sglang",
-            f"workload.trace={path}",
-            f"tiers.gpu_blocks={329 + reserved}",
-            "tiers.primary_blocks=64",
-        ],
-    )
-    with pytest.raises(TraceError, match="tiers.gpu_blocks"):
-        TraceWorkload(sglang)
 
 
 def test_unreadable_trace_files_say_what_to_do(tmp_path):

@@ -7,12 +7,6 @@ pool, the primary CPU tier as the single framework region, an optional
 anonymous mmap as the KVCR-owned DRAM pool, a ZMQ peer control channel.
 Unlike vLLM's default, KVCR's telemetry is on: the report reads it.
 
-``LinkerHost`` mirrors SGLang's ``KVCRRuntime`` and ``KVCRLayout`` (direct
-linker): every K and V tensor of every layer is its own labelled framework
-region, a page is one key with a piece in each, one pool holds the pieces,
-there are no pin callbacks, and KVCR is built by the thread that will own it.
-The device regions are host memory here.
-
 Small probes keep this working against older KVCR trees so A/B arms can differ.
 """
 
@@ -100,28 +94,19 @@ def core_groups(cpus) -> list[list[int]]:
     return [group for _, group in sorted(physical_cores(cpus).items())]
 
 
-def plan_affinity(
-    cpus: list[int], dedicated: int
-) -> tuple[list[int | None], list[int]]:
-    """Split a worker's CPUs into ``dedicated`` one-thread cores and the rest.
+def plan_affinity(cpus: list[int]) -> tuple[int | None, int | None, list[int]]:
+    """Split a worker's CPUs: engine thread, kvcr-progress, native threads.
 
-    Each dedicated thread (engine, kvcr-progress, and the linker's owner, which
-    spins while transfers are pending) gets the first hyperthread of its own
-    physical core and the sibling is left idle; everything else (NIXL, UCX and
-    ZMQ threads) shares the remaining cores. With too few cores for that,
+    The engine and progress threads each get the first hyperthread of their
+    own physical core and its sibling is left idle; everything else (NIXL, UCX
+    and ZMQ threads) shares the remaining cores. With fewer than three cores
     nothing is dedicated.
     """
     groups = core_groups(cpus)
-    if len(groups) <= dedicated:
-        return [None] * dedicated, sorted(cpus)
-    native = [cpu for group in groups[dedicated:] for cpu in group]
-    return [group[0] for group in groups[:dedicated]], native
-
-
-def _pin_progress(cpu: int) -> None:
-    for thread in threading.enumerate():
-        if thread.name == "kvcr-progress" and thread.native_id:
-            os.sched_setaffinity(thread.native_id, {cpu})
+    if len(groups) < 3:
+        return None, None, sorted(cpus)
+    native = [cpu for group in groups[2:] for cpu in group]
+    return groups[0][0], groups[1][0], native
 
 
 def auto_cpus(local_id: int, per_node: int, reserve: int = 2) -> tuple[list[int], int]:
@@ -207,7 +192,7 @@ class Host:
                 cancel_pin_request=framework.cancel_pin_request,
             )
 
-        (engine_cpu, progress_cpu), native = plan_affinity(cpus, 2)
+        engine_cpu, progress_cpu, native = plan_affinity(cpus)
         if native:
             # Threads KVCR and NIXL start inherit this mask.
             os.sched_setaffinity(0, native)
@@ -258,7 +243,9 @@ class Host:
         }
         if engine_cpu is not None:
             os.sched_setaffinity(0, {engine_cpu})
-            _pin_progress(progress_cpu)
+            for thread in threading.enumerate():
+                if thread.name == "kvcr-progress" and thread.native_id:
+                    os.sched_setaffinity(thread.native_id, {progress_cpu})
 
     def stamp(self, slot: int, bid: int) -> None:
         _STAMP.pack_into(self._primary_view, slot * self.block_bytes, bid)
@@ -274,179 +261,3 @@ class Host:
 
     def close(self) -> None:
         self.kvcr.close()
-
-
-class LinkerHost:
-    """Memory and KVCR for the SGLang direct-linker profile.
-
-    The constructor only maps memory. ``start()`` builds KVCR and must run on
-    the thread that will make every KVCR call (the linker's owner thread);
-    ``close()`` runs there too.
-    """
-
-    def __init__(
-        self,
-        tiers: TierConfig,
-        engine: EngineConfig,
-        *,
-        agent_name: str,
-        bind_host: str,
-        control_port: int,
-        nixl_port: int,
-        stats_factory,
-        cpus: list[int],
-    ) -> None:
-        self.agent_name = agent_name
-        self.piece_bytes = piece = tiers.piece_bytes
-        layers = tiers.layers
-        self.pool = f"kv_{piece}"
-        # Upstream labels: ``<pool>:c<component>.b<buffer>``; K is component 0.
-        self.labels = tuple(
-            tuple(f"{self.pool}:c{component}.b{layer}" for layer in range(layers))
-            for component in range(2)
-        )
-        self.device = mmap.mmap(-1, tiers.gpu_blocks * tiers.block_bytes)
-        self._words = memoryview(self.device).cast("Q")
-        self._piece_words = piece // 8
-        self._region_words = tiers.gpu_blocks * self._piece_words
-        self.g2 = mmap.mmap(-1, tiers.g2_blocks * tiers.block_bytes)
-        self._tiers = tiers
-        self._engine = engine
-        self._network = (bind_host, control_port, nixl_port)
-        # The linker port is KVCR's key adapter and callback target.
-        self._port = None
-        self._stats_factory = stats_factory
-        (scheduler, owner, progress), native = plan_affinity(cpus, 3)
-        self.affinity = {
-            "engine": scheduler,
-            "owner": owner,
-            "progress": progress,
-            "native": native,
-        }
-        self.kvcr = None
-        self._closed = False
-
-    def bind(self, port) -> None:
-        self._port = port
-
-    def start(self) -> None:
-        from kvcr import KVCR, KVCRBindings, ZmqPeerControlChannel
-        from kvcr.config import (
-            KVCRBackendConfigs,
-            KVCRConfig,
-            LocalDramOptions,
-            RemoteFWDramOptions,
-        )
-        from kvcr.types import RegionDescriptor
-
-        tiers, engine = self._tiers, self._engine
-        piece = self.piece_bytes
-        bind_host, control_port, nixl_port = self._network
-        device_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.device))
-        region_bytes = tiers.gpu_blocks * piece
-        regions = [
-            RegionDescriptor(
-                addr=device_addr + index * region_bytes,
-                size=piece,
-                count=tiers.gpu_blocks,
-                label=label,
-            )
-            for index, label in enumerate(
-                label for component in self.labels for label in component
-            )
-        ]
-        g2_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.g2))
-        framework = self._port
-
-        native = self.affinity["native"]
-        if native:
-            # Threads KVCR and NIXL start inherit this mask.
-            os.sched_setaffinity(0, native)
-        self.control = ZmqPeerControlChannel(bind_host, control_port, bind_host)
-        self.kvcr = KVCR(
-            KVCRConfig(
-                nixl_agent_name=self.agent_name,
-                pool_layouts=[(self.pool, piece)],
-                nixl_listen_port=nixl_port,
-                operation_timeout_ms=engine.operation_timeout_ms,
-                abandon_timeout_ms=engine.abandon_timeout_ms,
-                enable_telemetry=True,
-            ),
-            KVCRBindings(
-                framework_control=self.control,
-                key_adapter=framework,
-                inventory_sink=framework.record_inventory,
-                on_resilience_event=framework.on_resilience_event,
-                stats_factory=self._stats_factory,
-            ),
-            KVCRBackendConfigs(
-                framework_regions=regions,
-                local_dram=LocalDramOptions([(self.pool, g2_addr, len(self.g2))]),
-                remote_fw_dram=RemoteFWDramOptions(opportunistic_query=False),
-            ),
-        )
-        if self.affinity["owner"] is not None:
-            os.sched_setaffinity(0, {self.affinity["owner"]})
-            _pin_progress(self.affinity["progress"])
-
-    def pin_scheduler(self) -> None:
-        """Pin the calling (scheduler) thread: to its own core, or, with too
-        few cores for that, to the worker's, so it stays off other workers'."""
-        engine = self.affinity["engine"]
-        cpus = {engine} if engine is not None else self.affinity["native"]
-        if cpus:
-            os.sched_setaffinity(0, cpus)
-
-    # Every piece of a page starts with the page's block id plus the piece's
-    # number, so a delivery that mixed up pages or layers is caught.
-
-    def stamp(self, slots, ids, pieces: range) -> None:
-        words, per_piece, per_region = (
-            self._words,
-            self._piece_words,
-            self._region_words,
-        )
-        for index in pieces:
-            base = index * per_region
-            for slot, bid in zip(slots, ids):
-                words[base + slot * per_piece] = bid + index
-
-    def mismatches(self, slots, ids, pieces: range) -> int:
-        words, per_piece, per_region = (
-            self._words,
-            self._piece_words,
-            self._region_words,
-        )
-        wrong = 0
-        for index in pieces:
-            base = index * per_region
-            for slot, bid in zip(slots, ids):
-                if words[base + slot * per_piece] != bid + index:
-                    wrong += 1
-        return wrong
-
-    def clear(self, slots, pieces: range) -> None:
-        """Zero the stamps, which no page's stamp equals."""
-        words, per_piece, per_region = (
-            self._words,
-            self._piece_words,
-            self._region_words,
-        )
-        for index in pieces:
-            base = index * per_region
-            for slot in slots:
-                words[base + slot * per_piece] = 0
-
-    def close(self) -> None:
-        if self._closed or self.kvcr is None:
-            return
-        self._closed = True
-        self.kvcr.close()
-
-
-def make_host(tiers: TierConfig, engine: EngineConfig, *, framework, **kwargs):
-    """``framework`` is the engine, KVCR's callback target in the vLLM profile;
-    the SGLang linker port binds itself instead."""
-    if engine.profile == "sglang":
-        return LinkerHost(tiers, engine, **kwargs)
-    return Host(tiers, engine, framework=framework, **kwargs)

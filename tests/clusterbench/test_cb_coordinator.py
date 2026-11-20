@@ -233,7 +233,7 @@ def test_every_request_is_logged_with_where_it_went_and_how_it_ended(cell):
     assert len(rows) == ANSWERED + SESSIONS
     assert len({(row["session"], row["turn"]) for row in rows}) == len(rows)
     assert {row["worker"] for row in rows} == set(range(WORKERS))
-    finished = [row for row in rows if "aborted" in row]
+    finished = [row for row in rows if "ttft_ms" in row]
     assert len(finished) == ANSWERED
     # Only the held requests went out during fill, and each row has its own
     # request's outcome.
@@ -241,9 +241,8 @@ def test_every_request_is_logged_with_where_it_went_and_how_it_ended(cell):
         [800] * SESSIONS
     )
     assert {row["ttft_ms"] for row in finished if row["in_window"]} == {20}
-    assert not any(row["aborted"] for row in finished)
     # A request the run ended on is logged with no outcome.
-    unfinished = [list(row) for row in rows if "aborted" not in row]
+    unfinished = [list(row) for row in rows if "ttft_ms" not in row]
     assert unfinished == [list(REQUEST_FIELDS[:9])] * SESSIONS
 
 
@@ -254,7 +253,7 @@ def test_requests_dispatched_and_finished_in_the_window_are_tallied(cell):
     # All but the held requests: those answered and each session's last.
     assert offered["dispatched"] == len(in_window) == ANSWERED
     assert offered["dispatched_blocks"] == sum(r["prompt_blocks"] for r in in_window)
-    blocks = sum(row["prompt_blocks"] for row in rows if "aborted" in row)
+    blocks = sum(row["prompt_blocks"] for row in rows if "ttft_ms" in row)
     assert blocks > 0
     assert summary["completed"] == {
         **Coordinator._new_tally()["completed"],
@@ -309,7 +308,6 @@ def test_finished_requests_are_tallied_by_where_their_blocks_came_from():
         Coordinator._tally_done(completed, done, 0, source, nodes)
     assert completed == {
         "completed": 3,
-        "aborted": 0,
         "prompt_blocks": 30,
         "gpu_blocks": 12,
         "primary_blocks": 9,
@@ -320,18 +318,6 @@ def test_finished_requests_are_tallied_by_where_their_blocks_came_from():
         "failed_blocks": 2,
         "timed_out_blocks": 1,
         "prefill_tokens": 192,
-    }
-
-
-def test_an_aborted_request_still_counts_its_failed_and_timed_out_blocks():
-    completed = Coordinator._new_tally()["completed"]
-    done = _done(aborted=True, failed_blocks=3, timed_out_blocks=2)
-    Coordinator._tally_done(completed, done, 0, 1, ["a", "b"])
-    assert completed == {
-        **Coordinator._new_tally()["completed"],
-        "aborted": 1,
-        "failed_blocks": 3,
-        "timed_out_blocks": 2,
     }
 
 

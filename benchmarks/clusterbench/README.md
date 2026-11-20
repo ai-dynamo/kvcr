@@ -12,9 +12,9 @@ and to compare KVCR source trees.
 
 - **Real:** `KVCR`, its progress thread, NIXL/UCX transfers, the ZMQ peer
   control channel, the bytes moved, one OS process per engine rank.
-- **Stand-ins:** the engine (a fake that makes vLLM's KVCR calls, or those of
-  SGLang's direct linker), GPU memory, the model (a sleep that releases the
-  GIL) and Dynamo (a small router with Dynamo's hint rule).
+- **Stand-ins:** the engine (a fake that makes the KVCR calls of vLLM's KVCR
+  tier), GPU memory, the model (a sleep that releases the GIL) and Dynamo (a
+  small router with Dynamo's hint rule).
 
 ## Running
 
@@ -55,13 +55,10 @@ them all, and an option it does not have is refused. Tests:
 
 With realistic GPU times (`engine.step_ms`, `engine.prefill_us_per_token`) a
 rank finishes one or two requests a second. The `-fast` scenarios shrink them
-until KVCR's time on the engine thread is what limits a rank. On the SGLang
-profile `agentic.toml` needs a KVCR pool its fill phase can fill, or the run
-is INVALID: add `--set tiers.g2_blocks=4096`.
+until KVCR's time on the engine thread is what limits a rank.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `engine.profile` | `vllm` | `sglang` swaps in SGLang's direct linker |
 | `router.migration_prob` | 0.05 | Chance per turn that a session moves, to the worker with the fewest sessions, whatever the system's speed |
 | `tiers.block_bytes` | 16 KiB | Bytes KVCR moves per block. Far smaller than a real KV block so that many ranks fit on a node; host cost follows the number of blocks, not their size |
 | `tiers.tokens_per_block` | 64 | Tokens per block |
@@ -77,15 +74,10 @@ is INVALID: add `--set tiers.g2_blocks=4096`.
 - **Workers:** one process each, with a real `KVCR` and a fake engine driving
   it. Host mappings stand in for engine memory and KVCR's DRAM pool. KVCR's
   telemetry is on (vLLM's default is off): the report reads it.
-- **vLLM profile** (`engine_vllm.py`): vLLM's KVCR tier. One `query` per key
-  on a CPU-tier miss, one `deliver` per request per step, one `deposit` per
+- **Engine** (`engine_vllm.py`): vLLM's KVCR tier. One `query` per key on a
+  CPU-tier miss, one `deliver` per request per step, one `deposit` per
   request per step for the blocks it stored, `align_sequence` after each. A
   request runs once the device has room for every token it will hold.
-- **SGLang profile** (`engine_sglang.py`, `linker_port.py`, `device_tree.py`):
-  the direct linker of SGLang PR #45650. An owner thread makes every KVCR
-  call: a batched `query`, one `deliver` per layer (a layer computes while
-  the later ones load), `deposit` batches, no `align_sequence`. A failed key
-  aborts the requests loading in its batch.
 - **Router:** tracks how much of each stream's prefix every worker holds.
   After choosing a worker it hints the peer with the longest prefix, if that
   beats what the chosen worker holds. That is Dynamo's rule.
@@ -93,8 +85,8 @@ is INVALID: add `--set tiers.g2_blocks=4096`.
   context that grows each turn and is compacted at the cap) or a replayed
   trace. Both are closed loop.
 
-The exact call sequence of each profile is in its module docstring and pinned
-by `tests/clusterbench/test_cb_engine_*.py`; change the two together.
+The exact call sequence is in the engine's module docstring and pinned by
+`tests/clusterbench/test_cb_engine_vllm.py`; change the two together.
 
 ## Trace replay
 
@@ -122,8 +114,8 @@ The replay follows aiperf's AgentX rules:
 - `workload.sessions_per_worker` sessions play at once per worker. Each play
   gets block ids of its own, so plays share nothing.
 
-A run is refused if its longest request does not fit `tiers.gpu_blocks` or,
-on the vLLM profile, its longest prompt `tiers.primary_blocks`.
+A run is refused if its longest request does not fit `tiers.gpu_blocks` or
+its longest prompt `tiers.primary_blocks`.
 
 ## Results
 
@@ -152,8 +144,7 @@ closed-loop workload and the modelled engine as much as on KVCR.
 
 **Thread split.** Each rank's engine thread is split into KVCR calls, the
 modelled forward pass, idle, and everything else the thread does ("harness").
-KVCR is the bottleneck when its share dominates. On the SGLang profile the
-KVCR calls are on the owner thread, which gets a split of its own.
+KVCR is the bottleneck when its share dominates.
 
 **Failed blocks.** Hinted blocks that a peer did not deliver are counted by
 the status KVCR returns for them: `timeout`, `unavailable` (the source no
@@ -161,8 +152,7 @@ longer held the block, or could not pin it), `aborted` or `failed`.
 `report --detail` has KVCR's reasons. A KVCR tree that returns no reason shows
 them as `unclassified`. Blocks *beyond the hint* are counted apart: vLLM's
 opportunistic query asks the peer for the rest of the prompt too, which it
-cannot have. On the SGLang profile a failed batch is dropped whole, but its
-pages are still counted as delivered, failed or never issued.
+cannot have.
 
 **Request log.** `requests.jsonl` starts with a header naming its fields:
 where each request went and when, the hint, what the router believed the
@@ -173,8 +163,8 @@ worker held, then the outcome. A request still in flight at the end has none.
 - delivered bytes did not match, or no request completed;
 - the coordinator dispatched late inside the window (p99 over 1 ms) or had no
   slack;
-- on any worker, an engine, owner or progress thread waited for a CPU more
-  than 1% of the window;
+- on any worker, the engine or progress thread waited for a CPU more than 1%
+  of the window;
 - peers first connected inside the window after a full mesh warm, or
   mesh-warm pulls failed;
 - a host tier had not filled to `phases.min_primary_occupancy` when the window
@@ -219,7 +209,7 @@ touch $CB_ROOT/control/release-$JOB
 
 - Kubernetes launch, the G3 disk tier, the Guard service, and `kv.prefetch`
   and `kv.move` hints.
-- SGLang's HiCache storage backend and its TP>1 and sliding-window layouts.
+- Engines other than vLLM, such as SGLang's direct linker.
 - Forcing evictions or timeouts: they are reported, not injected.
 - vLLM's preemption: it allocates device blocks as a request grows and
   preempts when they run out; here a request waits until all of it fits.

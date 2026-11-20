@@ -8,7 +8,6 @@ def test_block_key_is_reversible_and_vllm_sized():
     key = ids.id_to_key(bid)
     assert len(key) == 36
     assert ids.key_to_id(key) == bid
-    assert ids.split_id(bid) == (ids.session_stream(7, 3), 12345)
     assert 0 <= bid < 1 << 64
 
 
@@ -30,22 +29,19 @@ def test_segments_expand_to_ids_in_order():
 
 
 def test_key_cache_returns_the_same_keys_for_a_growing_stream():
-    cache = ids.NameCache(ids.id_to_key)
-    first = cache.names([(4, 0, 3)])
-    grown = cache.names([(4, 0, 5)])
+    cache = ids.KeyCache()
+    first = cache.keys([(4, 0, 3)])
+    grown = cache.keys([(4, 0, 5)])
     assert grown[:3] == first
     assert all(a is b for a, b in zip(first, grown))  # cached objects, not copies
     assert [ids.key_to_id(k) for k in grown] == [ids.block_id(4, i) for i in range(5)]
-    assert cache.names([(4, 2, 4)]) == grown[2:4]
-    hashes = ids.NameCache(ids.page_hash)
-    expected = [ids.page_hash(ids.block_id(4, i)) for i in (1, 2)]
-    assert hashes.names([(4, 1, 3)]) == expected
+    assert cache.keys([(4, 2, 4)]) == grown[2:4]
 
 
 def test_key_cache_is_bounded():
-    cache = ids.NameCache(ids.id_to_key, max_streams=4)
+    cache = ids.KeyCache(max_streams=4)
     for stream in range(10):
-        cache.names([(stream, 0, 2)])
+        cache.keys([(stream, 0, 2)])
     assert len(cache._streams) == 4
 
 

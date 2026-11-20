@@ -41,12 +41,13 @@ from __future__ import annotations
 import time
 from collections import deque
 
+import msgspec
+
 from kvcr.types import CacheTier, MemoryRef, QueryStatus
 
 from .config import RunConfig
-from .engine import count_failure, failure_cause, fetch_hint, live_blocks
 from .ids import (
-    NameCache,
+    KeyCache,
     block_id,
     id_to_key,
     key_to_id,
@@ -75,6 +76,50 @@ _FETCHING, _Q_HIT, _FETCHABLE = (
 )
 _REMOTE = CacheTier.REMOTE_G2
 _LOCAL_G2 = CacheTier.LOCAL_G2
+
+
+class HintAction(msgspec.Struct, frozen=True, kw_only=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict = {}
+
+
+class HintEnvelope(msgspec.Struct, frozen=True, kw_only=True):
+    """The ``kv_hints`` envelope a router attaches to a request."""
+
+    protocol_version: str
+    message_id: str
+    actions: list[HintAction] = []
+
+
+def fetch_hint(message_id: str, endpoint: str, hashes: list[int]) -> HintEnvelope:
+    """The envelope Dynamo's router attaches (one ``kv.fetch`` action)."""
+    payload = {"source_control_endpoint": endpoint, "block_hashes": hashes}
+    action = HintAction(
+        action_id="a1", action_type="kv.fetch", action_version="1.0", payload=payload
+    )
+    return HintEnvelope(protocol_version="0.1", message_id=message_id, actions=[action])
+
+
+def failure_cause(entry) -> str:
+    """Why KVCR did not deliver a block: its result's status in lower case
+    (``timeout``, ``unavailable``, ``aborted``, ``failed``), or
+    ``unclassified`` on an older tree, whose results have no reason and call
+    every failure ``FAILED``."""
+    if not hasattr(entry, "reason"):
+        return "unclassified"
+    return entry.status.name.lower()
+
+
+def count_failure(counters, entry) -> str:
+    """Count one hinted block that a peer did not deliver; returns its cause."""
+    cause = failure_cause(entry)
+    counters[f"hinted_failed|{cause}"] += 1
+    reason = getattr(entry, "reason", None)
+    if reason:
+        counters[f"hinted_failed_reason|{reason}"] += 1
+    return cause
 
 
 class _Req:
@@ -120,7 +165,7 @@ class VllmEngine:
         self._primary = PrimaryTier(tiers.primary_blocks, 1 + self._warm_slots)
         self._gpu = StreamCache(tiers.gpu_blocks)
         self._refs: list[MemoryRef] = []  # one per primary slot
-        self._key_cache = NameCache(id_to_key)
+        self._key_cache = KeyCache()
         self._waiting: list[_Req] = []
         self._running: list[_Req] = []
         self._jobs: dict[int, _Job] = {}
@@ -207,8 +252,8 @@ class VllmEngine:
         r = _Req()
         r.rid = request.rid
         r.req_id = f"r{request.rid}"
-        r.keys = self._key_cache.names(request.segments)
-        tail = self._key_cache.names((request.tail,))
+        r.keys = self._key_cache.keys(request.segments)
+        tail = self._key_cache.keys((request.tail,))
         r.all_keys = r.keys + tail
         r.segments = request.segments
         r.all_segments = (*request.segments, request.tail)
@@ -217,7 +262,14 @@ class VllmEngine:
         r.arrived = time.perf_counter()
         r.resolved = r.first_token = r.looked = 0.0
         r.rank = self._primary.new_rank()
-        r.live = live_blocks(request, self._block_tokens, self._gpu.capacity)
+        # Device blocks it holds while it runs: every token of its prompt and
+        # its answer, cacheable or not.
+        r.live = -(-(r.prompt_tokens + r.output_tokens) // self._block_tokens)
+        if r.live > self._gpu.capacity:
+            raise ValueError(
+                f"request {r.rid} needs {r.live} device blocks, more than "
+                f"tiers.gpu_blocks ({self._gpu.capacity})"
+            )
         r.gpu_hit = r.computed = r.sched = r.next_stored = 0
         r.promote = []
         r.local_ok = r.remote_ok = r.failed = r.timed_out = r.primary_hit = 0
@@ -744,7 +796,4 @@ class VllmEngine:
         pass
 
     def end_window(self) -> None:
-        pass
-
-    def close(self) -> None:
         pass

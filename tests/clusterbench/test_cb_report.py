@@ -15,9 +15,8 @@ from clusterbench.trace import compile_corpus
 from clusterbench.workload import make_workload
 
 
-def _inputs(workers=2, profile="vllm", **phases):
+def _inputs(workers=2, **phases):
     config = msgspec.to_builtins(RunConfig())
-    config["engine"]["profile"] = profile
     config["phases"].update(phases)
     tally = Coordinator._new_tally()
     lag = LogHist()
@@ -99,18 +98,10 @@ def test_a_clean_run_is_valid_and_normalised():
 
 
 def test_harness_is_what_is_left_of_the_engine_threads_window():
-    # vLLM: of 20 worker-seconds, 4 s of forward pass, 2 s idle, 12 ms in KVCR.
+    # Of 20 worker-seconds, 4 s of forward pass, 2 s idle, 12 ms in KVCR.
     headline = summarize(*_inputs())["headline"]
     assert abs(headline["engine_harness_share"] - 13.988 / 20) < 1e-12
     assert abs(headline["engine_harness_us_per_request"] - 139_880) < 1e-6
-    # SGLang's KVCR calls are on the owner thread: its engine thread spends
-    # 1 s blocked on the linker and 3 s waiting for loads instead.
-    config, coord, reports = _inputs(profile="sglang")
-    for report in reports:
-        report["counters"].update(linker_wait_seconds=0.5, load_wait_seconds=1.5)
-    headline = summarize(config, coord, reports)["headline"]
-    assert headline["engine_harness_share"] == 0.5
-    assert headline["engine_harness_us_per_request"] == 100_000
 
 
 def test_deposits_that_copied_nothing_are_not_moved_blocks():
@@ -199,40 +190,6 @@ def test_cold_connects_are_not_flagged_when_no_mesh_warm_was_asked_for():
         connect.to_json()
     )
     assert summarize(config, coord, reports)["valid"]
-
-
-def test_an_sglang_summary_prints_the_owner_and_scheduler_threads():
-    config, coord, reports = _inputs(profile="sglang")
-    wait = LogHist()
-    wait.add(0.004)
-    for report in reports:
-        report["counters"].update(
-            linker_wait_seconds=0.5,
-            load_wait_seconds=1.5,
-            owner_idle_seconds=6.0,
-            owner_spin_seconds=1.0,
-            owner_loops=5000,
-            aborted_requests=2,
-            load_batches=40,
-            load_batches_failed=1,
-        )
-        report["hists"]["step_load_wait"] = report["hists"]["deposit"] = wait.to_json()
-    coord["coordinator"]["completed"]["aborted"] = 4
-    lines = format_summary(summarize(config, coord, reports)).splitlines()
-    assert lines[0].startswith("t  profile=sglang  arm=base  kvcr=abc  2 workers")
-    at = lines.index("") + 6  # after the request, block, latency and failure lines
-    assert lines[at : at + 5] == [
-        "owner thread: KVCR 0.1% of wall (0.12 ms/request), linker 29.9%, "
-        "yielding 10.0%, idle 60.0%; 500.0 loops/s",
-        "scheduler thread: blocked on linker calls 5.0% (10.0 ms/request), "
-        "waiting for loads 15.0% (30.0 ms/request), harness 50.0% "
-        "(100.0 ms/request), modelled GPU 20.0%, idle 10.0%",
-        "per busy iteration, blocked on linker calls p50/p99 10.0/10.0 ms; "
-        "per loading batch p50/p99 4/4 ms",
-        "aborted requests 4 (3.85%); load batches failed 2.50%; backup p50/p99 4/4 ms",
-        "per moved block: KVCR 3 us, progress 100.0 us, native 5,000 us; 0% of "
-        "deposited blocks were already in KVCR's pool",
-    ]
 
 
 def test_a_trace_summary_prints_what_was_replayed(tmp_path):

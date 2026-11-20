@@ -621,15 +621,13 @@ class TraceWorkload:
                 f" tiers.tokens_per_block is {tiers.tokens_per_block}"
             )
         reserved = 1 + config.phases.warm_concurrency
-        sglang = config.engine.profile == "sglang"
-        device = tiers.gpu_blocks - (reserved if sglang else 0)
-        if header.max_request_blocks > device:
+        if header.max_request_blocks > tiers.gpu_blocks:
             raise TraceError(
                 f"{workload.trace}: the longest request is"
                 f" {header.max_request_blocks} blocks, more than the device tier"
-                f" can hold ({device}); raise tiers.gpu_blocks"
+                f" can hold ({tiers.gpu_blocks}); raise tiers.gpu_blocks"
             )
-        if not sglang and header.max_prompt_blocks > tiers.primary_blocks - reserved:
+        if header.max_prompt_blocks > tiers.primary_blocks - reserved:
             raise TraceError(
                 f"{workload.trace}: the longest prompt is"
                 f" {header.max_prompt_blocks} blocks, more than the CPU tier can"

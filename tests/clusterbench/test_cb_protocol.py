@@ -49,9 +49,7 @@ def test_scenarios_are_found():
         (["engine.abandon_timeout_ms=1500"], "must be >= 2x operation timeout"),
         (["phases.mesh_warm=some"], "phases.mesh_warm must be full or none"),
         (["engine.verify=maybe"], "engine.verify must be none, sample or full"),
-        (["engine.profile=trtllm"], "unknown engine profile 'trtllm'"),
-        (["engine.profile=sglang", "tiers.layers=7"], "2 x tiers.layers pieces"),
-        (["engine.profile=sglang", "tiers.g2_blocks=0"], "needs a KVCR pool"),
+        (["engine.profile=sglang"], r"unknown field `profile` - at `\$.engine`"),
         (
             ["tiers.g2_blocks=0", "tiers.framework_pinning=false"],
             "no G2 pool and no pinning cannot be a source",

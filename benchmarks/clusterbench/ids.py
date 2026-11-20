@@ -40,10 +40,6 @@ def block_id(stream: int, index: int) -> int:
     return (stream << INDEX_BITS) | index
 
 
-def split_id(bid: int) -> tuple[int, int]:
-    return bid >> INDEX_BITS, bid & INDEX_MASK
-
-
 def id_to_key(bid: int) -> bytes:
     return _KEY.pack(bid, 0)
 
@@ -81,36 +77,28 @@ def segment_ids(segments: Iterable[Segment]) -> list[int]:
     return ids
 
 
-class NameCache:
-    """Per-stream lists of block names, so a request's names are list slices.
+class KeyCache:
+    """Per-stream key lists, so a request's keys are list slices."""
 
-    ``make`` names one block id: ``id_to_key`` for vLLM's keys, ``page_hash``
-    for SGLang's storage hashes.
-    """
-
-    def __init__(self, make, max_streams: int = 4096) -> None:
-        self._make = make
-        self._streams: dict[int, list] = {}
+    def __init__(self, max_streams: int = 4096) -> None:
+        self._streams: dict[int, list[bytes]] = {}
         self._max_streams = max_streams
 
-    def stream(self, stream: int, end: int) -> list:
-        """Names of the stream's blocks ``[0, end)`` (the list may be longer)."""
-        cached = self._streams.pop(stream, None)
-        if cached is None:
-            cached = []
-        if len(cached) < end:
-            base, make = stream << INDEX_BITS, self._make
-            cached.extend(make(base + i) for i in range(len(cached), end))
-        # Reinsert at the back: the dict doubles as an LRU of streams.
-        self._streams[stream] = cached
-        if len(self._streams) > self._max_streams:
-            del self._streams[next(iter(self._streams))]
-        return cached
-
-    def names(self, segments: Iterable[Segment]) -> list:
-        out: list = []
+    def keys(self, segments: Iterable[Segment]) -> list[bytes]:
+        out: list[bytes] = []
         for stream, start, end in segments:
-            out.extend(self.stream(stream, end)[start:end])
+            cached = self._streams.pop(stream, None)
+            if cached is None:
+                cached = []
+            if len(cached) < end:
+                base = stream << INDEX_BITS
+                pack = _KEY.pack
+                cached.extend(pack(base + i, 0) for i in range(len(cached), end))
+            # Reinsert at the back: the dict doubles as an LRU of streams.
+            self._streams[stream] = cached
+            out.extend(cached[start:end])
+        while len(self._streams) > self._max_streams:
+            del self._streams[next(iter(self._streams))]
         return out
 
 
@@ -138,24 +126,3 @@ class KeyAdapter:
 
     def decode(self, key: bytes) -> int:
         return key_to_id(key)
-
-
-# ---- SGLang direct-linker identities ----------------------------------------
-#
-# SGLang names a page by a chained SHA-256 "storage hash" (64 hex digits). The
-# linker's KVCR key is ``sglang-kvcr-v1:<layout namespace>:<pool>:<hash>`` and
-# the router hash is the first 16 digits. Here the block id fills those 16
-# digits, so a page hash is reversible like the vLLM key.
-
-LINKER_NAMESPACE = "c1" * 32  # one model and layout for every worker
-LINKER_KEY_PREFIX = f"sglang-kvcr-v1:{LINKER_NAMESPACE}:".encode()
-LINKER_POOL = "kv"
-_HASH_PAD = "0" * 48
-
-
-def page_hash(bid: int) -> str:
-    return f"{bid:016x}{_HASH_PAD}"
-
-
-def hash_to_id(storage_hash: str) -> int:
-    return int(storage_hash[:16], 16)

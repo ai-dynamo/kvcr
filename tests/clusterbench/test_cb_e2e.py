@@ -117,42 +117,6 @@ def test_workers_pull_blocks_from_each_other(real_nixl, tmp_path, mode, tier_ove
     assert sum(row[remote] for row in rows if len(row) > remote) > 100
 
 
-def test_sglang_workers_restore_pages_from_each_other(real_nixl, tmp_path):
-    overrides = [
-        "name=sglang-linker",
-        *OVERRIDES,
-        "engine.profile=sglang",
-        "tiers.layers=8",
-        "tiers.gpu_blocks=2048",
-        "tiers.g2_blocks=8192",
-    ]
-    summary = run_local(load_config(None, overrides), tmp_path, nodes=3, per_node=1)
-    logs = "".join(p.read_text()[-2000:] for p in (tmp_path / "logs").glob("*.log"))
-    assert summary["workers"] == 3 and summary["profile"] == "sglang", logs
-    counters = summary["counters"]
-    assert summary["warm"]["ok"] == 6 and summary["warm"]["failed"] == 0
-    # Pages moved between workers layer by layer, and every piece had its bytes.
-    assert counters["deliver_blocks_remote"] > 100, summary["flags"]
-    assert counters["bytes_checked"] >= counters["deliver_blocks_remote"]
-    assert counters.get("bytes_mismatch", 0) == 0
-    assert summary["completed"]["remote_blocks_cross_node"] > 0
-    assert summary["headline"]["abort_rate"] < 0.05
-    calls = summary["engine_calls"]
-    # One deliver per layer of every load; the linker never aligns a sequence.
-    assert calls["deliver"]["calls"] >= 8 * counters["load_batches"]
-    assert calls["deposit"]["items"] > 0 and counters["deposit_blocks_ok"] > 0
-    assert calls["query"]["items"] > calls["query"]["calls"]
-    assert "align_sequence" not in calls
-    assert summary["threads"]["owner"]["threads_per_worker"] == 1
-    hard = [
-        f
-        for f in summary["flags"]
-        if "waited for a CPU" not in f and "dispatch lag" not in f
-    ]
-    assert not hard, hard
-    assert len(list((tmp_path / "reports").glob("*.json"))) == 3
-
-
 def _corpus(path, sessions=6, turns=40):
     """A small corpus in the AgentX trace format, with sub-agents."""
     rng = random.Random(7)
@@ -195,33 +159,20 @@ def _corpus(path, sessions=6, turns=40):
             file.write(json.dumps({**trace, "requests": requests}) + "\n")
 
 
-@pytest.mark.parametrize(
-    "profile,profile_overrides",
-    [
-        ("vllm", []),
-        (
-            "sglang",
-            ["engine.profile=sglang", "tiers.layers=8", "tiers.gpu_blocks=2048"],
-        ),
-    ],
-)
-def test_a_replayed_trace_moves_blocks_between_workers(
-    real_nixl, tmp_path, profile, profile_overrides
-):
+def test_a_replayed_trace_moves_blocks_between_workers(real_nixl, tmp_path):
     _corpus(tmp_path / "source.jsonl")
     stats = compile_corpus(tmp_path / "source.jsonl", tmp_path / "replay.cbtrace")
     assert stats.groups and stats.tail_blocks
     overrides = [
-        f"name=trace-{profile}",
+        "name=trace",
         *OVERRIDES,
         "tiers.g2_blocks=8192",
         f"workload.trace={tmp_path / 'replay.cbtrace'}",
-        *profile_overrides,
     ]
     out = tmp_path / "run"
     summary = run_local(load_config(None, overrides), out, nodes=3, per_node=1)
     logs = "".join(p.read_text()[-2000:] for p in (out / "logs").glob("*.log"))
-    assert summary["workers"] == 3 and summary["profile"] == profile, logs
+    assert summary["workers"] == 3, logs
     workload = summary["workload"]
     # Nine plays of six traces: sub-agents ran beside their parents.
     assert workload["kind"] == "trace" and workload["traces"] == 6

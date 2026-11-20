@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             "--cores-per-worker",
             type=int,
             default=0,
-            help="pin each worker to this many physical cores (>=3; >=4 for sglang)",
+            help="pin each worker to this many physical cores (3 or more)",
         )
         p.add_argument("--out", help="run directory")
 

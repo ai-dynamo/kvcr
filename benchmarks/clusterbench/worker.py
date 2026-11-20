@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """One emulated engine rank: a real KVCR driven by a fake engine.
 
-The process has the thread layout of a real rank: this (engine) thread next to
-KVCR's progress thread and NIXL's own threads, plus the linker's KVCR-owner
-thread in the SGLang profile. Coordinator traffic is handled between engine
-steps, where a real engine reads its input queue.
+The process has the thread layout of a real rank: this (engine) thread, which
+makes every KVCR call, next to KVCR's progress thread and NIXL's own threads.
+Coordinator traffic is handled between engine steps, where a real engine reads
+its input queue.
 """
 
 from __future__ import annotations
@@ -22,14 +22,7 @@ import zmq
 
 from . import protocol
 from .config import decode_config
-from .engine import make_engine
-from .kvcr_host import (
-    auto_cpus,
-    kvcr_identity,
-    limits,
-    make_host,
-    prepare_environment,
-)
+from .kvcr_host import Host, auto_cpus, kvcr_identity, limits, prepare_environment
 from .metrics import Telemetry, Window, rss_bytes, thread_delta, thread_snapshot
 
 INVENTORY_FLUSH_S = 0.05
@@ -96,9 +89,11 @@ def run_worker(args) -> int:
 
         window = Window()
         window.watch_gc()
-        engine = make_engine(config, window, me)
+        from .engine_vllm import VllmEngine  # imports kvcr: after the environment
+
+        engine = VllmEngine(config, window, me)
         engine.set_peers(configure.peers)
-        host = make_host(
+        host = Host(
             config.tiers,
             config.engine,
             agent_name=agent,
@@ -246,13 +241,11 @@ def run_worker(args) -> int:
             pass
         status = 1
     finally:
-        # The engine first: a linker owner thread closes KVCR itself.
-        for closing in (engine, host):
-            if closing is not None:
-                try:
-                    closing.close()
-                except Exception:
-                    traceback.print_exc()
+        if host is not None:
+            try:
+                host.close()
+            except Exception:
+                traceback.print_exc()
         sock.close()
         context.term()
     return status

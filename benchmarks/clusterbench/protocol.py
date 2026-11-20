@@ -55,8 +55,6 @@ class Done(_Msg):
     remote_blocks: int  # promoted from a peer
     failed_blocks: int  # promotions that failed
     recomputed_tokens: int
-    # The engine dropped the request (SGLang: a cache load in its batch failed).
-    aborted: bool = False
     # Of the failed blocks, those KVCR reported as timed out.
     timed_out_blocks: int = 0
 

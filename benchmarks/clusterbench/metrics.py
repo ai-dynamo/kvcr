@@ -174,17 +174,6 @@ class Window:
         for key, value in stats.gauges.items():
             self.gauges["|".join(key)] = value
 
-    def merge_owner(self, stats: "OwnerStats") -> None:
-        """Fold in what a KVCR-owner thread accumulated; it has let go of it."""
-        for name, seconds in stats.secs.items():
-            self.secs[name] += seconds
-            self.calls[name] += stats.calls[name]
-            self.items[name] += stats.items[name]
-        for name, value in stats.counters.items():
-            self.counters[name] += value
-        for stats_ in stats.telemetry:
-            self.merge_telemetry(stats_)
-
     def to_json(self) -> dict:
         ended = self.ended or time.perf_counter()
         return {
@@ -204,28 +193,6 @@ class Window:
         }
 
 
-class OwnerStats:
-    """What a dedicated KVCR-owner thread accumulates between hand-overs.
-
-    Only that thread writes it. The engine thread gets the object once the
-    owner has swapped in a fresh one, so a ``Window`` keeps a single writer.
-    """
-
-    __slots__ = ("secs", "calls", "items", "counters", "telemetry")
-
-    def __init__(self) -> None:
-        self.secs: dict[str, float] = defaultdict(float)
-        self.calls: dict[str, int] = defaultdict(int)
-        self.items: dict[str, int] = defaultdict(int)
-        self.counters: dict[str, float] = defaultdict(float)
-        self.telemetry: list[Telemetry] = []
-
-    def call(self, name: str, seconds: float, calls: int = 1, items: int = 1) -> None:
-        self.secs[name] += seconds
-        self.calls[name] += calls
-        self.items[name] += items
-
-
 _TICK = os.sysconf("SC_CLK_TCK")
 _PAGE = os.sysconf("SC_PAGE_SIZE")
 
@@ -240,8 +207,6 @@ def thread_names() -> dict[int, str]:
             names[thread.native_id] = "engine"
         elif thread.name == "kvcr-progress":
             names[thread.native_id] = "progress"
-        elif thread.name == "kvcr-owner":
-            names[thread.native_id] = "owner"
         else:
             names[thread.native_id] = f"py:{thread.name}"
     return names

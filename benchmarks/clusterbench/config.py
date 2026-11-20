@@ -22,29 +22,15 @@ class TierConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_field
     # KVCR-owned DRAM pool (vLLM ``secondary_g2_slots``); 0 is peer-only.
     g2_blocks: int = 65536
     framework_pinning: bool = True
-    # SGLang profile only: transformer layers. A page is one KVCR key with a K
-    # and a V piece per layer (``block_bytes / (2 * layers)`` bytes each), and
-    # ``gpu_blocks`` is real memory there, since KVCR reads and writes it.
-    layers: int = 64
-
-    @property
-    def pieces(self) -> int:
-        return 2 * self.layers
-
-    @property
-    def piece_bytes(self) -> int:
-        return self.block_bytes // self.pieces
 
 
 class EngineConfig(
     msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
 ):
-    # "vllm": vLLM's KVCR offload tier. "sglang": SGLang's KVCR direct linker.
-    profile: str = "vllm"
     # Modelled forward pass, GIL released: step_ms + prefill_us_per_token * tokens.
     step_ms: float = 20.0
     prefill_us_per_token: float = 20.0
-    # vLLM profile: its engine sleeps this long when it has nothing to run.
+    # The engine sleeps this long when it has nothing to run, as vLLM's does.
     idle_sleep_ms: float = 1.0
     max_batched_tokens: int = 8192
     max_running: int = 64
@@ -169,17 +155,7 @@ def validate(config: RunConfig) -> None:
         raise ValueError("tiers.block_bytes must be a multiple of 4096")
     if tiers.primary_blocks < 64:
         raise ValueError("tiers.primary_blocks is too small")
-    if engine.profile not in ("vllm", "sglang"):
-        raise ValueError(f"unknown engine profile {engine.profile!r}")
-    if engine.profile == "sglang":
-        if tiers.layers < 1 or tiers.block_bytes % (8 * tiers.pieces):
-            raise ValueError(
-                "tiers.block_bytes must split into 2 x tiers.layers pieces of "
-                "a multiple of 8 bytes"
-            )
-        if not tiers.g2_blocks:
-            raise ValueError("the SGLang linker needs a KVCR pool (tiers.g2_blocks)")
-    elif not tiers.g2_blocks and not tiers.framework_pinning:
+    if not tiers.g2_blocks and not tiers.framework_pinning:
         raise ValueError("a worker with no G2 pool and no pinning cannot be a source")
     if engine.abandon_timeout_ms < 2 * engine.operation_timeout_ms:
         raise ValueError("engine.abandon_timeout_ms must be >= 2x operation timeout")

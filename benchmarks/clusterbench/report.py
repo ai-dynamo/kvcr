@@ -55,7 +55,6 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     workers = len(nodes)
     window = sum(r["window_s"] for r in reports)  # worker-seconds
     mean_window = window / workers
-    profile = config["engine"]["profile"]
     secs, calls, items = (_sum(reports, k) for k in ("secs", "calls", "items"))
     counters = _sum(reports, "counters")
     hists = _merge_hists(reports, "hists")
@@ -75,13 +74,9 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     kvcr_seconds = sum(secs.values())
     forward = counters.get("forward_seconds", 0)
     idle = counters.get("idle_seconds", 0)
-    linker_wait = counters.get("linker_wait_seconds", 0)
-    load_wait = counters.get("load_wait_seconds", 0)
     # Harness is what is left of the engine thread's window, so the work
-    # between engine steps counts too. vLLM's engine thread makes the KVCR
-    # calls itself; SGLang's waits for the owner thread's calls and loads.
-    on_kvcr = linker_wait + load_wait if profile == "sglang" else kvcr_seconds
-    harness_seconds = max(0.0, window - forward - idle - on_kvcr)
+    # between engine steps counts too.
+    harness_seconds = max(0.0, window - forward - idle - kvcr_seconds)
 
     threads: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for report in reports:
@@ -154,34 +149,6 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "hinted_unavailable_rate": _ratio(causes.get("unavailable", 0), hinted_asked),
     }
 
-    if profile == "sglang":
-        # The linker's owner thread makes the KVCR calls; the scheduler thread
-        # blocks on linker calls and on loads.
-        owner_idle = counters.get("owner_idle_seconds", 0)
-        spin = counters.get("owner_spin_seconds", 0)
-        aborted = counters.get("aborted_requests", 0)
-        headline.update(
-            {
-                "linker_wait_share": _ratio(linker_wait, window),
-                "load_wait_share": _ratio(load_wait, window),
-                "linker_wait_us_per_request": _ratio(linker_wait, requests) * 1e6,
-                "load_wait_us_per_request": _ratio(load_wait, requests) * 1e6,
-                "owner_linker_share": _ratio(
-                    max(0.0, window - owner_idle - spin - kvcr_seconds), window
-                ),
-                "owner_spin_share": _ratio(spin, window),
-                "owner_idle_share": _ratio(owner_idle, window),
-                "owner_loops_per_s": _ratio(counters.get("owner_loops", 0), window),
-                "abort_rate": _ratio(aborted, aborted + requests),
-                "load_batch_failure_rate": _ratio(
-                    counters.get("load_batches_failed", 0),
-                    counters.get("load_batches", 0),
-                ),
-                **_p50_p99(hists["step_load_wait"], "step_load_wait"),
-                **_p50_p99(hists["deposit"], "offload"),
-            }
-        )
-
     lag = LogHist.from_json(tally["lag"])
     cold = sum(
         h.n
@@ -199,7 +166,7 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     coordinator_busy = _ratio(tally["busy_s"], tally["measure_s"])
     if coordinator_busy > MAX_COORDINATOR_BUSY:
         flags.append(f"the coordinator was busy {coordinator_busy:.0%} of the window")
-    for role in ("engine", "owner", "progress"):
+    for role in ("engine", "progress"):
         shares = {
             r["worker"]: _ratio(r["threads"][role]["delay_s"], r["window_s"])
             for r in reports
@@ -231,7 +198,6 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
 
     return {
         "name": coord["name"],
-        "profile": profile,
         "arm": coord["arm"],
         "kvcr_sha": coord["kvcr_sha"],
         "kvcr_file": coord["kvcr_file"],
@@ -286,41 +252,16 @@ def format_summary(summary: dict) -> str:
     offered = summary["offered"]
     failures = summary["failures"]
     workload = summary["workload"]
-    if summary["profile"] == "sglang":
-        thread_lines = [
-            f"owner thread: KVCR {h['engine_kvcr_share']:.1%} of wall "
-            f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), linker "
-            f"{h['owner_linker_share']:.1%}, yielding {h['owner_spin_share']:.1%}, "
-            f"idle {h['owner_idle_share']:.1%}; "
-            f"{_fmt(h['owner_loops_per_s'])} loops/s",
-            f"scheduler thread: blocked on linker calls {h['linker_wait_share']:.1%} "
-            f"({_fmt(h['linker_wait_us_per_request'] / 1e3)} ms/request), waiting "
-            f"for loads {h['load_wait_share']:.1%} "
-            f"({_fmt(h['load_wait_us_per_request'] / 1e3)} ms/request), harness "
-            f"{h['engine_harness_share']:.1%} "
-            f"({_fmt(h['engine_harness_us_per_request'] / 1e3)} ms/request), "
-            f"modelled GPU {h['engine_forward_share']:.1%}, "
-            f"idle {h['engine_idle_share']:.1%}",
-            f"per busy iteration, blocked on linker calls p50/p99 "
-            f"{_fmt(h['step_kvcr_p50_ms'])}/{_fmt(h['step_kvcr_p99_ms'])} ms; "
-            f"per loading batch p50/p99 {_fmt(h['step_load_wait_p50_ms'])}/"
-            f"{_fmt(h['step_load_wait_p99_ms'])} ms",
-            f"aborted requests {done['aborted']} "
-            f"({h['abort_rate']:.2%}); load batches failed "
-            f"{h['load_batch_failure_rate']:.2%}; backup p50/p99 "
-            f"{_fmt(h['offload_p50_ms'])}/{_fmt(h['offload_p99_ms'])} ms",
-        ]
-    else:
-        thread_lines = [
-            f"engine thread: KVCR {h['engine_kvcr_share']:.1%} of wall "
-            f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), harness "
-            f"{h['engine_harness_share']:.1%} "
-            f"({_fmt(h['engine_harness_us_per_request'] / 1e3)} ms/request), "
-            f"modelled GPU {h['engine_forward_share']:.1%}, "
-            f"idle {h['engine_idle_share']:.1%}",
-            f"KVCR per engine step p50/p99 "
-            f"{_fmt(h['step_kvcr_p50_ms'])}/{_fmt(h['step_kvcr_p99_ms'])} ms",
-        ]
+    thread_lines = [
+        f"engine thread: KVCR {h['engine_kvcr_share']:.1%} of wall "
+        f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), harness "
+        f"{h['engine_harness_share']:.1%} "
+        f"({_fmt(h['engine_harness_us_per_request'] / 1e3)} ms/request), "
+        f"modelled GPU {h['engine_forward_share']:.1%}, "
+        f"idle {h['engine_idle_share']:.1%}",
+        f"KVCR per engine step p50/p99 "
+        f"{_fmt(h['step_kvcr_p50_ms'])}/{_fmt(h['step_kvcr_p99_ms'])} ms",
+    ]
     trace_lines = []
     if workload["kind"] == "trace":
         trace_lines = [
@@ -346,8 +287,7 @@ def format_summary(summary: dict) -> str:
             f"{failures['pin_wait_timeouts']:.0f} timed out"
         )
     lines = [
-        f"{summary['name']}  profile={summary['profile']}  "
-        f"arm={summary['arm'] or '-'}  "
+        f"{summary['name']}  arm={summary['arm'] or '-'}  "
         f"kvcr={summary['kvcr_sha']}  {summary['workers']} workers on "
         f"{summary['nodes']} nodes  window {summary['window_s']:.1f}s",
         "VALID" if summary["valid"] else "INVALID: " + "; ".join(summary["flags"]),
