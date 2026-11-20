@@ -243,17 +243,15 @@ class _TargetPullOp(_RemoteOp):
         self, progress: _KVCRProgress, now: float
     ) -> tuple[bool, bool] | None:
         """Ask a quiet source to answer; None if the request could not be sent."""
-        # A start_write to a source that is gone leaves its destinations
-        # uncertain until abandonment; before one is sent, failing exposes nothing.
         backend = self._backend
         endpoint = self.remote_ctrl_ep
-        if not self.awaiting_source:
-            # Ask at once; only resends wait out the retry interval.
-            self.awaiting_source = True
-            # The source acks only a target_metadata that carries metadata.
-            backend._metadata_acked_sources.discard(endpoint)
-        elif now < backend._metadata_retry_after.get(endpoint, 0):
+        self.awaiting_source = True
+        # One exchange in flight serves every operation waiting on this source.
+        if now < backend._metadata_retry_after.get(endpoint, 0):
             return False, False
+        # The source acks only a target_metadata that carries metadata, and an
+        # earlier ack may have gone stale before this operation resumed.
+        backend._metadata_acked_sources.discard(endpoint)
         if not backend._send_control(progress, endpoint, _TargetMetadata()):
             return None
         return False, True
@@ -315,6 +313,8 @@ class _TargetPullOp(_RemoteOp):
                 self._record_unserved(scope)
                 return True, True
             sent = False
+            # start_write lets the source write into the destinations, so a source
+            # that may be gone must answer first.
             if backend._source_quiet(self.remote_ctrl_ep, now):
                 awaiting = self._await_source(progress, now)
                 if awaiting is not None:

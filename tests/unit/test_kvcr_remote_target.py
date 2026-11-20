@@ -1107,7 +1107,7 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
 def test_kvcr_metadata_ack_retry_lifecycle():
     agent = FakeNixlAgent(metadata=b"target-md")
     pinning = FakePrimaryPinning()
-    control = FakeBytesControl()
+    control = FakeBytesControl(answers=False)
     kvcr = _new_kvcr(
         agent,
         pinning,
@@ -1395,7 +1395,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert [error.state for error in errors] == ["uncertain"]
     assert errors[0].op_handle == handle
 
-    # An abandoned operation must not blacklist the endpoint for fresh work.
+    # An abandoned operation must not blacklist the endpoint for fresh work. Let the
+    # metadata retry interval that the last probe started run out first.
+    now += 0.2
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     retry = kvcr.deliver(
         {key: [_mem_descriptor(label="framework")]}, request_id="retry"
@@ -1441,7 +1443,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     ] == [handle, handle]
 
 
-@pytest.mark.parametrize("source", ["answers", "silent", "unreachable"])
+@pytest.mark.parametrize("source", ["answers", "answers_late", "silent", "unreachable"])
 @pytest.mark.parametrize("acked_long_ago", [False, True])
 def test_quiet_source_must_answer_before_start_write(source, acked_long_ago, caplog):
     """A dead source costs a miss by the deadline, not uncertain destinations."""
@@ -1484,19 +1486,46 @@ def test_quiet_source_must_answer_before_start_write(source, acked_long_ago, cap
     time.sleep(0.01)
     # Nothing that exposes a destination goes out before the source answers.
     assert set(sent_types()) == {"target_metadata"}
+    if source != "unreachable":
+        # The hint and the operation share one exchange.
+        assert sent_types() == ["target_metadata"]
     assert _decode_control_message(control.sent[0][1])["target_agent_metadata"] == (
         b"target-md"
     )
 
-    if source == "answers":
+    if source in ("answers", "answers_late"):
         ack = {
             "type": "target_metadata_ack",
             "sender_control_endpoint": endpoint,
             "sender_incarnation": "restarted" if acked_long_ago else "source",
         }
+        if source == "answers_late":
+            # Progress stalls past the freshness window after handling the ack and
+            # before the waiting operation resumes, so the ack has gone stale.
+            backend = kvcr._core._remote_fw_dram
+            handle_ack, stalled = backend._handle_target_metadata_ack, []
+
+            def handle_then_stall(progress, payload):
+                handle_ack(progress, payload)
+                if not stalled:
+                    stalled.append(True)
+                    now[0] += 0.2
+                    control.answers = True
+
+            backend._handle_target_metadata_ack = handle_then_stall
         control.incoming.append(msgspec.msgpack.encode(ack))
         start_write = _start_write_sent(control)
         assert start_write["source_incarnation"] == ack["sender_incarnation"]
+        asks = [
+            message
+            for message in map(
+                _decode_control_message, (raw for _, raw in control.sent)
+            )
+            if message["type"] == "target_metadata"
+        ]
+        # A stale ack costs one more full handshake, not a stream of empty ones.
+        assert len(asks) == (2 if source == "answers_late" else 1)
+        assert all(ask["target_agent_metadata"] == b"target-md" for ask in asks)
         agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
         assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
     elif source == "silent":
@@ -1512,7 +1541,7 @@ def test_quiet_source_must_answer_before_start_write(source, acked_long_ago, cap
             (handle, _op_entries({key: (OpEntryStatus.FAILED, "control_error")}))
         ]
         assert "did not answer" not in caplog.text
-    if source != "answers":
+    if source in ("silent", "unreachable"):
         assert "start_write" not in sent_types()
         assert kvcr._core._remote_fw_dram._request_hints["load"].failed
     assert errors == []
@@ -1635,6 +1664,8 @@ def test_remote_write_cancellation_and_late_completion(
     assert _poll_until(kvcr, bool) == [
         (handle, _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")}))
     ]
+    # Let the metadata retry interval that the last probe started run out.
+    now += 0.2
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
     _wait_until(
@@ -2114,7 +2145,7 @@ class _Peer:
         self.primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
         self.local = ctypes.create_string_buffer(32)
         self.agent = _CopyingWriteAgent(metadata=name.encode())
-        self.control = FakeBytesControl(f"tcp://{name}:1")
+        self.control = FakeBytesControl(f"tcp://{name}:1", answers=False)
         self.events, self.results = [], {}
         self.kvcr = _new_kvcr(
             self.agent,
