@@ -228,7 +228,7 @@ class _TargetPullOp(_RemoteOp):
     # Why the whole operation failed, or why each unserved key was not written.
     failure_reason: str | None = None
     unserved: dict[BlockKey, str] = field(default_factory=dict)
-    liveness_deadline: float | None = None
+    awaiting_source: bool = False
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
@@ -240,38 +240,23 @@ class _TargetPullOp(_RemoteOp):
         return completed, did_work
 
     def _await_source(
-        self, progress: _KVCRProgress, now: float, scope: str, timeout_ms: int
-    ) -> tuple[bool, bool]:
+        self, progress: _KVCRProgress, now: float
+    ) -> tuple[bool, bool] | None:
+        """Ask a quiet source to answer; None if the request could not be sent."""
         # A start_write to a source that is gone leaves its destinations
         # uncertain until abandonment; before one is sent, failing exposes nothing.
         backend = self._backend
         endpoint = self.remote_ctrl_ep
-        if self.liveness_deadline is None:
-            self.liveness_deadline = now + timeout_ms / 1000
+        if not self.awaiting_source:
+            # Ask at once; only resends wait out the retry interval.
+            self.awaiting_source = True
             # The source acks only a target_metadata that carries metadata.
             backend._metadata_acked_sources.discard(endpoint)
-        if now < self.liveness_deadline:
-            if now < backend._metadata_retry_after.get(endpoint, 0):
-                return False, False
-            if backend._send_control(progress, endpoint, _TargetMetadata()):
-                return False, True
-        logger.warning(
-            "KVCR source %s did not answer within %d ms; op=%d fails before "
-            "exposing its destinations",
-            endpoint,
-            timeout_ms,
-            self.op_id[1],
-        )
-        if self.trace is not None:
-            self.trace.reject(
-                "target.start_write.rejected",
-                _nvtx.Reason.CONTROL_ERROR,
-                status=_nvtx.Status.TIMEOUT,
-            )
-        self.success = False
-        self.state = _TargetPullState.FINISHED
-        backend._record_progress_duration(scope, self.started_at, "source_unresponsive")
-        return True, True
+        elif now < backend._metadata_retry_after.get(endpoint, 0):
+            return False, False
+        if not backend._send_control(progress, endpoint, _TargetMetadata()):
+            return None
+        return False, True
 
     def _progress(
         self, progress: _KVCRProgress, event: object | None
@@ -306,6 +291,13 @@ class _TargetPullOp(_RemoteOp):
                 # A stale ACK from the dead peer may have re-acked the endpoint.
                 backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
             if now >= self.deadline:
+                if self.awaiting_source:
+                    logger.warning(
+                        "KVCR source %s did not answer before the deadline; op=%d "
+                        "fails without exposing its destinations",
+                        self.remote_ctrl_ep,
+                        self.op_id[1],
+                    )
                 if trace is not None:
                     trace.reject(
                         "target.start_write.rejected",
@@ -315,28 +307,33 @@ class _TargetPullOp(_RemoteOp):
                 self.success = False
                 self.failure_reason = Reason.DEADLINE.value
                 self.state = _TargetPullState.FINISHED
-                backend._record_progress_duration(scope, self.started_at, "timeout")
+                backend._record_progress_duration(
+                    scope,
+                    self.started_at,
+                    "source_unresponsive" if self.awaiting_source else "timeout",
+                )
                 self._record_unserved(scope)
                 return True, True
-            timeout_ms = backend._options.source_liveness_timeout_ms
-            if timeout_ms is not None and backend._source_quiet(
-                self.remote_ctrl_ep, now
-            ):
-                return self._await_source(progress, now, scope, timeout_ms)
-            sent = backend._send_control(
-                progress,
-                self.remote_ctrl_ep,
-                _StartWrite(
-                    op_handle=self.op_id[1],
-                    remaining_timeout_ms=(self.deadline - now) * 1000,
-                    source_incarnation=self.source_incarnation,
-                    keys=self.ordered_keys,
-                    dst_descriptors=self.dst_descriptors,
-                    key_layout=self.key_layout if self.local_fill else (),
-                    move=self.move,
-                    g2_only=self.g2_only,
-                ),
-            )
+            sent = False
+            if backend._source_quiet(self.remote_ctrl_ep, now):
+                awaiting = self._await_source(progress, now)
+                if awaiting is not None:
+                    return awaiting
+            else:
+                sent = backend._send_control(
+                    progress,
+                    self.remote_ctrl_ep,
+                    _StartWrite(
+                        op_handle=self.op_id[1],
+                        remaining_timeout_ms=(self.deadline - now) * 1000,
+                        source_incarnation=self.source_incarnation,
+                        keys=self.ordered_keys,
+                        dst_descriptors=self.dst_descriptors,
+                        key_layout=self.key_layout if self.local_fill else (),
+                        move=self.move,
+                        g2_only=self.g2_only,
+                    ),
+                )
             if not sent:
                 if trace is not None:
                     trace.reject("target.start_write.rejected", Reason.CONTROL_ERROR)

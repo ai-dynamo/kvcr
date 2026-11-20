@@ -113,11 +113,6 @@ class _RemoteFWDram:
             raise ValueError("metadata_retry_interval_ms must be positive")
         if not options.backend:
             raise ValueError("remote framework DRAM NIXL backend must be non-empty")
-        if (
-            options.source_liveness_timeout_ms is not None
-            and options.source_liveness_timeout_ms <= 0
-        ):
-            raise ValueError("source_liveness_timeout_ms must be positive")
         self._framework_pinning = kvcr._request_pin_callback is not None
         if (
             self._framework_pinning
@@ -160,7 +155,9 @@ class _RemoteFWDram:
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
+        # When each source last answered this target, pruned once stale.
         self._source_answered_at: dict[str, float] = {}
+        self._source_answers_pruned_at = 0.0
         self._refused_writes: dict[_OpId, dict[str, Any]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
@@ -654,11 +651,11 @@ class _RemoteFWDram:
             observed_work |= self._retry_local_sources(progress)
         # Only terminal notifications outrank a refusal for the same operation.
         events = self._poll_notifications(progress)
-        if self._options.source_liveness_timeout_ms is not None:
-            for op_id in events:
-                op = progress._in_flight_ops.get(op_id)
-                if isinstance(op, _TargetPullOp):
-                    self._source_answered(op.remote_ctrl_ep)
+        for op_id in events:
+            op = progress._in_flight_ops.get(op_id)
+            if isinstance(op, _TargetPullOp):
+                self._source_answered(op.remote_ctrl_ep)
+        self._prune_source_answers()
         for op_id, refusal in self._refused_writes.items():
             native = events.get(op_id, {})
             if not native.get("terminal") and not (
@@ -822,17 +819,31 @@ class _RemoteFWDram:
         self._metadata_retry_after.pop(endpoint, None)
 
     def _source_answered(self, endpoint: str | None) -> None:
-        if endpoint and self._options.source_liveness_timeout_ms is not None:
+        if endpoint:
             self._source_answered_at[endpoint] = self._kvcr._clock()
 
     def _source_quiet(self, endpoint: str, now: float) -> bool:
         """Whether ``endpoint`` must answer before a start_write is sent to it."""
-        timeout_ms = self._options.source_liveness_timeout_ms
+        # A metadata exchange counts as current for as long as it would go
+        # without a resend.
         return (
-            timeout_ms is not None
-            and now - self._source_answered_at.get(endpoint, -math.inf)
-            >= timeout_ms / 1000
+            now - self._source_answered_at.get(endpoint, -math.inf)
+            >= self._options.metadata_retry_interval_ms / 1000
         )
+
+    def _prune_source_answers(self) -> None:
+        # Past the window an entry no longer skips the handshake, so dropping it
+        # changes nothing and keeps departed endpoints from accumulating.
+        now = self._kvcr._clock()
+        window = self._options.metadata_retry_interval_ms / 1000
+        if 0 <= now - self._source_answers_pruned_at < window:
+            return
+        self._source_answers_pruned_at = now
+        self._source_answered_at = {
+            endpoint: answered
+            for endpoint, answered in self._source_answered_at.items()
+            if now - answered < window
+        }
 
     def _handle_target_metadata(
         self, progress: _KVCRProgress, payload: _TargetMetadata
