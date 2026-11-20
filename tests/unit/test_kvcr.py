@@ -6,7 +6,6 @@ import ctypes
 import logging
 import mmap
 import threading
-import time
 from contextlib import nullcontext, suppress
 from functools import partial
 from types import SimpleNamespace
@@ -711,14 +710,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
             pinning.request_pin,
             pinning.poll_pin_results,
             pinning.release_pin,
-            framework_control=(
-                SimpleNamespace(
-                    recv=lambda: (),
-                    wait_for_input=lambda _fd, timeout: time.sleep(min(timeout, 0.001)),
-                )
-                if remote_enabled
-                else None
-            ),
+            framework_control=FakeBytesControl() if remote_enabled else None,
         ),
         KVCRBackendConfigs(
             framework_regions=[

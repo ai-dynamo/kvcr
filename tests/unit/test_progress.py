@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import contextlib
+import fcntl
 import logging
 import os
 import resource
@@ -1029,25 +1029,20 @@ def test_wake_wait_accepts_descriptors_past_the_select_limit() -> None:
     # A process with many open files can get a wake pipe numbered past FD_SETSIZE,
     # which select() rejects; the idle wait must still work.
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    high = 1500
-    if hard != resource.RLIM_INFINITY and hard <= high:
+    high, limit = 1500, 1600
+    if hard != resource.RLIM_INFINITY and hard < limit:
         pytest.skip(f"open-file limit {hard} cannot reach descriptor {high}")
-    if soft <= high:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (high + 1, hard))
+    if soft != resource.RLIM_INFINITY and soft < limit:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
     read, write = os.pipe()
+    duplicate = None
     try:
-        while True:
-            try:
-                os.fstat(high)
-            except OSError:
-                break
-            high += 1
-        os.dup2(read, high)
-        assert not _wait_for_wake(high, 0)
+        duplicate = fcntl.fcntl(read, fcntl.F_DUPFD, high)
+        assert not _wait_for_wake(duplicate, 0)
         os.write(write, b"\0")
-        assert _wait_for_wake(high, 1)
+        assert _wait_for_wake(duplicate, 1)
     finally:
-        for descriptor in {read, write, high}:
-            with contextlib.suppress(OSError):
+        for descriptor in (read, write, duplicate):
+            if descriptor is not None:
                 os.close(descriptor)
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))

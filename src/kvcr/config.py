@@ -111,14 +111,7 @@ class FrameworkControl(Protocol):
         ...
 
     def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
-        """Block until ``recv`` has input, ``wake_fd`` is readable, or ``timeout`` ends.
-
-        Return whether either is ready. A channel that cannot wait for its input can
-        sleep instead, which keeps the idle progress thread polling every millisecond::
-
-            time.sleep(min(timeout, 0.001))
-            return False
-        """
+        """Wait up to ``timeout`` for input or ``wake_fd``; True if either is ready."""
         ...
 
 
