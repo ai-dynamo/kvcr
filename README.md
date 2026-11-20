@@ -66,7 +66,7 @@ A hint envelope may carry several hints. KVCR parses and dispatches each one ind
 
 ### Quick start
 
-The [vLLM quick start](docs/quick-start-vllm.md) is a public preview that builds and runs KVCR with vLLM, Dynamo, and NIXL using pinned source revisions and a compatible base image. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
+The [vLLM quick start](docs/quick-start-vllm.md) is a public preview that builds and runs KVCR with vLLM, Dynamo, and NIXL using a pinned vLLM image and Dynamo package. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
 
 The [SGLang quick start](docs/quick-start-sglang.md) is a preview for building and running KVCR with SGLang and Dynamo, through either the HiCache storage backend or the experimental direct linker.
 
@@ -78,11 +78,11 @@ For local development, API lifecycle guidance, validation, integration, and KVCR
 
 KVCR is released under the Apache License 2.0. The full license text is in [LICENSE](LICENSE).
 
-KVCR package source files carry an SPDX Apache-2.0 identifier and the NVIDIA copyright notice. The vLLM source files used in the public quick-start build retain their Apache-2.0 contributor headers.
+KVCR package source files carry an SPDX Apache-2.0 identifier and the NVIDIA copyright notice.
 
 ## Third-party software
 
-The quick-start images install the inference engine and Dynamo separately; they are not bundled into the `kvcr` wheel. See the [vLLM](docs/quick-start-vllm.md) and [SGLang](docs/quick-start-sglang.md) guides for the pinned sources.
+The inference engines and Dynamo are not bundled into the `kvcr` wheel. See the [vLLM](docs/quick-start-vllm.md) and [SGLang](docs/quick-start-sglang.md) guides for their quick-start dependencies.
 
 KVCR declares runtime dependencies on `msgspec`, `pyzmq`, and `nixl`. Each is installed from its own distribution under its own license. None of them are redistributed by this repository or bundled into the `kvcr` wheel, which packages only `src/kvcr`.
 

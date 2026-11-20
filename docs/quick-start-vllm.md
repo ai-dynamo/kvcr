@@ -237,7 +237,7 @@ The explicit rank selection is only for this deterministic mechanism test. In a 
 ## Troubleshooting
 
 - **Build failure:** Check access to the public package indexes and inspect the final compatibility-check output. Keep the vLLM image and Dynamo version together.
-- **Tier initialization failure:** Check that the `kvcr` tier is registered, NIXL matches the KVCR pin, and shared memory covers both host allocations and vLLM IPC.
+- **Tier initialization failure:** Check that the `kvcr` tier is registered, NIXL satisfies KVCR's supported range, and shared memory covers both host allocations and vLLM IPC. The pinned vLLM image supplies NIXL 1.5.2.
 - **No router hint or cache hit:** Use `--router-mode kv`, enable self-describing KV events, and confirm the worker advertises `router_hint` and its control endpoints. Use a fresh prefix longer than one block.
 - **Peer connection or transfer failure:** Ensure control and event ports are unique, with one control port per DP rank, and `control_advertise_host` is reachable by peers. Check terminal transfer status and destination data; a control acknowledgement alone does not prove delivery.
 
