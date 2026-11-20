@@ -406,33 +406,61 @@ def _workload(tmp_path, traces, **workload):
     return TraceWorkload(_config(_write(tmp_path, traces), **workload))
 
 
-def test_waits_are_the_recorded_gap_after_the_latest_dependency():
+def _ids(path):
+    """The source ids of the traces in a compiled file, in order."""
+    lines = path.read_bytes().splitlines()[1:]
+    return [msgspec.json.decode(line, type=Compiled).id for line in lines]
+
+
+def test_a_request_waits_the_recorded_gap_after_the_one_before_it_in_its_lane():
     compiled = compile_trace(trace(AGENTS))
     assert compiled.spawn == [-1, 0, 0, 2]
     # Both early sub-agents end before the turn at 6; no turn follows the last.
     assert compiled.join == [-1, 1, 1, -1]
-    # Main lane: nothing, then 6 - 4 (the slower sub-agent), then 8 - 7.
-    # Sub-agents: after the parent turn ended at 1, then after their own turns.
+    # Main lane: nothing, then 6 - 1 (the sub-agents it joins end later, at 4,
+    # and do not count), then 8 - 7. Sub-agents: from the start of their
+    # branch, then after their own requests (3 - 2.5).
     assert _waits(compiled) == [
         (0, 0),
-        (0, 2000),
+        (0, 5000),
         (0, 1000),
+        (1, 0),
         (1, 500),
-        (1, 500),
-        (2, 1000),
-        (3, 500),
+        (2, 500),
+        (3, 0),
     ]
+
+
+def test_sub_agents_with_one_spawn_and_join_start_from_the_earliest_of_their_groups():
+    def first_waits(api, parent_api=1.0):
+        requests = [
+            req(0, [1], api=parent_api),
+            group(2, [req(2.5, [10], api=1.0)]),
+            group(3, [req(4, [20], api=api)]),
+            req(6, [1, 2]),
+            req(12, [1, 2, 3]),
+        ]
+        compiled = compile_trace(trace(requests))
+        return compiled.join[1:], [wait for lane, wait in _waits(compiled) if lane]
+
+    # Both join the turn at 6, so both count from 2: 2.5 - 2 and 4 - 2.
+    assert first_waits(1.0) == ([1, 1], [500, 2000])
+    # The second ends at 9 and joins the turn at 12: it counts from its own 3.
+    assert first_waits(5.0) == ([1, 2], [500, 1000])
+    # A branch that began before the parent turn ended (at 2.2) counts from
+    # that end: nothing starts before the turn returns.
+    assert first_waits(1.0, parent_api=2.2) == ([1, 1], [300, 1800])
+
+
+def test_a_negative_or_non_finite_api_time_counts_as_no_time():
+    for api in (-3.0, float("nan"), float("inf")):
+        compiled = compile_trace(trace([req(0, [1], api=api), req(5, [1, 2])]))
+        assert _waits(compiled) == [(0, 0), (0, 5000)], api
 
 
 def test_a_sub_agent_joins_the_first_parent_turn_recorded_at_or_after_its_end():
     compiled = compile_trace(trace(OVERLAP))
     assert (compiled.spawn, compiled.join) == ([-1, 0], [-1, 2])
-    # The turn at 6 follows turn 0 alone: 6 - 1. The turn at 12 follows the
-    # sub-agent, which ended at 9, later than the turn at 6 did: 12 - 9.
-    assert _waits(compiled) == [(0, 0), (0, 5000), (0, 3000), (1, 1000)]
-    # A turn at 6 that ends at 11 is the later of the two: 12 - 11.
-    slow = [*OVERLAP[:2], req(6, [1, 2, 3], api=5.0), OVERLAP[3]]
-    assert _waits(compile_trace(trace(slow)))[2] == (0, 1000)
 
     def join(api):
         child = group(2, [req(2, [10], api=api)])
@@ -440,6 +468,18 @@ def test_a_sub_agent_joins_the_first_parent_turn_recorded_at_or_after_its_end():
 
     assert join(4.0) == [-1, 1]  # ends at 6, as the next parent turn starts
     assert join(10.5) == [-1, -1]  # ends after the last parent turn starts
+
+
+def test_a_sub_agent_ends_after_its_recorded_duration_not_with_its_last_call():
+    def join(**recorded):
+        child = {**group(2, [req(2, [10], api=3.0)]), **recorded}
+        turns = [req(3, [1, 2]), req(6, [1, 2, 3]), req(13, [1, 2, 3, 4])]
+        return compile_trace(trace([req(0, [1]), child, *turns])).join[1]
+
+    assert join() == 2  # no duration: the call's end, 5, so the turn at 6
+    assert join(duration_ms=10_000) == 3  # ends at 12: the turn at 13
+    # A negative or non-finite duration counts as 0: it ends at 2, as it starts.
+    assert join(duration_ms=-1) == join(duration_ms=float("nan")) == 1
 
 
 def test_inner_times_relative_to_the_group_are_shifted():
@@ -456,7 +496,7 @@ def test_sub_agents_run_together_and_the_parent_waits_for_all_of_them(tmp_path, 
     turn = workload.next_turn(main)
     a, b = main + 1, main + 2
     step = workload.completed(turn)
-    assert sorted(step.wake) == [(0.5, a), (1.0, b)] and not step.ended  # no parent
+    assert sorted(step.wake) == [(0.0, a), (0.5, b)] and not step.ended  # no parent
 
     def finish_a():
         again = workload.completed(workload.next_turn(a))
@@ -469,27 +509,37 @@ def test_sub_agents_run_together_and_the_parent_waits_for_all_of_them(tmp_path, 
     order = (finish_a, finish_b) if first == "a" else (finish_b, finish_a)
     early, late = order[0](), order[1]()
     assert early.wake == [] and len(early.ended) == 1
-    # The last sub-agent to finish releases the parent after its recorded gap.
-    assert late.wake == [(2.0, main)] and sorted(early.ended + late.ended) == [a, b]
+    # The parent is parked: the last sub-agent to finish sends it out at once.
+    assert late.wake == [(0.0, main)] and sorted(early.ended + late.ended) == [a, b]
     turn = workload.next_turn(main)
     assert turn.turn == 1 and turn.segments == ((TRACE_BASE, 0, 3),)
 
 
-@pytest.mark.parametrize("first", ["child", "parent"])
-def test_a_parent_turn_before_the_join_runs_beside_the_sub_agent(tmp_path, first):
+def test_a_parent_turn_before_the_join_runs_beside_the_sub_agent(tmp_path):
     workload = _workload(tmp_path, [trace(OVERLAP)])
     main = workload.new_session().id
     child = main + 1
     step = workload.completed(workload.next_turn(main))
     # The turn at 6 is due without the sub-agent having run.
-    assert sorted(step.wake) == [(1.0, child), (5.0, main)] and not step.ended
-    running = workload.next_turn(child)
-    beside = workload.next_turn(main)
-    assert beside.turn == 1
+    assert sorted(step.wake) == [(0.0, child), (5.0, main)] and not step.ended
+    assert workload.next_turn(child).turn == 0 and workload.next_turn(main).turn == 1
+
+
+# The gap recorded before OVERLAP's turn at 12 is 5 s, after the turn at 6.
+@pytest.mark.parametrize(("first", "delay"), [("child", 5.0), ("parent", 0.0)])
+def test_a_join_turn_waits_its_gap_unless_it_was_parked_for_its_sub_agents(
+    tmp_path, first, delay
+):
+    workload = _workload(tmp_path, [trace(OVERLAP)])
+    main = workload.new_session().id
+    child = main + 1
+    workload.completed(workload.next_turn(main))
+    running, beside = workload.next_turn(child), workload.next_turn(main)
     order = (running, beside) if first == "child" else (beside, running)
     early, late = workload.completed(order[0]), workload.completed(order[1])
-    # The turn at 12 waits for both; the later one releases it.
-    assert early.wake == [] and late.wake == [(3.0, main)]
+    # The turn at 12 waits for both. The later one releases it: the turn at 6
+    # after the gap, the sub-agent (the parent was parked for it) at once.
+    assert early.wake == [] and late.wake == [(delay, main)]
     assert early.ended + late.ended == [child]
     last = workload.next_turn(main)
     assert last.turn == 2
@@ -506,7 +556,7 @@ def test_a_play_is_replaced_only_when_every_lane_has_ended(tmp_path):
     assert workload.completed(workload.next_turn(main)) == ([(1.0, main)], [])
     # The last main turn starts a sub-agent nobody waits for.
     step = workload.completed(workload.next_turn(main))
-    assert step == ([(0.5, main + 3)], [main]) and workload.started == 1
+    assert step == ([(0.0, main + 3)], [main]) and workload.started == 1
     step = workload.completed(workload.next_turn(main + 3))
     assert step.ended == [main + 3]
     ((delay, fresh),) = step.wake
@@ -517,12 +567,20 @@ def test_a_play_is_replaced_only_when_every_lane_has_ended(tmp_path):
 
 
 def test_waits_are_scaled_then_capped(tmp_path):
+    # Recorded gaps of 0.5 s and 2 s.
+    turns = [req(0, [1]), req(1.5, [1, 2]), req(4.5, [1, 2, 3])]
     workload = _workload(
-        tmp_path, [trace(AGENTS)], trace_think_scale=2.0, think_cap_s=1.5
+        tmp_path, [trace(turns)], trace_think_scale=2.0, think_cap_s=1.5
     )
     main = workload.new_session().id
-    step = workload.completed(workload.next_turn(main))
-    assert sorted(step.wake) == [(1.0, main + 1), (1.5, main + 2)]
+    assert workload.completed(workload.next_turn(main)).wake == [(1.0, main)]
+    assert workload.completed(workload.next_turn(main)).wake == [(1.5, main)]
+
+
+def test_an_answer_to_a_prompt_under_one_block_is_shortened_too(tmp_path):
+    short = [req(0, [], tokens=40, out=2000), req(5, [1, 2])]
+    workload = _workload(tmp_path, [trace(short)], trace_output_scale=0.02)
+    assert workload.next_turn(workload.new_session().id).output_tokens == 40
 
 
 def test_shortened_answers_complete_fewer_blocks(tmp_path):
@@ -594,22 +652,33 @@ def test_aged_plays_start_part_way_and_replacements_at_the_beginning(tmp_path):
 
 def test_a_play_that_starts_past_a_sub_agent_does_not_wait_for_it(tmp_path):
     workload = _workload(tmp_path, _many(1))
-    play = workload.new_session(aged=True)
-    while workload.next_turn(play.id).turn < 3:  # started before the sub-agent
+    for _ in range(20):
         play = workload.new_session(aged=True)
-    assert play.live == 1  # the sub-agent after turn 2 is over
+        turn = workload.next_turn(play.id)
+        if turn.turn >= 3:  # the sub-agent follows turn 2
+            break
+    else:
+        pytest.fail("no aged play started past the sub-agent")
+    for _ in range(turn.turn, 29):  # on to the last of its 30 turns
+        workload.completed(turn)
+        turn = workload.next_turn(play.id)
+    # The sub-agent is over: the play ends with its main lane.
+    started = workload.started
+    assert workload.completed(turn).ended == [play.id]
+    assert workload.started == started + 1
 
 
 def test_a_play_that_starts_between_a_spawn_and_its_join_does_not_wait(tmp_path):
     workload = _workload(tmp_path, [trace(OVERLAP)])
-    play = workload.new_session(aged=True)
-    turn = workload.next_turn(play.id)
-    while turn.turn != 1:  # the turn at 6: after the spawn, before the join
+    for _ in range(20):
         play = workload.new_session(aged=True)
         turn = workload.next_turn(play.id)
-    assert play.live == 1
+        if turn.turn == 1:  # the turn at 6: after the spawn, before the join
+            break
+    else:
+        pytest.fail("no aged play started between the spawn and the join")
     # The sub-agent is over: the turn at 12 follows the turn at 6 alone.
-    assert workload.completed(turn) == ([(3.0, play.id)], [])
+    assert workload.completed(turn) == ([(5.0, play.id)], [])
     assert workload.next_turn(play.id).turn == 2
 
 
@@ -623,10 +692,17 @@ def test_the_compiled_file_round_trips(tmp_path):
     assert (header.traces, header.turns, header.block_tokens) == (2, 8, BLOCK)
     assert (header.max_prompt_blocks, header.max_request_blocks) == (4, 4)
     assert header.source == "source.jsonl" and len(header.sha256) == 64
-    assert [item.id for item in loaded] == ["a", "b"]
+    assert len(loaded) == 2 and _ids(path) == ["a", "b"]
     lines = path.read_bytes().splitlines()
     decoded = msgspec.json.decode(lines[1], type=Compiled)
     assert decoded == compile_trace(traces[0])
+
+
+def test_the_longest_request_counts_every_token_not_only_whole_cached_blocks(tmp_path):
+    # Two cached blocks and one answered, but 188 + 10 tokens reach a fourth.
+    request = req(0, [1, 2], tokens=2 * BLOCK + 60, out=10)
+    header, _ = load(_write(tmp_path, [trace([request])]))
+    assert (header.max_prompt_blocks, header.max_request_blocks) == (2, 4)
 
 
 def test_compile_errors_name_the_trace_and_request():
@@ -666,10 +742,7 @@ def test_the_limit_takes_the_first_traces(tmp_path):
     source = tmp_path / "source.jsonl"
     source.write_text("".join(json.dumps(item) + "\n" for item in _many(5)))
     stats = compile_corpus(source, tmp_path / "out", limit=2)
-    assert stats.traces == 2 and [item.id for item in load(tmp_path / "out")[1]] == [
-        "t0",
-        "t1",
-    ]
+    assert stats.traces == 2 and _ids(tmp_path / "out") == ["t0", "t1"]
 
 
 def test_a_trace_that_does_not_fit_the_run_is_refused(tmp_path):
@@ -713,7 +786,7 @@ def test_unreadable_trace_files_say_what_to_do(tmp_path):
     header = msgspec.json.decode(lines[0], type=Header)
     old = msgspec.structs.replace(header, clusterbench_trace=0)
     path.write_bytes(msgspec.json.encode(old) + b"\n" + lines[1] + b"\n")
-    with pytest.raises(TraceError, match="format 0, this build reads 2"):
+    with pytest.raises(TraceError, match="format 0, this build reads 3; compile"):
         TraceWorkload(_config(path))
     path.write_bytes(b"not json\n")
     with pytest.raises(TraceError, match="not a compiled trace"):
