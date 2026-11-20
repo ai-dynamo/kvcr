@@ -3,7 +3,7 @@
 This guide builds and runs a container containing KV Cache Runner (KVCR), Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack without editing source code in any of those projects.
 
 > [!IMPORTANT]
-> This is a public preview using vLLM's supported KVCR secondary-tier adapter. The container recipe pins the exact adapter, vLLM base image, and landed Dynamo revision validated together for this guide.
+> This is a public preview using the KVCR secondary-tier adapter included in vLLM 0.34.0. The container recipe pins the vLLM image and Dynamo nightly used for this guide.
 
 For source builds, editable installs, API development, or test workflows, use the [developer guide](dev-guide.md).
 
@@ -14,10 +14,10 @@ For a proposed Kubernetes deployment with an optional KVCR guard service sidecar
 ## Prerequisites
 
 - A Linux x86-64 host with at least two supported NVIDIA GPUs;
-- NVIDIA driver 580.126.20 or newer for the pinned CUDA 13.0.2 runtime;
+- NVIDIA driver 580.126.20 or newer for the CUDA 13 runtime;
 - Docker Engine with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
 - Git, curl, and Python 3 for the build and verification commands;
-- network access to GitHub, PyPI, Docker Hub, crates.io, Debian package mirrors, and the model source; and
+- network access to PyPI, NVIDIA's Python package index, Docker Hub, Debian package mirrors, and the model source; and
 - enough free disk space for the multi-gigabyte Dynamo/vLLM image and its build layers.
 
 The example below runs two data-parallel ranks on one host, so it requires two visible GPUs. It uses loopback addresses, a 2 GB host tier per rank, and an 8 GB shared-memory allocation for both ranks' host allocations plus vLLM IPC. Adjust the model, memory, and network addresses for the target system.
@@ -28,21 +28,16 @@ Run the commands below from the KVCR repository root.
 
 ## 1. Build the integration image
 
-The repository includes [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-vllm). The build fetches pinned adapter source and applies it to the base image. Pass the public repository and exact revision explicitly:
+The repository includes [Dockerfile.quick-start-vllm](../Dockerfile.quick-start-vllm). The build uses the KVCR adapter and NIXL already included in the vLLM image.
 
 ```bash
-export KVCR_VLLM_REPO=https://github.com/vllm-project/vllm.git
-export KVCR_VLLM_REF=a5db4c9ff58a0ec4dc20594ba5cea9f776dcd693
-
 DOCKER_BUILDKIT=1 docker build \
-  --build-arg KVCR_VLLM_REPO="$KVCR_VLLM_REPO" \
-  --build-arg KVCR_VLLM_REF="$KVCR_VLLM_REF" \
   --file Dockerfile.quick-start-vllm \
   --tag kvcr-quick-start:local \
   .
 ```
 
-No private-repository credentials are required. The first build uses pinned, tested vLLM and Dynamo revisions and may take several minutes. Continue only if its final compatibility checks pass.
+No private-repository credentials are required. The first build may take several minutes. Continue only if its final compatibility checks pass.
 
 ---
 
@@ -241,7 +236,7 @@ The explicit rank selection is only for this deterministic mechanism test. In a 
 
 ## Troubleshooting
 
-- **Build failure:** Check access to the public sources and package indexes, and inspect the final compatibility-check output. Keep the base image, `DYNAMO_REF`, and `KVCR_VLLM_REF` together.
+- **Build failure:** Check access to the public package indexes and inspect the final compatibility-check output. Keep the vLLM image and Dynamo version together.
 - **Tier initialization failure:** Check that the `kvcr` tier is registered, NIXL matches the KVCR pin, and shared memory covers both host allocations and vLLM IPC.
 - **No router hint or cache hit:** Use `--router-mode kv`, enable self-describing KV events, and confirm the worker advertises `router_hint` and its control endpoints. Use a fresh prefix longer than one block.
 - **Peer connection or transfer failure:** Ensure control and event ports are unique, with one control port per DP rank, and `control_advertise_host` is reachable by peers. Check terminal transfer status and destination data; a control acknowledgement alone does not prove delivery.
