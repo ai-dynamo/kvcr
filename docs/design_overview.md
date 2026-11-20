@@ -120,7 +120,7 @@ Claims are attached to concrete residencies. They prevent KVCR-owned memory from
 
 ### Asynchronous Execution
 
-The event loop owns most KVCR metadata mutations and never performs blocking external calls. A dedicated progress thread owns the NIXL agent, submits and polls transfers, and posts completions back to the event loop. It may also claim ready local DRAM sources under a shared lock. Framework-agent and storage work follow the same asynchronous completion pattern.
+The event loop owns most KVCR metadata mutations and never performs blocking external calls. A dedicated progress thread owns the NIXL agent, submits and polls transfers, and posts completions back to the event loop. It may also claim ready local DRAM sources under a shared lock. It also applies deposit completions and independent hints under the core lock. Framework-agent and storage work follow the same asynchronous completion pattern.
 
 The active in-process KVCR owns the NIXL agent used for KVCR-owned memory and framework memory exposed through the KVCR bindings. A future integration may instead coordinate with a framework-owned agent. When resilience is enabled, the backup KVCR has its own agent but uses it only after a fenced takeover.
 
@@ -257,7 +257,7 @@ KVCR-owned inventory events use the same `BlockKey` values as fetch and `submit_
 
 ### KV transfer hints
 
-For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` only advises it not to keep an additional KVCR-owned copy after the framework no longer needs it.
+For data shared among engines on the same node, the router can use one KVCR as the source in hints sent to the other local KVCRs. A destination may retain a local copy when replication is worthwhile. Otherwise, the router includes `no_retain` in `submit_hint`. The destination still satisfies any committed framework request; `no_retain` marks the advertised hashes so that later unprotected deposits of those blocks are dropped.
 
 The router may choose not to send a hint based on its internal cost model. The router also considers sending hints for matching TP layouts, meaning prefill-to-prefill, decode-to-decode, and aggregated deployments, which cover many use cases. A TP-independent host representation further removes that constraint.
 
@@ -269,15 +269,21 @@ KVCR-to-KVCR movement is destination-initiated for request-scoped hints. A reque
 
 `kv.evict_on_fetch` uses the same payload and request ID, but removes the source's eligible local DRAM copies of whole keys successfully retrieved through `fetch()` or `deliver()`. Destination cache hits and `deliver()` calls that request only part of a key leave the source unchanged. Framework-owned memory can supply the data and is always retained. G3 copies and local DRAM copies protected by `no_evict` are also retained.
 
+`kv.fetch` and `kv.evict_on_fetch` accept optional `no_retain`: `true` sets the mark, `false` clears it, and omission or `null` leaves it unchanged. The setting applies to all advertised hashes when the hint arrives, even if the request fails or never uses those hashes. Enforcing the `no_retain` mark requires a key adaptor.
+
 Each hint in an envelope is parsed and handled independently. `discard_hint` normally reports that the relevant request is over, and also permits an integration to discard the request-scoped hint early. A route-time `submit_hint` may carry a whole request's block hashes from one source. In the future, if necessary, multi-source assembly can be added by splitting the list into multiple hinted operations.
 
 #### Independent hints
 
-`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Hints are sent to the source with `destination_control_endpoint` and `block_hashes`. They run independently of their carrier request's keys and lifetime, work without a request ID, and can share an envelope with request advice.
+`kv.prefetch` copies cached KV blocks; `kv.move` also requests removal of the source copy. Hints are sent to the source with `destination_control_endpoint` and `block_hashes`. They run independently of their carrier request's keys and lifetime, work without a request ID, and can share an envelope with request advice. The existing control socket also accepts request hint envelopes as MessagePack, rejecting request-scoped actions. Control-socket envelopes above 16 MiB, or arriving while 256 are queued, are dropped; senders must bound both. Both paths queue independent hints for the KVCR progress thread and can finish inventory updates and claim release without framework polling; results remain local debug reports.
 
-During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
+On the progress thread, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
 
-The integration maintains the source's hash-to-key map and handles collisions. Missing or ambiguous hashes fail individually while valid hashes proceed.
+KVCR core maintains the hash-to-key map from inventory changes and recovered residency via the configured adapter's `encode_to_router()`. Resolution uses the source reader lock and no longer calls `decode_from_router()`; the adapter API is unchanged. Missing or ambiguous hashes fail individually while valid hashes proceed. Only complete KVCR-owned DRAM copies are transferable; lookup reserves nothing, so blocks may disappear before transfer. Guard takeover does not automatically preserve the adapter.
+
+`kv.no_retain` runs on the receiving KVCR's progress thread: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
+
+`kv.invalidate` removes complete local DRAM copies identified by `block_hashes`, without transferring data. It honors `no_evict` and waits for existing readers to drain. `COMPLETED` means cleanup is queued; actual removals publish inventory events. Combine it with `kv.no_retain` to prevent later deposits from recreating the copies.
 
 ### Peer control and liveness
 
@@ -327,7 +333,7 @@ At initialization, an integration selects one built-in policy or supplies an ext
 
 Eviction scores are finite floats. LRU favors evicting later sequence keys at comparable recency. Custom policies may use ordering position or ignore it.
 
-Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is an advisory router retention hint. If it conflicts with a framework `no_evict` claim, `no_evict` wins until the framework calls `release` with the returned handle; policy may then honor or override `no_retain`.
+Policy decides whether to stage, retain, move, or drop data within KVCR-owned DRAM and downstream storage. Fetch and `no_evict` deposit claims are hard mechanism constraints: while they exist, policy cannot evict the entry. `no_retain` is a router retention rule enforced ahead of policy: marked deposits are dropped before `decide_ingest` runs unless `no_evict` protects them, and existing copies stay intact. Marks persist until cleared, including across deposits and request cleanup.
 
 The policy methods are invoked as follows:
 

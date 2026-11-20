@@ -44,8 +44,6 @@ class _StubHint(_Hint):
 class _StubHandler(_HintHandler):
     """Inline handler that accepts every hint except those listed in ``fail``."""
 
-    action_type = "kv.test"
-
     def __init__(self, core, dispatcher) -> None:
         self.core = core
         self.dispatcher = dispatcher
@@ -60,7 +58,7 @@ class _StubHandler(_HintHandler):
         self.dispatcher.report(
             HintResult(
                 action_id=hint.action_id,
-                action_type=self.action_type,
+                action_type=hint.ACTION_TYPE,
                 status=HintStatus.ACCEPTED,
                 request_id=request_id,
                 message_id=message_id,
@@ -97,7 +95,7 @@ def _stub_kvcr(monkeypatch, **config_fields):
     return kvcr, handler, _record_hint_results(monkeypatch, kvcr)
 
 
-def test_dispatcher_owns_the_hint_type_table(monkeypatch):
+def test_dispatcher_uses_the_hint_type_table(monkeypatch):
     # Registering a new action type needs no change to core.
     kvcr, handler, _ = _stub_kvcr(monkeypatch)
     dispatcher = kvcr._core._hints_dispatcher

@@ -18,9 +18,11 @@ from _kvcr_test_utils import (
     FakeTelemetryStats,
     PendingPrimaryPinning,
     _buffer_region,
+    _ConstantHashAdapter,
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _invalidate,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
@@ -47,6 +49,8 @@ from kvcr.runtime.progress import _STOP, _TransferRef
 from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
+    CacheTier,
+    InventoryEvent,
     OpEntryResult,
     OpEntryStatus,
     PinHandle,
@@ -56,54 +60,46 @@ from kvcr.types import (
 
 
 @pytest.mark.parametrize(
-    "case",
-    ["ready", "ambiguous", "stale", "adapter_error", "incomplete", "duplicate_key"],
+    "case", ["no_sink", "sink_ok", "sink_error", "encode_error", "invalid_hash"]
 )
-def test_resolve_hashes_reports_each_hash_without_pinning_or_copying(case):
-    """Resolution needs only inventory and an adapter, with no transfer/pin APIs."""
-    key = BlockKey(b"full-key-with-group")
-    adapter = SimpleNamespace()
-    adapter.decode_from_router = Mock(
-        side_effect=[
-            {
-                "ambiguous": ValueError("collision"),
-                "adapter_error": RuntimeError("bug"),
-            }.get(case, key),
-            KeyError(999),
-        ]
+def test_hash_index_tracks_inventory_and_isolates_callback_errors(case):
+    pinning = FakePrimaryPinning()
+    callback = None if case == "no_sink" else Mock()
+    if case == "sink_error":
+        callback.side_effect = RuntimeError("inventory unavailable")
+    encoder = Mock(return_value=[] if case == "invalid_hash" else 123)
+    if case == "encode_error":
+        encoder.side_effect = RuntimeError("encoding failed")
+    kvcr, agent, _control, _memory = _pinless_source(
+        pinning=pinning,
+        key_adapter=SimpleNamespace(encode_to_router=encoder),
+        inventory_sink=callback,
     )
-    residency = _LocalDramResidency(
-        (("", 0), (":tail", 1)) if case == "incomplete" else (("", 0),),
-        _LocalDramState.READY,
-        pending_labels={":tail"} if case == "incomplete" else None,
-    )
-    core = SimpleNamespace(
-        _key_adapter=adapter,
-        _block_sizes={"": 16},
-        _block_record_map={}
-        if case == "stale"
-        else {key: _BlockRecord(local_dram=residency)},
-    )
-    hashes = (123, 999)
-    if case == "duplicate_key":
-        adapter.decode_from_router.side_effect = [key, key, KeyError(999)]
-        hashes = (123, 124, 999)
-    groups, failures = _KVCRCore.resolve_hashes(core, hashes)
-    assert failures.pop(999) == "not_found"
-    if case in ("ready", "duplicate_key"):
-        assert groups == {(("",), (16,)): {key: 123}}
-        assert failures == (
-            {124: "resolution_failed"} if case == "duplicate_key" else {}
+    agent.state = "DONE"
+    core = kvcr._core
+    key = BlockKey(b"key")
+    handle = kvcr.deposit({key: [_mem_descriptor(end_point_name="source")]})
+    assert dict(_poll_until(kvcr, bool))[handle][key].success
+    if case in ("encode_error", "invalid_hash"):
+        assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
+        callback.assert_called_once_with(
+            InventoryEvent((key,), CacheTier.LOCAL_G2, False)
         )
-    else:
-        assert not groups and failures == {
-            123: {
-                "ambiguous": "ambiguous_hash",
-                "stale": "source_not_transferable",
-                "incomplete": "source_not_transferable",
-                "adapter_error": "resolution_failed",
-            }[case]
-        }
+        return
+    encoder.reset_mock()
+    assert core.resolve_hashes((123, 999)) == (
+        {(("",), (16,)): {key: 123}}, {999: "not_found"}
+    )
+    encoder.assert_not_called()
+    assert len(agent.transfers) == 1 and not pinning.searches
+    assert core._block_record_map[key].local_dram.source_readers == 0
+    with core._state_lock:
+        _invalidate(kvcr, (key,))
+        assert core.resolve_hashes((123,)) == ({}, {123: "source_not_transferable"})
+    _wait_until(lambda: key not in core._block_record_map)
+    assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
+    if callback is not None:
+        assert callback.call_count == 2
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
@@ -248,13 +244,14 @@ def test_framework_pinning_disabled(
     )
 
 
-def _pinless_source(size=16, **kwargs):
-    """Pinless source over one local-DRAM buffer; keep the returned buffer alive."""
+def _pinless_source(size=16, *, pinning=None, **kwargs):
+    """Source over one local-DRAM buffer, pinless unless callbacks are supplied."""
     memory = ctypes.create_string_buffer(size)
     agent, control = FakeNixlAgent(), FakeBytesControl()
     source = _new_kvcr(
         agent,
-        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        pinning
+        or SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
         control,
         name="source",
         framework_regions=[_buffer_region(memory, 16)],
@@ -408,6 +405,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
             capacity_low_watermark_percent=100,
         ),
         name="source",
+        key_adapter=_ConstantHashAdapter(),
         framework_regions=[
             RegionDescriptor(
                 addr=ctypes.addressof(memory), size=16, count=3, label=label
@@ -444,6 +442,7 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
                 expected_layout=["", ":b", ":c"],
             )
             assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+            assert source._core.resolve_hashes((123,)) == ({}, {123: "not_found"})
         prior_transfers = len(agent.xfers)
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
@@ -490,6 +489,9 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, recovered
             deposit = source.deposit({key: descriptors[1:2]})
             assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
             prior_transfers = len(agent.xfers)
+        assert source._core.resolve_hashes((123,)) == (
+            {(("", ":b", ":c"), (16, 16, 16)): {key: 123}}, {}
+        )
         callbacks.clear()
         agent.state = transfer_state
         with (
@@ -1391,18 +1393,32 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle(local_sou
         source.close()
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
+@pytest.mark.parametrize(
+    "mixed,g2_only,shutdown",
+    [
+        (False, False, False), (True, False, False),
+        (False, True, False), (False, True, True),
+    ],
+)
+def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(
+    mixed, g2_only, shutdown
+):
     now = 0.0
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, control, errors = FakeNixlAgent(), FakeBytesControl(), []
+
+    def on_resilience_event(error):
+        residency = source._core._block_record_map[key].local_dram
+        assert residency.claim_count + residency.source_readers == 1
+        errors.append(error)
+
     source = _new_kvcr(
         agent,
         FakePrimaryPinning(missing_indices=(0,)),
         control,
         name="source",
-        on_resilience_event=errors.append,
+        on_resilience_event=on_resilience_event,
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
         framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
     )
@@ -1423,6 +1439,7 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
             _start_write_message(12, key, target_agent="target")
         )
         payload["keys"] = [key, missing, framework_hit] if mixed else [key]
+        payload["g2_only"] = g2_only
         payload["dst_descriptors"] = [
             [_TransferRef("target", index)] for index in range(len(payload["keys"]))
         ]
@@ -1438,18 +1455,34 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
         ]
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count + residency.source_readers == 1
+        if shutdown:
+            source._core._progress._submissions.put(_STOP)
+            _wait_until(lambda: source._core._progress._startup_stage == "cleanup")
         agent.state = "DONE"
-        assert _poll_until(source, lambda _: len(errors) == 2) == []
+        if shutdown:
+            source.close()
+        else:
+            _wait_until(lambda: not source._core._progress._in_flight_ops)
+            control.incoming.append(msgspec.msgpack.encode({
+                "type": "target_metadata_ack", "sender_control_endpoint": "tcp://ack:1",
+            }))  # fmt: skip
+            _wait_until(
+                lambda: "tcp://ack:1"
+                in source._core._remote_fw_dram._metadata_acked_sources
+            )
+            assert _poll_until(source, lambda _: len(errors) == 2) == []
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert residency.claim_count + residency.source_readers == 0
+        assert not _has_outstanding_operations(source)
         assert errors[1].source_blocks == expected_sources
         for error in errors:
             assert error.source_owners == expected_owners
             assert error.destination_regions is error.destination_owner is None
-        deposit = source.deposit({replacement: [descriptor]})
-        assert _poll_until(source, bool) == [
-            (deposit, _op_entries({replacement: True}))
-        ]
+        if not shutdown:
+            deposit = source.deposit({replacement: [descriptor]})
+            assert _poll_until(source, bool) == [
+                (deposit, _op_entries({replacement: True}))
+            ]
     finally:
         agent.state = "DONE"
         source.close()

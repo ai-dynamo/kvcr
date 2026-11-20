@@ -6,6 +6,7 @@ import logging
 import os
 from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 from _kvcr_test_utils import (
     _OPEN_KVCRS,
@@ -20,6 +21,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _record_hint_results,
     _recovered_record,
     _router_hint,
     _wait_until,
@@ -34,12 +36,14 @@ from kvcr import (
 )
 from kvcr.backends.local_disk import _G3, _G3Residency
 from kvcr.backends.local_dram_pools import _LocalDramState
+from kvcr.backends.remote_ops import _FetchGroup, _KeysToFetch
 from kvcr.config import (
     G3Options,
     KVCRConfig,
     LocalDramOptions,
     RemoteFWDramOptions,
 )
+from kvcr.hints.results import HintStatus
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
 from kvcr.runtime.core import _BlockRecord
 from kvcr.service.recovery_journal import install_recovery_records
@@ -696,6 +700,35 @@ def test_g3_rejects_capacity_smaller_than_one_slot(tmp_path) -> None:
     assert not (tmp_path / "g3.data").exists()
 
 
+@pytest.mark.parametrize("drop_g2_first", [True, False])
+def test_recovered_hash_collisions_track_both_storage_tiers(tmp_path, drop_g2_first):
+    page = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page)
+    core = _new_g3_kvcr(tmp_path, local, key_adapter=_ConstantHashAdapter())._core
+    first, second = BlockKey(b"first"), BlockKey(b"second")
+    install_recovery_records(
+        core,
+        {
+            first: _recovered_record(g2=[("", 0)], g3=0),
+            second: _recovered_record(g3=1),
+        },
+    )
+    assert core.resolve_hashes((123,)) == ({}, {123: "ambiguous_hash"})
+    with core._state_lock:
+        # Hold each reclaimed slot to force the next allocation to evict too.
+        assert core._g3._allocate_slot(frozenset((first,))) == 1
+        assert core.resolve_hashes((123,)) == ({(("",), (page,)): {first: 123}}, {})
+        if drop_g2_first:
+            core._local_dram._pools._drop(first)
+            assert core.resolve_hashes((123,)) == ({}, {123: "source_not_transferable"})
+        assert core._g3._allocate_slot(frozenset()) == 0
+        core._g3._free_slots.extend((0, 1))
+        if not drop_g2_first:
+            assert core.resolve_hashes((123,)) == ({(("",), (page,)): {first: 123}}, {})
+            core._local_dram._pools._drop(first)
+    assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
+
+
 @pytest.mark.parametrize("policy", [G3FIFOPolicy(), G3LRUPolicy()], ids=["fifo", "lru"])
 def test_g3_recovery_rebuilds_free_slots_and_a_tier_recovered_full_frees_one(
     tmp_path,
@@ -906,7 +939,10 @@ def test_g3_spill_deliver_and_fill_reuse_existing_progress(tmp_path) -> None:
         assert ("histogram", DURATION_METRIC, scope, "success") in metrics
 
 
-def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
+@pytest.mark.parametrize("independent", [False, True])
+def test_delayed_remote_fill_waves_use_private_transfer_ids(
+    tmp_path, monkeypatch, independent
+) -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
     primary = ctypes.create_string_buffer(page_size * 2)
     local = ctypes.create_string_buffer(page_size * 2)
@@ -914,6 +950,7 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
     remotes = (BlockKey(b"remote-0"), BlockKey(b"remote-1"))
     agent = _FakeG3Agent()
     control = FakeBytesControl()
+    inventory = []
     kvcr = _new_g3_kvcr(
         tmp_path,
         local,
@@ -922,44 +959,65 @@ def test_delayed_remote_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         control=control,
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+        inventory_sink=inventory.append,
         framework_regions=[_buffer_region(primary, page_size)],
     )
-
+    core = kvcr._core
     for index, key in enumerate(residents):
         assert _deposit(kvcr, key, index).success
-    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
-    fetch = kvcr.fetch(remotes, request_id="req")
-
-    _poll_until(
-        kvcr,
-        lambda _: (
-            len(
-                [
-                    message
-                    for _, raw in control.sent
-                    if (message := _decode_control_message(raw)).get("type")
-                    == "start_write"
-                ]
-            )
-            == 2
-        ),
-    )
-    messages = [
-        message
-        for _, raw in control.sent
-        if (message := _decode_control_message(raw)).get("type") == "start_write"
-    ]
+    inventory.clear()
+    agent.state = "PROC"
+    if independent:
+        reports = _record_hint_results(monkeypatch, kvcr)
+        monkeypatch.setattr(
+            core, "poll_completed", Mock(side_effect=AssertionError("owner polling"))
+        )
+        request = _KeysToFetch(
+            action_id="prefetch",
+            message_id="message",
+            move=False,
+            groups=(_FetchGroup(remotes, (123, 124), ("",), (page_size,)),),
+            sender_control_endpoint="tcp://source:1",
+            sender_incarnation="source-incarnation",
+        )
+        control.incoming.append(msgspec.msgpack.encode(request))
+    else:
+        kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="req")
+        fetch = kvcr.fetch(remotes, request_id="req")
+    _wait_until(lambda: len(agent.transfers) > len(residents))
+    assert not control.sent  # Both fills wait while the spill holds its slot.
+    agent.state = "DONE"
+    _wait_until(lambda: len(control.sent) == 2)
+    messages = [_decode_control_message(raw) for _, raw in control.sent]
+    assert all(message["type"] == "start_write" for message in messages)
     fill_ids = {message["op_handle"] for message in messages}
     assert len(fill_ids) == 2 and all(fill_id < 0 for fill_id in fill_ids)
-    assert fetch not in dict(kvcr.poll_completed())
+    if not independent:
+        assert fetch not in dict(kvcr.poll_completed())
 
     agent.notifs["source"] = [_write_done_notification(fill_id) for fill_id in fill_ids]
-    result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
-    assert all(entry.success for entry in result[fetch].values())
-    assert kvcr.query(residents) == [
-        (QueryStatus.FETCHABLE, CacheTier.G3),
-        (QueryStatus.FETCHABLE, CacheTier.G3),
-    ]
+    if independent:
+        _wait_until(lambda: bool(reports))
+        with core._state_lock:
+            assert [report.status for report in reports] == [HintStatus.COMPLETED]
+            assert not _has_outstanding_operations(kvcr)
+            assert not core._local_dram._pools._public_claims
+            assert all(
+                core._block_record_map[key].local_dram.claim_count == 0
+                for key in remotes
+            )
+    else:
+        result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
+        assert all(entry.success for entry in result[fetch].values())
+    assert kvcr.query(residents) == [(QueryStatus.FETCHABLE, CacheTier.G3)] * 2
+    assert kvcr.query(remotes) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 2
+    for key in (*residents, *remotes):
+        events = [(e.tier, e.removed) for e in inventory if key in e.keys]
+        assert events == (
+            [(CacheTier.G3, False), (CacheTier.LOCAL_G2, True)]
+            if key in residents
+            else [(CacheTier.LOCAL_G2, False)]
+        )
 
 
 def test_waiting_g3_fetch_source_is_not_evicted(tmp_path) -> None:
@@ -993,7 +1051,7 @@ def test_waiting_g3_fetch_source_is_not_evicted(tmp_path) -> None:
     assert kvcr.query((second,)) == [(QueryStatus.MISS, None)]
 
 
-def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
+def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path, monkeypatch) -> None:
     class _DelayedReadAgent(_FakeG3Agent):
         def __init__(self):
             super().__init__()
@@ -1026,10 +1084,13 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
         BlockKey(b"fourth"),
     )
     agent = _DelayedReadAgent()
+    control, inventory = FakeBytesControl(), []
     kvcr = _new_g3_kvcr(
         tmp_path,
         local,
         agent=agent,
+        control=control,
+        inventory_sink=inventory.append,
         slot_count=2,
         g3_slot_count=4,
         framework_regions=[_buffer_region(primary, page_size)],
@@ -1057,12 +1118,35 @@ def test_delayed_g3_fill_waves_use_private_transfer_ids(tmp_path) -> None:
     assert all(op_id[1] < 0 for op_id in fill_ids)
     assert fetch not in dict(kvcr.poll_completed())
 
+    # The hint joins reads started by the caller; it must not start a G3 fallback.
+    core = kvcr._core
+    reports = _record_hint_results(monkeypatch, kvcr)
+    control.incoming.append(msgspec.msgpack.encode(_KeysToFetch(
+        action_id="joined", message_id="joined", move=False,
+        groups=(_FetchGroup((first, second), (123, 124), ("",), (page_size,)),),
+        sender_control_endpoint="tcp://source:1", sender_incarnation="source",
+    )))  # fmt: skip
+    _wait_until(lambda: bool(core._independent_hint_handler._pending_operations))
+    inventory.clear()
     now = 0.75
     agent.allow_reads = True
-    _wait_until(lambda: kvcr._core._progress._completed.qsize() == len(fill_ids))
+    # Progress finalizes cache fills; only the caller's public result stays queued.
+    _wait_until(lambda: reports and fetch in dict(core._completion_queue))
+    assert [report.status for report in reports] == [HintStatus.COMPLETED]
+    assert not control.sent and not core._independent_hint_handler._pending_operations
+    assert {key for event in inventory for key in event.keys} == {first, second}
+    assert all(
+        event.tier is CacheTier.LOCAL_G2 and not event.removed for event in inventory
+    )
+    for key in (first, second):
+        record = core._block_record_map[key]
+        assert record.g3.claim_count == 0 and record.local_dram.claim_count == 1
     now = 1.5
     result = dict(_poll_until(kvcr, lambda done: fetch in dict(done)))
     assert all(entry.success for entry in result[fetch].values())
+    claims = [entry.release_handle for entry in result[fetch].values()]
+    assert all(released for _, released in kvcr.release(claims))
+    assert not core._local_dram._pools._public_claims
 
 
 def test_failed_g3_spill_recovers_by_dropping_source(tmp_path, caplog) -> None:

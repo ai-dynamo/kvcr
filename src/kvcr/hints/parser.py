@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 
 import msgspec
 
-from .hint_types import HintType, _Hint
+from .hint_types import HintType, _Hint, _KVInvalidateHint
 from .results import HintResult, HintStatus
 
 # Public integration constants exported by kvcr.__init__.
@@ -82,25 +82,9 @@ def hint_message_id(hint: msgspec.Struct) -> str | None:
     return message_id if isinstance(message_id, str) else None
 
 
-def _parse_payload(
-    action_id: str | None,
-    payload: Mapping[str, object],
-    *,
-    peer: str,
-    hint_factory: Callable[[str | None, str, frozenset[int]], _Hint],
-) -> _Hint:
-    """The ``{peer}_control_endpoint`` and ``block_hashes`` of a hint payload."""
-    if "no_retain" in payload:
-        raise ValueError("no_retain is not currently supported")
-    endpoint = payload.get(f"{peer}_control_endpoint")
-    if endpoint is None:
-        raise ValueError(f"{peer}-less hints are not currently supported")
+def _parse_block_hashes(payload: Mapping[str, object]) -> frozenset[int]:
     block_hashes = payload.get("block_hashes")
-    if (
-        not isinstance(endpoint, str)
-        or not endpoint
-        or not isinstance(block_hashes, list)
-    ):
+    if not isinstance(block_hashes, list):
         raise ValueError("invalid router hint")
     hashes: set[int] = set()
     for block_hash in block_hashes:
@@ -113,7 +97,41 @@ def _parse_payload(
         hashes.add(block_hash)
     if not hashes:
         raise ValueError("invalid router hint")
-    return hint_factory(action_id, endpoint, frozenset(hashes))
+    return frozenset(hashes)
+
+
+def _parse_invalidate(
+    action_id: str | None, payload: Mapping[str, object]
+) -> _KVInvalidateHint:
+    if payload.get("no_retain") is not None:
+        raise ValueError("no_retain is not supported by this hint")
+    return _KVInvalidateHint(action_id, _parse_block_hashes(payload))
+
+
+def _parse_payload(
+    action_id: str | None,
+    payload: Mapping[str, object],
+    *,
+    peer: str | None,
+    hint_factory: Callable[..., _Hint],
+) -> _Hint:
+    """Validate block hashes, retention advice, and an optional peer endpoint."""
+    no_retain = payload.get("no_retain")
+    if (peer is None or no_retain is not None) and not isinstance(no_retain, bool):
+        raise ValueError("no_retain must be a boolean")
+    endpoint = payload.get(f"{peer}_control_endpoint") if peer else None
+    if peer and endpoint is None:
+        raise ValueError(f"{peer}-less hints are not currently supported")
+    if peer and (not isinstance(endpoint, str) or not endpoint):
+        raise ValueError("invalid router hint")
+    hashes = _parse_block_hashes(payload)
+    if peer is None:
+        return hint_factory(action_id, hashes, no_retain)
+    if peer == "source":
+        return hint_factory(action_id, endpoint, hashes, no_retain)
+    if no_retain is not None:
+        raise ValueError("no_retain is not supported by this hint")
+    return hint_factory(action_id, endpoint, hashes)
 
 
 def parse_hints(

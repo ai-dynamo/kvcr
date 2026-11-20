@@ -74,6 +74,7 @@ class _DanglingOps:
             and self._backend._kvcr._clock() >= cast(float, status.cancel_deadline)
         ):
             status.abandoned = True
+            op.uncertain = True
             self.report_source(op, "uncertain")
             self._backend._progress_outbound.append(replace(op))
         return result
@@ -86,10 +87,13 @@ class _DanglingOps:
         elif status is not None:
             status.submitted = False  # Native access ended; probes can confirm it.
         if status is not None and op.local_sources:
-            self._backend._kvcr._local_dram._pools.release_readers(
-                op.source_keys, op.local_sources, success=op.success
-            )
-            op.local_sources = ()
+            if status.abandoned:
+                self._backend._sources._uncertain_readers[op.op_id] = op
+            else:
+                self._backend._kvcr._local_dram._pools.release_readers(
+                    op.source_keys, op.local_sources, success=op.success
+                )
+                op.local_sources = ()
         if status is not None and status.abandoned:
             self.report_source(op, "quiesced")
 

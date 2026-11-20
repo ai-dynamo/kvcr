@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 
 from .. import _nvtx
+from ..hints.hint_types import MAX_HINT_MESSAGE_BYTES, KvHintsEnvelope, _HintAction
 from ..runtime.core import TRANSFER_BLOCKS_METRIC, UNSERVED_BLOCKS_METRIC, logger
 from ..runtime.progress import (
     _FAILED_RESULT,
@@ -117,6 +118,48 @@ _ControlMessage = (
     | _WriteProbeAck
 )
 _CONTROL_DECODER = msgspec.msgpack.Decoder(_ControlMessage)
+_HINT_DECODER = msgspec.msgpack.Decoder(KvHintsEnvelope)
+
+
+class _ControlRoute(msgspec.Struct):
+    # Inspect the discriminator without allocating the peer message's body.
+    type: object = msgspec.UNSET
+
+
+_CONTROL_ROUTE_DECODER = msgspec.msgpack.Decoder(_ControlRoute)
+
+
+def _decode_control_message(
+    message: bytes,
+) -> _ControlMessage | KvHintsEnvelope | None:
+    """Route untagged hint envelopes separately from typed peer messages.
+
+    None is an oversized envelope, dropped before it is decoded.
+    """
+    try:
+        return _CONTROL_DECODER.decode(message)
+    except msgspec.ValidationError:
+        if _CONTROL_ROUTE_DECODER.decode(message).type is not msgspec.UNSET:
+            raise
+        if len(message) > MAX_HINT_MESSAGE_BYTES:
+            return None
+        try:
+            return _HINT_DECODER.decode(message)
+        except msgspec.ValidationError:
+            # Isolate malformed actions just as request ingress does. Keep the
+            # envelope validation, but leave action validation to the parser.
+            fields = msgspec.msgpack.decode(message)
+            actions = fields.pop("actions", None)
+            if not isinstance(actions, list):
+                raise
+            envelope = msgspec.convert({**fields, "actions": []}, type=KvHintsEnvelope)
+            envelope.actions.extend(
+                _HintAction(*map(action.get, _HintAction.__struct_fields__))
+                if isinstance(action, dict)
+                else action
+                for action in actions
+            )
+            return envelope
 
 
 # Known reasons map identically for whole-write failures and unserved blocks.
@@ -554,6 +597,7 @@ class _SourceWriteOp(_RemoteOp):
     src_descriptors: tuple[tuple[_TransferRef, ...], ...] = ()
     # Retain the source restriction across progress retries and owner admission.
     g2_only: bool = False
+    uncertain: bool = False
     transfer_id: int | None = None
     success: bool = False
     completed_indices: tuple[int, ...] = ()
@@ -563,7 +607,7 @@ class _SourceWriteOp(_RemoteOp):
     moving: tuple[BlockKey, ...] = ()
     # None means copy; else the keys to evict by layout, set at source preparation.
     evictions: dict[tuple[str, ...], list[BlockKey]] | None = None
-    # None uses caller cleanup; a tuple (even empty) is owned by progress.
+    # None uses caller cleanup; tuples use progress until uncertainty is reported.
     local_sources: tuple["_LocalDramResidency", ...] | None = None
     # Reported to the target: why the operation failed, or why requested
     # indices were left out of completed_indices.

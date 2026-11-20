@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The hint handlers: request-scoped advice stored at the destination, and the
-independent ``kv.prefetch`` / ``kv.move`` actions, which the source resolves
-and asks the named destination to fetch; the destination transfers and reports
-the outcome."""
+"""Request advice, independent transfers, and local cache hints."""
 
 from __future__ import annotations
 
+import logging
+import threading
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -14,23 +13,36 @@ from typing import TYPE_CHECKING, cast
 
 import msgspec
 
-from .hint_types import _Hint, _KVFetchHint, _KVMoveHint, _KVPrefetchHint
+from .hint_types import (
+    _Hint,
+    _KVFetchHint,
+    _KVInvalidateHint,
+    _KVNoRetainHint,
+    _KVPrefetchHint,
+)
 from .parser import reject_hint
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
+    from ..backends.local_dram import _PendingResidencyOp
     from ..backends.remote_ops import _KeysToFetch
     from ..runtime.core import _KVCRCore
     from ..types import BlockKey, OpEntryResult, OpHandle
     from .dispatcher import HintDispatcher
 
+logger = logging.getLogger(__name__)
+
 
 class _HintHandler(ABC):
     """Base for handlers of one or more action types.
 
-    ``submit`` runs on the caller's thread without the state lock and reports
-    admission once. Handlers acquire the lock as needed for cache operations.
+    Fetch advice runs on the caller. Independent actions run on progress;
+    cache mutations, destination admission, and cleanup take the state lock.
     """
+
+    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
+        self._core = core
+        self._dispatcher = dispatcher
 
     @abstractmethod
     def submit(
@@ -45,15 +57,7 @@ class _HintHandler(ABC):
 
 
 class _FetchHintHandler(_HintHandler):
-    """Store ``kv.fetch`` / ``kv.evict_on_fetch`` advice at the destination.
-
-    Inline only: no state lock, no block records, and no transfer beyond the
-    store's own eager control connect.
-    """
-
-    def __init__(self, core: _KVCRCore, dispatcher: HintDispatcher) -> None:
-        self._core = core  # backend access only
-        self._dispatcher = dispatcher  # results
+    """Store request advice and apply any retention setting immediately."""
 
     def submit(
         self,
@@ -62,6 +66,7 @@ class _FetchHintHandler(_HintHandler):
         message_id: str | None,
     ) -> None:
         hint = cast(_KVFetchHint, hint)
+        _NoRetainHintHandler.apply(self._core, hint)
         # One store call per hint; the store's own rules apply (a later hint
         # replaces the request's hashes, a different source fails the request).
         self._core._remote_fw_dram.submit_hint(
@@ -81,6 +86,41 @@ class _FetchHintHandler(_HintHandler):
         )
 
 
+class _NoRetainHintHandler(_HintHandler):
+    """Set or clear retention advice on the receiving KVCR."""
+
+    def submit(
+        self,
+        hint: _Hint,
+        request_id: str | None,
+        message_id: str | None,
+    ) -> None:
+        hint = cast(_KVNoRetainHint, hint)
+        self.apply(self._core, hint)
+        self._dispatcher.report(
+            HintResult(
+                action_id=hint.action_id,
+                action_type=hint.ACTION_TYPE,
+                status=HintStatus.COMPLETED,
+                request_id=request_id,
+                message_id=message_id,
+            )
+        )
+
+    @staticmethod
+    def apply(core: _KVCRCore, hint: _KVFetchHint | _KVNoRetainHint) -> None:
+        """Record standalone or piggybacked advice; a rule is just a hash."""
+        if hint.no_retain is None:
+            return
+        if hint.no_retain and core._key_adapter is None:
+            # Deposits are keyed by BlockKey; matching them needs encode_to_router.
+            logger.warning("KVCR no_retain is not enforced without a key adapter")
+        if hint.no_retain:
+            core._no_retain.update(hint.block_hashes)
+        else:
+            core._no_retain.difference_update(hint.block_hashes)
+
+
 @dataclass
 class _PendingHint:
     receipt: HintResult
@@ -88,12 +128,13 @@ class _PendingHint:
 
 
 class _IndependentHintHandler(_HintHandler):
-    """Owner-thread lifecycle of ``kv.prefetch`` / ``kv.move`` on both peers;
-    the dispatcher's handler for both action types."""
+    """Resolve independent transfers and local invalidation on progress."""
 
     def __init__(self, core: _KVCRCore) -> None:
         self._core = core
-        self._received: deque[_KeysToFetch] = deque()
+        self._background_items: deque[object] = deque()
+        self._completed: deque[tuple[OpHandle, dict[BlockKey, OpEntryResult]]] = deque()
+        self._deferred: dict[tuple[OpHandle, BlockKey], _PendingResidencyOp] = {}
         # Layout fetches share one receipt and completion count per hint.
         self._pending_operations: dict[
             OpHandle, tuple[_PendingHint, dict[BlockKey, int]]
@@ -107,23 +148,19 @@ class _IndependentHintHandler(_HintHandler):
         request_id: str | None,
         message_id: str | None,
     ) -> None:
-        """Resolve the hashes here and ask the destination to fetch the blocks.
+        """Resolve hashes for local invalidation or a destination fetch.
 
-        Admission reports the hashes that did not resolve; the destination
-        reports one combined outcome for all forwarded groups under the same
-        action and message IDs.
+        Report resolution failures here; the destination reports the combined result.
         """
         from ..backends.remote_ops import _FetchGroup, _KeysToFetch
 
-        hint = cast(_KVPrefetchHint | _KVMoveHint, hint)
+        hint = cast(_KVPrefetchHint | _KVInvalidateHint, hint)
         core = self._core
-        if core._local_dram is None or core._key_adapter is None:
-            reason = (
-                "source_has_no_managed_dram"
-                if core._local_dram is None
-                else "key_adapter_unavailable"
-            )
-        elif hint.destination_endpoint == getattr(
+        if core._local_dram is None:
+            reason = "source_has_no_managed_dram"
+        elif core._key_adapter is None:
+            reason = "key_adapter_unavailable"
+        elif isinstance(hint, _KVPrefetchHint) and hint.destination_endpoint == getattr(
             core.framework_control, "endpoint", None
         ):
             reason = "self_destination"
@@ -136,11 +173,22 @@ class _IndependentHintHandler(_HintHandler):
                 )
             )
             return
-        with core._state_lock:
-            groups, failures = core.resolve_hashes(hint.block_hashes)
+        groups, failures = core.resolve_hashes(hint.block_hashes)
+        status = HintStatus.ACCEPTED if groups else HintStatus.FAILED
+        if isinstance(hint, _KVInvalidateHint):
+            # A resolved key without a complete READY copy, including one
+            # still filling, fails resolution as source_not_transferable.
+            by_key = {k: h for g in groups.values() for k, h in g.items()}
+            queued = set(core._invalidation_handler.submit(by_key))
+            for key, block_hash in by_key.items():
+                if key not in queued:
+                    failures[block_hash] = "protected"
+            core._drain_invalidation()
+            # Removal is queued, not finished; no later report follows.
+            status = HintStatus.COMPLETED if queued else HintStatus.FAILED
         # Queue before reporting: a failed submission must raise before any
         # report. One-way: a send failure is logged, not reported.
-        if groups:
+        if groups and isinstance(hint, _KVPrefetchHint):
             core._progress.submit(
                 _KeysToFetch(
                     action_id=hint.action_id,
@@ -162,22 +210,113 @@ class _IndependentHintHandler(_HintHandler):
             HintResult(
                 action_id=hint.action_id,
                 action_type=hint.ACTION_TYPE,
-                status=HintStatus.ACCEPTED if groups else HintStatus.FAILED,
+                status=status,
                 request_id=request_id,
                 message_id=message_id,
                 failures=failures or None,
             )
         )
 
+    def poll(self, completed: list[object]) -> list[object]:
+        """Advance cache work; framework pins and public results stay caller-owned."""
+        core = self._core
+        if core._progress._stop_requested or core._progress._close_requested:
+            return completed
+        core._hints_dispatcher.poll()
+        from ..backends.local_disk import _G3TransferOp
+        from ..backends.local_dram import _LocalCopyOp
+        from ..backends.remote_ops import (
+            _Invalidate,
+            _KeysToFetch,
+            _SourceWriteOp,
+            _TargetPullOp,
+        )
+        from ..backends.remote_sources import _SourcePinOp
+
+        framework = []
+        for item in completed:
+            if (
+                isinstance(item, (_Invalidate, _KeysToFetch))
+                or isinstance(item, _SourcePinOp)
+                and item.g2_only
+                or isinstance(item, _SourceWriteOp)
+                and item.g2_only
+                and not item.uncertain
+                # Hints may join a caller's fill even after native completion.
+                or isinstance(item, _TargetPullOp)
+                and (item.g2_only or item.local_fill)
+                and not item.uncertain
+                # Spills free slots; hints can also join an existing G3 cache fill.
+                or isinstance(item, _G3TransferOp)
+                and item.kind != "deliver"
+                # Hints may join deposits; uncertain memory still waits for caller.
+                or isinstance(item, _LocalCopyOp)
+                and item.deliver_op_id is None
+                and not item.uncertain
+            ):
+                self._background_items.append(item)
+            else:
+                framework.append(item)
+        local = core._local_dram
+        if not (
+            self._background_items
+            or self._completed
+            or self._deferred
+            or core._invalidation_handler._dirty
+            or local is not None
+            and (
+                not local._pools._source_state.completions.empty()
+                or self._pending_operations
+                and core._clock() >= local._next_expiry
+            )
+        ):
+            return framework
+        # Wait briefly for a polling caller, unless results are ready to hand back.
+        if not core._state_lock.acquire(timeout=0 if framework else 0.0002):
+            return framework
+        try:
+            items = [
+                self._background_items.popleft()
+                for _ in range(min(64, len(self._background_items)))
+            ]
+            if core._g3 is not None:
+                items = core._g3.poll_main(items)
+            if local is not None:
+                items = local.poll_main(items)
+            core._remote_fw_dram.poll_main(items)
+            core._drain_invalidation()
+            deferred, self._deferred = self._deferred, {}
+            for (_, key), op in deferred.items():
+                if (
+                    local._pending_residency_ops.get(op.op_id) is op
+                    and key not in op.results
+                    and key not in op.capacity_waiters
+                ):
+                    local._resolve_fetch_waiter(key, op)
+                    local._finish_residency_if_ready(op)
+            if deferred:
+                # A deferred capacity waiter paused the caller's pass; continue it.
+                local._resume_capacity_waiters()
+            while self._completed:
+                handle, entries = self._completed.popleft()
+                self._complete(*self._pending_operations.pop(handle), entries)
+            core._drain_invalidation()
+        finally:
+            core._state_lock.release()
+        return framework
+
     # Destination: the request's recipient.
 
-    def receive(self, request: _KeysToFetch) -> None:
-        """Queue a source's request; ``poll`` starts it outside the state lock."""
-        self._received.append(request)
-
-    def poll(self) -> None:
-        while self._received:
-            self.requested(self._received.popleft())
+    def defer(self, key: BlockKey, op: _PendingResidencyOp) -> bool:
+        """Hand off an independent waiter woken by a caller-side release/fill."""
+        handle = op.op_id[1]
+        if (
+            handle not in self._pending_operations
+            or threading.current_thread() is self._core._progress._thread
+        ):
+            return False
+        self._deferred[handle, key] = op
+        return True
 
     def requested(self, request: _KeysToFetch) -> None:
         """Fetch the requested blocks through the existing copy/move path."""
@@ -229,50 +368,38 @@ class _IndependentHintHandler(_HintHandler):
         pending = _PendingHint(receipt, len(request.groups))
         for group in request.groups:
             operation = pending, dict(zip(group.keys, group.block_hashes))
-            if self._layout_sizes(group.key_layout) != group.sizes:
+            try:
+                core._validate_expected_layout(list(group.key_layout))
+                sizes = tuple(
+                    core._block_sizes[label.partition(":")[0]]
+                    for label in group.key_layout
+                )
+            except ValueError:
+                sizes = None
+            if sizes != group.sizes:
                 self._complete(*operation, {}, reason="incompatible_layout")
                 continue
+            handle = next(core._op_handles)
+            self._pending_operations[handle] = operation
             try:
-                handle = core.fetch(
+                core.fetch(
                     group.keys,
                     expected_layout=list(group.key_layout),
                     source_endpoint=source,
                     move=request.move,
+                    _op_handle=handle,
                 )
             except Exception as error:
+                self._pending_operations.pop(handle, None)
                 # Fatal progress failures retain their ordinary API behavior.
                 core._progress.raise_if_failed()
-                # Fail this group without escaping the owner's poll. Layout
+                # Fail this group without escaping progress. Layout
                 # conflicts are expected; anything else warns once.
                 if not isinstance(error, ValueError):
                     core._hints_dispatcher.warn_handler_error(
                         receipt.action_type, "admission"
                     )
                 self._complete(*operation, {})
-            else:
-                # Synchronous hits are queued until polling, so registration
-                # after fetch returns is safe.
-                self._pending_operations[handle] = operation
-
-    def _layout_sizes(self, layout: tuple[str, ...]) -> tuple[int, ...] | None:
-        """Return piece sizes for a layout this destination can store."""
-        core = self._core
-        try:
-            core._validate_expected_layout(list(layout))
-        except ValueError:
-            return None
-        return tuple(core._block_sizes[label.partition(":")[0]] for label in layout)
-
-    def finish(self, completed):
-        """Consume independent completions and return framework operations."""
-        framework = []
-        for handle, entries in completed:
-            operation = self._pending_operations.pop(handle, None)
-            if operation is None:
-                framework.append((handle, entries))
-                continue
-            self._complete(*operation, entries)
-        return framework
 
     def _complete(
         self,
@@ -309,5 +436,7 @@ class _IndependentHintHandler(_HintHandler):
         )
 
     def close(self) -> None:
-        self._received.clear()
+        self._background_items.clear()
+        self._completed.clear()
+        self._deferred.clear()
         self._pending_operations.clear()

@@ -638,6 +638,8 @@ def test_get_stats_emits_public_state_metric_name(monkeypatch) -> None:
 
     def set_gauge(*args):
         _assert_state_lock_available(core)
+        # Updates during gauge emission belong to the next snapshot.
+        core._stats.increase_counter("background-transfer")
         original_gauge(*args)
 
     def factory():
@@ -651,6 +653,7 @@ def test_get_stats_emits_public_state_metric_name(monkeypatch) -> None:
     assert isinstance(stats, FakeTelemetryStats)
     assert {record[1] for record in stats.records} == {"kvcr_state"}
     assert core._stats is not stats
+    assert ("counter", "background-transfer", 1, ()) in kvcr.get_stats().records
 
 
 @pytest.mark.parametrize(

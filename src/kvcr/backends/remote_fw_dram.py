@@ -13,7 +13,9 @@ Source: start_write -> local claim/framework pin -> write -> write_done.
 
 import logging
 import math
+import threading
 import time
+from collections import deque
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from itertools import chain
@@ -23,6 +25,7 @@ import msgspec
 
 from .. import _nvtx
 from ..config import RemoteFWDramOptions
+from ..hints.hint_types import KvHintsEnvelope
 from ..runtime.core import (
     DURATION_METRIC,
     TRANSFER_BYTES_METRIC,
@@ -45,8 +48,8 @@ from ..types import (
 )
 from .dangling_ops import _DanglingOps, _SourceWriteStatus
 from .remote_ops import (
-    _CONTROL_DECODER,
     _ControlMessage,
+    _decode_control_message,
     _decode_notif,
     _failed_result,
     _Invalidate,
@@ -139,6 +142,7 @@ class _RemoteFWDram:
         # Main-thread state: request hints, source ownership, and progress state.
         self._closed = False
         self._request_hints: dict[str, _RequestHint] = {}
+        self._request_hint_completions: deque[_TargetPullOp] = deque()
         self._connected_remote_count = 0
         self._sources = _RemoteSources(self, kvcr)
 
@@ -306,7 +310,12 @@ class _RemoteFWDram:
                     for key in blocks
                     if key not in kept
                 }
-            if current_hint.submitted_at is not None:
+            if (
+                current_hint.submitted_at is not None
+                # Request advice is caller-owned; a pull resumed on progress
+                # leaves the first-use sample to the next caller-side pull.
+                and threading.current_thread() is not kvcr._progress._thread
+            ):
                 self._request_hints[request_id] = replace(
                     current_hint, submitted_at=None
                 )
@@ -458,7 +467,12 @@ class _RemoteFWDram:
         return None if reason is None else _failed_result(reason)
 
     def poll_main(self, items: Collection[object]) -> None:
-        self._sources.retry_releases()
+        # Framework pin callbacks stay on the caller thread.
+        on_caller = threading.current_thread() is not self._kvcr._progress._thread
+        if on_caller:
+            while self._request_hint_completions:
+                self._finish_request_hint(self._request_hint_completions.popleft())
+            self._sources.retry_releases()
         for item in items:
             if isinstance(item, _SourcePinOp):
                 self._sources.start_source_pin(item)
@@ -470,15 +484,30 @@ class _RemoteFWDram:
                         raise RuntimeError(
                             "non-local target pull is waiting for terminal state"
                         )
+                    # A caller may have finalized an uncertain pull before this
+                    # deferred snapshot. Never discard a replacement's fill.
                     self._kvcr._discard_local_dram_fill(
-                        item.keys, failures=item.key_results()
+                        tuple(
+                            key
+                            for key in item.keys
+                            if (record := self._kvcr._block_record_map.get(key))
+                            is not None
+                            and item.op_id in record.active_op_ids
+                        ),
+                        failures=item.key_results(),
                     )
                 elif item.state is _TargetPullState.QUARANTINED:
                     self._finish_target_pull(item)
                 elif item.state is _TargetPullState.FINISHED and item.uncertain:
                     self._release_target_dependencies(item)
                     if item.local_fill:
-                        self._kvcr._complete_local_dram_fill(item.keys, success=False)
+                        # The earlier cancellation snapshot may still be deferred.
+                        self._kvcr._discard_local_dram_fill(
+                            item.keys, failures=item.key_results()
+                        )
+                        self._kvcr._complete_local_dram_fill(
+                            item.keys, success=False
+                        )
                 elif item.state is _TargetPullState.FINISHED:
                     self._finish_target_pull(item)
                 else:
@@ -494,11 +523,11 @@ class _RemoteFWDram:
                     item.keys, key_layout=item.key_layout
                 )
             elif isinstance(item, _KeysToFetch):
-                # A source resolved its hashes; fetch them once outside the lock.
-                self._kvcr._independent_hint_handler.receive(item)
+                self._kvcr._independent_hint_handler.requested(item)
             else:
                 raise TypeError(f"unsupported KVCR main item: {type(item)!r}")
-        if not self._closed:
+        # G2-only source acquisition submits or fails immediately above.
+        if on_caller and not self._closed:
             self._sources.poll()
 
     def discard_hint(self, request_id: str) -> None:
@@ -521,11 +550,27 @@ class _RemoteFWDram:
             if hint.trace is not None:
                 hint.trace.mark("hint.discarded", once=True, reason=Reason.SHUTDOWN)
         self._request_hints.clear()
+        self._request_hint_completions.clear()
         self._sources.close()
 
     # -------------------------------------------------------------------------
     # Target side: request and receive remote KV.
     # -------------------------------------------------------------------------
+
+    def _finish_request_hint(self, op: _TargetPullOp) -> None:
+        """Apply the result to caller-owned request advice."""
+        if not op.success:
+            self._fail_request_hint(op.request_id)
+        elif (
+            op.request_id is not None
+            and (hint := self._request_hints.get(op.request_id)) is not None
+        ):
+            self._request_hints[op.request_id] = replace(
+                hint,
+                missing_keys=(
+                    hint.missing_keys.union(op.ordered_keys) - op.completed_keys
+                ),
+            )
 
     def _finish_target_pull(self, op: _TargetPullOp) -> None:
         trace = op.trace
@@ -548,17 +593,11 @@ class _RemoteFWDram:
                     request_id=op.request_id,
                     op_handle=cast(OpHandle, op.op_id[1]),
                 )
-            if not op.success:
-                self._fail_request_hint(op.request_id)
-            elif (
-                op.request_id is not None
-                and (hint := self._request_hints.get(op.request_id)) is not None
-            ):
-                self._request_hints[op.request_id] = replace(
-                    hint,
-                    missing_keys=hint.missing_keys.union(op.ordered_keys)
-                    - completed_keys,
-                )
+            if op.request_id is not None:
+                if threading.current_thread() is kvcr._progress._thread:
+                    self._request_hint_completions.append(op)
+                else:
+                    self._finish_request_hint(op)
             if op.local_fill:
                 if op.state is _TargetPullState.QUARANTINED:
                     # DISCARDING already failed callers, but still owns the slots.
@@ -698,17 +737,27 @@ class _RemoteFWDram:
         handled = False
         for message, received_at in messages:
             try:
-                payload = _CONTROL_DECODER.decode(message)
+                payload = _decode_control_message(message)
             except msgspec.ValidationError as error:
-                handled |= self._handle_malformed_start_write(progress, message, error)
+                if self._handle_malformed_start_write(progress, message, error):
+                    handled = True
+                else:
+                    logger.debug("KVCR control message dropped: %s", error)
                 continue
             except (TypeError, msgspec.DecodeError):
+                continue
+            if payload is None:
+                logger.debug("KV hint dropped; ingress limit reached")
+                continue
+            if isinstance(payload, KvHintsEnvelope):
+                self._kvcr._hints_dispatcher.submit(payload, None, direct=True)
+                handled = True
                 continue
             handled_at = self._kvcr._timer()
             if isinstance(payload, _StartWrite):
                 self._handle_start_write(progress, payload, received_at)
             elif isinstance(payload, (_Invalidate, _KeysToFetch)):
-                # Owner-thread work: the main poll applies or starts it.
+                # The locked progress phase applies or starts this work.
                 self._progress_outbound.append(payload)
             elif isinstance(payload, _WriteAccepted):
                 status = self._dangling_ops.source_writes.get(
@@ -1041,8 +1090,7 @@ class _RemoteFWDram:
             else None,
         )
         if payload.move and payload.g2_only:
-            # A move closes owner-side admission for its keys, so the owner
-            # thread admits it; the write itself still runs on progress.
+            # A move changes shared admission; queue it for the locked phase.
             self._queue_source_pin(source_write, payload.key_layout, move=True)
             return
         source_write.evictions = {} if payload.move else None
