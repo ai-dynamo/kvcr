@@ -484,8 +484,8 @@ jobs:
       wheel: ${{ needs.prepare.outputs.wheel }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
       stage_path: ${{ needs.prepare.outputs.stage_path }}
-      # Release pins: no stable vLLM supports this kvcr API yet, so test a known-good nightly stack.
-      base_image: vllm/vllm-openai@sha256:390a656b54e12144ad15ff32244c6e848408b0ee94f2c4c5a84451e7430f1aa7
+      # Release pins match the vLLM 0.34.0 quick-start stack.
+      base_image: vllm/vllm-openai@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1
       dynamo_version: 1.7.0.dev20261110
 
   # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.

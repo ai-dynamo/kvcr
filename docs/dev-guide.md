@@ -16,7 +16,7 @@ Use a Linux development environment with:
 - enough local memory and disk space for the tests you intend to run; and
 - for service-backed recovery, in the guard service and every claimant: Linux 5.3 or newer for `pidfd_open` (before 6.5 the worker supplies its own pidfd, as described under Guard pools below), and the system libatomic runtime (`libatomic1` on Debian and Ubuntu). Importing `kvcr` needs neither.
 
-KVCR declares its Python dependencies in `pyproject.toml`. In particular, it pins a compatible NIXL version. Let `uv` resolve that dependency instead of installing a different NIXL release manually.
+KVCR declares its Python dependencies in `pyproject.toml`, including the supported NIXL range `>=1.5.0,<1.6`. Let `uv` resolve the dependencies for your environment; the lockfile records a specific resolution.
 
 The framework-neutral unit suite does not require a GPU. Tests for a concrete framework adapter, CUDA-aware NIXL transport, or cross-worker KV transfer may require GPUs and the native dependencies of that framework.
 
@@ -456,7 +456,7 @@ If import fails, rerun `uv sync`. Confirm that the command uses the intended `.v
 
 Run the dependency checks under [Verify the installation](#verify-the-installation).
 
-Do not override the NIXL version declared by this checkout. If dependency metadata changed, rerun `uv sync` rather than mutating individual packages until the environment happens to import.
+Check that the installed NIXL version satisfies the range declared by this checkout and is compatible with the framework environment. If dependency metadata changed, rerun `uv sync` rather than mutating individual packages until the environment happens to import.
 
 ### The shared integration environment imports the wrong vLLM
 
