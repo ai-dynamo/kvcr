@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
 import logging
+import os
+import resource
 import threading
 import time
 from types import SimpleNamespace
@@ -1002,21 +1005,6 @@ def test_pending_work_keeps_the_short_poll_interval(monkeypatch, work) -> None:
         progress.close()
 
 
-def test_without_an_input_wait_idle_polling_never_backs_off(monkeypatch) -> None:
-    # Nothing could end an idle wait early, so the loop keeps polling every
-    # millisecond.
-    waits = _WaitRecorder(monkeypatch)
-    progress = _KVCRProgress(
-        lambda _: None, lambda _, __: ({}, False), list, lambda: None
-    )
-    progress.start()
-    try:
-        _wait_until(lambda: len(waits.waits) >= 30, timeout=5)
-        assert set(waits.waits[:30]) == {progress_module._IDLE_WAIT_SECONDS}
-    finally:
-        progress.close()
-
-
 def test_close_exits_without_another_idle_wait(monkeypatch) -> None:
     # The iteration that consumes the stop request finds no other work, so the
     # loop must exit then rather than start another idle wait.
@@ -1035,3 +1023,31 @@ def test_close_exits_without_another_idle_wait(monkeypatch) -> None:
     # close() ended the long wait, and the loop exited without another.
     assert waits.long_wait_woken[:1] == [True]
     assert waits.waits[started:] == []
+
+
+def test_wake_wait_accepts_descriptors_past_the_select_limit() -> None:
+    # A process with many open files can get a wake pipe numbered past FD_SETSIZE,
+    # which select() rejects; the idle wait must still work.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    high = 1500
+    if hard != resource.RLIM_INFINITY and hard <= high:
+        pytest.skip(f"open-file limit {hard} cannot reach descriptor {high}")
+    if soft <= high:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (high + 1, hard))
+    read, write = os.pipe()
+    try:
+        while True:
+            try:
+                os.fstat(high)
+            except OSError:
+                break
+            high += 1
+        os.dup2(read, high)
+        assert not _wait_for_wake(high, 0)
+        os.write(write, b"\0")
+        assert _wait_for_wake(high, 1)
+    finally:
+        for descriptor in {read, write, high}:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))

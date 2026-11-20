@@ -361,13 +361,10 @@ class _KVCRCore:
             finally:
                 self._remote_fw_dram.close_progress()
 
-        # A control channel that cannot wait for its own input keeps the progress
-        # thread polling every millisecond, or its peer messages would wait out a
-        # backed-off idle wait.
         wait_for_input = (
             _wait_for_wake
             if self.framework_control is None
-            else getattr(self.framework_control, "wait_for_input", None)
+            else self.framework_control.wait_for_input
         )
 
         self._progress = _KVCRProgress(

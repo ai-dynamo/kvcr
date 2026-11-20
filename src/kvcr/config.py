@@ -104,18 +104,21 @@ class TelemetryStats(Protocol):
 
 
 class FrameworkControl(Protocol):
-    """Peer control transport.
-
-    A channel may also define ``wait_for_input(wake_fd: int, timeout: float) ->
-    bool``, which blocks until a message can be received, ``wake_fd`` is readable,
-    or ``timeout`` seconds pass. With it the idle progress thread waits for input;
-    without it, the thread polls every millisecond.
-    """
-
     def send(self, endpoint: str, message: bytes) -> bool: ...
 
     def recv(self) -> list[tuple[bytes, float]]:
         """Return messages with their local time.monotonic() receipt timestamps."""
+        ...
+
+    def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
+        """Block until ``recv`` has input, ``wake_fd`` is readable, or ``timeout`` ends.
+
+        Return whether either is ready. A channel that cannot wait for its input can
+        sleep instead, which keeps the idle progress thread polling every millisecond::
+
+            time.sleep(min(timeout, 0.001))
+            return False
+        """
         ...
 
 

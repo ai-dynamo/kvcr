@@ -29,8 +29,7 @@ _FAILED_RESULT = OpEntryResult(OpEntryStatus.FAILED)
 _TIMEOUT_RESULT = OpEntryResult(OpEntryStatus.TIMEOUT, reason=Reason.DEADLINE.value)
 _DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
-# Cap on an idle wait. Local submissions and peer input end the wait at once; the
-# cap only bounds work that arrives by other routes.
+# Bound latency for work without wakeup notifications.
 _IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
@@ -42,8 +41,10 @@ _STOP = object()
 
 def _wait_for_wake(wake_fd: int, timeout: float) -> bool:
     """Wait for input when only local submissions can arrive."""
-    readable, _, _ = select.select([wake_fd], [], [], timeout)
-    return bool(readable)
+    # poll(), unlike select(), accepts descriptors numbered past FD_SETSIZE.
+    poller = select.poll()
+    poller.register(wake_fd, select.POLLIN)
+    return bool(poller.poll(timeout * 1000))
 
 
 _OpId = tuple[str, Any]
@@ -153,7 +154,7 @@ class _KVCRProgress:
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
-        wait_for_input: Callable[[int, float], bool] | None = None,
+        wait_for_input: Callable[[int, float], bool] = _wait_for_wake,
         needs_poll: Callable[[], bool] | None = None,
     ) -> None:
         if batch_size < 0:
@@ -186,16 +187,10 @@ class _KVCRProgress:
         self._ready = threading.Event()
         self._prepare_ready = threading.Event()
         self._activate = threading.Event()
-        # Blocks until input arrives, the wake descriptor is readable, or the timeout.
-        # Without one, nothing could end an idle wait early, so the loop never backs
-        # off.
         self._wait_for_input = wait_for_input
-        # Backend work outside the ops and transfers below that still needs polling,
-        # such as a retry that nothing will signal.
+        # Backend retries may need polling without a wakeup signal.
         self._needs_poll = needs_poll
-        # Self-pipe that ends an idle wait. It exists only while the thread runs; the
-        # lock keeps a submitter from writing to a descriptor number the thread has
-        # just closed.
+        # Prevent wake writes from racing with pipe closure and descriptor reuse.
         self._wake_lock = threading.Lock()
         self._wake_read: int | None = None
         self._wake_write: int | None = None
@@ -697,16 +692,13 @@ class _KVCRProgress:
                     idle_wait = _IDLE_WAIT_SECONDS
                     continue
                 if self._stop_requested:
-                    # The iteration consumed a stop request; exit without waiting.
                     break
                 if (
-                    self._wait_for_input is None
-                    or self._in_flight_ops
+                    self._in_flight_ops
                     or self._active_transfers
                     or (self._needs_poll is not None and self._needs_poll())
                 ):
-                    # Poll when nothing could end a wait early, and for in-flight NIXL
-                    # work and backend retries, which only advance by polling.
+                    # Keep polling when work cannot signal its completion.
                     idle_wait = _IDLE_WAIT_SECONDS
                     time.sleep(_IDLE_WAIT_SECONDS)
                     continue
@@ -751,11 +743,7 @@ class _KVCRProgress:
                 pass
 
     def _wait_for_work(self, timeout: float) -> None:
-        """Block until a submission, peer input, or the timeout.
-
-        Polling every millisecond while idle costs the host process a GIL handoff per
-        wakeup.
-        """
+        """Wait for input, then drain pending wake signals."""
         self._wait_for_input(self._wake_read, timeout)
         try:
             while os.read(self._wake_read, 4096):

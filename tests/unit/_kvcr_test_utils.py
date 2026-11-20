@@ -463,6 +463,11 @@ class FakeBytesControl:
         self.incoming = []
         return [(message, self._clock()) for message in incoming]
 
+    def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
+        # Appends to incoming signal nothing, so keep the thread polling.
+        time.sleep(min(timeout, 0.001))
+        return False
+
 
 def _mem_descriptor(
     element_index: int = 0,
