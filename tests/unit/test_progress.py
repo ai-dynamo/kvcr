@@ -10,15 +10,17 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import zmq
-from _kvcr_test_utils import _wait_until
+from _kvcr_test_utils import _wait_until, free_port
 from nixl import nixlRemoteDisconnectError
 
 from kvcr.runtime import progress as progress_module
+from kvcr.runtime.control_channels import ZmqPeerControlChannel
 from kvcr.runtime.progress import (
     _KVCRProgress,
     _MemDescriptor,
     _ProgressOp,
     _TransferRef,
+    _wait_for_wake,
 )
 from kvcr.types import RegionDescriptor
 
@@ -884,29 +886,27 @@ class _WaitRecorder:
 
     LONG_WAIT_SECONDS = 0.5
 
-    def __init__(self, monkeypatch) -> None:
+    def __init__(self, monkeypatch, wait_for_input=_wait_for_wake) -> None:
         self.waits: list[float] = []
         self.long_wait_woken: list[bool] = []
         self.long_wait = threading.Event()
-        recorder, real_sleep = self, time.sleep
+        real_sleep = time.sleep
 
-        class Poller(zmq.Poller):
-            def poll(self, timeout=None):
-                seconds = timeout / 1000
-                recorder.waits.append(seconds)
-                long = seconds >= recorder.LONG_WAIT_SECONDS
-                if long:
-                    recorder.long_wait.set()
-                events = super().poll(timeout)
-                if long:
-                    recorder.long_wait_woken.append(bool(events))
-                return events
+        def wait(wake_fd: int, timeout: float) -> bool:
+            self.waits.append(timeout)
+            long = timeout >= self.LONG_WAIT_SECONDS
+            if long:
+                self.long_wait.set()
+            woken = wait_for_input(wake_fd, timeout)
+            if long:
+                self.long_wait_woken.append(woken)
+            return woken
 
         def sleep(seconds: float) -> None:
-            recorder.waits.append(seconds)
+            self.waits.append(seconds)
             real_sleep(seconds)
 
-        monkeypatch.setattr(progress_module.zmq, "Poller", Poller)
+        self.wait_for_input = wait
         monkeypatch.setattr(
             progress_module, "time", SimpleNamespace(**{**vars(time), "sleep": sleep})
         )
@@ -918,34 +918,32 @@ class _WaitRecorder:
 def test_idle_wait_backs_off_until_a_wakeup(monkeypatch, wake) -> None:
     # Peer control traffic arrives on a socket only the progress thread reads, so it
     # must end an idle wait just as a local submission does.
-    waits = _WaitRecorder(monkeypatch)
-    context = zmq.Context.instance()
-    pull = context.socket(zmq.PULL)
-    pull.linger = 0
-    port = pull.bind_to_random_port("tcp://127.0.0.1")
-    push = context.socket(zmq.PUSH)
-    push.linger = 0
-    push.connect(f"tcp://127.0.0.1:{port}")
+    channel = ZmqPeerControlChannel("127.0.0.1", free_port(), "127.0.0.1")
+    waits = _WaitRecorder(monkeypatch, channel.wait_for_input)
     received = threading.Event()
 
     def poll(_progress, items):
-        try:
-            pull.recv(zmq.NOBLOCK)
-        except zmq.Again:
-            if not items:
-                return {}, False
+        if not channel.recv() and not items:
+            return {}, False
         received.set()
         return {}, True
 
     progress = _KVCRProgress(
-        lambda _: None, poll, list, lambda: None, idle_sockets=lambda: [pull]
+        lambda _: channel.initialize(),
+        poll,
+        list,
+        channel.close,
+        wait_for_input=waits.wait_for_input,
     )
     progress.start()
+    push = zmq.Context.instance().socket(zmq.PUSH)
+    push.linger = 0
     try:
         assert waits.long_wait.wait(5)
         if wake == "submit":
             progress.submit("item")
         else:
+            push.connect(channel.endpoint)
             push.send(b"peer")
         assert received.wait(5)
         # The wakeup, not the timeout, ended the long wait.
@@ -953,7 +951,6 @@ def test_idle_wait_backs_off_until_a_wakeup(monkeypatch, wake) -> None:
     finally:
         progress.close()
         push.close()
-        pull.close()
 
 
 @pytest.mark.parametrize("work", ["operation", "backend_retry"])
@@ -975,7 +972,12 @@ def test_pending_work_keeps_the_short_poll_interval(monkeypatch, work) -> None:
         return {}, bool(items)
 
     progress = _KVCRProgress(
-        lambda _: None, poll, list, lambda: None, needs_poll=retrying.is_set
+        lambda _: None,
+        poll,
+        list,
+        lambda: None,
+        wait_for_input=waits.wait_for_input,
+        needs_poll=retrying.is_set,
     )
     progress.start()
     try:
@@ -1000,15 +1002,36 @@ def test_pending_work_keeps_the_short_poll_interval(monkeypatch, work) -> None:
         progress.close()
 
 
-def test_close_exits_without_another_idle_wait(monkeypatch) -> None:
-    # The iteration that consumes the stop request finds no other work, so the
-    # loop must exit then rather than start another idle wait.
+def test_without_an_input_wait_idle_polling_never_backs_off(monkeypatch) -> None:
+    # Nothing could end an idle wait early, so the loop keeps polling every
+    # millisecond.
     waits = _WaitRecorder(monkeypatch)
     progress = _KVCRProgress(
         lambda _: None, lambda _, __: ({}, False), list, lambda: None
     )
     progress.start()
+    try:
+        _wait_until(lambda: len(waits.waits) >= 30, timeout=5)
+        assert set(waits.waits[:30]) == {progress_module._IDLE_WAIT_SECONDS}
+    finally:
+        progress.close()
+
+
+def test_close_exits_without_another_idle_wait(monkeypatch) -> None:
+    # The iteration that consumes the stop request finds no other work, so the
+    # loop must exit then rather than start another idle wait.
+    waits = _WaitRecorder(monkeypatch)
+    progress = _KVCRProgress(
+        lambda _: None,
+        lambda _, __: ({}, False),
+        list,
+        lambda: None,
+        wait_for_input=waits.wait_for_input,
+    )
+    progress.start()
     assert waits.long_wait.wait(5)
     started = len(waits.waits)
     progress.close()
+    # close() ended the long wait, and the loop exited without another.
+    assert waits.long_wait_woken[:1] == [True]
     assert waits.waits[started:] == []

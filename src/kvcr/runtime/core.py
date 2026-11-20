@@ -60,6 +60,7 @@ from .progress import (
     _OpId,
     _resolve_region,
     _TransferRef,
+    _wait_for_wake,
 )
 
 if TYPE_CHECKING:
@@ -360,9 +361,14 @@ class _KVCRCore:
             finally:
                 self._remote_fw_dram.close_progress()
 
-        def idle_sockets() -> list[object]:
-            readable_socket = getattr(self.framework_control, "readable_socket", None)
-            return [readable_socket()] if readable_socket is not None else []
+        # A control channel that cannot wait for its own input keeps the progress
+        # thread polling every millisecond, or its peer messages would wait out a
+        # backed-off idle wait.
+        wait_for_input = (
+            _wait_for_wake
+            if self.framework_control is None
+            else getattr(self.framework_control, "wait_for_input", None)
+        )
 
         self._progress = _KVCRProgress(
             initialize_progress,
@@ -374,7 +380,7 @@ class _KVCRCore:
             dram_backends=list(dram_backends),
             memory_regions=self._memory_regions,
             startup_timeout_seconds=startup_timeout_seconds,
-            idle_sockets=idle_sockets,
+            wait_for_input=wait_for_input,
             needs_poll=self._remote_fw_dram.needs_progress_poll,
         )
 

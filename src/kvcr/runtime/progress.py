@@ -5,6 +5,7 @@
 import logging
 import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -17,7 +18,6 @@ from typing import Annotated, Any
 
 import msgspec
 import numpy as np
-import zmq
 from nixl import nixl_agent, nixl_agent_config, nixlRemoteDisconnectError
 
 from .. import _nvtx
@@ -29,8 +29,8 @@ _FAILED_RESULT = OpEntryResult(OpEntryStatus.FAILED)
 _TIMEOUT_RESULT = OpEntryResult(OpEntryStatus.TIMEOUT, reason=Reason.DEADLINE.value)
 _DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
-# Cap on an idle wait. Local submissions and readable idle sockets end the wait at once;
-# the cap only bounds work that arrives by other routes.
+# Cap on an idle wait. Local submissions and peer input end the wait at once; the
+# cap only bounds work that arrives by other routes.
 _IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
@@ -38,6 +38,14 @@ _STARTUP_TIMEOUT_SECONDS = 60.0
 _PREPARE_LOG_INTERVAL_SECONDS = 10.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
+
+
+def _wait_for_wake(wake_fd: int, timeout: float) -> bool:
+    """Wait for input when only local submissions can arrive."""
+    readable, _, _ = select.select([wake_fd], [], [], timeout)
+    return bool(readable)
+
+
 _OpId = tuple[str, Any]
 _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
 
@@ -145,7 +153,7 @@ class _KVCRProgress:
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
-        idle_sockets: Callable[[], Sequence[object]] | None = None,
+        wait_for_input: Callable[[int, float], bool] | None = None,
         needs_poll: Callable[[], bool] | None = None,
     ) -> None:
         if batch_size < 0:
@@ -178,11 +186,10 @@ class _KVCRProgress:
         self._ready = threading.Event()
         self._prepare_ready = threading.Event()
         self._activate = threading.Event()
-        # Sockets whose readability should end an idle wait (for example the peer
-        # control channel), resolved on first idle wait because they exist only after
-        # initialize.
-        self._idle_sockets = idle_sockets
-        self._idle_poller: zmq.Poller | None = None
+        # Blocks until input arrives, the wake descriptor is readable, or the timeout.
+        # Without one, nothing could end an idle wait early, so the loop never backs
+        # off.
+        self._wait_for_input = wait_for_input
         # Backend work outside the ops and transfers below that still needs polling,
         # such as a retry that nothing will signal.
         self._needs_poll = needs_poll
@@ -693,11 +700,13 @@ class _KVCRProgress:
                     # The iteration consumed a stop request; exit without waiting.
                     break
                 if (
-                    self._in_flight_ops
+                    self._wait_for_input is None
+                    or self._in_flight_ops
                     or self._active_transfers
                     or (self._needs_poll is not None and self._needs_poll())
                 ):
-                    # In-flight NIXL work and backend retries only advance by polling.
+                    # Poll when nothing could end a wait early, and for in-flight NIXL
+                    # work and backend retries, which only advance by polling.
                     idle_wait = _IDLE_WAIT_SECONDS
                     time.sleep(_IDLE_WAIT_SECONDS)
                     continue
@@ -742,20 +751,12 @@ class _KVCRProgress:
                 pass
 
     def _wait_for_work(self, timeout: float) -> None:
-        """Block until a submission, a readable idle socket, or the timeout.
+        """Block until a submission, peer input, or the timeout.
 
         Polling every millisecond while idle costs the host process a GIL handoff per
         wakeup.
         """
-        if self._idle_poller is None:
-            self._idle_poller = zmq.Poller()
-            self._idle_poller.register(self._wake_read, zmq.POLLIN)
-            for idle_socket in (
-                self._idle_sockets() if self._idle_sockets is not None else ()
-            ):
-                if idle_socket is not None:
-                    self._idle_poller.register(idle_socket, zmq.POLLIN)
-        self._idle_poller.poll(timeout * 1000)
+        self._wait_for_input(self._wake_read, timeout)
         try:
             while os.read(self._wake_read, 4096):
                 pass

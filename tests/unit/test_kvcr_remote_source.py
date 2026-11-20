@@ -42,9 +42,8 @@ from kvcr.backends.remote_fw_dram import _RemoteFWDram
 from kvcr.backends.remote_ops import _CONTROL_DECODER, _failed_result, _TargetMetadata
 from kvcr.backends.remote_sources import _FwMemResidency, _RemoteSources, _SourcePinOp
 from kvcr.config import KVCRConfig, LocalDramOptions
-from kvcr.runtime import progress as progress_module
 from kvcr.runtime.core import _BlockRecord, _KVCRCore
-from kvcr.runtime.progress import _STOP, _TransferRef
+from kvcr.runtime.progress import _STOP, _TransferRef, _wait_for_wake
 from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
@@ -655,10 +654,12 @@ def test_local_source_waits_for_declared_pieces(
 @pytest.mark.parametrize(
     "outcome", ["write", "framework", "deadline", "cancel", "route", "shutdown"]
 )
-def test_local_source_retries_after_reader_contention(outcome):
+def test_local_source_retries_after_reader_contention(monkeypatch, outcome):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    # Lets the idle progress thread back off, as it does with a real channel.
+    control.wait_for_input = _wait_for_wake
     if outcome != "framework":
         pinning.request_pin = pinning.poll_pin_results = None
         pinning.release_pin = pinning.cancel_pin_request = None
@@ -674,6 +675,21 @@ def test_local_source_retries_after_reader_contention(outcome):
     source._core._clock = lambda: now
     local = source._core._local_dram._pools
     backend = source._core._remote_fw_dram
+    progress = source._core._progress
+    waits: list[float] = []
+    attempts: list[object] = []
+    wait_for_work, acquire_readers = progress._wait_for_work, local.acquire_readers
+
+    def record_wait(timeout: float) -> None:
+        waits.append(timeout)
+        wait_for_work(timeout)
+
+    def record_attempt(*args, **kwargs):
+        attempts.append(args)
+        return acquire_readers(*args, **kwargs)
+
+    monkeypatch.setattr(progress, "_wait_for_work", record_wait)
+    monkeypatch.setattr(local, "acquire_readers", record_attempt)
     key = BlockKey(b"local")
     requested_key = BlockKey(b"framework-only") if outcome == "framework" else key
     try:
@@ -695,6 +711,13 @@ def test_local_source_retries_after_reader_contention(outcome):
                 )
             )
             _wait_until(lambda: bool(backend._pending_local_sources))
+            if outcome == "write":
+                # Releasing the lock sends no wakeup, so contended retries must keep
+                # the loop polling instead of backing off past the deadline.
+                waits.clear()
+                retried = len(attempts)
+                _wait_until(lambda: len(attempts) >= retried + 3)
+                assert waits == []
             assert len(agent.xfers) == 1
             assert source._core._block_record_map[key].local_dram.claim_count == 0
             if outcome == "deadline":
@@ -745,75 +768,6 @@ def test_local_source_retries_after_reader_contention(outcome):
             sum(_decode_notif(raw)["op_handle"] == 12 for _, raw in agent.sent_notifs)
             == 1
         )
-
-
-def test_contended_local_source_retries_at_the_poll_interval(monkeypatch):
-    """Reader contention must not let the progress loop back off past a deadline."""
-    memory = ctypes.create_string_buffer(16)
-    agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
-    pinning.request_pin = pinning.poll_pin_results = None
-    pinning.release_pin = pinning.cancel_pin_request = None
-    source = _new_kvcr(
-        agent,
-        pinning,
-        control,
-        name="source",
-        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
-        framework_regions=[RegionDescriptor(addr=ctypes.addressof(memory), size=16)],
-    )
-    key = BlockKey(b"local")
-    local = source._core._local_dram._pools
-    progress = source._core._progress
-    try:
-        agent.state = "DONE"
-        deposit = source.deposit({key: [_mem_descriptor(end_point_name="source")]})
-        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
-        agent.state = "PROC"
-
-        # Virtual time advances only while the progress thread waits, so every
-        # retry happens at an exact offset from the start_write. It stops once the
-        # write starts, which keeps the in-flight write inside its deadline.
-        now_us = [0]
-        attempts: list[int] = []
-        acquired: list[int] = []
-        real_sleep = time.sleep
-
-        def wait(seconds: float) -> None:
-            if not acquired:
-                now_us[0] += round(seconds * 1_000_000)
-            real_sleep(0)
-
-        source._core._clock = lambda: now_us[0] / 1_000_000
-        monkeypatch.setattr(
-            progress_module, "time", SimpleNamespace(**{**vars(time), "sleep": wait})
-        )
-        monkeypatch.setattr(progress, "_wait_for_work", wait)
-        acquire_readers = local.acquire_readers
-
-        def contended(*args, **kwargs):
-            attempts.append(now_us[0])
-            # The lock is released just after the attempt 7 ms in.
-            if now_us[0] <= attempts[0] + 7_000:
-                return None
-            acquired.append(now_us[0])
-            return acquire_readers(*args, **kwargs)
-
-        monkeypatch.setattr(local, "acquire_readers", contended)
-        control.incoming.append(
-            _start_write_message(
-                12, key, target_agent="target", remaining_timeout_ms=12
-            )
-        )
-        _wait_until(lambda: len(agent.xfers) == 2 or bool(agent.sent_notifs))
-        assert not agent.sent_notifs
-        assert len(agent.xfers) == 2
-        # The first poll after the release starts the write, inside the 12 ms.
-        assert acquired == [attempts[0] + 8_000]
-        agent.state = "DONE"
-        _poll_until(source, lambda _: not _has_outstanding_operations(source))
-    finally:
-        agent.state = "DONE"
-        source.close()
 
 
 @pytest.mark.parametrize(

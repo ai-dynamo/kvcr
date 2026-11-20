@@ -50,6 +50,7 @@ from kvcr.backends.remote_ops import (
     _WriteProbeAck,
 )
 from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
+from kvcr.runtime import progress as progress_module
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -2354,3 +2355,21 @@ def test_invalidation_preserves_an_already_admitted_remote_fetch(pair):
     assert target.kvcr.release((result.release_handle,)) == [
         (result.release_handle, True)
     ]
+
+
+def test_control_without_wait_for_input_keeps_one_millisecond_polling(monkeypatch):
+    """Nothing can end an idle wait on such a channel's messages, so never back off."""
+    sleeps: list[float] = []
+    real_sleep = time.sleep
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(
+        progress_module, "time", SimpleNamespace(**{**vars(time), "sleep": sleep})
+    )
+    # FakeBytesControl implements only the required send() and recv().
+    _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl())
+    _wait_until(lambda: len(sleeps) >= 30)
+    assert set(sleeps[:30]) == {progress_module._IDLE_WAIT_SECONDS}
