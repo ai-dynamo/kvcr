@@ -60,7 +60,6 @@ jobs:
       stage_path: ${{ steps.plan.outputs.stage_path }}
       stage: ${{ steps.plan.outputs.stage }}
       publish: ${{ steps.plan.outputs.publish }}
-      label: ${{ steps.plan.outputs.label }}
       e2e: ${{ steps.plan.outputs.e2e }}
       gate: ${{ steps.plan.outputs.gate }}
     steps:
@@ -122,7 +121,6 @@ jobs:
             echo "stage_path=${stage_path}"
             echo "stage=${stage}"
             echo "publish=${publish}"
-            echo "label=${label}"
           } >> "${GITHUB_OUTPUT}"
           # The GPU test pulls the staged wheel, so it runs only when the wheel is staged.
           e2e=off
@@ -247,17 +245,40 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_RELEASE_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
-          LABEL: ${{ needs.prepare.outputs.label }}
-          ICON: ${{ needs.prepare.outputs.mode == 'release' && ':package:' || ':crescent_moon:' }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RC: ${{ inputs.rc_round }}
         run: |
           set -euo pipefail
           auth="$(mktemp -p "${RUNNER_TEMP}")"
           trap 'rm -f "${auth}"' EXIT
           printf 'Authorization: Bearer %s\n' "${SLACK_BOT_TOKEN}" > "${auth}"
-          text="${ICON} *KVCR ${LABEL}* started from \`${GITHUB_SHA:0:7}\` <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|GitHub run>"
-          response="$(jq -n --arg channel "${SLACK_CHANNEL_ID}" --arg text "${text}" '{channel: $channel, text: $text}' \
-            | curl -q -fsS --max-time 15 --retry 2 -H "@${auth}" -H 'Content-Type: application/json; charset=utf-8' \
-              --data @- https://slack.com/api/chat.postMessage)"
+          icon=":crescent_moon:" title="KVCR Nightly build" rc=""
+          if [ "${MODE}" = "release" ]; then
+            icon=":package:" title="KVCR ${VERSION} rc${RC} release candidate" rc="rc${RC}"
+          fi
+          payload="$(jq -cn \
+            --arg channel "${SLACK_CHANNEL_ID}" \
+            --arg icon "${icon}" \
+            --arg title "${title} started — $(date -u +%Y-%m-%d)" \
+            --arg sha "${GITHUB_SHA:0:7}" \
+            --arg version "${VERSION}" \
+            --arg rc "${rc}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{
+              channel: $channel,
+              text: $title,
+              blocks: [
+                {type: "header", text: {type: "plain_text", text: ($icon + " " + $title), emoji: true}},
+                {type: "section", fields: [
+                  {type: "mrkdwn", text: ("*Commit:*\n`" + $sha + "`")},
+                  {type: "mrkdwn", text: ("*Version:*\n`" + $version + "`")},
+                  ({type: "mrkdwn", text: ("*RC round:*\n`" + $rc + "`")} | select($rc != ""))]},
+                {type: "context", elements: [{type: "mrkdwn", text: ("<" + $run_url + "|GitHub Actions run>")}]}
+              ]
+            }')"
+          response="$(curl -q -fsS --max-time 15 --retry 2 -H "@${auth}" -H 'Content-Type: application/json; charset=utf-8' \
+            --data @- https://slack.com/api/chat.postMessage <<< "${payload}")"
           if [ "$(jq -r '.ok' <<< "${response}")" != "true" ]; then
             echo "::error::Slack chat.postMessage failed: $(jq -r '.error // "unknown"' <<< "${response}")"
             exit 1
@@ -463,8 +484,8 @@ jobs:
       wheel: ${{ needs.prepare.outputs.wheel }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
       stage_path: ${{ needs.prepare.outputs.stage_path }}
-      # Release pins: no stable vLLM supports this kvcr API yet, so test a known-good nightly stack.
-      base_image: vllm/vllm-openai@sha256:390a656b54e12144ad15ff32244c6e848408b0ee94f2c4c5a84451e7430f1aa7
+      # Release pins match the vLLM 0.34.0 quick-start stack.
+      base_image: vllm/vllm-openai@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1
       dynamo_version: 1.7.0.dev20261110
 
   # Nightlies never wait for the GPU test, as in Dynamo; a failure only alerts.
@@ -605,13 +626,22 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL }}
           MENTION_IDS: ${{ secrets.SLACK_NOTIFY_MENTIONS }}
-          LABEL: ${{ needs.prepare.outputs.label || inputs.mode || 'release' }}
+          MODE: ${{ needs.prepare.outputs.mode || inputs.mode || 'release' }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RC: ${{ inputs.rc_round }}
           NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
           [ -n "${WEBHOOK_URL}" ] || { echo "::warning::secret SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL is not set; no Slack alert sent"; exit 0; }
-          failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<< "${NEEDS}")"
-          [ -n "${failed}" ] || failed="trigger-gitlab did not run"
+          failed="$(jq -r '
+            {prepare: "Prepare version", authorize: "Ops gate", "slack-start": "Slack start message",
+             build: "Build and stage wheel", test: "Test staged wheel", e2e: "GPU end-to-end test",
+             "e2e-nightly": "GPU end-to-end test (non-blocking)", approve: "Approval",
+             "trigger-gitlab": "Trigger GitLab pipeline"} as $names
+            | to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")
+            | ":failed: " + ($names[.key] // .key) + (if .value.result == "cancelled" then " (cancelled)" else "" end)
+          ' <<< "${NEEDS}")"
+          [ -n "${failed}" ] || failed=":failed: Trigger GitLab pipeline (did not run)"
           mentions=""
           IFS=',' read -ra ids <<< "${MENTION_IDS}"
           for id in "${ids[@]}"; do
@@ -623,9 +653,39 @@ jobs:
               *) mentions+=" ${id}" ;;
             esac
           done
+          cta="please investigate and post a preliminary debug with clear next steps to action, address, and drive to closure."
+          if [ -n "${mentions}" ]; then cta="${mentions# } ${cta}"; else cta="${cta^}"; fi
+          icon=":crescent_moon:" title="KVCR Nightly" rc=""
+          if [ "${MODE}" = "release" ]; then
+            icon=":package:" title="KVCR release candidate"
+            if [ -n "${VERSION}" ]; then
+              title="KVCR ${VERSION} rc${RC} release candidate" rc="rc${RC}"
+            fi
+          fi
+          payload="$(jq -cn \
+            --arg header "${icon} ${title} failed — $(date -u +%Y-%m-%d)" \
+            --arg sha "${GITHUB_SHA:0:7}" \
+            --arg version "${VERSION:-unknown}" \
+            --arg rc "${rc}" \
+            --arg failed "${failed}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --arg trigger "${GITHUB_EVENT_NAME}" \
+            --arg cta "${cta}" \
+            '{
+              text: $header,
+              blocks: [
+                {type: "header", text: {type: "plain_text", text: $header, emoji: true}},
+                {type: "section", fields: [
+                  {type: "mrkdwn", text: ("*Commit:*\n`" + $sha + "`")},
+                  {type: "mrkdwn", text: ("*Version:*\n`" + $version + "`")},
+                  ({type: "mrkdwn", text: ("*RC round:*\n`" + $rc + "`")} | select($rc != ""))]},
+                {type: "section", text: {type: "mrkdwn", text: ("*Failed jobs*\n" + $failed)}},
+                {type: "context", elements: [
+                  {type: "mrkdwn", text: ("<" + $run_url + "|GitHub Actions run> · trigger `" + $trigger + "`")}]},
+                {type: "section", text: {type: "mrkdwn", text: $cta}}
+              ]
+            }')"
           config="$(mktemp -p "${RUNNER_TEMP}")"
           trap 'rm -f "${config}"' EXIT
           printf 'url = "%s"\n' "${WEBHOOK_URL}" > "${config}"
-          jq -n --arg text ":alert: *KVCR ${LABEL} failed* (${failed})${mentions} <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|GitHub run>" \
-            '{text: $text}' \
-            | curl -q -fsS --retry 3 --max-time 30 -o /dev/null -H 'Content-Type: application/json' --data @- --config "${config}"
+          curl -q -fsS --retry 3 --max-time 30 -o /dev/null -H 'Content-Type: application/json' --data @- --config "${config}" <<< "${payload}"

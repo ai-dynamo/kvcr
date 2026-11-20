@@ -283,7 +283,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "msgspec", specifier = ">=0.21.0,<1" },
-    { name = "nixl", specifier = "==1.5.0" },
+    { name = "nixl", specifier = ">=1.5.0,<1.6" },
     { name = "numpy", marker = "extra == 'profiling'", specifier = ">=1.26,<3" },
     { name = "nvtx", marker = "extra == 'profiling'", specifier = ">=0.2.16,<0.3" },
     { name = "pyzmq", specifier = ">=25.0.0,<28" },

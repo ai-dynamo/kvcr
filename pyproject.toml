@@ -11,7 +11,8 @@ version = "0.2.0"
 description = "Framework-neutral KV Cache Runner"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
@@ -20,7 +21,7 @@ classifiers = [
 dependencies = [
   "msgspec>=0.21.0,<1",
   "pyzmq>=25.0.0,<28",
-  "nixl==1.5.0",
+  "nixl>=1.5.0,<1.6",
 ]
 # Not installable from here: KVCR's recovery journal loads the system libatomic
 # (Debian/Ubuntu "libatomic1", RHEL "libatomic") for 8-byte acquire/release
