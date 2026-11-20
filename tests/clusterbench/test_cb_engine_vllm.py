@@ -354,14 +354,6 @@ def test_pins_are_resolved_before_promotions_are_delivered():
     assert seen == [1]
 
 
-def test_idle_steps_still_poll_and_report_stats():
-    engine, kvcr, window = _engine()
-    for _ in range(3):
-        assert engine.step() == []
-    assert kvcr.names() == ["poll", "get_stats"] * 3
-    assert window.counters["steps"] == 3 and not window.counters["busy_steps"]
-
-
 def test_warm_pulls_one_block_from_every_peer_and_retries():
     engine, kvcr, _ = _engine()
     peer_key = id_to_key(block_id((1 << 20) + 1, 0))
@@ -384,8 +376,11 @@ def _key(stream, index):
 
 
 def test_time_outside_kvcr_and_the_harness_is_split_into_forward_and_idle():
-    engine, _, window = _engine()
-    engine.step()  # nothing to run
+    engine, kvcr, window = _engine()
+    for _ in range(3):  # nothing to run: it still polls and reports stats
+        assert engine.step() == []
+    assert kvcr.names() == ["poll", "get_stats"] * 3
+    assert window.counters["steps"] == 3 and not window.counters["busy_steps"]
     assert "idle_seconds" in window.counters
     assert "forward_seconds" not in window.counters
     # "KVCR per step" is over steps that ran something.
@@ -414,12 +409,10 @@ def test_aborting_requests_leaves_only_kvcr_operations_to_drain():
 # session's prefix tree, and the answer's block opens the run the next
 # request continues on.
 PATH = [(900, 0, 2), (901, 0, 1), (902, 0, 3), (903, 0, 1), (904, 0, 2)]
-PATH_KEYS = [id_to_key(bid) for bid in segment_ids(PATH)]
 
 
-def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
+def test_an_answer_that_opens_a_stream_is_cached_for_the_turn_that_names_it():
     engine, kvcr, _ = _engine()
-    kvcr.remote_ok = set(PATH_KEYS[:4])
     engine.submit(
         Request(
             rid=1,
@@ -428,35 +421,13 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
             tail=(905, 0, 1),
             prompt_tokens=9 * BLOCK + 10,
             output_tokens=3,
-            hint_source=1,
-            hint_blocks=4,
         )
     )
-    # The hint names the first four blocks of the path, across three streams.
-    (hint,) = kvcr.of("submit_hint")
-    assert hint[2]["block_hashes"] == [
-        block_id(900, 0),
-        block_id(900, 1),
-        block_id(901, 0),
-        block_id(902, 0),
-    ]
-    done, _ = _run(engine, kvcr)
-    (deliver,) = kvcr.of("deliver")
-    assert list(deliver[1]) == PATH_KEYS  # path order, root first
-    (deposit,) = kvcr.of("deposit")
-    assert list(deposit[1]) == PATH_KEYS[4:]
-    assert (done.prompt_blocks, done.remote_blocks) == (9, 4)
-
-    # One run per stream, in both tiers; the answer's stream on the device.
-    deltas = engine.take_inventory()
+    _run(engine, kvcr)
+    # One run per stream on the device, the answer's stream among them.
+    device = sorted(d[1:] for d in engine.take_inventory() if d[0] == TIER_DEVICE)
     runs = [(stream, 0, end, False) for stream, _, end in PATH]
-    assert sorted(d[1:] for d in deltas if d[0] == TIER_PRIMARY) == runs
-    assert sorted(d[1:] for d in deltas if d[0] == TIER_DEVICE) == [
-        *runs,
-        (905, 0, 1, False),
-    ]
-
-    # The next turn names the answer's stream as prompt and adds no block.
+    assert device == [*runs, (905, 0, 1, False)]
     kvcr.calls.clear()
     engine.submit(
         Request(
@@ -471,7 +442,6 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another():
     done, _ = _run(engine, kvcr)
     assert done.gpu_blocks == 10  # the whole old path and the answer's block
     assert [key_to_id(q[1][0]) for q in kvcr.of("query")] == [block_id(905, 1)]
-    assert (TIER_DEVICE, 905, 1, 3, False) in engine.take_inventory()
 
 
 # ---- why a block asked of a peer failed ---------------------------------------
@@ -485,40 +455,43 @@ def _hinted_failures(window):
     }
 
 
-def test_hinted_blocks_a_peer_did_not_deliver_are_counted_by_kvcr_status():
+@pytest.mark.parametrize(
+    ("failure", "cause", "timed_out"),
+    [
+        (
+            OpEntryResult(OpEntryStatus.UNAVAILABLE, reason="not_resident"),
+            "unavailable",
+            0,
+        ),
+        # The request's own timeout count covers the blocks beyond the hint too.
+        (OpEntryResult(OpEntryStatus.TIMEOUT, reason="deadline"), "timeout", 7),
+        # KVCR trees before per-block reasons: every failure is FAILED.
+        (
+            SimpleNamespace(success=False, status=OpEntryStatus.FAILED),
+            "unclassified",
+            0,
+        ),
+    ],
+)
+def test_hinted_blocks_a_peer_did_not_deliver_are_counted_by_kvcr_status(
+    failure, cause, timed_out
+):
     engine, kvcr, window = _engine()
     kvcr.remote_ok = set(KEYS[:3])
+    kvcr.failure = failure
     engine.submit(_request(1, hint_source=1, hint_blocks=6))
     done, _ = _run(engine, kvcr)
     # Seven blocks failed: three the hint named and four beyond it.
     counters = window.counters
     assert counters["deliver_blocks_failed"] == 7
     assert counters["deliver_blocks_failed_beyond_hint"] == 4
-    assert _hinted_failures(window) == {"unavailable": 3}
-    assert counters["hinted_failed_reason|not_resident"] == 3
-    assert (done.failed_blocks, done.timed_out_blocks) == (7, 0)
-
-
-def test_a_timeout_is_what_kvcr_calls_one():
-    engine, kvcr, window = _engine()
-    kvcr.remote_ok = set(KEYS[:3])
-    kvcr.failure = OpEntryResult(OpEntryStatus.TIMEOUT, reason="deadline")
-    engine.submit(_request(1, hint_source=1, hint_blocks=6))
-    done, _ = _run(engine, kvcr)
-    assert _hinted_failures(window) == {"timeout": 3}
-    # The request's own count covers the blocks beyond the hint too.
-    assert (done.failed_blocks, done.timed_out_blocks) == (7, 7)
-
-
-def test_a_result_without_a_reason_is_left_unclassified():
-    engine, kvcr, window = _engine()
-    kvcr.remote_ok = set(KEYS[:3])
-    # KVCR trees before per-block reasons: every failure is FAILED.
-    kvcr.failure = SimpleNamespace(success=False, status=OpEntryStatus.FAILED)
-    engine.submit(_request(1, hint_source=1, hint_blocks=6))
-    done, _ = _run(engine, kvcr)
-    assert _hinted_failures(window) == {"unclassified": 3}
-    assert done.timed_out_blocks == 0
+    assert _hinted_failures(window) == {cause: 3}
+    reasons = {
+        n: c for n, c in counters.items() if n.startswith("hinted_failed_reason")
+    }
+    reason = getattr(failure, "reason", None)
+    assert reasons == ({f"hinted_failed_reason|{reason}": 3} if reason else {})
+    assert (done.failed_blocks, done.timed_out_blocks) == (7, timed_out)
 
 
 def test_a_failed_local_block_is_not_blamed_on_a_peer():

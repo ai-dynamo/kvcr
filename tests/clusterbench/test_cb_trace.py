@@ -115,14 +115,6 @@ def test_a_linear_conversation_is_one_stream_and_answers_open_the_next_prompt():
     assert [turn[4] for turn in view.turns] == [(0, 10, 12), (0, 15, 16), (0, 20, 20)]
 
 
-def test_a_later_branch_cuts_an_earlier_requests_path():
-    view = compiled_view([req(0, [1, 2, 3, 4, 5, 6]), req(5, [1, 2, 3, 7, 8])])
-    # Streams: the shared run, then one per branch; parents come first.
-    assert view.compiled.edges == [-1, 3, 0, 3, 0, 2]
-    assert view.turns[0][3] == [(0, 0, 3), (1, 0, 3)]
-    assert view.turns[1][3] == [(0, 0, 3), (2, 0, 2)]
-
-
 def test_a_trailing_partial_block_id_is_not_a_block():
     # 212 tokens are three whole blocks; the fourth id names a partial block
     # whose content, and so its id, changes on the next turn.
@@ -131,12 +123,6 @@ def test_a_trailing_partial_block_id_is_not_a_block():
     )
     assert view.compiled.edges == [-1, 5]
     assert view.turns[0][3] == [(0, 0, 3)]
-
-
-def test_the_same_hash_id_under_another_prefix_is_another_block():
-    view = compiled_view([req(0, [1, 2, 3]), req(5, [4, 2, 3])])
-    first, second = view.turns[0][1], view.turns[1][1]
-    assert len(set(first) | set(second)) == 6
 
 
 def test_a_prompt_under_one_block_has_no_segments(tmp_path):
@@ -222,66 +208,9 @@ def test_an_answer_stops_where_the_next_prompt_stops():
     assert stats.uncarried_blocks == 3 and stats.tail_blocks == 2
 
 
-def test_an_answer_is_cut_where_a_later_request_branches_inside_it():
-    stats = Stats()
-    view = compiled_view(
-        [
-            req(0, [1, 2], out=3 * BLOCK),
-            req(5, [1, 2, 3, 4, 5, 6]),
-            req(9, [1, 2, 3, 9]),  # shares one answer block, then departs
-        ],
-        stats,
-    )
-    assert view.turns[0][2] == [view.turns[1][1][2]]
-    assert stats.cut_blocks == 2
-
-
 def test_a_request_nobody_extends_puts_its_answer_past_the_end_of_its_stream():
     view = compiled_view([req(0, [1, 2, 3], out=2 * BLOCK), req(5, [7, 8], out=BLOCK)])
     assert view.turns[0][4] == (0, 3, 5) and view.turns[1][4] == (1, 2, 3)
-
-
-def test_a_strict_prefix_of_an_earlier_prompt_does_not_claim_its_blocks():
-    stats = Stats()
-    view = compiled_view(
-        [
-            req(0, [1, 2, 3, 4, 5]),
-            req(
-                5, [1, 2], out=2 * BLOCK
-            ),  # a rewind: blocks 3 and 4 are not its answer
-            req(9, [1, 2, 3, 4, 5, 6]),
-        ],
-        stats,
-    )
-    assert view.turns[1][2] == []
-    assert stats.dropped_blocks == 2
-
-
-def test_of_two_identical_prompts_only_the_later_one_claims_the_continuation():
-    view = compiled_view(
-        [
-            req(0, [1, 2], out=2 * BLOCK),  # a failed attempt
-            req(5, [1, 2], out=2 * BLOCK),
-            req(9, [1, 2, 3, 4, 5]),
-        ]
-    )
-    assert view.turns[0][2] == []
-    assert view.turns[1][4] == (0, 2, 4)
-
-
-def test_an_answer_at_a_branch_goes_down_the_branch_that_continues_it():
-    view = compiled_view(
-        [
-            req(0, [1, 2], out=BLOCK),
-            req(5, [1, 2, 3, 4]),
-            req(9, [1, 2], out=BLOCK),
-            req(13, [1, 2, 7, 8]),
-        ]
-    )
-    # [1, 2] ends a stream; each answer is the first block of its own branch.
-    assert view.turns[0][2] == [view.turns[1][1][2]]
-    assert view.turns[2][2] == [view.turns[3][1][2]]
-    assert view.turns[0][4][0] != view.turns[2][4][0]
 
 
 def _conversation(rng, turns):

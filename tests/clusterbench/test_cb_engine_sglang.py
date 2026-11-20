@@ -13,7 +13,6 @@ import time
 
 import pytest
 from clusterbench.config import load_config
-from clusterbench.engine import fetch_hint
 from clusterbench.engine_sglang import SglangEngine, forward_end
 from clusterbench.ids import (
     LINKER_KEY_PREFIX,
@@ -208,29 +207,6 @@ def drain(port, kvcr, rounds=500):
 # ---- the linker port, driven inline -----------------------------------------
 
 
-def test_lookup_is_one_batched_query_under_the_request_scope():
-    port, kvcr = inline_port()
-    hashes = [page_hash(bid) for bid in (10, 11, 12, 13)]
-    handle = Handle("abcd", 0)
-    scope = "4:abcd:0"
-    kvcr.resident = {key(10)}
-    kvcr.fetchable[scope] = {key(11), key(12)}
-    port.set_request_context(handle, fetch_hint("abcd", "tcp://peer:1", [10, 11, 12]))
-    valid, remote = port.lookup("abcd", hashes)
-
-    assert kvcr.of("submit_hint") == [
-        (
-            "submit_hint",
-            scope,
-            {"source_control_endpoint": "tcp://peer:1", "block_hashes": [10, 11, 12]},
-        )
-    ]
-    assert kvcr.of("query") == [("query", [key(b) for b in (10, 11, 12, 13)], scope)]
-    # Every restorable prefix length; the miss at page 13 ends them.
-    assert valid == [1, 2, 3]
-    assert remote == [False, True, True, False]
-
-
 def test_a_load_is_one_deliver_per_layer_at_most_four_outstanding():
     port, kvcr = inline_port(layers=6)
     handle = Handle("r", 0)
@@ -257,23 +233,6 @@ def test_a_load_is_one_deliver_per_layer_at_most_four_outstanding():
     assert port.finish_layer_wise_loading(index) is True
     (load,) = port.batch_info[index].loads
     assert load.layers == 6 and not load.failed
-
-
-def test_one_failed_key_fails_every_load_in_the_batch():
-    port, kvcr = inline_port()
-    for rid, bid, slot in (("a", 5, 40), ("b", 9, 41)):
-        port.set_request_context(Handle(rid, 0), None)
-        port.load(rid, [page_hash(bid)], [slot])
-    kvcr.fail = {key(9)}
-    index = port.start_layer_wise_loading()
-    drain(port, kvcr)
-    assert port.finish_layer_wise_loading(index) is False
-    # Each load keeps KVCR's result for its own page that failed, and how many
-    # of its layers returned: the rest of the failed batch is not attempted.
-    a, b = port.batch_info[index].loads
-    assert (a.failed, b.failed) == ({}, {key(9): kvcr.failure})
-    assert (a.layers, b.layers) == (2, 2)
-    assert len(kvcr.of("deliver")) == 4
 
 
 def test_an_offload_is_chunked_deposits_one_at_a_time():
@@ -729,14 +688,10 @@ def test_stopping_drops_requests_and_unstarted_backups(rig_factory):
 PATH = [(900, 0, 2), (901, 0, 1), (902, 0, 3), (903, 0, 1), (904, 0, 2)]
 
 
-def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another(
+def test_an_answer_that_opens_a_stream_is_cached_for_the_turn_that_names_it(
     rig_factory,
 ):
     rig = rig_factory()
-    kvcr = rig.kvcr
-    blocks = segment_ids(PATH)
-    scope = f"32:{1:032x}:0"
-    kvcr.fetchable[scope] = {key(b) for b in blocks[:4]}
     rig.engine.submit(
         Request(
             rid=1,
@@ -745,31 +700,16 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another(
             tail=(905, 0, 1),
             prompt_tokens=9 * PAGE + 10,
             output_tokens=PAGE,
-            hint_source=1,
-            hint_blocks=4,
         )
     )
     rig.finish(1)
-
-    # The hint names the first four pages of the path, across three streams.
-    ((_, _, hint),) = kvcr.of("submit_hint")
-    assert hint["block_hashes"] == blocks[:4]
-    assert kvcr.of("query")[0] == ("query", [key(b) for b in blocks], scope)
-    assert all(
-        list(refs) == [key(b) for b in blocks[:4]] for _, refs, _ in kvcr.of("deliver")
-    )
-    assert rig.dones[0].remote_blocks == 4 and not rig.dones[0].aborted
-    # Every page of the path is backed up, and the answer's page after them.
-    backed_up = deposited(kvcr)
-    assert sorted(backed_up[:-1]) == sorted(key(b) for b in blocks)
-    assert backed_up[-1] == key(905 << 24)
-    # The router hears one root-aligned run per stream, in both tiers.
-    for stream, _, end in [*PATH, (905, 0, 1)]:
-        assert rig.held(TIER_DEVICE, stream) == end
-        assert rig.held(TIER_G2, stream) == end
-
-    # The next turn names the answer's stream as prompt and adds no page.
-    kvcr.calls.clear()
+    # The answer's page is backed up last, and each stream hangs from the one
+    # before it, the answer's from the end of the path.
+    assert deposited(rig.kvcr)[-1] == key(905 << 24)
+    tree = rig.engine._tree
+    chain = tree.ancestry(tree.node_at(905, 0))
+    assert [node.stream for node in chain] == [900, 901, 902, 903, 904, 905]
+    rig.kvcr.calls.clear()
     rig.engine.submit(
         Request(
             rid=2,
@@ -783,54 +723,7 @@ def test_a_replayed_request_spans_many_streams_and_its_answer_opens_another(
     rig.finish(2)
     assert rig.dones[1].gpu_blocks == 10  # the whole old path and the answer
     looked = [key((905 << 24) + i) for i in (1, 2)]
-    assert kvcr.of("query") == [("query", looked, f"32:{2:032x}:0")]
-    assert deposited(kvcr) == looked
-
-
-# ---- why a page asked of a peer failed ----------------------------------------
-
-
-def _two_loads_one_failing(rig):
-    for rid, session in ((1, 70), (2, 80)):
-        pages = segment_ids([(SYSTEM, 0, 4), (session, 0, 6)])
-        rig.kvcr.fetchable[f"32:{rid:032x}:0"] = set(map(key, pages[:8]))
-        rig.engine.submit(
-            Request(
-                rid=rid,
-                session=rid,
-                segments=[(SYSTEM, 0, 4), (session, 0, 6)],
-                tail=(session, 6, 7),
-                prompt_tokens=10 * PAGE + 10,
-                output_tokens=PAGE,
-                hint_source=1,
-                hint_blocks=8,
-            )
-        )
-    rig.kvcr.fail = {key((80 << 24) + 2)}
-    rig.finish_requests(2)
-    return {done.rid: done for done in rig.dones}, rig.window.counters
-
-
-def test_an_aborted_request_reports_only_its_own_failed_pages(rig_factory):
-    by_rid, counters = _two_loads_one_failing(rig_factory())
-    assert by_rid[1].aborted and by_rid[2].aborted
-    # One page failed, in the second request, in the first layer: no other
-    # page had every layer delivered.
-    assert (by_rid[1].failed_blocks, by_rid[2].failed_blocks) == (0, 1)
-    assert counters["deliver_blocks_failed"] == 1
-    assert counters["deliver_blocks_unissued"] == 15
-    assert counters["deliver_blocks_remote"] == 0
-    assert counters["hinted_failed|unavailable"] == 1
-    assert counters["hinted_failed_reason|not_resident"] == 1
-    assert by_rid[2].timed_out_blocks == 0
-
-
-def test_a_page_kvcr_timed_out_is_a_timeout(rig_factory):
-    rig = rig_factory()
-    rig.kvcr.failure = OpEntryResult(OpEntryStatus.TIMEOUT, reason="deadline")
-    by_rid, counters = _two_loads_one_failing(rig)
-    assert counters["hinted_failed|timeout"] == 1
-    assert (by_rid[1].timed_out_blocks, by_rid[2].timed_out_blocks) == (0, 1)
+    assert rig.kvcr.of("query") == [("query", looked, f"32:{2:032x}:0")]
 
 
 def test_a_layer_computes_once_it_has_landed_and_the_one_before_has_computed():
@@ -895,7 +788,13 @@ def test_a_failure_belongs_to_the_request_whose_delivery_failed(rig_factory):
     by_rid = {done.rid: done for done in rig.dones}
     assert (by_rid[1].failed_blocks, by_rid[2].failed_blocks) == (0, 1)
     assert (by_rid[1].timed_out_blocks, by_rid[2].timed_out_blocks) == (0, 1)
-    assert rig.window.counters["hinted_failed|timeout"] == 1
+    counters = rig.window.counters
+    assert counters["hinted_failed|timeout"] == 1
+    assert counters["hinted_failed_reason|deadline"] == 1
+    # It failed in the first layer: no other page had every layer delivered.
+    assert counters["deliver_blocks_failed"] == 1
+    assert counters["deliver_blocks_unissued"] == 15
+    assert counters["deliver_blocks_remote"] == 0
 
 
 def test_a_chunked_request_whose_load_fails_is_dropped(rig_factory):

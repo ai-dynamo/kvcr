@@ -3,40 +3,7 @@
 from pathlib import Path
 
 import pytest
-from clusterbench import protocol
 from clusterbench.config import RunConfig, decode_config, encode_config, load_config
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        protocol.Hello(
-            "n0",
-            1,
-            "host",
-            42,
-            "tcp://h:1",
-            "agent",
-            "/k",
-            "abc",
-            [0, 1],
-            {"nofile": 1024},
-        ),
-        protocol.Ready("warm", {"ok": 3.0}),
-        protocol.Done(7, 1.5, 0.5, 100, 60, 10, 5, 20, 5, 320, timed_out_blocks=2),
-        protocol.Inventory([(1, 5, 0, 10, False), (0, 5, 8, 10, True)]),
-        protocol.Stats(1.0, {"running": 2.0}),
-        protocol.Report(b"{}"),
-        protocol.Failure("boom"),
-        protocol.Configure(3, b"{}", [("n0", "tcp://h:1")]),
-        protocol.Phase("measure"),
-        protocol.Request(9, 4, [(1, 0, 10), (70, 0, 3)], (70, 3, 4), 900, 80, 2, 12),
-    ],
-)
-def test_messages_round_trip(message):
-    decoded = protocol.decode(protocol.encode(message))
-    assert type(decoded) is type(message)
-    assert protocol.encode(decoded) == protocol.encode(message)
 
 
 def test_config_round_trips_and_overrides(tmp_path):

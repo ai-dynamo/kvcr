@@ -152,6 +152,7 @@ def test_each_problem_raises_its_own_flag():
     coord["coordinator"].update(measure_s=10.0, busy_s=9.5)
     reports[0]["threads"]["engine"]["delay_s"] = 1.0
     reports[1]["drained"] = False
+    reports[1]["profiled"] = True
     connect = LogHist()
     connect.add(0.01)
     reports[1]["kvcr_hists"]["kvcr_duration_seconds|peer_setup|connected"] = (
@@ -168,6 +169,7 @@ def test_each_problem_raises_its_own_flag():
         "the coordinator was busy 95% of the window",
         "in flight at exit",
         "only filled to 40% at window start",
+        "profiled (CB_PROFILE_DIR)",
     ):
         assert expected in flags, expected
     assert "INVALID" in format_summary(summarize(config, coord, reports))
@@ -187,14 +189,6 @@ def test_one_worker_waiting_for_a_cpu_is_flagged_and_named_among_quiet_ones():
     ]
     # The thread table has the average over the workers, which is under 1%.
     assert summary["threads"]["engine"]["run_delay_share"] == 0.5 / 80
-
-
-def test_a_profiled_run_is_flagged():
-    config, coord, reports = _inputs()
-    reports[1]["profiled"] = True
-    summary = summarize(config, coord, reports)
-    assert summary["flags"] == ["profiled (CB_PROFILE_DIR)"]
-    assert not summary["valid"]
 
 
 def test_cold_connects_are_not_flagged_when_no_mesh_warm_was_asked_for():
