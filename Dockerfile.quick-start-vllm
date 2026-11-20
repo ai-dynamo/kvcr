@@ -72,7 +72,7 @@ RUN python3 -m pip install --no-cache-dir \
 # Install KVCR from the checkout used as the Docker build context.
 COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
 COPY src /opt/kvcr-src/src
-RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
+RUN python3 -m pip install --no-cache-dir /opt/kvcr-src "nixl==1.5.0" \
  && python3 -m pip install --no-cache-dir \
       "nvidia-nccl-cu13==${NCCL_VERSION}"
 
