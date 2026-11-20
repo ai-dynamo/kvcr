@@ -5,7 +5,7 @@
 import heapq
 import logging
 import math
-from collections.abc import Collection, Generator
+from collections.abc import Callable, Collection, Generator
 
 from ..policy import KVCachePolicy
 from ..types import (
@@ -155,6 +155,8 @@ class _EvictionQueue:
     def __init__(self) -> None:
         self._heap: list[tuple[float, int, BlockKey]] = []
         self._live: dict[BlockKey, tuple[float, int, BlockKey]] = {}
+        # Queued keys read since their score; candidates() rescores them on visit.
+        self._stale: set[BlockKey] = set()
         self._next_sequence = 0
 
     def __len__(self) -> int:
@@ -164,8 +166,16 @@ class _EvictionQueue:
         entry = self._live.get(key)
         return entry[0] if entry is not None else None
 
+    def mark_stale(self, key: BlockKey) -> bool:
+        """Defer rescoring a queued key to the next scan, returning whether queued."""
+        if key not in self._live:
+            return False
+        self._stale.add(key)
+        return True
+
     def insert(self, key: BlockKey, score: float) -> bool:
         """Refresh a score, returning whether the key newly became evictable."""
+        self._stale.discard(key)
         previous = self._live.get(key)
         if previous is not None and previous[0] == score:
             return False
@@ -185,12 +195,19 @@ class _EvictionQueue:
         return previous is None
 
     def remove(self, key: BlockKey) -> bool:
+        self._stale.discard(key)
         return self._live.pop(key, None) is not None
 
     def candidates(
-        self, excluded: frozenset[BlockKey]
+        self,
+        excluded: frozenset[BlockKey],
+        rescore: Callable[[BlockKey], None] | None = None,
     ) -> Generator[BlockKey, None, None]:
-        """Visit each key once in score order; close to restore live entries."""
+        """Visit each key once in score order; close to restore live entries.
+
+        A stale key is passed to rescore before its visit; if its score changed,
+        it is visited at its new rank in the same pass.
+        """
         # Reuse the immutable exclusion set to avoid copying it for each allocation.
         seen: set[BlockKey] = set()
         skipped: list[tuple[float, int, BlockKey]] = []
@@ -200,6 +217,11 @@ class _EvictionQueue:
                 key = item[2]
                 if self._live.get(key) is not item:
                     continue
+                if rescore is not None and key in self._stale and key not in excluded:
+                    self._stale.remove(key)
+                    rescore(key)
+                    if self._live.get(key) is not item:
+                        continue
                 skipped.append(item)
                 if key not in excluded and key not in seen:
                     seen.add(key)
