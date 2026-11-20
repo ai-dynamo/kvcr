@@ -31,12 +31,12 @@ import sys
 
 from packaging.version import Version
 
-# Keep the selected vLLM and torch stack while installing Dynamo and KVCR.
+# Keep the selected vLLM, NIXL, and torch stack while installing Dynamo and KVCR.
 backend_versions = {}
 # grpcio-observability requires an exactly matching grpcio version. Preserve
 # the installed gRPC family so Dynamo's tooling dependencies cannot split it.
 for name in (
-    "vllm", "torch", "torchvision", "torchaudio", "numpy", "protobuf",
+    "vllm", "nixl", "torch", "torchvision", "torchaudio", "numpy", "protobuf",
     "grpcio", "grpcio-tools", "grpcio-observability",
 ):
     try:
