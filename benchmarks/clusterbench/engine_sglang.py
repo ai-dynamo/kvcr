@@ -19,8 +19,9 @@ This file is the scheduler side. One iteration, in SGLang's order:
 2. A request stopped mid-prefill is checkpointed: its new pages enter the
    tree and are offloaded.
 3. Admission, first come first served: a request with at least one full page
-   the device lacks gets ``set_request_context`` and ``lookup``. One that
-   then finds no room on the device (``NO_TOKEN``) stays queued and closes
+   the device lacks gets ``set_request_context`` and ``lookup``. It needs
+   device room for every token it will hold, cacheable or not; one that
+   finds none (``NO_TOKEN``) stays queued and closes
    admission until a running request leaves; with nothing running it is
    matched again on every iteration. An admitted request with a host hit
    gets one ``load``.
@@ -46,10 +47,10 @@ from collections import deque
 
 from .config import RunConfig
 from .device_tree import DeviceTree, Node
-from .engine import count_failure, failure_cause, fetch_hint
+from .engine import count_failure, fetch_hint, live_blocks
 from .ids import (
     INDEX_BITS,
-    HashCache,
+    NameCache,
     block_id,
     hash_to_id,
     page_hash,
@@ -65,13 +66,23 @@ from .router import PrefixTracker
 _WARM_ATTEMPTS = 5
 
 
+def forward_end(start: float, landed: list[float], per_layer: float) -> float:
+    """When a forward that started at ``start`` ends: every attention layer
+    waits for its K and V, so a layer computes once it has landed and the one
+    before it has computed."""
+    end = start
+    for at in landed:
+        end = max(end, at) + per_layer
+    return end
+
+
 class _Req:
     __slots__ = (
         "rid", "sid", "handle", "hint", "segments", "all_segments", "parents",
         "hashes", "prompt_tokens", "output_tokens", "prompt_pages", "match_pages",
-        "total_pages", "arrived", "looked", "started", "first_token", "device_hit",
-        "host_hit", "remote_pages", "slots", "path", "computed", "sched",
-        "inserted", "walked", "lookups", "hinted", "prefill_tokens", "loaded",
+        "total_pages", "live_pages", "arrived", "looked", "started", "first_token",
+        "device_hit", "host_hit", "remote_pages", "slots", "path", "computed",
+        "sched", "inserted", "walked", "lookups", "prefill_tokens", "loaded",
         "contexts", "remote_flags", "failed", "timed_out",
     )  # fmt: skip
 
@@ -88,7 +99,8 @@ class SglangEngine:
         self._warm_slots = config.phases.warm_concurrency
         # Slot 0 holds this worker's warm page; the next ones are warm scratch.
         self._tree = DeviceTree(tiers.gpu_blocks, 1 + self._warm_slots)
-        self._hash_cache = HashCache()
+        self._usable = tiers.gpu_blocks - 1 - self._warm_slots
+        self._hash_cache = NameCache(page_hash)
         # KVCR evicts in access order here (the linker never aligns a
         # sequence), so its pool can lose a page from the middle of a stream.
         self._g2 = PrefixTracker(TIER_G2)
@@ -117,26 +129,6 @@ class SglangEngine:
         self._warm_free: list[int] = []
         self._warm_ok = 0
         self._warm_failed = 0
-
-    # ---- KVCRBindings callbacks: the linker port has them in this profile --
-
-    def request_pin(self, keys):
-        raise RuntimeError("the SGLang linker registers no pin callbacks")
-
-    def poll_pin_results(self):
-        return []
-
-    def release_pin(self, handle) -> bool:
-        return True
-
-    def cancel_pin_request(self, request) -> None:
-        pass
-
-    def record_inventory(self, event) -> None:
-        self._linker.record_inventory(event)
-
-    def on_resilience_event(self, error: Exception) -> None:
-        self._linker.on_resilience_event(error)
 
     # ---- setup -------------------------------------------------------------
 
@@ -184,26 +176,27 @@ class SglangEngine:
         r.parents = parents
         r.prompt_tokens = request.prompt_tokens
         r.output_tokens = max(1, request.output_tokens)
-        r.hashes = self._hash_cache.hashes(request.segments)
+        r.hashes = self._hash_cache.names(request.segments)
         r.prompt_pages = len(r.hashes)
         # The matched length is at most one less than the input length.
         r.match_pages = min(r.prompt_pages, (r.prompt_tokens - 1) // self._page_tokens)
         tail = request.tail
+        # The pages that enter the cache, and the pages it holds while it runs.
         r.total_pages = r.prompt_pages + tail[2] - tail[1]
+        r.live_pages = live_blocks(request, self._page_tokens, self._usable)
         r.arrived = time.perf_counter()
         r.looked = r.started = r.first_token = 0.0
+        r.loaded = 0.0  # when its load finished, on the owner's clock
         r.device_hit = r.host_hit = r.remote_pages = 0
         r.slots = []
         r.path = []
         r.computed = r.sched = r.inserted = r.walked = 0
-        r.lookups = r.hinted = r.prefill_tokens = 0
-        r.loaded = False
+        r.lookups = r.prefill_tokens = 0
         r.contexts = 0
         r.remote_flags = ()
         r.failed = r.timed_out = 0
         r.hint = None
         if request.hint_source >= 0 and request.hint_blocks > 0:
-            r.hinted = request.hint_blocks
             hashes = segment_ids(request.segments)[: request.hint_blocks]
             endpoint = self._peers[request.hint_source][1]
             r.hint = fetch_hint(r.sid, endpoint, hashes)
@@ -256,19 +249,16 @@ class SglangEngine:
                 break
             r = waiting[0]
             self._match(r)
-            need = r.prompt_tokens - min(
-                (r.device_hit + r.host_hit) * self._page_tokens, r.prompt_tokens - 1
-            )
             if not self._admit(r):
                 # NO_TOKEN: matched, but the device has no room for it yet.
                 self._batch_full = bool(batch) or bool(self._running)
                 break
             waiting.popleft()
-            n = min(need, budget)
+            n = min(r.prefill_tokens, budget)
             r.sched = n
             budget -= n
             batch.append(r)
-            if n < need:
+            if n < r.prefill_tokens:
                 self._chunked = r
                 break
 
@@ -281,18 +271,17 @@ class SglangEngine:
             t0 = perf()
             end = t0 + compute
             if index >= 0:
-                # Every attention layer waits for its K and its V buffer, so
-                # a layer computes once it has loaded and the one before it
-                # has computed. One timeline, slept out at the end.
+                # Each layer waits for its K and its V buffer. One timeline,
+                # slept out at the end.
                 counter = linker.layer_done_counter
                 counter.set_consumer(index)
                 wait_until = counter.wait_until
-                per_layer = compute / self._layers
-                end = t0
+                landed = []
                 for layer in range(self._layers):
                     wait_until(layer)
                     wait_until(layer)
-                    end = max(end, perf()) + per_layer
+                    landed.append(perf())
+                end = forward_end(t0, landed, compute / self._layers)
                 load_wait += max(0.0, end - t0 - compute)
             time.sleep(max(0.0, end - perf()))
             t2 = perf()
@@ -304,13 +293,11 @@ class SglangEngine:
                 # Waiting for the batch to drain is transfer time, not a call.
                 load_wait += self._blocked - blocked
                 self._blocked = blocked
-                while linker.num_completed_loads():
-                    linker.pop_completed_load()
-                self._loads_finished(loaders, index, failed, perf())
+                self._loads_finished(loaders, index, failed)
             now = perf()
             for r in batch:
                 if failed and r in loaders:
-                    dones.append(self._abort(r, now))
+                    dones.append(self._abort(r))
                     continue
                 before = r.computed
                 r.computed = before + r.sched
@@ -319,7 +306,7 @@ class SglangEngine:
                 r.first_token = now
                 self._checkpoint(r, r.prompt_pages)
                 if r.output_tokens <= 1:
-                    dones.append(self._finish(r, now))
+                    dones.append(self._finish(r))
                 else:
                     self._running.append(r)
         elif self._running:
@@ -332,7 +319,7 @@ class SglangEngine:
             for r in self._running:
                 r.computed += 1
                 if r.computed >= r.prompt_tokens + r.output_tokens - 1:
-                    dones.append(self._finish(r, now))
+                    dones.append(self._finish(r))
                 else:
                     still.append(r)
             self._running = still
@@ -347,9 +334,6 @@ class SglangEngine:
             counters["forward_seconds"] += forward
             counters["load_wait_seconds"] += load_wait
             counters["linker_wait_seconds"] += blocked
-            counters["engine_harness_seconds"] += max(
-                0.0, total - forward - load_wait - blocked
-            )
             window.hists["step_kvcr"].add(blocked)
             if load_wait:
                 window.hists["step_load_wait"].add(load_wait)
@@ -389,7 +373,7 @@ class SglangEngine:
         path = tree.path(r.segments, r.device_hit)
         tree.touch(path)
         tree.lock(path)
-        slots = tree.allocate(r.total_pages - r.device_hit)
+        slots = tree.allocate(r.live_pages - r.device_hit)
         if slots is None:
             tree.unlock(path)
             self._window.counters["device_alloc_failures"] += 1
@@ -410,47 +394,48 @@ class SglangEngine:
             self._window.counters["loads"] += 1
         return True
 
-    def _loads_finished(
-        self, loaders: list[_Req], index: int, failed: bool, now: float
-    ) -> None:
+    def _loads_finished(self, loaders: list[_Req], index: int, failed: bool) -> None:
         window = self._window
         counters = window.counters
-        info = self._linker.batch_info.pop(index, None)
-        duration = info.seconds if info else 0.0
+        info = self._linker.batch_info.pop(index)
         remote = sum(r.remote_pages for r in loaders)
-        pages = sum(r.host_hit for r in loaders)
         counters["load_batches"] += 1
+        duration = info.finished - info.started
         window.hists["deliver_remote" if remote else "deliver_local"].add(duration)
+        for r in loaders:
+            r.loaded = info.finished
         if failed:
-            failures = info.failed if info else {}
+            # The batch is discarded whole, but KVCR's results say what became
+            # of each request's pages: failed, delivered (every layer of the
+            # request returned and the page never failed) or never issued. The
+            # linker only loads what KVCR called restorable, so a page from a
+            # peer was named by the hint.
             counters["load_batches_failed"] += 1
-            counters["deliver_blocks_failed"] += len(failures)
-            # Each request's own failed pages, from KVCR's results. The linker
-            # only loads what KVCR called restorable, so a page from a peer
-            # was named by the hint.
             encode = self._linker.encode_key
-            from_peer: dict[bytes, object] = {}
+            loads = {load.rid: load for load in info.loads}
             for r in loaders:
+                load = loads[r.sid]
+                whole = load.layers == self._layers
                 hashes = r.hashes[r.device_hit : r.device_hit + r.host_hit]
                 for page, is_remote in zip(hashes, r.remote_flags):
                     key = encode(page)
-                    entry = failures.get(key)
-                    if entry is None:
-                        continue
-                    r.failed += 1
-                    if is_remote:
-                        from_peer[key] = entry
-                        r.timed_out += failure_cause(entry) == "timeout"
-            for entry in from_peer.values():
-                count_failure(counters, entry)
-            # Pages that had not failed go with the batch all the same.
-            counters["aborted_pages"] += pages - sum(r.failed for r in loaders)
+                    if key in load.failed:
+                        r.failed += 1
+                        counters["deliver_blocks_failed"] += 1
+                        if is_remote:
+                            cause = count_failure(counters, load.failed[key])
+                            r.timed_out += cause == "timeout"
+                    elif not whole:
+                        counters["deliver_blocks_unissued"] += 1
+                    elif is_remote:
+                        counters["deliver_blocks_remote"] += 1
+                    else:
+                        counters["deliver_blocks_local"] += 1
             return
         counters["deliver_blocks_remote"] += remote
-        counters["deliver_blocks_local"] += pages - remote
+        counters["deliver_blocks_local"] += sum(r.host_hit for r in loaders) - remote
         for r in loaders:
-            r.loaded = True
-            resolve = now - r.looked
+            resolve = r.loaded - r.looked
             window.hists["cache_resolve"].add(resolve)
             if r.remote_pages:
                 window.hists["cache_resolve_remote"].add(resolve)
@@ -478,7 +463,6 @@ class SglangEngine:
         tree = self._tree
         if upto > r.inserted:
             first = r.inserted
-            new_nodes: list[Node] = []
             offset = 0
             base = r.device_hit
             restored_end = base + r.host_hit
@@ -496,21 +480,19 @@ class SglangEngine:
                         stamp_slots.extend(slots[skip:])
                         first_id = (stream << INDEX_BITS) + page + skip
                         stamp_ids.extend(range(first_id, first_id + len(slots) - skip))
-                    parent = r.parents.get(stream)
-                    restored = max(0, min(high, restored_end) - low)
-                    node = tree.insert(stream, page, slots, parent) if slots else None
-                    if node is not None:
-                        new_nodes.append(node)
-                        self._window.counters["reoffered_restored_pages"] += restored
+                    if slots:
+                        tree.insert(stream, page, slots, r.parents.get(stream))
                 offset += length
                 if offset >= upto:
                     break
             if stamp_slots:
                 self._host.stamp(stamp_slots, stamp_ids, self._stamped)
             r.inserted = upto
-            if new_nodes:
-                tree.lock(new_nodes)
-                r.path.extend(new_nodes)
+            # The request now uses the tree's path up to there, whoever
+            # inserted it: another request may have computed the same pages.
+            path = tree.path(r.all_segments, upto)
+            tree.lock(path[len(r.path) :])
+            r.path = path
         # The insert walk: every node past what this request walked before.
         walked = r.walked
         position = 0
@@ -524,15 +506,16 @@ class SglangEngine:
 
     def _offload(self, node: Node) -> None:
         hashes = self._hash_cache.stream(node.stream, node.end)[node.start : node.end]
+        # Stamped before the call: the owner can finish a deposit before this
+        # thread runs again.
+        accepted = time.perf_counter()
         if self._call(self._linker.offload, hashes, node.slots):
             node.pending = True
-            # inc_lock_ref: the node and its ancestors stay until it completes.
+            # inc_lock_ref: the node and its ancestors stay until it completes
+            # (none for the warm page, which is outside the tree).
             locked = self._tree.ancestry(node)
-            if len(locked) > 1 or self._tree.node_at(node.stream, node.start) is node:
-                self._tree.lock(locked)
-            else:
-                locked = []  # the warm page is outside the tree
-            self._pending.append((node, locked, time.perf_counter()))
+            self._tree.lock(locked)
+            self._pending.append((node, locked, accepted))
             counters = self._window.counters
             counters["offloads"] += 1
             counters["offload_pages"] += node.end - node.start
@@ -544,14 +527,13 @@ class SglangEngine:
         if completed:
             window = self._window
             counters = window.counters
-            now = time.perf_counter()
             for _ in range(completed):
-                ok = self._call(linker.pop_completed_offload)
+                ok, finished = self._call(linker.pop_completed_offload)
                 node, locked, accepted = pending.popleft()
                 node.pending = False
                 self._tree.unlock(locked)
                 pages = node.end - node.start
-                window.hists["deposit"].add(now - accepted)
+                window.hists["deposit"].add(finished - accepted)
                 if ok:
                     node.stored = True
                     self._g2.add(node.stream, node.start, node.end)
@@ -577,11 +559,13 @@ class SglangEngine:
         if r.contexts:
             self._call(self._linker.release_request_context, r.handle)
 
-    def _finish(self, r: _Req, now: float) -> Done:
+    def _finish(self, r: _Req) -> Done:
         window = self._window
         self._batch_full = False  # a request leaves the running batch
-        # release_kv_cache(checkpoint=True): the answer's pages join the tree.
+        # release_kv_cache(checkpoint=True): the answer's pages join the tree;
+        # what held tokens that make no whole page goes back.
         self._checkpoint(r, r.total_pages)
+        self._tree.release(r.slots[r.total_pages - r.device_hit :])
         self._release(r)
         ttft = r.first_token - r.arrived
         window.hists["ttft"].add(ttft)
@@ -592,21 +576,20 @@ class SglangEngine:
         counters["gpu_hit_blocks"] += r.device_hit
         counters["prefill_tokens"] += r.prefill_tokens
         counters["lookups"] += r.lookups
-        local = r.host_hit - r.remote_pages
         return Done(
             rid=r.rid,
             ttft_ms=ttft * 1e3,
-            load_ms=(r.started - r.looked) * 1e3 if r.looked else 0.0,
+            load_ms=self._load_ms(r),
             prompt_blocks=r.prompt_pages,
             gpu_blocks=r.device_hit,
             primary_blocks=0,
-            local_blocks=local,
+            local_blocks=r.host_hit - r.remote_pages,
             remote_blocks=r.remote_pages,
             failed_blocks=0,
             recomputed_tokens=r.prefill_tokens,
         )
 
-    def _abort(self, r: _Req, now: float) -> Done:
+    def _abort(self, r: _Req) -> Done:
         """A failed load: the request ends without output and inserts nothing."""
         if self._chunked is r:
             self._chunked = None
@@ -620,7 +603,7 @@ class SglangEngine:
         return Done(
             rid=r.rid,
             ttft_ms=0.0,
-            load_ms=(now - r.looked) * 1e3 if r.looked else 0.0,
+            load_ms=self._load_ms(r),
             prompt_blocks=r.prompt_pages,
             gpu_blocks=r.device_hit,
             primary_blocks=0,
@@ -631,6 +614,12 @@ class SglangEngine:
             timed_out_blocks=r.timed_out,
             aborted=True,
         )
+
+    @staticmethod
+    def _load_ms(r: _Req) -> float:
+        """From the first lookup to the end of the load, or to admission if
+        nothing was loaded."""
+        return ((r.loaded or r.started) - r.looked) * 1e3 if r.looked else 0.0
 
     # ---- mesh warm ----------------------------------------------------------
 
@@ -661,8 +650,6 @@ class SglangEngine:
                 landed = False
             linker.layer_done_counter.finish(index)
             linker.batch_info.pop(index, None)
-            while linker.num_completed_loads():
-                linker.pop_completed_load()
             ok = landed and not host.mismatches(
                 [slot], [bid], range(self._tiers.pieces)
             )
@@ -750,7 +737,6 @@ class SglangEngine:
             "device_alloc_failures": tree.allocation_failures,
             "device_duplicate_pages": tree.duplicate_pages,
             "kvcr_pool_fill": self.fill_level(),
-            "primary_fill": self.fill_level(),
         }
 
     def resilience_samples(self) -> list[str]:

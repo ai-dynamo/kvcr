@@ -34,6 +34,7 @@ from .metrics import Telemetry, Window, rss_bytes, thread_delta, thread_snapshot
 
 INVENTORY_FLUSH_S = 0.05
 STATS_INTERVAL_S = 1.0
+CONFIGURE_TIMEOUT_S = 600
 
 
 def parse_cpus(spec: str) -> list[int]:
@@ -54,8 +55,7 @@ def run_worker(args) -> int:
         devices = args.net_devices.split(",")
         os.environ["UCX_NET_DEVICES"] = devices[socket_index % len(devices)]
     prepare_environment()
-    advertise = args.advertise_host or args.bind_host
-    endpoint = f"tcp://{advertise}:{args.control_port}"
+    endpoint = f"tcp://{args.bind_host}:{args.control_port}"
     agent = f"cb-{args.node}-{args.local_id}-{os.getpid()}"
 
     context = zmq.Context()  # private: KVCR owns zmq.Context.instance()
@@ -78,7 +78,6 @@ def run_worker(args) -> int:
                     pid=os.getpid(),
                     control_endpoint=endpoint,
                     agent_name=agent,
-                    arm=args.arm,
                     kvcr_file=path,
                     kvcr_sha=sha,
                     cpus=cpus,
@@ -86,7 +85,7 @@ def run_worker(args) -> int:
                 )
             )
         )
-        if not sock.poll(args.configure_timeout * 1000):
+        if not sock.poll(CONFIGURE_TIMEOUT_S * 1000):
             raise RuntimeError("no Configure from the coordinator")
         configure = protocol.decode(sock.recv())
         if not isinstance(configure, protocol.Configure):
@@ -104,7 +103,6 @@ def run_worker(args) -> int:
             config.engine,
             agent_name=agent,
             bind_host=args.bind_host,
-            advertise_host=advertise,
             control_port=args.control_port,
             nixl_port=args.nixl_port,
             framework=engine,
@@ -120,8 +118,8 @@ def run_worker(args) -> int:
         exit_deadline = None
         final = None
         threads_before = thread_snapshot()
-        threads_after = threads_before
         # CB_PROFILE_DIR: profile the engine thread over the measured window.
+        # The report says so, because a profiled run is slower.
         profile_dir = os.environ.get("CB_PROFILE_DIR")
         profiler = None
         next_inventory = next_stats = perf()
@@ -179,8 +177,6 @@ def run_worker(args) -> int:
                         stop_deadline = perf() + phases.drain_s
                     elif name == "exit":
                         exit_deadline = 0.0
-                    else:
-                        send(encode(protocol.Ready(name)))
 
             for done in engine.step():
                 send(encode(done))
@@ -224,9 +220,9 @@ def run_worker(args) -> int:
                     node=args.node,
                     local_id=args.local_id,
                     host=socket.gethostname(),
-                    arm=args.arm,
                     kvcr_file=path,
                     kvcr_sha=sha,
+                    profiled=bool(profile_dir),
                     affinity=host.affinity,
                     rss_mb=rss_bytes() / 1e6,
                     drained=not engine.busy(),

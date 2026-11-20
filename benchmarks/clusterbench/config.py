@@ -44,6 +44,7 @@ class EngineConfig(
     # Modelled forward pass, GIL released: step_ms + prefill_us_per_token * tokens.
     step_ms: float = 20.0
     prefill_us_per_token: float = 20.0
+    # vLLM profile: its engine sleeps this long when it has nothing to run.
     idle_sleep_ms: float = 1.0
     max_batched_tokens: int = 8192
     max_running: int = 64
@@ -101,9 +102,6 @@ class RouterConfig(
     # A session stays on its home worker and moves with this probability per
     # turn, whatever the load, so both A/B arms are offered the same work.
     migration_prob: float = 0.05
-    # A migrating session goes to the emptiest worker; when several are equally
-    # empty, the probability that it picks one on its own node.
-    same_node_prob: float = 0.0
     seed: int = 0
 
 

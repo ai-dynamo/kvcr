@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import random
+import threading
 
-from clusterbench.metrics import (
-    LogHist,
-    Telemetry,
-    Window,
-    thread_delta,
-    thread_snapshot,
-)
+from clusterbench.metrics import LogHist, Telemetry, Window, thread_delta
 
 
 def test_loghist_quantiles_are_close_and_merge_exactly():
@@ -35,7 +30,6 @@ def test_window_accumulates_calls_and_kvcr_telemetry():
     window.call("query", 0.002, calls=4, items=4)
     window.call("query", 0.001, calls=1, items=1)
     stats = Telemetry()
-    assert stats.is_empty()
     stats.increase_counter("kvcr_transfer_blocks", 5, ("remote_deliver",))
     stats.observe_histogram("kvcr_duration_seconds", 0.01, ("transfer", "success"))
     stats.observe_histogram("kvcr_duration_seconds", 0.02, ("transfer", "success"))
@@ -52,11 +46,13 @@ def test_window_accumulates_calls_and_kvcr_telemetry():
     assert not window.to_json()["calls"]
 
 
-def test_thread_delta_attributes_cpu_to_the_engine_thread():
-    before = thread_snapshot()
-    total = 0
-    for i in range(3_000_000):
-        total += i
-    roles = thread_delta(before, thread_snapshot())
-    assert roles["engine"]["cpu_s"] > 0
-    assert roles["engine"]["threads"] == 1
+def test_thread_delta_is_what_each_role_used_between_two_snapshots():
+    engine = threading.main_thread().native_id
+    # Ids no Python thread has, as NIXL's and UCX's threads appear.
+    before = {engine: (1.0, 0.25), -1: (4.0, 0.5)}
+    after = {engine: (1.5, 0.375), -1: (4.25, 0.5), -2: (0.125, 0.0625)}
+    assert thread_delta(before, after) == {
+        "engine": {"cpu_s": 0.5, "delay_s": 0.125, "threads": 1},
+        # One thread from before and one that started in between.
+        "native": {"cpu_s": 0.375, "delay_s": 0.0625, "threads": 2},
+    }

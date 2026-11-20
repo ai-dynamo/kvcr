@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The engine's own caches, modelled on vLLM's.
 
-Both evict like vLLM's ``LRUCachePolicy``: every block is ranked
-``(request rank, -position)``, so the oldest request goes first and, within a
-request, the tail goes before the head. What survives is a root-aligned
-prefix, which a plain per-block LRU would not give.
+Both evict in vLLM's order: every block is ranked ``(request rank,
+-position)``, so the oldest request goes first and, within a request, the tail
+goes before the head. What survives is a root-aligned prefix, which a plain
+per-block LRU would not give. A request's blocks take their final rank when it
+finishes (``LRUCachePolicy.on_request_finished``; the device frees them to the
+end of its queue then).
 
 ``StreamCache`` is the device tier: membership only, tracked per stream. A
 running request reserves room for all of its blocks when it is admitted and
@@ -24,7 +26,6 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import Iterable, Sequence
-from itertools import islice
 
 from .ids import Segment
 
@@ -344,30 +345,29 @@ class PrimaryTier:
         """A request's lookup walks ``keys[start:]`` until one is missing.
 
         Returns where it stopped and whether any key on the way is still being
-        written. Keys it found now rank with the request (the CPU tier records
-        the access at lookup), so the request's own promotions cannot evict
-        what it just found.
+        written. Keys it found rank with the request from here on. vLLM
+        records the access later, when the load is prepared; doing it at the
+        lookup keeps the request's own promotions from evicting what it just
+        found.
         """
         ref, codes = self._ref, self._codes
-        code = ((rank << _SHIFT) | _MASK) - start
+        top = (rank << _SHIFT) | _MASK
         pending = False
         bucket = None
-        stop = start
-        for key in islice(keys, start, None):
+        for stop in range(start, len(keys)):
+            key = keys[stop]
             state = ref.get(key)
             if state is None:
-                break
+                return stop, pending
             if state == _WRITING:
                 pending = True
-            elif codes[key] < code:
-                codes[key] = code
+            elif codes[key] < top - stop:
+                codes[key] = top - stop
                 if state == 0:
                     if bucket is None:
                         bucket = self._bucket(rank)
                     bucket.append(key)
-            code -= 1
-            stop += 1
-        return stop, pending
+        return max(start, len(keys)), pending
 
     # ---- writes ------------------------------------------------------------
 
@@ -379,7 +379,7 @@ class PrimaryTier:
 
     def reserve(self, key: bytes, rank: int, position: int) -> int | None:
         """A slot for one absent key, write in flight; None if the tier is full."""
-        slot = self._free.pop() if self._free else self._take_slot()
+        slot = self._take_slot()
         if slot is None:
             self.allocation_failures += 1
             return None

@@ -15,7 +15,7 @@ What KVCR sees, and must keep seeing if this file changes:
 - One ``kvcr-owner`` thread makes every KVCR call. The scheduler thread posts
   a command and blocks on its result. While a load or an offload is pending
   the owner spins (a zero-timeout queue read, then ``sleep(0)``), and every
-  loop iteration starts with ``poll_completed``.
+  loop iteration ends with ``poll_completed``.
 - ``lookup`` is one ``query`` over all of a request's uncached pages, with the
   request's scope as ``request_id``. ``submit_hint`` precedes it whenever the
   request carries a hint, on every scheduling pass.
@@ -92,6 +92,10 @@ class _Load:
     transfers: tuple
     done: bool = False
     error: BaseException | None = None
+    # Instrumentation: how many of its per-layer delivers returned, and
+    # KVCR's result for each page that failed (None if it named none).
+    layers: int = 0
+    failed: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -105,8 +109,6 @@ class _Batch:
     error: BaseException | None = None
     started: float = field(default_factory=time.perf_counter)
     completion: Future = field(default_factory=Future)
-    # Instrumentation: KVCR's result for each key that failed.
-    failed: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -125,21 +127,24 @@ class _Operation:
     owner: _Batch | _Offload
     keys: set[bytes]
     layer: int | None = None
+    load: _Load | None = None
     result: object = None
 
 
 class BatchInfo(NamedTuple):
-    """Instrumentation: how a finished load batch went."""
+    """Instrumentation: a finished load batch, on the owner's clock."""
 
-    failed: dict  # key -> KVCR's result entry
-    seconds: float
+    loads: tuple[_Load, ...]
+    started: float
+    finished: float
 
 
 class LayerCounter:
     """Upstream ``LayerWiseLoadCounter``: one future per layer of a batch."""
 
-    def __init__(self, num_layers: int) -> None:
+    def __init__(self, num_layers: int, timeout_s: float) -> None:
         self.num_layers = num_layers
+        self._timeout = timeout_s
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
@@ -164,16 +169,12 @@ class LayerCounter:
         futures = self.futures.get(self.consumer_index)
         if futures is None:
             return
-        # Blocks until the layer resolves; a failure is reported by finish().
-        futures[threshold].exception()
+        # Blocks until the layer resolves; the batch's completion says whether
+        # it failed. A stuck owner raises here instead of hanging the worker.
+        futures[threshold].exception(self._timeout)
 
-    def finish(self, index: int) -> bool:
-        futures = self.futures.get(index)
-        if futures is None:
-            return True
-        landed = all(future.exception() is None for future in futures)
-        del self.futures[index]
-        return landed
+    def finish(self, index: int) -> None:
+        self.futures.pop(index, None)
 
 
 class LinkerPort:
@@ -192,23 +193,20 @@ class LinkerPort:
         host,
         *,
         inline: bool = False,
-        telemetry: bool = True,
         call_timeout_s: float = 60.0,
     ) -> None:
         self._host = host
         self._inline = inline
-        self._telemetry = telemetry
         self._call_timeout = call_timeout_s
         self._components: tuple[tuple[str, ...], ...] = tuple(host.labels)
         self.num_layers = len(self._components[0])
         pieces = sum(len(component) for component in self._components)
         self._key_bytes = host.piece_bytes * pieces
-        self.layer_done_counter = LayerCounter(self.num_layers)
+        self.layer_done_counter = LayerCounter(self.num_layers, call_timeout_s)
         self._key_prefix = LINKER_KEY_PREFIX
         self._batch_results: dict[int, Future] = {}
         self._commands: Queue = Queue()
         self._command_lock = threading.Lock()
-        self._completed_loads: Queue = Queue()
         self._completed_offloads: Queue = Queue()
         self._loads: dict[str, _Load] = {}
         self._queued: list[_Load] = []
@@ -279,17 +277,14 @@ class LinkerPort:
         idle = spin = 0.0
         loops = active_loops = 0
         while not self._closed:
-            # Spin only while transfers are in flight; a batch that only awaits
-            # its forward would otherwise contend for the GIL with it.
+            # Spin only while transfers are in flight.
             active = self._fatal is None and (
                 self._offloads
                 or any(not b.exhausted or b.active for b in self._batches)
             )
             started = perf()
             try:
-                function, args, future = commands.get(
-                    timeout=0 if active else (0.0005 if self._batches else 0.001)
-                )
+                function, args, future = commands.get(timeout=0 if active else 0.001)
             except Empty:
                 function = None
                 if active:
@@ -350,7 +345,7 @@ class LinkerPort:
     def _swap(self) -> None:
         """Instrumentation: hand the accumulated stats to the engine thread."""
         box, self._swap_box = self._swap_box, None
-        if self._telemetry and self._fatal is None and not self._closed:
+        if self._fatal is None and not self._closed:
             # Close the interval here so telemetry does not straddle the edge.
             try:
                 stats = self._kvcr.get_stats()
@@ -377,8 +372,6 @@ class LinkerPort:
 
     def _log_stats(self) -> None:
         """Upstream ``KVCRRuntime.log_stats``: drain telemetry every five seconds."""
-        if not self._telemetry:
-            return
         now = time.monotonic()
         if now - self._last_stats < STATS_INTERVAL_S:
             return
@@ -566,17 +559,11 @@ class LinkerPort:
         """Instrumentation (mesh warm): the batch's future, without waiting."""
         return self._call(self._batch_results.pop, counter_index)
 
-    def num_completed_loads(self) -> int:
-        return self._completed_loads.qsize()
-
-    def pop_completed_load(self) -> list[str]:
-        return self._completed_loads.get_nowait()
-
     def _layer_work(self, loads):
         for layer in range(self.num_layers):
             for load in loads:
                 for blocks in self._mappings(load.transfers, layer):
-                    yield layer, load.scope, blocks
+                    yield layer, load, blocks
             # The sentinel accounts for work not yet submitted in this layer.
             yield layer, None, None
 
@@ -647,17 +634,19 @@ class LinkerPort:
     def num_completed_offloads(self) -> int:
         return self._completed_offloads.qsize()
 
-    def pop_completed_offload(self) -> bool:
+    def pop_completed_offload(self) -> tuple[bool, float]:
+        """Whether the oldest finished offload landed, and when it finished
+        (the time is instrumentation; upstream returns the first only)."""
         return self._call(self._pop_completed_offload)
 
-    def _pop_completed_offload(self) -> bool:
-        success, keys = self._completed_offloads.get_nowait()
+    def _pop_completed_offload(self) -> tuple[bool, float]:
+        success, keys, finished = self._completed_offloads.get_nowait()
         unacknowledged = self._unacknowledged_keys
         for key in keys:
             unacknowledged[key] -= 1
             if not unacknowledged[key]:
                 del unacknowledged[key]
-        return success
+        return success, finished
 
     def pop_storage_removals(self) -> list[str]:
         return self._call(self._pop_storage_removals)
@@ -719,15 +708,19 @@ class LinkerPort:
         for handle, result in results:
             operation = operations[handle]
             operation.result = result
+            load = operation.load
+            if load is not None:
+                load.layers += 1
             if set(result) != operation.keys or not all(
                 entry.success for entry in result.values()
             ):
                 owner = operation.owner
                 if isinstance(owner, _Batch):
-                    for key, entry in result.items():
-                        if not entry.success:
+                    for key in operation.keys:
+                        entry = result.get(key)
+                        if entry is None or not entry.success:
                             # Several layers name a page: its first failure counts.
-                            owner.failed.setdefault(key, entry)
+                            load.failed.setdefault(key, entry)
                     self._fail_batch(
                         owner, RuntimeError(f"KVCR delivery {handle} failed")
                     )
@@ -751,7 +744,7 @@ class LinkerPort:
         for batch in batches:
             while not batch.exhausted and deliveries < MAX_DELIVERIES:
                 try:
-                    layer, scope, blocks = next(batch.work)
+                    layer, load, blocks = next(batch.work)
                 except StopIteration:
                     batch.exhausted = True
                     break
@@ -760,11 +753,11 @@ class LinkerPort:
                     self._complete_layer(batch, layer)
                     continue
                 started = time.perf_counter()
-                handle = kvcr.deliver(blocks, request_id=scope)
+                handle = kvcr.deliver(blocks, request_id=load.scope)
                 self._stats.call(
                     "deliver", time.perf_counter() - started, 1, len(blocks)
                 )
-                operations[handle] = _Operation(batch, set(blocks), layer)
+                operations[handle] = _Operation(batch, set(blocks), layer, load)
                 batch.active += 1
                 batch.remaining[layer] += 1
                 deliveries += 1
@@ -774,10 +767,9 @@ class LinkerPort:
             for load in batch.loads:
                 load.done, load.error = True, batch.error
                 del self._loads[load.rid]
-            self._completed_loads.put([load.rid for load in batch.loads])
             self._cleanup_scopes()
             self.batch_info[batch.index] = BatchInfo(
-                batch.failed, time.perf_counter() - batch.started
+                batch.loads, batch.started, time.perf_counter()
             )
             if not batch.completion.done():
                 batch.completion.set_result(batch.error is None)
@@ -808,7 +800,9 @@ class LinkerPort:
                         operations[handle] = _Operation(task, set(blocks))
                         task.active += 1
             if task.exhausted and not task.active:
-                self._completed_offloads.put((task.success, task.keys))
+                self._completed_offloads.put(
+                    (task.success, task.keys, time.perf_counter())
+                )
                 self._offloads.popleft()
 
     def _complete_layer(self, batch: _Batch, layer: int) -> None:

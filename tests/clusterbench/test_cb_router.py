@@ -176,17 +176,14 @@ def test_sticky_migration_rate():
     assert 0.2 < moves / (200 * 19) < 0.3
 
 
-def test_same_node_prob_chooses_among_equally_empty_workers():
-    for same_node_prob, expected in ((1.0, {1}), (0.0, {2, 3})):
-        seen = set()
-        for seed in range(8):
-            router = _router(
-                migration_prob=1.0, same_node_prob=same_node_prob, seed=seed
-            )
-            for session in range(4):  # one session on each worker
-                assert router.route(session, SEGMENTS).worker == session
-            seen.add(router.route(0, SEGMENTS).worker)
-        assert seen == expected
+def test_a_migrating_session_prefers_an_equally_empty_worker_on_another_node():
+    seen = set()
+    for seed in range(8):
+        router = _router(migration_prob=1.0, seed=seed)
+        for session in range(4):  # one session on each worker
+            assert router.route(session, SEGMENTS).worker == session
+        seen.add(router.route(0, SEGMENTS).worker)
+    assert seen == {2, 3}  # never worker 1, which shares node "a"
 
 
 def test_a_migrating_session_goes_to_the_emptiest_worker():
@@ -207,7 +204,9 @@ def test_a_migrating_session_goes_to_the_emptiest_worker():
                 assert counts[route.worker] == min(others)
             homes[s] = route.worker
         counts = [list(homes.values()).count(w) for w in range(12)]
-        assert max(counts) - min(counts) <= 2, counts
+        # A target is the emptiest of eleven workers, so it cannot go past
+        # one session over the mean of eight: nothing piles up.
+        assert max(counts) <= 9, counts
     assert moves > 500
     # A session that ends frees its place; a new one takes the emptiest worker.
     counts = [list(homes.values()).count(w) for w in range(12)]

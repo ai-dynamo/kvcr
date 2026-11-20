@@ -163,6 +163,18 @@ def test_a_lookup_hit_protects_the_key_from_its_own_requests_promotions():
     assert tier.scan(request, 0, mine) == (4, True)  # promotions in flight
 
 
+def test_a_lookup_that_resumes_late_does_not_walk_the_keys_before_it():
+    class Indexed(list):
+        def __iter__(self):
+            raise AssertionError("the scan walked the prompt from its start")
+
+    tier = PrimaryTier(8)
+    keys = Indexed(_keys("p", 5))
+    _store(tier, keys[3:4], tier.new_rank())
+    assert tier.scan(keys, 3, tier.new_rank()) == (4, False)
+    assert tier.scan(keys, 5, tier.new_rank()) == (5, False)
+
+
 def test_reserve_fails_when_nothing_can_be_evicted():
     tier = PrimaryTier(2)
     held = _keys("h", 2)

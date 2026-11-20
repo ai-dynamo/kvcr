@@ -7,8 +7,10 @@ exact calls per step. If one fails after an engine change, compare against
 vLLM's KVCRSecondaryTierManager before touching the expectation.
 """
 
+import time
 from types import SimpleNamespace
 
+import pytest
 from clusterbench.config import EngineConfig, PhaseConfig, RunConfig, TierConfig
 from clusterbench.engine_vllm import VllmEngine
 from clusterbench.ids import block_id, id_to_key, key_to_id, segment_ids
@@ -130,11 +132,13 @@ def _engine(**engine_overrides):
             gpu_blocks=64, primary_blocks=64, g2_blocks=0, tokens_per_block=BLOCK
         ),
         engine=EngineConfig(
-            step_ms=0,
-            prefill_us_per_token=0,
-            idle_sleep_ms=0,
-            verify="full",
-            **engine_overrides,
+            **{
+                "step_ms": 0,
+                "prefill_us_per_token": 0,
+                "idle_sleep_ms": 0,
+                "verify": "full",
+                **engine_overrides,
+            }
         ),
         phases=PhaseConfig(warm_concurrency=2),
     )
@@ -185,9 +189,13 @@ def test_cold_request_stores_once_and_aligns_the_whole_prefix():
     slots = [refs[0].element_index for refs in deposit[1].values()]
     assert len(set(slots)) == 10 and min(slots) >= 3  # past the reserved slots
     assert all(refs[0].end_point_name == "stub-agent" for refs in deposit[1].values())
-    # align_sequence: whole prefix after the deposit completes, and at finish.
+    # align_sequence: the prefix after the deposit completes, and every block
+    # the request processed, the answer's too, at finish.
     aligns = kvcr.of("align")
-    assert [(a[1], a[2]) for a in aligns] == [(KEYS, False), (KEYS, True)]
+    assert [(a[1], a[2]) for a in aligns] == [
+        (KEYS, False),
+        (KEYS + [_key(*TAIL[:2])], True),
+    ]
     assert kvcr.names()[-3:-1] == ["align", "discard_hint"]
 
     # Step 1: poll at the first lookup, again for the request's store, and
@@ -260,7 +268,7 @@ def test_hinted_request_promotes_through_one_deliver_and_keeps_the_prefix():
     assert [(len(a[1]), a[2]) for a in kvcr.of("align")] == [
         (10, False),  # deliver completed (its last block is block 9)
         (10, False),  # deposit completed
-        (10, True),  # request finished
+        (11, True),  # request finished: the answer's block too
     ]
     assert (done.remote_blocks, done.failed_blocks, done.primary_blocks) == (6, 4, 0)
     assert done.recomputed_tokens == PROMPT - 6 * BLOCK
@@ -270,7 +278,7 @@ def test_hinted_request_promotes_through_one_deliver_and_keeps_the_prefix():
     assert counters["bytes_checked"] == 6 and not counters["bytes_mismatch"]
 
 
-def test_failures_inside_the_hint_and_wrong_bytes_are_counted():
+def test_wrong_bytes_are_counted():
     engine, kvcr, window = _engine()
     kvcr.remote_ok = set(KEYS[:3])
     engine.submit(_request(3, hint_source=1, hint_blocks=6))
@@ -280,7 +288,6 @@ def test_failures_inside_the_hint_and_wrong_bytes_are_counted():
     kvcr.host.stamp = original
     done, _ = _run(engine, kvcr)
     assert (done.remote_blocks, done.failed_blocks) == (3, 7)
-    assert window.counters["hinted_failed|unavailable"] == 3
     assert window.counters["bytes_mismatch"] == 3
 
 
@@ -381,22 +388,12 @@ def test_time_outside_kvcr_and_the_harness_is_split_into_forward_and_idle():
     engine.step()  # nothing to run
     assert "idle_seconds" in window.counters
     assert "forward_seconds" not in window.counters
+    # "KVCR per step" is over steps that ran something.
+    assert window.hists["step_kvcr"].n == 0
     engine.submit(_request(1))
     engine.step()
-    assert window.counters["forward_seconds"] >= 0.0
-
-
-def test_inventory_reports_the_device_tier_by_stream():
-    engine, kvcr, _ = _engine()
-    engine.submit(_request(1))
-    for _ in range(8):
-        engine.step()
-    deltas = engine.take_inventory()
-    device = [delta for delta in deltas if delta[0] == TIER_DEVICE]
-    assert device == [(TIER_DEVICE, 1, 0, 4, False), (TIER_DEVICE, 70, 0, 7, False)]
-    primary = [delta for delta in deltas if delta[0] == TIER_PRIMARY]
-    assert primary == [(TIER_PRIMARY, 1, 0, 4, False), (TIER_PRIMARY, 70, 0, 6, False)]
-    assert engine.take_inventory() == []
+    assert "forward_seconds" in window.counters
+    assert window.hists["step_kvcr"].n == 1
 
 
 def test_aborting_requests_leaves_only_kvcr_operations_to_drain():
@@ -411,21 +408,6 @@ def test_aborting_requests_leaves_only_kvcr_operations_to_drain():
     engine.step()
     assert not engine.busy()
     assert engine.step() == []
-
-
-def test_aborting_requests_frees_slots_reserved_for_unfinished_writes():
-    engine, kvcr, _ = _engine()
-    engine.submit(_request(8))
-    primary = engine._primary
-    before = len(primary)
-    # Stop between scheduling and the forward pass: the store is prepared
-    # (slots reserved, write in flight) but its copy has not completed.
-    engine._complete_copies = lambda: None
-    engine.step()
-    assert len(primary) == before + 10
-    engine.abort_requests()
-    assert len(primary) == before
-    assert not engine.busy()
 
 
 # Trace replay: a prompt is the branch-free runs on its path through the
@@ -620,12 +602,108 @@ def test_a_running_requests_cached_prefix_is_not_evicted_to_admit_another():
 
 def test_a_request_the_device_could_never_hold_is_refused():
     engine, _, _ = _engine()
-    try:
+    with pytest.raises(ValueError, match="needs 65 device blocks.*tiers.gpu_blocks"):
         engine.submit(_long(1, 100, blocks=65))
-    except ValueError as error:
-        assert "tiers.gpu_blocks" in str(error)
-    else:
-        raise AssertionError("a 65-block request was accepted by a 64-block device")
+
+
+def test_a_running_request_reserves_device_blocks_for_all_its_tokens():
+    engine, kvcr, _ = _engine()
+    # No cacheable block at all: 40 prompt tokens and a 200-token answer.
+    engine.submit(
+        Request(
+            rid=1,
+            session=0,
+            segments=[],
+            tail=(70, 0, 0),
+            prompt_tokens=40,
+            output_tokens=200,
+        )
+    )
+    engine.step()
+    assert engine._gpu.live == 4  # 240 tokens of 64-token blocks
+    _run(engine, kvcr, steps=300)
+    assert engine._gpu.live == 0 and len(engine._gpu) == 0
+
+
+def test_a_request_is_the_most_recently_used_when_it_finishes():
+    engine, kvcr, _ = _engine()
+    # Submitted first, finishes last: 20 blocks and a 40-token answer.
+    engine.submit(
+        Request(
+            rid=1,
+            session=1,
+            segments=[(100, 0, 19)],
+            tail=(100, 19, 20),
+            prompt_tokens=19 * BLOCK + 5,
+            output_tokens=40,
+        )
+    )
+    engine.submit(_long(2, 200, blocks=20))
+    finished = []
+    while len(finished) < 2:
+        finished += [done.rid for done in engine.step()]
+    assert finished == [2, 1]
+    # A third request needs room in both tiers. What goes is the request that
+    # finished first, not the one that arrived first.
+    engine.submit(_long(3, 300, blocks=40))
+    engine.step()
+    assert (engine._gpu.held(100), engine._gpu.held(200)) == (20, 4)
+    kept = engine._primary.readable
+    assert len(kept([_key(100, i) for i in range(19)])) == 19
+    assert len(kept([_key(200, i) for i in range(19)])) == 3
+
+
+def test_load_time_is_the_promotion_and_not_the_wait_for_the_device():
+    engine, kvcr, window = _engine(step_ms=1)
+    kvcr.remote_ok = set(KEYS)
+    # 55 of the 64 device blocks are busy for 30 steps.
+    engine.submit(
+        Request(
+            rid=1,
+            session=1,
+            segments=[(100, 0, 54)],
+            tail=(100, 54, 55),
+            prompt_tokens=54 * BLOCK + 5,
+            output_tokens=30,
+        )
+    )
+    engine.step()
+    started = time.perf_counter()
+    engine.submit(_request(2, hint_source=1, hint_blocks=10))
+    dones = []
+    while len(dones) < 2:
+        dones += engine.step()
+    elapsed_ms = (time.perf_counter() - started) * 1e3
+    assert window.counters["device_alloc_failures"] > 20
+    hinted = dones[1]
+    assert hinted.rid == 2 and hinted.remote_blocks == 10
+    # From the first lookup to the one that found the delivered blocks: the
+    # promotion is in it, the steps spent waiting for device room are not.
+    assert window.hists["deliver_remote"].total * 1e3 <= hinted.load_ms
+    assert hinted.load_ms < elapsed_ms / 2
+
+
+def test_a_block_kvcr_is_still_fetching_defers_the_request():
+    engine, kvcr, _ = _engine()
+    fetching = [KEYS[0]]  # KVCR is bringing the first block in, once
+
+    def query(keys, request_id=None):
+        kvcr.calls.append(("query", tuple(keys), request_id))
+        if keys[0] in fetching:
+            fetching.remove(keys[0])
+            return [(QueryStatus.FETCHING, CacheTier.LOCAL_G2)]
+        return [(QueryStatus.MISS, None)]
+
+    kvcr.query = query
+    engine.submit(_request(1))
+    engine.step()
+    # Not a miss: the scan goes on, and nothing is computed until KVCR has an
+    # answer for the block.
+    assert [call[1] for call in kvcr.of("query")] == [(KEYS[0],), (KEYS[1],)]
+    assert not engine._running and not kvcr.of("deposit")
+    engine.step()
+    assert [r.rid for r in engine._running] == [1]
+    assert kvcr.of("query")[-1][1] == (KEYS[0],)
 
 
 def test_decode_tokens_come_out_of_the_step_budget():

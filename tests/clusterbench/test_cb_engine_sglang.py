@@ -14,9 +14,15 @@ import time
 import pytest
 from clusterbench.config import load_config
 from clusterbench.engine import fetch_hint
-from clusterbench.engine_sglang import SglangEngine
-from clusterbench.ids import LINKER_KEY_PREFIX, page_hash, segment_ids
-from clusterbench.linker_port import Handle, LinkerPort
+from clusterbench.engine_sglang import SglangEngine, forward_end
+from clusterbench.ids import (
+    LINKER_KEY_PREFIX,
+    block_id,
+    page_hash,
+    segment_ids,
+    warm_stream,
+)
+from clusterbench.linker_port import Handle, LayerCounter, LinkerPort
 from clusterbench.metrics import Window
 from clusterbench.protocol import TIER_DEVICE, TIER_G2, Request
 from clusterbench.router import Inventory
@@ -52,12 +58,14 @@ class StubKvcr:
         self.resident = set()
         self.fetchable = {}  # request id -> keys a hinted peer holds
         self.fail = set()  # keys whose delivery fails
+        self.fail_scope = None  # ... only for this request id
+        self.fail_layer = None  # ... only in this layer
         self.failure = OpEntryResult(OpEntryStatus.UNAVAILABLE, reason="not_resident")
         self.delay = delay
         self.auto = auto
         self.polls = 0
         self.raise_on_poll = None
-        self.outstanding = {}  # handle -> (kind, keys, issued at poll)
+        self.outstanding = {}  # handle -> (kind, keys, issued at poll, scope, layer)
         self.max_delivers = 0
         self.max_deposits = 0
         self.closed_on = None
@@ -90,10 +98,10 @@ class StubKvcr:
                 out.append((QueryStatus.MISS, None))
         return out
 
-    def _issue(self, kind, blocks):
+    def _issue(self, kind, blocks, scope=None, layer=None):
         self._next += 1
-        self.outstanding[self._next] = (kind, list(blocks), self.polls)
-        count = sum(1 for k, _, _ in self.outstanding.values() if k == kind)
+        self.outstanding[self._next] = (kind, list(blocks), self.polls, scope, layer)
+        count = sum(1 for entry in self.outstanding.values() if entry[0] == kind)
         if kind == "deliver":
             self.max_delivers = max(self.max_delivers, count)
         else:
@@ -103,7 +111,8 @@ class StubKvcr:
     def deliver(self, blocks, request_id=None):
         refs = {k: [(r.label, r.element_index) for r in v] for k, v in blocks.items()}
         self._record("deliver", refs, request_id)
-        return self._issue("deliver", blocks)
+        label = next(iter(refs.values()))[0][0]
+        return self._issue("deliver", blocks, request_id, int(label.rsplit("b", 1)[1]))
 
     def deposit(self, blocks):
         refs = {k: [(r.label, r.element_index) for r in v] for k, v in blocks.items()}
@@ -112,10 +121,12 @@ class StubKvcr:
 
     def complete(self, handle):
         """Finish an operation: the next poll reports it."""
-        kind, keys, _ = self.outstanding.pop(handle)
+        kind, keys, _, scope, layer = self.outstanding.pop(handle)
         if kind == "deposit":
             self.resident.update(keys)
         failed = self.fail if kind == "deliver" else ()
+        if self.fail_scope not in (None, scope) or self.fail_layer not in (None, layer):
+            failed = ()
         results = {k: self.failure if k in failed else OK for k in keys}
         self.ready.append((handle, results))
 
@@ -125,8 +136,8 @@ class StubKvcr:
             raise self.raise_on_poll
         self.polls += 1
         if self.auto:
-            for handle, (_, _, at) in list(self.outstanding.items()):
-                if self.polls - at >= self.delay:
+            for handle, entry in list(self.outstanding.items()):
+                if self.polls - entry[2] >= self.delay:
                     self.complete(handle)
         ready, self.ready = self.ready, []
         return ready
@@ -168,7 +179,8 @@ class StubHost:
     def stamp(self, slots, ids, pieces):
         pass
 
-    clear = stamp
+    def clear(self, slots, pieces):
+        pass
 
     def mismatches(self, slots, ids, pieces):
         return 0
@@ -179,7 +191,7 @@ class StubHost:
 
 def inline_port(layers=LAYERS, **stub):
     kvcr = StubKvcr(auto=False, **stub)
-    return LinkerPort(StubHost(kvcr, layers), inline=True, telemetry=False), kvcr
+    return LinkerPort(StubHost(kvcr, layers), inline=True), kvcr
 
 
 def drain(port, kvcr, rounds=500):
@@ -243,8 +255,8 @@ def test_a_load_is_one_deliver_per_layer_at_most_four_outstanding():
             key(6): [(f"kv_128:c0.b{layer}", 41), (f"kv_128:c1.b{layer}", 41)],
         }
     assert port.finish_layer_wise_loading(index) is True
-    assert port.pop_completed_load() == ["r"]
-    assert not port.batch_info[index].failed
+    (load,) = port.batch_info[index].loads
+    assert load.layers == 6 and not load.failed
 
 
 def test_one_failed_key_fails_every_load_in_the_batch():
@@ -256,11 +268,12 @@ def test_one_failed_key_fails_every_load_in_the_batch():
     index = port.start_layer_wise_loading()
     drain(port, kvcr)
     assert port.finish_layer_wise_loading(index) is False
-    assert port.pop_completed_load() == ["a", "b"]
-    # The batch keeps KVCR's result for the key that failed.
-    assert port.batch_info[index].failed == {key(9): kvcr.failure}
-    # The other layers of the failed batch are not attempted.
-    assert len(kvcr.of("deliver")) < 2 * LAYERS
+    # Each load keeps KVCR's result for its own page that failed, and how many
+    # of its layers returned: the rest of the failed batch is not attempted.
+    a, b = port.batch_info[index].loads
+    assert (a.failed, b.failed) == ({}, {key(9): kvcr.failure})
+    assert (a.layers, b.layers) == (2, 2)
+    assert len(kvcr.of("deliver")) == 4
 
 
 def test_an_offload_is_chunked_deposits_one_at_a_time():
@@ -281,7 +294,7 @@ def test_an_offload_is_chunked_deposits_one_at_a_time():
     assert list(first) == [key(b) for b in pages[:32]]
     assert first[key(103)] == [(label, 3) for label in labels]
     assert port.num_completed_offloads() == 1
-    assert port.pop_completed_offload() is True
+    assert port.pop_completed_offload()[0] is True
 
 
 def test_an_offload_waits_for_the_loads_accepted_before_it():
@@ -319,7 +332,7 @@ def test_a_removal_is_held_back_until_its_offload_is_acknowledged():
     drain(port, kvcr)
     port.record_inventory(_Event([key(7)], removed=True))
     assert port.pop_storage_removals() == []
-    assert port.pop_completed_offload() is True
+    assert port.pop_completed_offload()[0] is True
     assert port.pop_storage_removals() == [page_hash(7)]
     assert port.pop_storage_removals() == []
     # A later add cancels a removal that was never reported.
@@ -358,7 +371,7 @@ class Rig:
         self.window = Window()
         self.engine = SglangEngine(self.config, self.window, worker=0)
         self.engine.set_peers([("n0", "tcp://self:1"), ("n1", "tcp://peer:1")])
-        port = LinkerPort(StubHost(self.kvcr), telemetry=False, call_timeout_s=10)
+        port = LinkerPort(StubHost(self.kvcr), call_timeout_s=10)
         self.engine.attach(port._host, port)
         self.port = port
         self.dones = []
@@ -501,7 +514,6 @@ def test_hinted_pages_are_loaded_per_layer_then_backed_up_again(rig_factory):
     assert all(request_id == scope for _, _, request_id in delivers)
     # Restored pages enter the tree as new nodes and are deposited again.
     assert set(deposited(kvcr)) >= {key(b) for b in ids()}
-    assert rig.window.counters["reoffered_restored_pages"] == 8
     done = rig.dones[0]
     assert done.remote_blocks == 8 and done.recomputed_tokens == 2 * PAGE + 10
     assert rig.window.counters["deliver_blocks_remote"] == 8
@@ -802,10 +814,12 @@ def _two_loads_one_failing(rig):
 def test_an_aborted_request_reports_only_its_own_failed_pages(rig_factory):
     by_rid, counters = _two_loads_one_failing(rig_factory())
     assert by_rid[1].aborted and by_rid[2].aborted
-    # One page failed, in the second request; the other fifteen went with it.
+    # One page failed, in the second request, in the first layer: no other
+    # page had every layer delivered.
     assert (by_rid[1].failed_blocks, by_rid[2].failed_blocks) == (0, 1)
     assert counters["deliver_blocks_failed"] == 1
-    assert counters["aborted_pages"] == 15
+    assert counters["deliver_blocks_unissued"] == 15
+    assert counters["deliver_blocks_remote"] == 0
     assert counters["hinted_failed|unavailable"] == 1
     assert counters["hinted_failed_reason|not_resident"] == 1
     assert by_rid[2].timed_out_blocks == 0
@@ -819,34 +833,190 @@ def test_a_page_kvcr_timed_out_is_a_timeout(rig_factory):
     assert (by_rid[1].timed_out_blocks, by_rid[2].timed_out_blocks) == (0, 1)
 
 
-def test_layers_compute_while_later_layers_load(rig_factory):
-    rig = rig_factory("engine.step_ms=40")  # a 40 ms forward over four layers
-    counter = rig.port.layer_done_counter
-    wait_until, seen = counter.wait_until, set()
+def test_a_layer_computes_once_it_has_landed_and_the_one_before_has_computed():
+    # Four layers of 10 ms each, landing 10 ms apart: only the first landing
+    # holds the forward up, so it ends 10 ms late, not 40.
+    assert forward_end(0.0, [0.01, 0.02, 0.03, 0.04], 0.01) == pytest.approx(0.05)
+    # Loads that land before they are needed cost nothing.
+    assert forward_end(1.0, [0.2, 0.4], 0.5) == 2.0
+    # A late last layer delays only itself.
+    assert forward_end(0.0, [0.0, 0.0, 0.0, 0.1], 0.01) == pytest.approx(0.11)
 
-    def slow(layer):
-        if layer not in seen:  # each layer lands 10 ms after the one before
-            seen.add(layer)
-            time.sleep(0.01)
-        wait_until(layer)
 
-    counter.wait_until = slow
+def test_a_layer_that_never_lands_raises_instead_of_hanging():
+    counter = LayerCounter(2, timeout_s=0.01)
+    counter.set_consumer(counter.update_producer())
+    with pytest.raises(TimeoutError):
+        counter.wait_until(0)
+
+
+# ---- what a failed batch transferred, and whose failure it was ----------------
+
+
+def test_pages_delivered_before_a_late_failure_count_as_transferred(rig_factory):
+    rig = rig_factory()
     rig.kvcr.fetchable[f"32:{1:032x}:0"] = {key(b) for b in ids()[:8]}
+    rig.kvcr.fail = {key(ids()[7])}
+    rig.kvcr.fail_layer = LAYERS - 1
+    rig.engine.submit(request(1, hint_source=1, hint=8))
+    rig.finish_requests(1)
+    (done,) = rig.dones
+    counters = rig.window.counters
+    # The request is aborted, but seven of its eight pages had every layer.
+    assert done.aborted and done.failed_blocks == 1
+    assert counters["deliver_blocks_remote"] == 7
+    assert counters["hinted_failed|unavailable"] == 1
+    assert counters["deliver_blocks_unissued"] == 0
+
+
+def test_a_failure_belongs_to_the_request_whose_delivery_failed(rig_factory):
+    rig = rig_factory()
+    # Both requests load the system prefix; only the second one's delivery of
+    # its first page times out.
+    rig.kvcr.failure = OpEntryResult(OpEntryStatus.TIMEOUT, reason="deadline")
+    rig.kvcr.fail_scope = f"32:{2:032x}:0"
+    for rid, session in ((1, 70), (2, 80)):
+        pages = segment_ids([(SYSTEM, 0, 4), (session, 0, 6)])
+        rig.kvcr.fetchable[f"32:{rid:032x}:0"] = set(map(key, pages[:8]))
+        rig.kvcr.fail.add(key(pages[0]))
+        rig.engine.submit(
+            Request(
+                rid=rid,
+                session=rid,
+                segments=[(SYSTEM, 0, 4), (session, 0, 6)],
+                tail=(session, 6, 7),
+                prompt_tokens=10 * PAGE + 10,
+                output_tokens=PAGE,
+                hint_source=1,
+                hint_blocks=8,
+            )
+        )
+    rig.finish_requests(2)
+    by_rid = {done.rid: done for done in rig.dones}
+    assert (by_rid[1].failed_blocks, by_rid[2].failed_blocks) == (0, 1)
+    assert (by_rid[1].timed_out_blocks, by_rid[2].timed_out_blocks) == (0, 1)
+    assert rig.window.counters["hinted_failed|timeout"] == 1
+
+
+def test_a_chunked_request_whose_load_fails_is_dropped(rig_factory):
+    rig = rig_factory("engine.max_batched_tokens=128")
+    rig.kvcr.fetchable[f"32:{1:032x}:0"] = {key(b) for b in ids()[:2]}
+    rig.kvcr.fail = {key(ids()[0])}
+    rig.engine.submit(request(1, hint_source=1, hint=2))
+    rig.finish_requests(1)
+    assert rig.dones[0].aborted
+    assert rig.engine._chunked is None and not rig.engine.busy()
+    assert len(rig.engine._tree) == 0
+
+
+# ---- device room, locks and timing ------------------------------------------
+
+
+def test_a_running_request_holds_device_pages_for_all_its_tokens(rig_factory):
+    rig = rig_factory()
+    # No cacheable block at all: 40 prompt tokens and a 200-token answer.
     rig.engine.submit(
         Request(
             rid=1,
             session=1,
-            segments=[(SYSTEM, 0, 4), (SESSION, 0, 6)],
-            tail=(SESSION, 6, 6),
-            prompt_tokens=10 * PAGE + 10,
-            output_tokens=1,
-            hint_source=1,
-            hint_blocks=8,
+            segments=[],
+            tail=(SESSION, 0, 0),
+            prompt_tokens=40,
+            output_tokens=200,
         )
     )
+    rig.run(lambda: rig.engine._running)
+    assert len(rig.engine._tree) == 4  # 240 tokens of 64-token pages
+    rig.finish(1)
+    assert len(rig.engine._tree) == 0  # nothing of it is cacheable
+
+
+def test_a_request_the_device_cannot_hold_is_refused(rig_factory):
+    rig = rig_factory()
+    with pytest.raises(ValueError, match="needs 300 device blocks"):
+        rig.engine.submit(request(1, context=295, extra=0))
+
+
+def test_a_request_keeps_pages_another_request_inserted_locked(rig_factory):
+    rig = rig_factory()
+    # Two requests compute the same cold prefix in one prefill batch. The
+    # first finishes at once; the second keeps decoding.
+    rig.engine.submit(request(1, extra=0, output=0))
+    rig.engine.submit(
+        Request(
+            rid=2,
+            session=1,
+            segments=[(SYSTEM, 0, 4), (SESSION, 0, 6)],
+            tail=(SESSION, 6, 6),
+            prompt_tokens=10 * PAGE,
+            output_tokens=10_000,
+        )
+    )
+    rig.run(lambda: rig.dones and not rig.engine._pending)
+    assert [done.rid for done in rig.dones] == [1]
+    tree = rig.engine._tree
+    # The first request and its backups are gone; the second still holds the
+    # pages it uses, so nothing can evict them from under it.
+    assert tree.node_at(SYSTEM, 0).locks == 1
+    assert tree.node_at(SESSION, 0).locks == 1
+    assert tree.allocate(250) is None
+
+
+def test_load_time_runs_to_the_end_of_the_transfer(rig_factory):
+    rig = rig_factory("engine.step_ms=30", delay=200)
+    rig.kvcr.fetchable[f"32:{1:032x}:0"] = {key(b) for b in ids()[:8]}
+    rig.engine.submit(request(1, output=0, hint_source=1, hint=8))
     rig.finish_requests(1)
+    (done,) = rig.dones
+    hists = rig.window.hists
+    # From the first lookup to the end of the load on the owner's clock: it
+    # covers the transfer, and the modelled forward is no part of it.
+    assert done.load_ms >= hists["deliver_remote"].total * 1e3 > 0
+    assert hists["cache_resolve_remote"].total * 1e3 == pytest.approx(done.load_ms)
+    assert done.load_ms < 30
+
+
+def test_backup_latency_ends_when_the_deposit_does(rig_factory):
+    rig = rig_factory("engine.step_ms=40")
+    rig.engine.submit(
+        Request(
+            rid=1,
+            session=1,
+            segments=[(SESSION, 0, 6)],
+            tail=(SESSION, 6, 6),
+            prompt_tokens=6 * PAGE,
+            output_tokens=3,
+        )
+    )
+    rig.finish(1)
+    # Deposits finish during 40 ms forwards; the scheduler only looks after.
+    assert 0 < rig.window.hists["deposit"].max < 0.03
+
+
+def test_a_page_in_kvcrs_pool_is_restored_as_a_local_block(rig_factory):
+    rig = rig_factory()
+    rig.kvcr.resident.update(key(b) for b in ids()[:8])
+    rig.engine.submit(request(1))
+    rig.finish(1)
+    (done,) = rig.dones
+    assert (done.local_blocks, done.remote_blocks) == (8, 0)
     counters = rig.window.counters
-    # Layer n loads while the layers before it compute: only the first
-    # layer's 10 ms holds the forward up, not all four.
-    assert 0.005 < counters["load_wait_seconds"] < 0.03
-    assert 0.035 < counters["forward_seconds"] < 0.08
+    assert counters["deliver_blocks_local"] == 8
+    assert counters["deliver_blocks_remote"] == 0
+
+
+def test_mesh_warm_pulls_one_page_from_each_peer_and_retries(rig_factory):
+    rig = rig_factory()
+    good, bad = block_id(warm_stream(1), 0), block_id(warm_stream(2), 0)
+    kvcr = rig.kvcr
+    for attempt in range(5):
+        kvcr.fetchable[f"8:warm-1-{attempt}:0"] = {key(good)}
+    rig.engine.start_warm([(1, "tcp://peer:1"), (2, "tcp://gone:1")])
+    rig.run(lambda: rig.engine.warm_status()[0] == 0)
+    # The reachable peer's page lands on the first try; the other is asked
+    # five times, then counted as failed.
+    assert rig.engine.warm_status() == (0, 1, 1)
+    assert [list(refs) for _, refs, _ in kvcr.of("deliver")] == [[key(good)]] * LAYERS
+    asked = [keys for _, keys, _ in kvcr.of("query")]
+    assert asked.count([key(bad)]) == 5 and asked.count([key(good)]) == 1
+    assert not rig.engine.busy()

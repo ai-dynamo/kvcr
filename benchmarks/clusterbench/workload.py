@@ -71,10 +71,8 @@ class Session:
     def _sample(self, median: float, sigma: float) -> int:
         return max(1, round(_lognormal(self._rng, median, sigma)))
 
-    def next_turn(self) -> Turn | None:
+    def next_turn(self) -> Turn:
         config = self._config
-        if self._turn >= self._turns:
-            return None
         if self._turn:
             self._context += self._sample(
                 config.turn_tokens_median, config.turn_tokens_sigma
@@ -134,17 +132,14 @@ class Workload:
         self._sessions[session.id] = session
         return session
 
-    def next_turn(self, session: int) -> Turn | None:
-        turn = self._sessions[session].next_turn()
-        if turn is None:
-            del self._sessions[session]
-        return turn
+    def next_turn(self, session: int) -> Turn:
+        return self._sessions[session].next_turn()
 
     def completed(self, turn: Turn) -> Step:
         """The same session after its think time, or a fresh one if it ended."""
         if not turn.last:
             return Step(((turn.think_s, turn.session),), ())
-        self._sessions.pop(turn.session, None)
+        del self._sessions[turn.session]
         return Step(((turn.think_s, self.new_session().id),), (turn.session,))
 
     def summary(self) -> dict:

@@ -41,6 +41,19 @@ def fetch_hint(message_id: str, endpoint: str, hashes: list[int]) -> HintEnvelop
     return HintEnvelope(protocol_version="0.1", message_id=message_id, actions=[action])
 
 
+def live_blocks(request: Request, tokens_per_block: int, capacity: int) -> int:
+    """Device blocks a request holds while it runs: every token of its prompt
+    and its answer, cacheable or not. Raises if the device cannot hold it."""
+    tokens = request.prompt_tokens + max(1, request.output_tokens)
+    blocks = -(-tokens // tokens_per_block)
+    if blocks > capacity:
+        raise ValueError(
+            f"request {request.rid} needs {blocks} device blocks, more than "
+            f"tiers.gpu_blocks leaves for requests ({capacity})"
+        )
+    return blocks
+
+
 def failure_cause(entry) -> str:
     """Why KVCR did not deliver a block: its result's status in lower case
     (``timeout``, ``unavailable``, ``aborted``, ``failed``), or
@@ -67,14 +80,6 @@ class Engine(Protocol):
     In the vLLM profile that thread is also the only one calling KVCR; the
     SGLang profile hands every KVCR call to its own owner thread.
     """
-
-    # KVCRBindings callbacks.
-    def request_pin(self, keys): ...
-    def poll_pin_results(self): ...
-    def release_pin(self, handle) -> bool: ...
-    def cancel_pin_request(self, request) -> None: ...
-    def record_inventory(self, event) -> None: ...
-    def on_resilience_event(self, error: Exception) -> None: ...
 
     def attach(self, host) -> None:
         """Bind the started KVCR and its memory."""

@@ -7,10 +7,11 @@ from clusterbench.workload import Session, Workload
 BLOCK = 64
 
 
-def _turns(session, limit=10_000):
-    turns = []
-    while (turn := session.next_turn()) is not None and len(turns) < limit:
-        turns.append(turn)
+def _turns(session):
+    """Every turn of a session, up to its last."""
+    turns = [session.next_turn()]
+    while not turns[-1].last:
+        turns.append(session.next_turn())
     return turns
 
 
@@ -21,9 +22,9 @@ def test_sessions_are_deterministic_and_independent():
     other = Session(12, config, BLOCK)
     b_session = Session(11, config, BLOCK)
     b = []
-    while (turn := b_session.next_turn()) is not None:
+    for _ in a:
+        b.append(b_session.next_turn())
         other.next_turn()
-        b.append(turn)
     assert a == b
     assert a != _turns(Session(11, WorkloadConfig(seed=4), BLOCK))
 
@@ -54,15 +55,6 @@ def test_system_prefix_is_shared_by_agent_type():
     assert streams == {system_stream(0), system_stream(1)}
     blocks = config.system_prefix_tokens // BLOCK
     assert all(t.segments[0] == (t.segments[0][0], 0, blocks) for t in first)
-
-
-def test_workload_replaces_ended_sessions_with_new_ids():
-    workload = Workload(WorkloadConfig(turns_median=1, turns_sigma=0.01), BLOCK)
-    session = workload.new_session()
-    turn = workload.next_turn(session.id)
-    assert turn.last
-    assert workload.next_turn(session.id) is None
-    assert workload.new_session().id == session.id + 1
 
 
 def test_aged_sessions_start_mid_life_with_grown_contexts():

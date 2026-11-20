@@ -55,7 +55,9 @@ them all, and an option it does not have is refused. Tests:
 
 With realistic GPU times (`engine.step_ms`, `engine.prefill_us_per_token`) a
 rank finishes one or two requests a second. The `-fast` scenarios shrink them
-until KVCR's time on the engine thread is what limits a rank.
+until KVCR's time on the engine thread is what limits a rank. On the SGLang
+profile `agentic.toml` needs a KVCR pool its fill phase can fill, or the run
+is INVALID: add `--set tiers.g2_blocks=4096`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -73,11 +75,12 @@ until KVCR's time on the engine thread is what limits a rank.
   pulls one block from every other, so the window holds no first-contact
   connection setup.
 - **Workers:** one process each, with a real `KVCR` and a fake engine driving
-  it. Host mappings stand in for engine memory and KVCR's DRAM pool.
+  it. Host mappings stand in for engine memory and KVCR's DRAM pool. KVCR's
+  telemetry is on (vLLM's default is off): the report reads it.
 - **vLLM profile** (`engine_vllm.py`): vLLM's KVCR tier. One `query` per key
-  on a CPU-tier miss, one `deliver` per request per step, a `deposit` per
-  stored block, `align_sequence` after each. A request runs once the device
-  has room for all of it.
+  on a CPU-tier miss, one `deliver` per request per step, one `deposit` per
+  request per step for the blocks it stored, `align_sequence` after each. A
+  request runs once the device has room for every token it will hold.
 - **SGLang profile** (`engine_sglang.py`, `linker_port.py`, `device_tree.py`):
   the direct linker of SGLang PR #45650. An owner thread makes every KVCR
   call: a batched `query`, one `deliver` per layer (a layer computes while
@@ -90,9 +93,8 @@ until KVCR's time on the engine thread is what limits a rank.
   context that grows each turn and is compacted at the cap) or a replayed
   trace. Both are closed loop.
 
-The exact call sequence of each profile is in the module docstrings and pinned
-by `tests/clusterbench/test_cb_engine_*.py`. If the upstream integration
-changes, change the engine and its tests together.
+The exact call sequence of each profile is in its module docstring and pinned
+by `tests/clusterbench/test_cb_engine_*.py`; change the two together.
 
 ## Trace replay
 
@@ -102,30 +104,32 @@ sessions, 68,266 requests). Compile it once, then pass the file to an `agentx`
 scenario:
 
 ```bash
-python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
-python -m clusterbench local --config benchmarks/clusterbench/scenarios/agentx-fast.toml \
+PYTHONPATH=benchmarks uv run python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
+PYTHONPATH=benchmarks uv run python -m clusterbench local \
+  --config benchmarks/clusterbench/scenarios/agentx-fast.toml \
   --set workload.trace=$PWD/agentx-062126.cbtrace --nodes 2 --per-node 4
 ```
 
 The replay follows aiperf's AgentX rules:
 
-- A request goes out the recorded gap after the one it depends on finishes
-  (`workload.trace_think_scale` scales the gap, `workload.think_cap_s` caps
-  it).
-- Sub-agents run side by side as sessions of their own. The first parent turn
-  recorded at or after a sub-agent's end waits for it; earlier ones do not.
+- A request goes out the recorded gap after the one before it in its lane
+  finishes (`workload.trace_think_scale` scales the gap,
+  `workload.think_cap_s` caps it).
+- Sub-agents run side by side as sessions of their own, at their recorded
+  offsets. The first parent turn recorded at or after a sub-agent's end waits
+  for it and, if that held it up, goes out the moment it ends; earlier turns
+  do not wait.
 - `workload.sessions_per_worker` sessions play at once per worker. Each play
   gets block ids of its own, so plays share nothing.
 
-A run is refused if its longest request does not fit `tiers.gpu_blocks` (or
-`tiers.primary_blocks` on the vLLM profile).
+A run is refused if its longest request does not fit `tiers.gpu_blocks` or,
+on the vLLM profile, its longest prompt `tiers.primary_blocks`.
 
 ## Results
 
 | In the run directory | Content |
 |---|---|
-| `summary.json` | What `report` prints |
-| `reports/` | One raw report per worker |
+| `summary.json`, `reports/` | What `report` prints; one raw report per worker |
 | `requests.jsonl` | One row per request: where it went, the hint, the outcome |
 | `timeseries.jsonl`, `workers.json`, `config.json` | Periodic worker stats, who ran where, the resolved config |
 
@@ -141,14 +145,15 @@ another architecture.
 
 **What to compare between arms.** The normalised numbers: engine-thread
 microseconds per item for each KVCR call; engine, progress and native-thread
-microseconds per moved block; KVCR time per engine step. Throughput and
-latency are reported too, but they depend on the closed-loop workload and the
-modelled engine as much as on KVCR.
+microseconds per moved block; KVCR time per engine step. A moved block is one
+KVCR copied: a delivered block, or a deposited block its pool did not already
+hold. Throughput and latency are reported too, but they depend on the
+closed-loop workload and the modelled engine as much as on KVCR.
 
-**Thread split.** Each rank's engine thread is split into KVCR calls, the fake
-engine's own bookkeeping ("harness"), the modelled forward pass and idle. KVCR
-is the bottleneck when its share dominates. On the SGLang profile the KVCR
-calls are on the owner thread, which gets a split of its own.
+**Thread split.** Each rank's engine thread is split into KVCR calls, the
+modelled forward pass, idle, and everything else the thread does ("harness").
+KVCR is the bottleneck when its share dominates. On the SGLang profile the
+KVCR calls are on the owner thread, which gets a split of its own.
 
 **Failed blocks.** Hinted blocks that a peer did not deliver are counted by
 the status KVCR returns for them: `timeout`, `unavailable` (the source no
@@ -156,30 +161,30 @@ longer held the block, or could not pin it), `aborted` or `failed`.
 `report --detail` has KVCR's reasons. A KVCR tree that returns no reason shows
 them as `unclassified`. Blocks *beyond the hint* are counted apart: vLLM's
 opportunistic query asks the peer for the rest of the prompt too, which it
-cannot have.
+cannot have. On the SGLang profile a failed batch is dropped whole, but its
+pages are still counted as delivered, failed or never issued.
 
 **Request log.** `requests.jsonl` starts with a header naming its fields:
-session, turn, worker, hint source (-1: none), hint blocks, send time, whether
-the window was open, prompt blocks, blocks the router believed the worker
-held, then the outcome (blocks delivered by a peer, failed and timed out, load
-and first-token times, aborted). A request still in flight at the end has no
-outcome.
+where each request went and when, the hint, what the router believed the
+worker held, then the outcome. A request still in flight at the end has none.
 
 **INVALID.** A run is marked INVALID, with the reason, when:
 
-- delivered bytes did not match, or a worker did not report;
-- the coordinator dispatched late (p99 over 1 ms) or had no slack;
-- an engine, owner or progress thread waited for a CPU more than 1% of the
-  window;
-- peers first connected inside the window after a full mesh warm;
+- delivered bytes did not match, or no request completed;
+- the coordinator dispatched late inside the window (p99 over 1 ms) or had no
+  slack;
+- on any worker, an engine, owner or progress thread waited for a CPU more
+  than 1% of the window;
+- peers first connected inside the window after a full mesh warm, or
+  mesh-warm pulls failed;
 - a host tier had not filled to `phases.min_primary_occupancy` when the window
   opened;
-- KVCR raised resilience events, or operations were still in flight at exit.
+- KVCR raised resilience events, or operations were still in flight at exit;
+- the run was profiled: `CB_PROFILE_DIR=<dir>` makes every worker write a
+  cProfile of the window, which slows it.
 
-`report --arm` compares valid runs only and fails if an arm has none. It warns
+`report --arm` compares valid runs only, fails if an arm has none, and warns
 when arms were offered different amounts of work.
-`CB_PROFILE_DIR=<dir>` makes every worker write a cProfile of the window (it
-slows the run).
 
 ## Slurm
 
@@ -206,11 +211,9 @@ touch $CB_ROOT/control/release-$JOB
 - `$CB_ROOT/site` must hold `nixl`, `msgspec` and `pyzmq` built for the
   compute nodes (`pip install --target $CB_ROOT/site ...` on one of them).
 - `CB_NET_DEVICES` is one RDMA device per socket and `CB_CTRL_IF` the
-  interface KVCR's control channel advertises. Workers pin themselves,
-  alternating between sockets.
+  interface of KVCR's control channel. Workers pin themselves by socket.
 - `CB_HARNESS` selects the harness copy a cell runs (default
-  `$CB_ROOT/harness`). Give a queued job a copy of its own, so that a later
-  restage does not change what it runs.
+  `$CB_ROOT/harness`); give a queued job its own, so a restage cannot change it.
 
 ## Not covered
 
@@ -223,9 +226,6 @@ touch $CB_ROOT/control/release-$JOB
 - Load-aware routing such as Dynamo's cost formula: sessions are sticky and
   migrate at a fixed rate.
 - In trace replay, a sub-agent's requests run one after another (aiperf splits
-  some into parallel streams), and the 13% of answer blocks that never
+  some into parallel streams), a sub-agent recorded as starting during its
+  parent turn starts when that turn returns, and the answer blocks that never
   reappear in a prompt are not cached.
-- Replaying a recorded placement. It was tried and dropped: plain repeats
-  already agree within 1% on a cluster, and a fixed placement is unstable at
-  saturation, because nothing moves load off a worker that falls behind
-  (throughput fell 45% on 32 workers).

@@ -5,7 +5,7 @@
 # contexts (1,400 blocks at the median, up to 256k tokens), branches,
 # compactions and sub-agents. Compile the corpus once, then point at the file:
 #
-#   python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
+#   PYTHONPATH=benchmarks uv run python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
 #   ... --config scenarios/agentx.toml --set workload.trace=/path/agentx-062126.cbtrace
 #
 # The GPU is modelled and waits are the recorded ones, capped at 10 s as AgentX

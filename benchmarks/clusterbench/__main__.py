@@ -47,11 +47,12 @@ def _local(args) -> int:
     )
     print(format_summary(summary))
     print(f"\nrun directory: {out}")
-    return 0 if summary["valid"] or args.allow_invalid else 2
+    return 0 if summary["valid"] else 2
 
 
 def _ab(args) -> int:
     from .config import load_config
+    from .coordinator import RunFailed
     from .launch_local import run_local
 
     config = load_config(args.config, args.set)
@@ -66,8 +67,8 @@ def _ab(args) -> int:
         for name, src in order:
             out = root / f"{name}-{rep}"
             print(f"[ab] rep {rep} arm {name}", flush=True)
-            results[name].append(
-                run_local(
+            try:
+                summary = run_local(
                     config,
                     out,
                     nodes=args.nodes,
@@ -76,7 +77,10 @@ def _ab(args) -> int:
                     arm=name,
                     cores_per_worker=args.cores_per_worker,
                 )
-            )
+            except RunFailed as error:  # the other cells are still worth having
+                print(f"[ab] rep {rep} arm {name} failed: {error}", flush=True)
+                continue
+            results[name].append(summary)
     print(f"run directories under: {root}\n")
     return _print_comparison(results)
 
@@ -103,14 +107,13 @@ def _coordinator(args) -> int:
         coordinator.bind(args.bind)
         summary = coordinator.run(
             expect=args.expect,
-            expect_sha=args.expect_sha,
             per_node=args.per_node,
             expect_kvcr=args.expect_kvcr,
         )
     finally:
         coordinator.close()
     print(format_summary(summary))
-    return 0 if summary["valid"] or args.allow_invalid else 2
+    return 0 if summary["valid"] else 2
 
 
 def _worker(args) -> int:
@@ -173,7 +176,6 @@ def main(argv: list[str] | None = None) -> int:
         "--kvcr-src", help="KVCR source tree to test (default: the installed kvcr)"
     )
     local.add_argument("--arm", default="")
-    local.add_argument("--allow-invalid", action="store_true")
     local.set_defaults(func=_local)
 
     ab = sub.add_parser("ab", help="interleaved local A/B between KVCR trees")
@@ -194,13 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     coord.add_argument("--bind", required=True, help="e.g. tcp://0.0.0.0:17700")
     coord.add_argument("--expect", type=int, required=True, help="worker count")
     coord.add_argument("--per-node", type=int, default=0, help="workers per node")
-    coord.add_argument("--expect-sha", default="")
     coord.add_argument(
         "--expect-kvcr", default="", help="the src directory workers must import from"
     )
     coord.add_argument("--out", required=True)
     coord.add_argument("--arm", default="")
-    coord.add_argument("--allow-invalid", action="store_true")
     coord.set_defaults(func=_coordinator)
 
     worker = sub.add_parser("worker", help="one worker (started by a launcher)")
@@ -208,7 +208,6 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--node", required=True)
     worker.add_argument("--local-id", type=int, required=True)
     worker.add_argument("--bind-host", default="127.0.0.1")
-    worker.add_argument("--advertise-host", default="")
     worker.add_argument("--control-port", type=int, required=True)
     worker.add_argument("--nixl-port", type=int, required=True)
     worker.add_argument(
@@ -221,8 +220,6 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument(
         "--net-devices", default="", help="UCX_NET_DEVICES per socket, comma separated"
     )
-    worker.add_argument("--arm", default="")
-    worker.add_argument("--configure-timeout", type=int, default=600)
     worker.set_defaults(func=_worker)
 
     report = sub.add_parser("report", help="summarise or compare runs")

@@ -31,7 +31,6 @@ class Hello(_Msg):
     pid: int
     control_endpoint: str
     agent_name: str
-    arm: str
     kvcr_file: str
     kvcr_sha: str
     cpus: list[int]

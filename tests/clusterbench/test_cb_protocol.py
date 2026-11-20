@@ -17,7 +17,6 @@ from clusterbench.config import RunConfig, decode_config, encode_config, load_co
             42,
             "tcp://h:1",
             "agent",
-            "base",
             "/k",
             "abc",
             [0, 1],
@@ -73,21 +72,26 @@ def test_scenarios_are_found():
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    "overrides,message",
     [
-        ["tiers.block_bytes=1000"],
-        ["router.mode=cost"],  # an option that does not exist
-        ["tiers.gpu_block=64"],
-        ["engine.abandon_timeout_ms=1500"],
-        ["phases.mesh_warm=some"],
-        ["engine.verify=maybe"],
-        ["engine.profile=trtllm"],
-        ["engine.profile=sglang", "tiers.layers=7"],
-        ["engine.profile=sglang", "tiers.g2_blocks=0"],
-        ["tiers.g2_blocks=0", "tiers.framework_pinning=false"],
-        ["no_equals_sign"],
+        (["tiers.block_bytes=1000"], "tiers.block_bytes must be a multiple of 4096"),
+        # Options that do not exist.
+        (["router.mode=cost"], r"unknown field `mode` - at `\$.router`"),
+        (["router.same_node_prob=1"], r"unknown field `same_node_prob`"),
+        (["tiers.gpu_block=64"], r"unknown field `gpu_block` - at `\$.tiers`"),
+        (["engine.abandon_timeout_ms=1500"], "must be >= 2x operation timeout"),
+        (["phases.mesh_warm=some"], "phases.mesh_warm must be full or none"),
+        (["engine.verify=maybe"], "engine.verify must be none, sample or full"),
+        (["engine.profile=trtllm"], "unknown engine profile 'trtllm'"),
+        (["engine.profile=sglang", "tiers.layers=7"], "2 x tiers.layers pieces"),
+        (["engine.profile=sglang", "tiers.g2_blocks=0"], "needs a KVCR pool"),
+        (
+            ["tiers.g2_blocks=0", "tiers.framework_pinning=false"],
+            "no G2 pool and no pinning cannot be a source",
+        ),
+        (["no_equals_sign"], "override must be section.field=value"),
     ],
 )
-def test_invalid_config_is_rejected(overrides):
-    with pytest.raises(ValueError):
+def test_invalid_config_is_rejected(overrides, message):
+    with pytest.raises(ValueError, match=message):
         load_config(None, overrides)

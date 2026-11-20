@@ -10,12 +10,12 @@
 # ROOT/src/ARM, exported from this repository at GIT_REV (or copied from a
 # checkout, uncommitted changes included) with its revision in .kvcr-sha.
 #
-#   CB_HOST       ssh host of the cluster login node (default: tyche)
+#   CB_HOST       ssh host of the cluster login node (required)
 #   CB_SITE_FROM  existing site-packages directory on the cluster to copy into
 #                 ROOT/site when ROOT/site does not exist yet. It must hold
 #                 nixl, msgspec and pyzmq built for the compute nodes.
 set -euo pipefail
-HOST=${CB_HOST:-tyche}
+HOST=${CB_HOST:?set CB_HOST to the ssh host of the cluster login node}
 ROOT=${1:?usage: stage.sh ROOT ARM=REV...}
 shift
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -35,16 +35,22 @@ rsync -e "${SSH[*]}" -a --delete --exclude __pycache__ "$REPO/benchmarks/" "$HOS
 for arm in "$@"; do
   name=${arm%%=*}
   rev=${arm#*=}
-  "${SSH[@]}" "$HOST" "rm -rf '$ROOT/src/$name' && mkdir -p '$ROOT/src/$name'"
+  [ -n "$name" ] || { echo "stage.sh: no arm name in '$arm'" >&2; exit 2; }
+  # The staged arm is replaced only once its successor is complete, so a bad
+  # revision or a broken copy leaves it as it was.
+  new=$ROOT/src/$name.new
   if [ -d "$rev" ]; then
     sha=$(git -C "$rev" rev-parse --short=12 HEAD)
     [ -z "$(git -C "$rev" status --porcelain -- src)" ] || sha=$sha-dirty
-    rsync -e "${SSH[*]}" -a --exclude __pycache__ "$rev/src" "$HOST:$ROOT/src/$name/"
+    "${SSH[@]}" "$HOST" "rm -rf '$new' && mkdir -p '$new'"
+    rsync -e "${SSH[*]}" -a --exclude __pycache__ "$rev/src" "$HOST:$new/"
   else
-    sha=$(git -C "$REPO" rev-parse --short=12 "$rev")
-    git -C "$REPO" archive "$rev" src | "${SSH[@]}" "$HOST" "tar -x -C '$ROOT/src/$name'"
+    sha=$(git -C "$REPO" rev-parse --short=12 "$rev^{commit}")
+    git -C "$REPO" archive "$rev" src \
+      | "${SSH[@]}" "$HOST" "rm -rf '$new' && mkdir -p '$new' && tar -x -C '$new'"
   fi
-  "${SSH[@]}" "$HOST" "echo $sha > '$ROOT/src/$name/.kvcr-sha'"
+  "${SSH[@]}" "$HOST" \
+    "echo $sha > '$new/.kvcr-sha' && rm -rf '$ROOT/src/$name' && mv '$new' '$ROOT/src/$name'"
   echo "staged $name = $sha"
 done
 if [ -n "${CB_SITE_FROM:-}" ]; then

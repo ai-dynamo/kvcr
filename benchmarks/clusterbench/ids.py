@@ -81,28 +81,36 @@ def segment_ids(segments: Iterable[Segment]) -> list[int]:
     return ids
 
 
-class KeyCache:
-    """Per-stream key lists, so a request's keys are list slices."""
+class NameCache:
+    """Per-stream lists of block names, so a request's names are list slices.
 
-    def __init__(self, max_streams: int = 4096) -> None:
-        self._streams: dict[int, list[bytes]] = {}
+    ``make`` names one block id: ``id_to_key`` for vLLM's keys, ``page_hash``
+    for SGLang's storage hashes.
+    """
+
+    def __init__(self, make, max_streams: int = 4096) -> None:
+        self._make = make
+        self._streams: dict[int, list] = {}
         self._max_streams = max_streams
 
-    def keys(self, segments: Iterable[Segment]) -> list[bytes]:
-        out: list[bytes] = []
-        for stream, start, end in segments:
-            cached = self._streams.pop(stream, None)
-            if cached is None:
-                cached = []
-            if len(cached) < end:
-                base = stream << INDEX_BITS
-                pack = _KEY.pack
-                cached.extend(pack(base + i, 0) for i in range(len(cached), end))
-            # Reinsert at the back: the dict doubles as an LRU of streams.
-            self._streams[stream] = cached
-            out.extend(cached[start:end])
-        while len(self._streams) > self._max_streams:
+    def stream(self, stream: int, end: int) -> list:
+        """Names of the stream's blocks ``[0, end)`` (the list may be longer)."""
+        cached = self._streams.pop(stream, None)
+        if cached is None:
+            cached = []
+        if len(cached) < end:
+            base, make = stream << INDEX_BITS, self._make
+            cached.extend(make(base + i) for i in range(len(cached), end))
+        # Reinsert at the back: the dict doubles as an LRU of streams.
+        self._streams[stream] = cached
+        if len(self._streams) > self._max_streams:
             del self._streams[next(iter(self._streams))]
+        return cached
+
+    def names(self, segments: Iterable[Segment]) -> list:
+        out: list = []
+        for stream, start, end in segments:
+            out.extend(self.stream(stream, end)[start:end])
         return out
 
 
@@ -151,31 +159,3 @@ def page_hash(bid: int) -> str:
 
 def hash_to_id(storage_hash: str) -> int:
     return int(storage_hash[:16], 16)
-
-
-class HashCache:
-    """Per-stream page-hash lists, so a request's hashes are list slices."""
-
-    def __init__(self, max_streams: int = 4096) -> None:
-        self._streams: dict[int, list[str]] = {}
-        self._max_streams = max_streams
-
-    def stream(self, stream: int, end: int) -> list[str]:
-        """Hashes of the stream's pages ``[0, end)`` (the list may be longer)."""
-        cached = self._streams.pop(stream, None)
-        if cached is None:
-            cached = []
-        if len(cached) < end:
-            base = stream << INDEX_BITS
-            pad = _HASH_PAD
-            cached.extend(f"{base + i:016x}{pad}" for i in range(len(cached), end))
-        self._streams[stream] = cached
-        if len(self._streams) > self._max_streams:
-            del self._streams[next(iter(self._streams))]
-        return cached
-
-    def hashes(self, segments: Iterable[Segment]) -> list[str]:
-        out: list[str] = []
-        for stream, start, end in segments:
-            out.extend(self.stream(stream, end)[start:end])
-        return out

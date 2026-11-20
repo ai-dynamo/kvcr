@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config import RunConfig
@@ -41,10 +42,18 @@ def _free_port_base(count: int) -> int:
 
 
 def _cpu_sets(workers: int, cores_per_worker: int) -> list[list[int]]:
-    """Disjoint blocks of physical cores per worker, or no pinning if short."""
-    groups = core_groups(os.sched_getaffinity(0))
-    if cores_per_worker < 3 or len(groups) < workers * cores_per_worker:
+    """Disjoint blocks of physical cores per worker; 0 cores is no pinning."""
+    if not cores_per_worker:
         return [[] for _ in range(workers)]
+    if cores_per_worker < 3:
+        raise ValueError("a pinned worker needs at least 3 physical cores")
+    groups = core_groups(os.sched_getaffinity(0))
+    needed = workers * cores_per_worker
+    if len(groups) < needed:
+        raise ValueError(
+            f"pinning {workers} workers to {cores_per_worker} physical cores each "
+            f"needs {needed}; {len(groups)} are available"
+        )
     return [
         sorted(
             cpu
@@ -53,6 +62,18 @@ def _cpu_sets(workers: int, cores_per_worker: int) -> list[list[int]]:
         )
         for w in range(workers)
     ]
+
+
+def _stop(children: list[subprocess.Popen], grace_s: float) -> None:
+    """Give the workers ``grace_s`` between them to exit, SIGTERM those still
+    running, and SIGKILL the ones that outlive that."""
+    for sig, wait_s in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 10.0)):
+        deadline = time.monotonic() + wait_s
+        for child in children:
+            try:
+                child.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, sig)
 
 
 def run_local(
@@ -71,14 +92,14 @@ def run_local(
         expect_kvcr = str(Path(kvcr_src).resolve() / "src")
         if not (Path(expect_kvcr) / "kvcr" / "__init__.py").is_file():
             raise ValueError(f"{kvcr_src} is not a KVCR checkout: no src/kvcr in it")
+    workers = nodes * per_node
+    cpu_sets = _cpu_sets(workers, cores_per_worker)
     out = Path(out_dir)
     logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    workers = nodes * per_node
     coordinator = Coordinator(config, out, arm=arm)
     endpoint = coordinator.bind("tcp://127.0.0.1:*")
     base = _free_port_base(2 * workers)
-    cpu_sets = _cpu_sets(workers, cores_per_worker)
 
     env = dict(os.environ)
     paths = [str(BENCHMARKS)]
@@ -89,6 +110,7 @@ def run_local(
     env["PYTHONPATH"] = os.pathsep.join(paths)
 
     children: list[subprocess.Popen] = []
+    grace_s = 20.0
     try:
         for index in range(workers):
             node, local_id = divmod(index, per_node)
@@ -114,8 +136,6 @@ def run_local(
                         str(base + workers + index),
                         "--cpus",
                         ",".join(map(str, cpu_sets[index])),
-                        "--arm",
-                        arm,
                     ],
                     env=env,
                     stdout=log,
@@ -125,15 +145,11 @@ def run_local(
             )
             log.close()
         return coordinator.run(expect=workers, expect_kvcr=expect_kvcr)
+    except BaseException:
+        # No coordinator is left for the workers to finish with, and they are
+        # in sessions of their own, so a Ctrl-C here does not reach them.
+        grace_s = 0.0
+        raise
     finally:
         coordinator.close()
-        for child in children:
-            try:
-                child.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGTERM)
-        for child in children:
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
+        _stop(children, grace_s)

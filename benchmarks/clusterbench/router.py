@@ -226,7 +226,7 @@ class Router:
             return home, False
         rng = self._session_rng(session)
         # Draw every turn so the stream does not depend on earlier outcomes.
-        move, where, pick = rng.random(), rng.random(), rng.random()
+        move, pick = rng.random(), rng.random()
         if self._workers < 2 or move >= self._config.migration_prob:
             return home, False
         # The emptiest other worker anywhere: a session takes turns faster on
@@ -236,10 +236,9 @@ class Router:
         emptiest = [
             w for w, count in enumerate(resident) if count == least and w != home
         ]
-        # Among equally empty workers, same_node_prob picks the node.
+        # Among equally empty workers, one on another node if there is one.
         nodes = self._nodes
-        on_node = where < self._config.same_node_prob
-        pool = [w for w in emptiest if (nodes[w] == nodes[home]) == on_node] or emptiest
+        pool = [w for w in emptiest if nodes[w] != nodes[home]] or emptiest
         target = pool[int(pick * len(pool)) % len(pool)]
         resident[home] -= 1
         resident[target] += 1

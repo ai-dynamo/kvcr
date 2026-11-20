@@ -15,22 +15,10 @@ from .metrics import LogHist
 MAX_COORDINATOR_LAG_P99_S = 1e-3
 # The coordinator is one thread: when it has no slack it limits the load.
 MAX_COORDINATOR_BUSY = 0.8
+# Per worker: one starved worker must not hide among quiet ones.
 MAX_RUN_DELAY_SHARE = 0.01
-# Closed-loop sessions make offered work vary a little run to run (about 2%
-# between identical arms on a quiet cluster).
+# Closed-loop sessions make offered work vary a little run to run.
 MAX_OFFERED_WORK_DIFF = 0.05
-
-KVCR_CALLS = (
-    "submit_hint",
-    "query",
-    "deliver",
-    "deposit",
-    "poll",
-    "poll_empty",
-    "align_sequence",
-    "discard_hint",
-    "get_stats",
-)
 
 
 def _ratio(part: float, whole: float) -> float:
@@ -47,7 +35,7 @@ def _p50_p99(hist: LogHist, name: str) -> dict[str, float]:
 def _merge_hists(reports: list[dict], section: str) -> dict[str, LogHist]:
     merged: dict[str, LogHist] = defaultdict(LogHist)
     for report in reports:
-        for name, data in report.get(section, {}).items():
+        for name, data in report[section].items():
             merged[name].merge(LogHist.from_json(data))
     return merged
 
@@ -55,7 +43,7 @@ def _merge_hists(reports: list[dict], section: str) -> dict[str, LogHist]:
 def _sum(reports: list[dict], section: str) -> dict[str, float]:
     total: dict[str, float] = defaultdict(float)
     for report in reports:
-        for name, value in report.get(section, {}).items():
+        for name, value in report[section].items():
             total[name] += value
     return dict(total)
 
@@ -66,7 +54,8 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     nodes = coord["nodes"]
     workers = len(nodes)
     window = sum(r["window_s"] for r in reports)  # worker-seconds
-    mean_window = window / len(reports) if reports else 0.0
+    mean_window = window / workers
+    profile = config["engine"]["profile"]
     secs, calls, items = (_sum(reports, k) for k in ("secs", "calls", "items"))
     counters = _sum(reports, "counters")
     hists = _merge_hists(reports, "hists")
@@ -84,18 +73,19 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
             "share": _ratio(secs[name], window),
         }
     kvcr_seconds = sum(secs.values())
-    if "engine_harness_seconds" in counters:
-        # Engines whose KVCR calls are on another thread say it outright.
-        harness_seconds = counters["engine_harness_seconds"]
-    else:
-        scheduler_seconds = (
-            hists["step_scheduler"].total if "step_scheduler" in hists else 0.0
-        )
-        harness_seconds = max(0.0, scheduler_seconds - kvcr_seconds)
+    forward = counters.get("forward_seconds", 0)
+    idle = counters.get("idle_seconds", 0)
+    linker_wait = counters.get("linker_wait_seconds", 0)
+    load_wait = counters.get("load_wait_seconds", 0)
+    # Harness is what is left of the engine thread's window, so the work
+    # between engine steps counts too. vLLM's engine thread makes the KVCR
+    # calls itself; SGLang's waits for the owner thread's calls and loads.
+    on_kvcr = linker_wait + load_wait if profile == "sglang" else kvcr_seconds
+    harness_seconds = max(0.0, window - forward - idle - on_kvcr)
 
     threads: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for report in reports:
-        for role, entry in report.get("threads", {}).items():
+        for role, entry in report["threads"].items():
             role = "py" if role.startswith("py:") else role
             for key, value in entry.items():
                 threads[role][key] += value
@@ -104,7 +94,7 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
             "cpu_s": entry["cpu_s"],
             "cores_per_worker": _ratio(entry["cpu_s"], window),
             "run_delay_share": _ratio(entry["delay_s"], window),
-            "threads_per_worker": _ratio(entry["threads"], len(reports)),
+            "threads_per_worker": _ratio(entry["threads"], workers),
         }
         for role, entry in threads.items()
     }
@@ -113,7 +103,9 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     remote = counters.get("deliver_blocks_remote", 0)
     local = counters.get("deliver_blocks_local", 0)
     deposited = counters.get("deposit_blocks_ok", 0)
-    moved = remote + local + deposited
+    # KVCR accepts a deposit of blocks it already holds and copies nothing.
+    copied = kvcr_counters.get("kvcr_transfer_blocks|local_fill", 0)
+    moved = remote + local + copied
     progress_cpu = threads.get("progress", {}).get("cpu_s", 0.0)
     native_cpu = threads.get("native", {}).get("cpu_s", 0.0)
 
@@ -145,13 +137,14 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "engine_kvcr_share": _ratio(kvcr_seconds, window),
         "engine_harness_share": _ratio(harness_seconds, window),
         # The modelled forward pass, and steps with nothing to run.
-        "engine_forward_share": _ratio(counters.get("forward_seconds", 0), window),
-        "engine_idle_share": _ratio(counters.get("idle_seconds", 0), window),
+        "engine_forward_share": _ratio(forward, window),
+        "engine_idle_share": _ratio(idle, window),
         "engine_kvcr_us_per_request": _ratio(kvcr_seconds, requests) * 1e6,
         "engine_harness_us_per_request": _ratio(harness_seconds, requests) * 1e6,
         "engine_kvcr_us_per_moved_block": _ratio(kvcr_seconds, moved) * 1e6,
         "progress_us_per_moved_block": _ratio(progress_cpu, moved) * 1e6,
         "native_us_per_moved_block": _ratio(native_cpu, moved) * 1e6,
+        "deposit_already_held_share": _ratio(max(0.0, deposited - copied), deposited),
         **_p50_p99(hists["step_kvcr"], "step_kvcr"),
         **_p50_p99(hists["ttft"], "ttft"),
         **_p50_p99(hists["cache_resolve_remote"], "remote_resolve"),
@@ -161,15 +154,12 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "hinted_unavailable_rate": _ratio(causes.get("unavailable", 0), hinted_asked),
     }
 
-    profile = config.get("engine", {}).get("profile", "vllm")
-    aborted = counters.get("aborted_requests", 0)
     if profile == "sglang":
         # The linker's owner thread makes the KVCR calls; the scheduler thread
         # blocks on linker calls and on loads.
-        idle = counters.get("owner_idle_seconds", 0)
+        owner_idle = counters.get("owner_idle_seconds", 0)
         spin = counters.get("owner_spin_seconds", 0)
-        linker_wait = counters.get("linker_wait_seconds", 0)
-        load_wait = counters.get("load_wait_seconds", 0)
+        aborted = counters.get("aborted_requests", 0)
         headline.update(
             {
                 "linker_wait_share": _ratio(linker_wait, window),
@@ -177,10 +167,10 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
                 "linker_wait_us_per_request": _ratio(linker_wait, requests) * 1e6,
                 "load_wait_us_per_request": _ratio(load_wait, requests) * 1e6,
                 "owner_linker_share": _ratio(
-                    max(0.0, window - idle - spin - kvcr_seconds), window
+                    max(0.0, window - owner_idle - spin - kvcr_seconds), window
                 ),
                 "owner_spin_share": _ratio(spin, window),
-                "owner_idle_share": _ratio(idle, window),
+                "owner_idle_share": _ratio(owner_idle, window),
                 "owner_loops_per_s": _ratio(counters.get("owner_loops", 0), window),
                 "abort_rate": _ratio(aborted, aborted + requests),
                 "load_batch_failure_rate": _ratio(
@@ -189,10 +179,6 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
                 ),
                 **_p50_p99(hists["step_load_wait"], "step_load_wait"),
                 **_p50_p99(hists["deposit"], "offload"),
-                "reoffered_restored_share": _ratio(
-                    counters.get("reoffered_restored_pages", 0),
-                    counters.get("offload_pages", 0),
-                ),
             }
         )
 
@@ -204,33 +190,42 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     )
     warm_full = config["phases"]["mesh_warm"] == "full" and workers > 1
     flags = []
-    if len(reports) != workers:
-        flags.append(f"reports from {len(reports)} of {workers} workers")
     if counters.get("bytes_mismatch", 0):
         flags.append(
             f"{int(counters['bytes_mismatch'])} delivered blocks had wrong bytes"
         )
     if lag.quantile(0.99) > MAX_COORDINATOR_LAG_P99_S:
         flags.append(f"coordinator dispatch lag p99 {lag.quantile(0.99) * 1e3:.2f} ms")
-    measure_s = tally.get("measure_s", 0)
-    coordinator_busy = _ratio(tally.get("busy_s", 0), measure_s)
+    coordinator_busy = _ratio(tally["busy_s"], tally["measure_s"])
     if coordinator_busy > MAX_COORDINATOR_BUSY:
         flags.append(f"the coordinator was busy {coordinator_busy:.0%} of the window")
     for role in ("engine", "owner", "progress"):
-        share = thread_summary.get(role, {}).get("run_delay_share", 0)
-        if share > MAX_RUN_DELAY_SHARE:
-            flags.append(f"{role} thread waited for a CPU {share:.1%} of the window")
+        shares = {
+            r["worker"]: _ratio(r["threads"][role]["delay_s"], r["window_s"])
+            for r in reports
+            if role in r["threads"]
+        }
+        over = [w for w, share in shares.items() if share > MAX_RUN_DELAY_SHARE]
+        if over:
+            worst = max(over, key=shares.__getitem__)
+            flags.append(
+                f"{role} thread waited for a CPU {shares[worst]:.1%} of the window "
+                f"on worker {worst} ({len(over)} of {workers} workers over "
+                f"{MAX_RUN_DELAY_SHARE:.0%})"
+            )
     if warm_full and cold:
         flags.append(f"{cold} first-contact peer connects inside the window")
     if warm_full and coord["warm"]["failed"]:
         flags.append(f"{coord['warm']['failed']} mesh-warm pulls failed")
     if counters.get("resilience_events", 0):
         flags.append(f"{int(counters['resilience_events'])} KVCR resilience events")
-    if not all(r.get("drained", True) for r in reports):
+    if not all(r["drained"] for r in reports):
         flags.append("some workers still had operations in flight at exit")
-    occupancy = tally.get("primary_occupancy_min", 1.0)
-    if occupancy < config["phases"].get("min_primary_occupancy", 0.0):
+    occupancy = tally["primary_occupancy_min"]
+    if occupancy < config["phases"]["min_primary_occupancy"]:
         flags.append(f"a host tier had only filled to {occupancy:.0%} at window start")
+    if any(r["profiled"] for r in reports):
+        flags.append("profiled (CB_PROFILE_DIR)")
     if not requests:
         flags.append("no requests completed in the window")
 
@@ -248,40 +243,12 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "headline": headline,
         "failures": failures,
         "workload": {
-            **tally.get("workload", {"kind": "synthetic"}),
-            "sessions_started": tally.get("sessions_started", 0),
-            "inflight_max": tally.get("inflight_max", 0),
+            **tally["workload"],
+            "sessions_started": tally["sessions_started"],
+            "inflight_max": tally["inflight_max"],
         },
-        "offered": {
-            k: tally[k]
-            for k in (
-                "dispatched",
-                "dispatched_blocks",
-                "dispatched_tokens",
-                "hinted",
-                "hinted_blocks",
-                "hinted_same_node",
-                "hinted_cross_node",
-                "migrations",
-            )
-        },
-        "completed": {
-            k: tally.get(k, 0)
-            for k in (
-                "completed",
-                "aborted",
-                "prompt_blocks",
-                "gpu_blocks",
-                "primary_blocks",
-                "local_blocks",
-                "remote_requests",
-                "remote_blocks_same_node",
-                "remote_blocks_cross_node",
-                "failed_blocks",
-                "timed_out_blocks",
-                "prefill_tokens",
-            )
-        },
+        "offered": tally["offered"],
+        "completed": tally["completed"],
         "engine_calls": engine_calls,
         "counters": counters,
         "latency": {name: hist.summary() for name, hist in sorted(hists.items())},
@@ -291,12 +258,10 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "warm": coord["warm"],
         "coordinator_lag": lag.summary(),
         "coordinator_busy": coordinator_busy,
-        "rss_mb_mean": statistics.fmean(r.get("rss_mb", 0) for r in reports)
-        if reports
-        else 0,
+        "rss_mb_mean": statistics.fmean(r["rss_mb"] for r in reports),
         "engine_gauges": {
             key: statistics.fmean(r["engine"][key] for r in reports)
-            for key in (reports[0]["engine"] if reports else {})
+            for key in reports[0]["engine"]
         },
     }
 
@@ -319,8 +284,9 @@ def format_summary(summary: dict) -> str:
     h = summary["headline"]
     done = summary["completed"]
     offered = summary["offered"]
-    sglang = summary.get("profile") == "sglang"
-    if sglang:
+    failures = summary["failures"]
+    workload = summary["workload"]
+    if summary["profile"] == "sglang":
         thread_lines = [
             f"owner thread: KVCR {h['engine_kvcr_share']:.1%} of wall "
             f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), linker "
@@ -339,30 +305,53 @@ def format_summary(summary: dict) -> str:
             f"{_fmt(h['step_kvcr_p50_ms'])}/{_fmt(h['step_kvcr_p99_ms'])} ms; "
             f"per loading batch p50/p99 {_fmt(h['step_load_wait_p50_ms'])}/"
             f"{_fmt(h['step_load_wait_p99_ms'])} ms",
-            f"aborted requests {summary['completed'].get('aborted', 0)} "
+            f"aborted requests {done['aborted']} "
             f"({h['abort_rate']:.2%}); load batches failed "
             f"{h['load_batch_failure_rate']:.2%}; backup p50/p99 "
-            f"{_fmt(h['offload_p50_ms'])}/{_fmt(h['offload_p99_ms'])} ms, "
-            f"{h['reoffered_restored_share']:.1%} of backed-up pages had just "
-            f"been restored",
+            f"{_fmt(h['offload_p50_ms'])}/{_fmt(h['offload_p99_ms'])} ms",
         ]
     else:
         thread_lines = [
             f"engine thread: KVCR {h['engine_kvcr_share']:.1%} of wall "
             f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), harness "
             f"{h['engine_harness_share']:.1%} "
-            f"({_fmt(h.get('engine_harness_us_per_request', 0) / 1e3)} ms/request), "
-            f"modelled GPU {h.get('engine_forward_share', 0):.1%}, "
-            f"idle {h.get('engine_idle_share', 0):.1%}",
+            f"({_fmt(h['engine_harness_us_per_request'] / 1e3)} ms/request), "
+            f"modelled GPU {h['engine_forward_share']:.1%}, "
+            f"idle {h['engine_idle_share']:.1%}",
             f"KVCR per engine step p50/p99 "
             f"{_fmt(h['step_kvcr_p50_ms'])}/{_fmt(h['step_kvcr_p99_ms'])} ms",
         ]
+    trace_lines = []
+    if workload["kind"] == "trace":
+        trace_lines = [
+            f"trace {workload['trace']} ({workload['sha256'][:12]}, "
+            f"{workload['traces']} traces): {workload['plays_started']} plays "
+            f"started, {workload['plays_finished']} finished, "
+            f"{workload['turns']} turns sent ({workload['child_turns']} by "
+            f"sub-agents), at most {workload['inflight_max']} requests in flight"
+        ]
+    causes = dict(failures["causes"])
+    cause = (
+        f"hinted blocks a peer did not deliver, by KVCR status: timeout "
+        f"{causes.pop('timeout', 0):.0f} ({h['hinted_timeout_rate']:.2%} of "
+        f"hinted blocks), unavailable {causes.pop('unavailable', 0):.0f} "
+        f"({h['hinted_unavailable_rate']:.2%})"
+    )
+    cause += "".join(f", {name} {n:.0f}" for name, n in sorted(causes.items()))
+    cause += f"; beyond the hint {failures['beyond_hint']:.0f}"
+    if failures["pin_requests"]:
+        cause += (
+            f"; source pins {failures['pin_requests']:.0f} requested, "
+            f"{failures['pin_misses']:.0f} missed, "
+            f"{failures['pin_wait_timeouts']:.0f} timed out"
+        )
     lines = [
-        f"{summary['name']}  profile={summary.get('profile', 'vllm')}  "
+        f"{summary['name']}  profile={summary['profile']}  "
         f"arm={summary['arm'] or '-'}  "
         f"kvcr={summary['kvcr_sha']}  {summary['workers']} workers on "
         f"{summary['nodes']} nodes  window {summary['window_s']:.1f}s",
         "VALID" if summary["valid"] else "INVALID: " + "; ".join(summary["flags"]),
+        *trace_lines,
         "",
         f"requests/s {_fmt(h['requests_per_s'])}   "
         f"remote blocks/s {_fmt(h['remote_blocks_per_s'])}   "
@@ -379,44 +368,18 @@ def format_summary(summary: dict) -> str:
         f"{_fmt(h['remote_resolve_p99_ms'])} ms   "
         f"remote deliver p50/p99 {_fmt(h['deliver_remote_p50_ms'])}/"
         f"{_fmt(h['deliver_remote_p99_ms'])} ms",
+        cause,
         "",
         *thread_lines,
         f"per moved block: KVCR {_fmt(h['engine_kvcr_us_per_moved_block'])} us, "
         f"progress {_fmt(h['progress_us_per_moved_block'])} us, "
-        f"native {_fmt(h['native_us_per_moved_block'])} us",
+        f"native {_fmt(h['native_us_per_moved_block'])} us; "
+        f"{h['deposit_already_held_share']:.0%} of deposited blocks were already "
+        f"in KVCR's pool",
         "",
         f"{'KVCR call':<16}{'calls':>10}{'items':>12}{'us/call':>10}"
         f"{'us/item':>10}{'share':>9}",
     ]
-    failures = summary.get("failures")
-    if failures and "causes" in failures:
-        at = lines.index("", 3)  # after the blocks and latency lines
-        causes = dict(failures["causes"])
-        cause = (
-            f"hinted blocks a peer did not deliver, by KVCR status: timeout "
-            f"{causes.pop('timeout', 0):.0f} ({h['hinted_timeout_rate']:.2%} of "
-            f"hinted blocks), unavailable {causes.pop('unavailable', 0):.0f} "
-            f"({h['hinted_unavailable_rate']:.2%})"
-        )
-        cause += "".join(f", {name} {n:.0f}" for name, n in sorted(causes.items()))
-        cause += f"; beyond the hint {failures['beyond_hint']:.0f}"
-        if failures["pin_requests"]:
-            cause += (
-                f"; source pins {failures['pin_requests']:.0f} requested, "
-                f"{failures['pin_misses']:.0f} missed, "
-                f"{failures['pin_wait_timeouts']:.0f} timed out"
-            )
-        lines.insert(at, cause)
-    workload = summary.get("workload", {})
-    if workload.get("kind") == "trace":
-        lines.insert(
-            2,
-            f"trace {workload['trace']} ({workload['sha256'][:12]}, "
-            f"{workload['traces']} traces): {workload['plays_started']} plays "
-            f"started, {workload['plays_finished']} finished, "
-            f"{workload['turns']} turns sent ({workload['child_turns']} by "
-            f"sub-agents), at most {workload['inflight_max']} requests in flight",
-        )
     for name, call in summary["engine_calls"].items():
         lines.append(
             f"{name:<16}{call['calls']:>10,.0f}{call['items']:>12,.0f}"
@@ -477,7 +440,7 @@ def format_detail(summary: dict) -> str:
     lines.append(
         f"mesh warm: {warm['ok']:.0f} ok, {warm['failed']:.0f} failed, slowest worker "
         f"{warm['max_seconds']:.1f}s;  coordinator lag p99 {_fmt(lag['p99_ms'])} ms, "
-        f"busy {summary.get('coordinator_busy', 0):.0%};  "
+        f"busy {summary['coordinator_busy']:.0%};  "
         f"mean RSS {summary['rss_mb_mean']:.0f} MB"
     )
     return "\n".join(lines)
@@ -500,6 +463,14 @@ AB_METRICS = (
     ("requests_per_s", "requests / s"),
     ("remote_blocks_per_s", "remote blocks / s"),
 )
+
+
+def _relative(delta: float, base: float, spec: str) -> str:
+    """``delta`` as a share of ``base``, which has no value against a zero
+    base unless ``delta`` is zero too."""
+    if base:
+        return format(delta / base, spec)
+    return "n/a" if delta else format(0.0, spec)
 
 
 def compare(arms: dict[str, list[dict]]) -> str:
@@ -547,22 +518,20 @@ def compare(arms: dict[str, list[dict]]) -> str:
         out = f"{label:<32}"
         for n in names:
             v = values[n]
-            spread = (max(v) - min(v)) / medians[n] if medians[n] else 0
-            out += f"{_fmt(medians[n]) + f' ({spread:.0%})':>24}"
+            spread = _relative(max(v) - min(v), medians[n], ".0%")
+            out += f"{_fmt(medians[n]) + f' ({spread})':>24}"
         for n in names[1:]:
-            change = (medians[n] / medians[base] - 1) if medians[base] else 0
-            out += f"{change:>+18.1%}"
+            change = _relative(medians[n] - medians[base], medians[base], "+.1%")
+            out += f"{change:>18}"
         return out
 
     for key, label in AB_METRICS:
         lines.append(
-            row(
-                label,
-                {n: [s["headline"].get(key, 0.0) for s in arms[n]] for n in names},
-            )
+            row(label, {n: [s["headline"][key] for s in arms[n]] for n in names})
         )
     lines.append("engine thread, by KVCR call:")
-    for call in KVCR_CALLS:
+    calls = {call for runs in arms.values() for s in runs for call in s["engine_calls"]}
+    for call in sorted(calls):
         # poll's cost is per call (most polls complete nothing); the others
         # scale with the keys they are given.
         unit = "call" if call in ("poll", "poll_empty") else "item"

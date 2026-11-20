@@ -67,7 +67,6 @@ class DeviceTree:
         # Ordered residency changes.
         self.events: list[StreamEvent] = []
         self.evictions = 0
-        self.evicted_pages = 0
         self.allocation_failures = 0
         self.duplicate_pages = 0
 
@@ -113,29 +112,6 @@ class DeviceTree:
             pages -= end - start
         return nodes
 
-    def slots(self, segments: Iterable[Segment], first: int, pages: int) -> list[int]:
-        """Slots of request pages ``[first, first + pages)``, which are cached."""
-        out: list[int] = []
-        chains = self._chains
-        offset = 0
-        last = first + pages
-        for stream, start, end in segments:
-            length = end - start
-            low = max(first, offset) - offset + start
-            high = min(last, offset + length) - offset + start
-            if low < high:
-                for node in chains[stream]:
-                    if node.end <= low:
-                        continue
-                    if node.start >= high:
-                        break
-                    a, b = max(low, node.start), min(high, node.end)
-                    out.extend(node.slots[a - node.start : b - node.start])
-            offset += length
-            if offset >= last:
-                break
-        return out
-
     # ---- recency and locks -------------------------------------------------
 
     def touch(self, nodes: Sequence[Node]) -> None:
@@ -166,13 +142,14 @@ class DeviceTree:
                 self._evictable += node.end - node.start
 
     def ancestry(self, node: Node) -> list[Node]:
-        """The node and every node it hangs from, root first."""
+        """The node and every node it hangs from, root first; none of them if
+        the node is not in the tree."""
         out: list[Node] = []
         stream = node.stream
         chain = self._chains.get(stream, ())
         own = [n for n in chain if n.start <= node.start]
         if not own or own[-1] is not node:
-            return [node]  # not in the tree
+            return []
         parent = self._parent.get(stream)
         lineage = []
         while parent is not None:
@@ -182,9 +159,6 @@ class DeviceTree:
             out.extend(self._chains.get(ancestor, ()))
         out.extend(own)
         return out
-
-    def evictable(self) -> int:
-        return self._evictable
 
     # ---- slots -------------------------------------------------------------
 
@@ -228,7 +202,6 @@ class DeviceTree:
             self._free.extend(node.slots)
             self.events.append((stream, node.start, node.end, True))
             self.evictions += 1
-            self.evicted_pages += node.end - node.start
             if chain:
                 heapq.heappush(heap, (chain[-1].access, stream))
             else:

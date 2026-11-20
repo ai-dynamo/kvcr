@@ -116,12 +116,6 @@ class Telemetry:
             values = self.observations.setdefault(key, [])
         values.append(value)
 
-    def reduce(self):
-        return {}
-
-    def is_empty(self):
-        return not (self.counters or self.observations or self.gauges)
-
 
 class Window:
     """Everything a worker accumulates over the measurement window."""
@@ -188,8 +182,6 @@ class Window:
             self.items[name] += stats.items[name]
         for name, value in stats.counters.items():
             self.counters[name] += value
-        for name, hist in stats.hists.items():
-            self.hists[name].merge(hist)
         for stats_ in stats.telemetry:
             self.merge_telemetry(stats_)
 
@@ -219,14 +211,13 @@ class OwnerStats:
     owner has swapped in a fresh one, so a ``Window`` keeps a single writer.
     """
 
-    __slots__ = ("secs", "calls", "items", "counters", "hists", "telemetry")
+    __slots__ = ("secs", "calls", "items", "counters", "telemetry")
 
     def __init__(self) -> None:
         self.secs: dict[str, float] = defaultdict(float)
         self.calls: dict[str, int] = defaultdict(int)
         self.items: dict[str, int] = defaultdict(int)
         self.counters: dict[str, float] = defaultdict(float)
-        self.hists: dict[str, LogHist] = defaultdict(LogHist)
         self.telemetry: list[Telemetry] = []
 
     def call(self, name: str, seconds: float, calls: int = 1, items: int = 1) -> None:

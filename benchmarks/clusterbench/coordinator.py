@@ -3,7 +3,8 @@
 """The coordinator: workload generator, synthetic router and run phases.
 
 Never imports ``kvcr``, so it is the same program whichever KVCR tree the
-workers run. Workers dial in; every phase change is an acknowledged barrier.
+workers run. Workers dial in. They acknowledge ``configure``, ``warm`` and
+``measure``; ``stop`` is answered with a report and ``exit`` with nothing.
 """
 
 from __future__ import annotations
@@ -39,8 +40,8 @@ REQUEST_FIELDS = (
 )  # fmt: skip
 
 
-REGISTER_TIMEOUT_S = 300.0
-WARM_TIMEOUT_S = 300.0
+# How long the workers have to register and to acknowledge a phase.
+PHASE_TIMEOUT_S = 300.0
 
 
 class RunFailed(RuntimeError):
@@ -76,7 +77,13 @@ class Coordinator:
     # ---- plumbing ----------------------------------------------------------
 
     def _send(self, worker: int, message) -> None:
-        self._sock.send_multipart([self._idents[worker], protocol.encode(message)])
+        ident = self._idents[worker]
+        try:
+            self._sock.send_multipart([ident, protocol.encode(message)])
+        except zmq.ZMQError as error:  # ROUTER_MANDATORY: its connection is gone
+            raise RunFailed(
+                f"cannot reach worker {worker} ({ident.decode()}): {error}"
+            ) from None
 
     def _recv(self, timeout_s: float):
         """Next (worker, message), or None on timeout."""
@@ -92,34 +99,31 @@ class Coordinator:
             raise RunFailed(f"worker {ident.decode()} failed:\n{message.text}")
         return self._ids.get(ident, ident), message
 
-    def _barrier(self, phase: str, timeout_s: float, handler=None) -> dict:
-        """Wait for every worker's Ready(phase); other messages go to handler."""
+    def _no_ack(self, phase: str, acked) -> RunFailed:
+        missing = sorted(set(range(self._workers)) - set(acked))
+        return RunFailed(f"phase {phase!r}: no ack from workers {missing}")
+
+    def _barrier(self, phase: str) -> dict:
+        """Wait for every worker's Ready(phase)."""
         infos: dict[int, dict] = {}
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
         while len(infos) < self._workers:
             left = deadline - time.monotonic()
             if left <= 0:
-                missing = sorted(set(range(self._workers)) - set(infos))
-                raise RunFailed(f"phase {phase!r}: no ack from workers {missing}")
+                raise self._no_ack(phase, infos)
             received = self._recv(min(left, 0.5))
             if received is None:
                 continue
             worker, message = received
             if isinstance(message, protocol.Ready) and message.phase == phase:
                 infos[worker] = message.info
-            elif handler is not None:
-                handler(worker, message)
+            else:
+                self._background(worker, message)
         return infos
 
     # ---- run ---------------------------------------------------------------
 
-    def run(
-        self,
-        expect: int,
-        expect_sha: str = "",
-        per_node: int = 0,
-        expect_kvcr: str = "",
-    ) -> dict:
+    def run(self, expect: int, per_node: int = 0, expect_kvcr: str = "") -> dict:
         """Run the cell. ``expect_kvcr`` is the directory every worker must
         have imported ``kvcr`` from (an arm's ``src``)."""
         config, phases = self.config, self.config.phases
@@ -131,7 +135,7 @@ class Coordinator:
         # Register.
         self._ids = {}
         hellos: dict[bytes, protocol.Hello] = {}
-        deadline = time.monotonic() + REGISTER_TIMEOUT_S
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
         while len(hellos) < expect:
             left = deadline - time.monotonic()
             if left <= 0:
@@ -156,15 +160,13 @@ class Coordinator:
         if per_node and any(count != per_node for count in counts.values()):
             # srun can place a step's tasks on the wrong node of the job.
             raise RunFailed(f"expected {per_node} workers per node, got {counts}")
-        if expect_sha and shas != [expect_sha]:
-            raise RunFailed(f"expected KVCR {expect_sha}, workers run {shas}")
         if expect_kvcr:
             # A wrong path falls back to the installed kvcr without a sound.
             root = Path(expect_kvcr).resolve()
             if any(root not in Path(file).parents for file in files):
                 raise RunFailed(f"workers loaded KVCR from {files}, not from {root}")
         (self.out / "workers.json").write_text(
-            json.dumps([msgspec.to_builtins(h) for h in hello], indent=1)
+            json.dumps([msgspec.structs.asdict(h) for h in hello], indent=1)
         )
 
         # Configure: every worker starts its KVCR and learns the peer table.
@@ -172,21 +174,23 @@ class Coordinator:
         blob = encode_config(config)
         router = Router(config.router, nodes, config.tiers)
         self._router = router
-        self._timeseries = open(self.out / "timeseries.jsonl", "w")
         self._reports: dict[int, dict] = {}
-        for worker in range(workers):
-            self._send(worker, protocol.Configure(worker, blob, peers))
-        self._barrier("configure", REGISTER_TIMEOUT_S, self._background)
-
-        # Mesh warm.
-        warm = {}
-        if phases.mesh_warm == "full" and workers > 1:
+        with (
+            open(self.out / "timeseries.jsonl", "w") as self._timeseries,
+            open(self.out / REQUEST_LOG, "wb") as log,
+        ):
             for worker in range(workers):
-                self._send(worker, protocol.Phase("warm"))
-            warm = self._barrier("warm", WARM_TIMEOUT_S, self._background)
+                self._send(worker, protocol.Configure(worker, blob, peers))
+            self._barrier("configure")
 
-        summary = self._drive(router, nodes)
-        self._timeseries.close()
+            # Mesh warm.
+            warm = {}
+            if phases.mesh_warm == "full" and workers > 1:
+                for worker in range(workers):
+                    self._send(worker, protocol.Phase("warm"))
+                warm = self._barrier("warm")
+
+            summary = self._drive(router, nodes, log)
 
         summary_in = {
             "name": config.name,
@@ -225,7 +229,7 @@ class Coordinator:
         elif isinstance(message, protocol.Report):
             self._reports[worker] = json.loads(message.payload)
 
-    def _drive(self, router: Router, nodes: list[str]) -> dict:
+    def _drive(self, router: Router, nodes: list[str], log) -> dict:
         config, phases = self.config, self.config.phases
         workers = self._workers
         workload = self._workload
@@ -246,7 +250,7 @@ class Coordinator:
         measuring = False
         measure_acks: set[int] = set()
         measure_at = start + phases.fill_s
-        measure_sent = False
+        measure_deadline = None  # set when the workers are told to measure
         # Time spent waiting for a message or for the next turn to fall due;
         # the rest of the window is the coordinator's own work.
         waiting = waiting_before = 0.0
@@ -255,7 +259,7 @@ class Coordinator:
         report_deadline = None
         lag = LogHist()
         tally = self._new_tally()
-        log = open(self.out / REQUEST_LOG, "wb")
+        offered, completed = tally["offered"], tally["completed"]
         encode = msgspec.json.Encoder().encode
         log.write(encode({"clusterbench_requests": 1, "fields": REQUEST_FIELDS}))
 
@@ -276,7 +280,7 @@ class Coordinator:
                 )
                 log.write(b"\n" + encode(sent + outcome))
                 if measuring and not stopped:
-                    self._tally_done(tally, message, worker, sent[3], nodes)
+                    self._tally_done(completed, message, worker, sent[3], nodes)
                 if stopped:
                     return
                 # The workload says what this sets off: the session's next
@@ -306,10 +310,6 @@ class Coordinator:
                 while due and due[0][0] <= now:
                     when, session = heapq.heappop(due)
                     turn = workload.next_turn(session)
-                    if turn is None:  # only if a session had zero turns left
-                        router.forget(session)
-                        heapq.heappush(due, (now, workload.new_session().id))
-                        continue
                     route = router.route(turn.session, turn.segments)
                     rid = next_rid
                     next_rid += 1
@@ -317,7 +317,6 @@ class Coordinator:
                     # Per request: turns that fall due together still go out
                     # one after another.
                     sent_at = clock()
-                    lag.add(sent_at - when)
                     self._send(
                         route.worker,
                         protocol.Request(
@@ -348,21 +347,27 @@ class Coordinator:
                     if len(inflight) > inflight_max:
                         inflight_max = len(inflight)
                     if measuring:
-                        tally["dispatched"] += 1
-                        tally["dispatched_blocks"] += blocks
-                        tally["dispatched_tokens"] += turn.prompt_tokens
-                        tally["migrations"] += route.migrated
+                        lag.add(sent_at - when)
+                        offered["dispatched"] += 1
+                        offered["dispatched_blocks"] += blocks
+                        offered["dispatched_tokens"] += turn.prompt_tokens
+                        offered["migrations"] += route.migrated
                         if route.hint_source >= 0:
-                            tally["hinted"] += 1
-                            tally["hinted_blocks"] += route.hint_blocks
+                            offered["hinted"] += 1
+                            offered["hinted_blocks"] += route.hint_blocks
                             same = router.same_node(route.worker, route.hint_source)
-                            tally[
+                            offered[
                                 "hinted_same_node" if same else "hinted_cross_node"
                             ] += 1
-                if not measure_sent and now >= measure_at:
-                    measure_sent = True
-                    for worker in range(workers):
-                        self._send(worker, protocol.Phase("measure"))
+                if measure_deadline is None:
+                    if now >= measure_at:
+                        measure_deadline = now + PHASE_TIMEOUT_S
+                        for worker in range(workers):
+                            self._send(worker, protocol.Phase("measure"))
+                elif not measuring and now > measure_deadline:
+                    # The window only opens, and so only closes, once every
+                    # worker has acknowledged.
+                    raise self._no_ack("measure", measure_acks)
                 if stop_at is not None and now >= stop_at:
                     stopped = True
                     tally["measure_s"] = now - (stop_at - phases.measure_s)
@@ -393,7 +398,6 @@ class Coordinator:
         for _, sent in inflight.values():
             log.write(b"\n" + encode(sent))
         log.write(b"\n")
-        log.close()
         tally["lag"] = lag.to_json()
         tally["sessions_started"] = workload.started
         tally["inflight_max"] = inflight_max
@@ -402,52 +406,57 @@ class Coordinator:
 
     @staticmethod
     def _new_tally() -> dict:
-        tally = dict.fromkeys(
-            (
-                "dispatched",
-                "dispatched_blocks",
-                "dispatched_tokens",
-                "migrations",
-                "hinted",
-                "hinted_blocks",
-                "hinted_same_node",
-                "hinted_cross_node",
-                "completed",
-                "aborted",
-                "timed_out_blocks",
-                "remote_blocks_same_node",
-                "remote_blocks_cross_node",
-                "remote_requests",
-                "failed_blocks",
-                "local_blocks",
-                "gpu_blocks",
-                "primary_blocks",
-                "prompt_blocks",
-                "prefill_tokens",
-            ),
-            0,
+        """What the window offered and what came back; the summary carries
+        both dicts as they are."""
+        offered = (
+            "dispatched",
+            "dispatched_blocks",
+            "dispatched_tokens",
+            "hinted",
+            "hinted_blocks",
+            "hinted_same_node",
+            "hinted_cross_node",
+            "migrations",
         )
-        tally["primary_occupancy_min"] = 1.0  # emptiest host tier at window start
-        tally["busy_s"] = 0.0  # window time not spent waiting
-        return tally
+        completed = (
+            "completed",
+            "aborted",
+            "prompt_blocks",
+            "gpu_blocks",
+            "primary_blocks",
+            "local_blocks",
+            "remote_requests",
+            "remote_blocks_same_node",
+            "remote_blocks_cross_node",
+            "failed_blocks",
+            "timed_out_blocks",
+            "prefill_tokens",
+        )
+        return {
+            "offered": dict.fromkeys(offered, 0),
+            "completed": dict.fromkeys(completed, 0),
+            "primary_occupancy_min": 1.0,  # emptiest host tier at window start
+            "measure_s": 0.0,
+            "busy_s": 0.0,  # window time not spent waiting
+        }
 
     @staticmethod
-    def _tally_done(tally, done, worker, source, nodes) -> None:
+    def _tally_done(completed, done, worker, source, nodes) -> None:
+        completed["failed_blocks"] += done.failed_blocks
+        completed["timed_out_blocks"] += done.timed_out_blocks
         if done.aborted:
             # Dropped by the engine: no first token and nothing reused.
-            tally["aborted"] += 1
+            completed["aborted"] += 1
             return
-        tally["completed"] += 1
-        tally["prompt_blocks"] += done.prompt_blocks
-        tally["gpu_blocks"] += done.gpu_blocks
-        tally["primary_blocks"] += done.primary_blocks
-        tally["local_blocks"] += done.local_blocks
-        tally["failed_blocks"] += done.failed_blocks
-        tally["timed_out_blocks"] += done.timed_out_blocks
-        tally["prefill_tokens"] += done.recomputed_tokens
+        completed["completed"] += 1
+        completed["prompt_blocks"] += done.prompt_blocks
+        completed["gpu_blocks"] += done.gpu_blocks
+        completed["primary_blocks"] += done.primary_blocks
+        completed["local_blocks"] += done.local_blocks
+        completed["prefill_tokens"] += done.recomputed_tokens
         if done.remote_blocks:
-            tally["remote_requests"] += 1
+            completed["remote_requests"] += 1
             same = source >= 0 and nodes[worker] == nodes[source]
-            tally[
+            completed[
                 "remote_blocks_same_node" if same else "remote_blocks_cross_node"
             ] += done.remote_blocks

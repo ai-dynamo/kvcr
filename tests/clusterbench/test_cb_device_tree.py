@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The SGLang profile's device radix tree."""
 
-from clusterbench.device_tree import DeviceTree
+from clusterbench.device_tree import DeviceTree, Node
 
 SYSTEM, A, B = 1, 100, 200
 
@@ -14,7 +14,7 @@ def _grow(tree, stream, pages, parent=None):
     return tree.insert(stream, start, slots, parent)
 
 
-def test_prefix_path_and_slots_follow_segments():
+def test_prefix_and_path_follow_segments():
     tree = DeviceTree(64)
     system = _grow(tree, SYSTEM, 4)
     first = _grow(tree, A, 3, SYSTEM)
@@ -25,7 +25,6 @@ def test_prefix_path_and_slots_follow_segments():
     assert tree.path(request, 9) == [system, first, second]
     assert tree.path(request, 5) == [system, first]
     assert tree.path(request, 4) == [system]
-    assert tree.slots(request, 3, 3) == [system.slots[3], *first.slots[:2]]
     assert tree.node_at(A, 3) is second
     assert tree.node_at(A, 5) is None
     assert len(tree) == 9 and tree.fill_level() == 9 / 64
@@ -60,7 +59,7 @@ def test_eviction_takes_unlocked_leaves_least_recently_used_first():
     tree.unlock([a])
     assert tree.allocate(8) is not None
     assert tree.take_events() == [(A, 0, 4, True), (SYSTEM, 0, 4, True)]
-    assert tree.evictions == 3 and tree.evicted_pages == 12
+    assert tree.evictions == 3
 
 
 def test_eviction_peels_a_stream_from_its_tail():
@@ -87,9 +86,8 @@ def test_a_lock_covers_the_ancestry_and_refuses_before_evicting():
     other = _grow(tree, B, 4, SYSTEM)
     assert tree.ancestry(second) == [system, first, second]
     assert tree.ancestry(first) == [system, first]
-    assert tree.evictable() == 12
+    assert tree.ancestry(Node(B, 9, [0], 0)) == []  # not in the tree
     tree.lock(tree.ancestry(first))  # a pending backup of A's first node
-    assert tree.evictable() == 6
     tree.take_events()
     # Seven pages cannot be had: nothing is evicted for the attempt.
     assert tree.allocate(7) is None and tree.take_events() == []
@@ -97,4 +95,5 @@ def test_a_lock_covers_the_ancestry_and_refuses_before_evicting():
     assert sorted(tree.take_events()) == [(A, 2, 4, True), (B, 0, 4, True)]
     assert tree.held(A) == 2 and other.locks == 0
     tree.unlock(tree.ancestry(first))
-    assert tree.evictable() == 6
+    assert tree.allocate(6) is not None
+    assert tree.take_events() == [(A, 0, 2, True), (SYSTEM, 0, 4, True)]

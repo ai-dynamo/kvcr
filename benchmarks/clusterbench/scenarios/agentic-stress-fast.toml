@@ -4,9 +4,9 @@
 # agentic-stress pushed until KVCR is what limits a rank. In agentic-stress the
 # modelled GPU is the limit (about two requests a second per rank). Here the
 # forward pass, the answers and the think time are cut down so the engine
-# thread spends most of its time inside KVCR calls: about 20 requests a second
-# per rank on Grace cores. Contexts, tiers, sessions and migration are those
-# of agentic-stress, so a fetch is still about a thousand blocks.
+# thread spends most of its time inside KVCR calls. Contexts, tiers, sessions
+# and migration are those of agentic-stress, so a fetch is still about a
+# thousand blocks.
 name = "agentic-stress-fast"
 
 [tiers]
