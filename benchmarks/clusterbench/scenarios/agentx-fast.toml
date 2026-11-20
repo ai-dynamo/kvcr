@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# The AgentX trace pushed until KVCR is what limits a rank, as
+# agentic-stress-fast does for the synthetic workload: the modelled GPU is cut
+# down, answers are shortened fifty-fold (so a rank is not busy decoding),
+# recorded waits are divided by ten and capped at 1.5 s, twice as many plays
+# are live, a quarter of all turns land on another worker, and the KVCR pool
+# is halved so it evicts throughout the window. Prompts, contexts and
+# sub-agents are the trace's own.
+#
+#   ... --config scenarios/agentx-fast.toml --set workload.trace=/path/agentx-062126.cbtrace
+name = "agentx-fast"
+
+[tiers]
+g2_blocks = 32768
+
+[engine]
+step_ms = 0.2
+prefill_us_per_token = 0.15
+
+[workload]
+trace = "agentx-062126.cbtrace"
+sessions_per_worker = 16
+trace_think_scale = 0.1
+trace_output_scale = 0.02
+think_cap_s = 1.5
+
+[router]
+migration_prob = 0.25
+
+[phases]
+fill_s = 45.0
+measure_s = 60.0

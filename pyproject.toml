@@ -45,6 +45,8 @@ packages = ["src/kvcr"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/clusterbench imports the benchmark package, which is not installed.
+pythonpath = ["benchmarks"]
 
 [tool.ruff]
 # Illustrative pseudo-code in design docs is laid out for readability, not for

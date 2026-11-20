@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# vLLM's quick-start shape: no KVCR-owned pool. Peers are served straight from
+# the engine's CPU tier through framework pins, and deposits have nowhere to go.
+name = "peer-only"
+
+[tiers]
+g2_blocks = 0
+
+[workload]
+sessions_per_worker = 8
+
+[router]
+migration_prob = 0.05
+
+[phases]
+fill_s = 45.0
+measure_s = 60.0
+min_primary_occupancy = 0.9
