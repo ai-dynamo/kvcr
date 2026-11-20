@@ -21,6 +21,7 @@ from _kvcr_test_utils import (
     _decode_control_message,
     _decode_notif,
     _has_outstanding_operations,
+    _invalidate,
     _mem_descriptor,
     _new_kvcr,
     _op_entries,
@@ -55,55 +56,20 @@ from kvcr.types import (
 )
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["ready", "ambiguous", "stale", "adapter_error", "incomplete", "duplicate_key"],
-)
-def test_resolve_hashes_reports_each_hash_without_pinning_or_copying(case):
-    """Resolution needs only inventory and an adapter, with no transfer/pin APIs."""
-    key = BlockKey(b"full-key-with-group")
-    adapter = SimpleNamespace()
-    adapter.decode_from_router = Mock(
-        side_effect=[
-            {
-                "ambiguous": ValueError("collision"),
-                "adapter_error": RuntimeError("bug"),
-            }.get(case, key),
-            KeyError(999),
-        ]
+@pytest.mark.parametrize("second", [123, ValueError("encoding failed")])
+def test_resolve_hashes_after_deposit_and_invalidation(second):
+    kvcr, agent, _, _ = _pinless_source(
+        32, key_adapter=Mock(encode_to_router=Mock(side_effect=(123, second)))
     )
-    residency = _LocalDramResidency(
-        (("", 0), (":tail", 1)) if case == "incomplete" else (("", 0),),
-        _LocalDramState.READY,
-        pending_labels={":tail"} if case == "incomplete" else None,
-    )
-    core = SimpleNamespace(
-        _key_adapter=adapter,
-        _block_sizes={"": 16},
-        _block_record_map={}
-        if case == "stale"
-        else {key: _BlockRecord(local_dram=residency)},
-    )
-    hashes = (123, 999)
-    if case == "duplicate_key":
-        adapter.decode_from_router.side_effect = [key, key, KeyError(999)]
-        hashes = (123, 124, 999)
-    groups, failures = _KVCRCore.resolve_hashes(core, hashes)
-    assert failures.pop(999) == "not_found"
-    if case in ("ready", "duplicate_key"):
-        assert groups == {(("",), (16,)): {key: 123}}
-        assert failures == (
-            {124: "resolution_failed"} if case == "duplicate_key" else {}
-        )
-    else:
-        assert not groups and failures == {
-            123: {
-                "ambiguous": "ambiguous_hash",
-                "stale": "source_not_transferable",
-                "incomplete": "source_not_transferable",
-                "adapter_error": "resolution_failed",
-            }[case]
-        }
+    agent.state = "DONE"
+    for key in (b"a", b"b"):
+        kvcr.deposit({key: [_mem_descriptor(end_point_name="source")]})
+        _poll_until(kvcr, bool)
+    unique, shared = ({(("",), (16,)): {b"a": 123}}, {}), ({}, {123: "ambiguous_hash"})
+    assert kvcr._core.resolve_hashes((123,)) == (shared if second == 123 else unique)
+    _invalidate(kvcr, (b"b",))
+    kvcr.poll_completed()
+    assert kvcr._core.resolve_hashes((123,)) == unique
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])

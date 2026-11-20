@@ -160,7 +160,7 @@ For `on_resilience_event` and optional framework-memory quarantine, see the [res
 
 See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api) and [operating flow](design_overview.md#operating-flow) for query, transfer, completion, and release semantics, and the [Router-KVCR API](design_overview.md#router-kvcr-api) for request-scoped hints. `abort()` is currently unimplemented as it cannot be used by the frameworks.
 
-For `kv.prefetch` and `kv.move`, configure the key adapter's reverse lookup at the source and keep polling both peers. See [independent hints](design_overview.md#independent-hints) for the payload and managed-G2 contract.
+For `kv.prefetch` and `kv.move`, keep polling both peers. The source can resolve hashes supplied by its adapter, learned from a peer, or restored by Guard. See [independent hints](design_overview.md#independent-hints) for the payload and managed-G2 contract.
 
 ### Development loop
 

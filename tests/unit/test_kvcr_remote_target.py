@@ -2411,12 +2411,13 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     source = pair.source
     kvcr = source.kvcr
     key = BlockKey(b"reader")
+    hashes = {key: 123, b"other": 456}
+    kvcr._core._key_adapter = SimpleNamespace(encode_to_router=hashes.__getitem__)
     source.deposit(key)
     other = BlockKey(b"other")
     source.deposit(other, 1)
     fetched = kvcr.fetch((key,))
     claim = dict(kvcr.poll_completed())[fetched][key].release_handle
-    kvcr._core._key_adapter = SimpleNamespace(decode_from_router={123: key}.__getitem__)
     kvcr.submit_hint(_router_hint(None, (123, 123), action_type="kv.invalidate"))
     assert kvcr.query((key,)) == [(QueryStatus.MISS, None)]
     handles = [

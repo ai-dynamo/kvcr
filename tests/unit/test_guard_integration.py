@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -154,6 +155,7 @@ def _make_kvcr(
                 pinning.request_pin,
                 pinning.poll_pin_results,
                 pinning.release_pin,
+                key_adapter=SimpleNamespace(encode_to_router=lambda key: key[-1]),
                 framework_control=ZmqPeerControlChannel(
                     "127.0.0.1", int(control_port), "127.0.0.1"
                 ),
@@ -741,6 +743,10 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
     # The G2 half is what a Guard serves; resident-a is spilled to G3.
     assert set(first_guard._core._block_record_map) == {BlockKey(b"resident-b")}
+    assert first_guard._core.resolve_hashes((ord("a"), ord("b"))) == (
+        {(("",), (page_size,)): {b"resident-b": ord("b")}},
+        {ord("a"): "not_found"},
+    )
 
     # Inline, not a child: adoption only claims and reads, and the service's
     # pidfd on our own live pid never fires.

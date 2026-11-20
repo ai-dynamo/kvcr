@@ -583,6 +583,9 @@ class _RemoteFWDram:
                         kvcr._complete_local_dram_fill(
                             failures.keys(), success=False, failures=failures
                         )
+                if op.move:
+                    index = kvcr._local_dram._pools._source_state.index
+                    accepted_keys = [k for k in accepted_keys if index.get(k)]
             else:
                 accepted_keys = completed_keys
                 kvcr._complete(cast(OpHandle, op.op_id[1]), op.key_results())

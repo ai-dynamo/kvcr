@@ -10,6 +10,7 @@ from kvcr.backends.local_disk import _G3Residency
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.runtime.core import _BlockRecord
 from kvcr.runtime.progress import _TransferRef
+from kvcr.service.guard import _with_g3
 from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
     _RECOVERY_ENCODER,
@@ -48,7 +49,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
 
 
 @pytest.mark.parametrize(
-    ("record", "pool_names", "wire", "recovered"),
+    ("record", "pool_names", "legacy_wire", "recovered"),
     [
         (
             _FULLY_LOADED_RECORD,
@@ -66,7 +67,7 @@ _FULLY_LOADED_RECORD = _BlockRecord(
                 g2=[("full", 7), ("full", 2), ("swa", 9)], g3=5, g3_pool="full"
             ),
         ),
-        (_BlockRecord(), _ONE_POOL, [None, None, -1], _BlockRecord()),
+        (_BlockRecord(block_hash=123), _ONE_POOL, [None, None, -1], _BlockRecord()),
         (
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
             _ONE_POOL,
@@ -74,10 +75,10 @@ _FULLY_LOADED_RECORD = _BlockRecord(
             replace(_recovered_record(g2=[(":a", 3), (":part:b:", 2)]), position=4),
         ),
         (
-            replace(_recovered_record(g3=5), position=6),
+            replace(_recovered_record(g3=5), position=6, block_hash=b"advertised"),
             _ONE_POOL,
             [None, [[""], [5]], 6],
-            replace(_recovered_record(g3=5), position=6),
+            replace(_recovered_record(g3=5), position=6, block_hash=b"advertised"),
         ),
         (
             _BlockRecord(
@@ -126,15 +127,17 @@ _FULLY_LOADED_RECORD = _BlockRecord(
 def test_recovery_wire_round_trip_keeps_settled_slots_and_position(
     record: _BlockRecord,
     pool_names: tuple[str, ...],
-    wire: list[object],
+    legacy_wire: list[object],
     recovered: _BlockRecord,
 ) -> None:
     """Complete residencies survive; decode rebuilds other live state."""
     encoded = _payload(record)
 
     # The outer record stays positional; G2 locations carry their pool names.
-    assert msgspec.msgpack.decode(encoded) == wire
+    assert msgspec.msgpack.decode(encoded) == [*legacy_wire, recovered.block_hash]
     assert _decode_recovery_record(encoded, pool_names) == recovered
+    old = _decode_recovery_record(msgspec.msgpack.encode(legacy_wire), pool_names)
+    assert old == replace(recovered, block_hash=None)
 
 
 def test_recovery_encoding_accepts_a_field_appended_later() -> None:
@@ -154,7 +157,7 @@ def test_recovery_encoding_accepts_a_field_appended_later() -> None:
     assert upgraded.g3 == (("",), (5,))
     assert upgraded.position == 6
     assert upgraded.appended == 0
-    future = msgspec.msgpack.encode(_RecoveryBlockV2([("", 3)], (("",), (5,)), 6, 42))
+    future = msgspec.msgpack.encode(replace(upgraded, appended=42))
     assert _decode_recovery_record(future, _ONE_POOL) == positioned
 
 
@@ -256,7 +259,6 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
             local_dram=_LocalDramResidency(
                 [("full", 7), ("swa", 17)], _LocalDramState.FILLING
             ),
-            g3=_G3Residency(("full",), (4,)),
         ),
         discarding_spill: _BlockRecord(
             local_dram=_LocalDramResidency(
@@ -280,6 +282,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
             g3=_G3Residency(("full",), (6,)),
         ),
     }
+    _with_g3(served, {filling_spill: (_G3Residency(("full",), (4,)), -1, 98)})
     # A kept mirror must match exactly what the handback frames carry.
     residency = served[ready].local_dram
     residency.refs = (
@@ -302,7 +305,7 @@ def test_mirror_adopts_exactly_what_a_handback_region_would_carry() -> None:
     assert mirror._records == {
         ready: replace(_recovered_record(g2=[("full", 0), ("swa", 10)]), position=7),
         spilled: _recovered_record(g3=3, g3_pool="full"),
-        filling_spill: _recovered_record(g3=4, g3_pool="full"),
+        filling_spill: replace(_recovered_record(g3=4, g3_pool="full"), block_hash=98),
         discarding_spill: _recovered_record(g3=5, g3_pool="full"),
         partial_spill: _recovered_record(g3=6, g3_pool="full"),
     }
