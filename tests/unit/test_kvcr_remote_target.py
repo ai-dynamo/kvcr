@@ -1554,12 +1554,70 @@ def test_source_answer_times_are_pruned_once_stale():
     kvcr = _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl())
     now = [0.0]
     kvcr._core._clock = lambda: now[0]
-    answered_at = lambda: kvcr._core._remote_fw_dram._source_answered_at  # noqa: E731
+    backend = kvcr._core._remote_fw_dram
     for port in range(4):
         kvcr.submit_hint(_router_hint(f"tcp://source:{port}"), request_id=str(port))
-    _wait_until(lambda: len(answered_at()) == 4)
+    _wait_until(lambda: len(backend._source_answered_at) == 4)
     now[0] = 1.0
-    _wait_until(lambda: not answered_at())
+    _wait_until(lambda: not backend._source_answered_at)
+
+
+def test_target_without_a_return_address_sends_start_write_directly():
+    """A source cannot answer a target whose channel has no endpoint, such as a
+    Guard's shared listener, so that target skips the handshake."""
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl(answers=False)
+    control.endpoint = None
+    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
+    key = BlockKey(b"k0")
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="load")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+    start_write = _start_write_sent(control)
+    agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
+
+
+def test_failed_send_makes_an_answered_source_answer_again():
+    """A send that fails can mean the source is gone, so its last answer no longer
+    lets a start_write skip the handshake."""
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl(answers=False)
+    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
+    now = [0.0]
+    kvcr._core._clock = lambda: now[0]
+    source = "tcp://source:1"
+    primed, wire = _acked_deliver(control, kvcr, source, BlockKey(b"k0"))
+    agent.notifs["source"] = [_write_done_notification(wire)]
+    assert _poll_until(kvcr, bool) == [(primed, _op_entries({BlockKey(b"k0"): True}))]
+
+    control.send_result = False
+    kvcr.submit_hint(_router_hint(source), request_id="failed")
+    failed = kvcr.deliver({BlockKey(b"k1"): [_mem_descriptor()]}, request_id="failed")
+    assert _poll_until(kvcr, bool) == [
+        (
+            failed,
+            _op_entries({BlockKey(b"k1"): (OpEntryStatus.FAILED, "control_error")}),
+        )
+    ]
+
+    control.send_result = True
+    control.sent.clear()
+    key = BlockKey(b"k2")
+    kvcr.submit_hint(_router_hint(source), request_id="retry")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+    _wait_until(lambda: bool(control.sent))
+    time.sleep(0.01)
+    assert [_decode_control_message(raw)["type"] for _, raw in control.sent] == [
+        "target_metadata"
+    ]
+    control.incoming.append(
+        msgspec.msgpack.encode(
+            {"type": "target_metadata_ack", "sender_control_endpoint": source}
+        )
+    )
+    start_write = _start_write_sent(control)
+    agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
 
 
 @pytest.mark.parametrize(

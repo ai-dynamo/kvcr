@@ -807,6 +807,8 @@ class _RemoteFWDram:
         )
         if not sent:
             self._invalidate_control_peer(endpoint)
+            # A source we could not reach must answer again before a start_write.
+            self._source_answered_at.pop(endpoint, None)
             return False
         if includes_metadata:
             self._metadata_retry_after[endpoint] = (
@@ -824,6 +826,9 @@ class _RemoteFWDram:
 
     def _source_quiet(self, endpoint: str, now: float) -> bool:
         """Whether ``endpoint`` must answer before a start_write is sent to it."""
+        if not isinstance(getattr(self._control, "endpoint", None), str):
+            # Without a return address of our own, no answer can arrive.
+            return False
         # A metadata exchange counts as current for as long as it would go
         # without a resend.
         return (
