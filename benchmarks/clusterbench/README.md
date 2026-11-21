@@ -19,18 +19,23 @@ and to compare KVCR source trees.
 
 ## Running
 
-From a KVCR checkout with its environment set up (`uv sync`), plus the vLLM
-commit pinned in `requirements.txt`, built without its CUDA extensions:
+The benchmark needs the vLLM commit pinned in `requirements.txt`, built
+without its CUDA extensions. From a KVCR checkout, in an environment of its
+own:
 
 ```bash
-VLLM_TARGET_DEVICE=empty CARGO=false uv pip install -r benchmarks/clusterbench/requirements.txt
+uv venv .venv-clusterbench && source .venv-clusterbench/bin/activate
+VLLM_TARGET_DEVICE=empty CARGO=false uv pip install -e . --group dev \
+  -r benchmarks/clusterbench/requirements.txt \
+  --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+export PYTHONPATH=benchmarks
 
 # Four workers and a coordinator on this machine. Nodes are only labels here.
-PYTHONPATH=benchmarks uv run python -m clusterbench local \
+python -m clusterbench local \
   --config benchmarks/clusterbench/scenarios/smoke.toml --nodes 2 --per-node 2
 
 # Compare two KVCR checkouts (or one with itself, for the noise floor).
-PYTHONPATH=benchmarks uv run python -m clusterbench ab \
+python -m clusterbench ab \
   --config benchmarks/clusterbench/scenarios/agentic-stress.toml \
   --nodes 2 --per-node 2 --cores-per-worker 4 --reps 3 \
   --arm base=/path/to/kvcr-main --arm cand=/path/to/kvcr-branch
@@ -44,7 +49,7 @@ quote cluster numbers.
 
 Any option can be set with `--set section.field=value`; `config.py` documents
 them all, and an option it does not have is refused. Tests:
-`uv run pytest tests/clusterbench`.
+`python -m pytest tests/clusterbench` (without vLLM, those that need it skip).
 
 ## Scenarios
 
@@ -91,8 +96,8 @@ block is a whole number of pages: a host with 64 KiB pages needs
 sessions, 68,266 requests). Compile it once, then pass the file to the run:
 
 ```bash
-PYTHONPATH=benchmarks uv run python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
-PYTHONPATH=benchmarks uv run python -m clusterbench local \
+python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
+python -m clusterbench local \
   --config benchmarks/clusterbench/scenarios/agentx-fast.toml \
   --set workload.trace=$PWD/agentx-062126.cbtrace --nodes 2 --per-node 4
 ```

@@ -442,7 +442,7 @@ Use this progression so failures are localized:
 3. **Two-worker transfer correctness** - exercise router, workers, peer control, NIXL, and output correctness together.
 4. **Performance regression tests** - only after correctness is green.
 
-For KVCR's own host-side cost at deployment scale, without GPUs or an engine, use the cluster benchmark in [`benchmarks/clusterbench`](../benchmarks/clusterbench/README.md): many real KVCR instances pulling from each other, driven by a fake engine with the call pattern of vLLM's tier or of SGLang's direct linker, on generated sessions or a replay of the AgentX trace.
+For KVCR's own host-side cost at deployment scale, without GPUs or a model, use the cluster benchmark in [`benchmarks/clusterbench`](../benchmarks/clusterbench/README.md): many real KVCR instances pulling from each other, each driven by vLLM's own scheduler, on generated sessions or a replay of the AgentX trace.
 
 ---
 
