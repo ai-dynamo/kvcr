@@ -32,6 +32,7 @@ from _kvcr_test_utils import (
     _poll_until,
     _RecordingFIFOPolicy,
     _router_hint,
+    _start_write_sent,
     _wait_until,
     _write_done_notification,
 )
@@ -127,8 +128,7 @@ def test_kvcr_opportunistic_query_accepts_key_outside_hint(monkeypatch, caplog):
     op_handle = target.deliver({requested_key: [_mem_descriptor()]}, request_id="req")
 
     assert list(target.poll_completed()) == []
-    _wait_until(lambda: bool(control.sent))
-    assert _decode_control_message(control.sent[0][1])["keys"] == [requested_key]
+    assert _start_write_sent(control)["keys"] == [requested_key]
     target.discard_hint("req")
     assert target.query((requested_key,), "req") == [(QueryStatus.MISS, None)]
     agent.notifs["source"] = [_write_done_notification(op_handle)]
@@ -235,7 +235,12 @@ def test_remote_fetch_uses_local_then_framework_sources(action_type) -> None:
     target_agent.notifs["source"] = [notification]
     completed = dict(_poll_until(target, lambda results: bool(results)))
     if action_type == "kv.evict_on_fetch":
-        _wait_until(lambda: len(target_control.sent) == 2)
+        _wait_until(
+            lambda: (
+                _decode_control_message(target_control.sent[-1][1])["type"]
+                == "write_accepted"
+            )
+        )
         source_control.incoming.append(target_control.sent[-1][1])
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
     assert source.query((keys[0],)) == [
@@ -383,10 +388,7 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
         ].remote_fill_keys
         target_agent.state = "DONE"
         assert dict(_poll_until(target, bool))[deposit][key].success
-    _wait_until(lambda: bool(target_control.sent))
-    assert _decode_control_message(target_control.sent[-1][1])["key_layout"] == (
-        expected_layout
-    )
+    assert _start_write_sent(target_control)["key_layout"] == (expected_layout)
     source_control.incoming.extend(message for _, message in target_control.sent)
     if success:
         _wait_until(lambda: len(source_agent.xfers) == 2)
@@ -403,7 +405,12 @@ def test_remote_fetch_preserves_block_layout_and_bytes(
     result = dict(_poll_until(target, bool))[fetch][key]
     assert result.success is success
     if evict:
-        _wait_until(lambda: len(target_control.sent) == 2)
+        _wait_until(
+            lambda: (
+                _decode_control_message(target_control.sent[-1][1])["type"]
+                == "write_accepted"
+            )
+        )
         source_control.incoming.append(target_control.sent[-1][1])
     if success:
         assert {name: memory.raw for name, memory in target_local.items()} == pool_data
@@ -438,8 +445,7 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
     residency = target._core._block_record_map[key].local_dram
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch([key], "req", expected_layout=["p:a", "p:b"])
-    _wait_until(lambda: bool(control.sent))
-    message = _decode_control_message(control.sent[0][1])
+    message = _start_write_sent(control)
     if queued_success:
         local[16:] = primary[16:]
         agent.notifs["source"] = [_write_done_notification(message["op_handle"])]
@@ -497,8 +503,7 @@ def test_remote_staging_commits_available_keys(monkeypatch, caplog) -> None:
     fetch = target.fetch(keys, request_id="req")
     # A second fetch of the same request shares the fill and its failures.
     second = target.fetch(keys, request_id="req")
-    _wait_until(lambda: bool(control.sent))
-    message = _decode_control_message(control.sent[0][1])
+    message = _start_write_sent(control)
     assert message["key_layout"] == [""]  # One declaration for the whole batch.
     # Malformed handles must not fail the fill or discard its valid completion.
     agent.notifs["source"] = [
@@ -640,8 +645,7 @@ def test_remote_fetch_timeout_keeps_slot_until_source_is_terminal(
     fetch = target.fetch((key,), request_id="req")
     # Both callers share the pending fill and must each complete once.
     second_fetch = target.fetch((key,), request_id="req")
-    _wait_until(lambda: bool(control.sent))
-    message = _decode_control_message(control.sent[0][1])
+    message = _start_write_sent(control)
 
     progress = target._core._progress
     _wait_until(lambda: ("target", message["op_handle"]) in progress._in_flight_ops)
@@ -766,8 +770,7 @@ def test_remote_fetch_reports_a_nonterminal_source_cancellation_as_aborted():
     key = BlockKey(b"k0")
     target.submit_hint(_router_hint("tcp://source:1"), request_id="req")
     fetch = target.fetch((key,), request_id="req")
-    _wait_until(lambda: bool(control.sent))
-    handle = _decode_control_message(control.sent[0][1])["op_handle"]
+    handle = _start_write_sent(control)["op_handle"]
     # A delivery of the same key waits for that fill.
     delivery = target.deliver({key: [_mem_descriptor()]})
 
@@ -837,7 +840,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         {key: [_mem_descriptor()]},
         request_id="req",
     )
-    _wait_until(lambda: bool(target_control.sent))
+    _start_write_sent(target_control)
     source_control.incoming.extend(message for _, message in target_control.sent)
 
     assert _poll_until(source, lambda _: bool(source_agent.sent_notifs)) == []
@@ -1104,7 +1107,7 @@ def test_only_a_refusal_from_this_operation_s_source_finishes_it():
 def test_kvcr_metadata_ack_retry_lifecycle():
     agent = FakeNixlAgent(metadata=b"target-md")
     pinning = FakePrimaryPinning()
-    control = FakeBytesControl()
+    control = FakeBytesControl(answers=False)
     kvcr = _new_kvcr(
         agent,
         pinning,
@@ -1156,6 +1159,25 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     assert [
         _decode_control_message(message)["type"] for _, message in control.sent
     ] == ["target_metadata"]
+
+    # The failed send dropped the source's answer, so a delivery waits for a new one.
+    control.recv = Mock(wraps=control.recv)
+    reconnected = kvcr.deliver({key: [_mem_descriptor()]}, request_id="reconnect")
+    received = control.recv.call_count
+    # A receive is counted when it starts, and the pass that picks up the delivery
+    # receives before progressing it; the third receive follows that whole pass.
+    _wait_until(lambda: control.recv.call_count >= received + 3)
+    assert [
+        _decode_control_message(message)["type"] for _, message in control.sent
+    ] == ["target_metadata"]
+    control.incoming.append(
+        msgspec.msgpack.encode(
+            {"type": "target_metadata_ack", "sender_control_endpoint": source}
+        )
+    )
+    start_write = _start_write_sent(control)
+    agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+    assert _poll_until(kvcr, bool) == [(reconnected, _op_entries({key: True}))]
 
 
 @pytest.mark.parametrize("terminal,success", [(True, True), (False, False)])
@@ -1392,7 +1414,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     assert [error.state for error in errors] == ["uncertain"]
     assert errors[0].op_handle == handle
 
-    # An abandoned operation must not blacklist the endpoint for fresh work.
+    # An abandoned operation must not blacklist the endpoint for fresh work. Let the
+    # metadata retry interval that the last probe started run out first.
+    now += 0.2
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     retry = kvcr.deliver(
         {key: [_mem_descriptor(label="framework")]}, request_id="retry"
@@ -1436,6 +1460,143 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         for _, raw in control.sent
         if (message := _decode_control_message(raw))["type"] == "write_probe"
     ] == [handle, handle]
+
+
+@pytest.mark.parametrize("source", ["answers", "answers_late", "silent", "unreachable"])
+@pytest.mark.parametrize("acked_long_ago", [False, True])
+def test_quiet_source_must_answer_before_start_write(source, acked_long_ago, caplog):
+    """A dead source costs a miss by the deadline, not uncertain destinations."""
+    caplog.set_level(logging.WARNING, logger="kvcr.runtime.core")
+    errors = []
+    now = [0.0]
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl(answers=False)
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", 16)],
+            operation_timeout_ms=1000,
+            abandon_timeout_ms=7000,
+        ),
+        on_resilience_event=errors.append,
+    )
+    kvcr._core._clock = lambda: now[0]
+    endpoint, key = "tcp://source:1", BlockKey(b"k1")
+    if acked_long_ago:
+        # A source that just answered gets its start_write without a round trip.
+        primed, wire = _acked_deliver(control, kvcr, endpoint, BlockKey(b"k0"))
+        agent.notifs["source"] = [_write_done_notification(wire)]
+        assert _poll_until(kvcr, bool) == [
+            (primed, _op_entries({BlockKey(b"k0"): True}))
+        ]
+        now[0] = 1.0
+    control.sent.clear()
+    control.send_result = source != "unreachable"
+
+    def sent_types():
+        return [_decode_control_message(raw)["type"] for _, raw in control.sent]
+
+    control.recv = Mock(wraps=control.recv)
+    kvcr.submit_hint(_router_hint(endpoint), request_id="load")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+    received = control.recv.call_count
+    # A receive is counted when it starts, and the pass that picks up the delivery
+    # receives before progressing it; the third receive follows that whole pass.
+    _wait_until(lambda: control.recv.call_count >= received + 3)
+    # Nothing that exposes a destination goes out before the source answers.
+    assert set(sent_types()) == {"target_metadata"}
+    if source != "unreachable":
+        # The hint and the operation share one exchange.
+        assert sent_types() == ["target_metadata"]
+    assert _decode_control_message(control.sent[0][1])["target_agent_metadata"] == (
+        b"target-md"
+    )
+
+    if source in ("answers", "answers_late"):
+        ack = {
+            "type": "target_metadata_ack",
+            "sender_control_endpoint": endpoint,
+            "sender_incarnation": "restarted" if acked_long_ago else "source",
+        }
+        if source == "answers_late":
+            # Progress stalls past the freshness window after handling the ack and
+            # before the waiting operation resumes, so the ack has gone stale.
+            backend = kvcr._core._remote_fw_dram
+            handle_ack, stalled = backend._handle_target_metadata_ack, []
+
+            def handle_then_stall(progress, payload):
+                handle_ack(progress, payload)
+                if not stalled:
+                    stalled.append(True)
+                    now[0] += 0.2
+                    control.answers = True
+
+            backend._handle_target_metadata_ack = handle_then_stall
+        control.incoming.append(msgspec.msgpack.encode(ack))
+        start_write = _start_write_sent(control)
+        assert start_write["source_incarnation"] == ack["sender_incarnation"]
+        asks = [
+            message
+            for message in map(
+                _decode_control_message, (raw for _, raw in control.sent)
+            )
+            if message["type"] == "target_metadata"
+        ]
+        # A stale ack costs one more full handshake, not a stream of empty ones.
+        assert len(asks) == (2 if source == "answers_late" else 1)
+        assert all(ask["target_agent_metadata"] == b"target-md" for ask in asks)
+        agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
+    elif source == "silent":
+        # The wait is bounded by the operation's own deadline, not another timeout.
+        now[0] += 1.0
+        assert _poll_until(kvcr, bool) == [
+            (handle, _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")}))
+        ]
+        assert "did not answer before the deadline" in caplog.text
+    else:
+        # A handshake that cannot be sent fails at once, as a control error.
+        assert _poll_until(kvcr, bool) == [
+            (handle, _op_entries({key: (OpEntryStatus.FAILED, "control_error")}))
+        ]
+        assert "did not answer" not in caplog.text
+    if source in ("silent", "unreachable"):
+        assert "start_write" not in sent_types()
+        assert kvcr._core._remote_fw_dram._request_hints["load"].failed
+    assert errors == []
+    assert not _has_outstanding_operations(kvcr)
+
+
+def test_source_answer_times_are_pruned_once_stale():
+    """Endpoints that stop answering, such as a restarted worker's old port,
+    must not accumulate."""
+    kvcr = _new_kvcr(FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl())
+    now = [0.0]
+    kvcr._core._clock = lambda: now[0]
+    backend = kvcr._core._remote_fw_dram
+    for port in range(4):
+        kvcr.submit_hint(_router_hint(f"tcp://source:{port}"), request_id=str(port))
+    _wait_until(lambda: len(backend._source_answered_at) == 4)
+    now[0] = 1.0
+    _wait_until(lambda: not backend._source_answered_at)
+
+
+def test_target_without_a_return_address_sends_start_write_directly():
+    """A source cannot answer a target whose channel has no endpoint, such as a
+    Guard's shared listener, so that target skips the handshake."""
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl(answers=False)
+    control.endpoint = None
+    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
+    key = BlockKey(b"k0")
+    kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="load")
+    handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
+    start_write = _start_write_sent(control)
+    agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
 
 
 @pytest.mark.parametrize(
@@ -1540,6 +1701,8 @@ def test_remote_write_cancellation_and_late_completion(
     assert _poll_until(kvcr, bool) == [
         (handle, _op_entries({key: (OpEntryStatus.TIMEOUT, "deadline")}))
     ]
+    # Let the metadata retry interval that the last probe started run out.
+    now += 0.2
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
     _wait_until(
@@ -1733,11 +1896,16 @@ def test_kvcr_request_scoped_sources_survive_local_deposits(
             kvcr.deliver({key: [_mem_descriptor(1, ":b")]}, request)
             for request in ("req-a", "req-b")
         ]
-        _wait_until(lambda: len(control.sent) == previous + 2)
-        assert [endpoint for endpoint, _ in control.sent[-2:]] == [
-            "tcp://source-A:1",
-            "tcp://source-B:1",
-        ]
+
+        def start_writes():
+            return [
+                endpoint
+                for endpoint, raw in control.sent[previous:]
+                if _decode_control_message(raw)["type"] == "start_write"
+            ]
+
+        _wait_until(lambda: len(start_writes()) == 2)
+        assert start_writes() == ["tcp://source-A:1", "tcp://source-B:1"]
         # Remote deliveries are tracked per operation, not on block records.
         in_flight = {("target", handle) for handle in handles}
         assert in_flight <= set(kvcr._core._progress._in_flight_ops)
@@ -1877,7 +2045,7 @@ def test_remote_framework_dram_transfers_available_keys(
         {key: [_mem_descriptor(index)] for index, key in enumerate(keys)},
         request_id="req",
     )
-    _wait_until(lambda: bool(target_control.sent))
+    _start_write_sent(target_control)
     source_control.incoming.extend(message for _, message in target_control.sent)
 
     assert _poll_until(source, lambda _: bool(source_agent.xfers)) == []
@@ -2014,7 +2182,7 @@ class _Peer:
         self.primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
         self.local = ctypes.create_string_buffer(32)
         self.agent = _CopyingWriteAgent(metadata=name.encode())
-        self.control = FakeBytesControl(f"tcp://{name}:1")
+        self.control = FakeBytesControl(f"tcp://{name}:1", answers=False)
         self.events, self.results = [], {}
         self.kvcr = _new_kvcr(
             self.agent,

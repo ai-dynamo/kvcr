@@ -228,6 +228,7 @@ class _TargetPullOp(_RemoteOp):
     # Why the whole operation failed, or why each unserved key was not written.
     failure_reason: str | None = None
     unserved: dict[BlockKey, str] = field(default_factory=dict)
+    awaiting_source: bool = False
     trace: _nvtx._LifecycleTrace | None = field(default=None, repr=False, compare=False)
 
     def progress(
@@ -237,6 +238,23 @@ class _TargetPullOp(_RemoteOp):
         if completed and self.trace is not None:
             self.trace.end("target.remote")
         return completed, did_work
+
+    def _await_source(
+        self, progress: _KVCRProgress, now: float
+    ) -> tuple[bool, bool] | None:
+        """Ask a quiet source to answer; None if the request could not be sent."""
+        backend = self._backend
+        endpoint = self.remote_ctrl_ep
+        self.awaiting_source = True
+        # One exchange in flight serves every operation waiting on this source.
+        if now < backend._metadata_retry_after.get(endpoint, 0):
+            return False, False
+        # The source acks only a target_metadata that carries metadata, and an
+        # earlier ack may have gone stale before this operation resumed.
+        backend._metadata_acked_sources.discard(endpoint)
+        if not backend._send_control(progress, endpoint, _TargetMetadata()):
+            return None
+        return False, True
 
     def _progress(
         self, progress: _KVCRProgress, event: object | None
@@ -271,6 +289,13 @@ class _TargetPullOp(_RemoteOp):
                 # A stale ACK from the dead peer may have re-acked the endpoint.
                 backend._metadata_acked_sources.discard(self.remote_ctrl_ep)
             if now >= self.deadline:
+                if self.awaiting_source:
+                    logger.warning(
+                        "KVCR source %s did not answer before the deadline; op=%d "
+                        "fails without exposing its destinations",
+                        self.remote_ctrl_ep,
+                        self.op_id[1],
+                    )
                 if trace is not None:
                     trace.reject(
                         "target.start_write.rejected",
@@ -280,23 +305,35 @@ class _TargetPullOp(_RemoteOp):
                 self.success = False
                 self.failure_reason = Reason.DEADLINE.value
                 self.state = _TargetPullState.FINISHED
-                backend._record_progress_duration(scope, self.started_at, "timeout")
+                backend._record_progress_duration(
+                    scope,
+                    self.started_at,
+                    "source_unresponsive" if self.awaiting_source else "timeout",
+                )
                 self._record_unserved(scope)
                 return True, True
-            sent = backend._send_control(
-                progress,
-                self.remote_ctrl_ep,
-                _StartWrite(
-                    op_handle=self.op_id[1],
-                    remaining_timeout_ms=(self.deadline - now) * 1000,
-                    source_incarnation=self.source_incarnation,
-                    keys=self.ordered_keys,
-                    dst_descriptors=self.dst_descriptors,
-                    key_layout=self.key_layout if self.local_fill else (),
-                    move=self.move,
-                    g2_only=self.g2_only,
-                ),
-            )
+            sent = False
+            # start_write lets the source write into the destinations, so a source
+            # that may be gone must answer first.
+            if backend._source_quiet(self.remote_ctrl_ep, now):
+                awaiting = self._await_source(progress, now)
+                if awaiting is not None:
+                    return awaiting
+            else:
+                sent = backend._send_control(
+                    progress,
+                    self.remote_ctrl_ep,
+                    _StartWrite(
+                        op_handle=self.op_id[1],
+                        remaining_timeout_ms=(self.deadline - now) * 1000,
+                        source_incarnation=self.source_incarnation,
+                        keys=self.ordered_keys,
+                        dst_descriptors=self.dst_descriptors,
+                        key_layout=self.key_layout if self.local_fill else (),
+                        move=self.move,
+                        g2_only=self.g2_only,
+                    ),
+                )
             if not sent:
                 if trace is not None:
                     trace.reject("target.start_write.rejected", Reason.CONTROL_ERROR)

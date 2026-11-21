@@ -104,6 +104,8 @@ class TelemetryStats(Protocol):
 
 
 class FrameworkControl(Protocol):
+    endpoint: str | None
+
     def send(self, endpoint: str, message: bytes) -> bool: ...
 
     def recv(self) -> list[tuple[bytes, float]]:

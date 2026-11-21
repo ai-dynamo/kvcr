@@ -5,11 +5,12 @@
 import msgspec
 import pytest
 from _kvcr_test_utils import (
+    _decode_control_message,
     _mem_descriptor,
     _poll_until,
     _record_hint_results,
     _router_hint,
-    _wait_until,
+    _start_write_sent,
     _write_done_notification,
 )
 from _nvtx_test_utils import make_target, payloads, reason_of
@@ -43,7 +44,7 @@ def test_batch_hint_traces(recording, monkeypatch, level, scenario):
     if scenario == "replacement":
         for expected in (1, 2):
             handle = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, "request")
-            _wait_until(lambda: len(control.sent) == expected)
+            _start_write_sent(control, expected - 1)
             agent.notifs["source"] = [_write_done_notification(handle)]
             assert handle in dict(_poll_until(kvcr, bool))
         assert len(payloads(recording, "hint.used")) == (0 if level == "off" else 2)
@@ -52,7 +53,8 @@ def test_batch_hint_traces(recording, monkeypatch, level, scenario):
         assert [result.status for result in results] == [HintStatus.ACCEPTED] * 3
         failed = kvcr.deliver({BlockKey(b"k"): [_mem_descriptor()]}, "request")
         assert not dict(kvcr.poll_completed())[failed][BlockKey(b"k")].success
-        assert len(control.sent) == 2
+        start_writes = [_decode_control_message(raw) for _, raw in control.sent]
+        assert [m["type"] for m in start_writes].count("start_write") == 2
     stored = kvcr._core._remote_fw_dram._request_hints["request"]
     assert stored.block_hashes == {2 if scenario == "replacement" else 1}
     assert stored.failed == (scenario == "replacement")
