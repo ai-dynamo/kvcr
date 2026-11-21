@@ -5,6 +5,7 @@
 import heapq
 import logging
 import math
+import numbers
 from collections.abc import Collection, Generator
 
 from ..policy import KVCachePolicy
@@ -40,7 +41,11 @@ class _PolicyInvoker:
         except Exception:
             logger.warning("KVCR eviction_score failed", exc_info=True)
             return previous_score
-        if type(score) not in (int, float) or not math.isfinite(score):
+        # Accept real numbers such as numpy.float64, but never bool.
+        if (
+            type(score) not in (int, float)
+            and (isinstance(score, bool) or not isinstance(score, numbers.Real))
+        ) or not math.isfinite(score):
             logger.warning("KVCR eviction_score returned invalid score %r", score)
             return previous_score
         return float(score)
