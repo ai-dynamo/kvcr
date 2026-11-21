@@ -861,23 +861,33 @@ def test_startup_failure_is_reported_to_main(monkeypatch, prepared) -> None:
     assert exc_info.value is expected
 
 
-def test_loop_failure_is_reported_to_main() -> None:
+def test_loop_failure_is_reported_to_main(monkeypatch) -> None:
     expected = RuntimeError("loop failed")
-    stepped = threading.Event()
 
     def poll(
         _progress: _KVCRProgress,
         items: list[object],
     ) -> tuple[dict[object, object], bool]:
         if items:
-            stepped.set()
             raise expected
         return {}, False
 
     progress = _KVCRProgress(lambda _: None, poll, lambda: [], lambda: None)
     progress.start()
+    reader, writer = (end.fileno() for end in progress._wake_pipe[:2])
+    write = os.write
+
+    def write_after_exit(fd, data):
+        # The worker consumes the queued item and exits before this wake write.
+        progress._thread.join(5)
+        assert not progress._thread.is_alive()
+        return write(fd, data)
+
+    monkeypatch.setattr(os, "write", write_after_exit)
     progress.submit(object())
-    assert stepped.wait(timeout=1)
+    for fd in (reader, writer):
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
 
     with pytest.raises(RuntimeError, match="loop failed") as exc_info:
         progress.close()
