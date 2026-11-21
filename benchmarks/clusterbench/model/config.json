@@ -1,0 +1,1 @@
+{"model_type": "opt", "architectures": ["OPTForCausalLM"], "max_position_embeddings": 1099511627776, "dtype": "float16"}

@@ -1,0 +1,8 @@
+# The vLLM whose scheduler and KV-offload tiering drive KVCR in clusterbench:
+# upstream main on 2026-11-21. KVCR main needs a5db4c9ff5 or later.
+# Install with VLLM_TARGET_DEVICE=empty: Python only, no CUDA extensions.
+vllm @ git+https://github.com/vllm-project/vllm@f8b29fab414884206460fe63b983ca34fc6e3e9b
+# The torch that commit pins; a Python-only build does not require one.
+torch==2.14.0
+# vLLM's CPU platform refuses x86 without Triton; CPU torch does not bring it.
+triton==3.8.0 ; platform_machine == "x86_64"

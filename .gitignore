@@ -12,3 +12,7 @@ __pycache__/
 /dist/
 /htmlcov/
 *.egg-info/
+
+# clusterbench: its environment and run directories
+/.venv-clusterbench/
+/runs/

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# The same workload pushed hard: twice the sessions, short answers and think
+# times so turns come quickly, a quarter of all turns migrating, and a KVCR
+# pool small enough that it evicts throughout the window.
+name = "agentic-stress"
+
+[tiers]
+g2_blocks = 16384
+
+[workload]
+sessions_per_worker = 16
+output_tokens_median = 60
+think_median_s = 0.3
+think_cap_s = 5.0
+
+[router]
+migration_prob = 0.25
+
+[phases]
+fill_s = 45.0
+measure_s = 60.0
+min_primary_occupancy = 0.9
