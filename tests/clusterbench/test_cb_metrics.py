@@ -3,7 +3,7 @@
 import random
 import threading
 
-from clusterbench.metrics import LogHist, Telemetry, Window, thread_delta
+from clusterbench.metrics import LogHist, Window, thread_delta
 
 
 def test_loghist_quantiles_are_close_and_merge_exactly():
@@ -29,13 +29,19 @@ def test_window_accumulates_calls_and_kvcr_telemetry():
     window = Window()
     window.call("query", 0.002, calls=4, items=4)
     window.call("query", 0.001, calls=1, items=1)
-    stats = Telemetry()
-    stats.increase_counter("kvcr_transfer_blocks", 5, ("remote_deliver",))
-    stats.observe_histogram("kvcr_duration_seconds", 0.01, ("transfer", "success"))
-    stats.observe_histogram("kvcr_duration_seconds", 0.02, ("transfer", "success"))
-    stats.set_gauge("kvcr_state", 3, ("connected_remotes",))
-    window.merge_telemetry(stats)
-    window.merge_telemetry(None)
+    # KVCR's telemetry as vLLM's stats object holds it: kinds, then values
+    # per label tuple.
+    kinds = {
+        "kvcr_transfer_blocks": "counter",
+        "kvcr_duration_seconds": "histogram",
+        "kvcr_state": "gauge",
+    }
+    values = {
+        "kvcr_transfer_blocks": {("remote_deliver",): 5},
+        "kvcr_duration_seconds": {("transfer", "success"): [0.01, 0.02]},
+        "kvcr_state": {("connected_remotes",): 3},
+    }
+    window.merge_stats(kinds, values)
     report = window.to_json()
     assert report["calls"]["query"] == 5 and report["items"]["query"] == 5
     assert abs(report["secs"]["query"] - 0.003) < 1e-12

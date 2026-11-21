@@ -1,62 +1,81 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""A GPU-free engine that calls KVCR the way vLLM's KVCR tier does.
+"""vLLM's own scheduler, with no model behind it, driving a real KVCR.
 
-Modelled on vLLM ``main`` at ``8278030eba``:
+The worker hosts vLLM's ``Scheduler`` with the offloading connector and the
+KVCR secondary tier, built the way vLLM's unit tests build them
+(``_make_tiering_engine_scheduler`` in
+``tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py``). vLLM
+constructs the KVCR, owns the device and CPU tiers, and makes every KVCR
+call; ``kvcr_probe.py`` watches those calls. The vLLM commit is pinned in
+``requirements.txt``.
 
-- ``vllm/v1/kv_offload/tiering/kvcr/manager.py`` (``KVCRSecondaryTierManager``)
-- ``vllm/v1/kv_offload/tiering/manager.py`` (``TieringOffloadingManager``)
-- ``vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py``
-- ``vllm/v1/kv_offload/cpu/policies/lru.py``
+Only what needs a GPU is faked:
 
-One step is, in vLLM's order: schedule (lookups, then store jobs), schedule
-end (poll, serve pins, flush promotions into ``deliver``), the forward pass
-(a GIL-released sleep), then output handling (store completions into
-``deposit``, finished requests, ``get_stats``).
+- The forward pass: a sleep that releases the GIL, then one sampled token for
+  every request past its prefill.
+- The worker side of the connector. No bytes move between device and CPU;
+  each load and store job is reported finished in the step after the one
+  that issued it, which is when vLLM's worker reports them (it defers stores
+  a step and starts loads after the forward pass). A flushed job, or a load
+  the scheduler asked for synchronously, is reported in its own step.
 
-What KVCR sees, and must keep seeing if this file changes:
-
-- ``query`` is one key per call, only on a primary-tier miss, and the scan
-  runs to the end of the prompt unless a key misses.
-- A request's promotions go out as one ``deliver`` per step, into primary-tier
-  slots. ``fetch`` and ``release`` are never used.
-- Every GPU->CPU store is followed by a ``deposit`` of the same blocks.
-- ``align_sequence`` covers the request's whole prefix up to the job's last
-  block after every completed deliver or deposit, and the whole request at
-  finish, followed by ``discard_hint``.
-- ``poll_completed`` runs on the first lookup of a step, again for every
-  request that stores, and at schedule end if it has not run yet.
-- Pins are resolved once per step from the primary tier and released at the
-  next poll. ``get_stats`` runs every step.
-
-The device tier is bookkeeping: a request is admitted when every token it
-will hold, cacheable or not, fits beside the running requests', first come
-first served, and every token a step computes, prompt or answer, comes out of
-``max_batched_tokens``. A request's blocks become the most recently used when
-it finishes, on the device and in the CPU tier, as in vLLM.
+Block hashes are given to vLLM, not computed from tokens: the block id
+(``ids.py``) for every block a segment names, and ids private to the request
+for the rest.
 """
 
+# ruff: noqa: E402  (the environment is prepared before vLLM is imported)
 from __future__ import annotations
 
+import functools
+import glob
+import mmap
+import os
 import time
-from collections import deque
+from pathlib import Path
 
-import msgspec
+from .kvcr_host import prepare_environment
 
-from kvcr.types import CacheTier, MemoryRef, QueryStatus
+prepare_environment()  # vLLM picks its platform the moment it is imported
+
+import numpy as np
+import torch
+from vllm import SamplingParams
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVEventsConfig,
+    KVTransferConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
+from vllm.distributed.kv_events import MEDIUM_CPU, MEDIUM_GPU, BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingWorkerMetadata,
+)
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    KVCacheGroup,
+    KVCacheLayerConfig,
+)
+from vllm.v1.kv_hints.protocol import KvHintAction, KvHintsEnvelope
+from vllm.v1.kv_offload.tiering.kvcr import manager as kvcr_tier
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.request import Request as VllmRequest
+from vllm.v1.request import RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
+
+import kvcr
 
 from .config import RunConfig
-from .ids import (
-    KeyCache,
-    block_id,
-    id_to_key,
-    key_to_id,
-    keys_to_ids,
-    segment_ids,
-    warm_stream,
-)
+from .ids import INDEX_BITS, PRIVATE_BASE, block_hash, block_id, segment_ids
+from .kvcr_probe import KvcrProbe
 from .metrics import Window
-from .primary_tier import KeyEvent, PrimaryTier, StreamCache
 from .protocol import (
     TIER_DEVICE,
     TIER_G2,
@@ -67,723 +86,400 @@ from .protocol import (
 )
 from .router import PrefixTracker
 
-_LOAD, _STORE, _WARM = 0, 1, 2
-_WARM_ATTEMPTS = 5
-_FETCHING, _Q_HIT, _FETCHABLE = (
-    QueryStatus.FETCHING,
-    QueryStatus.HIT,
-    QueryStatus.FETCHABLE,
-)
-_REMOTE = CacheTier.REMOTE_G2
-_LOCAL_G2 = CacheTier.LOCAL_G2
+_MODEL = str(Path(__file__).resolve().parent / "model")
+_KVCR = kvcr_tier.KVCR
+_PRIVATE = PRIVATE_BASE << INDEX_BITS
+# (medium, ownership) of a vLLM KV event -> the tier the router is told about.
+_TIERS = {
+    (MEDIUM_GPU, None): TIER_DEVICE,
+    (MEDIUM_CPU, None): TIER_PRIMARY,
+    (MEDIUM_CPU, "kvcr"): TIER_G2,
+}
 
 
-class HintAction(msgspec.Struct, frozen=True, kw_only=True):
-    action_id: str
-    action_type: str
-    action_version: str
-    payload: dict = {}
+def _later_hashes(hashes: list[bytes], block: int, request) -> list[bytes]:
+    """vLLM's ``block_hasher``: the hashes of the blocks filled since it last asked."""
+    return hashes[len(request.block_hashes) : request.num_tokens // block]
 
 
-class HintEnvelope(msgspec.Struct, frozen=True, kw_only=True):
-    """The ``kv_hints`` envelope a router attaches to a request."""
-
-    protocol_version: str
-    message_id: str
-    actions: list[HintAction] = []
+class _Live:
+    __slots__ = ("rid", "arrived", "first_token", "prompt_blocks", "device_hit",
+                 "external_hit", "computed")  # fmt: skip
 
 
-def fetch_hint(message_id: str, endpoint: str, hashes: list[int]) -> HintEnvelope:
-    """The envelope Dynamo's router attaches (one ``kv.fetch`` action)."""
-    payload = {"source_control_endpoint": endpoint, "block_hashes": hashes}
-    action = HintAction(
-        action_id="a1", action_type="kv.fetch", action_version="1.0", payload=payload
-    )
-    return HintEnvelope(protocol_version="0.1", message_id=message_id, actions=[action])
+class _Events:
+    """In place of vLLM's KV event publisher: keeps the batches for the router."""
 
+    def __init__(self) -> None:
+        self.batches: list = []
 
-def failure_cause(entry) -> str:
-    """Why KVCR did not deliver a block: its result's status in lower case
-    (``timeout``, ``unavailable``, ``aborted``, ``failed``), or
-    ``unclassified`` on an older tree, whose results have no reason and call
-    every failure ``FAILED``."""
-    if not hasattr(entry, "reason"):
-        return "unclassified"
-    return entry.status.name.lower()
+    def publish(self, batch) -> None:
+        self.batches.append(batch)
 
-
-def count_failure(counters, entry) -> str:
-    """Count one hinted block that a peer did not deliver; returns its cause."""
-    cause = failure_cause(entry)
-    counters[f"hinted_failed|{cause}"] += 1
-    reason = getattr(entry, "reason", None)
-    if reason:
-        counters[f"hinted_failed_reason|{reason}"] += 1
-    return cause
-
-
-class _Req:
-    __slots__ = (
-        "rid", "req_id", "keys", "all_keys", "prompt_tokens", "output_tokens",
-        "arrived", "resolved", "first_token", "rank", "live", "gpu_hit",
-        "computed", "sched", "next_stored", "promote",
-        "local_ok", "remote_ok", "failed", "timed_out", "primary_hit",
-        "prefill_tokens", "lookups", "hinted", "looked", "segments", "all_segments",
-        "pins", "need", "cross",
-    )  # fmt: skip
-
-
-class _Job:
-    __slots__ = ("kind", "req", "keys", "remaining", "ok", "bad", "end",
-                 "started", "remote", "hinted", "warm")  # fmt: skip
-
-    def __init__(self, kind, req, keys, end, remote=None, hinted=None):
-        self.kind = kind
-        self.req = req
-        self.keys = keys
-        self.remaining = len(keys)
-        self.ok: list[bytes] = []
-        self.bad: dict[bytes, object] = {}  # failed key -> KVCR's result entry
-        self.end = end
-        self.started = time.perf_counter()
-        self.remote = remote
-        self.hinted = hinted
-        self.warm = None
+    def shutdown(self) -> None:
+        pass
 
 
 class VllmEngine:
-    def __init__(self, config: RunConfig, window: Window, worker: int) -> None:
+    def __init__(
+        self,
+        config: RunConfig,
+        window: Window,
+        worker: int,
+        peers: list[tuple[str, str]],
+        *,
+        bind_host: str,
+        control_port: int,
+        engine_id: str,
+        kvcr_cls=_KVCR,
+    ) -> None:
         tiers, engine = config.tiers, config.engine
-        self._tiers = tiers
-        self._cfg = engine
+        block = self._block = tiers.tokens_per_block
+        if tiers.block_bytes % mmap.PAGESIZE or tiers.block_bytes % (4 * block):
+            raise ValueError(
+                f"tiers.block_bytes ({tiers.block_bytes}) must be a multiple of "
+                f"this host's page size ({mmap.PAGESIZE}) and of 4 x "
+                "tiers.tokens_per_block: vLLM's CPU tier is page aligned"
+            )
         self._window = window
-        self._worker = worker
-        self._block_tokens = tiers.tokens_per_block
-        self._verify = engine.verify
-        self._warm_slots = config.phases.warm_concurrency
-        # Slot 0 holds this worker's warm block; the next ones are warm scratch.
-        self._primary = PrimaryTier(tiers.primary_blocks, 1 + self._warm_slots)
-        self._gpu = StreamCache(tiers.gpu_blocks)
-        self._refs: list[MemoryRef] = []  # one per primary slot
-        self._key_cache = KeyCache()
-        self._waiting: list[_Req] = []
-        self._running: list[_Req] = []
-        self._jobs: dict[int, _Job] = {}
-        self._stores: list[tuple[_Req, list[tuple[bytes, int]], int]] = []
-        self._loads: list[list[bytes]] = []
-        self._polled = False
-        # Framework pin adapter state.
-        self._next_pin = 0
-        self._next_handle = 0
-        self._pending_pins: dict[int, tuple[bytes, ...]] = {}
-        self._completed_pins: list = []
-        self._pins: dict[str, list[bytes]] = {}
-        self._pin_released: list[list[bytes]] = []
-        self._g2_events: list[KeyEvent] = []
-        # What the router is told the host tiers hold.
-        self._primary_seen = PrefixTracker(TIER_PRIMARY)
-        self._g2_seen = PrefixTracker(TIER_G2)
-        self._resilience: list[str] = []
-        # Mesh warm.
-        self._warm_queue: deque[tuple[int, str, int]] = deque()
-        self._warm_free: list[int] = []
-        self._warm_active = 0
-        self._warm_ok = 0
-        self._warm_failed = 0
-        self._kvcr = None
-        self._host = None
-        self._peers: list[tuple[str, str]] = []
-
-    # ---- KVCRBindings callbacks (all on the engine thread) -----------------
-
-    def request_pin(self, keys):
-        request = self._next_pin
-        self._next_pin += 1
-        self._pending_pins[request] = tuple(keys)
-        return request
-
-    def poll_pin_results(self):
-        done, self._completed_pins = self._completed_pins, []
-        return done
-
-    def release_pin(self, handle) -> bool:
-        keys = self._pins.pop(handle, None)
-        if keys is not None:
-            self._pin_released.append(keys)
-        return True
-
-    def cancel_pin_request(self, request) -> None:
-        self._pending_pins.pop(request, None)
-
-    def record_inventory(self, event) -> None:
-        if event.tier is _LOCAL_G2:
-            self._g2_events.append((event.removed, event.keys))
-
-    def on_resilience_event(self, error: Exception) -> None:
-        self._window.counters["resilience_events"] += 1
-        if len(self._resilience) < 20:
-            self._resilience.append(str(error)[:200])
-
-    # ---- setup -------------------------------------------------------------
-
-    def attach(self, host) -> None:
-        self._host = host
-        self._kvcr = host.kvcr
-        self._refs = [
-            MemoryRef(end_point_name=host.agent_name, element_index=slot)
-            for slot in range(self._tiers.primary_blocks)
-        ]
-        warm = block_id(warm_stream(self._worker), 0)
-        key = id_to_key(warm)
-        self._primary.insert_reserved(key, 0)
-        host.stamp(0, warm)
-        if self._tiers.g2_blocks:
-            # Deposited too, like every block the engine stores.
-            op = self._kvcr.deposit({key: [self._refs[0]]})
-            self._primary.prepare_read((key,))
-            self._jobs[op] = _Job(_STORE, None, [key], 0)
-
-    def set_peers(self, peers: list[tuple[str, str]]) -> None:
+        self._cfg = engine
         self._peers = peers
+        self._device_blocks = tiers.gpu_blocks
+        self._primary_blocks = tiers.primary_blocks
+        node = peers[worker][0]
+        self.probe = KvcrProbe(
+            kvcr_cls,
+            window,
+            verify=engine.verify,
+            cross_node=frozenset(endpoint for name, endpoint in peers if name != node),
+            on_stats=lambda stats: window.merge_stats(*stats.metric_sections()),
+        )
+        torch.set_num_threads(1)
+        max_tokens = tiers.gpu_blocks * block
+        vllm_config = VllmConfig(
+            model_config=ModelConfig(
+                model=_MODEL,
+                dtype="float16",
+                seed=0,
+                max_model_len=max_tokens,
+                skip_tokenizer_init=True,
+            ),
+            device_config=DeviceConfig("cpu"),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=engine.max_running,
+                max_num_batched_tokens=engine.max_batched_tokens,
+                max_model_len=max_tokens,
+                enable_chunked_prefill=True,
+                is_encoder_decoder=False,
+            ),
+            cache_config=CacheConfig(
+                block_size=block, gpu_memory_utilization=0.9, enable_prefix_caching=True
+            ),
+        )
+        vllm_config.scheduler_config.async_scheduling = False
+        vllm_config.cache_config.kv_cache_layout = "LBNHC"
+        # Block 0 of vLLM's pool is its null block.
+        vllm_config.cache_config.num_gpu_blocks = tiers.gpu_blocks + 1
+        vllm_config.kv_events_config = KVEventsConfig(
+            enable_kv_cache_events=True, publisher="null"
+        )
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="OffloadingConnector",
+            kv_role="kv_both",
+            engine_id=engine_id,
+            kv_connector_extra_config={
+                "spec_name": "TieringOffloadingSpec",
+                "cpu_bytes_to_use": tiers.primary_blocks * tiers.block_bytes,
+                "self_describing_kv_events": True,
+                "secondary_tiers": [
+                    {
+                        "type": "kvcr",
+                        "router_capabilities": sorted(kvcr.ROUTER_HINT_CAPABILITIES),
+                        "control_host": bind_host,
+                        "control_ports": [control_port],
+                        "control_advertise_host": bind_host,
+                        "secondary_g2_slots": tiers.g2_blocks,
+                        "operation_timeout_ms": engine.operation_timeout_ms,
+                        "abandon_timeout_ms": engine.abandon_timeout_ms,
+                        # vLLM's default is off; the report reads it.
+                        "enable_telemetry": True,
+                    }
+                ],
+            },
+        )
+        # One layer whose KV for a block is tiers.block_bytes: that is the size
+        # of a CPU-tier chunk, and so of a KVCR block.
+        spec = AttentionSpec(
+            block_size=block,
+            num_kv_heads=1,
+            head_size=tiers.block_bytes // (4 * block),
+            dtype=torch.float16,
+        )
+        layer = KVCacheLayerConfig(FullAttentionManager.config(), spec)
+        kv_cache_config = KVCacheConfig(
+            num_blocks=tiers.gpu_blocks + 1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroup.from_layers({"layer": layer})],
+        )
+        kvcr_tier.KVCR = self.probe  # what vLLM's tier builds its KVCR with
+        try:
+            self._scheduler = Scheduler(
+                vllm_config=vllm_config,
+                kv_cache_config=kv_cache_config,
+                structured_output_manager=StructuredOutputManager(vllm_config),
+                block_size=block,
+                log_stats=True,
+            )
+        finally:
+            kvcr_tier.KVCR = _KVCR
+        # The CPU tier is a file in /dev/shm that only this process maps:
+        # unlinked now, a killed worker leaves nothing behind.
+        for path in glob.glob(f"/dev/shm/vllm_offload_{engine_id}.mmap*"):
+            os.unlink(path)
+        if self.probe.region != (tiers.block_bytes, tiers.primary_blocks):
+            raise RuntimeError(
+                f"vLLM's CPU tier is {self.probe.region[1]} chunks of "
+                f"{self.probe.region[0]} bytes, not {tiers.primary_blocks} of "
+                f"{tiers.block_bytes}"
+            )
+        self._events = self._scheduler.kv_event_publisher = _Events()
+        self._trackers = [PrefixTracker(tier) for tier in sorted(_TIERS.values())]
+        self._tokens = np.zeros(max_tokens, np.int32)  # token values are never read
+        self._live: dict[str, _Live] = {}
+        # Jobs to report next step, and the requests whose loads are among them.
+        self._due: dict[int, int] = {}
+        self._received: set[str] = set()
+        self._primary = 0
+        self._evicted = False
 
     # ---- requests ----------------------------------------------------------
 
-    def submit(self, request: Request) -> None:
-        r = _Req()
-        r.rid = request.rid
-        r.req_id = f"r{request.rid}"
-        r.keys = self._key_cache.keys(request.segments)
-        tail = self._key_cache.keys((request.tail,))
-        r.all_keys = r.keys + tail
-        r.segments = request.segments
-        r.all_segments = (*request.segments, request.tail)
-        r.prompt_tokens = request.prompt_tokens
-        r.output_tokens = max(1, request.output_tokens)
-        r.arrived = time.perf_counter()
-        r.resolved = r.first_token = r.looked = 0.0
-        r.rank = self._primary.new_rank()
-        # Device blocks it holds while it runs: every token of its prompt and
-        # its answer, cacheable or not.
-        r.live = -(-(r.prompt_tokens + r.output_tokens) // self._block_tokens)
-        if r.live > self._gpu.capacity:
+    def submit(self, turn: Request) -> None:
+        block = self._block
+        prompt, output = turn.prompt_tokens, max(1, turn.output_tokens)
+        need = -(-(prompt + output) // block)
+        if need > self._device_blocks:
             raise ValueError(
-                f"request {r.rid} needs {r.live} device blocks, more than "
-                f"tiers.gpu_blocks ({self._gpu.capacity})"
+                f"request {turn.rid} needs {need} device blocks, more than "
+                f"tiers.gpu_blocks ({self._device_blocks})"
             )
-        r.gpu_hit = r.computed = r.sched = r.next_stored = 0
-        r.promote = []
-        r.local_ok = r.remote_ok = r.failed = r.timed_out = r.primary_hit = 0
-        r.prefill_tokens = r.lookups = r.hinted = 0
-        r.pins = ()
-        r.need = 0
-        r.cross = False
-        if request.hint_source >= 0 and request.hint_blocks > 0:
-            r.hinted = request.hint_blocks
-            # vLLM on_new_request: submit_hint only when the router sent one.
-            hashes = segment_ids(request.segments)[: request.hint_blocks]
-            node, endpoint = self._peers[request.hint_source]
-            r.cross = node != self._peers[self._worker][0]
-            hint = fetch_hint(r.req_id, endpoint, hashes)
-            t = time.perf_counter()
-            self._kvcr.submit_hint(hint, r.req_id)
-            self._window.call("submit_hint", time.perf_counter() - t, 1, len(hashes))
-        self._waiting.append(r)
+        request_id = f"r{turn.rid}"
+        named = segment_ids(turn.segments)
+        hint = None
+        if turn.hint_source >= 0 and turn.hint_blocks > 0:
+            # vLLM hands a hint to KVCR only when the router sent one.
+            payload = {
+                "source_control_endpoint": self._peers[turn.hint_source][1],
+                "block_hashes": named[: turn.hint_blocks],
+            }
+            action = KvHintAction(
+                action_id="a1",
+                action_type="kv.fetch",
+                action_version="1.0",
+                payload=payload,
+            )
+            hint = KvHintsEnvelope(
+                protocol_version="0.1", message_id=request_id, actions=[action]
+            )
+        # One id per full block of the prompt, then per block the answer fills.
+        private = block_id(PRIVATE_BASE + turn.rid, 0)
+        full = prompt // block
+        ids = named[:full]
+        ids.extend(range(private + len(ids), private + full))
+        answer = (prompt + output) // block - full
+        tail = segment_ids((turn.tail,))[:answer]
+        tail.extend(range(private + full + len(tail), private + full + answer))
+        hashes = [block_hash(i) for i in ids]
+        later = hashes + [block_hash(i) for i in tail]
+        live = self._live[request_id] = _Live()
+        live.rid = turn.rid
+        live.first_token = 0.0
+        live.prompt_blocks = full
+        live.device_hit = live.external_hit = 0
+        live.computed = prompt
+        live.arrived = t = time.perf_counter()
+        request = VllmRequest(
+            request_id=request_id,
+            prompt_token_ids=self._tokens[:prompt],
+            sampling_params=SamplingParams(max_tokens=output),
+            pooling_params=None,
+            block_hasher=functools.partial(_later_hashes, later, block),
+            kv_hints=hint,
+            block_hashes=hashes,
+        )
+        self._scheduler.add_request(request)
+        self._window.counters["vllm_seconds"] += time.perf_counter() - t
 
     # ---- one engine step ---------------------------------------------------
 
     def step(self) -> list[Done]:
         perf = time.perf_counter
-        window = self._window
-        cfg = self._cfg
+        window, cfg, scheduler = self._window, self._cfg, self._scheduler
+        counters = window.counters
         kvcr_before = sum(window.secs.values())
-        budget = cfg.max_batched_tokens
-        prefill = 0
-        scheduled: list[_Req] = []
-
-        # Schedule: running requests first, then the waiting queue.
-        for r in self._running:
-            if budget <= 0:
-                break
-            remaining = r.prompt_tokens - r.computed
-            if remaining > 0:
-                n = min(remaining, budget)
-                prefill += n
-            else:
-                n = 1  # a decode step is one token of the budget
-            budget -= n
-            r.sched = n
-            scheduled.append(r)
-        if self._waiting:
-            waiting = []
-            admitting = True
-            for r in self._waiting:
-                if (
-                    not admitting
-                    or len(self._running) >= cfg.max_running
-                    or budget <= 0
-                ):
-                    waiting.append(r)
-                    continue
-                hit = self._lookup(r)
-                if hit is None:
-                    waiting.append(r)  # deferred: retried next step
-                    continue
-                if not r.resolved:
-                    r.resolved = perf()  # waiting for the device is not KVCR's
-                need = r.live - r.gpu_hit
-                pins = self._gpu.admit(r.segments, need)
-                if pins is None:
-                    # No room on the device: it waits, and so does every
-                    # request behind it.
-                    admitting = False
-                    window.counters["device_alloc_failures"] += 1
-                    waiting.append(r)
-                    continue
-                r.pins, r.need = pins, need
-                self._start(r, hit)
-                n = min(r.prompt_tokens - r.computed, budget)
-                budget -= n
-                prefill += n
-                r.sched = n
-                scheduled.append(r)
-            self._waiting = waiting
-
-        # build_connector_meta: GPU->CPU store jobs for what this step computes.
-        for r in scheduled:
-            self._build_store(r)
-
-        # on_schedule_end.
-        if not self._polled:
-            self._poll()
-        if self._pending_pins:
-            self._serve_pins()
-        self._polled = False
-        self._flush_promotions()
-        if self._warm_queue:
-            self._warm_tick()
+        t_schedule = perf()
+        out = scheduler.schedule()
         t_scheduled = perf()
 
-        # Forward pass: the GIL is released, as it is while the GPU runs.
-        if scheduled:
-            time.sleep(cfg.step_ms / 1e3 + prefill * cfg.prefill_us_per_token / 1e6)
-        else:
-            time.sleep(cfg.idle_sleep_ms / 1e3)
-        t_output = perf()
-        # Where the engine thread is neither in KVCR nor in this harness.
-        window.counters["forward_seconds" if scheduled else "idle_seconds"] += (
-            t_output - t_scheduled
+        # The connector's worker side: what finished since the last step.
+        finished, received = self._due, self._received
+        self._due, self._received = {}, set()
+        meta = out.kv_connector_metadata
+        if meta is not None:
+            flush = meta.jobs_to_flush or ()
+            for job_id, job in meta.load_jobs.items():
+                if job.sync:
+                    finished[job_id] = 1
+                else:
+                    self._due[job_id] = 1
+                    self._received.add(job.req_id)
+            for job_id in meta.store_jobs:
+                if job_id in flush:
+                    finished[job_id] = 1
+                else:
+                    self._due[job_id] = 1
+        connector_output = None
+        if finished or received:
+            connector_output = KVConnectorOutput(
+                finished_recving=received or None,
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs=finished
+                ),
+            )
+        request_ids = list(out.num_scheduled_tokens)
+        requests = scheduler.requests
+        runner_output = ModelRunnerOutput(
+            req_ids=request_ids,
+            sampled_token_ids=[
+                [] if requests[request_id].is_prefill_chunk else [0]
+                for request_id in request_ids
+            ],
+            kv_connector_output=connector_output,
         )
 
-        # update_from_output.
-        self._complete_copies()
+        # Forward pass: the GIL is released, as it is while the GPU runs.
+        scheduled = out.total_num_scheduled_tokens
+        t_forward = perf()
+        if scheduled:
+            prefill = scheduled - len(request_ids)
+            time.sleep(cfg.step_ms / 1e3 + prefill * cfg.prefill_us_per_token / 1e6)
+        else:
+            time.sleep(cfg.idle_sleep_ms / 1e3)  # vLLM's engine sleeps too
+        t_output = perf()
+        counters["forward_seconds" if scheduled else "idle_seconds"] += (
+            t_output - t_forward
+        )
+
+        outputs = scheduler.update_from_output(out, runner_output)
+        counters["vllm_seconds"] += t_scheduled - t_schedule + perf() - t_output
         dones: list[Done] = []
+        for client in outputs.values():
+            stats = client.scheduler_stats
+            if stats is not None and stats.num_preempted_reqs:
+                counters["preemptions"] += stats.num_preempted_reqs
+            for output in client.outputs:
+                live = self._live.get(output.request_id)
+                if live is None:
+                    continue
+                if not live.first_token and output.new_token_ids:
+                    live.first_token = t_output
+                prefill_stats = output.prefill_stats
+                if prefill_stats is not None:
+                    live.device_hit = prefill_stats.num_local_cached_tokens
+                    live.external_hit = prefill_stats.num_external_cached_tokens
+                    live.computed = prefill_stats.num_computed_tokens
+                if output.finish_reason is not None:
+                    dones.append(self._finish(output.request_id, live))
+        counters["steps"] += 1
         if scheduled:
-            now = perf()
-            for r in scheduled:
-                before = r.computed
-                r.computed = before + r.sched
-                if before < r.prompt_tokens:
-                    if r.computed < r.prompt_tokens:
-                        continue
-                    r.first_token = now  # prefill done: first token sampled
-                if r.computed >= r.prompt_tokens + r.output_tokens - 1:
-                    dones.append(self._finish(r, now))
-        t = perf()
-        stats = self._kvcr.get_stats()
-        window.call("get_stats", perf() - t)
-        window.merge_telemetry(stats)
-        window.counters["steps"] += 1
-        if scheduled:
-            window.counters["busy_steps"] += 1
+            counters["busy_steps"] += 1
             window.hists["step_kvcr"].add(sum(window.secs.values()) - kvcr_before)
         return dones
 
-    def _lookup(self, r: _Req) -> int | None:
-        """vLLM ``_maximal_prefix_lookup`` over ``TieringOffloadingManager.lookup``.
-
-        Returns the number of offloaded blocks after the device-cached prefix,
-        or None when the request must wait for a promotion.
-        """
-        perf = time.perf_counter
-        keys = r.keys
-        gpu = self._gpu.prefix(r.segments)
-        r.gpu_hit = gpu
-        if not r.looked:
-            r.looked = perf()
-        r.lookups += 1
-        end = len(keys)
-        if gpu >= end:
-            return 0
-        if not self._polled:
-            self._poll()
-        primary = self._primary
-        scan, reserve = primary.scan, primary.reserve
-        rank = r.rank
-        query = self._kvcr.query
-        req_id = r.req_id
-        promote = r.promote
-        defer = False
-        spent = 0.0
-        queries = 0
-        position = gpu
-        while True:
-            # CPU-tier hits and writes in flight, up to the first key it lacks.
-            position, pending = scan(keys, position, rank)
-            if pending:
-                defer = True
-            if position >= end:
-                break
-            key = keys[position]
-            t = perf()
-            status, tier = query((key,), req_id)[0]
-            spent += perf() - t
-            queries += 1
-            if status is _FETCHING:
-                defer = True
-            elif status is _Q_HIT or status is _FETCHABLE:
-                slot = reserve(key, rank, position)
-                if slot is None:
-                    break  # primary tier full: treated as a miss
-                promote.append((key, slot, tier is _REMOTE, position))
-                defer = True
-            else:
-                break
-            position += 1
-        if queries:
-            self._window.call("query", spent, queries, queries)
-        return None if defer else position - gpu
-
-    def _start(self, r: _Req, hit: int) -> None:
-        gpu = r.gpu_hit
-        tokens = self._block_tokens
-        # At least one prompt token is always computed.
-        r.computed = min((gpu + hit) * tokens, r.prompt_tokens - 1)
-        r.prefill_tokens = r.prompt_tokens - r.computed
-        # Blocks promoted twice (evicted while the request waited) count twice
-        # on the right, so clamp: this is a lower bound.
-        r.primary_hit = max(0, hit - r.local_ok - r.remote_ok)
-        if hit:
-            load = r.keys[gpu : gpu + hit]
-            # CPU->GPU load job: the slots stay pinned until the step ends.
-            self._primary.prepare_read(load)
-            self._loads.append(load)
-            r.next_stored = gpu + hit  # chunk-level policy skips loaded chunks
-        self._running.append(r)
-
-    def _build_store(self, r: _Req) -> None:
-        # Prompt blocks only (vLLM's ``offload_prompt_only`` default).
-        limit = min((r.computed + r.sched) // self._block_tokens, len(r.keys))
-        start = r.next_stored
-        if limit <= start:
-            return
-        keys = r.keys[start:limit]
-        # TieringOffloadingManager.prepare_store polls unconditionally.
-        self._poll()
-        taken = self._primary.prepare_write(keys, r.rank, range(start, limit))
-        if taken is None:
-            return  # the CPU tier is full: the range is tried again next step
-        r.next_stored = limit
-        self._primary.access(keys, r.rank, start)
-        if taken:
-            self._stores.append((r, taken, limit - 1))
-
-    def _complete_copies(self) -> None:
-        primary = self._primary
-        if self._stores:
-            perf = time.perf_counter
-            host = self._host
-            refs = self._refs
-            for r, taken, end in self._stores:
-                keys = [key for key, _ in taken]
-                host.stamp_many([slot for _, slot in taken], keys)
-                # complete_store cascades to KVCR; the slots stay pinned (one
-                # reader) until the deposit finishes.
-                primary.complete_write(keys, True, 1)
-                blocks = {key: [refs[slot]] for key, slot in taken}
-                t = perf()
-                op = self._kvcr.deposit(blocks)
-                self._window.call("deposit", perf() - t, 1, len(blocks))
-                self._jobs[op] = _Job(_STORE, r, keys, end)
-            self._stores = []
-        if self._loads:
-            for load in self._loads:
-                primary.complete_read(load)
-            self._loads = []
-
-    def _flush_promotions(self) -> None:
-        """One ``deliver`` per request per step (``_flush_pending_promotions``)."""
-        perf = time.perf_counter
-        refs = self._refs
-        for r in self._waiting:
-            if not r.promote:
-                continue
-            promote, r.promote = r.promote, []
-            blocks = {key: [refs[slot]] for key, slot, _, _ in promote}
-            t = perf()
-            op = self._kvcr.deliver(blocks, request_id=r.req_id)
-            self._window.call("deliver", perf() - t, 1, len(blocks))
-            keys = [key for key, _, _, _ in promote]
-            remote = {key for key, _, is_remote, _ in promote if is_remote}
-            # Blocks the router said the source holds; with opportunistic
-            # query the rest of the prompt is requested too and cannot succeed.
-            hinted = {key for key, _, _, position in promote if position < r.hinted}
-            end = max(position for _, _, _, position in promote)
-            self._jobs[op] = _Job(_LOAD, r, keys, end, remote, hinted)
-
-    def _poll(self) -> None:
-        """``KVCRSecondaryTierManager._poll_finished_jobs`` and its completions."""
-        self._polled = True
-        perf = time.perf_counter
-        window = self._window
-        t = perf()
-        completed = list(self._kvcr.poll_completed())
-        window.call("poll", perf() - t, 1, len(completed))
-        if completed:
-            primary = self._primary
-            aligned: list[tuple[_Req, int]] = []
-            for op, entries in completed:
-                job = self._jobs.get(op)
-                if job is None:
-                    continue
-                job.remaining -= len(entries)
-                ok, bad = job.ok, job.bad
-                for key, entry in entries.items():
-                    if entry.success:
-                        ok.append(key)
-                    else:
-                        bad[key] = entry
-                if job.remaining > 0:
-                    continue
-                del self._jobs[op]
-                if job.kind == _WARM:
-                    self._warm_done(job)
-                    continue
-                r = job.req
-                elapsed = perf() - job.started
-                if job.kind == _LOAD:
-                    primary.complete_write(job.ok, True)
-                    primary.complete_write(job.bad, False)
-                    self._loaded(r, job, elapsed)
-                else:
-                    primary.complete_read(job.keys)
-                    window.hists["deposit"].add(elapsed)
-                    window.counters["deposit_blocks_ok"] += len(job.ok)
-                    window.counters["deposit_blocks_failed"] += len(job.bad)
-                if r is None:
-                    continue
-                end = job.end
-                # Preserve ordering across requests, which may share keys.
-                if aligned and aligned[-1][0] is r:
-                    end = max(end, aligned.pop()[1])
-                aligned.append((r, end))
-            for r, end in aligned:
-                # Earlier resident keys are included even when only the tail moved.
-                keys = r.all_keys[: end + 1]
-                t = perf()
-                self._kvcr.align_sequence(keys)
-                window.call("align_sequence", perf() - t, 1, len(keys))
-        if self._pin_released:
-            for keys in self._pin_released:
-                self._primary.complete_read(keys)
-            self._pin_released = []
-
-    def _loaded(self, r: _Req, job: _Job, elapsed: float) -> None:
-        window = self._window
-        remote = sum(1 for key in job.ok if key in job.remote)
-        local = len(job.ok) - remote
-        r.remote_ok += remote
-        r.local_ok += local
-        r.failed += len(job.bad)
-        window.hists["deliver_remote" if job.remote else "deliver_local"].add(elapsed)
-        window.counters["deliver_blocks_remote"] += remote
-        if remote and r.cross:
-            window.counters["deliver_blocks_remote_cross_node"] += remote
-        window.counters["deliver_blocks_local"] += local
-        window.counters["deliver_blocks_failed"] += len(job.bad)
-        if job.bad:
-            counters = window.counters
-            counters["deliver_ops_partial" if job.ok else "deliver_ops_failed"] += 1
-            # Blocks asked of a peer. Those the hint named are counted by
-            # KVCR's status; the opportunistic query asks the peer for the
-            # rest of the prompt too, which it cannot have.
-            peers, hinted = job.remote, job.hinted
-            for key, entry in job.bad.items():
-                if key not in peers:
-                    continue
-                if key in hinted:
-                    cause = count_failure(counters, entry)
-                else:
-                    counters["deliver_blocks_failed_beyond_hint"] += 1
-                    cause = failure_cause(entry)
-                if cause == "timeout":
-                    r.timed_out += 1
-        if self._verify != "none" and job.ok:
-            check = job.ok if self._verify == "full" else job.ok[:1]
-            host, slot = self._host, self._primary.slot
-            for key in check:
-                window.counters["bytes_checked"] += 1
-                if host.stamp_at(slot(key)) != key_to_id(key):
-                    window.counters["bytes_mismatch"] += 1
-
-    def _serve_pins(self) -> None:
-        """``_FrameworkPinAdapter.process_pending``: once per step, primary only."""
-        pending, self._pending_pins = self._pending_pins, {}
-        primary = self._primary
-        slot, all_refs = primary.slot, self._refs
-        window = self._window
-        for request, keys in pending.items():
-            hit = primary.readable(keys)
-            window.counters["pin_requests"] += 1
-            if not hit:
-                self._completed_pins.append((request, None))
-                window.counters["pin_misses"] += 1
-                continue
-            primary.prepare_read(hit)
-            handle = f"pin-{self._next_handle}"
-            self._next_handle += 1
-            self._pins[handle] = hit
-            refs: dict = dict.fromkeys(keys)
-            for key in hit:
-                refs[key] = [all_refs[slot(key)]]
-            self._completed_pins.append((request, (handle, refs)))
-            window.counters["pin_keys"] += len(hit)
-
-    def _finish(self, r: _Req, now: float) -> Done:
-        self._running.remove(r)
-        window = self._window
-        keys = r.all_keys
-        # on_request_finished: final recency for every block it processed,
-        # in KVCR and in the CPU tier, then drop the request's hints.
-        if keys:
-            t = time.perf_counter()
-            self._kvcr.align_sequence(keys, True)
-            window.call("align_sequence", time.perf_counter() - t, 1, len(keys))
-        t = time.perf_counter()
-        self._kvcr.discard_hint(r.req_id)
-        window.call("discard_hint", time.perf_counter() - t)
-        self._primary.access(r.keys, self._primary.new_rank(), 0)
-        # Its cacheable blocks join the device cache as the most recent: the
-        # device frees a finished request's blocks to the end of its queue.
-        self._gpu.release(r.pins, r.need)
-        self._gpu.insert(r.all_segments, self._gpu.new_rank())
-        ttft = r.first_token - r.arrived
-        # Queueing for the engine's token budget or for device room is not
-        # KVCR's doing; the time from the first lookup to the last is.
-        load = r.resolved - r.looked
+    def _finish(self, request_id: str, live: _Live) -> Done:
+        del self._live[request_id]
+        window, block = self._window, self._block
+        remote, local, failed, timed_out, waited = self.probe.outcome(request_id)
+        ttft = live.first_token - live.arrived
         window.hists["ttft"].add(ttft)
-        window.hists["queue"].add(r.looked - r.arrived)
-        window.hists["cache_resolve"].add(load)
-        if r.remote_ok or r.failed:
-            window.hists["cache_resolve_remote"].add(load)
-        window.counters["requests"] += 1
-        window.counters["prompt_blocks"] += len(r.keys)
-        window.counters["gpu_hit_blocks"] += r.gpu_hit
-        window.counters["primary_hit_blocks"] += r.primary_hit
-        window.counters["prefill_tokens"] += r.prefill_tokens
-        window.counters["lookups"] += r.lookups
-        return Done(
-            rid=r.rid,
-            ttft_ms=ttft * 1e3,
-            load_ms=load * 1e3,
-            remote_blocks=r.remote_ok,
-            failed_blocks=r.failed,
-            timed_out_blocks=r.timed_out,
+        window.hists["cache_resolve"].add(waited)
+        if remote or failed:
+            window.hists["cache_resolve_remote"].add(waited)
+        counters = window.counters
+        counters["requests"] += 1
+        counters["prompt_blocks"] += live.prompt_blocks
+        counters["gpu_hit_blocks"] += live.device_hit // block
+        # Loaded from the CPU tier without KVCR having to put them there.
+        counters["primary_hit_blocks"] += max(
+            0, live.external_hit // block - remote - local
         )
-
-    # ---- mesh warm ---------------------------------------------------------
-
-    def start_warm(self, peers: list[tuple[int, str]]) -> None:
-        self._warm_queue.extend((peer, endpoint, 0) for peer, endpoint in peers)
-        self._warm_free = list(range(1, 1 + self._warm_slots))
-
-    def warm_status(self) -> tuple[int, int, int]:
-        pending = len(self._warm_queue) + self._warm_active
-        return pending, self._warm_ok, self._warm_failed
-
-    def _warm_tick(self) -> None:
-        kvcr = self._kvcr
-        while self._warm_queue and self._warm_free:
-            peer, endpoint, attempt = self._warm_queue.popleft()
-            slot = self._warm_free.pop()
-            bid = block_id(warm_stream(peer), 0)
-            key = id_to_key(bid)
-            req_id = f"warm-{peer}-{attempt}"
-            kvcr.submit_hint(fetch_hint(req_id, endpoint, [bid]), req_id)
-            kvcr.query((key,), req_id)
-            op = kvcr.deliver({key: [self._refs[slot]]}, request_id=req_id)
-            job = _Job(_WARM, None, [key], 0)
-            job.warm = (peer, endpoint, attempt, slot, req_id, bid)
-            self._jobs[op] = job
-            self._warm_active += 1
-
-    def _warm_done(self, job: _Job) -> None:
-        peer, endpoint, attempt, slot, req_id, bid = job.warm
-        self._kvcr.discard_hint(req_id)
-        self._warm_active -= 1
-        ok = bool(job.ok) and self._host.stamp_at(slot) == bid
-        self._host.stamp(slot, 0)
-        self._warm_free.append(slot)
-        if ok:
-            self._warm_ok += 1
-        elif attempt + 1 < _WARM_ATTEMPTS:
-            self._warm_queue.append((peer, endpoint, attempt + 1))
-        else:
-            self._warm_failed += 1
+        counters["prefill_tokens"] += live.computed
+        return Done(
+            rid=live.rid,
+            ttft_ms=ttft * 1e3,
+            load_ms=waited * 1e3,
+            remote_blocks=remote,
+            failed_blocks=failed,
+            timed_out_blocks=timed_out,
+        )
 
     # ---- reporting ---------------------------------------------------------
 
     def take_inventory(self) -> list[InventoryDelta]:
-        gpu = self._gpu
-        out: list[InventoryDelta] = [(TIER_DEVICE, *event) for event in gpu.events]
-        gpu.events = []
-        g2_events, self._g2_events = self._g2_events, []
-        for tracker, events in (
-            (self._primary_seen, self._primary.take_events()),
-            (self._g2_seen, g2_events),
-        ):
-            for removed, keys in events:
-                tracker.apply(removed, keys_to_ids(keys))
-            out.extend(tracker.take())
-        return out
+        """What entered and left each tier, from vLLM's own KV events."""
+        batches, self._events.batches = self._events.batches, []
+        trackers = self._trackers
+        for batch in batches:
+            for event in batch.events:
+                kind = type(event)
+                if kind is not BlockStored and kind is not BlockRemoved:
+                    continue
+                tier = _TIERS.get((event.medium, event.ownership))
+                if tier is None:
+                    continue
+                removed = kind is BlockRemoved
+                ids = event.block_hashes
+                if tier == TIER_PRIMARY:
+                    if removed:  # the CPU tier only removes what it evicts
+                        self._primary -= len(ids)
+                        self._evicted = True
+                    else:
+                        self._primary += len(ids)
+                named = [bid for bid in ids if bid < _PRIVATE]
+                if named:
+                    trackers[tier].apply(removed, named)
+        deltas: list[InventoryDelta] = []
+        for tracker in trackers:
+            deltas.extend(tracker.take())
+        return deltas
 
     def abort_requests(self) -> None:
-        """Drop every request; KVCR operations already issued still complete.
-
-        Called between steps, when no promotion, store or load is half made.
-        """
-        for r in self._waiting + self._running:
-            self._kvcr.discard_hint(r.req_id)
-            self._gpu.release(r.pins, r.need)
-            r.pins, r.need = (), 0
-        self._waiting = []
-        self._running = []
+        """Drop every request; KVCR operations already issued still complete."""
+        self._scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+        self._live.clear()
 
     def busy(self) -> bool:
         return bool(
-            self._waiting
-            or self._running
-            or self._jobs
-            or self._pins
-            or self._pending_pins
+            self._live
+            or self._due
+            or self.probe.pending()
+            or self._scheduler.has_finished_requests()
         )
 
     def gauges(self) -> dict[str, float]:
-        primary = self._primary
+        running, waiting = self._scheduler.get_request_counts()
         return {
-            "waiting": len(self._waiting),
-            "running": len(self._running),
-            "jobs": len(self._jobs),
-            "pins": len(self._pins),
-            "primary_occupancy": primary.occupancy(),
-            "primary_fill": primary.fill_level(),
-            "primary_evictions": primary.evictions,
-            "primary_alloc_failures": primary.allocation_failures,
-            "gpu_blocks": len(self._gpu),
-            "gpu_reserved": self._gpu.live,
+            "waiting": waiting,
+            "running": running,
+            "jobs": self.probe.pending(),
+            "primary_occupancy": self._primary / self._primary_blocks,
+            "primary_fill": self.fill_level(),
+            "gpu_usage": self._scheduler.get_kv_cache_usage(),
         }
 
-    def resilience_samples(self) -> list[str]:
-        return self._resilience
-
     def fill_level(self) -> float:
-        return self._primary.fill_level()
+        """How full the CPU tier has got: 1.0 once it has had to evict."""
+        return 1.0 if self._evicted else self._primary / self._primary_blocks
+
+    def close(self) -> None:
+        self._scheduler.shutdown()  # closes KVCR and unmaps the tiers

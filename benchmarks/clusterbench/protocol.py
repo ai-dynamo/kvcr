@@ -82,7 +82,7 @@ class Configure(_Msg):
 
 
 class Phase(_Msg):
-    name: str  # "warm", "measure", "stop", "exit"
+    name: str  # "measure", "stop", "exit"
 
 
 class Request(_Msg):

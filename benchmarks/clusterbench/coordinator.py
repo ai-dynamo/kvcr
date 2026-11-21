@@ -3,8 +3,8 @@
 """The coordinator: workload generator, synthetic router and run phases.
 
 Never imports ``kvcr``, so it is the same program whichever KVCR tree the
-workers run. Workers dial in. They acknowledge ``configure``, ``warm`` and
-``measure``; ``stop`` is answered with a report and ``exit`` with nothing.
+workers run. Workers dial in. They acknowledge ``configure`` and ``measure``;
+``stop`` is answered with a report and ``exit`` with nothing.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import heapq
 import json
 import random
 import time
+from collections import deque
 from pathlib import Path
 
 import msgspec
@@ -20,7 +21,7 @@ import zmq
 
 from . import protocol
 from .config import RunConfig, encode_config
-from .ids import segment_blocks
+from .ids import segment_blocks, warm_stream
 from .metrics import LogHist
 from .report import summarize
 from .router import Router
@@ -39,8 +40,12 @@ REQUEST_FIELDS = (
 )  # fmt: skip
 
 
-# How long the workers have to register and to acknowledge a phase.
+# How long the workers have to register, to acknowledge a phase and to warm.
 PHASE_TIMEOUT_S = 300.0
+# Mesh warm: a pull that fails is tried again this often, each time for a
+# block the puller has not seen, and its requests have ids of their own.
+WARM_ATTEMPTS = 5
+WARM_RID = 1 << 38
 
 
 class RunFailed(RuntimeError):
@@ -182,12 +187,9 @@ class Coordinator:
                 self._send(worker, protocol.Configure(worker, blob, peers))
             self._barrier("configure")
 
-            # Mesh warm.
-            warm = {}
+            warm = {"ok": 0, "failed": 0, "max_seconds": 0.0}
             if phases.mesh_warm == "full" and workers > 1:
-                for worker in range(workers):
-                    self._send(worker, protocol.Phase("warm"))
-                warm = self._barrier("warm")
+                warm = self._warm(router)
 
             summary = self._drive(router, log)
 
@@ -197,13 +199,7 @@ class Coordinator:
             "kvcr_sha": shas[0],
             "kvcr_file": files[0],
             "nodes": nodes,
-            "warm": {
-                "ok": sum(i.get("ok", 0) for i in warm.values()),
-                "failed": sum(i.get("failed", 0) for i in warm.values()),
-                "max_seconds": max(
-                    (i.get("seconds", 0) for i in warm.values()), default=0.0
-                ),
-            },
+            "warm": warm,
             "coordinator": summary,
         }
         reports = [self._reports[w] for w in sorted(self._reports)]
@@ -217,6 +213,83 @@ class Coordinator:
         result = summarize(msgspec.to_builtins(config), summary_in, reports)
         (self.out / "summary.json").write_text(json.dumps(result, indent=1))
         return result
+
+    def _warm(self, router: Router) -> dict:
+        """Mesh warm: every worker pulls one block from every other, so the
+        window holds no first-contact connection setup. They are ordinary
+        requests: each worker first computes a few blocks of its own, then is
+        sent a one-block prompt per peer with a hint naming that peer."""
+        workers = self._workers
+        block = self.config.tiers.tokens_per_block
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
+        rids = iter(range(WARM_RID, 2 * WARM_RID))
+
+        def send(worker, stream, start, end, source=-1) -> int:
+            rid = next(rids)
+            request = protocol.Request(
+                rid=rid,
+                session=-1,
+                segments=[(stream, start, end)],
+                tail=(stream, end, end),
+                prompt_tokens=(end - start) * block + 1,
+                output_tokens=1,
+                hint_source=source,
+                hint_blocks=int(source >= 0),
+            )
+            self._send(worker, request)
+            return rid
+
+        def receive(what: str):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RunFailed(f"mesh warm: {what} did not finish")
+            return self._recv(min(left, 0.5))
+
+        # Each worker stores its own blocks where a peer can pull them.
+        own = [[(warm_stream(w), 0, WARM_ATTEMPTS)] for w in range(workers)]
+        for worker in range(workers):
+            send(worker, *own[worker][0])
+        while any(router.servable(w, own[w]) < WARM_ATTEMPTS for w in range(workers)):
+            received = receive("storing the workers' own blocks")
+            if received is not None and not isinstance(received[1], protocol.Done):
+                self._background(*received)
+
+        todo = [deque(s for s in range(workers) if s != w) for w in range(workers)]
+        pulls: dict[int, tuple[int, int, int]] = {}  # rid -> puller, source, attempt
+        open_pulls = [0] * workers
+        started = time.monotonic()
+        ok = failed = 0
+        slowest = 0.0
+
+        def pull(worker, source, attempt) -> None:
+            rid = send(worker, warm_stream(source), attempt, attempt + 1, source)
+            pulls[rid] = (worker, source, attempt)
+            open_pulls[worker] += 1
+
+        limit = self.config.phases.warm_concurrency  # pulls a worker has open
+        while pulls or any(todo):
+            for worker, sources in enumerate(todo):
+                while sources and open_pulls[worker] < limit:
+                    pull(worker, sources.popleft(), 0)
+            received = receive("pulling a block from every peer")
+            if received is None:
+                continue
+            if not isinstance(received[1], protocol.Done):
+                self._background(*received)
+                continue
+            pulled = pulls.pop(received[1].rid, None)
+            if pulled is None:
+                continue  # a worker's request for its own blocks
+            worker, source, attempt = pulled
+            open_pulls[worker] -= 1
+            if received[1].remote_blocks:
+                ok += 1
+            elif attempt + 1 < WARM_ATTEMPTS:
+                pull(worker, source, attempt + 1)
+            else:
+                failed += 1
+            slowest = time.monotonic() - started
+        return {"ok": ok, "failed": failed, "max_seconds": slowest}
 
     def _background(self, worker, message) -> None:
         """Messages that can arrive in any phase."""

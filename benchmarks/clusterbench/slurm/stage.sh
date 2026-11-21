@@ -13,7 +13,7 @@
 #   CB_HOST       ssh host of the cluster login node (required)
 #   CB_SITE_FROM  existing site-packages directory on the cluster to copy into
 #                 ROOT/site when ROOT/site does not exist yet. It must hold
-#                 nixl, msgspec and pyzmq built for the compute nodes.
+#                 what the README's install command puts there.
 set -euo pipefail
 HOST=${CB_HOST:?set CB_HOST to the ssh host of the cluster login node}
 ROOT=${1:?usage: stage.sh ROOT ARM=REV...}

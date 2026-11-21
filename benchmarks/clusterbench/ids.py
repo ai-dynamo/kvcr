@@ -5,52 +5,48 @@
 A block is ``(stream, index)``: a stream is one lineage of KV blocks (a shared
 system prefix, or one session's context) and ``index`` is the block's position
 in it. The coordinator only ever handles ``(stream, start, end)`` segments;
-workers expand them into KVCR keys.
+workers expand them into block hashes for the engine.
 
-The KVCR ``BlockKey`` is 36 bytes like vLLM's (a 32-byte hash plus a 4-byte
-group index) so dict and set costs inside KVCR match a real deployment, and it
-is reversible so no reverse map is needed. The router hash is the packed id.
+The 64-bit block id is the low 8 bytes of a 32-byte vLLM block hash. vLLM
+appends a 4-byte group index to make the offload key, which is the KVCR key,
+and gives a router the low 64 bits of the hash: the id again. So keys are 36
+bytes, as in a real deployment, and reversible.
 """
 
 from __future__ import annotations
 
-import struct
 from collections.abc import Iterable
 
 INDEX_BITS = 24
 INDEX_MASK = (1 << INDEX_BITS) - 1
-MAX_STREAM = (1 << (64 - INDEX_BITS)) - 1
 
 # Stream id ranges. Sessions get ``SESSION_BASE + session * GENERATIONS + gen``;
 # each play of a replayed trace takes the next free ids from ``TRACE_BASE`` up.
+# From ``PRIVATE_BASE`` up, a stream belongs to one request: the blocks of it
+# that no segment names (one straddling two streams, an answer block no later
+# prompt uses).
 SYSTEM_BASE = 1
 WARM_BASE = 1 << 20
 SESSION_BASE = 1 << 24
 GENERATIONS = 64
 TRACE_BASE = 1 << 32
+PRIVATE_BASE = 1 << 39
+MAX_STREAM = PRIVATE_BASE - 1
 
 Segment = tuple[int, int, int]  # stream, start index, end index (exclusive)
-
-_KEY = struct.Struct(">Q24xI")
-_ID = struct.Struct(">Q")
-_KEY_IDS = struct.Struct(">Q28x")
 
 
 def block_id(stream: int, index: int) -> int:
     return (stream << INDEX_BITS) | index
 
 
-def id_to_key(bid: int) -> bytes:
-    return _KEY.pack(bid, 0)
+def block_hash(bid: int) -> bytes:
+    return bid.to_bytes(32, "big")
 
 
 def key_to_id(key: bytes) -> int:
-    return _ID.unpack_from(key)[0]
-
-
-def keys_to_ids(keys: Iterable[bytes]) -> list[int]:
-    """Block ids of many keys at once."""
-    return [bid for (bid,) in _KEY_IDS.iter_unpack(b"".join(keys))]
+    """The block id of a KVCR key (a block hash plus the group index)."""
+    return int.from_bytes(key[24:32], "big")
 
 
 def system_stream(agent_type: int) -> int:
@@ -75,54 +71,3 @@ def segment_ids(segments: Iterable[Segment]) -> list[int]:
         base = stream << INDEX_BITS
         ids.extend(range(base + start, base + end))
     return ids
-
-
-class KeyCache:
-    """Per-stream key lists, so a request's keys are list slices."""
-
-    def __init__(self, max_streams: int = 4096) -> None:
-        self._streams: dict[int, list[bytes]] = {}
-        self._max_streams = max_streams
-
-    def keys(self, segments: Iterable[Segment]) -> list[bytes]:
-        out: list[bytes] = []
-        for stream, start, end in segments:
-            cached = self._streams.pop(stream, None)
-            if cached is None:
-                cached = []
-            if len(cached) < end:
-                base = stream << INDEX_BITS
-                pack = _KEY.pack
-                cached.extend(pack(base + i, 0) for i in range(len(cached), end))
-            # Reinsert at the back: the dict doubles as an LRU of streams.
-            self._streams[stream] = cached
-            out.extend(cached[start:end])
-        while len(self._streams) > self._max_streams:
-            del self._streams[next(iter(self._streams))]
-        return out
-
-
-class KeyAdapter:
-    """KVCR ``KeyAdapter`` for both the current and the pre-#161 protocol."""
-
-    # Current protocol.
-    def encode_to_framework(self, key: bytes) -> object:
-        return key
-
-    def decode_from_framework(self, framework_key: object) -> bytes:
-        return framework_key  # type: ignore[return-value]
-
-    def encode_to_router(self, key: bytes) -> int:
-        return key_to_id(key)
-
-    def decode_from_router(self, router_key: int | bytes) -> bytes:
-        if isinstance(router_key, bytes):
-            return router_key
-        return id_to_key(router_key)
-
-    # Older trees.
-    def encode(self, framework_key: object) -> bytes:
-        return framework_key  # type: ignore[return-value]
-
-    def decode(self, key: bytes) -> int:
-        return key_to_id(key)

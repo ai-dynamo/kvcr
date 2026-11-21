@@ -209,7 +209,6 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--local-id", type=int, required=True)
     worker.add_argument("--bind-host", default="127.0.0.1")
     worker.add_argument("--control-port", type=int, required=True)
-    worker.add_argument("--nixl-port", type=int, required=True)
     worker.add_argument(
         "--cpus",
         default="",

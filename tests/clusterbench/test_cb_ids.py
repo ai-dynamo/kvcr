@@ -3,12 +3,13 @@
 from clusterbench import ids
 
 
-def test_block_key_is_reversible_and_vllm_sized():
+def test_a_block_id_is_the_low_bytes_of_its_hash_and_survives_the_kvcr_key():
     bid = ids.block_id(ids.session_stream(7, 3), 12345)
-    key = ids.id_to_key(bid)
-    assert len(key) == 36
-    assert ids.key_to_id(key) == bid
-    assert 0 <= bid < 1 << 64
+    block_hash = ids.block_hash(bid)
+    # What vLLM gives a router is the low 64 bits of a 32-byte block hash.
+    assert len(block_hash) == 32 and int.from_bytes(block_hash[-8:], "big") == bid
+    # The KVCR key is the hash plus vLLM's 4-byte group index.
+    assert ids.key_to_id(block_hash + bytes(4)) == bid
 
 
 def test_streams_do_not_collide():
@@ -16,6 +17,8 @@ def test_streams_do_not_collide():
     streams |= {ids.warm_stream(w) for w in range(512)}
     streams |= {ids.session_stream(s, g) for s in range(64) for g in range(4)}
     assert len(streams) == 8 + 512 + 64 * 4
+    # Above every named stream, each request has ids of its own.
+    assert max(streams) < ids.TRACE_BASE < ids.PRIVATE_BASE == ids.MAX_STREAM + 1
 
 
 def test_segments_expand_to_ids_in_order():
@@ -26,29 +29,3 @@ def test_segments_expand_to_ids_in_order():
         ids.block_id(9, 3),
     ]
     assert ids.segment_blocks(segments) == len(expanded)
-
-
-def test_key_cache_returns_the_same_keys_for_a_growing_stream():
-    cache = ids.KeyCache()
-    first = cache.keys([(4, 0, 3)])
-    grown = cache.keys([(4, 0, 5)])
-    assert grown[:3] == first
-    assert all(a is b for a, b in zip(first, grown))  # cached objects, not copies
-    assert [ids.key_to_id(k) for k in grown] == [ids.block_id(4, i) for i in range(5)]
-    assert cache.keys([(4, 2, 4)]) == grown[2:4]
-
-
-def test_key_cache_is_bounded():
-    cache = ids.KeyCache(max_streams=4)
-    for stream in range(10):
-        cache.keys([(stream, 0, 2)])
-    assert len(cache._streams) == 4
-
-
-def test_key_adapter_speaks_both_protocol_generations():
-    adapter = ids.KeyAdapter()
-    key = ids.id_to_key(ids.block_id(3, 1))
-    assert adapter.encode_to_router(key) == adapter.decode(key) == ids.block_id(3, 1)
-    assert adapter.decode_from_router(ids.block_id(3, 1)) == key
-    assert adapter.decode_from_framework(adapter.encode_to_framework(key)) == key
-    assert adapter.encode(key) == key

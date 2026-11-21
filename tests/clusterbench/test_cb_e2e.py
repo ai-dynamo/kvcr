@@ -4,6 +4,7 @@
 
 import itertools
 import json
+import mmap
 import os
 import random
 import subprocess
@@ -12,6 +13,10 @@ from pathlib import Path
 
 import pytest
 from clusterbench.config import load_config
+
+pytest.importorskip(
+    "vllm", reason="needs the pinned vLLM: see benchmarks/clusterbench/README.md"
+)
 from clusterbench.launch_local import run_local
 from clusterbench.trace import compile_corpus
 
@@ -23,7 +28,7 @@ _PROBE = (
 REPO = str(Path(__file__).parents[2])
 
 OVERRIDES = [
-    "tiers.block_bytes=4096",
+    f"tiers.block_bytes={mmap.PAGESIZE}",  # the smallest block vLLM's CPU tier takes
     "tiers.gpu_blocks=512",
     # Roomy tiers: inventory never goes stale, so hinted blocks must arrive.
     "tiers.primary_blocks=4096",

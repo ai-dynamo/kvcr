@@ -11,16 +11,20 @@ calls, the progress thread, peer control, transfer latency with many peers)
 and to compare KVCR source trees.
 
 - **Real:** `KVCR`, its progress thread, NIXL/UCX transfers, the ZMQ peer
-  control channel, the bytes moved, one OS process per engine rank.
-- **Stand-ins:** the engine (a fake that makes the KVCR calls of vLLM's KVCR
-  tier), GPU memory, the model (a sleep that releases the GIL) and Dynamo (a
-  small router with Dynamo's hint rule).
+  control channel, the bytes moved, one OS process per engine rank, and
+  vLLM's own scheduler and KV-offload tiering, which make every KVCR call.
+- **Stand-ins:** the model and GPU memory (the forward pass is a sleep that
+  releases the GIL, and nothing is copied between device and CPU) and Dynamo
+  (a small router with Dynamo's hint rule).
 
 ## Running
 
-From a KVCR checkout with its environment set up (`uv sync`):
+From a KVCR checkout with its environment set up (`uv sync`), plus the vLLM
+commit pinned in `requirements.txt`, built without its CUDA extensions:
 
 ```bash
+VLLM_TARGET_DEVICE=empty CARGO=false uv pip install -r benchmarks/clusterbench/requirements.txt
+
 # Four workers and a coordinator on this machine. Nodes are only labels here.
 PYTHONPATH=benchmarks uv run python -m clusterbench local \
   --config benchmarks/clusterbench/scenarios/smoke.toml --nodes 2 --per-node 2
@@ -32,10 +36,11 @@ PYTHONPATH=benchmarks uv run python -m clusterbench ab \
   --arm base=/path/to/kvcr-main --arm cand=/path/to/kvcr-branch
 ```
 
-An arm is a KVCR checkout (the directory holding `src/kvcr`); a run fails if
-its workers loaded KVCR from anywhere else. The harness always comes from this
-checkout, so every arm is driven identically. Local numbers show correctness
-and rough direction; quote cluster numbers.
+An arm is a KVCR checkout (the directory holding `src/kvcr`) that the pinned
+vLLM's KVCR tier can import; a run fails if its workers loaded KVCR from
+anywhere else. The harness and vLLM are the same for every arm, so every arm
+is driven identically. Local numbers show correctness and rough direction;
+quote cluster numbers.
 
 Any option can be set with `--set section.field=value`; `config.py` documents
 them all, and an option it does not have is refused. Tests:
@@ -54,7 +59,9 @@ With realistic GPU times (`engine.step_ms`, `engine.prefill_us_per_token`) a
 rank finishes one or two requests a second; `agentx-fast` shrinks them until
 KVCR's time on the engine thread is what limits a rank. Blocks are 16 KiB
 (`tiers.block_bytes`), far smaller than a real KV block, so that many ranks
-fit on a node: host cost follows the number of blocks, not their size.
+fit on a node: host cost follows the number of blocks, not their size. A
+block is a whole number of pages: a host with 64 KiB pages needs
+`tiers.block_bytes=65536`.
 
 ## How it works
 
@@ -64,12 +71,14 @@ fit on a node: host cost follows the number of blocks, not their size.
   `kvcr`, so it is the same program for every arm. In mesh warm every worker
   pulls one block from every other, so the window holds no first-contact
   connection setup.
-- **Workers:** one process each, with a real `KVCR` and a fake engine driving
-  it. Host mappings stand in for engine memory and KVCR's DRAM pool. KVCR's
-  telemetry is on (vLLM's default is off): the report reads it.
-- **Engine** (`engine_vllm.py`): makes the calls of vLLM's KVCR tier. Its
-  module docstring has the exact sequence, which
-  `tests/clusterbench/test_cb_engine_vllm.py` pins; change the two together.
+- **Workers:** one process each, hosting vLLM's `Scheduler` with its
+  offloading connector and KVCR tier, which build the `KVCR` and decide every
+  call to it. KVCR's telemetry is on (vLLM's default is off): the report
+  reads it.
+- **Driver** (`engine_vllm.py`): fakes only what needs a GPU. It gives vLLM
+  requests with block ids for hashes, sleeps for the forward pass, and reports
+  the connector's copy jobs as finished. `kvcr_probe.py` sits between vLLM and
+  the `KVCR` object: it times the calls, counts what moved and checks bytes.
 - **Router:** a session stays on its worker and moves with
   `router.migration_prob` per turn. After choosing a worker the router hints
   the peer holding the longest prefix, if that beats what the chosen worker
@@ -118,15 +127,15 @@ microseconds per moved block; KVCR time per engine step. A moved block is one
 KVCR copied: a delivered block, or a deposited block its pool did not already
 hold. Throughput and latency are reported too, but they depend on the
 closed-loop workload and the modelled engine as much as on KVCR. The engine
-thread's time is split into KVCR calls, the modelled forward pass, idle and
-the rest ("harness"); KVCR is the bottleneck when its share dominates.
+thread's time is split into KVCR calls, vLLM's own scheduling, the modelled
+forward pass, idle and the rest ("harness").
 
 **Failed blocks.** Hinted blocks that a peer did not deliver are counted by
 the status KVCR returns for them: `timeout`, `unavailable` (the source no
-longer held the block, or could not pin it), `aborted` or `failed`, or
-`unclassified` on a KVCR tree that returns no reason. `report --detail` has
-the reasons. Blocks *beyond the hint* are counted apart: vLLM's opportunistic
-query asks the peer for the rest of the prompt too, which it cannot have.
+longer held the block, or could not pin it), `aborted` or `failed`.
+`report --detail` has KVCR's reasons. Blocks *beyond the hint* are counted
+apart: vLLM's opportunistic query asks the peer for the rest of the prompt
+too, which it cannot have.
 
 **INVALID.** A run is marked INVALID, with the reason, when:
 
@@ -168,8 +177,11 @@ bash $S/slurm/ab.sh $JOB myab 4 8 $S/scenarios/agentic-stress.toml 3 "base cand"
 touch $CB_ROOT/control/release-$JOB
 ```
 
-- `$CB_ROOT/site` must hold `nixl`, `msgspec` and `pyzmq` built for the
-  compute nodes (`pip install --target $CB_ROOT/site ...` on one of them).
+- `$CB_ROOT/site` holds the Python packages. Fill an empty one on a compute
+  node (Python 3.11 or later, git; `pip.pyz` from bootstrap.pypa.io works where
+  there is no pip): `VLLM_TARGET_DEVICE=empty CARGO=false python3 -m pip install
+  --target $CB_ROOT/site --extra-index-url https://download.pytorch.org/whl/cpu
+  -r $S/requirements.txt nixl`.
 - `CB_NET_DEVICES` is one RDMA device per socket and `CB_CTRL_IF` the
   interface of KVCR's control channel. Workers pin themselves by socket.
 - `CB_HARNESS` selects the harness copy a cell runs (default
@@ -181,8 +193,8 @@ touch $CB_ROOT/control/release-$JOB
   and `kv.move` hints.
 - Engines other than vLLM, such as SGLang's direct linker.
 - Forcing evictions or timeouts: they are reported, not injected.
-- vLLM's preemption: it allocates device blocks as a request grows and
-  preempts when they run out; here a request waits until all of it fits.
+- A pin other than the one in `requirements.txt`: the driver uses vLLM's
+  scheduler at the level its own tests do, so a newer vLLM may need changes.
 - Load-aware routing such as Dynamo's cost formula: sessions are sticky and
   migrate at a fixed rate.
 - In trace replay, a sub-agent's requests run one after another (aiperf splits

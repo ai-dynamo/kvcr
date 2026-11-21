@@ -197,6 +197,10 @@ class Router:
         self._resident = [0] * self._workers  # sessions per worker
         self._rngs: dict[int, random.Random] = {}
 
+    def servable(self, worker: int, segments: Sequence[Segment]) -> int:
+        """Blocks of the prefix this worker holds where a peer can pull them."""
+        return self.inventory.prefix(worker, segments, _SOURCE_TIERS)
+
     def same_node(self, a: int, b: int) -> bool:
         return self._nodes[a] == self._nodes[b]
 

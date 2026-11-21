@@ -9,15 +9,13 @@ import random
 import msgspec
 import pytest
 from clusterbench.config import (
-    PhaseConfig,
     RunConfig,
     TierConfig,
     WorkloadConfig,
     load_config,
 )
 from clusterbench.coordinator import Coordinator
-from clusterbench.ids import TRACE_BASE
-from clusterbench.primary_tier import StreamCache
+from clusterbench.ids import TRACE_BASE, segment_ids
 from clusterbench.trace import (
     _ROW,
     Compiled,
@@ -245,12 +243,15 @@ def _conversation(rng, turns):
     return requests, truth
 
 
-def _replay_stream_cache(view):
-    cache = StreamCache(1 << 30)
+def _replay_block_cache(view):
+    """Leading blocks each turn finds in a cache keyed by block, as an
+    engine's prefix cache is."""
+    held = set()
     hits = []
     for _, _, _, segments, tail in view.turns:
-        hits.append(cache.prefix(segments))
-        cache.insert([*segments, tail], cache.new_rank())
+        ids = segment_ids(segments)
+        hits.append(next((n for n, b in enumerate(ids) if b not in held), len(ids)))
+        held.update(ids, segment_ids([tail]))
     return hits
 
 
@@ -262,7 +263,7 @@ def test_replayed_caches_hit_what_the_true_answers_would_give(seed):
     for index, (prompt, _) in enumerate(truth):
         held = [earlier + answer for earlier, answer in truth[:index]]
         expected.append(max((common(prompt, path) for path in held), default=0))
-    assert _replay_stream_cache(view) == expected
+    assert _replay_block_cache(view) == expected
     # A request that is extended got its whole answer, in order.
     block_of = {}
     for (_, blocks, _, _, _), (prompt, _) in zip(view.turns, truth):
@@ -671,11 +672,9 @@ def test_a_trace_that_does_not_fit_the_run_is_refused(tmp_path):
         TraceWorkload(run(tokens_per_block=16))
     with pytest.raises(TraceError, match=r"longest request is 330 .* tiers.gpu_blocks"):
         TraceWorkload(run(gpu_blocks=329))
-    # The vLLM model promotes a whole prompt into the CPU tier before starting.
-    reserved = 1 + PhaseConfig().warm_concurrency
-    TraceWorkload(run(primary_blocks=330 + reserved))
+    TraceWorkload(run(primary_blocks=330))
     with pytest.raises(TraceError, match="longest prompt is 330 .*primary_blocks"):
-        TraceWorkload(run(primary_blocks=329 + reserved))
+        TraceWorkload(run(primary_blocks=329))
 
 
 def test_unreadable_trace_files_say_what_to_do(tmp_path):
@@ -692,10 +691,6 @@ def test_unreadable_trace_files_say_what_to_do(tmp_path):
         TraceWorkload(_config(path))
     path.write_bytes(b"not json\n")
     with pytest.raises(TraceError, match="not a compiled trace"):
-        TraceWorkload(_config(path))
-    deep = msgspec.structs.replace(header, max_segments=300)
-    path.write_bytes(msgspec.json.encode(deep) + b"\n" + lines[1] + b"\n")
-    with pytest.raises(TraceError, match="crosses 300 streams"):
         TraceWorkload(_config(path))
 
 

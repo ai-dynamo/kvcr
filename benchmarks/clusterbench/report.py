@@ -74,9 +74,11 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
     kvcr_seconds = sum(secs.values())
     forward = counters.get("forward_seconds", 0)
     idle = counters.get("idle_seconds", 0)
-    # Harness is what is left of the engine thread's window, so the work
+    # vLLM's own time: its scheduler calls, less the KVCR calls made inside
+    # them. Harness is what is left of the engine thread's window, so the work
     # between engine steps counts too.
-    harness_seconds = max(0.0, window - forward - idle - kvcr_seconds)
+    vllm_seconds = max(0.0, counters.get("vllm_seconds", 0) - kvcr_seconds)
+    harness_seconds = max(0.0, window - forward - idle - kvcr_seconds - vllm_seconds)
 
     threads: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for report in reports:
@@ -130,11 +132,13 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
         "requests_per_s": _ratio(requests, mean_window),
         "remote_blocks_per_s": _ratio(remote, mean_window),
         "engine_kvcr_share": _ratio(kvcr_seconds, window),
+        "engine_vllm_share": _ratio(vllm_seconds, window),
         "engine_harness_share": _ratio(harness_seconds, window),
         # The modelled forward pass, and steps with nothing to run.
         "engine_forward_share": _ratio(forward, window),
         "engine_idle_share": _ratio(idle, window),
         "engine_kvcr_us_per_request": _ratio(kvcr_seconds, requests) * 1e6,
+        "engine_vllm_us_per_request": _ratio(vllm_seconds, requests) * 1e6,
         "engine_harness_us_per_request": _ratio(harness_seconds, requests) * 1e6,
         "engine_kvcr_us_per_moved_block": _ratio(kvcr_seconds, moved) * 1e6,
         "progress_us_per_moved_block": _ratio(progress_cpu, moved) * 1e6,
@@ -253,7 +257,9 @@ def format_summary(summary: dict) -> str:
     workload = summary["workload"]
     thread_lines = [
         f"engine thread: KVCR {h['engine_kvcr_share']:.1%} of wall "
-        f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), harness "
+        f"({_fmt(h['engine_kvcr_us_per_request'] / 1e3)} ms/request), vLLM "
+        f"{h['engine_vllm_share']:.1%} "
+        f"({_fmt(h['engine_vllm_us_per_request'] / 1e3)} ms/request), harness "
         f"{h['engine_harness_share']:.1%} "
         f"({_fmt(h['engine_harness_us_per_request'] / 1e3)} ms/request), "
         f"modelled GPU {h['engine_forward_share']:.1%}, "

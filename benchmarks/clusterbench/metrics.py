@@ -92,31 +92,6 @@ class LogHist:
         }
 
 
-class Telemetry:
-    """KVCR ``TelemetryStats`` sink; KVCR swaps in a new one per get_stats()."""
-
-    __slots__ = ("counters", "observations", "gauges")
-
-    def __init__(self) -> None:
-        self.counters: dict[tuple, float] = {}
-        self.observations: dict[tuple, list[float]] = {}
-        self.gauges: dict[tuple, float] = {}
-
-    def increase_counter(self, name, value=1, labelvalues=()):
-        key = (name, *labelvalues)
-        self.counters[key] = self.counters.get(key, 0) + value
-
-    def set_gauge(self, name, value, labelvalues=()):
-        self.gauges[(name, *labelvalues)] = value
-
-    def observe_histogram(self, name, value, labelvalues=()):
-        key = (name, *labelvalues)
-        values = self.observations.get(key)
-        if values is None:
-            values = self.observations.setdefault(key, [])
-        values.append(value)
-
-
 class Window:
     """Everything a worker accumulates over the measurement window."""
 
@@ -160,19 +135,21 @@ class Window:
         entry[1] += pause
         entry[2] = max(entry[2], pause)
 
-    def merge_telemetry(self, stats: Telemetry | None) -> None:
-        if stats is None:
-            return
-        counters = self.kvcr_counters
-        for key, value in stats.counters.items():
-            counters["|".join(key)] += value
-        hists = self.kvcr_hists
-        for key, values in stats.observations.items():
-            hist = hists["|".join(key)]
-            for value in values:
-                hist.add(value)
-        for key, value in stats.gauges.items():
-            self.gauges["|".join(key)] = value
+    def merge_stats(self, types: dict, values: dict) -> None:
+        """KVCR's telemetry since its last ``get_stats``: per metric name its
+        kind, and per label tuple a count, a gauge value or a list of samples."""
+        for name, by_labels in values.items():
+            kind = types[name]
+            for labels, value in by_labels.items():
+                key = "|".join((name, *labels))
+                if kind == "counter":
+                    self.kvcr_counters[key] += value
+                elif kind == "gauge":
+                    self.gauges[key] = value
+                else:
+                    hist = self.kvcr_hists[key]
+                    for sample in value:
+                        hist.add(sample)
 
     def to_json(self) -> dict:
         ended = self.ended or time.perf_counter()

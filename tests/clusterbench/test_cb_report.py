@@ -105,6 +105,18 @@ def test_harness_is_what_is_left_of_the_engine_threads_window():
     assert abs(headline["engine_harness_us_per_request"] - 139_880) < 1e-6
 
 
+def test_vllm_time_is_its_calls_less_the_kvcr_calls_made_inside_them():
+    config, coord, reports = _inputs()
+    for report in reports:  # 0.5 s in vLLM's scheduler, 6 ms of it in KVCR
+        report["counters"]["vllm_seconds"] = 0.506
+    summary = summarize(config, coord, reports)
+    headline = summary["headline"]
+    assert abs(headline["engine_vllm_share"] - 1.0 / 20) < 1e-12
+    assert abs(headline["engine_vllm_us_per_request"] - 10_000) < 1e-6
+    assert abs(headline["engine_harness_share"] - 12.988 / 20) < 1e-12
+    assert "vLLM 5.0% (10.0 ms/request), harness 64.9%" in format_summary(summary)
+
+
 def test_deposits_that_copied_nothing_are_not_moved_blocks():
     config, coord, reports = _inputs()
     for report in reports:

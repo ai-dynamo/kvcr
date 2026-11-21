@@ -1,30 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Build one real KVCR instance on host memory, the way an engine does.
-
-``Host`` mirrors ``KVCRSecondaryTierManager.__init__`` in vLLM: one unnamed
-pool, the primary CPU tier as the single framework region, an optional
-anonymous mmap as the KVCR-owned DRAM pool, a ZMQ peer control channel.
-Unlike vLLM's default, KVCR's telemetry is on: the report reads it.
-
-Small probes keep this working against older KVCR trees so A/B arms can differ.
-"""
+"""Process setup around the engine: environment, CPU topology and affinity,
+and which KVCR tree was imported."""
 
 from __future__ import annotations
 
-import ctypes
-import mmap
 import os
 import resource
-import struct
 import subprocess
 import threading
 from pathlib import Path
-
-from .config import EngineConfig, TierConfig
-from .ids import KeyAdapter, keys_to_ids
-
-_STAMP = struct.Struct(">Q")
 
 
 def prepare_environment() -> None:
@@ -33,6 +18,11 @@ def prepare_environment() -> None:
     # devices and keeping cuda_copy in the list satisfies both.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     os.environ.setdefault("UCX_TLS", "self,sm,tcp,cuda_copy")
+    # vLLM: the CPU platform whatever NVML sees, and no model hub.
+    os.environ["VLLM_TARGET_DEVICE"] = "cpu"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft < hard:
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
@@ -133,125 +123,21 @@ def auto_cpus(local_id: int, per_node: int) -> tuple[list[int], int]:
     return sorted(cpu for core in block for cpu in core), socket
 
 
-def _filtered(struct_type, **kwargs):
-    """Construct a msgspec struct with only the fields this KVCR tree has."""
-    fields = set(struct_type.__struct_fields__)
-    return struct_type(**{k: v for k, v in kwargs.items() if k in fields})
+def confine_new_threads(cpus: list[int]) -> dict:
+    """Before the engine starts: threads KVCR and NIXL start inherit the mask
+    left here. Returns the plan ``pin_engine_threads`` completes."""
+    engine_cpu, progress_cpu, native = plan_affinity(cpus)
+    if native:
+        os.sched_setaffinity(0, native)
+    return {"engine": engine_cpu, "progress": progress_cpu, "native": native}
 
 
-class Host:
-    """A started KVCR plus the memory it was given."""
-
-    def __init__(
-        self,
-        tiers: TierConfig,
-        engine: EngineConfig,
-        *,
-        agent_name: str,
-        bind_host: str,
-        control_port: int,
-        nixl_port: int,
-        framework,
-        stats_factory,
-        cpus: list[int],
-    ) -> None:
-        from kvcr import KVCR, KVCRBindings
-        from kvcr.config import (
-            KVCRBackendConfigs,
-            KVCRConfig,
-            LocalDramOptions,
-            RemoteFWDramOptions,
-        )
-        from kvcr.types import RegionDescriptor
-
-        try:
-            from kvcr import ZmqPeerControlChannel
-        except ImportError:  # older trees
-            from kvcr.control_channels import ZmqPeerControlChannel
-
-        self.agent_name = agent_name
-        self.block_bytes = tiers.block_bytes
-        self.primary = mmap.mmap(-1, tiers.primary_blocks * tiers.block_bytes)
-        self._primary_view = memoryview(self.primary)
-        primary_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.primary))
-        self.g2 = None
-        local_dram = None
-        if tiers.g2_blocks:
-            self.g2 = mmap.mmap(-1, tiers.g2_blocks * tiers.block_bytes)
-            g2_addr = ctypes.addressof(ctypes.c_char.from_buffer(self.g2))
-            local_dram = LocalDramOptions(pools=[("", g2_addr, len(self.g2))])
-
-        self.control = ZmqPeerControlChannel(bind_host, control_port, bind_host)
-
-        engine_cpu, progress_cpu, native = plan_affinity(cpus)
-        if native:
-            # Threads KVCR and NIXL start inherit this mask.
-            os.sched_setaffinity(0, native)
-
-        self.kvcr = KVCR(
-            _filtered(
-                KVCRConfig,
-                nixl_agent_name=agent_name,
-                nixl_listen_port=nixl_port,
-                pool_layouts=[("", tiers.block_bytes)],
-                enable_telemetry=True,
-                operation_timeout_ms=engine.operation_timeout_ms,
-                abandon_timeout_ms=engine.abandon_timeout_ms,
-            ),
-            _filtered(
-                KVCRBindings,
-                request_pin=framework.request_pin,
-                poll_pin_results=framework.poll_pin_results,
-                release_pin=framework.release_pin,
-                cancel_pin_request=framework.cancel_pin_request,
-                framework_control=self.control,
-                key_adapter=KeyAdapter(),
-                inventory_sink=framework.record_inventory,
-                stats_factory=stats_factory,
-                on_resilience_event=framework.on_resilience_event,
-            ),
-            _filtered(
-                KVCRBackendConfigs,
-                framework_regions=[
-                    RegionDescriptor(
-                        addr=primary_addr,
-                        size=tiers.block_bytes,
-                        count=tiers.primary_blocks,
-                    )
-                ],
-                local_dram=local_dram,
-                remote_fw_dram=_filtered(
-                    RemoteFWDramOptions,
-                    # vLLM's adapter defaults.
-                    eager_ctrl_connect=True,
-                    opportunistic_query=True,
-                    metadata_retry_interval_ms=100,
-                ),
-            ),
-        )
-
-        self.affinity = {
-            "engine": engine_cpu,
-            "progress": progress_cpu,
-            "native": native,
-        }
-        if engine_cpu is not None:
-            os.sched_setaffinity(0, {engine_cpu})
-            for thread in threading.enumerate():
-                if thread.name == "kvcr-progress" and thread.native_id:
-                    os.sched_setaffinity(thread.native_id, {progress_cpu})
-
-    def stamp(self, slot: int, bid: int) -> None:
-        _STAMP.pack_into(self._primary_view, slot * self.block_bytes, bid)
-
-    def stamp_many(self, slots, keys) -> None:
-        """Stamp each slot with the block id of its key."""
-        pack, view, size = _STAMP.pack_into, self._primary_view, self.block_bytes
-        for slot, bid in zip(slots, keys_to_ids(keys)):
-            pack(view, slot * size, bid)
-
-    def stamp_at(self, slot: int) -> int:
-        return _STAMP.unpack_from(self._primary_view, slot * self.block_bytes)[0]
-
-    def close(self) -> None:
-        self.kvcr.close()
+def pin_engine_threads(affinity: dict) -> None:
+    """After the engine started: this thread and KVCR's progress thread each
+    get their own core."""
+    if affinity["engine"] is None:
+        return
+    os.sched_setaffinity(0, {affinity["engine"]})
+    for thread in threading.enumerate():
+        if thread.name == "kvcr-progress" and thread.native_id:
+            os.sched_setaffinity(thread.native_id, {affinity["progress"]})

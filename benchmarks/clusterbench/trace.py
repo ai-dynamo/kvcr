@@ -52,7 +52,6 @@ FORMAT = 3
 # Ints per turn: lane, last stream, blocks used of it, tail stream, tail start,
 # tail end, prompt tokens, output tokens, wait (ms), recorded time (ms).
 _ROW = 10
-MAX_SEGMENTS = 255  # the device cache orders a request's streams in one byte
 # A parent turn recorded this close before a sub-agent's end still joins it;
 # mirrors aiperf's join epsilon.
 _JOIN_EPSILON_S = 1e-6
@@ -620,24 +619,18 @@ class TraceWorkload:
                 f"{workload.trace}: {header.block_tokens}-token blocks, but"
                 f" tiers.tokens_per_block is {tiers.tokens_per_block}"
             )
-        reserved = 1 + config.phases.warm_concurrency
         if header.max_request_blocks > tiers.gpu_blocks:
             raise TraceError(
                 f"{workload.trace}: the longest request is"
                 f" {header.max_request_blocks} blocks, more than the device tier"
                 f" can hold ({tiers.gpu_blocks}); raise tiers.gpu_blocks"
             )
-        if header.max_prompt_blocks > tiers.primary_blocks - reserved:
+        if header.max_prompt_blocks > tiers.primary_blocks:
             raise TraceError(
                 f"{workload.trace}: the longest prompt is"
                 f" {header.max_prompt_blocks} blocks, more than the CPU tier can"
-                f" promote at once ({tiers.primary_blocks - reserved}); raise"
+                f" promote at once ({tiers.primary_blocks}); raise"
                 " tiers.primary_blocks"
-            )
-        if header.max_segments > MAX_SEGMENTS:
-            raise TraceError(
-                f"{workload.trace}: a request crosses {header.max_segments}"
-                f" streams, more than the {MAX_SEGMENTS} the device cache orders"
             )
         self._scale = workload.trace_think_scale
         self._cap = workload.think_cap_s

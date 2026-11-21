@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""One emulated engine rank: a real KVCR driven by a fake engine.
+"""One emulated engine rank: vLLM's scheduler driving a real KVCR, no model.
 
 The process has the thread layout of a real rank: this (engine) thread, which
 makes every KVCR call, next to KVCR's progress thread and NIXL's own threads.
@@ -22,8 +22,15 @@ import zmq
 
 from . import protocol
 from .config import decode_config
-from .kvcr_host import Host, auto_cpus, kvcr_identity, limits, prepare_environment
-from .metrics import Telemetry, Window, rss_bytes, thread_delta, thread_snapshot
+from .kvcr_host import (
+    auto_cpus,
+    confine_new_threads,
+    kvcr_identity,
+    limits,
+    pin_engine_threads,
+    prepare_environment,
+)
+from .metrics import Window, rss_bytes, thread_delta, thread_snapshot
 
 INVENTORY_FLUSH_S = 0.05
 STATS_INTERVAL_S = 1.0
@@ -59,7 +66,7 @@ def run_worker(args) -> int:
     send = sock.send
     encode = protocol.encode
 
-    host = None
+    engine = None
     try:
         path, sha = kvcr_identity()
         send(
@@ -89,26 +96,22 @@ def run_worker(args) -> int:
 
         window = Window()
         window.watch_gc()
-        from .engine_vllm import VllmEngine  # imports kvcr: after the environment
+        affinity = confine_new_threads(cpus)
+        from .engine_vllm import VllmEngine  # imports vllm: after the environment
 
-        engine = VllmEngine(config, window, me)
-        engine.set_peers(configure.peers)
-        host = Host(
-            config.tiers,
-            config.engine,
-            agent_name=agent,
+        engine = VllmEngine(
+            config,
+            window,
+            me,
+            configure.peers,
             bind_host=args.bind_host,
             control_port=args.control_port,
-            nixl_port=args.nixl_port,
-            framework=engine,
-            stats_factory=Telemetry,
-            cpus=cpus,
+            engine_id=agent,
         )
-        engine.attach(host)
+        pin_engine_threads(affinity)
         send(encode(protocol.Ready("configure")))
 
         perf = time.perf_counter
-        warm_started = None
         stop_deadline = None
         exit_deadline = None
         final = None
@@ -129,18 +132,7 @@ def run_worker(args) -> int:
                     engine.submit(message)
                 elif isinstance(message, protocol.Phase):
                     name = message.name
-                    if name == "warm":
-                        engine.start_warm(
-                            [
-                                (peer, peer_endpoint)
-                                for peer, (_, peer_endpoint) in enumerate(
-                                    configure.peers
-                                )
-                                if peer != me
-                            ]
-                        )
-                        warm_started = perf()
-                    elif name == "measure":
+                    if name == "measure":
                         # Start the window from a settled heap, like a
                         # long-running engine: startup garbage is collected
                         # and what survives is not rescanned.
@@ -175,22 +167,6 @@ def run_worker(args) -> int:
                 send(encode(done))
 
             now = perf()
-            if warm_started is not None:
-                pending, ok, failed = engine.warm_status()
-                if pending == 0:
-                    send(
-                        encode(
-                            protocol.Ready(
-                                "warm",
-                                {
-                                    "ok": ok,
-                                    "failed": failed,
-                                    "seconds": now - warm_started,
-                                },
-                            )
-                        )
-                    )
-                    warm_started = None
             if now >= next_inventory:
                 deltas = engine.take_inventory()
                 if deltas:
@@ -216,10 +192,10 @@ def run_worker(args) -> int:
                     kvcr_file=path,
                     kvcr_sha=sha,
                     profiled=bool(profile_dir),
-                    affinity=host.affinity,
+                    affinity=affinity,
                     rss_mb=rss_bytes() / 1e6,
                     drained=not engine.busy(),
-                    resilience_samples=engine.resilience_samples(),
+                    resilience_samples=engine.probe.resilience,
                     ucx_tls=os.environ.get("UCX_TLS", ""),
                     ucx_net_devices=os.environ.get("UCX_NET_DEVICES", ""),
                 )
@@ -239,9 +215,9 @@ def run_worker(args) -> int:
             pass
         status = 1
     finally:
-        if host is not None:
+        if engine is not None:
             try:
-                host.close()
+                engine.close()
             except Exception:
                 traceback.print_exc()
         sock.close()

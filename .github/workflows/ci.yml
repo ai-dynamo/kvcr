@@ -29,4 +29,23 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e . --group dev
-      - run: python -m pytest tests/unit tests/clusterbench -q
+      - run: python -m pytest tests/unit -q
+
+  clusterbench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            benchmarks/clusterbench/requirements.txt
+      # No GPU here: CPU torch, and vLLM built without its CUDA extensions.
+      - run: pip install -e . --group dev -r benchmarks/clusterbench/requirements.txt
+        env:
+          PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+          VLLM_TARGET_DEVICE: empty
+          CARGO: "false"
+      - run: python -m pytest tests/clusterbench -q

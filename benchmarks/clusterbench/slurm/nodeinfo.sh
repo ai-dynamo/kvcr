@@ -15,5 +15,6 @@ for d in /sys/class/infiniband/*; do
     "netdev=$(ls "$d/device/net" 2>/dev/null | tr '\n' ' ')"
 done
 ip -4 -br addr | grep -v "^lo"
-echo "memlock=$(ulimit -l) nofile=$(ulimit -n) mem=$(free -g | awk '/Mem:/{print $2}')G"
+echo "memlock=$(ulimit -l) nofile=$(ulimit -n) mem=$(free -g | awk '/Mem:/{print $2}')G" \
+  "pagesize=$(getconf PAGESIZE) shm_free=$(df -h --output=avail /dev/shm | tail -1 | tr -d ' ')"
 echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"

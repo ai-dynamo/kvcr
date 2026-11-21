@@ -99,7 +99,7 @@ def run_local(
     logs.mkdir(parents=True, exist_ok=True)
     coordinator = Coordinator(config, out, arm=arm)
     endpoint = coordinator.bind("tcp://127.0.0.1:*")
-    base = _free_port_base(2 * workers)
+    base = _free_port_base(workers)
 
     env = dict(os.environ)
     paths = [str(BENCHMARKS)]
@@ -132,8 +132,6 @@ def run_local(
                         "127.0.0.1",
                         "--control-port",
                         str(base + index),
-                        "--nixl-port",
-                        str(base + workers + index),
                         "--cpus",
                         ",".join(map(str, cpu_sets[index])),
                     ],
