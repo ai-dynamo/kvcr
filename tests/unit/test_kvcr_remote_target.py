@@ -1160,6 +1160,24 @@ def test_kvcr_metadata_ack_retry_lifecycle():
         _decode_control_message(message)["type"] for _, message in control.sent
     ] == ["target_metadata"]
 
+    # The failed send dropped the source's answer, so a delivery waits for a new one.
+    control.recv = Mock(wraps=control.recv)
+    reconnected = kvcr.deliver({key: [_mem_descriptor()]}, request_id="reconnect")
+    received = control.recv.call_count
+    # Two receives ensure a full progress pass has handled the delivery.
+    _wait_until(lambda: control.recv.call_count >= received + 2)
+    assert [
+        _decode_control_message(message)["type"] for _, message in control.sent
+    ] == ["target_metadata"]
+    control.incoming.append(
+        msgspec.msgpack.encode(
+            {"type": "target_metadata_ack", "sender_control_endpoint": source}
+        )
+    )
+    start_write = _start_write_sent(control)
+    agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
+    assert _poll_until(kvcr, bool) == [(reconnected, _op_entries({key: True}))]
+
 
 @pytest.mark.parametrize("terminal,success", [(True, True), (False, False)])
 def test_native_terminal_or_cancellation_outranks_metadata_retry(terminal, success):
@@ -1480,10 +1498,12 @@ def test_quiet_source_must_answer_before_start_write(source, acked_long_ago, cap
     def sent_types():
         return [_decode_control_message(raw)["type"] for _, raw in control.sent]
 
+    control.recv = Mock(wraps=control.recv)
     kvcr.submit_hint(_router_hint(endpoint), request_id="load")
     handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
-    _wait_until(lambda: bool(control.sent))
-    time.sleep(0.01)
+    received = control.recv.call_count
+    # Two receives ensure a full progress pass has handled the delivery.
+    _wait_until(lambda: control.recv.call_count >= received + 2)
     # Nothing that exposes a destination goes out before the source answers.
     assert set(sent_types()) == {"target_metadata"}
     if source != "unreachable":
@@ -1572,49 +1592,6 @@ def test_target_without_a_return_address_sends_start_write_directly():
     key = BlockKey(b"k0")
     kvcr.submit_hint(_router_hint("tcp://source:1"), request_id="load")
     handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
-    start_write = _start_write_sent(control)
-    agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
-    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
-
-
-def test_failed_send_makes_an_answered_source_answer_again():
-    """A send that fails can mean the source is gone, so its last answer no longer
-    lets a start_write skip the handshake."""
-    agent = FakeNixlAgent(metadata=b"target-md")
-    control = FakeBytesControl(answers=False)
-    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
-    now = [0.0]
-    kvcr._core._clock = lambda: now[0]
-    source = "tcp://source:1"
-    primed, wire = _acked_deliver(control, kvcr, source, BlockKey(b"k0"))
-    agent.notifs["source"] = [_write_done_notification(wire)]
-    assert _poll_until(kvcr, bool) == [(primed, _op_entries({BlockKey(b"k0"): True}))]
-
-    control.send_result = False
-    kvcr.submit_hint(_router_hint(source), request_id="failed")
-    failed = kvcr.deliver({BlockKey(b"k1"): [_mem_descriptor()]}, request_id="failed")
-    assert _poll_until(kvcr, bool) == [
-        (
-            failed,
-            _op_entries({BlockKey(b"k1"): (OpEntryStatus.FAILED, "control_error")}),
-        )
-    ]
-
-    control.send_result = True
-    control.sent.clear()
-    key = BlockKey(b"k2")
-    kvcr.submit_hint(_router_hint(source), request_id="retry")
-    handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
-    _wait_until(lambda: bool(control.sent))
-    time.sleep(0.01)
-    assert [_decode_control_message(raw)["type"] for _, raw in control.sent] == [
-        "target_metadata"
-    ]
-    control.incoming.append(
-        msgspec.msgpack.encode(
-            {"type": "target_metadata_ack", "sender_control_endpoint": source}
-        )
-    )
     start_write = _start_write_sent(control)
     agent.notifs["source"] = [_write_done_notification(start_write["op_handle"])]
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
