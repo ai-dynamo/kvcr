@@ -104,7 +104,6 @@ class TelemetryStats(Protocol):
 
 
 class FrameworkControl(Protocol):
-    # Where peers send replies; None when the channel cannot advertise one.
     endpoint: str | None
 
     def send(self, endpoint: str, message: bytes) -> bool: ...
