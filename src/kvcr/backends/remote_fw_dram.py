@@ -772,8 +772,8 @@ class _RemoteFWDram:
             return False
         payload.target_agent = kvcr.nixl_agent_name
         payload.sender_incarnation = self._dangling_ops.incarnation
-        sender_endpoint = getattr(self._control, "endpoint", None)
-        if isinstance(sender_endpoint, str) and payload.sender_control_endpoint is None:
+        sender_endpoint = self._control.endpoint
+        if sender_endpoint is not None and payload.sender_control_endpoint is None:
             payload.sender_control_endpoint = sender_endpoint
         if not isinstance(payload, _TargetMetadataAck):
             payload.source_control_endpoint = endpoint
@@ -826,7 +826,7 @@ class _RemoteFWDram:
 
     def _source_quiet(self, endpoint: str, now: float) -> bool:
         """Whether ``endpoint`` must answer before a start_write is sent to it."""
-        if not isinstance(getattr(self._control, "endpoint", None), str):
+        if self._control is None or self._control.endpoint is None:
             # Without a return address of our own, no answer can arrive.
             return False
         # A metadata exchange counts as current for as long as it would go
@@ -837,6 +837,8 @@ class _RemoteFWDram:
         )
 
     def _prune_source_answers(self) -> None:
+        if not self._source_answered_at:
+            return
         # Past the window an entry no longer skips the handshake, so dropping it
         # changes nothing and keeps departed endpoints from accumulating.
         now = self._kvcr._clock()

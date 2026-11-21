@@ -1164,8 +1164,9 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     control.recv = Mock(wraps=control.recv)
     reconnected = kvcr.deliver({key: [_mem_descriptor()]}, request_id="reconnect")
     received = control.recv.call_count
-    # Two receives ensure a full progress pass has handled the delivery.
-    _wait_until(lambda: control.recv.call_count >= received + 2)
+    # A receive is counted when it starts, and the pass that picks up the delivery
+    # receives before progressing it; the third receive follows that whole pass.
+    _wait_until(lambda: control.recv.call_count >= received + 3)
     assert [
         _decode_control_message(message)["type"] for _, message in control.sent
     ] == ["target_metadata"]
@@ -1502,8 +1503,9 @@ def test_quiet_source_must_answer_before_start_write(source, acked_long_ago, cap
     kvcr.submit_hint(_router_hint(endpoint), request_id="load")
     handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="load")
     received = control.recv.call_count
-    # Two receives ensure a full progress pass has handled the delivery.
-    _wait_until(lambda: control.recv.call_count >= received + 2)
+    # A receive is counted when it starts, and the pass that picks up the delivery
+    # receives before progressing it; the third receive follows that whole pass.
+    _wait_until(lambda: control.recv.call_count >= received + 3)
     # Nothing that exposes a destination goes out before the source answers.
     assert set(sent_types()) == {"target_metadata"}
     if source != "unreachable":
