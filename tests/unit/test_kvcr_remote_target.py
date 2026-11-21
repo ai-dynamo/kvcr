@@ -2416,7 +2416,8 @@ def test_pending_removal_rejects_new_work_and_frees_after_reader(pair, protected
     source.deposit(other, 1)
     fetched = kvcr.fetch((key,))
     claim = dict(kvcr.poll_completed())[fetched][key].release_handle
-    _invalidate(kvcr, (key, key))
+    kvcr._core._key_adapter = SimpleNamespace(decode_from_router={123: key}.__getitem__)
+    kvcr.submit_hint(_router_hint(None, (123, 123), action_type="kv.invalidate"))
     assert kvcr.query((key,)) == [(QueryStatus.MISS, None)]
     handles = [
         kvcr.fetch((key,)),

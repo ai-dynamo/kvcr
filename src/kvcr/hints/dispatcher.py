@@ -15,16 +15,18 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
-from .hint_handler import _FetchHintHandler, _HintHandler
+from .hint_handler import _FetchHintHandler, _HintHandler, _NoRetainHintHandler
 from .hint_types import (
     HintType,
     _Hint,
     _KVEvictOnFetchHint,
     _KVFetchHint,
+    _KVInvalidateHint,
     _KVMoveHint,
+    _KVNoRetainHint,
     _KVPrefetchHint,
 )
-from .parser import _parse_payload, hint_message_id, parse_hints
+from .parser import _parse_invalidate, _parse_payload, hint_message_id, parse_hints
 from .results import HintResult, HintStatus
 
 if TYPE_CHECKING:
@@ -42,8 +44,7 @@ KV_EVICT_ON_FETCH = HintType(
     partial(_parse_payload, peer="source", hint_factory=_KVEvictOnFetchHint),
     _FetchHintHandler,
 )
-# Core builds the independent hint handler before the dispatcher; it handles
-# both independent actions.
+# Core builds the shared prefetch/move handler before the dispatcher.
 KV_PREFETCH = HintType(
     _KVPrefetchHint.ACTION_TYPE,
     "1.0",
@@ -56,9 +57,23 @@ KV_MOVE = HintType(
     partial(_parse_payload, peer="destination", hint_factory=_KVMoveHint),
     lambda core, dispatcher: core._independent_hint_handler,
 )
+KV_NO_RETAIN = HintType(
+    _KVNoRetainHint.ACTION_TYPE,
+    "1.0",
+    partial(_parse_payload, peer=None, hint_factory=_KVNoRetainHint),
+    _NoRetainHintHandler,
+)
+KV_INVALIDATE = HintType(
+    _KVInvalidateHint.ACTION_TYPE,
+    "1.0",
+    _parse_invalidate,
+    lambda core, dispatcher: core._independent_hint_handler,
+)
 
 # The supported hint types. Every dispatcher builds one handler per entry.
-_HINT_TYPES: tuple[HintType, ...] = (KV_FETCH, KV_EVICT_ON_FETCH, KV_PREFETCH, KV_MOVE)
+_HINT_TYPES: tuple[HintType, ...] = (
+    KV_FETCH, KV_EVICT_ON_FETCH, KV_PREFETCH, KV_MOVE, KV_NO_RETAIN, KV_INVALIDATE,
+)  # fmt: skip
 
 logger = logging.getLogger(__name__)
 # Handlers run on hot paths; warn once per (phase, action type) about errors.
