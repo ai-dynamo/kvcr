@@ -43,7 +43,7 @@ from kvcr.backends.remote_ops import _CONTROL_DECODER, _failed_result, _TargetMe
 from kvcr.backends.remote_sources import _FwMemResidency, _RemoteSources, _SourcePinOp
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.runtime.core import _BlockRecord, _KVCRCore
-from kvcr.runtime.progress import _STOP, _TransferRef
+from kvcr.runtime.progress import _STOP, _TransferRef, _wait_for_wake
 from kvcr.service.recovery_journal import install_recovery_records
 from kvcr.types import (
     BlockKey,
@@ -654,10 +654,12 @@ def test_local_source_waits_for_declared_pieces(
 @pytest.mark.parametrize(
     "outcome", ["write", "framework", "deadline", "cancel", "route", "shutdown"]
 )
-def test_local_source_retries_after_reader_contention(outcome):
+def test_local_source_retries_after_reader_contention(monkeypatch, outcome):
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, pinning, control = FakeNixlAgent(), FakePrimaryPinning(), FakeBytesControl()
+    # Lets the idle progress thread back off, as it does with a real channel.
+    control.wait_for_input = _wait_for_wake
     if outcome != "framework":
         pinning.request_pin = pinning.poll_pin_results = None
         pinning.release_pin = pinning.cancel_pin_request = None
@@ -673,6 +675,21 @@ def test_local_source_retries_after_reader_contention(outcome):
     source._core._clock = lambda: now
     local = source._core._local_dram._pools
     backend = source._core._remote_fw_dram
+    progress = source._core._progress
+    waits: list[float] = []
+    attempts: list[object] = []
+    wait_for_work, acquire_readers = progress._wait_for_work, local.acquire_readers
+
+    def record_wait(timeout: float) -> None:
+        waits.append(timeout)
+        wait_for_work(timeout)
+
+    def record_attempt(*args, **kwargs):
+        attempts.append(args)
+        return acquire_readers(*args, **kwargs)
+
+    monkeypatch.setattr(progress, "_wait_for_work", record_wait)
+    monkeypatch.setattr(local, "acquire_readers", record_attempt)
     key = BlockKey(b"local")
     requested_key = BlockKey(b"framework-only") if outcome == "framework" else key
     try:
@@ -694,6 +711,13 @@ def test_local_source_retries_after_reader_contention(outcome):
                 )
             )
             _wait_until(lambda: bool(backend._pending_local_sources))
+            if outcome == "write":
+                # Releasing the lock sends no wakeup, so contended retries must keep
+                # the loop polling instead of backing off past the deadline.
+                waits.clear()
+                retried = len(attempts)
+                _wait_until(lambda: len(attempts) >= retried + 3)
+                assert waits == []
             assert len(agent.xfers) == 1
             assert source._core._block_record_map[key].local_dram.claim_count == 0
             if outcome == "deadline":

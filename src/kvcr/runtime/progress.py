@@ -3,7 +3,9 @@
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
 import logging
+import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -27,12 +29,24 @@ _FAILED_RESULT = OpEntryResult(OpEntryStatus.FAILED)
 _TIMEOUT_RESULT = OpEntryResult(OpEntryStatus.TIMEOUT, reason=Reason.DEADLINE.value)
 _DROPPED_RESULT = OpEntryResult(OpEntryStatus.DROPPED)
 _IDLE_WAIT_SECONDS = 0.001
+# Bound latency for work without wakeup notifications.
+_IDLE_WAIT_MAX_SECONDS = 0.02
 _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 60.0
 _PREPARE_LOG_INTERVAL_SECONDS = 10.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
 _STOP = object()
+
+
+def _wait_for_wake(wake_fd: int, timeout: float) -> bool:
+    """Wait for input when only local submissions can arrive."""
+    # poll(), unlike select(), accepts descriptors numbered past FD_SETSIZE.
+    poller = select.poll()
+    poller.register(wake_fd, select.POLLIN)
+    return bool(poller.poll(timeout * 1000))
+
+
 _OpId = tuple[str, Any]
 _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
 
@@ -140,6 +154,8 @@ class _KVCRProgress:
         nixl_listen_port: int | None = None,
         memory_regions: _RegionMaps | None = None,
         startup_timeout_seconds: float | None = None,
+        wait_for_input: Callable[[int, float], bool] = _wait_for_wake,
+        needs_poll: Callable[[], bool] | None = None,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
@@ -171,6 +187,13 @@ class _KVCRProgress:
         self._ready = threading.Event()
         self._prepare_ready = threading.Event()
         self._activate = threading.Event()
+        self._wait_for_input = wait_for_input
+        # Backend retries may need polling without a wakeup signal.
+        self._needs_poll = needs_poll
+        # Prevent wake writes from racing with pipe closure and descriptor reuse.
+        self._wake_lock = threading.Lock()
+        self._wake_read: int | None = None
+        self._wake_write: int | None = None
         self._close_requested = False
         self._thread = threading.Thread(
             target=self._run,
@@ -575,6 +598,7 @@ class _KVCRProgress:
     def submit(self, item: object) -> None:
         self.raise_if_failed()
         self._submissions.put(item)
+        self._signal_wake()
 
     def take_completed(self) -> list[object]:
         completed: list[object] = []
@@ -609,6 +633,7 @@ class _KVCRProgress:
             self._close_requested = True
             self._activate.set()
             self._submissions.put(_STOP)
+            self._signal_wake()
             # An interrupt can cut join() short, so the recheck below is
             # what callers rely on, not that join() returned.
             self._thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
@@ -631,6 +656,11 @@ class _KVCRProgress:
 
     def _run(self) -> None:
         try:
+            wake_read, wake_write = os.pipe()
+            os.set_blocking(wake_read, False)
+            os.set_blocking(wake_write, False)
+            with self._wake_lock:
+                self._wake_read, self._wake_write = wake_read, wake_write
             self._log_startup_stage("NIXL agent initialization")
             self._initialize_nixl()
             if self._close_requested:
@@ -656,9 +686,24 @@ class _KVCRProgress:
             self._capture_agent_metadata()
             self._log_startup_stage("ready")
             self._ready.set()
+            idle_wait = _IDLE_WAIT_SECONDS
             while not self._stop_requested:
-                if not self._run_one_iteration():
+                if self._run_one_iteration():
+                    idle_wait = _IDLE_WAIT_SECONDS
+                    continue
+                if self._stop_requested:
+                    break
+                if (
+                    self._in_flight_ops
+                    or self._active_transfers
+                    or (self._needs_poll is not None and self._needs_poll())
+                ):
+                    # Keep polling when work cannot signal its completion.
+                    idle_wait = _IDLE_WAIT_SECONDS
                     time.sleep(_IDLE_WAIT_SECONDS)
+                    continue
+                self._wait_for_work(idle_wait)
+                idle_wait = min(idle_wait * 2, _IDLE_WAIT_MAX_SECONDS)
         except BaseException as error:
             self._failure = error
         finally:
@@ -680,6 +725,31 @@ class _KVCRProgress:
                 if self._failure is None:
                     self._failure = error
             self._ready.set()
+            with self._wake_lock:
+                for descriptor in (self._wake_read, self._wake_write):
+                    if descriptor is not None:
+                        os.close(descriptor)
+                self._wake_read = self._wake_write = None
+
+    def _signal_wake(self) -> None:
+        with self._wake_lock:
+            if self._wake_write is None:
+                # Not running: the loop drains the queue before its first wait.
+                return
+            try:
+                os.write(self._wake_write, b"\0")
+            except BlockingIOError:
+                # The pipe is full, so a wakeup is already pending.
+                pass
+
+    def _wait_for_work(self, timeout: float) -> None:
+        """Wait for input, then drain pending wake signals."""
+        self._wait_for_input(self._wake_read, timeout)
+        try:
+            while os.read(self._wake_read, 4096):
+                pass
+        except BlockingIOError:
+            pass
 
     def _close_progress_ops(self) -> None:
         self._stop_requested = True

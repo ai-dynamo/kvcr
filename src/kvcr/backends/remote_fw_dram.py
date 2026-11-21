@@ -654,6 +654,11 @@ class _RemoteFWDram:
         observed_work |= bool(events)
         return events, observed_work
 
+    def needs_progress_poll(self) -> bool:
+        # A source waiting out reader contention retries only when polled: releasing
+        # the reader lock does not wake the progress thread.
+        return bool(self._pending_local_sources)
+
     def flush_progress(self) -> list[object]:
         remote_count = len(self._remote_agents_by_target)
         if self._progress_metrics or remote_count != self._published_remote_count:

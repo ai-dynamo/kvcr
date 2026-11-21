@@ -28,6 +28,7 @@ from _kvcr_test_utils import _wait_until, free_port, listening_socket
 from kvcr import KVCRClient, KVCRServiceError
 from kvcr.config import G3Options
 from kvcr.runtime.control_channels import FramedConnection
+from kvcr.runtime.progress import _wait_for_wake
 from kvcr.service import protocol as guard_protocol
 from kvcr.service.guard import _Command, _Phase
 from kvcr.service.memory import _KVCRPoolOwner
@@ -207,8 +208,8 @@ def _channels_are_taken():
     """Close the duplicate a claim hands its Guard, as a real Guard would."""
     # Within a test a Guard's endpoint never moves; across tests it is gone.
     _GUARD_BINDS.clear()
-    # A promoted Guard's poll loop drains this, so recv() must be iterable.
-    channel = Mock(recv=Mock(return_value=[]))
+    # A promoted Guard's progress loop drains recv() and idles in wait_for_input().
+    channel = Mock(recv=Mock(return_value=[]), wait_for_input=_wait_for_wake)
 
     def _take(duplicate: socket.socket):
         duplicate.close()

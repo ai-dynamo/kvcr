@@ -110,6 +110,10 @@ class FrameworkControl(Protocol):
         """Return messages with their local time.monotonic() receipt timestamps."""
         ...
 
+    def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
+        """Wait up to ``timeout`` for input or ``wake_fd``; True if either is ready."""
+        ...
+
 
 class KeyAdapter(Protocol):
     """Convert between KVCR storage keys and external key representations.

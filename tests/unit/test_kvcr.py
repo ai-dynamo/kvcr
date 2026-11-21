@@ -710,9 +710,7 @@ def test_nixl_lifecycle_stays_on_progress_thread(
             pinning.request_pin,
             pinning.poll_pin_results,
             pinning.release_pin,
-            framework_control=(
-                SimpleNamespace(recv=lambda: ()) if remote_enabled else None
-            ),
+            framework_control=FakeBytesControl() if remote_enabled else None,
         ),
         KVCRBackendConfigs(
             framework_regions=[

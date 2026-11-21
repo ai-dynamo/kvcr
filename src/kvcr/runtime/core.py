@@ -60,6 +60,7 @@ from .progress import (
     _OpId,
     _resolve_region,
     _TransferRef,
+    _wait_for_wake,
 )
 
 if TYPE_CHECKING:
@@ -360,6 +361,12 @@ class _KVCRCore:
             finally:
                 self._remote_fw_dram.close_progress()
 
+        wait_for_input = (
+            _wait_for_wake
+            if self.framework_control is None
+            else self.framework_control.wait_for_input
+        )
+
         self._progress = _KVCRProgress(
             initialize_progress,
             self._remote_fw_dram.poll_progress,
@@ -370,6 +377,8 @@ class _KVCRCore:
             dram_backends=list(dram_backends),
             memory_regions=self._memory_regions,
             startup_timeout_seconds=startup_timeout_seconds,
+            wait_for_input=wait_for_input,
+            needs_poll=self._remote_fw_dram.needs_progress_poll,
         )
 
     def start(self) -> None:

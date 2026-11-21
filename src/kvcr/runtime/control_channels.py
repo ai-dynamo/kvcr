@@ -186,6 +186,8 @@ class ZmqPeerControlChannel:
     _ctx: zmq.Context | None
     _socket: zmq.Socket | None
     _outgoing: dict[str, zmq.Socket]
+    _input_poller: zmq.Poller | None
+    _input_wake_fd: int | None
 
     def __init__(
         self,
@@ -204,6 +206,8 @@ class ZmqPeerControlChannel:
         self._ctx = None
         self._socket = None
         self._outgoing = {}
+        self._input_poller = None
+        self._input_wake_fd = None
 
     @classmethod
     def from_shared_listener(cls, listener: socket.socket) -> "ZmqPeerControlChannel":
@@ -264,6 +268,8 @@ class ZmqPeerControlChannel:
             self._socket.close()
             self._socket = None
             raise
+        self._input_poller = zmq.Poller()
+        self._input_poller.register(self._socket, zmq.POLLIN)
 
     def send(self, endpoint: str, message: bytes) -> bool:
         if self._ctx is None:
@@ -293,6 +299,22 @@ class ZmqPeerControlChannel:
             return False
         return True
 
+    def wait_for_input(self, wake_fd: int, timeout: float) -> bool:
+        """Block until a peer message or ``wake_fd`` is readable, or ``timeout`` ends.
+
+        Return whether either is ready. Like ``recv``, it may only be used from the
+        progress thread.
+        """
+        poller = self._input_poller
+        if poller is None:
+            raise RuntimeError("KVCR control channel is not initialized")
+        if wake_fd != self._input_wake_fd:
+            if self._input_wake_fd is not None:
+                poller.unregister(self._input_wake_fd)
+            poller.register(wake_fd, zmq.POLLIN)
+            self._input_wake_fd = wake_fd
+        return bool(poller.poll(timeout * 1000))
+
     def recv(self) -> list[tuple[bytes, float]]:
         socket = self._socket
         if socket is None:
@@ -317,6 +339,7 @@ class ZmqPeerControlChannel:
 
         A first-failure stop leaves the pool's control address bound, unclaimable.
         """
+        self._input_poller = self._input_wake_fd = None
         with ExitStack() as sockets:
             for target in (*self._outgoing.values(), self._socket, self._listener):
                 if target is not None:
