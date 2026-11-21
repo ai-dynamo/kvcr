@@ -48,25 +48,18 @@ them all, and an option it does not have is refused. Tests:
 | `smoke.toml` | Seconds long, tiny tiers, every delivered byte checked |
 | `agentic.toml` | The baseline: 8 sessions per rank, one turn in twenty migrates |
 | `agentic-stress.toml` | Twice the sessions, fast turns, a quarter migrating, a KVCR pool that evicts |
-| `agentic-stress-fast.toml` | `agentic-stress` with the modelled GPU and think time compressed |
-| `peer-only.toml` | No KVCR pool: peers are served from pinned engine memory |
-| `agentx.toml` | The AgentX trace with the modelled GPU and recorded waits; needs `workload.trace` |
-| `agentx-fast.toml` | The AgentX trace compressed, with twice the sessions and half the KVCR pool; needs `workload.trace` |
+| `agentx-fast.toml` | The AgentX trace with the modelled GPU, answers and waits compressed; needs `workload.trace` |
 
 With realistic GPU times (`engine.step_ms`, `engine.prefill_us_per_token`) a
-rank finishes one or two requests a second. The `-fast` scenarios shrink them
-until KVCR's time on the engine thread is what limits a rank.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `router.migration_prob` | 0.05 | Chance per turn that a session moves, to the worker with the fewest sessions, whatever the system's speed |
-| `tiers.block_bytes` | 16 KiB | Bytes KVCR moves per block. Far smaller than a real KV block so that many ranks fit on a node; host cost follows the number of blocks, not their size |
-| `tiers.tokens_per_block` | 64 | Tokens per block |
-| `workload.trace` | none | Replay a compiled trace instead of generating sessions |
+rank finishes one or two requests a second; `agentx-fast` shrinks them until
+KVCR's time on the engine thread is what limits a rank. Blocks are 16 KiB
+(`tiers.block_bytes`), far smaller than a real KV block, so that many ranks
+fit on a node: host cost follows the number of blocks, not their size.
 
 ## How it works
 
-- **Coordinator:** generates the workload, routes it and drives the phases
+- **Coordinator:** generates the workload (closed-loop coding-agent sessions,
+  synthetic or replayed from a trace), routes it and drives the phases
   (register, configure, mesh warm, fill, measure, stop). It never imports
   `kvcr`, so it is the same program for every arm. In mesh warm every worker
   pulls one block from every other, so the window holds no first-contact
@@ -74,26 +67,19 @@ until KVCR's time on the engine thread is what limits a rank.
 - **Workers:** one process each, with a real `KVCR` and a fake engine driving
   it. Host mappings stand in for engine memory and KVCR's DRAM pool. KVCR's
   telemetry is on (vLLM's default is off): the report reads it.
-- **Engine** (`engine_vllm.py`): vLLM's KVCR tier. One `query` per key on a
-  CPU-tier miss, one `deliver` per request per step, one `deposit` per
-  request per step for the blocks it stored, `align_sequence` after each. A
-  request runs once the device has room for every token it will hold.
-- **Router:** tracks how much of each stream's prefix every worker holds.
-  After choosing a worker it hints the peer with the longest prefix, if that
-  beats what the chosen worker holds. That is Dynamo's rule.
-- **Workload:** synthetic coding-agent sessions (a shared system prefix, a
-  context that grows each turn and is compacted at the cap) or a replayed
-  trace. Both are closed loop.
-
-The exact call sequence is in the engine's module docstring and pinned by
-`tests/clusterbench/test_cb_engine_vllm.py`; change the two together.
+- **Engine** (`engine_vllm.py`): makes the calls of vLLM's KVCR tier. Its
+  module docstring has the exact sequence, which
+  `tests/clusterbench/test_cb_engine_vllm.py` pins; change the two together.
+- **Router:** a session stays on its worker and moves with
+  `router.migration_prob` per turn. After choosing a worker the router hints
+  the peer holding the longest prefix, if that beats what the chosen worker
+  holds. That is Dynamo's rule.
 
 ## Trace replay
 
 `workload.trace` replays recorded sessions: the AgentX trace
 (`semianalysisai/cc-traces-weka-062126` on Hugging Face, 393 Claude Code
-sessions, 68,266 requests). Compile it once, then pass the file to an `agentx`
-scenario:
+sessions, 68,266 requests). Compile it once, then pass the file to the run:
 
 ```bash
 PYTHONPATH=benchmarks uv run python -m clusterbench trace traces.jsonl -o agentx-062126.cbtrace
@@ -102,20 +88,11 @@ PYTHONPATH=benchmarks uv run python -m clusterbench local \
   --set workload.trace=$PWD/agentx-062126.cbtrace --nodes 2 --per-node 4
 ```
 
-The replay follows aiperf's AgentX rules:
-
-- A request goes out the recorded gap after the one before it in its lane
-  finishes (`workload.trace_think_scale` scales the gap,
-  `workload.think_cap_s` caps it).
-- Sub-agents run side by side as sessions of their own, at their recorded
-  offsets. The first parent turn recorded at or after a sub-agent's end waits
-  for it and, if that held it up, goes out the moment it ends; earlier turns
-  do not wait.
-- `workload.sessions_per_worker` sessions play at once per worker. Each play
-  gets block ids of its own, so plays share nothing.
-
-A run is refused if its longest request does not fit `tiers.gpu_blocks` or
-its longest prompt `tiers.primary_blocks`.
+The replay follows aiperf's AgentX timing, sub-agents included; the `trace.py`
+docstring has the rules. `workload.sessions_per_worker` sessions play at once
+per worker, each with block ids of its own. A run is refused if its longest
+request does not fit `tiers.gpu_blocks` or its longest prompt
+`tiers.primary_blocks`.
 
 ## Results
 
@@ -140,23 +117,16 @@ microseconds per item for each KVCR call; engine, progress and native-thread
 microseconds per moved block; KVCR time per engine step. A moved block is one
 KVCR copied: a delivered block, or a deposited block its pool did not already
 hold. Throughput and latency are reported too, but they depend on the
-closed-loop workload and the modelled engine as much as on KVCR.
-
-**Thread split.** Each rank's engine thread is split into KVCR calls, the
-modelled forward pass, idle, and everything else the thread does ("harness").
-KVCR is the bottleneck when its share dominates.
+closed-loop workload and the modelled engine as much as on KVCR. The engine
+thread's time is split into KVCR calls, the modelled forward pass, idle and
+the rest ("harness"); KVCR is the bottleneck when its share dominates.
 
 **Failed blocks.** Hinted blocks that a peer did not deliver are counted by
 the status KVCR returns for them: `timeout`, `unavailable` (the source no
-longer held the block, or could not pin it), `aborted` or `failed`.
-`report --detail` has KVCR's reasons. A KVCR tree that returns no reason shows
-them as `unclassified`. Blocks *beyond the hint* are counted apart: vLLM's
-opportunistic query asks the peer for the rest of the prompt too, which it
-cannot have.
-
-**Request log.** `requests.jsonl` starts with a header naming its fields:
-where each request went and when, the hint, what the router believed the
-worker held, then the outcome. A request still in flight at the end has none.
+longer held the block, or could not pin it), `aborted` or `failed`, or
+`unclassified` on a KVCR tree that returns no reason. `report --detail` has
+the reasons. Blocks *beyond the hint* are counted apart: vLLM's opportunistic
+query asks the peer for the rest of the prompt too, which it cannot have.
 
 **INVALID.** A run is marked INVALID, with the reason, when:
 

@@ -68,7 +68,6 @@ def real_nixl():
     [
         ("g2-pool", ["tiers.g2_blocks=8192"]),
         ("peer-only", ["tiers.g2_blocks=0"]),
-        ("pinless", ["tiers.g2_blocks=8192", "tiers.framework_pinning=false"]),
     ],
 )
 def test_workers_pull_blocks_from_each_other(real_nixl, tmp_path, mode, tier_overrides):
@@ -88,7 +87,9 @@ def test_workers_pull_blocks_from_each_other(real_nixl, tmp_path, mode, tier_ove
     assert counters["deliver_blocks_remote"] > 100, summary["flags"]
     assert counters["bytes_checked"] >= counters["deliver_blocks_remote"]
     assert counters.get("bytes_mismatch", 0) == 0
-    assert summary["completed"]["remote_blocks_cross_node"] > 0
+    # One worker per node: every peer is on another node.
+    cross_node = counters["deliver_blocks_remote_cross_node"]
+    assert cross_node == counters["deliver_blocks_remote"]
     assert summary["headline"]["hinted_block_failure_rate"] < 0.05
     assert summary["engine_calls"]["deliver"]["calls"] > 0
     assert summary["engine_calls"]["align_sequence"]["items"] > 0
@@ -98,8 +99,6 @@ def test_workers_pull_blocks_from_each_other(real_nixl, tmp_path, mode, tier_ove
         assert counters.get("deposit_blocks_ok", 0) == 0
     else:
         assert counters["deposit_blocks_ok"] > 0
-    if mode == "pinless":
-        assert counters.get("pin_requests", 0) == 0
     hard = [
         f
         for f in summary["flags"]
@@ -183,7 +182,7 @@ def test_a_replayed_trace_moves_blocks_between_workers(real_nixl, tmp_path):
     assert counters["deliver_blocks_remote"] > 50, summary["flags"]
     assert counters["bytes_checked"] >= counters["deliver_blocks_remote"]
     assert counters.get("bytes_mismatch", 0) == 0
-    assert summary["completed"]["completed"] > 50
+    assert counters["requests"] > 50
     hard = [
         f
         for f in summary["flags"]
@@ -209,5 +208,9 @@ def test_transfers_kvcr_times_out_are_reported_as_timeouts(real_nixl, tmp_path):
     # This tree's KVCR names a status for every block it does not deliver.
     assert "unclassified" not in causes
     assert summary["counters"]["hinted_failed_reason|deadline"] > 0
-    assert summary["completed"]["timed_out_blocks"] > 0
     assert summary["headline"]["hinted_timeout_rate"] > 0
+    # The request log has each request's share of them.
+    log = (tmp_path / "requests.jsonl").read_text().splitlines()
+    header, *rows = map(json.loads, log)
+    timed_out = header["fields"].index("timed_out_blocks")
+    assert sum(row[timed_out] for row in rows if len(row) > timed_out) > 0

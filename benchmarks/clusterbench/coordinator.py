@@ -171,7 +171,7 @@ class Coordinator:
         # Configure: every worker starts its KVCR and learns the peer table.
         peers = [(h.node, h.control_endpoint) for h in hello]
         blob = encode_config(config)
-        router = Router(config.router, nodes, config.tiers)
+        router = Router(config.router, nodes)
         self._router = router
         self._reports: dict[int, dict] = {}
         with (
@@ -189,7 +189,7 @@ class Coordinator:
                     self._send(worker, protocol.Phase("warm"))
                 warm = self._barrier("warm")
 
-            summary = self._drive(router, nodes, log)
+            summary = self._drive(router, log)
 
         summary_in = {
             "name": config.name,
@@ -228,7 +228,7 @@ class Coordinator:
         elif isinstance(message, protocol.Report):
             self._reports[worker] = json.loads(message.payload)
 
-    def _drive(self, router: Router, nodes: list[str], log) -> dict:
+    def _drive(self, router: Router, log) -> dict:
         config, phases = self.config, self.config.phases
         workers = self._workers
         workload = self._workload
@@ -258,7 +258,7 @@ class Coordinator:
         report_deadline = None
         lag = LogHist()
         tally = self._new_tally()
-        offered, completed = tally["offered"], tally["completed"]
+        offered = tally["offered"]
         encode = msgspec.json.Encoder().encode
         log.write(encode({"clusterbench_requests": 1, "fields": REQUEST_FIELDS}))
 
@@ -277,8 +277,6 @@ class Coordinator:
                     round(message.ttft_ms, 3),
                 )
                 log.write(b"\n" + encode(sent + outcome))
-                if measuring and not stopped:
-                    self._tally_done(completed, message, worker, sent[3], nodes)
                 if stopped:
                     return
                 # The workload says what this sets off: the session's next
@@ -404,8 +402,8 @@ class Coordinator:
 
     @staticmethod
     def _new_tally() -> dict:
-        """What the window offered and what came back; the summary carries
-        both dicts as they are."""
+        """What the window offered (the summary carries that dict as it is).
+        What came of it is counted by the workers."""
         offered = (
             "dispatched",
             "dispatched_blocks",
@@ -416,40 +414,9 @@ class Coordinator:
             "hinted_cross_node",
             "migrations",
         )
-        completed = (
-            "completed",
-            "prompt_blocks",
-            "gpu_blocks",
-            "primary_blocks",
-            "local_blocks",
-            "remote_requests",
-            "remote_blocks_same_node",
-            "remote_blocks_cross_node",
-            "failed_blocks",
-            "timed_out_blocks",
-            "prefill_tokens",
-        )
         return {
             "offered": dict.fromkeys(offered, 0),
-            "completed": dict.fromkeys(completed, 0),
             "primary_occupancy_min": 1.0,  # emptiest host tier at window start
             "measure_s": 0.0,
             "busy_s": 0.0,  # window time not spent waiting
         }
-
-    @staticmethod
-    def _tally_done(completed, done, worker, source, nodes) -> None:
-        completed["failed_blocks"] += done.failed_blocks
-        completed["timed_out_blocks"] += done.timed_out_blocks
-        completed["completed"] += 1
-        completed["prompt_blocks"] += done.prompt_blocks
-        completed["gpu_blocks"] += done.gpu_blocks
-        completed["primary_blocks"] += done.primary_blocks
-        completed["local_blocks"] += done.local_blocks
-        completed["prefill_tokens"] += done.recomputed_tokens
-        if done.remote_blocks:
-            completed["remote_requests"] += 1
-            same = source >= 0 and nodes[worker] == nodes[source]
-            completed[
-                "remote_blocks_same_node" if same else "remote_blocks_cross_node"
-            ] += done.remote_blocks

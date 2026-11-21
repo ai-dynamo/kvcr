@@ -28,7 +28,6 @@ def _inputs(workers=2, **phases):
         inflight_max=4,
     )
     tally["offered"].update(dispatched=100, dispatched_blocks=50_000, hinted=10)
-    tally["completed"].update(completed=100)
     coord = {
         "name": "t",
         "arm": "base",
@@ -94,6 +93,8 @@ def test_a_clean_run_is_valid_and_normalised():
     text = format_summary(summary)
     assert text.splitlines()[1] == "VALID"
     assert "modelled GPU 20.0%, idle 10.0%" in text
+    # Block counts are the workers' own, summed.
+    assert "kvcr-local 0  remote 2000 (0 cross-node)  failed 0 " in text
     assert "mesh warm: 2 ok" in format_detail(summary)
 
 

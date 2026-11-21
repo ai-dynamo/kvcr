@@ -33,7 +33,7 @@ head_node=${nodes[0]}
 nodelist=$(IFS=,; echo "${nodes[*]}")
 port=${CB_COORD_PORT:-17700}
 
-# The first cores of socket 0 are reserved from the workers (--reserve-cores).
+# The workers leave the first two cores of every socket free.
 srun --jobid "$JOB" --overlap -N1 -n1 -w "$head_node" --cpu-bind=none \
   env PYTHONPATH="$CB_ROOT/site:$harness/benchmarks" taskset -c 0-1 \
   python3 -m clusterbench coordinator \

@@ -214,7 +214,6 @@ def summarize(config: dict, coord: dict, reports: list[dict]) -> dict:
             "inflight_max": tally["inflight_max"],
         },
         "offered": tally["offered"],
-        "completed": tally["completed"],
         "engine_calls": engine_calls,
         "counters": counters,
         "latency": {name: hist.summary() for name, hist in sorted(hists.items())},
@@ -248,7 +247,7 @@ def _fmt(value: float) -> str:
 
 def format_summary(summary: dict) -> str:
     h = summary["headline"]
-    done = summary["completed"]
+    count = summary["counters"].get
     offered = summary["offered"]
     failures = summary["failures"]
     workload = summary["workload"]
@@ -297,11 +296,12 @@ def format_summary(summary: dict) -> str:
         f"remote blocks/s {_fmt(h['remote_blocks_per_s'])}   "
         f"hinted {offered['hinted']} of {offered['dispatched']} requests "
         f"({offered['hinted_cross_node']} cross-node)",
-        f"blocks: gpu {done['gpu_blocks']}  primary {done['primary_blocks']}  "
-        f"kvcr-local {done['local_blocks']}  "
-        f"remote {done['remote_blocks_same_node'] + done['remote_blocks_cross_node']}"
-        f" ({done['remote_blocks_cross_node']} cross-node)  "
-        f"failed {done['failed_blocks']} "
+        f"blocks: gpu {count('gpu_hit_blocks', 0):.0f}  "
+        f"primary {count('primary_hit_blocks', 0):.0f}  "
+        f"kvcr-local {count('deliver_blocks_local', 0):.0f}  "
+        f"remote {count('deliver_blocks_remote', 0):.0f}"
+        f" ({count('deliver_blocks_remote_cross_node', 0):.0f} cross-node)  "
+        f"failed {count('deliver_blocks_failed', 0):.0f} "
         f"(hinted-block failure rate {h['hinted_block_failure_rate']:.2%})",
         f"ttft p50/p99 {_fmt(h['ttft_p50_ms'])}/{_fmt(h['ttft_p99_ms'])} ms   "
         f"remote resolve p50/p99 {_fmt(h['remote_resolve_p50_ms'])}/"
@@ -474,7 +474,7 @@ def compare(arms: dict[str, list[dict]]) -> str:
     for call in sorted(calls):
         # poll's cost is per call (most polls complete nothing); the others
         # scale with the keys they are given.
-        unit = "call" if call in ("poll", "poll_empty") else "item"
+        unit = "call" if call == "poll" else "item"
         values = {
             n: [
                 s["engine_calls"].get(call, {}).get(f"us_per_{unit}", 0.0)

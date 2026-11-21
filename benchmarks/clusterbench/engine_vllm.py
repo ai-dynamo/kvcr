@@ -129,7 +129,7 @@ class _Req:
         "computed", "sched", "next_stored", "promote",
         "local_ok", "remote_ok", "failed", "timed_out", "primary_hit",
         "prefill_tokens", "lookups", "hinted", "looked", "segments", "all_segments",
-        "pins", "need",
+        "pins", "need", "cross",
     )  # fmt: skip
 
 
@@ -238,7 +238,7 @@ class VllmEngine:
         self._primary.insert_reserved(key, 0)
         host.stamp(0, warm)
         if self._tiers.g2_blocks:
-            # Also in the KVCR pool, so a pinless source can serve it.
+            # Deposited too, like every block the engine stores.
             op = self._kvcr.deposit({key: [self._refs[0]]})
             self._primary.prepare_read((key,))
             self._jobs[op] = _Job(_STORE, None, [key], 0)
@@ -276,11 +276,13 @@ class VllmEngine:
         r.prefill_tokens = r.lookups = r.hinted = 0
         r.pins = ()
         r.need = 0
+        r.cross = False
         if request.hint_source >= 0 and request.hint_blocks > 0:
             r.hinted = request.hint_blocks
             # vLLM on_new_request: submit_hint only when the router sent one.
             hashes = segment_ids(request.segments)[: request.hint_blocks]
-            endpoint = self._peers[request.hint_source][1]
+            node, endpoint = self._peers[request.hint_source]
+            r.cross = node != self._peers[self._worker][0]
             hint = fetch_hint(r.req_id, endpoint, hashes)
             t = time.perf_counter()
             self._kvcr.submit_hint(hint, r.req_id)
@@ -293,7 +295,6 @@ class VllmEngine:
         perf = time.perf_counter
         window = self._window
         cfg = self._cfg
-        t_step = perf()
         kvcr_before = sum(window.secs.values())
         budget = cfg.max_batched_tokens
         prefill = 0
@@ -391,8 +392,6 @@ class VllmEngine:
         stats = self._kvcr.get_stats()
         window.call("get_stats", perf() - t)
         window.merge_telemetry(stats)
-        t_end = perf()
-        window.hists["step_scheduler"].add(t_scheduled - t_step + t_end - t_output)
         window.counters["steps"] += 1
         if scheduled:
             window.counters["busy_steps"] += 1
@@ -597,6 +596,8 @@ class VllmEngine:
         r.failed += len(job.bad)
         window.hists["deliver_remote" if job.remote else "deliver_local"].add(elapsed)
         window.counters["deliver_blocks_remote"] += remote
+        if remote and r.cross:
+            window.counters["deliver_blocks_remote_cross_node"] += remote
         window.counters["deliver_blocks_local"] += local
         window.counters["deliver_blocks_failed"] += len(job.bad)
         if job.bad:
@@ -684,13 +685,8 @@ class VllmEngine:
             rid=r.rid,
             ttft_ms=ttft * 1e3,
             load_ms=load * 1e3,
-            prompt_blocks=len(r.keys),
-            gpu_blocks=r.gpu_hit,
-            primary_blocks=r.primary_hit,
-            local_blocks=r.local_ok,
             remote_blocks=r.remote_ok,
             failed_blocks=r.failed,
-            recomputed_tokens=r.prefill_tokens,
             timed_out_blocks=r.timed_out,
         )
 
@@ -791,9 +787,3 @@ class VllmEngine:
 
     def fill_level(self) -> float:
         return self._primary.fill_level()
-
-    def begin_window(self) -> None:
-        pass
-
-    def end_window(self) -> None:
-        pass

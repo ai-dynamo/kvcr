@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from clusterbench.config import RouterConfig, TierConfig
+from clusterbench.config import RouterConfig
 from clusterbench.ids import block_id
 from clusterbench.protocol import TIER_DEVICE, TIER_G2, TIER_PRIMARY
 from clusterbench.router import Inventory, PrefixTracker, Router
@@ -84,7 +84,7 @@ def test_tracked_blocks_travel_as_runs():
 
 
 def _router(**kwargs):
-    return Router(RouterConfig(**kwargs), NODES, TierConfig())
+    return Router(RouterConfig(**kwargs), NODES)
 
 
 def test_hint_names_the_longest_holder_with_ties_to_the_lower_id():
@@ -107,7 +107,7 @@ def test_hint_search_matches_a_scan_of_every_worker():
 
     rng = random.Random(7)
     nodes = [f"n{w // 4}" for w in range(16)]
-    router = Router(RouterConfig(migration_prob=0.0), nodes, TierConfig(g2_blocks=64))
+    router = Router(RouterConfig(migration_prob=0.0), nodes)
     streams = [1, 2, 50, 51, 52, 53]
     hinted = 0
     for step in range(3000):
@@ -144,22 +144,12 @@ def test_device_only_blocks_cannot_be_a_hint_source():
     assert router.route(2, SEGMENTS).hint_source == -1
 
 
-def test_pinless_peer_only_sources_are_ignored():
-    tiers = TierConfig(g2_blocks=4096, framework_pinning=False)
-    router = Router(RouterConfig(migration_prob=0.0), NODES, tiers)
-    router.inventory.apply(1, [(TIER_PRIMARY, 1, 0, 10, False)])
-    assert router.route(2, SEGMENTS).hint_source == -1
-    router.inventory.apply(1, [(TIER_G2, 1, 0, 10, False)])
-    assert router.route(2, SEGMENTS).hint_source == 1
-
-
-def test_routing_is_decided_by_the_seed_alone():
-    def plan(seed):
-        router = _router(migration_prob=0.3, seed=seed)
+def test_the_same_requests_are_always_routed_the_same_way():
+    def plan():
+        router = _router(migration_prob=0.3)
         return [router.route(s, SEGMENTS).worker for _ in range(40) for s in range(6)]
 
-    assert plan(1) == plan(1)
-    assert plan(1) != plan(2)
+    assert plan() == plan() and len(set(plan())) == 4
 
 
 def test_sticky_migration_rate():
@@ -178,17 +168,17 @@ def test_sticky_migration_rate():
 
 def test_a_migrating_session_prefers_an_equally_empty_worker_on_another_node():
     seen = set()
-    for seed in range(8):
-        router = _router(migration_prob=1.0, seed=seed)
-        for session in range(4):  # one session on each worker
-            assert router.route(session, SEGMENTS).worker == session
-        seen.add(router.route(0, SEGMENTS).worker)
+    for first in range(0, 32, 4):  # each session draws from an RNG of its own
+        router = _router(migration_prob=1.0)
+        for session in range(first, first + 4):  # one session on each worker
+            assert router.route(session, SEGMENTS).worker == session % 4
+        seen.add(router.route(first, SEGMENTS).worker)
     assert seen == {2, 3}  # never worker 1, which shares node "a"
 
 
 def test_a_migrating_session_goes_to_the_emptiest_worker():
     nodes = [f"n{w // 4}" for w in range(12)]
-    router = Router(RouterConfig(migration_prob=0.5), nodes, TierConfig())
+    router = Router(RouterConfig(migration_prob=0.5), nodes)
     sessions = list(range(96))
     homes = {s: router.route(s, SEGMENTS).worker for s in sessions}
     assert sorted(homes.values()) == sorted(list(range(12)) * 8)

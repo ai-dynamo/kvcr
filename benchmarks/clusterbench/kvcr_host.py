@@ -109,13 +109,14 @@ def plan_affinity(cpus: list[int]) -> tuple[int | None, int | None, list[int]]:
     return groups[0][0], groups[1][0], native
 
 
-def auto_cpus(local_id: int, per_node: int, reserve: int = 2) -> tuple[list[int], int]:
+def auto_cpus(local_id: int, per_node: int) -> tuple[list[int], int]:
     """CPUs for worker ``local_id`` of ``per_node`` on this machine, and its socket.
 
     Workers alternate between sockets and each gets a contiguous block of
-    physical cores (all hyperthreads). The first ``reserve`` cores of every
-    socket are left for the OS, the coordinator and profilers.
+    physical cores (all hyperthreads). The first two cores of every socket
+    are left for the OS, the coordinator and profilers.
     """
+    reserve = 2
     sockets: dict[int, list[list[int]]] = {}
     for (package, _), group in sorted(physical_cores(os.sched_getaffinity(0)).items()):
         sockets.setdefault(package, []).append(group)
@@ -182,16 +183,6 @@ class Host:
 
         self.control = ZmqPeerControlChannel(bind_host, control_port, bind_host)
 
-        # Pinning is off when the callbacks are left out.
-        pins = {}
-        if tiers.framework_pinning:
-            pins = dict(
-                request_pin=framework.request_pin,
-                poll_pin_results=framework.poll_pin_results,
-                release_pin=framework.release_pin,
-                cancel_pin_request=framework.cancel_pin_request,
-            )
-
         engine_cpu, progress_cpu, native = plan_affinity(cpus)
         if native:
             # Threads KVCR and NIXL start inherit this mask.
@@ -209,7 +200,10 @@ class Host:
             ),
             _filtered(
                 KVCRBindings,
-                **pins,
+                request_pin=framework.request_pin,
+                poll_pin_results=framework.poll_pin_results,
+                release_pin=framework.release_pin,
+                cancel_pin_request=framework.cancel_pin_request,
                 framework_control=self.control,
                 key_adapter=KeyAdapter(),
                 inventory_sink=framework.record_inventory,

@@ -29,7 +29,6 @@ from collections.abc import Iterable, Sequence
 
 from .ids import Segment
 
-MISS, HIT, PENDING = 0, 1, 2
 _WRITING = -1
 
 # A key's place in the eviction order is one integer, lowest first:
@@ -75,9 +74,6 @@ class StreamCache:
     def new_rank(self) -> int:
         self._next_rank += 1
         return self._next_rank
-
-    def held(self, stream: int) -> int:
-        return self._length.get(stream, 0)
 
     def prefix(self, segments: Iterable[Segment]) -> int:
         """Leading blocks of the request that are cached."""
@@ -326,12 +322,6 @@ class PrimaryTier:
         return None if key is None else self._evict(key)
 
     # ---- lookups -----------------------------------------------------------
-
-    def lookup(self, key: bytes) -> int:
-        ref = self._ref.get(key)
-        if ref is None:
-            return MISS
-        return PENDING if ref == _WRITING else HIT
 
     def slot(self, key: bytes) -> int:
         return self._slot[key]

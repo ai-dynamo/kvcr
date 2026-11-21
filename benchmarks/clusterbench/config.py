@@ -21,7 +21,6 @@ class TierConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_field
     primary_blocks: int = 8192
     # KVCR-owned DRAM pool (vLLM ``secondary_g2_slots``); 0 is peer-only.
     g2_blocks: int = 65536
-    framework_pinning: bool = True
 
 
 class EngineConfig(
@@ -88,7 +87,6 @@ class RouterConfig(
     # A session stays on its home worker and moves with this probability per
     # turn, whatever the load, so both A/B arms are offered the same work.
     migration_prob: float = 0.05
-    seed: int = 0
 
 
 class PhaseConfig(
@@ -116,9 +114,6 @@ class RunConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
 
 
 def _coerce(text: str) -> object:
-    lowered = text.lower()
-    if lowered in ("true", "false"):
-        return lowered == "true"
     for cast in (int, float):
         try:
             return cast(text)
@@ -155,8 +150,6 @@ def validate(config: RunConfig) -> None:
         raise ValueError("tiers.block_bytes must be a multiple of 4096")
     if tiers.primary_blocks < 64:
         raise ValueError("tiers.primary_blocks is too small")
-    if not tiers.g2_blocks and not tiers.framework_pinning:
-        raise ValueError("a worker with no G2 pool and no pinning cannot be a source")
     if engine.abandon_timeout_ms < 2 * engine.operation_timeout_ms:
         raise ValueError("engine.abandon_timeout_ms must be >= 2x operation timeout")
     if engine.verify not in ("none", "sample", "full"):

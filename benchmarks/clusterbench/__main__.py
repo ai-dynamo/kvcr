@@ -216,7 +216,6 @@ def main(argv: list[str] | None = None) -> int:
         help='CPU list (e.g. 4-11,76-83), or "auto" with --per-node',
     )
     worker.add_argument("--per-node", type=int, default=1, help="workers on this node")
-    worker.add_argument("--reserve-cores", type=int, default=2, help="per socket")
     worker.add_argument(
         "--net-devices", default="", help="UCX_NET_DEVICES per socket, comma separated"
     )

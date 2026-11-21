@@ -40,7 +40,7 @@ def parse_cpus(spec: str) -> list[int]:
 
 def run_worker(args) -> int:
     if args.cpus == "auto":
-        cpus, socket_index = auto_cpus(args.local_id, args.per_node, args.reserve_cores)
+        cpus, socket_index = auto_cpus(args.local_id, args.per_node)
     else:
         cpus, socket_index = parse_cpus(args.cpus), 0
     if args.net_devices:
@@ -59,7 +59,7 @@ def run_worker(args) -> int:
     send = sock.send
     encode = protocol.encode
 
-    host = engine = None
+    host = None
     try:
         path, sha = kvcr_identity()
         send(
@@ -147,7 +147,6 @@ def run_worker(args) -> int:
                         gc.collect()
                         gc.freeze()
                         window.reset()
-                        engine.begin_window()
                         threads_before = thread_snapshot()
                         fill = engine.fill_level()
                         ready = protocol.Ready("measure", {"primary_occupancy": fill})
@@ -162,7 +161,6 @@ def run_worker(args) -> int:
                             profiler = None
                         window.ended = perf()
                         threads_after = thread_snapshot()
-                        engine.end_window()
                         final = window.to_json()
                         final["threads"] = thread_delta(threads_before, threads_after)
                         final["engine"] = engine.gauges()

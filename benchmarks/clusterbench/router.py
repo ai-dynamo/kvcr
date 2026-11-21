@@ -22,9 +22,14 @@ import random
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
-from .config import RouterConfig, TierConfig
+from .config import RouterConfig
 from .ids import INDEX_BITS, INDEX_MASK, Segment
 from .protocol import TIER_DEVICE, TIER_G2, TIER_PRIMARY, InventoryDelta
+
+_LOCAL_TIERS = (TIER_DEVICE, TIER_PRIMARY, TIER_G2)
+# A peer can only serve what it holds in host memory: its CPU tier, through a
+# pin, or its KVCR pool.
+_SOURCE_TIERS = (TIER_PRIMARY, TIER_G2)
 
 
 class Inventory:
@@ -183,21 +188,11 @@ class Route(NamedTuple):
 
 
 class Router:
-    def __init__(
-        self, config: RouterConfig, nodes: Sequence[str], tiers: TierConfig
-    ) -> None:
+    def __init__(self, config: RouterConfig, nodes: Sequence[str]) -> None:
         self._config = config
         self._nodes = list(nodes)
         self._workers = len(nodes)
         self.inventory = Inventory(self._workers)
-        self._local_tiers = (TIER_DEVICE, TIER_PRIMARY, TIER_G2)
-        # A peer can only serve what it holds in host memory it can expose.
-        source_tiers = []
-        if tiers.framework_pinning:
-            source_tiers.append(TIER_PRIMARY)
-        if tiers.g2_blocks:
-            source_tiers.append(TIER_G2)
-        self._source_tiers = tuple(source_tiers)
         self._home: dict[int, int] = {}
         self._resident = [0] * self._workers  # sessions per worker
         self._rngs: dict[int, random.Random] = {}
@@ -208,8 +203,7 @@ class Router:
     def _session_rng(self, session: int) -> random.Random:
         rng = self._rngs.get(session)
         if rng is None:
-            seed = (self._config.seed << 32) ^ (session * 40503 + 0x5BD1E995)
-            rng = self._rngs[session] = random.Random(seed)
+            rng = self._rngs[session] = random.Random(session * 40503 + 0x5BD1E995)
         return rng
 
     def _place(self, session: int) -> tuple[int, bool]:
@@ -247,23 +241,22 @@ class Router:
 
     def route(self, session: int, segments: Sequence[Segment]) -> Route:
         worker, migrated = self._place(session)
-        local = self.inventory.prefix(worker, segments, self._local_tiers)
+        inventory = self.inventory
+        local = inventory.prefix(worker, segments, _LOCAL_TIERS)
         source, source_blocks = -1, local
-        if self._source_tiers:
-            # To hold a longer prefix a peer must hold the block the chosen
-            # worker stops at, so only holders of that block's stream can win.
-            inventory = self.inventory
-            covered = 0
-            for stream, start, end in segments:
-                covered += end - start
-                if local < covered:
-                    for peer in inventory.holders(stream, self._source_tiers):
-                        if peer == worker:
-                            continue
-                        held = inventory.prefix(peer, segments, self._source_tiers)
-                        if held > source_blocks:  # longest wins, ties to the lower id
-                            source, source_blocks = peer, held
-                    break
+        # To hold a longer prefix a peer must hold the block the chosen worker
+        # stops at, so only holders of that block's stream can win.
+        covered = 0
+        for stream, start, end in segments:
+            covered += end - start
+            if local < covered:
+                for peer in inventory.holders(stream, _SOURCE_TIERS):
+                    if peer == worker:
+                        continue
+                    held = inventory.prefix(peer, segments, _SOURCE_TIERS)
+                    if held > source_blocks:  # longest wins, ties to the lower id
+                        source, source_blocks = peer, held
+                break
         hint_blocks = source_blocks if source >= 0 else 0
         return Route(worker, local, source, hint_blocks, migrated)
 

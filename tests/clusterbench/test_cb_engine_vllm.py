@@ -203,8 +203,10 @@ def test_cold_request_stores_once_and_aligns_the_whole_prefix():
     assert steps[0] == ["poll", "query", "poll", "deposit", "get_stats"]
     assert steps[1] == ["poll", "align", "get_stats"]
     assert steps[2] == ["poll", "align", "discard_hint", "get_stats"]
-    assert (done.prompt_blocks, done.gpu_blocks, done.remote_blocks) == (10, 0, 0)
-    assert done.recomputed_tokens == PROMPT
+    assert done.remote_blocks == 0
+    counters = window.counters
+    assert (counters["prompt_blocks"], counters["gpu_hit_blocks"]) == (10, 0)
+    assert counters["prefill_tokens"] == PROMPT
 
     deltas = engine.take_inventory()
     assert (TIER_PRIMARY, 1, 0, 4, False) in deltas
@@ -215,7 +217,7 @@ def test_cold_request_stores_once_and_aligns_the_whole_prefix():
 
 
 def test_second_turn_on_the_same_worker_hits_the_device_cache():
-    engine, kvcr, _ = _engine()
+    engine, kvcr, window = _engine()
     engine.submit(_request(1))
     _run(engine, kvcr)
     kvcr.calls.clear()
@@ -228,8 +230,9 @@ def test_second_turn_on_the_same_worker_hits_the_device_cache():
         output_tokens=2,
     )
     engine.submit(grown)
-    done, _ = _run(engine, kvcr)
-    assert done.gpu_blocks == 11  # ten prompt blocks and the answer's block
+    _run(engine, kvcr)
+    # Ten prompt blocks and the answer's block; the first turn found none.
+    assert window.counters["gpu_hit_blocks"] == 11
     # The scan resumes after the device prefix: one query, for block 11.
     assert [key_to_id(q[1][0]) for q in kvcr.of("query")] == [block_id(70, 7)]
     # No load happened, so storing starts from block 0 again; only blocks the
@@ -270,12 +273,25 @@ def test_hinted_request_promotes_through_one_deliver_and_keeps_the_prefix():
         (10, False),  # deposit completed
         (11, True),  # request finished: the answer's block too
     ]
-    assert (done.remote_blocks, done.failed_blocks, done.primary_blocks) == (6, 4, 0)
-    assert done.recomputed_tokens == PROMPT - 6 * BLOCK
+    assert (done.remote_blocks, done.failed_blocks) == (6, 4)
     counters = window.counters
+    assert counters["primary_hit_blocks"] == 0
+    assert counters["prefill_tokens"] == PROMPT - 6 * BLOCK
+    # The hinted worker is on another node than this one.
+    assert counters["deliver_blocks_remote_cross_node"] == 6
     assert counters["deliver_blocks_failed_beyond_hint"] == 4  # all past the hint
     assert not any(name.startswith("hinted_failed") for name in counters)
     assert counters["bytes_checked"] == 6 and not counters["bytes_mismatch"]
+
+
+def test_blocks_from_a_peer_on_this_node_are_not_counted_as_cross_node():
+    engine, kvcr, window = _engine()
+    engine.set_peers([("n0", "tcp://a:1"), ("n0", "tcp://b:2")])
+    kvcr.remote_ok = set(KEYS[:6])
+    engine.submit(_request(2, hint_source=1, hint_blocks=6))
+    _run(engine, kvcr)
+    assert window.counters["deliver_blocks_remote"] == 6
+    assert "deliver_blocks_remote_cross_node" not in window.counters
 
 
 def test_wrong_bytes_are_counted():
@@ -412,7 +428,7 @@ PATH = [(900, 0, 2), (901, 0, 1), (902, 0, 3), (903, 0, 1), (904, 0, 2)]
 
 
 def test_an_answer_that_opens_a_stream_is_cached_for_the_turn_that_names_it():
-    engine, kvcr, _ = _engine()
+    engine, kvcr, window = _engine()
     engine.submit(
         Request(
             rid=1,
@@ -439,8 +455,9 @@ def test_an_answer_that_opens_a_stream_is_cached_for_the_turn_that_names_it():
             output_tokens=2,
         )
     )
-    done, _ = _run(engine, kvcr)
-    assert done.gpu_blocks == 10  # the whole old path and the answer's block
+    _run(engine, kvcr)
+    # The whole old path and the answer's block; the first turn found none.
+    assert window.counters["gpu_hit_blocks"] == 10
     assert [key_to_id(q[1][0]) for q in kvcr.of("query")] == [block_id(905, 1)]
 
 
@@ -620,7 +637,8 @@ def test_a_request_is_the_most_recently_used_when_it_finishes():
     # finished first, not the one that arrived first.
     engine.submit(_long(3, 300, blocks=40))
     engine.step()
-    assert (engine._gpu.held(100), engine._gpu.held(200)) == (20, 4)
+    device = engine._gpu.prefix
+    assert (device([(100, 0, 99)]), device([(200, 0, 99)])) == (20, 4)
     kept = engine._primary.readable
     assert len(kept([_key(100, i) for i in range(19)])) == 19
     assert len(kept([_key(200, i) for i in range(19)])) == 3

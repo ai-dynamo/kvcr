@@ -19,5 +19,5 @@ exec python3 -m clusterbench worker \
   --coordinator "$CB_COORD" --node "$(hostname -s)" --local-id "$SLURM_LOCALID" \
   --bind-host "$addr" --control-port $((17800 + SLURM_LOCALID)) \
   --nixl-port $((17900 + SLURM_LOCALID)) \
-  --cpus auto --per-node "$CB_PER_NODE" --reserve-cores 2 \
+  --cpus auto --per-node "$CB_PER_NODE" \
   --net-devices "${CB_NET_DEVICES:-}"

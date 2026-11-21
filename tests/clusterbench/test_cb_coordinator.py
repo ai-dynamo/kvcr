@@ -11,7 +11,6 @@ import subprocess
 import threading
 import time
 
-import msgspec
 import pytest
 import zmq
 from clusterbench import launch_local, protocol
@@ -116,18 +115,12 @@ class Workers(threading.Thread):
                     arrived += 1
                     if service_s is None:
                         continue
-                    blocks = sum(end - start for _, start, end in message.segments)
                     done = protocol.Done(
                         rid=message.rid,
                         ttft_ms=service_s * 1e3,
                         load_ms=0.0,
-                        prompt_blocks=blocks,
-                        gpu_blocks=blocks,
-                        primary_blocks=0,
-                        local_blocks=0,
                         remote_blocks=0,
                         failed_blocks=0,
-                        recomputed_tokens=0,
                     )
                     finish = time.monotonic() + service_s
                     heapq.heappush(pending, (finish, message.rid, sock, done))
@@ -246,21 +239,14 @@ def test_every_request_is_logged_with_where_it_went_and_how_it_ended(cell):
     assert unfinished == [list(REQUEST_FIELDS[:9])] * SESSIONS
 
 
-def test_requests_dispatched_and_finished_in_the_window_are_tallied(cell):
+def test_requests_dispatched_in_the_window_are_tallied(cell):
     _, summary, rows = cell
     in_window = [row for row in rows if row["in_window"]]
     offered = summary["offered"]
     # All but the held requests: those answered and each session's last.
     assert offered["dispatched"] == len(in_window) == ANSWERED
-    assert offered["dispatched_blocks"] == sum(r["prompt_blocks"] for r in in_window)
-    blocks = sum(row["prompt_blocks"] for row in rows if "ttft_ms" in row)
-    assert blocks > 0
-    assert summary["completed"] == {
-        **Coordinator._new_tally()["completed"],
-        "completed": ANSWERED,
-        "prompt_blocks": blocks,
-        "gpu_blocks": blocks,
-    }
+    blocks = sum(row["prompt_blocks"] for row in in_window)
+    assert offered["dispatched_blocks"] == blocks > 0
 
 
 def test_dispatch_lag_is_sampled_only_while_the_window_is_open(cell):
@@ -279,46 +265,6 @@ def test_requests_that_fall_due_together_are_timed_one_by_one(tmp_path):
     _run(tmp_path, "workload.ramp_s=0", "phases.fill_s=0.1", "phases.measure_s=0.2")
     burst = sorted(row["t_ms"] for row in _rows(tmp_path))[:SESSIONS]
     assert len(set(burst)) == SESSIONS
-
-
-def _done(**fields):
-    done = protocol.Done(
-        rid=0,
-        ttft_ms=1.0,
-        load_ms=0.5,
-        prompt_blocks=10,
-        gpu_blocks=4,
-        primary_blocks=3,
-        local_blocks=2,
-        remote_blocks=0,
-        failed_blocks=0,
-        recomputed_tokens=64,
-    )
-    return msgspec.structs.replace(done, **fields)
-
-
-def test_finished_requests_are_tallied_by_where_their_blocks_came_from():
-    completed = Coordinator._new_tally()["completed"]
-    nodes = ["a", "a", "b"]
-    for source, done in (
-        (-1, _done()),
-        (1, _done(remote_blocks=1)),  # from a worker on the same node
-        (2, _done(remote_blocks=5, failed_blocks=2, timed_out_blocks=1)),
-    ):
-        Coordinator._tally_done(completed, done, 0, source, nodes)
-    assert completed == {
-        "completed": 3,
-        "prompt_blocks": 30,
-        "gpu_blocks": 12,
-        "primary_blocks": 9,
-        "local_blocks": 6,
-        "remote_requests": 2,
-        "remote_blocks_same_node": 1,
-        "remote_blocks_cross_node": 5,
-        "failed_blocks": 2,
-        "timed_out_blocks": 1,
-        "prefill_tokens": 192,
-    }
 
 
 def test_a_worker_that_never_acknowledges_measure_fails_the_run_and_is_named(

@@ -48,13 +48,8 @@ class Done(_Msg):
     rid: int
     ttft_ms: float
     load_ms: float
-    prompt_blocks: int
-    gpu_blocks: int
-    primary_blocks: int
-    local_blocks: int  # promoted from this worker's own KVCR tiers
     remote_blocks: int  # promoted from a peer
     failed_blocks: int  # promotions that failed
-    recomputed_tokens: int
     # Of the failed blocks, those KVCR reported as timed out.
     timed_out_blocks: int = 0
 
