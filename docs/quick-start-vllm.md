@@ -2,8 +2,8 @@
 
 This guide builds and runs a container containing KV Cache Runner (KVCR), Dynamo, vLLM, and NIXL. It is for users who want to try the integrated stack without editing source code in any of those projects.
 
-> [!IMPORTANT]
-> This is a public preview using the KVCR secondary-tier adapter included in vLLM 0.34.0. The container recipe pins the vLLM image and Dynamo nightly used for this guide.
+> [!NOTE]
+> This guide uses the KVCR secondary-tier adapter included in vLLM 0.34.0. The container recipe pins the vLLM image and Dynamo nightly used for this guide.
 
 For source builds, editable installs, API development, or test workflows, use the [developer guide](dev-guide.md).
 

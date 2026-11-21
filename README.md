@@ -66,7 +66,7 @@ A hint envelope may carry several hints. KVCR parses and dispatches each one ind
 
 ### Quick start
 
-The [vLLM quick start](docs/quick-start-vllm.md) is a public preview that builds and runs KVCR with vLLM, Dynamo, and NIXL using a pinned vLLM image and Dynamo package. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
+The [vLLM quick start](docs/quick-start-vllm.md) builds and runs KVCR with vLLM, Dynamo, and NIXL using a pinned vLLM image and Dynamo package. See the [developer guide](docs/dev-guide.md#integrate-with-vllm-and-dynamo-optional) for source installation and verification.
 
 The [SGLang quick start](docs/quick-start-sglang.md) is a preview for building and running KVCR with SGLang and Dynamo, through either the HiCache storage backend or the experimental direct linker.
 
