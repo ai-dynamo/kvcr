@@ -170,8 +170,7 @@ class CacheTier(Enum):
     LOCAL_G2 = "DRAM"
     REMOTE_G2 = "REMOTE_G2"
     G3 = "G3"
-    # TODO: G4 is not supported; enable it with its backend.
-    # G4 = "G4"
+    G4 = "G4"
 
 
 class InventoryEvent(msgspec.Struct, frozen=True):

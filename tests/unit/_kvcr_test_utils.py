@@ -20,6 +20,7 @@ from kvcr.backends.local_disk import _G3Residency
 from kvcr.backends.local_dram_pools import _LocalDramResidency, _LocalDramState
 from kvcr.config import (
     G3Options,
+    G4Options,
     KVCRBackendConfigs,
     KVCRConfig,
     LocalDramOptions,
@@ -589,6 +590,7 @@ def _new_kvcr(
     framework_regions: list[RegionDescriptor] | None = None,
     local_dram: LocalDramOptions | None = None,
     g3: G3Options | None = None,
+    g4: G4Options | None = None,
     inventory_sink=None,
     capacity_needed_callback=None,
     policy=None,
@@ -631,6 +633,7 @@ def _new_kvcr(
                 ),
                 local_dram=local_dram,
                 g3=g3,
+                g4=g4,
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
             ),
         )

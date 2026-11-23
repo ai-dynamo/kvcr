@@ -62,6 +62,28 @@ class G3Options(msgspec.Struct, frozen=True, kw_only=True):
     backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
 
 
+class G4Options(msgspec.Struct, frozen=True, kw_only=True):
+    """Shared filesystem G4 through a NIXL file backend.
+
+    ``root`` is the mounted directory. POSIX is the verified backend.
+    """
+
+    root: Path
+    backend: str = "POSIX"
+    backend_options: Mapping[str, str] = msgspec.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path):
+            raise TypeError("G4 file root must be a path")
+        if type(self.backend) is not str or not self.backend:
+            raise ValueError("G4 file backend must be non-empty")
+        if not isinstance(self.backend_options, Mapping) or any(
+            type(key) is not str or type(value) is not str
+            for key, value in self.backend_options.items()
+        ):
+            raise TypeError("G4 backend options must map strings to strings")
+
+
 class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     framework_regions: list[RegionDescriptor] = msgspec.field(default_factory=list)
     local_dram: LocalDramOptions | None = None
@@ -69,6 +91,7 @@ class KVCRBackendConfigs(msgspec.Struct, frozen=True):
     remote_fw_dram: RemoteFWDramOptions = msgspec.field(
         default_factory=RemoteFWDramOptions
     )
+    g4: G4Options | None = None
 
 
 class TelemetryStats(Protocol):
