@@ -8,8 +8,8 @@ import msgspec
 import pytest
 from _kvcr_test_utils import _HintAction, _HintEnvelope, _router_hint
 
-from kvcr.hints.dispatcher import KV_FETCH
-from kvcr.hints.hint_types import HintType, _Hint, _KVFetchHint
+from kvcr.hints.dispatcher import KV_FETCH, KV_INVALIDATE, KV_NO_RETAIN
+from kvcr.hints.hint_types import HintType, _Hint, _KVFetchHint, _KVInvalidateHint
 from kvcr.hints.parser import _LOGGED_HINT_ISSUES, parse_hints
 from kvcr.hints.results import HintStatus
 
@@ -24,9 +24,9 @@ def _types(*extra: HintType) -> dict[str, HintType]:
     return {t.action_type: t for t in (KV_FETCH, *extra)}
 
 
-def _fetch_hint(action_id, source, hashes) -> _HintAction:
+def _fetch_hint(action_id, source, hashes, **extra) -> _HintAction:
     payload = {"source_control_endpoint": source, "block_hashes": list(hashes)}
-    return _HintAction(action_id, "kv.fetch", "1.0", payload)
+    return _HintAction(action_id, "kv.fetch", "1.0", {**payload, **extra})
 
 
 def test_parse_hints_returns_every_valid_action_in_order():
@@ -37,20 +37,32 @@ def test_parse_hints_returns_every_valid_action_in_order():
             _fetch_hint("a", "tcp://a:1", (1, 2, 1)),
             _HintAction("x", "kv.future_action", "1.0", {}),
             _fetch_hint("bad", "", (3,)),
-            _fetch_hint("b", "tcp://b:1", (4,)),
+            _fetch_hint("b", "tcp://b:1", (4,), no_retain=None),
+            _HintAction("nr", "kv.no_retain", "1.0", {"block_hashes": [1]}),
+            _HintAction(
+                "i",
+                "kv.invalidate",
+                "1.0",
+                {"block_hashes": [1, 1], "no_retain": None},
+            ),
         ],
     )
-    hints, rejected = parse_hints(hint, _types())
+    hint = msgspec.msgpack.decode(msgspec.msgpack.encode(hint), type=_HintEnvelope)
+    hints, rejected = parse_hints(hint, _types(KV_NO_RETAIN, KV_INVALIDATE))
     assert hints == [
         _KVFetchHint("a", "tcp://a:1", frozenset({1, 2})),
         _KVFetchHint("b", "tcp://b:1", frozenset({4})),
+        _KVInvalidateHint("i", frozenset({1})),
     ]
     assert [(r.action_id, r.status, r.reason) for r in rejected] == [
         ("x", HintStatus.REJECTED, "unsupported_action_type"),
         ("bad", HintStatus.REJECTED, "invalid router hint"),
+        ("nr", HintStatus.REJECTED, "no_retain must be a boolean"),
     ]
     assert all(r.message_id == "m" for r in rejected)
-    assert [r.action_type for r in rejected] == ["kv.future_action", "kv.fetch"]
+    assert [r.action_type for r in rejected] == [
+        "kv.future_action", "kv.fetch", "kv.no_retain",
+    ]  # fmt: skip
 
 
 def test_parse_hints_rejects_invalid_actions_and_payloads():
@@ -173,7 +185,7 @@ def test_parser_exception_rejects_only_its_hint() -> None:
         {
             "source_control_endpoint": "tcp://source:1",
             "block_hashes": [1],
-            "no_retain": True,
+            "no_retain": 1,
         },
     ],
 )

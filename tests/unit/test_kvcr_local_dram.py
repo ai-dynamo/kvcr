@@ -402,6 +402,10 @@ def test_local_reads_wait_for_later_piece_and_release_claims(monkeypatch, case):
     assert dram_pools.telemetry_state()["local_g2_evictable_slots"] == 0
     fetch = kvcr.fetch([key], expected_layout=["swa:a", "swa:b"])
     assert kvcr.poll_completed() == []
+    kvcr._core._key_adapter = SimpleNamespace(
+        encode_to_router={key: 123, other: 124}.__getitem__
+    )
+    kvcr._core._no_retain.add(123)
     now = 0.75
     try:
         if case == "retry":

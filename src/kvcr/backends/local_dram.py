@@ -317,6 +317,9 @@ class _LocalDram:
         dst_descriptors: list[_TransferRef] = []
         evicted: list[BlockKey] = []
         declared_local = list(op.key_layout) if op.key_layout is not None else None
+        no_retain = self._kvcr._no_retain
+        adapter = self._kvcr._key_adapter
+        lookup_failed = False
         for key in keys:
             if key in op.results or key in op.capacity_waiters or key in op.active_keys:
                 continue
@@ -337,7 +340,39 @@ class _LocalDram:
                 ):
                     op.results[key] = _FAILED_RESULT
                     continue
-            else:
+            marked = False
+            if (
+                no_retain
+                and adapter is not None
+                and not op.claim_on_ready
+                and not (
+                    residency is not None
+                    and (residency.retention_claims or residency.pending_labels)
+                )
+            ):
+                try:
+                    marked = adapter.encode_to_router(key) in no_retain
+                except Exception:
+                    if not lookup_failed:
+                        lookup_failed = True
+                        logger.warning(
+                            "KVCR no_retain lookup failed: %r", key, exc_info=True
+                        )
+            if marked:
+                if residency is not None:
+                    if (
+                        _layout_indices(
+                            residency.layout,
+                            layout,
+                            indices_by_label=residency.indices_by_label,
+                        )
+                        is None
+                    ):
+                        op.results[key] = _FAILED_RESULT
+                        continue
+                op.results[key] = _DROPPED_RESULT
+                continue
+            if residency is None:
                 declaration = op.key_layout or tuple(layout)
                 local_layout = declared_local if declared_local is not None else layout
                 size_bytes = sum(
