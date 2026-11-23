@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import chain
+from multiprocessing.connection import Connection
 from typing import Annotated, Any
 
 import msgspec
@@ -190,10 +191,7 @@ class _KVCRProgress:
         self._wait_for_input = wait_for_input
         # Backend retries may need polling without a wakeup signal.
         self._needs_poll = needs_poll
-        # Prevent wake writes from racing with pipe closure and descriptor reuse.
-        self._wake_lock = threading.Lock()
-        self._wake_read: int | None = None
-        self._wake_write: int | None = None
+        self._wake_pipe: tuple[Connection, Connection, int] | None = None
         self._close_requested = False
         self._thread = threading.Thread(
             target=self._run,
@@ -656,11 +654,12 @@ class _KVCRProgress:
 
     def _run(self) -> None:
         try:
-            wake_read, wake_write = os.pipe()
-            os.set_blocking(wake_read, False)
-            os.set_blocking(wake_write, False)
-            with self._wake_lock:
-                self._wake_read, self._wake_write = wake_read, wake_write
+            read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+            self._wake_pipe = (
+                Connection(read_fd, writable=False),
+                Connection(write_fd, readable=False),
+                write_fd,  # Cache fileno() for the submission path.
+            )
             self._log_startup_stage("NIXL agent initialization")
             self._initialize_nixl()
             if self._close_requested:
@@ -725,28 +724,25 @@ class _KVCRProgress:
                 if self._failure is None:
                     self._failure = error
             self._ready.set()
-            with self._wake_lock:
-                for descriptor in (self._wake_read, self._wake_write):
-                    if descriptor is not None:
-                        os.close(descriptor)
-                self._wake_read = self._wake_write = None
+            # Both ends close once the worker and any in-flight wake release the pair.
+            self._wake_pipe = None
 
     def _signal_wake(self) -> None:
-        with self._wake_lock:
-            if self._wake_write is None:
-                # Not running: the loop drains the queue before its first wait.
-                return
+        # Hold both ends through the write, even if the worker exits mid-submit.
+        pipe = self._wake_pipe
+        if pipe is not None:
             try:
-                os.write(self._wake_write, b"\0")
+                os.write(pipe[2], b"\0")
             except BlockingIOError:
                 # The pipe is full, so a wakeup is already pending.
                 pass
 
     def _wait_for_work(self, timeout: float) -> None:
         """Wait for input, then drain pending wake signals."""
-        self._wait_for_input(self._wake_read, timeout)
+        read_fd = self._wake_pipe[0].fileno()
+        self._wait_for_input(read_fd, timeout)
         try:
-            while os.read(self._wake_read, 4096):
+            while os.read(read_fd, 4096):
                 pass
         except BlockingIOError:
             pass
