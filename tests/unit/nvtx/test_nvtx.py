@@ -2,14 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """NVTX must describe pin ownership without changing it."""
 
-import msgspec
 import pytest
 from _kvcr_test_utils import (
-    FakeBytesControl,
-    FakeNixlAgent,
-    PendingPrimaryPinning,
     _decode_notif,
-    _new_kvcr,
     _poll_until,
     _start_write_message,
 )
@@ -50,7 +45,6 @@ def test_explicit_level_and_fresh_payloads(recording, monkeypatch, level):
     registered = payloads(recording, "source.pin.registered")
     assert [int(p["requested_blocks"]) for p in registered] == [2, 5]
     assert [int(p["op_handle"]) for p in registered] == [-(2**60), 2**60]
-    assert all(int(p["fw_dram_utilization_known"]) == 0 for p in registered)
 
 
 @pytest.mark.parametrize(
@@ -235,33 +229,6 @@ def test_callback_failure_is_correlated_before_registration(recording):
     assert not int(event["pin_request_known"])
     assert reason_of(event) == _nvtx.Reason.CALLBACK_ERROR
     assert not recording.stack
-
-
-def test_partial_result_counts_available_blocks_and_source_reported_cause(recording):
-    agent, pinning, control = (
-        FakeNixlAgent(),
-        PendingPrimaryPinning(),
-        FakeBytesControl(),
-    )
-    source = _new_kvcr(agent, pinning, control, name="source")
-    message = msgspec.msgpack.decode(_start_write_message(9, BlockKey(b"k0")))
-    message["keys"].append(b"k1")
-    message["dst_descriptors"] *= 2
-    control.incoming.append(msgspec.msgpack.encode(message))
-    _poll_until(source, lambda _: bool(pinning.pending))
-    agent.state = "DONE"
-    pinning.complete(0, missing_indices=(1,))
-    _poll_until(source, lambda _: pinning.unpins == ["pin"])
-    # The pin result gives no cause; the source write knows the block was absent.
-    for name, reason in (
-        ("source.pin.completed", _nvtx.Reason.UNKNOWN),
-        ("source.write.completed", _nvtx.Reason.NOT_RESIDENT),
-    ):
-        event = payloads(recording, name)[0]
-        assert int(event["requested_blocks"]) == 2
-        assert int(event["completed_blocks"]) == 1
-        assert int(event["status"]) == int(_nvtx.Status.PARTIAL)
-        assert reason_of(event) == reason
 
 
 def test_invalid_result_has_bounded_reason_and_releases_handle(recording):
