@@ -97,7 +97,7 @@ nsys export --type=sqlite --include-json=true \
 
 Inspect the following lanes using the [event identities](nvtx-events.md#payloads-and-identities), rather than proximity on the timeline:
 
-- Source: `source.write`, `nixl.write`, `nixl.done_observed`, `nixl.write.released`, and `source.write.completed`.
+- Source: `source.write` and `source.write.completed`. See [source transfers](nvtx-events.md#source-transfers) for transfer-level events.
 - Target: `hint.submitted`/`hint.used`, `target.queued`, `target.start_write.enqueued`, `target.write_done.received`, and `target.main.consume`.
 - Caller: `op.deliver.lifecycle`, `op.completion_queued`, and `op.completion_returned`.
 - Framework pins, when the source uses framework-owned memory: `source.pin.framework`, `source.pin.wait`, and `source.pin.completed`. HiCache's KVCR-owned source pool need not emit framework-pin events.
