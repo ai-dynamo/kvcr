@@ -162,6 +162,28 @@ See the design doc's [Framework-KVCR API](design_overview.md#framework-kvcr-api)
 
 For `kv.prefetch` and `kv.move`, configure the key adapter's reverse lookup at the source and keep polling both peers. See [independent hints](design_overview.md#independent-hints) for the payload and managed-G2 contract.
 
+### Configure G4 file storage
+
+G4 file storage is a shared directory opened by its own NIXL client. Pass it as `KVCRBackendConfigs.g4`. Startup creates an agent named `{nixl_agent_name}-g4` and opens that file backend alone. This does not query or load blocks.
+
+```python
+from pathlib import Path
+
+from kvcr.config import G4Options, KVCRBackendConfigs
+
+backend_configs = KVCRBackendConfigs(
+    g4=G4Options(root=Path("/mnt/kvcr-g4")),
+)
+```
+
+| Field | Meaning |
+| --- | --- |
+| `root` | Directory NIXL opens in path mode as `ro:<root>`. A path it cannot open, including a missing path, fails startup with `nixlBackendError`. The registration uses path-mode device id 0. |
+| `backend` | NIXL file backend. `POSIX` is the default. A missing plugin fails startup with `RuntimeError`. |
+| `backend_options` | String options passed to that backend. For `POSIX`, KVCR sets `use_aio=true` when `use_aio`, `use_uring`, and `use_posix_aio` are all unset. |
+
+`root` must be a `Path`, `backend` must be a non-empty string, and `backend_options` must map strings to strings. The file client does not use the worker's DRAM agent. If its backend is already open with different options, startup raises `ValueError`. A replacement Guard does not receive this configuration.
+
 ### Development loop
 
 Run a focused test while iterating, then the complete standalone validation before finishing. If an adapter or router contract changed, run the optional integration validation separately.
