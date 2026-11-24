@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: KVCR SGLang E2E
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Published SGLang HiCache KVCR image reference, preferably pinned by digest
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: Qwen/Qwen3-0.6B
+      attention_backend:
+        description: SGLang --attention-backend override (empty keeps the harness default)
+        required: false
+        type: string
+        default: ""
+  # Manual reruns against an already published image, e.g. to try another
+  # attention backend without rebuilding.
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Published SGLang HiCache KVCR image reference, preferably pinned by digest
+        required: true
+        type: string
+      model:
+        required: true
+        type: string
+        default: Qwen/Qwen3-0.6B
+      attention_backend:
+        description: SGLang --attention-backend override (empty keeps the harness default)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  phase1:
+    # KVCR test plan Phase 1 functional gate on SGLang HiCache with the KVCR
+    # storage backend (sgl-project/sglang#45647 preview). KVCR runs inside the
+    # worker, so there is no Guard service: --mode nonguard, and TC-04/TC-06 do
+    # not apply. --batch-invariant maps to SGLang's deterministic inference so
+    # the token comparison against the bare-engine reference is exact.
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: ${{ inputs.image }}
+    timeout-minutes: 60
+    env:
+      HF_HOME: /scratch/huggingface
+      XDG_CACHE_HOME: /scratch/cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show NVIDIA devices
+        run: nvidia-smi
+      - name: Run Phase 1 (TC-01,TC-02,TC-03) on SGLang HiCache
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+          ATTENTION_BACKEND: ${{ inputs.attention_backend }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ -n "$ATTENTION_BACKEND" ]]; then
+            # Appended after the harness's own --attention-backend; the last one wins.
+            extra+=("--worker-arg=--attention-backend=$ATTENTION_BACKEND")
+          fi
+          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1-sglang/run \
+            --engine sglang --model "$MODEL" --mode nonguard --batch-invariant \
+            --timeout 2400 --cases TC-01,TC-02,TC-03 "${extra[@]}"
+      - name: Save Phase 1 SGLang evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcr-phase1-sglang-${{ github.run_attempt }}
+          path: artifacts/phase1-sglang/
+          retention-days: 14

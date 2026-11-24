@@ -24,7 +24,7 @@ RUN /venv/bin/pip wheel --no-deps /src/dynamo --wheel-dir /wheels
 
 FROM ${SGLANG_IMAGE} AS sglang
 USER root
-ARG SGLANG_REF=658755604ace9f476b84f98511f76b815606072a
+ARG SGLANG_REF=24a3a79ed3ed3ee5811f78ba2c4cbd5ceaac27d1
 RUN test "$(uname -m)" = x86_64 \
  && apt-get update && apt-get install -y --no-install-recommends \
     git curl libatomic1 libhwloc15 libnuma1 libssl3t64 libudev1 \

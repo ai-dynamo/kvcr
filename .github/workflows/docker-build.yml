@@ -11,7 +11,9 @@ on:
     paths:
       - .github/workflows/docker-build.yml
       - .github/workflows/vllm-e2e.yml
+      - .github/workflows/sglang-e2e.yml
       - Dockerfile.ci
+      - Dockerfile.quick-start-sglang
       - pyproject.toml
       - src/**
       - tests/e2e/**
@@ -30,6 +32,10 @@ on:
         default: nightly
       kvcr_ref:
         description: KVCR ref to test (optional; e.g. refs/pull/23/merge)
+        required: false
+        type: string
+      sglang_ref:
+        description: SGLang commit SHA for the HiCache image (optional; default is SGLANG_REF in Dockerfile.quick-start-sglang)
         required: false
         type: string
 
@@ -160,3 +166,114 @@ jobs:
     uses: ./.github/workflows/vllm-e2e.yml
     with:
       image: ${{ needs.build.outputs.image }}
+
+  build-sglang:
+    # SGLang HiCache image from Dockerfile.quick-start-sglang: the SGLang commit
+    # with the KVCR storage backend (sgl-project/sglang#45647, preview until it
+    # merges), Dynamo wheels built from source, and the KVCR source under test.
+    # The Dynamo Rust build makes this much slower than the vLLM image; the
+    # timeout is generous until the build time is measured.
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 120
+    env:
+      AWS_DEFAULT_REGION: us-west-2
+      ECR_REGISTRY: 210086341041.dkr.ecr.us-west-2.amazonaws.com
+      ECR_REPOSITORY: ai-dynamo/kvcr
+      BUILDER_NAME: kvcr-sglang-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      image: ${{ steps.published.outputs.image }}
+    steps:
+      - name: Check out CI recipe
+        uses: actions/checkout@v4
+
+      - name: Check out KVCR source to test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.kvcr_ref || github.sha }}
+          path: kvcr-source
+
+      - name: Log in to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      # TODO: the vllm flavor shares the vLLM layer cache pool; switch if a
+      # dedicated SGLang flavor exists.
+      - name: Initialize shared BuildKit builder
+        id: builder
+        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@e8cb76eeca91bbac2ab5c2702bd8bd629b20dd3a
+        with:
+          builder_name: ${{ env.BUILDER_NAME }}
+          flavor: vllm
+          arch: linux/amd64
+          namespace: buildkit
+
+      - name: Resolve build inputs
+        id: source
+        shell: bash
+        env:
+          SGLANG_REF_INPUT: ${{ inputs.sglang_ref }}
+        run: |
+          set -euo pipefail
+          kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
+          # An empty build arg would override the Dockerfile default, so always
+          # pass a full SHA: the input, or the default pinned in the Dockerfile.
+          sglang_ref=${SGLANG_REF_INPUT:-$(sed -nE 's/^ARG SGLANG_REF=([0-9a-f]{40})\s*$/\1/p' kvcr-source/Dockerfile.quick-start-sglang | head -1)}
+          [[ "$sglang_ref" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "SGLang ref must be a full 40-character commit SHA, got '$sglang_ref'" >&2; exit 1; }
+          # Own tag so the SGLang image never overwrites the vLLM image of the same KVCR commit.
+          image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}-sglang-${sglang_ref:0:12}"
+          printf 'sglang_ref=%s\nimage_tag=%s\n' "$sglang_ref" "$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish SGLang HiCache image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ env.BUILDER_NAME }}
+          context: ./kvcr-source
+          file: Dockerfile.quick-start-sglang
+          platforms: linux/amd64
+          push: true
+          load: false
+          tags: ${{ steps.source.outputs.image_tag }}
+          build-args: |
+            SGLANG_REF=${{ steps.source.outputs.sglang_ref }}
+
+      - name: Record published image
+        id: published
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SGLANG_REF: ${{ steps.source.outputs.sglang_ref }}
+        run: |
+          set -euo pipefail
+          : "${IMAGE_DIGEST:?Build did not return a published image digest}"
+          image="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          {
+            printf 'SGLang commit: `%s`\n\n' "$SGLANG_REF"
+            printf 'Published tag: `%s`\n\n' "$IMAGE_TAG"
+            printf 'Image for downstream tests: `%s`\n' "$image"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove builder configuration
+        if: always() && (steps.builder.outcome == 'success' || steps.builder.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          if docker buildx inspect "$BUILDER_NAME" > /dev/null 2>&1; then
+            docker buildx rm "$BUILDER_NAME"
+          fi
+
+  e2e-sglang:
+    # After the vLLM tests, whatever their result: both use the runner host's
+    # Hugging Face cache, and two engines fetching the same model at once fail
+    # on its blob lock.
+    needs: [build-sglang, e2e]
+    if: ${{ !cancelled() && needs.build-sglang.result == 'success' }}
+    uses: ./.github/workflows/sglang-e2e.yml
+    with:
+      image: ${{ needs.build-sglang.outputs.image }}
