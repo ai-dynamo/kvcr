@@ -26,7 +26,7 @@ on:
         type: string
         default: vllm/vllm-openai:nightly
       dynamo_version:
-        description: Dynamo wheel version, or nightly for the newest dev wheel
+        description: Dynamo wheel version for the vLLM and SGLang images, or nightly for the newest dev wheel
         required: true
         type: string
         default: nightly
@@ -48,7 +48,33 @@ permissions:
   contents: read
 
 jobs:
+  resolve-dynamo:
+    # One Dynamo version for both images in a run. "nightly" is pinned here to
+    # the newest dev wheel, so the build arg (and the layer cache key) changes
+    # when a new nightly is published and the vLLM and SGLang images match.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      dynamo_version: ${{ steps.resolve.outputs.dynamo_version }}
+    steps:
+      - name: Resolve the Dynamo version
+        id: resolve
+        shell: bash
+        env:
+          DYNAMO_VERSION_INPUT: ${{ inputs.dynamo_version || 'nightly' }}
+        run: |
+          set -euo pipefail
+          dynamo_version=$DYNAMO_VERSION_INPUT
+          if [[ "$dynamo_version" == nightly ]]; then
+            dynamo_version=$(curl -fsSL https://pypi.org/pypi/ai-dynamo/json \
+              | jq -r '.releases | keys[] | select(test("\\.dev[0-9]+$"))' | sort -V | tail -1)
+          fi
+          [[ -n "$dynamo_version" ]] || { echo "Could not resolve the ai-dynamo version" >&2; exit 1; }
+          printf 'dynamo_version=%s\n' "$dynamo_version" >> "$GITHUB_OUTPUT"
+          printf 'Dynamo for both images: `ai-dynamo==%s`\n' "$dynamo_version" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: resolve-dynamo
     runs-on: prod-kvcr-builder-v1
     timeout-minutes: 45
     env:
@@ -133,7 +159,7 @@ jobs:
           tags: ${{ steps.source.outputs.image_tag }}
           build-args: |
             VLLM_IMAGE=${{ steps.source.outputs.base_image }}
-            DYNAMO_VERSION=${{ inputs.dynamo_version || 'nightly' }}
+            DYNAMO_VERSION=${{ needs.resolve-dynamo.outputs.dynamo_version }}
             KVCR_COMMIT=${{ steps.source.outputs.kvcr_sha }}
 
       - name: Record published image
@@ -170,9 +196,11 @@ jobs:
   build-sglang:
     # SGLang HiCache image from Dockerfile.quick-start-sglang: the SGLang commit
     # with the KVCR storage backend (sgl-project/sglang#45647, preview until it
-    # merges), Dynamo wheels built from source, and the KVCR source under test.
-    # The Dynamo Rust build makes this much slower than the vLLM image; the
-    # timeout is generous until the build time is measured.
+    # merges), the ai-dynamo wheel from PyPI (the same nightly as the vLLM image
+    # by default), and the KVCR source under test. Build Dockerfile with
+    # DYNAMO_FROM=source to compile the Dynamo commit paired with the fork
+    # instead (~15 minutes more).
+    needs: resolve-dynamo
     runs-on: prod-kvcr-builder-v1
     timeout-minutes: 120
     env:
@@ -215,9 +243,11 @@ jobs:
         shell: bash
         env:
           SGLANG_REF_INPUT: ${{ inputs.sglang_ref }}
+          DYNAMO_VERSION: ${{ needs.resolve-dynamo.outputs.dynamo_version }}
         run: |
           set -euo pipefail
           kvcr_sha=$(git -C kvcr-source rev-parse HEAD)
+          dynamo_version=$DYNAMO_VERSION
           # An empty build arg would override the Dockerfile default, so always
           # pass a full SHA: the input, or the default pinned in the Dockerfile.
           sglang_ref=${SGLANG_REF_INPUT:-$(sed -nE 's/^ARG SGLANG_REF=([0-9a-f]{40})\s*$/\1/p' kvcr-source/Dockerfile.quick-start-sglang | head -1)}
@@ -225,7 +255,8 @@ jobs:
             || { echo "SGLang ref must be a full 40-character commit SHA, got '$sglang_ref'" >&2; exit 1; }
           # Own tag so the SGLang image never overwrites the vLLM image of the same KVCR commit.
           image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}-sglang-${sglang_ref:0:12}"
-          printf 'sglang_ref=%s\nimage_tag=%s\n' "$sglang_ref" "$image_tag" >> "$GITHUB_OUTPUT"
+          printf 'sglang_ref=%s\ndynamo_version=%s\nimage_tag=%s\n' \
+            "$sglang_ref" "$dynamo_version" "$image_tag" >> "$GITHUB_OUTPUT"
 
       - name: Build and publish SGLang HiCache image
         id: build
@@ -240,6 +271,8 @@ jobs:
           tags: ${{ steps.source.outputs.image_tag }}
           build-args: |
             SGLANG_REF=${{ steps.source.outputs.sglang_ref }}
+            DYNAMO_FROM=wheel
+            DYNAMO_VERSION=${{ steps.source.outputs.dynamo_version }}
 
       - name: Record published image
         id: published
@@ -248,6 +281,7 @@ jobs:
           IMAGE_TAG: ${{ steps.source.outputs.image_tag }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           SGLANG_REF: ${{ steps.source.outputs.sglang_ref }}
+          DYNAMO_VERSION: ${{ steps.source.outputs.dynamo_version }}
         run: |
           set -euo pipefail
           : "${IMAGE_DIGEST:?Build did not return a published image digest}"
@@ -255,6 +289,7 @@ jobs:
           printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
           {
             printf 'SGLang commit: `%s`\n\n' "$SGLANG_REF"
+            printf 'Dynamo: `ai-dynamo==%s`\n\n' "$DYNAMO_VERSION"
             printf 'Published tag: `%s`\n\n' "$IMAGE_TAG"
             printf 'Image for downstream tests: `%s`\n' "$image"
           } >> "$GITHUB_STEP_SUMMARY"

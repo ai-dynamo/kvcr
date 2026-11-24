@@ -72,6 +72,7 @@ jobs:
           fi
           python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1-sglang/run \
             --engine sglang --model "$MODEL" --mode nonguard --batch-invariant \
+            --frontend-env DYN_ROUTER_WORKER_SELECTION_POLICY=kvcr \
             --timeout 2400 --cases TC-01,TC-02,TC-03 "${extra[@]}"
       - name: Save Phase 1 SGLang evidence
         if: always()
