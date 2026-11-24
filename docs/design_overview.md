@@ -279,7 +279,7 @@ Each hint in an envelope is parsed and handled independently. `discard_hint` nor
 
 During submission, the source resolves hashes into full keys and sends one control message asking the destination to fetch them. The destination reuses cached copies and allocates KVCR-owned DRAM space for missing data, then asks the source to write into those locations through the existing transfer path. Both peers must have KVCR-owned DRAM pools configured and use compatible cache layouts.
 
-KVCR indexes block hashes at DRAM fill, on a named cache hit, and during recovery. Missing or ambiguous hashes fail individually while valid hashes proceed. A unique match must have a complete, readable KVCR DRAM copy. The transfer claims it later.
+KVCR indexes block hashes at DRAM fill, on a named cache hit, and during recovery. Missing or ambiguous hashes fail individually while valid hashes proceed. A unique match must have a complete, readable KVCR DRAM copy.
 
 `kv.no_retain` acts on the receiving KVCR immediately: `no_retain: true` marks the supplied `block_hashes`, and `false` clears them, without starting a transfer. It also accepts hashes not stored locally. Keys sharing a hash share the rule.
 
