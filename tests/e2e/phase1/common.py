@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,18 @@ class ValidationError(RuntimeError):
 
 class BlockedError(RuntimeError):
     """The combination cannot run here; record the missing condition, not FAIL."""
+
+
+def validate_gpu_budget(gpus: list[int], utilization: float) -> None:
+    """Reserve headroom when multiple local workers share a physical GPU."""
+    if not 0.05 <= utilization <= 0.95:
+        raise ValueError("per-worker GPU memory utilization must be within 0.05..0.95")
+    for gpu, workers in Counter(gpus).items():
+        if workers > 1 and workers * utilization > 0.9 + 1e-12:
+            raise ValueError(
+                f"GPU {gpu}: {workers} workers exceed the shared GPU memory budget "
+                f"({workers * utilization:.2f} > 0.90)"
+            )
 
 
 def utc_now() -> str:
@@ -158,6 +171,7 @@ class CaseResult:
     started_at: str = field(default_factory=utc_now)
     finished_at: str | None = None
     measurements: dict[str, Any] = field(default_factory=dict)
+    proofs: dict[str, bool] = field(default_factory=dict)
 
     def check(self, name: str, passed: bool, detail: str = "") -> bool:
         self.checks.append(Check(name, bool(passed), detail))

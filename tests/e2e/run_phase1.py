@@ -31,6 +31,7 @@ import socket
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ from phase1.common import (  # noqa: E402
     extract_sample,
     save_json,
     utc_now,
+    validate_gpu_budget,
     write_junit,
 )
 from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
@@ -58,6 +60,7 @@ from phase1.stack import (  # noqa: E402
     MODES,
     NON_GUARD,
     SGLANG,
+    SGLANG_MODES,
     Settings,
     Stack,
 )
@@ -72,6 +75,7 @@ def provenance(args: argparse.Namespace) -> dict[str, Any]:
         "kvcr",
         "nixl",
         "vllm",
+        "sglang",
         "ai-dynamo",
         "ai-dynamo-runtime",
         "torch",
@@ -80,7 +84,9 @@ def provenance(args: argparse.Namespace) -> dict[str, Any]:
             versions[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
             versions[distribution] = None
-    manifest = Path("/opt/kvcr-build/source-revisions.json")
+    manifest = Path("/opt/kvcr-build-metadata.json")
+    if not manifest.exists():
+        manifest = Path("/opt/kvcr-build/source-revisions.json")
     package = Path(__file__).resolve().parent / "phase1"
     digest = hashlib.sha256()
     for path in sorted(package.glob("*.py")) + [Path(__file__).resolve()]:
@@ -125,9 +131,11 @@ class Runner:
         self.deadline = time.monotonic() + args.timeout
         self.settings = Settings(
             model=args.model,
+            model_path=args.model_path,
             output=self.output,
             mode=args.mode,
             engine=args.engine,
+            sglang_mode=args.sglang_mode,
             sglang_verify_bytes=args.sglang_verify_bytes,
             worker_env=dict(
                 item.split("=", 1) for item in args.worker_env if "=" in item
@@ -137,6 +145,7 @@ class Runner:
             http_port=args.http_port,
             reference_http_port=args.reference_http_port,
             pool_gb=args.pool_gb,
+            g2_slots=args.g2_slots,
             compatibility_digest=args.compatibility_digest or "",
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
@@ -173,12 +182,16 @@ class Runner:
         self.reference_cached: dict[str, list[int | None]] = {}
         self.wants_perf = bool(PERF_CASE_NAMES & set(args.cases))
         self.result: dict[str, Any] = {
-            "plan": "KVCR Test Plan v7, Phase 1 (Guard-mode critical path)",
+            "plan": "KVCR Test Plan v7, Phase 1",
             "started_at": utc_now(),
             "status": "running",
             "mode": args.mode,
-            "deployment": "aggregated",
+            "deployment": "disaggregated"
+            if args.topology == "disagg"
+            else "aggregated",
             "model": args.model,
+            "model_path": str(args.model_path) if args.model_path is not None else None,
+            "g2_slots": args.g2_slots,
             "prompt_tag": self.tag,
             "max_tokens": args.max_tokens,
             "perf": {
@@ -195,11 +208,13 @@ class Runner:
             },
             "worker_args": list(args.worker_arg),
             "engine": args.engine,
+            "sglang_mode": args.sglang_mode,
             "sglang_verify_bytes": args.sglang_verify_bytes,
             "worker_env": sorted(args.worker_env),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
-            "topology": (
+            "topology": args.topology,
+            "service_topology": (
                 "two-node"
                 if args.remote_workers
                 else "sidecar"
@@ -212,8 +227,9 @@ class Runner:
             if args.external_services
             else None,
             "batch_invariant": args.batch_invariant,
-            "state_agent": not args.no_state_agent,
+            "state_agent": self.stack.uses_state_agent(),
             "selected_cases": list(args.cases),
+            "phase_durations_seconds": {},
             "cases": [],
             "reference": {},
             "limitations": [
@@ -239,6 +255,14 @@ class Runner:
     def check_deadline(self) -> None:
         if time.monotonic() > self.deadline:
             raise ValidationError("overall run deadline expired")
+
+    def measure_phase(self, name: str, phase: Callable[[], Any]) -> Any:
+        started = time.monotonic()
+        try:
+            return phase()
+        finally:
+            self.result["phase_durations_seconds"][name] = time.monotonic() - started
+            self.save()
 
     # -- phases ------------------------------------------------------------
 
@@ -516,17 +540,22 @@ class Runner:
         blocked_all: str | None = None
         try:
             save_json(self.output / "provenance.json", provenance(self.args))
-            self.result["preflight"] = self.stack.preflight()
-            self.reference_phase()
-            client = self.stack_phase()
-            self.cases_phase(client)
+            self.result["preflight"] = self.measure_phase(
+                "preflight", self.stack.preflight
+            )
+            self.measure_phase("reference", self.reference_phase)
+            client = self.measure_phase("stack", self.stack_phase)
+            self.measure_phase("cases", lambda: self.cases_phase(client))
         except BlockedError as blocked:
             blocked_all = str(blocked)
         except (Exception, KeyboardInterrupt) as error:
             self.result["error"] = f"{type(error).__name__}: {error}"
         finally:
+            # Signals still mark the run interrupted, but must not interrupt
+            # bounded teardown or destroy the only available failure evidence.
+            self.cleaning_up = True
             try:
-                self.stack.cleanup()
+                self.measure_phase("cleanup", self.stack.cleanup)
             except Exception as error:  # noqa: BLE001
                 self.result["cleanup_error"] = str(error)
         if blocked_all is not None:
@@ -590,6 +619,12 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        help="existing pinned model snapshot directory; "
+        "--model remains the served name",
+    )
     parser.add_argument("--mode", choices=MODES, default=GUARD)
     parser.add_argument(
         "--sglang-verify-bytes",
@@ -613,6 +648,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "TC-01..03 and TC-05 only)",
     )
     parser.add_argument(
+        "--sglang-mode",
+        choices=SGLANG_MODES,
+        default=SGLANG_MODES[0],
+        help="SGLang engine: hicache = HiCache with the KVCR storage backend; "
+        "linker = KVCR direct linker (GPU KV pages to/from KVCR, TP1 only)",
+    )
+    parser.add_argument(
         "--gpus",
         default="0,1",
         help="CUDA device indices: two for --topology agg (0,1), three for disagg "
@@ -625,6 +667,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference-http-port", type=int, default=8001)
     parser.add_argument(
         "--pool-gb", type=int, default=2, help="Guard pool size per worker"
+    )
+    parser.add_argument(
+        "--g2-slots",
+        type=int,
+        default=256,
+        help="native in-process DRAM pages per worker "
+        "(bytes = slots * model page size)",
     )
     parser.add_argument("--compatibility-digest", default=None)
     parser.add_argument(
@@ -837,24 +886,21 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--engine sglang needs --mode nonguard (no Guard service)")
         if args.topology != "agg" or args.external_services or args.remote_worker:
             parser.error("--engine sglang supports only --topology agg on one node")
+        if args.sglang_mode == "linker" and args.sglang_verify_bytes:
+            parser.error("--sglang-verify-bytes applies only to --sglang-mode hicache")
         unsupported = {"TC-04", "TC-06"} & set(args.cases.split(","))
         if unsupported:
             parser.error(
                 f"--engine sglang cannot run {sorted(unsupported)} (Guard cases)"
             )
-    if args.topology == "disagg" and args.external_services is None:
-        parser.error(
-            "--topology disagg needs --external-services (kvcr_service sidecars)"
-        )
     # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
-    if (
-        args.gpus[0] == args.gpus[1]
-        and not args.remote_worker
-        and args.gpu_memory_utilization > 0.45
-    ):
-        parser.error("two workers on one GPU need --gpu-memory-utilization <= 0.45")
-    if not 0.05 <= args.gpu_memory_utilization <= 0.95:
-        parser.error("--gpu-memory-utilization must be within 0.05..0.95")
+    try:
+        validate_gpu_budget(
+            args.gpus if not args.remote_worker else list(range(len(args.gpus))),
+            args.gpu_memory_utilization,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     cases = [part.strip().upper() for part in args.cases.split(",") if part.strip()]
     unknown = [case for case in cases if case not in CASES]
     if unknown or not cases:
@@ -873,6 +919,12 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--index-wait must be between 0 and 300 seconds")
     if not 1 <= args.max_tokens <= 512 or not 1 <= args.pool_gb <= 64:
         parser.error("--max-tokens must be 1..512 and --pool-gb 1..64")
+    if not 1 <= args.g2_slots <= 65536:
+        parser.error("--g2-slots must be 1..65536")
+    if args.model_path is not None:
+        if not args.model_path.is_dir():
+            parser.error("--model-path must be an existing directory")
+        args.model_path = args.model_path.resolve()
     if not 1 <= args.perf_repeats <= 32 or not 1 <= args.perf_max_tokens <= 2048:
         parser.error("--perf-repeats must be 1..32 and --perf-max-tokens 1..2048")
     try:
@@ -939,8 +991,19 @@ def main() -> int:
         print(f"Cannot initialize run: {error}", file=sys.stderr)
         return 1
 
+    stop_requested = False
+
     def interrupted(signum: int, _frame: Any) -> None:
-        raise KeyboardInterrupt(f"received signal {signum}")
+        nonlocal stop_requested
+        if stop_requested:
+            return
+        stop_requested = True
+        message = f"received signal {signum}"
+        if getattr(runner, "cleaning_up", False):
+            runner.result.setdefault("error", f"KeyboardInterrupt: {message}")
+            runner.result["status"] = FAIL
+            return
+        raise KeyboardInterrupt(message)
 
     previous = {
         n: signal.signal(n, interrupted) for n in (signal.SIGINT, signal.SIGTERM)

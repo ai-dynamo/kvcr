@@ -10,12 +10,17 @@ USER root
 ARG VLLM_IMAGE
 ARG DYNAMO_VERSION=nightly
 ARG KVCR_COMMIT
+ARG CI_RECIPE_SHA
+ARG CI_IMAGE_PROFILE=vllm
+ARG RESOLVED_INPUTS_SHA256
+ARG DYNAMO_POLICY=nightly
 LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/kvcr" \
       org.opencontainers.image.revision="${KVCR_COMMIT}" \
       org.opencontainers.image.base.name="${VLLM_IMAGE}"
 
 # Recovery uses libatomic even though it is not a Python package dependency.
-RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+# Git verifies the checked-out recipe identity inside each serving container.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 patch git \
  && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
@@ -25,11 +30,9 @@ from importlib import metadata
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
-from packaging.version import Version
 
 # Keep the selected vLLM and torch stack while installing Dynamo and KVCR.
 backend_versions = {}
@@ -61,26 +64,10 @@ for name in ("nvidia-nccl-cu12", "nvidia-nccl-cu13"):
         nccl_versions[name] = metadata.version(name)
     except metadata.PackageNotFoundError:
         pass
-requested_dynamo_version = os.environ["DYNAMO_VERSION"]
-dynamo_version = requested_dynamo_version
+requested_dynamo_version = os.environ.get("DYNAMO_POLICY", "nightly")
+dynamo_version = os.environ["DYNAMO_VERSION"]
 if dynamo_version == "nightly":
-    # --pre also admits stable releases. Select the newest compatible dev wheel.
-    available = subprocess.check_output([
-        sys.executable, "-m", "pip", "index", "versions", "ai-dynamo",
-        "--pre", "--only-binary=:all:",
-        "--extra-index-url", "https://pypi.nvidia.com/",
-    ], text=True)
-    match = re.search(r"^Available versions: (.+)$", available, re.MULTILINE)
-    if match is None:
-        raise RuntimeError("Could not list available ai-dynamo versions")
-    dev_versions = [
-        version for item in match.group(1).split(", ")
-        if (version := Version(item)).is_devrelease
-    ]
-    if not dev_versions:
-        raise RuntimeError("No ai-dynamo dev wheel is available")
-    dynamo_version = str(max(dev_versions))
-    print(f"Selected ai-dynamo nightly: {dynamo_version}", flush=True)
+    raise ValueError("Resolve nightly outside Docker with tests/e2e/ci_images.py first")
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade",
     "--extra-index-url", "https://pypi.nvidia.com/",
@@ -91,6 +78,7 @@ subprocess.check_call([
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--no-cache-dir", "/opt/kvcr-src",
     "--constraint", str(constraints),
+    "--report", "/opt/kvcr-install-report.json",
 ])
 restore = [
     f"{name}=={version}"
@@ -112,7 +100,13 @@ packages = {
     name: metadata.version(name)
     for name in ("ai-dynamo", "ai-dynamo-runtime", "vllm", "kvcr", "nixl")
 }
+for name in ("ai-dynamo", "ai-dynamo-runtime"):
+    assert packages[name] == dynamo_version, f"Resolved Dynamo package changed: {name}"
 Path("/opt/kvcr-build-metadata.json").write_text(json.dumps({
+    "schema_version": 2,
+    "image_profile": os.environ["CI_IMAGE_PROFILE"],
+    "recipe_sha": os.environ.get("CI_RECIPE_SHA", ""),
+    "resolved_inputs_sha256": os.environ.get("RESOLVED_INPUTS_SHA256", ""),
     "kvcr_sha": os.environ.get("KVCR_COMMIT", ""),
     "base_image": os.environ["VLLM_IMAGE"],
     "requested_dynamo_version": requested_dynamo_version,
@@ -122,11 +116,56 @@ Path("/opt/kvcr-build-metadata.json").write_text(json.dumps({
 print(json.dumps(packages, indent=2))
 PY
 
+# Temporary until Dynamo #18840 is merged and a containing wheel is qualified.
+# Pin the complete PR diff, but apply only its three production Python files.
+ADD --checksum=sha256:2f91a13244c0b7770d39577850d2b0e938084cb3a25eb1245a874104cb3889dc https://github.com/ai-dynamo/dynamo/compare/c683a412d756ff7e5e9dcda1ceb2789d4f473f4f...66ba12c69706a8775f48684e0a9ac4682d41ca8b.diff /tmp/dynamo-vllm-fix.diff
+RUN python3 - <<'PY'
+import hashlib
+from importlib import metadata
+import json
+from pathlib import Path
+import subprocess
+
+package = Path(metadata.distribution("ai-dynamo").locate_file("dynamo/vllm"))
+files = ("benchmark_worker.py", "instrumented_scheduler.py", "kv_groups.py")
+patch = Path("/tmp/dynamo-vllm-fix.diff")
+sections = patch.read_text().split("diff --git ")[1:]
+production = "".join(
+    "diff --git " + section
+    for section in sections
+    if section.splitlines()[0].split()[0]
+    in {f"a/components/src/dynamo/vllm/{name}" for name in files}
+)
+subprocess.run(
+    ["patch", "--batch", "--forward", "--fuzz=0", "-p5", "-d", str(package)],
+    input=production, text=True, check=True,
+)
+build_metadata = Path("/opt/kvcr-build-metadata.json")
+record = json.loads(build_metadata.read_text())
+record["dynamo_vllm_fix"] = {
+    "pr": 18840, "commit": "66ba12c69706a8775f48684e0a9ac4682d41ca8b",
+    "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
+    "files": {
+        name: hashlib.sha256((package / name).read_bytes()).hexdigest()
+        for name in files
+    },
+}
+record.setdefault("compatibility_overlays", {})["dynamo-vllm-18840"] = {
+    "commit": record["dynamo_vllm_fix"]["commit"],
+    "patch_sha256": record["dynamo_vllm_fix"]["patch_sha256"],
+}
+build_metadata.write_text(json.dumps(record, indent=2) + "\n")
+patch.unlink()
+PY
+
 # A successful pip install alone does not prove the base's adapter supports
 # this KVCR API. Fail the build before handing an incompatible image to E2E.
 RUN kvcr-service --help
 RUN python3 - <<'PY'
+import hashlib
 from importlib import metadata
+import json
+from pathlib import Path
 
 # Use the public channel export in the adapter supplied by the base image.
 adapter = metadata.distribution("vllm").locate_file(
@@ -136,15 +175,46 @@ adapter.write_text(adapter.read_text().replace(
     "from kvcr.control_channels import ZmqPeerControlChannel",
     "from kvcr import ZmqPeerControlChannel",
 ))
+if "from kvcr.control_channels import ZmqPeerControlChannel" in adapter.read_text():
+    raise RuntimeError("vLLM adapter still imports the private channel module")
+build_metadata = Path("/opt/kvcr-build-metadata.json")
+record = json.loads(build_metadata.read_text())
+record["vllm_kvcr_public_channel"] = {
+    "revision": "public-channel-v1",
+    "files": {"manager.py": hashlib.sha256(adapter.read_bytes()).hexdigest()},
+}
+record.setdefault("compatibility_overlays", {})["vllm-kvcr-public-channel"] = {
+    "revision": "public-channel-v1",
+}
+build_metadata.write_text(json.dumps(record, indent=2) + "\n")
 
 import kvcr
-import dynamo.vllm
+import dynamo.vllm.main
 from vllm.v1.kv_offload.tiering.kvcr import manager
 
 print("kvcr==" + metadata.version("kvcr"))
 print("dynamo.vllm:", dynamo.vllm.__file__)
 print("KVCR adapter:", manager.__file__)
 PY
+
+# Preserve the full installed inventory after applying compatibility overlays.
+RUN python3 - <<'PYCODE'
+from importlib import metadata
+import json
+from pathlib import Path
+record_path = Path("/opt/kvcr-build-metadata.json")
+record = json.loads(record_path.read_text())
+record["installed_distributions"] = dict(sorted(
+    (dist.metadata["Name"], dist.version) for dist in metadata.distributions()
+    if dist.metadata["Name"]
+))
+record_path.write_text(json.dumps(record, indent=2) + "\n")
+PYCODE
+
+# Preserve rank-specific KVCR initialization without a separate GPU smoke job.
+# This named context comes from the checked-out recipe, independently of source.
+COPY --from=ci-recipe check_vllm_rank_initialization.py /opt/kvcr-rank-canary.py
+RUN python3 /opt/kvcr-rank-canary.py --metadata /opt/kvcr-build-metadata.json
 
 # E2E launches Dynamo explicitly instead of using the image's entrypoint.
 ENTRYPOINT []

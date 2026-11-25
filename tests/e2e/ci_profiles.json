@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "models": {
+    "dense": {
+      "launch": {
+        "max_model_len": 32000,
+        "max_tokens": 32,
+        "cpu_bytes_to_use": 2000000000,
+        "batch_invariant": true,
+        "keep_hybrid_kv_cache_manager": false,
+        "hit_block_tokens": 64,
+        "ssm_groups": 0,
+        "page_bytes": 0,
+        "tc02_shared_sections": 40,
+        "tc02_sections": 80,
+        "tc02_seed_prefix": false,
+        "g2_slots": 256,
+        "timeout": 2400,
+        "request_timeout": 120,
+        "worker_args": []
+      },
+      "model_key": "qwen3-0-6b"
+    },
+    "mamba": {
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "cpu_bytes_to_use": 536870912,
+        "batch_invariant": false,
+        "keep_hybrid_kv_cache_manager": true,
+        "hit_block_tokens": 1024,
+        "ssm_groups": 6,
+        "page_bytes": 16777216,
+        "tc02_shared_sections": 140,
+        "tc02_sections": 200,
+        "tc02_seed_prefix": true,
+        "g2_slots": 32,
+        "timeout": 3600,
+        "request_timeout": 180,
+        "worker_args": [
+          "--dtype=bfloat16",
+          "--max-num-seqs=4",
+          "--trust-remote-code"
+        ]
+      },
+      "model_key": "nemotron3-nano-4b-bf16"
+    },
+    "gdn": {
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "cpu_bytes_to_use": 536870912,
+        "batch_invariant": false,
+        "keep_hybrid_kv_cache_manager": true,
+        "hit_block_tokens": 576,
+        "ssm_groups": 3,
+        "page_bytes": 7077888,
+        "tc02_shared_sections": 140,
+        "tc02_sections": 200,
+        "tc02_seed_prefix": true,
+        "g2_slots": 32,
+        "timeout": 3600,
+        "request_timeout": 180,
+        "worker_args": [
+          "--dtype=bfloat16",
+          "--max-num-seqs=4",
+          "--trust-remote-code"
+        ]
+      },
+      "model_key": "qwen3-5-0-8b"
+    }
+  },
+  "integration": "vllm",
+  "profiles": [
+    {"id": "vllm-dense-agg-guard", "integration": "vllm", "model_family": "dense", "topology": "agg", "mode": "guard", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.8}, "qualification": "previous-ci-pass"},
+    {"id": "vllm-dense-agg-native", "integration": "vllm", "model_family": "dense", "topology": "agg", "mode": "native", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.8}, "qualification": "pending"},
+    {"id": "vllm-dense-disagg-guard", "integration": "vllm", "model_family": "dense", "topology": "disagg", "mode": "guard", "resources": {"gpus": [0, 0, 1], "gpu_memory_utilization": 0.35}, "qualification": "previous-ci-pass"},
+    {"id": "vllm-dense-disagg-native", "integration": "vllm", "model_family": "dense", "topology": "disagg", "mode": "native", "resources": {"gpus": [0, 0, 1], "gpu_memory_utilization": 0.35}, "qualification": "pending"},
+    {"id": "vllm-mamba-agg-guard", "integration": "vllm", "model_family": "mamba", "topology": "agg", "mode": "guard", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.44}, "qualification": "pending"},
+    {"id": "vllm-mamba-agg-native", "integration": "vllm", "model_family": "mamba", "topology": "agg", "mode": "native", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.44}, "qualification": "pending"},
+    {"id": "vllm-mamba-disagg-guard", "integration": "vllm", "model_family": "mamba", "topology": "disagg", "mode": "guard", "resources": {"gpus": [0, 0, 1], "gpu_memory_utilization": 0.44}, "qualification": "pending"},
+    {"id": "vllm-mamba-disagg-native", "integration": "vllm", "model_family": "mamba", "topology": "disagg", "mode": "native", "resources": {"gpus": [0, 0, 1], "gpu_memory_utilization": 0.44}, "qualification": "pending"},
+    {"id": "vllm-gdn-agg-guard", "integration": "vllm", "model_family": "gdn", "topology": "agg", "mode": "guard", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.38}, "qualification": "previous-ci-pass"},
+    {"id": "vllm-gdn-agg-native", "integration": "vllm", "model_family": "gdn", "topology": "agg", "mode": "native", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.38}, "qualification": "pending"},
+    {"id": "vllm-gdn-disagg-guard", "integration": "vllm", "model_family": "gdn", "topology": "disagg", "mode": "guard", "resources": {"gpus": [0, 0, 1], "gpu_memory_utilization": 0.32}, "qualification": "pending"},
+    {"id": "vllm-gdn-disagg-native", "integration": "vllm", "model_family": "gdn", "topology": "disagg", "mode": "native", "resources": {"gpus": [0, 0, 1], "gpu_memory_utilization": 0.32}, "qualification": "pending"}
+  ]
+}

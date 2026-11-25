@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "integrations": {
+    "vllm": {"build_job": "build-vllm", "test_job": "e2e-vllm"},
+    "sglang-hicache": {"build_job": "build-sglang-hicache", "test_job": "e2e-sglang-hicache"}
+  }
+}

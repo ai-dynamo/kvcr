@@ -2,19 +2,42 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# CI builds this recipe through tests/e2e/ci_images.py, which passes the base
+# image (SGLANG_IMAGE), the resolved Dynamo version and the source/recipe/input
+# identity recorded in /opt/kvcr-build-metadata.json.
+#
+# CI_IMAGE_PROFILE selects the SGLang KVCR integration: sglang-hicache (HiCache
+# storage backend, sgl-project/sglang#45647) or sglang-linker (direct linker,
+# sgl-project/sglang#45650). They are separate commits of the SGLang fork;
+# SGLANG_REF overrides the one the profile selects.
+ARG CI_IMAGE_PROFILE=sglang-hicache
+ARG SGLANG_HICACHE_REF=24a3a79ed3ed3ee5811f78ba2c4cbd5ceaac27d1
+ARG SGLANG_LINKER_REF=002d6d8d1df91a58695a8868ce2c2db590809f75
 ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.21-cu130-runtime@sha256:797614a377ead47cf89ccaba810685b56a1bf0d6f0c45f84af2e8f42c198e104
+# Where Dynamo comes from:
+#   wheel  - ai-dynamo==DYNAMO_VERSION from PyPI ("nightly" = newest dev wheel).
+#            CI resolves the nightly to an exact version so the layer cache
+#            never serves a stale one.
+#   source - compile the Dynamo commit paired with the profile's SGLang fork
+#            commit (~15 minutes of Rust).
+ARG DYNAMO_FROM=wheel
 
-FROM rust:1.96.1-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS sglang-dynamo-builder
+FROM rust:1.96.1-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS dynamo-source
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake git libclang-dev libhwloc-dev libprotobuf-dev libssl-dev libudev-dev \
     pkg-config protobuf-compiler python3-dev python3-pip python3-venv \
  && rm -rf /var/lib/apt/lists/*
-ARG SGLANG_DYNAMO_REF=83ea37e849e883c27d7ed848e0f329961e1fb173
-RUN git init /src/dynamo \
+ARG CI_IMAGE_PROFILE
+RUN case "${CI_IMAGE_PROFILE}" in \
+      sglang-hicache) ref=83ea37e849e883c27d7ed848e0f329961e1fb173 ;; \
+      sglang-linker) ref=fe81cfdccedc23b4eabef3a250b538ff11ba102c ;; \
+      *) echo "CI_IMAGE_PROFILE must be sglang-hicache or sglang-linker" >&2; exit 1 ;; \
+    esac \
+ && git init /src/dynamo \
  && git -C /src/dynamo remote add origin https://github.com/ai-dynamo/dynamo.git \
- && git -C /src/dynamo fetch --depth 1 origin "${SGLANG_DYNAMO_REF}" \
+ && git -C /src/dynamo fetch --depth 1 origin "${ref}" \
  && git -C /src/dynamo checkout --detach FETCH_HEAD \
- && test "$(git -C /src/dynamo rev-parse HEAD)" = "${SGLANG_DYNAMO_REF}"
+ && test "$(git -C /src/dynamo rev-parse HEAD)" = "${ref}"
 RUN python3 -m venv /venv \
  && /venv/bin/pip install --no-cache-dir 'maturin[patchelf]==1.9.6'
 ENV CARGO_BUILD_JOBS=4
@@ -22,22 +45,42 @@ RUN cd /src/dynamo/lib/bindings/python \
  && /venv/bin/maturin build --locked --release --features select-service,kv-indexer --out /wheels
 RUN /venv/bin/pip wheel --no-deps /src/dynamo --wheel-dir /wheels
 
+# No local wheels: Dynamo is installed from PyPI. BuildKit skips the Rust stage.
+FROM scratch AS dynamo-wheel
+COPY <<'EOF' /wheels/README
+Dynamo is installed from PyPI (DYNAMO_FROM=wheel).
+EOF
+
+FROM dynamo-${DYNAMO_FROM} AS dynamo-wheels
+
 FROM ${SGLANG_IMAGE} AS sglang
 USER root
-ARG SGLANG_REF=658755604ace9f476b84f98511f76b815606072a
+ARG CI_IMAGE_PROFILE
+ARG SGLANG_HICACHE_REF
+ARG SGLANG_LINKER_REF
+ARG SGLANG_REF=
 RUN test "$(uname -m)" = x86_64 \
  && apt-get update && apt-get install -y --no-install-recommends \
     git curl libatomic1 libhwloc15 libnuma1 libssl3t64 libudev1 \
  && rm -rf /var/lib/apt/lists/*
-RUN git init /opt/sglang-src \
+RUN case "${CI_IMAGE_PROFILE}" in \
+      sglang-hicache) ref=${SGLANG_HICACHE_REF} ;; \
+      sglang-linker) ref=${SGLANG_LINKER_REF} ;; \
+      *) echo "CI_IMAGE_PROFILE must be sglang-hicache or sglang-linker" >&2; exit 1 ;; \
+    esac \
+ && ref="${SGLANG_REF:-$ref}" \
+ && git init /opt/sglang-src \
  && git -C /opt/sglang-src remote add origin https://github.com/ziqifan617/sglang.git \
- && git -C /opt/sglang-src fetch --depth 1 origin "${SGLANG_REF}" \
+ && git -C /opt/sglang-src fetch --depth 1 origin "${ref}" \
  && git -C /opt/sglang-src checkout --detach FETCH_HEAD \
- && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${SGLANG_REF}"
-# Install KVCR from the checkout used as the Docker build context.
-COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
-COPY src /opt/kvcr-src/src
-COPY --from=sglang-dynamo-builder /wheels /tmp/dynamo-wheels
+ && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${ref}"
+# Three install layers, from least to most often changed, so a KVCR commit
+# rebuilds only the last one and a new Dynamo nightly only the last two:
+#   1. the SGLang fork and its pinned stack (multi-GB; the stand-in for a base
+#      image until an upstream SGLang image carries the KVCR backend),
+#   2. Dynamo, 3. KVCR.
+# Every step installs under the same constraints, and the final pip check
+# fails on any conflict the later layers add to the SGLang layer's baseline.
 COPY <<'EOF' /opt/sglang-constraints.txt
 torch==2.14.1
 transformers==5.19.0
@@ -59,12 +102,66 @@ RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-
  && python3 -m pip install --no-cache-dir --no-build-isolation \
       --constraint /opt/sglang-constraints.txt \
       --find-links https://pypi.nvidia.com/aisimulate/ \
-      /opt/sglang-src/python /opt/kvcr-src /tmp/dynamo-wheels/*.whl \
-      'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
+      /opt/sglang-src/python 'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
  && python3 -m pip install --no-cache-dir --no-deps \
       --index-url https://flashinfer.ai/whl 'flashinfer-cubin==0.7.2' \
  && python3 -m pip install --no-cache-dir --no-deps \
-      --index-url https://flashinfer.ai/whl/cu130 'flashinfer-jit-cache==0.7.2'
+      --index-url https://flashinfer.ai/whl/cu130 'flashinfer-jit-cache==0.7.2' \
+ && { python3 -m pip check || true; } | sort > /opt/sglang-pip-check-baseline.txt
+
+# Dynamo. Its build args are declared here, not at the top of the stage: a
+# changed build arg invalidates every RUN after its declaration.
+COPY --from=dynamo-wheels /wheels /tmp/dynamo-wheels
+ARG DYNAMO_FROM
+ARG DYNAMO_VERSION=nightly
+RUN python3 - <<'PY'
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from packaging.version import Version
+
+if os.environ["DYNAMO_FROM"] == "source":
+    requirements = [str(p) for p in sorted(Path("/tmp/dynamo-wheels").glob("*.whl"))]
+    assert requirements, "DYNAMO_FROM=source built no Dynamo wheels"
+else:
+    version = os.environ["DYNAMO_VERSION"]
+    if version == "nightly":
+        available = subprocess.check_output([
+            sys.executable, "-m", "pip", "index", "versions", "ai-dynamo",
+            "--pre", "--only-binary=:all:",
+        ], text=True)
+        match = re.search(r"^Available versions: (.+)$", available, re.MULTILINE)
+        if match is None:
+            raise RuntimeError("Could not list available ai-dynamo versions")
+        version = str(max(
+            v for item in match.group(1).split(", ")
+            if (v := Version(item)).is_devrelease
+        ))
+    requirements = [f"ai-dynamo=={version}"]
+print("Dynamo:", *requirements, flush=True)
+Path("/tmp/dynamo-requirements.txt").write_text("\n".join(requirements) + "\n")
+PY
+RUN python3 -m pip install --no-cache-dir \
+      --constraint /opt/sglang-constraints.txt \
+      --extra-index-url https://pypi.nvidia.com/ \
+      --report /opt/kvcr-dynamo-install-report.json \
+      --find-links https://pypi.nvidia.com/aisimulate/ \
+      --find-links https://pypi.nvidia.com/aisim/ \
+      -r /tmp/dynamo-requirements.txt
+
+# KVCR from the checkout used as the Docker build context.
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
+COPY src /opt/kvcr-src/src
+RUN python3 -m pip install --no-cache-dir --no-build-isolation \
+      --constraint /opt/sglang-constraints.txt \
+      --report /opt/kvcr-install-report.json /opt/kvcr-src \
+ && { python3 -m pip check || true; } | sort > /tmp/pip-check.txt \
+ && if comm -13 /opt/sglang-pip-check-baseline.txt /tmp/pip-check.txt | grep .; then \
+      echo "Dynamo/KVCR introduced the dependency conflicts above" >&2; exit 1; \
+    fi
 COPY <<'EOF' /opt/sglang-router-policy.yaml
 worker_selection:
   aggregated: two-tier
@@ -80,9 +177,11 @@ ENV DYN_REQUEST_PLANE=tcp DYN_EVENT_PLANE=zmq DYN_DISCOVERY_BACKEND=file \
     DYN_FILE_KV=/tmp/dynamo-sglang-quick-start DYN_SYSTEM_HOST=127.0.0.1 \
     DYN_RUNTIME_NUM_WORKER_THREADS=4 DYN_RUNTIME_MAX_BLOCKING_THREADS=8 \
     TOKENIZERS_PARALLELISM=false PYTHONHASHSEED=0 RUST_LOG=info \
-    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4
+    UCX_TLS=tcp,sm,self,cuda_copy OMP_NUM_THREADS=4 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
+    KVCR_SGLANG_INTEGRATION=${CI_IMAGE_PROFILE}
 # Import/version canary only; model/peer-transfer acceptance is in the guide.
 RUN python3 - <<'PY'
+import os
 from importlib import metadata
 from pathlib import Path
 import tomllib
@@ -90,11 +189,7 @@ import dynamo.sglang
 import torch
 from dynamo.common.constants import KV_HINT_TRANSFER_CAPABILITY_KEY
 from dynamo.llm import WorkerType
-from dynamo.sglang import kv_hints
-from dynamo.sglang.state_agent import StateAgentLifecycle
 from kvcr import ZmqPeerControlChannel
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
-from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
 
 for line in Path('/opt/sglang-constraints.txt').read_text().splitlines():
     name, expected = line.split('==')
@@ -103,16 +198,86 @@ for line in Path('/opt/sglang-constraints.txt').read_text().splitlines():
     print(f'{name}=={actual}')
 assert torch.version.cuda == '13.0'
 assert KV_HINT_TRANSFER_CAPABILITY_KEY == 'router_hint'
-assert callable(KVCRStore.batch_get_v1)
-assert callable(HiCacheStorage.get_kv_hint_source)
-assert callable(StateAgentLifecycle.start)
 assert callable(ZmqPeerControlChannel)
-assert metadata.version('ai-dynamo') == '1.7.0'
-assert metadata.version('ai-dynamo-runtime') == '1.7.0'
+if os.environ['KVCR_SGLANG_INTEGRATION'] == 'sglang-hicache':
+    from dynamo.sglang import kv_hints
+    from dynamo.sglang.state_agent import StateAgentLifecycle
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+    from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+
+    assert callable(KVCRStore.batch_get_v1)
+    assert callable(HiCacheStorage.get_kv_hint_source)
+    assert callable(StateAgentLifecycle.start)
+else:
+    from dynamo.sglang.kv_hints import is_supported_kvcr_linker_topology
+    from dynamo.sglang.state_agent import state_agent_descriptors
+    from kvcr.hints.fetch import KV_FETCH
+    from kvcr.hints.parser import parse_hints
+    from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
+    from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import KVCRDirectLinker
+
+    assert callable(is_supported_kvcr_linker_topology) and callable(state_agent_descriptors)
+    assert KVCRDirectLinker.local_storage_ownership == 'kvcr'
+    hint = decode_kv_hints_envelope({
+        'protocol_version': '0.1', 'message_id': 'canary',
+        'actions': [{'action_id': 'fetch', 'action_type': 'kv.fetch',
+                     'action_version': '1.0', 'payload': {
+                         'source_control_endpoint': 'tcp://127.0.0.1:19500',
+                         'block_hashes': [1],
+                     }}],
+    })
+    parsed, rejected = parse_hints(hint, {'kv.fetch': KV_FETCH})
+    assert len(parsed) == 1 and not rejected
+dynamo_version = metadata.version('ai-dynamo')
+assert metadata.version('ai-dynamo-runtime') == dynamo_version
+print(f'ai-dynamo=={dynamo_version}')
 kvcr_project = tomllib.loads(Path('/opt/kvcr-src/pyproject.toml').read_text())['project']
 assert metadata.version('kvcr') == kvcr_project['version']
-print('SGLang HiCache import/version checks passed; GPU verification still required')
+print(f"{os.environ['KVCR_SGLANG_INTEGRATION']} import/version checks passed; GPU verification still required")
 PY
 RUN python3 -m pip freeze --all > /opt/sglang-installed-packages.txt
+
+# Schema-2 build identity for tests/e2e/ci_identity.py. These args change on
+# every commit, so they are declared last: they invalidate only this layer.
+ARG SGLANG_IMAGE
+ARG KVCR_COMMIT
+ARG CI_RECIPE_SHA
+ARG RESOLVED_INPUTS_SHA256
+ARG DYNAMO_POLICY=nightly
+RUN python3 - <<'PY'
+from importlib import metadata
+import json
+import os
+from pathlib import Path
+import subprocess
+
+packages = {
+    name: metadata.version(name)
+    for name in ("ai-dynamo", "ai-dynamo-runtime", "sglang", "kvcr", "nixl", "torch")
+}
+if os.environ["DYNAMO_FROM"] == "wheel" and os.environ["DYNAMO_VERSION"] != "nightly":
+    for name in ("ai-dynamo", "ai-dynamo-runtime"):
+        assert packages[name] == os.environ["DYNAMO_VERSION"], f"Resolved Dynamo changed: {name}"
+record = {
+    "schema_version": 2,
+    "image_profile": os.environ["CI_IMAGE_PROFILE"],
+    "recipe_sha": os.environ.get("CI_RECIPE_SHA", ""),
+    "resolved_inputs_sha256": os.environ.get("RESOLVED_INPUTS_SHA256", ""),
+    "kvcr_sha": os.environ.get("KVCR_COMMIT", ""),
+    "base_image": os.environ["SGLANG_IMAGE"],
+    "sglang_ref": subprocess.check_output(
+        ["git", "-C", "/opt/sglang-src", "rev-parse", "HEAD"], text=True
+    ).strip(),
+    "dynamo_from": os.environ["DYNAMO_FROM"],
+    "requested_dynamo_version": os.environ.get("DYNAMO_POLICY", "nightly"),
+    "packages": packages,
+    "installed_distributions": dict(sorted(
+        (dist.metadata["Name"], dist.version) for dist in metadata.distributions()
+        if dist.metadata["Name"]
+    )),
+}
+Path("/opt/kvcr-build-metadata.json").write_text(json.dumps(record, indent=2) + "\n")
+print(json.dumps(packages, indent=2))
+PY
 WORKDIR /workspace
 ENTRYPOINT []

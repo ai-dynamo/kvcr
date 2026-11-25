@@ -6,7 +6,11 @@ vLLM logs ``KV Transfer metrics:`` lines (reset-interval samples of the
 connector and KVCR counters). SGLang's KVCR HiCache backend logs
 ``KVCR L3 native stats {json}`` lines every few seconds with the same KVCR
 counters under JSON tuple keys; they are mapped onto the vLLM metric names so
-the cases read both engines through one window API.
+the cases read both engines through one window API. SGLang's KVCR direct
+linker logs ``KVCR telemetry rank=N interval_s=S stats={json}`` instead, with
+``name[label,...].kind`` keys; its transfer block counts other than
+``local_fill`` are per (page, layer) and are divided by the model's layer count
+so a block is a page as in the other modes.
 
 Each Phase 1 worker runs one data-parallel rank, so every metric line in a log
 belongs to that worker. Values are interval samples; a window sums the samples
@@ -17,8 +21,9 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +64,10 @@ LOCAL_DELIVER = "local_deliver"
 TRANSFER = "transfer"
 
 
+VLLM_EPOCH_MARKER = "CI_LOG_EPOCH="
+VLLM_LOGGING_PREFIX = VLLM_EPOCH_MARKER + "%(created).9f "
+VLLM_EPOCH = re.compile(r"^CI_LOG_EPOCH=(\d+\.\d{9})$")
+
 VLLM_STAMP = re.compile(r"\b(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\b")
 SGLANG_STATS = "KVCR L3 native stats "
 
@@ -94,6 +103,58 @@ def sglang_metrics(
                 out[f"{base}_{field}"] = value
         elif field == "value":
             out[base] = value
+    return derive_tier_bytes(out, page_bytes)
+
+
+LINKER_STATS = re.compile(r"KVCR telemetry rank=\d+ interval_s=\S+ stats=(\{.*\})")
+LINKER_KEY = re.compile(r"^(?P<name>[^\[]+)\[(?P<labels>[^\]]*)\]\.(?P<kind>\w+)$")
+
+
+def linker_metrics(
+    stats: dict, layers: int, page_bytes: dict[str, float] | None = None
+) -> dict[str, int | float]:
+    """Map one SGLang linker ``KVCR telemetry`` payload onto vLLM metric names.
+
+    Keys are ``name[label,...].kind`` (``counter``, ``gauge``, or a histogram's
+    ``count``/``sum``/``max``). The linker moves KV layer by layer: its
+    ``source_write`` and delivery block counts are pages times layers and are
+    divided by ``layers`` (the raw value is kept under ``_per_layer:<metric>``).
+    ``local_fill`` deposits whole pages and is counted per page (a CI run on
+    Qwen3-0.6B logged 9 local_fill blocks / 66060288 bytes and 252 = 9 * 28
+    source_write blocks for the same bytes).
+    """
+    out: dict[str, int | float] = {}
+    for key, value in stats.items():
+        found = LINKER_KEY.match(key)
+        if found is None:
+            raise ValueError("invalid KVCR linker metric key")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            raise ValueError("invalid KVCR linker metric value")
+        labels = [label for label in found["labels"].split(",") if label]
+        base = metric(found["name"], *labels)
+        kind = found["kind"]
+        if kind in ("count", "sum"):
+            out[f"{base}_{kind}"] = value
+        elif kind in ("counter", "gauge"):
+            if (
+                found["name"] == TRANSFER_BLOCKS
+                and labels[:1] != [LOCAL_FILL]
+                and layers > 1
+            ):
+                out[f"_per_layer:{base}"] = value
+                value = value // layers if value % layers == 0 else value / layers
+            out[base] = value
+    return derive_tier_bytes(out, page_bytes)
+
+
+def derive_tier_bytes(
+    out: dict[str, int | float], page_bytes: dict[str, float] | None
+) -> dict[str, int | float]:
+    """Add the tier read/write bytes SGLang lacks (see sglang_metrics)."""
     fill_blocks = out.get(metric(TRANSFER_BLOCKS, LOCAL_FILL), 0)
     fill_bytes = out.get(metric(TRANSFER_BYTES, LOCAL_FILL), 0)
     if page_bytes is not None and fill_blocks and fill_bytes:
@@ -124,13 +185,24 @@ ISO_INSTANT = re.compile(
 
 
 def precise_stamp(line: str) -> datetime | None:
-    """Timezone-aware ISO instant at the start of a Dynamo-formatted line.
+    """Timezone-aware instant at the start of a Dynamo or precise vLLM line.
 
     Only a full instant with a zone counts: a bare date or a naive time at the
     start of some other line must not become a comparison partner for the
     aware request timestamps.
     """
     head = line.split(maxsplit=1)[0] if line else ""
+    if head.startswith(VLLM_EPOCH_MARKER):
+        matched = VLLM_EPOCH.fullmatch(head)
+        if matched is None:
+            return None
+        try:
+            epoch = float(matched[1])
+            if not math.isfinite(epoch):
+                return None
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if not ISO_INSTANT.match(head):
         return None
     stamp = parse_timestamp(head)
@@ -147,6 +219,9 @@ def line_timestamp(line: str) -> datetime | None:
     The latter is taken as UTC of the current year (the harness runs with
     TZ=UTC containers); a run spanning New Year would need the launch date.
     """
+    if line.startswith(VLLM_EPOCH_MARKER):
+        # A malformed marker cannot fall back to the old whole-second stamp.
+        return precise_stamp(line)
     stamp = parse_timestamp(line.split()[0])
     if stamp is not None:
         return stamp
@@ -175,10 +250,14 @@ class Snapshot:
     # after a request that started in the same second.
     second_precision: bool = False
     preceded_by: datetime | None = None
+    provenance: dict[str, str] = field(default_factory=dict)
 
 
-def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
-    """Return interval snapshots and parse errors for complete log lines."""
+def parse_log(text: str, layers: int = 1) -> tuple[list[Snapshot], list[str]]:
+    """Return interval snapshots and parse errors for complete log lines.
+
+    layers: the model's layer count, for SGLang linker logs (see linker_metrics).
+    """
     snapshots: list[Snapshot] = []
     errors: list[str] = []
     last_precise: datetime | None = None
@@ -193,11 +272,62 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             try:
                 payload = json.loads(line.split(SGLANG_STATS, 1)[1].strip())
                 stamp = datetime.fromtimestamp(float(payload["epoch"]), tz=timezone.utc)
+                metrics = payload["metrics"]
+                if not isinstance(metrics, dict):
+                    raise ValueError("metrics is not an object")
+                for key, value in metrics.items():
+                    if key != "dropped_observations":
+                        kind, name, labels, metric_field = json.loads(key)
+                        if not (
+                            isinstance(kind, str)
+                            and isinstance(name, str)
+                            and isinstance(labels, list)
+                            and isinstance(metric_field, str)
+                        ):
+                            raise ValueError("invalid KVCR metric key")
+                    if (
+                        not isinstance(value, (int, float))
+                        or isinstance(value, bool)
+                        or not math.isfinite(value)
+                    ):
+                        raise ValueError("invalid KVCR metric value")
             except (ValueError, KeyError, TypeError):
                 errors.append(f"line {number}: unparsable SGLang KVCR stats payload")
                 continue
             snapshots.append(
-                Snapshot(stamp, number, sglang_metrics(payload, page_bytes))
+                Snapshot(
+                    stamp,
+                    number,
+                    sglang_metrics(payload, page_bytes),
+                    provenance={
+                        TIER_READ_BYTES: "derived",
+                        TIER_WRITE_BYTES: "measured:local_fill",
+                    },
+                )
+            )
+            continue
+        linker = LINKER_STATS.search(line)
+        if linker is not None:
+            # SGLang linker: Dynamo's formatter stamps the line; the sample
+            # covers the interval_s seconds before it.
+            try:
+                stats = json.loads(linker.group(1))
+                if precise is None or not isinstance(stats, dict):
+                    raise ValueError("unstamped or malformed payload")
+                values = linker_metrics(stats, layers, page_bytes)
+            except ValueError:
+                errors.append(f"line {number}: unparsable SGLang linker telemetry")
+                continue
+            snapshots.append(
+                Snapshot(
+                    precise,
+                    number,
+                    values,
+                    provenance={
+                        TIER_READ_BYTES: "derived",
+                        TIER_WRITE_BYTES: "measured:local_fill",
+                    },
+                )
             )
             continue
         if "KV Transfer metrics:" not in line:
@@ -207,6 +337,11 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             errors.append(f"line {number}: metric line without a parseable timestamp")
             continue
         payload = line.split("KV Transfer metrics:", 1)[1].strip()
+        # A decoder with only NixlConnector reports human-readable transfer
+        # summaries, not KVCR counters. It needs its own transport validator;
+        # those lines must not count as KVCR observations or parse failures.
+        if payload.startswith("Num successful transfers="):
+            continue
         values: dict[str, int | float] = {}
         if CONNECTOR_DICT.search(payload):
             # MultiConnector: one Python dict repr per connector,
@@ -217,10 +352,23 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
                 try:
                     block = ast.literal_eval(found.group(2))
                 except (ValueError, SyntaxError):
+                    if "vllm:" in found.group(2):
+                        errors.append(
+                            f"line {number}: unparsable required per-connector metrics"
+                        )
                     continue
                 if isinstance(block, dict):
                     parsed += 1
                     for name, value in block.items():
+                        if str(name).startswith("vllm:") and (
+                            not isinstance(value, (int, float))
+                            or isinstance(value, bool)
+                            or not math.isfinite(value)
+                        ):
+                            errors.append(
+                                f"line {number}: invalid per-connector metric {name}"
+                            )
+                            continue
                         if isinstance(value, (int, float)) and not isinstance(
                             value, bool
                         ):
@@ -237,7 +385,20 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             if not values or len(values) != payload.count("="):
                 errors.append(f"line {number}: incomplete metric parsing")
                 continue
-        snapshots.append(Snapshot(stamp, number, values, precise is None, last_precise))
+        snapshots.append(
+            Snapshot(
+                stamp,
+                number,
+                values,
+                precise is None,
+                last_precise,
+                {
+                    name: "measured"
+                    for name in (TIER_READ_BYTES, TIER_WRITE_BYTES)
+                    if name in values
+                },
+            )
+        )
     return snapshots, errors
 
 
@@ -250,6 +411,26 @@ class Window:
     first_after_end: bool
     peer_failures: list[dict[str, Any]]
     parse_errors: list[str]
+    provenance: dict[str, str] = field(default_factory=dict)
+
+    def health_errors(self) -> list[str]:
+        """Missing or damaged evidence cannot establish an observed zero."""
+        errors = list(self.parse_errors)
+        if self.samples < 1:
+            errors.append("no complete telemetry samples")
+        if not any(name.startswith("vllm:kvcr_") for name in self.totals):
+            errors.append("required KVCR metric family was not observed")
+        dropped = self.get("_dropped_observations")
+        if dropped != 0:
+            errors.append(f"dropped telemetry observations={dropped}")
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            for value in self.totals.values()
+        ):
+            errors.append("invalid telemetry numeric value")
+        return errors
 
     def get(self, name: str, default: int | float = 0) -> int | float:
         return self.totals.get(name, default)
@@ -299,6 +480,7 @@ def window(
     interval containing the request has been flushed by the engine.
     """
     totals: dict[str, int | float] = {}
+    provenance: dict[str, str] = {}
     failures = []
     count = 0
     flushed = False
@@ -309,6 +491,9 @@ def window(
             flushed = True
             continue
         count += 1
+        for name, source in snapshot.provenance.items():
+            prior = provenance.get(name, source)
+            provenance[name] = source if prior == source else "mixed"
         for name, value in snapshot.metrics.items():
             if name.startswith(f"vllm:{STATE}:"):
                 totals[name] = value  # gauge: keep the latest sample
@@ -322,11 +507,13 @@ def window(
                 failures.append({"metric": name, "value": value, "line": snapshot.line})
     if errors:
         totals["_parse_errors"] = len(errors)
-    return Window(totals, count, flushed, failures, list(errors))
+    return Window(totals, count, flushed, failures, list(errors), provenance)
 
 
-def read_window(log: Path, start: datetime, end: datetime | None = None) -> Window:
-    snapshots, errors = parse_log(log.read_text(errors="replace"))
+def read_window(
+    log: Path, start: datetime, end: datetime | None = None, *, layers: int = 1
+) -> Window:
+    snapshots, errors = parse_log(log.read_text(errors="replace"), layers)
     return window(snapshots, errors, start, end)
 
 

@@ -3,11 +3,15 @@
 """CPU checks of the Phase 1 harness logic; these never claim a GPU pass."""
 
 import importlib.util
+import io
 import json
+import signal
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -377,6 +381,39 @@ def test_kernel_release_parsing(monkeypatch):
 # -- runner arguments --------------------------------------------------------
 
 
+@pytest.mark.parametrize("mapping", ["0,0,0", "0,1,1"])
+def test_disagg_arguments_reject_decode_worker_gpu_overcommit(tmp_path, mapping):
+    with pytest.raises(SystemExit):
+        runner.arguments(
+            [
+                "--output-dir",
+                str(tmp_path),
+                "--topology",
+                "disagg",
+                "--gpus",
+                mapping,
+                "--gpu-memory-utilization",
+                "0.35" if mapping == "0,0,0" else "0.8",
+            ]
+        )
+
+
+def test_three_shared_workers_can_use_a_bounded_diagnostic_budget(tmp_path):
+    args = runner.arguments(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--topology",
+            "disagg",
+            "--gpus",
+            "0,0,0",
+            "--gpu-memory-utilization",
+            "0.3",
+        ]
+    )
+    assert args.gpus == [0, 0, 0]
+
+
 def test_arguments_validate_gpus_and_cases(tmp_path):
     args = runner.arguments(["--output-dir", str(tmp_path), "--cases", "tc-01, TC-04"])
     assert args.gpus == [0, 1] and args.cases == ["TC-01", "TC-04"]
@@ -542,3 +579,373 @@ def test_missing_ssm_pages_fail_hybrid_delivery():
     assert lenient.delivery_covers(2, 2)
     lenient.bytes_match_pages(result, "skipped", 1, 5)
     assert len(result.checks) == 2
+
+
+# -- configuration-matrix harness contracts ---------------------------------
+
+
+@pytest.mark.parametrize("mode", [stack.GUARD, stack.NON_GUARD])
+def test_local_disagg_owns_only_mode_applicable_services(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(stack.Stack, "advertise_host", staticmethod(lambda: "10.0.0.5"))
+    args = runner.arguments(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--topology",
+            "disagg",
+            "--gpus",
+            "0,0,1",
+            "--gpu-memory-utilization",
+            "0.35",
+            "--mode",
+            mode,
+            "--cases",
+            "TC-01,TC-02,TC-03",
+        ]
+    )
+    run = runner.Runner(args)
+    s = run.stack
+    started = []
+    monkeypatch.setattr(s, "start_service", lambda i: started.append(("service", i)))
+    monkeypatch.setattr(s, "start_state_agent", lambda: started.append(("agent",)))
+    monkeypatch.setattr(
+        s, "start_frontend", lambda port: started.append(("frontend", port))
+    )
+    monkeypatch.setattr(s, "start_worker", lambda i: started.append(("worker", i)))
+    monkeypatch.setattr(s, "wait_model", lambda client: None)
+    monkeypatch.setattr(
+        s, "discover_worker", lambda client, i: s.worker_ids.update({i: str(i + 10)})
+    )
+    run.stack_phase()
+    assert [event for event in started if event[0] == "worker"] == [
+        ("worker", 0),
+        ("worker", 2),
+        ("worker", 1),
+    ]
+    assert [event for event in started if event[0] == "service"] == (
+        [("service", 0), ("service", 1)] if mode == stack.GUARD else []
+    )
+    assert (("agent",) in started) == (mode == stack.GUARD)
+    assert run.result["state_agent"] == (mode == stack.GUARD)
+    assert s.pin(0) == {"prefill": "10", "worker": "12"}
+    assert s.pin(1) == {"prefill": "11", "worker": "12"}
+    assert run.result["deployment"] == "disaggregated"
+    s.cleanup()
+
+
+def test_native_disagg_preserves_kvcr_and_disabled_reference_connectors(tmp_path):
+    args = runner.arguments(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--mode",
+            "nonguard",
+            "--topology",
+            "disagg",
+            "--gpus",
+            "0,0,1",
+            "--gpu-memory-utilization",
+            "0.35",
+            "--g2-slots",
+            "48",
+            "--cases",
+            "TC-01,TC-02,TC-03",
+        ]
+    )
+    run = runner.Runner(args)
+    s = run.stack
+    for index in (0, 1):
+        transfer = s.kv_transfer_config(index, kvcr=True)
+        assert transfer["kv_connector"] == "MultiConnector"
+        extra = transfer["kv_connector_extra_config"]
+        offload, nixl = extra["connectors"]
+        assert offload["kv_connector"] == "OffloadingConnector"
+        tier = extra["secondary_tiers"][0]
+        assert tier["secondary_g2_slots"] == 48
+        assert "kvcr_service_socket_path" not in tier
+        assert "dynamo_state_agent" not in extra
+        assert extra["self_describing_kv_events"]
+        assert nixl == {"kv_connector": "NixlConnector", "kv_role": "kv_producer"}
+        assert s.kv_transfer_config(index, kvcr=False) == nixl
+    decode = {"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}
+    assert s.kv_transfer_config(2, kvcr=True) == decode
+    assert s.kv_transfer_config(2, kvcr=False) == decode
+    s.cleanup()
+
+
+def test_snapshot_path_keeps_canonical_served_identity(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    args = runner.arguments(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--model",
+            "owner/model",
+            "--model-path",
+            str(snapshot),
+            "--g2-slots",
+            "24",
+            "--mode",
+            "nonguard",
+        ]
+    )
+    run = runner.Runner(args)
+    assert run.settings.model_path == snapshot.resolve()
+    assert run.settings.g2_slots == 24
+    for kvcr in (False, True):
+        command = run.stack.worker_command(0, kvcr=kvcr)
+        assert command[command.index("--model") + 1] == str(snapshot.resolve())
+        assert command[command.index("--served-model-name") + 1] == "owner/model"
+    assert run.result["model"] == "owner/model"
+    assert run.result["model_path"] == str(snapshot.resolve())
+    run.stack.cleanup()
+
+
+@pytest.mark.parametrize("slots", ["0", "-1", "65537"])
+def test_native_pool_slots_reject_invalid_capacity(tmp_path, slots, capsys):
+    with pytest.raises(SystemExit):
+        runner.arguments(["--output-dir", str(tmp_path), "--g2-slots", slots])
+    assert "--g2-slots must be 1..65536" in capsys.readouterr().err
+
+
+def test_snapshot_path_must_be_a_directory(tmp_path, capsys):
+    for path in (tmp_path / "missing", tmp_path / "file"):
+        if path.name == "file":
+            path.write_text("not a directory")
+        with pytest.raises(SystemExit):
+            runner.arguments(["--output-dir", str(tmp_path), "--model-path", str(path)])
+        assert "--model-path must be an existing directory" in capsys.readouterr().err
+
+
+def test_disagg_saved_connector_matches_actual_launch(tmp_path, monkeypatch):
+    s = stack.Stack(
+        stack.Settings(
+            model="m",
+            output=tmp_path,
+            mode=stack.NON_GUARD,
+            topology="disagg",
+            gpus=(0, 0, 1),
+        ),
+        tmp_path / "stack",
+    )
+    launches = {}
+
+    def spawn(name, command, env):
+        launches[name] = command
+        return SimpleNamespace(name=name)
+
+    monkeypatch.setattr(s, "_spawn", spawn)
+    for index, kvcr, tag in ((0, False, "-reference"), (0, True, ""), (2, True, "")):
+        s.start_worker(index, kvcr=kvcr, tag=tag)
+        name = f"worker-{index}{tag}"
+        actual = launches[name]
+        expected = json.loads(actual[actual.index("--kv-transfer-config") + 1])
+        assert (
+            json.loads((s.evidence / f"{name}.kv-transfer-config.json").read_text())
+            == expected
+        )
+    s.cleanup()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_provenance_reads_image_build_metadata(tmp_path, monkeypatch, legacy):
+    preferred = "/opt/kvcr-build-metadata.json"
+    old = "/opt/kvcr-build/source-revisions.json"
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text(
+        json.dumps({"kvcr_commit": "installed-source", "overlay": "fix"})
+    )
+    exists = Path.exists
+    read_text = Path.read_text
+
+    def metadata_exists(path):
+        if str(path) in (old, preferred):
+            return str(path) == (old if legacy else preferred)
+        return exists(path)
+
+    def metadata_read(path, *args, **kwargs):
+        if str(path) in (old, preferred):
+            return read_text(metadata, *args, **kwargs)
+        return read_text(path, *args, **kwargs)
+
+    args = runner.arguments(["--output-dir", str(tmp_path / "run")])
+    monkeypatch.setattr(Path, "exists", metadata_exists)
+    monkeypatch.setattr(Path, "read_text", metadata_read)
+    assert (
+        runner.provenance(args)["image_source_revisions"]["kvcr_commit"]
+        == "installed-source"
+    )
+
+
+def test_sigterm_reaches_runner_cleanup_and_restores_handler(tmp_path, monkeypatch):
+    args = runner.arguments(["--output-dir", str(tmp_path / "run")])
+    run = runner.Runner(args)
+    cleaned = []
+    monkeypatch.setattr(runner, "arguments", lambda: args)
+    monkeypatch.setattr(runner, "Runner", lambda args: run)
+    monkeypatch.setattr(runner, "provenance", lambda args: {})
+
+    def terminate():
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(run.stack, "preflight", terminate)
+    monkeypatch.setattr(run.stack, "cleanup", lambda: cleaned.append(True))
+    previous = signal.getsignal(signal.SIGTERM)
+    assert runner.main() == 1
+    assert cleaned == [True]
+    assert "KeyboardInterrupt" in run.result["error"]
+    assert signal.getsignal(signal.SIGTERM) == previous
+
+
+@pytest.mark.parametrize("failed_reference", [False, True])
+def test_phase_durations_include_failure_and_cleanup(
+    tmp_path, monkeypatch, failed_reference
+):
+    args = runner.arguments(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--cases",
+            "TC-01",
+        ]
+    )
+    run = runner.Runner(args)
+    monkeypatch.setattr(runner, "provenance", lambda args: {})
+    clock = iter(range(100))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(run.stack, "preflight", lambda: {})
+
+    def reference():
+        if failed_reference:
+            raise common.ValidationError("reference was unstable")
+
+    def cases_phase(client):
+        case = common.CaseResult("TC-01", "generation", "R1")
+        case.check("tokens", True)
+        case.finish()
+        run.result["cases"].append(case.to_dict())
+
+    monkeypatch.setattr(run, "reference_phase", reference)
+    monkeypatch.setattr(run, "stack_phase", lambda: object())
+    monkeypatch.setattr(run, "cases_phase", cases_phase)
+    monkeypatch.setattr(run.stack, "cleanup", lambda: {})
+    assert run.run() == int(failed_reference)
+    expected = {"preflight", "reference", "cleanup"}
+    if not failed_reference:
+        expected |= {"stack", "cases"}
+    assert run.result["phase_durations_seconds"] == {name: 1 for name in expected}
+
+
+def test_external_and_remote_native_services_remain_rejected(tmp_path, capsys):
+    base = ["--output-dir", str(tmp_path), "--mode", "nonguard"]
+    with pytest.raises(SystemExit):
+        runner.arguments(
+            base + ["--external-services", str(tmp_path), "--compatibility-digest", "d"]
+        )
+    assert "--external-services requires --mode guard" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        runner.arguments(base + ["--remote-worker", "1=http://node:1234"])
+    assert "--remote-worker needs --external-services" in capsys.readouterr().err
+
+
+def test_failed_reference_stop_is_retried_and_never_lost_from_cleanup(tmp_path):
+    s = stack.Stack(stack.Settings(model="m", output=tmp_path), tmp_path / "stack")
+    child = SimpleNamespace(name="reference", pid=123, stopped=False)
+    attempts = []
+
+    def stop():
+        attempts.append(True)
+        # Reproduce a child whose stop method marks itself stopped on failure.
+        child.stopped = True
+        if len(attempts) == 1:
+            return {"name": child.name, "pid": child.pid, "error": "did not exit"}
+        return {"name": child.name, "pid": child.pid, "exit_code": 0}
+
+    child.stop = stop
+    s.children.append(child)
+    with pytest.raises(common.ValidationError, match="stop"):
+        s.stop(child)
+    assert not child.stopped
+    with pytest.raises(common.ValidationError, match="cleanup"):
+        s.cleanup()
+    report = json.loads((s.evidence / "cleanup.json").read_text())
+    assert len(attempts) == 2
+    assert len(report["owned_processes"]) == 2
+    assert report["owned_processes"][0]["error"] == "did not exit"
+    assert report["owned_processes"][1]["exit_code"] == 0
+    assert report["process_states"] == [
+        {"name": "reference", "pid": 123, "stopped": True}
+    ]
+
+
+def test_cleanup_continues_after_one_child_stop_raises(tmp_path):
+    s = stack.Stack(stack.Settings(model="m", output=tmp_path), tmp_path / "stack")
+    good = SimpleNamespace(name="good", pid=1, stopped=False)
+    bad = SimpleNamespace(name="bad", pid=2, stopped=False)
+    good.stop = lambda: {"name": "good", "pid": 1, "exit_code": 0}
+
+    def failed_stop():
+        raise PermissionError("cannot signal child")
+
+    bad.stop = failed_stop
+    s.children = [good, bad]
+    with pytest.raises(common.ValidationError, match="cleanup"):
+        s.cleanup()
+    report = json.loads((s.evidence / "cleanup.json").read_text())
+    assert (
+        report["owned_processes"][0]["error"] == "PermissionError: cannot signal child"
+    )
+    assert report["owned_processes"][1]["name"] == "good"
+    assert good.stopped and not bad.stopped
+
+
+@pytest.mark.parametrize("managed_class", [stack.Managed, stack.RemoteManaged])
+def test_managed_failed_stop_remains_retryable(managed_class):
+    child = object.__new__(managed_class)
+    child.name = "reference"
+    child.stopped = False
+    child._log = io.StringIO()
+    if managed_class is stack.RemoteManaged:
+        child.pid = 123
+        child.agent_url = "http://node:1234"
+    responses = iter(["timeout", "timeout", 0, 0])
+
+    def wait(timeout):
+        response = next(responses)
+        if response == "timeout":
+            raise subprocess.TimeoutExpired("reference", timeout)
+        return response
+
+    child.process = SimpleNamespace(pid=123, returncode=0, wait=wait)
+    child.signal_group = lambda number: True
+    assert "error" in child.stop()
+    assert not child.stopped
+    assert child.stop()["exit_code"] == 0
+    assert child.stopped
+
+
+def test_injected_kill_failure_keeps_process_retryable(tmp_path):
+    s = stack.Stack(stack.Settings(model="m", output=tmp_path), tmp_path / "stack")
+
+    def wait(timeout):
+        raise subprocess.TimeoutExpired("worker", timeout)
+
+    child = SimpleNamespace(
+        name="worker-0",
+        pid=123,
+        stopped=False,
+        process=SimpleNamespace(wait=wait),
+        signal_group=lambda number: True,
+    )
+    child.stop = lambda: {"name": child.name, "pid": child.pid, "exit_code": -9}
+    s.children.append(child)
+    s.workers[0] = child
+    with pytest.raises(common.ValidationError, match="survived"):
+        s.kill_worker(0)
+    assert not child.stopped
+    with pytest.raises(common.ValidationError, match="cleanup"):
+        s.cleanup()
+    report = json.loads((s.evidence / "cleanup.json").read_text())
+    assert "survived SIGKILL" in report["owned_processes"][0]["error"]
+    assert report["owned_processes"][1]["exit_code"] == -9

@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "models": {
+    "dense": {
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "pool_gb": 2,
+        "batch_invariant": true,
+        "hit_block_tokens": 64,
+        "tc02_shared_sections": 40,
+        "tc02_sections": 80,
+        "tc02_seed_prefix": false,
+        "timeout": 2400,
+        "request_timeout": 120,
+        "worker_args": []
+      },
+      "model_key": "qwen3-0-6b"
+    },
+    "mamba": {
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "pool_gb": 2,
+        "batch_invariant": true,
+        "hit_block_tokens": 64,
+        "tc02_shared_sections": 140,
+        "tc02_sections": 200,
+        "tc02_seed_prefix": true,
+        "timeout": 3600,
+        "request_timeout": 180,
+        "worker_args": [
+          "--attention-backend=triton",
+          "--trust-remote-code"
+        ]
+      },
+      "model_key": "nemotron3-nano-4b-bf16"
+    },
+    "gdn": {
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "pool_gb": 2,
+        "batch_invariant": true,
+        "hit_block_tokens": 64,
+        "tc02_shared_sections": 140,
+        "tc02_sections": 200,
+        "tc02_seed_prefix": true,
+        "timeout": 3600,
+        "request_timeout": 180,
+        "worker_args": [
+          "--attention-backend=triton",
+          "--trust-remote-code"
+        ]
+      },
+      "model_key": "qwen3-5-0-8b"
+    }
+  },
+  "integration": "sglang-hicache",
+  "profiles": [
+    {"id": "sglang-hicache-dense-agg-native", "integration": "sglang-hicache", "model_family": "dense", "topology": "agg", "mode": "native", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.8}, "qualification": "previous-ci-pass"},
+    {"id": "sglang-hicache-mamba-agg-native", "integration": "sglang-hicache", "model_family": "mamba", "topology": "agg", "mode": "native", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.8}, "qualification": "pending"},
+    {"id": "sglang-hicache-gdn-agg-native", "integration": "sglang-hicache", "model_family": "gdn", "topology": "agg", "mode": "native", "resources": {"gpus": [0, 1], "gpu_memory_utilization": 0.8}, "qualification": "pending"}
+  ]
+}
