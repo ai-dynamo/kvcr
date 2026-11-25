@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: Build qualified CI image
+on:
+  workflow_call:
+    inputs:
+      image_profile:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      recipe_sha:
+        required: true
+        type: string
+      resolved_inputs_json:
+        required: true
+        type: string
+    outputs:
+      image:
+        value: ${{ jobs.build.outputs.image }}
+      source_sha:
+        value: ${{ inputs.source_sha }}
+      recipe_sha:
+        value: ${{ inputs.recipe_sha }}
+      image_profile:
+        value: ${{ inputs.image_profile }}
+      resolved_inputs_sha256:
+        value: ${{ jobs.build.outputs.resolved_inputs_sha256 }}
+      build_manifest_artifact:
+        value: ${{ jobs.build.outputs.build_manifest_artifact }}
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    runs-on: prod-kvcr-builder-v1
+    timeout-minutes: 45
+    env:
+      AWS_DEFAULT_REGION: us-west-2
+      ECR_REGISTRY: 210086341041.dkr.ecr.us-west-2.amazonaws.com
+      ECR_REPOSITORY: ai-dynamo/kvcr
+      BUILDER_NAME: kvcr-${{ inputs.image_profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      image: ${{ steps.published.outputs.image }}
+      resolved_inputs_sha256: ${{ steps.inputs.outputs.digest }}
+      build_manifest_artifact: kvcr-build-${{ inputs.image_profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out qualified recipe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.recipe_sha }}
+      - name: Check out tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: kvcr-source
+      - name: Validate immutable build contract
+        id: inputs
+        env:
+          RESOLVED_INPUTS: ${{ inputs.resolved_inputs_json }}
+          IMAGE_PROFILE: ${{ inputs.image_profile }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tests/e2e python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          from ci_images import build_inputs, inputs_digest
+          record = json.loads(os.environ['RESOLVED_INPUTS'])
+          expected = build_inputs(os.environ['IMAGE_PROFILE'], os.environ['SOURCE_SHA'],
+                                  os.environ['RECIPE_SHA'], record['base_image'],
+                                  record['dynamo_policy'], record['dynamo_version'])
+          if record != expected:
+              raise ValueError('Resolved image inputs differ from the registered recipe')
+          canaries = Path('ci-recipe-context')
+          canaries.mkdir()
+          for script in expected.get('canary_scripts', []):
+              shutil.copyfile(script, canaries / Path(script).name)
+          Path('resolved-inputs.json').write_text(json.dumps(record, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {**record, 'digest': inputs_digest(record)}.items():
+                  output.write(f'{key}={value}\n')
+          PY
+      - name: Log in to ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - name: Initialize shared BuildKit builder
+        id: builder
+        uses: ai-dynamo/.github/.github/actions/init-dynamo-builder@e8cb76eeca91bbac2ab5c2702bd8bd629b20dd3a
+        with:
+          builder_name: ${{ env.BUILDER_NAME }}
+          flavor: ${{ steps.inputs.outputs.flavor }}
+          arch: linux/amd64
+          namespace: buildkit
+      - name: Build and publish qualified image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ env.BUILDER_NAME }}
+          context: ./kvcr-source
+          file: ${{ steps.inputs.outputs.recipe }}
+          build-contexts: ci-recipe=./ci-recipe-context
+          platforms: linux/amd64
+          push: true
+          load: false
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ inputs.image_profile }}-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          build-args: |
+            ${{ steps.inputs.outputs.base_argument }}=${{ steps.inputs.outputs.base_image }}
+            DYNAMO_VERSION=${{ steps.inputs.outputs.dynamo_version }}
+            DYNAMO_POLICY=${{ steps.inputs.outputs.dynamo_policy }}
+            KVCR_COMMIT=${{ inputs.source_sha }}
+            CI_RECIPE_SHA=${{ inputs.recipe_sha }}
+            CI_IMAGE_PROFILE=${{ inputs.image_profile }}
+            RESOLVED_INPUTS_SHA256=${{ steps.inputs.outputs.digest }}
+      - name: Record published identity
+        id: published
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          INPUT_DIGEST: ${{ steps.inputs.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          digest = os.environ['IMAGE_DIGEST']
+          if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+              raise ValueError('Build did not return an immutable image digest')
+          record = json.loads(Path('resolved-inputs.json').read_text())
+          image = f"{os.environ['ECR_REGISTRY']}/{os.environ['ECR_REPOSITORY']}@{digest}"
+          record.update(image=image, resolved_inputs_sha256=os.environ['INPUT_DIGEST'],
+                        run_id=os.environ['GITHUB_RUN_ID'], run_attempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          Path('build-manifest.json').write_text(json.dumps(record, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'image={image}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Published `{image}`\n\n```json\n{json.dumps(record, indent=2)}\n```\n')
+          PY
+      - name: Save build provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvcr-build-${{ inputs.image_profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build-manifest.json
+            resolved-inputs.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove builder configuration
+        if: always() && (steps.builder.outcome == 'success' || steps.builder.outcome == 'failure')
+        continue-on-error: true
+        run: |
+          if docker buildx inspect "$BUILDER_NAME" > /dev/null 2>&1; then
+            docker buildx rm "$BUILDER_NAME"
+          fi

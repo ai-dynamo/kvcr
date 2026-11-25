@@ -1,0 +1,258 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: KVCR integration E2E
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Immutable published KVCR image reference, including sha256 digest
+        required: true
+        type: string
+      source_sha:
+        description: Exact KVCR source commit installed in the image
+        required: true
+        type: string
+      integration:
+        required: true
+        type: string
+      recipe_sha:
+        required: true
+        type: string
+      image_profile:
+        required: true
+        type: string
+      resolved_inputs_sha256:
+        required: true
+        type: string
+      build_manifest_artifact:
+        required: true
+        type: string
+      profile_selection:
+        description: all, or comma-separated profile IDs for an explicitly diagnostic subset
+        required: false
+        type: string
+        default: all
+
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      smokes: ${{ steps.plan.outputs.smokes }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.recipe_sha }}
+      - name: Download this integration's build provenance
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.build_manifest_artifact }}
+          path: build-provenance
+      - name: Select explicit configuration identities
+        id: plan
+        shell: bash
+        env:
+          PROFILE_SELECTION: ${{ inputs.profile_selection }}
+          IMAGE: ${{ inputs.image }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          INTEGRATION: ${{ inputs.integration }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+          IMAGE_PROFILE: ${{ inputs.image_profile }}
+          INPUT_DIGEST: ${{ inputs.resolved_inputs_sha256 }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tests/e2e python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          from ci_images import inputs_digest
+          record = json.loads(Path('build-provenance/build-manifest.json').read_text())
+          resolved = json.loads(Path('build-provenance/resolved-inputs.json').read_text())
+          expected = {'image': os.environ['IMAGE'], 'source_sha': os.environ['EXPECTED_SOURCE_SHA'],
+                      'recipe_sha': os.environ['RECIPE_SHA'], 'image_profile': os.environ['IMAGE_PROFILE'],
+                      'resolved_inputs_sha256': os.environ['INPUT_DIGEST'],
+                      'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT']}
+          if any(record.get(key) != value for key,value in expected.items()):
+              raise ValueError('Build artifact does not belong to selected integration/image/run')
+          if inputs_digest(resolved) != expected['resolved_inputs_sha256']:
+              raise ValueError('Resolved build inputs digest differs')
+          PYCODE
+          matrix=$(python3 tests/e2e/ci_profiles.py \
+            --integration "$INTEGRATION" --selection "$PROFILE_SELECTION" --output manifest.json \
+            --recipe-sha "$RECIPE_SHA" --image-profile "$IMAGE_PROFILE" \
+            --resolved-inputs-sha256 "$INPUT_DIGEST" \
+            --image "$IMAGE" --source-sha "$EXPECTED_SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT")
+          printf 'matrix=%s\nsource_sha=%s\n' "$matrix" "$EXPECTED_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          printf 'smokes=%s\n' "$(jq -c '{include: [.smokes[] | {profile: .id}]}' manifest.json)" >> "$GITHUB_OUTPUT"
+          {
+            printf 'Selected configuration manifest:\n\n```json\n'
+            cat manifest.json
+            printf '\n```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save expected manifest
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvcr-plan-${{ inputs.integration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  smokes:
+    if: needs.plan.outputs.smokes != '{"include":[]}'
+    name: ${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.smokes) }}
+    needs: plan
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: ${{ inputs.image }}
+    # Budget: 20m prefetch + (25m harness + 2m wrapper allowance + 3m
+    # cooperative termination) + 10m checkout/evidence reserve = 60m.
+    timeout-minutes: 60
+    env:
+      HF_HOME: /scratch/huggingface
+      VLLM_CACHE_ROOT: /scratch/vllm
+      XDG_CACHE_HOME: /scratch/cache
+      UCX_TLS: tcp,sm,self,cuda_copy
+      DYN_ROUTER_WORKER_SELECTION_POLICY: kvcr
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.recipe_sha }}
+      - name: Show allocated NVIDIA devices
+        run: nvidia-smi
+      - name: Verify cross-rank KVCR reuse
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          INTEGRATION: ${{ inputs.integration }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+          IMAGE_PROFILE: ${{ inputs.image_profile }}
+          INPUT_DIGEST: ${{ inputs.resolved_inputs_sha256 }}
+        run: |
+          set -euo pipefail
+          exec python3 -u tests/e2e/run_ci_profile.py \
+            --integration "$INTEGRATION" --recipe-sha "$RECIPE_SHA" \
+            --image-profile "$IMAGE_PROFILE" --resolved-inputs-sha256 "$INPUT_DIGEST" \
+            --profile "${{ matrix.profile }}" \
+            --output-dir "artifacts/${{ matrix.profile }}" \
+            --image "$IMAGE" --expected-source-sha "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Save smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvcr-result-${{ inputs.integration }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.profile }}
+          path: artifacts/${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  profiles:
+    name: ${{ matrix.profile }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # The shared ARC pool admits two jobs today and can admit eight after an
+    # independent infrastructure change. No test-to-test dependencies or
+    # per-matrix throttle are needed; each job gets its own GPUs and /scratch.
+    runs-on: prod-kvcr-tester-amd-gpu-2-v1
+    container:
+      image: ${{ inputs.image }}
+    # Longest profile: 20m prefetch + (60m harness + 2m wrapper allowance
+    # + 3m cooperative termination) + 10m checkout/evidence reserve = 95m.
+    # Keep the Actions deadline outside the wrapper's cleanup deadline.
+    timeout-minutes: 95
+    env:
+      HF_HOME: /scratch/huggingface
+      VLLM_CACHE_ROOT: /scratch/vllm
+      XDG_CACHE_HOME: /scratch/cache
+      UCX_TLS: tcp,sm,self,cuda_copy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.recipe_sha }}
+      - name: Show allocated NVIDIA devices
+        run: nvidia-smi
+      - name: Run configuration and collect owned cleanup evidence
+        shell: bash
+        env:
+          PROFILE: ${{ matrix.profile }}
+          IMAGE: ${{ inputs.image }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          INTEGRATION: ${{ inputs.integration }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+          IMAGE_PROFILE: ${{ inputs.image_profile }}
+          INPUT_DIGEST: ${{ inputs.resolved_inputs_sha256 }}
+        run: |
+          set -euo pipefail
+          exec python3 -u tests/e2e/run_ci_profile.py \
+            --integration "$INTEGRATION" --recipe-sha "$RECIPE_SHA" \
+            --image-profile "$IMAGE_PROFILE" --resolved-inputs-sha256 "$INPUT_DIGEST" \
+            --profile "$PROFILE" --output-dir "artifacts/$PROFILE" \
+            --image "$IMAGE" --expected-source-sha "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Save configuration evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvcr-result-${{ inputs.integration }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.profile }}
+          path: artifacts/${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  summary:
+    name: ${{ inputs.integration }} selected-configuration verdict
+    if: always()
+    needs: [plan, smokes, profiles]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.recipe_sha }}
+      - name: Download this attempt's expected manifest
+        if: always()
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kvcr-plan-${{ inputs.integration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: expected
+      - name: Download this attempt's individual results
+        if: always()
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: kvcr-result-${{ inputs.integration }}-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: results
+          # Keep artifact directories separate; merging could overwrite results.
+          merge-multiple: false
+      - name: Require every selected profile and smoke to pass
+        if: always()
+        shell: bash
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          python3 tests/e2e/summarize_ci.py \
+            --manifest expected/manifest.json --artifacts results \
+            --job-results "$JOB_RESULTS" --output summary/result.json
+      - name: Save aggregate verdict
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvcr-summary-${{ inputs.integration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: summary/
+          if-no-files-found: error
+          retention-days: 14
