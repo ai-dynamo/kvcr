@@ -260,7 +260,6 @@ def policy_fingerprint() -> str:
         for name in (
             "ci_profiles.py",
             "ci_models.json",
-            "ci_profiles.json",
             "ci_model_access.py",
             "ci_identity.py",
             "ci_resources.py",
@@ -268,7 +267,9 @@ def policy_fingerprint() -> str:
             "run_ci_profile.py",
             "summarize_ci.py",
         )
-    ] + sorted((E2E / "ci_integrations").glob("*.py"))
+    ]
+    paths += sorted(E2E.glob("ci_profiles*.json"))
+    paths += sorted((E2E / "ci_integrations").glob("*.py"))
     digest = hashlib.sha256()
     for path in paths:
         digest.update(str(path.relative_to(E2E)).encode())

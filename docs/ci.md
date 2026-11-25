@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Per-PR GPU CI and integration contract
 
-The active gate is **vLLM: 12 configurations and 42 functional cases**. SGLang HiCache and Linker are extension points, not
-registered or qualified lanes. A target-diagram row is never a passing result.
+The active gate is **vLLM: 12 configurations and 42 functional cases** and
+**SGLang HiCache: 3 configurations and 9 functional cases**. SGLang Linker is an
+extension point, not a registered lane. A target-diagram row is never a passing result.
 This document describes the executable contract; historical runs remain in their
 Actions artifacts. TC-05/06, nightly/weekly scheduling, cross-node validation and
 runner infrastructure changes are outside this per-PR gate.
@@ -16,14 +17,17 @@ runner infrastructure changes are outside this per-PR gate.
 1. CPU `ci.yml` runs lint and `tests/unit tests/ci` on pull requests.
 2. The trusted PR mirror pushes `pull-request/<number>` in the upstream repository.
    `docker-build.yml` selects all active required integrations for execution-affecting
-   workflow, recipe, dependency, source or E2E changes. It currently selects vLLM.
+   workflow, recipe, dependency, source or E2E changes. It currently selects vLLM
+   (`build-vllm`, `e2e-vllm`) and SGLang HiCache (`build-sglang-hicache`,
+   `e2e-sglang-hicache`).
    An unauthorized fork push alone does not grant access to GPU runners/secrets.
 3. `resolve` checks out recipe and tested source separately, resolves the serving
    base tag to a digest and resolves the nightly policy to one usable exact
    `ai-dynamo`/`ai-dynamo-runtime` version **before Docker caching**.
 4. `build-ci-image.yml` validates registered data-only image inputs, builds with the
    shared BuildKit service, publishes to ECR and returns the digest and build identity.
-5. The compatibility entry `vllm-e2e.yml` calls `integration-e2e.yml`. The latter
+5. The compatibility entry `vllm-e2e.yml` calls `integration-e2e.yml`; the SGLang
+   lane calls it directly with its own integration and build outputs. It
    checks the same-run build artifact, seals a selected profile manifest and starts
    independent profile jobs. Each uses only its own image.
 6. Each profile verifies installed source/build/overlay identity, prepares one
@@ -100,6 +104,27 @@ worker-addressed upper-tier reset can be acknowledged while KVCR residency survi
 `cached_tokens` alone never closes that gap. A reset experiment must preserve
 secondary KVCR, establish a fresh telemetry window, prove local delivery and exact
 output, and exclude KVCR peer delivery without forbidding NIXL decode transfer.
+
+## SGLang HiCache selection
+
+`ci_integrations/sglang_hicache.py` (shared SGLang policy in `sglang.py`) and
+`ci_profiles_sglang_hicache.json` define one aggregated native profile per model
+family, on the same pinned checkpoints as vLLM. KVCR runs inside each SGLang worker,
+so there is no Guard service or supported disaggregated layout: TC-01–03 only.
+
+| Profile | Checkpoint | SGLang launch | Qualification |
+|---|---|---|---|
+| `sglang-hicache-dense-agg-native` | `qwen3-0-6b` | deterministic inference, fa3 | previous CI pass |
+| `sglang-hicache-mamba-agg-native` | `nemotron3-nano-4b-bf16` | deterministic inference, triton | pending |
+| `sglang-hicache-gdn-agg-native` | `qwen3-5-0-8b` | deterministic inference, triton | pending |
+
+Workers 0/1 use GPUs 0/1 with `--mem-fraction-static 0.8`, page size 64 and an
+8192-token context. Hybrid rows use the vLLM hybrid TC-02 prompt layout (seeded
+prefix, 140/200 sections). Upstream SGLang does not yet claim peer reuse for
+hybrid (checkpointed SWA/Mamba) pools, so the hybrid rows are expected to show
+where TC-02/03 peer transfer stops; they stay `pending` until a run passes.
+Telemetry comes from the backend's `KVCR L3 native stats` lines; tier read bytes
+are derived from the measured `local_fill` page size and labeled as such.
 
 ## Images and dependencies
 
@@ -199,6 +224,9 @@ telemetry is not observed zero; HiCache-derived byte metrics are labeled derived
 Historical v1 artifacts require explicit replay mode and cannot qualify production.
 
 ## Dana's integration steps
+
+Status: steps 1–7 are done for HiCache (dense, Mamba and GDN rows; hybrids
+pending). Linker follows on its own branch with a non-gating lane.
 
 1. Rebase/replay only her distinct commits onto the exact reviewed PR208 handoff
    commit. At the 2026-11-25 11:12 UTC refresh, both

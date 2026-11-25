@@ -777,9 +777,19 @@ class Stack:
             "bfloat16",
             # Deterministic inference with the radix cache needs fa3/fa4/triton
             # (SGLang RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND); the
-            # quick start's trtllm_mha stays the default otherwise.
-            "--attention-backend",
-            "fa3" if self.settings.batch_invariant else "trtllm_mha",
+            # quick start's trtllm_mha stays the default otherwise. A
+            # --worker-arg --attention-backend replaces it (one flag only).
+            *(
+                []
+                if any(
+                    arg.startswith("--attention-backend")
+                    for arg in self.settings.extra_worker_args
+                )
+                else [
+                    "--attention-backend",
+                    "fa3" if self.settings.batch_invariant else "trtllm_mha",
+                ]
+            ),
             "--context-length",
             str(min(self.settings.max_model_len, 8192)),
             "--max-total-tokens",

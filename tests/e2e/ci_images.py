@@ -33,6 +33,14 @@ IMAGE_PROFILES = {
         "compatibility_overlays": VLLM_OVERLAYS,
         "canary_scripts": ["tests/e2e/check_vllm_rank_initialization.py"],
     },
+    # The SGLang fork commit, its pinned stack and the import canary live in
+    # the recipe; the base image is the digest pinned there (SGLANG_IMAGE).
+    "sglang-hicache": {
+        "recipe": "Dockerfile.quick-start-sglang",
+        "flavor": "vllm",
+        "python_version": "3.12",
+        "base_argument": "SGLANG_IMAGE",
+    },
 }
 PACKAGES = ("ai-dynamo", "ai-dynamo-runtime")
 
@@ -139,9 +147,27 @@ def main() -> int:
     parser.add_argument("--recipe-sha", required=True)
     parser.add_argument("--base-image", required=True)
     parser.add_argument("--dynamo-policy", default="nightly")
+    parser.add_argument(
+        "--dynamo-profiles",
+        default="",
+        help="comma-separated image profiles whose Python runtimes the "
+        "resolved Dynamo release must serve (default: --image-profile)",
+    )
+    parser.add_argument(
+        "--dynamo-version",
+        default="",
+        help="reuse a version already resolved for this run's image profiles",
+    )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    version = resolve_for_profiles(args.dynamo_policy, [args.image_profile])
+    profiles = [
+        name.strip() for name in args.dynamo_profiles.split(",") if name.strip()
+    ] or [args.image_profile]
+    if args.image_profile not in profiles:
+        parser.error("--dynamo-profiles must include --image-profile")
+    version = args.dynamo_version or resolve_for_profiles(
+        args.dynamo_policy, profiles
+    )
     record = build_inputs(
         args.image_profile,
         args.source_sha,

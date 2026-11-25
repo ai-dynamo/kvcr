@@ -74,6 +74,7 @@ def provenance(args: argparse.Namespace) -> dict[str, Any]:
         "kvcr",
         "nixl",
         "vllm",
+        "sglang",
         "ai-dynamo",
         "ai-dynamo-runtime",
         "torch",

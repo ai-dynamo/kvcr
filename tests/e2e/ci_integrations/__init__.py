@@ -9,7 +9,10 @@ architecture row alone does not make an integration runnable or passing.
 from importlib import import_module
 from types import ModuleType
 
-_INTEGRATIONS = {"vllm": "ci_integrations.vllm"}
+_INTEGRATIONS = {
+    "vllm": "ci_integrations.vllm",
+    "sglang-hicache": "ci_integrations.sglang_hicache",
+}
 
 
 def get_integration(name: str) -> ModuleType:

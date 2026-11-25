@@ -25,7 +25,7 @@ on:
         type: string
         default: vllm/vllm-openai:nightly
       dynamo_version:
-        description: Dynamo wheel version, or nightly for the newest dev wheel
+        description: Dynamo wheel version for every image, or nightly for the newest dev wheel
         required: true
         type: string
         default: nightly
@@ -55,13 +55,14 @@ jobs:
       source_sha: ${{ steps.inputs.outputs.source_sha }}
       recipe_sha: ${{ github.sha }}
       resolved_inputs_json: ${{ steps.inputs.outputs.json }}
+      sglang_hicache_inputs_json: ${{ steps.inputs.outputs.sglang_hicache_json }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.kvcr_ref || github.sha }}
           path: kvcr-source
-      - name: Resolve nightly policy and immutable inputs once
+      - name: Resolve nightly policy and immutable inputs once for every image
         id: inputs
         env:
           BASE_IMAGE: ${{ inputs.base_image || 'vllm/vllm-openai:nightly' }}
@@ -72,21 +73,35 @@ jobs:
           base_digest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')
           base_name="${BASE_IMAGE%%@*}"
           if [[ "${base_name##*/}" == *:* ]]; then base_name="${base_name%:*}"; fi
+          # One Dynamo release that serves every image's Python runtime.
+          profiles=vllm,sglang-hicache
           resolved=$(python3 tests/e2e/ci_images.py --image-profile vllm \
             --source-sha "$source_sha" --recipe-sha "$GITHUB_SHA" \
             --base-image "${base_name}@${base_digest}" --dynamo-policy "$DYNAMO_POLICY" \
-            --output resolved-inputs.json)
+            --dynamo-profiles "$profiles" --output resolved-inputs.json)
+          dynamo_version=$(jq -er '.dynamo_version' <<< "$resolved")
+          # The SGLang base is digest-pinned in its recipe.
+          sglang_base=$(sed -nE 's/^ARG SGLANG_IMAGE=(.+@sha256:[0-9a-f]{64})$/\1/p' \
+            Dockerfile.quick-start-sglang)
+          [[ -n "$sglang_base" ]] || { echo "SGLANG_IMAGE is not digest-pinned" >&2; exit 1; }
+          sglang_hicache=$(python3 tests/e2e/ci_images.py --image-profile sglang-hicache \
+            --source-sha "$source_sha" --recipe-sha "$GITHUB_SHA" \
+            --base-image "$sglang_base" --dynamo-policy "$DYNAMO_POLICY" \
+            --dynamo-profiles "$profiles" --dynamo-version "$dynamo_version" \
+            --output resolved-inputs-sglang-hicache.json)
           # A single-line JSON output is data, never executable shell input.
-          printf 'source_sha=%s\njson=%s\n' "$source_sha" \
-            "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$resolved")" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\njson=%s\nsglang_hicache_json=%s\n' "$source_sha" \
+            "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$resolved")" \
+            "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$sglang_hicache")" >> "$GITHUB_OUTPUT"
+          printf 'Dynamo for every image: `ai-dynamo==%s`\n' "$dynamo_version" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kvcr-inputs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: resolved-inputs.json
+          path: resolved-inputs*.json
           if-no-files-found: error
           retention-days: 14
 
-  build:
+  build-vllm:
     needs: resolve
     uses: ./.github/workflows/build-ci-image.yml
     with:
@@ -95,22 +110,47 @@ jobs:
       recipe_sha: ${{ needs.resolve.outputs.recipe_sha }}
       resolved_inputs_json: ${{ needs.resolve.outputs.resolved_inputs_json }}
 
-  e2e:
-    needs: build
+  e2e-vllm:
+    needs: build-vllm
     uses: ./.github/workflows/vllm-e2e.yml
     with:
-      image: ${{ needs.build.outputs.image }}
-      source_sha: ${{ needs.build.outputs.source_sha }}
-      recipe_sha: ${{ needs.build.outputs.recipe_sha }}
-      image_profile: ${{ needs.build.outputs.image_profile }}
-      resolved_inputs_sha256: ${{ needs.build.outputs.resolved_inputs_sha256 }}
-      build_manifest_artifact: ${{ needs.build.outputs.build_manifest_artifact }}
+      image: ${{ needs.build-vllm.outputs.image }}
+      source_sha: ${{ needs.build-vllm.outputs.source_sha }}
+      recipe_sha: ${{ needs.build-vllm.outputs.recipe_sha }}
+      image_profile: ${{ needs.build-vllm.outputs.image_profile }}
+      resolved_inputs_sha256: ${{ needs.build-vllm.outputs.resolved_inputs_sha256 }}
+      build_manifest_artifact: ${{ needs.build-vllm.outputs.build_manifest_artifact }}
+      profile_selection: ${{ inputs.profile_selection || 'all' }}
+
+  # SGLang HiCache with the KVCR storage backend: its own image and lane. Each
+  # e2e job consumes only its own build's outputs; the jobs share no runner
+  # state, so the SGLang and vLLM lanes run in parallel.
+  build-sglang-hicache:
+    needs: resolve
+    uses: ./.github/workflows/build-ci-image.yml
+    with:
+      image_profile: sglang-hicache
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      recipe_sha: ${{ needs.resolve.outputs.recipe_sha }}
+      resolved_inputs_json: ${{ needs.resolve.outputs.sglang_hicache_inputs_json }}
+
+  e2e-sglang-hicache:
+    needs: build-sglang-hicache
+    uses: ./.github/workflows/integration-e2e.yml
+    with:
+      integration: sglang-hicache
+      image: ${{ needs.build-sglang-hicache.outputs.image }}
+      source_sha: ${{ needs.build-sglang-hicache.outputs.source_sha }}
+      recipe_sha: ${{ needs.build-sglang-hicache.outputs.recipe_sha }}
+      image_profile: ${{ needs.build-sglang-hicache.outputs.image_profile }}
+      resolved_inputs_sha256: ${{ needs.build-sglang-hicache.outputs.resolved_inputs_sha256 }}
+      build_manifest_artifact: ${{ needs.build-sglang-hicache.outputs.build_manifest_artifact }}
       profile_selection: ${{ inputs.profile_selection || 'all' }}
 
   gpu-verdict:
     name: GPU E2E verdict
     if: always()
-    needs: [resolve, build, e2e]
+    needs: [resolve, build-vllm, e2e-vllm, build-sglang-hicache, e2e-sglang-hicache]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
