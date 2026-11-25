@@ -43,6 +43,7 @@ from .common import (
     utc_now,
     worker_identity,
 )
+from .telemetry import VLLM_LOGGING_PREFIX
 
 GUARD = "guard"
 NON_GUARD = "nonguard"
@@ -106,6 +107,9 @@ def kvcr_service_command() -> list[str]:
 class Settings:
     model: str
     output: Path
+    # Use the identical verified snapshot for weights/config/tokenizer in both
+    # the reference and tested stacks; model remains the public served identity.
+    model_path: Path | None = None
     mode: str = GUARD
     # "vllm": dynamo.vllm with the OffloadingConnector KVCR tier (Guard or
     # non-Guard). "sglang": dynamo.sglang with HiCache and the KVCR storage
@@ -123,7 +127,7 @@ class Settings:
     # Extra environment for every worker process (engine experiments).
     worker_env: dict[str, str] = field(default_factory=dict)
     # "agg": two decode workers, worker 0 KVCR source, worker 1 target.
-    # "disagg": 2P+1D on three GPUs: workers 0/1 are prefill workers (KVCR
+    # "disagg": 2P+1D: workers 0/1 are prefill workers (KVCR
     # source/target, the P->D hop uses NixlConnector), worker 2 is the single
     # decode worker. Requests pin the prefill worker; the decode is shared.
     topology: str = "agg"
@@ -174,6 +178,64 @@ class Settings:
             )
 
 
+def stop_managed(child: Any, grace: float) -> dict[str, Any]:
+    """Keep bounded group termination, recording what it actually proves.
+
+    A leader exiting is not evidence that every descendant shut down gracefully.
+    The outer CI wrapper separately checks its inherited process ownership token.
+    """
+    started = time.monotonic()
+    outcome: dict[str, Any] = {
+        "name": child.name,
+        "pid": child.pid,
+        "owner_pid": os.getpid(),
+        "intent": "normal_shutdown",
+        "phase": "reference" if "reference" in child.name else "candidate",
+        "started_at": utc_now(),
+        "grace_seconds": grace,
+        "grace_expired": False,
+        "signals": [],
+    }
+
+    def send(number: int) -> None:
+        delivered = child.signal_group(number)
+        outcome["signals"].append(
+            {
+                "signal": signal.Signals(number).name,
+                "scope": "process_group",
+                "sent_at": utc_now(),
+                "delivered": delivered,
+            }
+        )
+
+    send(signal.SIGTERM)
+    try:
+        child.process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        outcome.update(sigkill=True, grace_expired=True)
+    # Preserve the existing descendant sweep. Its use is visible even when
+    # the leader exited zero; this is not a graceful process-tree assertion.
+    send(signal.SIGKILL)
+    try:
+        outcome["exit_code"] = child.process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        outcome["error"] = "process did not exit"
+    outcome["leader_exited"] = "error" not in outcome
+    outcome["classification"] = (
+        "error"
+        if "error" in outcome
+        else "forced_kill"
+        if outcome["grace_expired"] or outcome.get("exit_code") == -signal.SIGKILL
+        else "graceful_exit"
+        if outcome.get("exit_code") == 0
+        else "nonzero_exit"
+    )
+    outcome["finished_at"] = utc_now()
+    outcome["duration_seconds"] = time.monotonic() - started
+    child.stopped = outcome["leader_exited"]
+    return outcome
+
+
 class Managed:
     """A child process in its own session with a log file."""
 
@@ -211,22 +273,10 @@ class Managed:
             return False
 
     def stop(self, grace: float = 20) -> dict[str, Any]:
-        outcome: dict[str, Any] = {"name": self.name, "pid": self.process.pid}
-        self.stopped = True
-        self.signal_group(signal.SIGTERM)
         try:
-            self.process.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            outcome["sigkill"] = True
-        # Descendants may survive their leader; sweep the whole group.
-        self.signal_group(signal.SIGKILL)
-        try:
-            self.process.wait(timeout=10)
-            outcome["exit_code"] = self.process.returncode
-        except subprocess.TimeoutExpired:
-            outcome["error"] = "process did not exit"
-        self._log.close()
-        return outcome
+            return stop_managed(self, grace)
+        finally:
+            self._log.close()
 
     def log_text(self) -> str:
         return self.log_path.read_text(errors="replace")
@@ -300,22 +350,8 @@ class RemoteManaged:
         )
 
     def stop(self, grace: float = 20) -> dict[str, Any]:
-        outcome: dict[str, Any] = {
-            "name": self.name,
-            "pid": self.pid,
-            "remote": self.agent_url,
-        }
-        self.stopped = True
-        self.signal_group(signal.SIGTERM)
-        try:
-            self.process.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            outcome["sigkill"] = True
-        self.signal_group(signal.SIGKILL)
-        try:
-            outcome["exit_code"] = self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            outcome["error"] = "process did not exit"
+        outcome = stop_managed(self, grace)
+        outcome["remote"] = self.agent_url
         return outcome
 
     def log_text(self) -> str:
@@ -406,7 +442,12 @@ class ExternalService:
             return ""
 
     def stop(self, grace: float = 0) -> dict[str, Any]:
-        return {"name": self.name, "external": True}
+        return {
+            "name": self.name,
+            "external": True,
+            "intent": "external_service",
+            "classification": "not_owned",
+        }
 
 
 class Stack:
@@ -415,6 +456,9 @@ class Stack:
         self.evidence = evidence
         self.evidence.mkdir(parents=True, exist_ok=True)
         self.children: list[Managed] = []
+        # Include reference/phase handoffs as well as final teardown; a later
+        # successful retry must not erase an earlier cleanup failure.
+        self.stop_history: list[dict[str, Any]] = []
         self.discovery: tempfile.TemporaryDirectory | None = None
         self.services: dict[int, Managed] = {}
         self.state_agent: Managed | None = None
@@ -720,7 +764,7 @@ class Stack:
             "-m",
             "dynamo.sglang",
             "--model-path",
-            self.settings.model,
+            str(self.settings.model_path or self.settings.model),
             "--served-model-name",
             self.settings.model,
             "--tp-size",
@@ -797,7 +841,12 @@ class Stack:
             "-m",
             "dynamo.vllm",
             "--model",
-            self.settings.model,
+            str(self.settings.model_path or self.settings.model),
+            *(
+                ["--served-model-name", self.settings.model]
+                if self.settings.model_path is not None
+                else []
+            ),
             "--tensor-parallel-size",
             "1",
             "--data-parallel-size",
@@ -979,6 +1028,9 @@ class Stack:
         env.update(self.settings.worker_env)
         env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpus[index])
         env["VLLM_LOGGING_LEVEL"] = "DEBUG"
+        if self.settings.engine == VLLM:
+            # Peer-source control traffic has no precise Dynamo HTTP log line.
+            env["VLLM_LOGGING_PREFIX"] = VLLM_LOGGING_PREFIX
         env["DYN_SYSTEM_PORT"] = str(self.settings.system_ports[index])
         if self.disagg:
             # Three NIXL side channels on one host; Dynamo only sets the host
@@ -998,7 +1050,7 @@ class Stack:
         else:
             save_json(
                 self.evidence / f"{name}.kv-transfer-config.json",
-                self.transfer_config(index) if kvcr else None,
+                self.kv_transfer_config(index, kvcr=kvcr),
             )
         agent = self.remote_agent(index)
         if agent is not None:
@@ -1088,6 +1140,8 @@ class Stack:
         router choose; when it keeps choosing a known worker, candidates from
         the discovery store are confirmed with a pinned probe instead.
         """
+        # A replacement restarts the attempt counter; retain the earlier probes.
+        discovery_id = uuid.uuid4().hex
         known = {wid for i, wid in self.worker_ids.items() if i != index}
         known |= self.retired_ids
         errors = 0
@@ -1112,7 +1166,7 @@ class Stack:
                     else {}
                 )
             probe = client.completion(
-                f"probe-w{index}-{attempt:02d}",
+                f"probe-w{index}-{discovery_id}-{attempt:02d}",
                 f"identity probe {uuid.uuid4().hex}",
                 max_tokens=1,
                 extra_fields=["worker_id"],
@@ -1137,12 +1191,35 @@ class Stack:
     def kill_worker(self, index: int) -> dict[str, Any]:
         worker = self.workers.pop(index)
         killed_at = utc_now()
-        worker.stopped = True
-        worker.signal_group(signal.SIGKILL)
+        outcome: dict[str, Any] = {
+            "name": worker.name,
+            "pid": worker.pid,
+            "action": "injected_sigkill",
+            "intent": "injected_failure",
+            "classification": "expected_injected_kill",
+            "phase": "cases",
+            "started_at": killed_at,
+        }
+        started = time.monotonic()
         try:
-            worker.process.wait(timeout=30)
+            worker.signal_group(signal.SIGKILL)
+            outcome["exit_code"] = worker.process.wait(timeout=30)
         except subprocess.TimeoutExpired as error:
-            raise ValidationError(f"worker {index} survived SIGKILL") from error
+            outcome["error"] = f"worker {index} survived SIGKILL"
+            raise ValidationError(outcome["error"]) from error
+        except Exception as error:
+            outcome["error"] = f"{type(error).__name__}: {error}"
+            raise
+        else:
+            worker.stopped = True
+            if isinstance(worker, Managed):
+                worker._log.close()
+        finally:
+            outcome["finished_at"] = utc_now()
+            outcome["duration_seconds"] = time.monotonic() - started
+            if "error" in outcome:
+                outcome["classification"] = "error"
+            self.stop_history.append(outcome)
         retired = self.worker_ids.pop(index, None)
         if retired is not None:
             self.retired_ids.add(retired)
@@ -1171,32 +1248,111 @@ class Stack:
 
     # -- teardown ----------------------------------------------------------
 
-    def stop(self, *children: Managed) -> list[dict[str, Any]]:
+    def stop(self, *children: Managed, strict: bool = True) -> list[dict[str, Any]]:
         outcomes = []
         targets = list(children) or list(reversed(self.children))
         for child in targets:
             if not child.stopped:
-                outcomes.append(child.stop())
+                try:
+                    outcome = child.stop()
+                except Exception as error:
+                    outcome = {
+                        "name": child.name,
+                        "pid": child.pid,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                child.stopped = "error" not in outcome
+                outcomes.append(outcome)
+                self.stop_history.append(outcome)
+        if strict and any("error" in outcome for outcome in outcomes):
+            raise ValidationError("owned process stop did not finish")
         return outcomes
 
     def cleanup(self) -> dict[str, Any]:
-        outcomes = self.stop()
-        self.reset_discovery()
+        started = time.monotonic()
+        self.stop(strict=False)
+        owned_paths = []
+        discovery_path = self.discovery.name if self.discovery is not None else None
+        try:
+            self.reset_discovery()
+        except OSError as error:
+            owned_paths.append(
+                {"path": discovery_path, "status": "FAIL", "errors": [str(error)]}
+            )
+        else:
+            if discovery_path is not None:
+                owned_paths.append({"path": discovery_path, "status": "PASS"})
         removed = []
         for path in (self.kvcr_run_dir, self.pool_dir):
+            errors = []
             if path.exists():
-                for item in sorted(path.rglob("*"), reverse=True):
+                try:
+                    items = sorted(path.rglob("*"), reverse=True)
+                except OSError as error:
+                    errors.append(f"{path}: {type(error).__name__}: {error}")
+                    items = []
+                for item in items:
                     try:
-                        item.unlink() if not item.is_dir() else item.rmdir()
-                    except OSError:
-                        pass
+                        if item.is_symlink() or not item.is_dir():
+                            item.unlink()
+                        else:
+                            item.rmdir()
+                    except OSError as error:
+                        errors.append(f"{item}: {type(error).__name__}: {error}")
                 try:
                     path.rmdir()
                     removed.append(str(path))
-                except OSError:
-                    pass
-        report = {"owned_processes": outcomes, "removed_paths": removed}
+                except OSError as error:
+                    errors.append(f"{path}: {type(error).__name__}: {error}")
+            if path.exists():
+                errors.append(f"owned runtime path remains: {path}")
+            owned_paths.append(
+                {
+                    "path": str(path),
+                    "status": "FAIL" if errors else "PASS",
+                    "errors": errors,
+                }
+            )
+        warnings = [
+            {
+                "name": outcome["name"],
+                "pid": outcome.get("pid"),
+                "classification": outcome.get("classification", "unclassified_exit"),
+                "exit_code": outcome.get("exit_code"),
+            }
+            for outcome in self.stop_history
+            if outcome.get("classification")
+            not in ("graceful_exit", "expected_injected_kill", "not_owned")
+            and "error" not in outcome
+        ]
+        failed = any("error" in outcome for outcome in self.stop_history) or any(
+            outcome["status"] == "FAIL" for outcome in owned_paths
+        )
+        report = {
+            "schema_version": 2,
+            "status": "FAIL" if failed else "PASS",
+            "reclaimed": not failed,
+            "reclamation_scope": "owned_process_leaders_and_runtime_paths",
+            # Unconditional descendant sweeps prevent an aggregate claim of
+            # graceful shutdown, even when every leader exited zero.
+            "graceful": False if warnings else None,
+            "observation_complete": False,
+            "observations": {
+                "descendant_processes": "OUTER_WRAPPER_REQUIRED",
+                "gpu_resources": "UNOBSERVED",
+                "ports": "UNOBSERVED",
+            },
+            "warnings": warnings,
+            "owned_processes": list(self.stop_history),
+            "process_states": [
+                {"name": child.name, "pid": child.pid, "stopped": child.stopped}
+                for child in self.children
+            ],
+            "removed_paths": removed,
+            "owned_paths": owned_paths,
+            "duration_seconds": time.monotonic() - started,
+        }
         save_json(self.evidence / "cleanup.json", report)
-        if any("error" in outcome for outcome in outcomes):
+        if failed:
             raise ValidationError("owned process cleanup did not finish")
         return report

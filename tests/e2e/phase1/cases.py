@@ -9,6 +9,7 @@ BlockedError marks the combination BLOCKED with the missing condition.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -435,6 +436,8 @@ class Context:
         )
         delivered = target_window.blocks(REMOTE_DELIVER)
         written = source_window.blocks(SOURCE_WRITE)
+        self.telemetry_health(result, source_window, f"{label} source")
+        self.telemetry_health(result, target_window, f"{label} target")
         result.check(
             f"{label}: target remote_deliver pages cover the cached blocks",
             self.delivery_covers(delivered, hit_blocks),
@@ -500,6 +503,7 @@ class Context:
         window = self.wait_window(
             worker_index, start, lambda w: w.blocks(LOCAL_FILL) > 0
         )
+        self.telemetry_health(result, window, label)
         fills = window.blocks(LOCAL_FILL)
         result.check(
             f"{label}: KVCR local_fill committed blocks after cold request",
@@ -514,6 +518,20 @@ class Context:
         )
         result.measurements[label] = window.totals
         return window
+
+    @staticmethod
+    def telemetry_health(result: CaseResult, window: Window, label: str) -> None:
+        errors = window.health_errors()
+        result.measurements.setdefault("telemetry_evidence", {})[label] = {
+            "samples": window.samples,
+            "errors": errors,
+            "metric_provenance": window.provenance,
+        }
+        result.check(
+            f"{label}: required KVCR telemetry is complete and healthy",
+            not errors,
+            "; ".join(errors) or f"{window.samples} complete samples",
+        )
 
     def save(self, result: CaseResult, name: str, value: Any) -> None:
         path = self.client.evidence / f"{result.case}.{name}.json"
@@ -534,6 +552,72 @@ def hit_verdict(
         detail += f", upper bound {max_blocks * block}"
         aligned = aligned and cached <= max_blocks * block
     return aligned, detail
+
+
+def local_restore_verdict(
+    ctx: Context, window: Window, cached: int
+) -> tuple[bool, str]:
+    """Prove restoration from KVCR itself, excluding GPU/primary-tier/peer hits.
+
+    The caller separately proves worker identity and exact output equality.
+    NIXL prefill-to-decode traffic is deliberately outside these KVCR counters.
+    """
+    aligned, _ = hit_verdict(cached, ctx.hit_block_tokens)
+    pages = window.blocks(LOCAL_DELIVER)
+    remote = window.blocks(REMOTE_DELIVER)
+    source = window.blocks(SOURCE_WRITE)
+    read_bytes = window.get(TIER_READ_BYTES)
+    correct_bytes = read_bytes > 0 and (
+        ctx.page_bytes <= 0 or read_bytes == pages * ctx.page_bytes
+    )
+    ok = (
+        aligned
+        and ctx.delivery_covers(pages, cached // ctx.hit_block_tokens)
+        and window.successes(LOCAL_DELIVER) > 0
+        and remote == 0
+        and source == 0
+        and correct_bytes
+        and not window.peer_failures
+        and not window.health_errors()
+    )
+    return ok, (
+        f"cached_tokens={cached}, local_deliver={pages}, "
+        f"successes={window.successes(LOCAL_DELIVER)}, remote_deliver={remote}, "
+        f"source_write={source}, tier_read_bytes={read_bytes}"
+    )
+
+
+def request_overlap(first: Response, second: Response) -> dict[str, Any]:
+    """Record actual client request intervals, rather than infer concurrency."""
+    record: dict[str, Any] = {
+        "requests": [
+            {
+                "stage": response.stage,
+                "start": response.started_at,
+                "end": response.finished_at,
+            }
+            for response in (first, second)
+        ],
+        "observed": False,
+        "overlap_seconds": 0.0,
+    }
+    try:
+        intervals = [
+            (parse_iso(response.started_at), parse_iso(response.finished_at))
+            for response in (first, second)
+        ]
+        if any(
+            start.tzinfo is None or end.tzinfo is None or end < start
+            for start, end in intervals
+        ):
+            raise ValueError("request interval is naive or reversed")
+        overlap = (
+            min(end for _, end in intervals) - max(start for start, _ in intervals)
+        ).total_seconds()
+        record.update(observed=overlap > 0, overlap_seconds=max(0.0, overlap))
+    except (TypeError, ValueError) as error:
+        record["error"] = str(error)
+    return record
 
 
 # -- cases -------------------------------------------------------------------
@@ -557,6 +641,7 @@ def tc01(ctx: Context) -> CaseResult:
         ctx.compare(result, reuse, "tc01")
         ctx.check_hit(result, reuse)
         window = ctx.settle(0, reuse.started_at)
+        ctx.telemetry_health(result, window, "tc01 reuse")
         result.check(
             "tc01-reuse-w0: no positive KVCR failed/partial metrics",
             not window.peer_failures,
@@ -631,6 +716,8 @@ def tc02(ctx: Context) -> CaseResult:
             # failing the case on an engine limit.
             window = ctx.settle(1, partial.started_at)
             source = ctx.settle(0, partial.started_at)
+            ctx.telemetry_health(result, window, "tc02 partial target")
+            ctx.telemetry_health(result, source, "tc02 partial source")
             result.check(
                 "tc02-partial-w1: partial-prefix reuse unsupported by the engine "
                 "itself (reference cached_tokens=0), hit checks not applicable",
@@ -754,6 +841,7 @@ def tc02(ctx: Context) -> CaseResult:
         window = ctx.wait_window(
             1, present.started_at, lambda w: w.blocks(REMOTE_DELIVER) > 0
         )
+        ctx.telemetry_health(result, window, "tc02 present")
         result.check(
             "tc02-present-w1: remaining blocks delivered from worker 0 via KVCR",
             window.blocks(REMOTE_DELIVER) > 0 and window.successes(REMOTE_DELIVER) >= 1,
@@ -774,6 +862,7 @@ def tc02(ctx: Context) -> CaseResult:
         ctx.compare(result, absent, "tc02_absent")
         ctx.check_cold(result, absent)
         window = ctx.settle(1, absent.started_at)
+        ctx.telemetry_health(result, window, "tc02 absent")
         result.check(
             "tc02-absent-w1: no remote delivery for a miss",
             window.blocks(REMOTE_DELIVER) == 0,
@@ -782,6 +871,7 @@ def tc02(ctx: Context) -> CaseResult:
 
     # release: consumers finished; the source still owns its committed blocks.
     settle = ctx.settle(0, absent.started_at)
+    ctx.telemetry_health(result, settle, "tc02 release")
     allocated = latest_gauge(ctx.stack.workers[0].log_path, "local_g2_allocated_slots")
     pinned = latest_gauge(ctx.stack.workers[0].log_path, "pinned_keys")
     result.check(
@@ -799,9 +889,61 @@ def tc02(ctx: Context) -> CaseResult:
     return result
 
 
+def tc03_peer_prerequisites(ctx: Context, result: CaseResult) -> bool:
+    """Establish peer identity and prefix freshness before seeding either peer.
+
+    The candidate client has its own request ledger, separate from the stopped
+    KVCR-disabled reference. Reject prior use by *any* candidate worker, which
+    also covers unpinned startup probes. A target's zero remote-delivery count
+    alone cannot exclude a previously cached GPU/local copy.
+    """
+    source = ctx.stack.worker_ids.get(0)
+    target = ctx.stack.worker_ids.get(1)
+    identities = result.check(
+        "tc03: source and target worker IDs are nonempty and distinct",
+        bool(source) and bool(target) and source != target,
+        f"source={source!r}, target={target!r}",
+    )
+    marker = ctx.prompts.section(ctx.prompts.tag + "f", 0)
+    previous = []
+    errors = []
+    for request in ctx.client.log:
+        try:
+            record = json.loads(
+                (ctx.client.evidence / request["request_file"]).read_text()
+            )
+            prompt = record["body"]["prompt"]
+            if not isinstance(prompt, str):
+                raise ValueError("previous request prompt is not text")
+            if marker in prompt:
+                previous.append(request["request_file"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            errors.append(str(error))
+    fresh = result.check(
+        "tc03: prefix has not been sent to any candidate worker",
+        bool(marker)
+        and ctx.prompts.tc03.startswith(marker)
+        and not previous
+        and not errors,
+        f"prior candidate requests={len(ctx.client.log)}, "
+        f"matching={previous}, evidence errors={errors}",
+    )
+    result.measurements["peer_prerequisites"] = {
+        "source_worker_id": source,
+        "target_worker_id": target,
+        "prior_candidate_requests": len(ctx.client.log),
+        "previous_prefix_requests": previous,
+        "evidence_errors": errors,
+    }
+    return identities and fresh
+
+
 def tc03(ctx: Context) -> CaseResult:
     result = CaseResult("TC-03", "Request hints and peer transfer, same-node", "R4")
     p = ctx.prompts
+    if not tc03_peer_prerequisites(ctx, result):
+        result.finish()
+        return result
     seed = ctx.request("tc03-seed-w0", p.tc03, 0)
     result.evidence += [seed.request_file, seed.response_file]
     if not ctx.require_ok(result, seed, 0):
@@ -810,7 +952,8 @@ def tc03(ctx: Context) -> CaseResult:
     ctx.compare(result, seed, "tc03")
     ctx.check_cold(result, seed)
     ctx.local_commit_checks(result, 0, seed.started_at, "tc03 source commits prefix")
-    before = read_window(ctx.stack.workers[1].log_path, parse_iso(seed.started_at))
+    before = ctx.wait_window(1, seed.started_at, lambda w: w.samples > 0)
+    ctx.telemetry_health(result, before, "tc03 target before request")
     result.check(
         "tc03: target worker 1 is cold for this prefix",
         before.blocks(REMOTE_DELIVER) == 0,
@@ -827,6 +970,15 @@ def tc03(ctx: Context) -> CaseResult:
         )
         hinted = hinted_future.result()
         isolated = isolated_future.result()
+    overlap = request_overlap(hinted, isolated)
+    result.measurements["request_overlap"] = overlap
+    # Record actual overlap without claiming concurrent engine execution. A
+    # production profile's proof policy decides whether overlap is required.
+    result.check(
+        "tc03: observed request intervals are valid",
+        "error" not in overlap,
+        str(overlap),
+    )
     result.evidence += [
         hinted.request_file,
         hinted.response_file,
@@ -937,6 +1089,7 @@ def tc04(ctx: Context) -> CaseResult:
             served.started_at,
             lambda w, b=blocks: w.blocks(REMOTE_DELIVER) >= b and b > 0,
         )
+        ctx.telemetry_health(result, window, f"{stage} delivery")
         result.check(
             f"{stage}: Guard-served blocks delivered to worker 1 (remote_deliver)",
             ctx.delivery_covers(window.blocks(REMOTE_DELIVER), blocks)
@@ -992,6 +1145,13 @@ def tc04(ctx: Context) -> CaseResult:
         # recomputed: a positive, block-aligned hit with no KVCR failures.
         ctx.check_hit(result, again)
         window = ctx.settle(0, again.started_at)
+        ctx.telemetry_health(result, window, "tc04 replacement readback")
+        local_ok, local_detail = local_restore_verdict(ctx, window, ctx.cached(again))
+        result.check(
+            "tc04-preserved-w0-replacement: KVCR local delivery covers the cache hit",
+            local_ok,
+            local_detail,
+        )
         result.check(
             "tc04-preserved-w0-replacement: no positive KVCR failed/partial metrics",
             not window.peer_failures,
@@ -1006,6 +1166,212 @@ def tc04(ctx: Context) -> CaseResult:
 
 
 CASES = {"TC-01": tc01, "TC-02": tc02, "TC-03": tc03, "TC-04": tc04}
+
+
+# Stable proof IDs refer to the real assertions above. Their required set is
+# selected by the integration policy, never inferred from the uploaded result.
+PROOF_CHECKS = {
+    "TC-01": {
+        "reference_exact": (
+            "tc01-cold-w0: tokens equal reference (tc01)",
+            "tc01-reuse-w0: tokens equal reference (tc01)",
+        ),
+        "local_commit": (
+            "tc01 store->commit: KVCR local_fill committed blocks after cold request",
+            "tc01 store->commit: no positive KVCR failed/partial metrics",
+        ),
+        "warm_reuse": (
+            "tc01-cold-w0: cold request has 0 cached tokens",
+            "tc01-reuse-w0: cache hit is positive and block-aligned",
+            "tc01-reuse-w0: no positive KVCR failed/partial metrics",
+        ),
+    },
+    "TC-02": {
+        "reference_exact": tuple(
+            f"{stage}: tokens equal reference ({prompt})"
+            for stage, prompt in (
+                ("tc02-seed-full-w0", "tc02_full"),
+                ("tc02-partial-w1", "tc02_partial"),
+                ("tc02-partial-again-w1", "tc02_partial"),
+                ("tc02-partial-w0", "tc02_partial"),
+                ("tc02-present-w1", "tc02_full"),
+                ("tc02-absent-w1", "tc02_absent"),
+            )
+        ),
+        "peer_transfer": (
+            "tc02 partial deliver: target remote_deliver pages cover the cached blocks",
+            "tc02 partial deliver: source source_write blocks == "
+            "target remote_deliver blocks",
+            "tc02 partial deliver: transfer/source_write/remote_deliver "
+            "successes recorded",
+            "tc02 partial deliver: source bytes == target tier read bytes",
+            "tc02-present-w1: remaining blocks delivered from worker 0 via KVCR",
+            "tc02 store->commit on w0: no positive KVCR failed/partial metrics",
+            "tc02 partial deliver: no unexpected KVCR failed/partial metrics",
+            "tc02-present-w1: no positive KVCR failed/partial metrics",
+        ),
+        "partial_reuse": (
+            "tc02-partial-w1: cache hit is positive and block-aligned",
+            "tc02-partial-w1: hit covers fewer blocks than the seeded prompt",
+        ),
+        "miss": (
+            "tc02-absent-w1: cold request has 0 cached tokens",
+            "tc02-absent-w1: no remote delivery for a miss",
+        ),
+        "release": (
+            "tc02 release: source pool still holds committed blocks after delivery",
+            "tc02 release: source framework pins released after delivery",
+        ),
+    },
+    "TC-03": {
+        "reference_exact": (
+            "tc03-seed-w0: tokens equal reference (tc03)",
+            "tc03-hinted-w1: tokens equal reference (tc03)",
+            "tc03-isolated-w1: tokens equal reference (tc03_isolated)",
+        ),
+        "peer_transfer": (
+            "tc03: source and target worker IDs are nonempty and distinct",
+            "tc03: prefix has not been sent to any candidate worker",
+            "tc03-seed-w0: served by worker 0",
+            "tc03-seed-w0: cold request has 0 cached tokens",
+            "tc03-hinted-w1: served by worker 1",
+            "tc03: target worker 1 is cold for this prefix",
+            "tc03 transfer: target remote_deliver pages cover the cached blocks",
+            "tc03 transfer: source source_write blocks == target remote_deliver blocks",
+            "tc03 transfer: transfer/source_write/remote_deliver successes recorded",
+            "tc03 transfer: source bytes == target tier read bytes",
+            "tc03 source commits prefix: no positive KVCR failed/partial metrics",
+            "tc03 transfer: no unexpected KVCR failed/partial metrics",
+        ),
+        "hint_isolation": (
+            "tc03-isolated-w1: cold request has 0 cached tokens",
+            "tc03-isolated-w1: served by worker 1",
+        ),
+    },
+    "TC-04": {
+        "reference_exact": tuple(
+            f"{stage}: tokens equal reference ({prompt})"
+            for stage, prompt in (
+                ("tc04-protect-w0", "tc04"),
+                ("tc04-protect-second-w0", "tc04_second"),
+                ("tc04-guard-served-w1", "tc04"),
+                ("tc04-guard-served-second-w1", "tc04_second"),
+                ("tc04-fresh-w0-replacement", "tc04_fresh"),
+                ("tc04-preserved-w0-replacement", "tc04"),
+            )
+        ),
+        "guard_promote": (
+            "tc04: service kept running and promoted its Guard after engine death",
+            "tc04: Guard recovered the committed blocks",
+            "tc04: warm recovery still enabled before failure",
+            "tc04 protected commit: no positive KVCR failed/partial metrics",
+            "tc04 protected commit (second prompt): "
+            "no positive KVCR failed/partial metrics",
+        ),
+        "guard_serve": tuple(
+            f"{stage}: {suffix}"
+            for stage in ("tc04-guard-served-w1", "tc04-guard-served-second-w1")
+            for suffix in (
+                "Guard-served blocks delivered to worker 1 (remote_deliver)",
+                "no positive KVCR failed/partial metrics while Guard served",
+            )
+        ),
+        "guard_reattach": (
+            "tc04: replacement attached without a second promotion (single owner)",
+            "tc04 replacement commits new data: KVCR local_fill committed blocks "
+            "after cold request",
+            "tc04 replacement commits new data: "
+            "no positive KVCR failed/partial metrics",
+        ),
+        "local_restore": (
+            "tc04-preserved-w0-replacement: served by worker 0",
+            "tc04-preserved-w0-replacement: KVCR local delivery covers the cache hit",
+            "tc04-preserved-w0-replacement: no positive KVCR failed/partial metrics",
+        ),
+    },
+}
+
+
+TELEMETRY_LABELS = {
+    "TC-01": ("tc01 store->commit", "tc01 reuse"),
+    "TC-02": (
+        "tc02 store->commit on w0",
+        "tc02 partial deliver source",
+        "tc02 partial deliver target",
+        "tc02 present",
+        "tc02 absent",
+        "tc02 release",
+    ),
+    "TC-03": (
+        "tc03 source commits prefix",
+        "tc03 target before request",
+        "tc03 transfer source",
+        "tc03 transfer target",
+    ),
+    "TC-04": (
+        "tc04 protected commit",
+        "tc04 protected commit (second prompt)",
+        "tc04-guard-served-w1 delivery",
+        "tc04-guard-served-second-w1 delivery",
+        "tc04 replacement commits new data",
+        "tc04 replacement readback",
+    ),
+}
+
+
+def required_proof_checks(
+    case_id: str, page_bytes: int = 0
+) -> dict[str, tuple[str, ...]]:
+    """Source-owned assertions, including applicable known-page byte geometry."""
+    required = dict(PROOF_CHECKS.get(case_id, {}))
+    if page_bytes > 0:
+        group, labels = {
+            "TC-02": ("peer_transfer", ("tc02 partial deliver",)),
+            "TC-03": ("peer_transfer", ("tc03 transfer",)),
+            "TC-04": (
+                "guard_serve",
+                ("tc04-guard-served-w1", "tc04-guard-served-second-w1"),
+            ),
+        }.get(case_id, (None, ()))
+        if group is not None:
+            required[group] += tuple(
+                f"{label}: transfer bytes == pages * page bytes" for label in labels
+            )
+    return required
+
+
+def record_case_proofs(result: CaseResult, page_bytes: int = 0) -> None:
+    """Derive semantic proof verdicts from the assertions actually executed."""
+
+    def passed(name: str) -> bool:
+        observed = [check.passed for check in result.checks if check.name == name]
+        return observed == [True]
+
+    result.proofs = {
+        proof: all(passed(name) for name in names)
+        for proof, names in required_proof_checks(result.case, page_bytes).items()
+    }
+    labels = TELEMETRY_LABELS.get(result.case, ())
+    result.proofs["telemetry_health"] = bool(labels) and all(
+        passed(f"{label}: required KVCR telemetry is complete and healthy")
+        for label in labels
+    )
+    if result.case == "TC-02":
+        capability = result.measurements.get("engine_partial_prefix_reuse", {})
+        reference_cached = capability.get("reference_cached_tokens") or []
+        result.proofs["partial_reuse"] = (
+            result.proofs["partial_reuse"]
+            and capability.get("reuses") is True
+            and len(reference_cached) >= 1
+            and type(reference_cached[0]) is int
+            and reference_cached[0] > 0
+        )
+    if result.case == "TC-03":
+        overlap = result.measurements.get("request_overlap", {})
+        result.proofs["request_overlap"] = (
+            passed("tc03: observed request intervals are valid")
+            and overlap.get("observed") is True
+        )
 
 
 def run_case(name: str, ctx: Context) -> CaseResult:
@@ -1024,4 +1390,5 @@ def run_case(name: str, ctx: Context) -> CaseResult:
         result.error = f"{type(error).__name__}: {error}"
         result.started_at = started
         result.finish()
+    record_case_proofs(result, page_bytes=getattr(ctx, "page_bytes", 0))
     return result

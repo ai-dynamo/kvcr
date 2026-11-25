@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,10 @@ LOCAL_FILL = "local_fill"
 LOCAL_DELIVER = "local_deliver"
 TRANSFER = "transfer"
 
+
+VLLM_EPOCH_MARKER = "CI_LOG_EPOCH="
+VLLM_LOGGING_PREFIX = VLLM_EPOCH_MARKER + "%(created).9f "
+VLLM_EPOCH = re.compile(r"^CI_LOG_EPOCH=(\d+\.\d{9})$")
 
 VLLM_STAMP = re.compile(r"\b(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\b")
 SGLANG_STATS = "KVCR L3 native stats "
@@ -124,13 +129,24 @@ ISO_INSTANT = re.compile(
 
 
 def precise_stamp(line: str) -> datetime | None:
-    """Timezone-aware ISO instant at the start of a Dynamo-formatted line.
+    """Timezone-aware instant at the start of a Dynamo or precise vLLM line.
 
     Only a full instant with a zone counts: a bare date or a naive time at the
     start of some other line must not become a comparison partner for the
     aware request timestamps.
     """
     head = line.split(maxsplit=1)[0] if line else ""
+    if head.startswith(VLLM_EPOCH_MARKER):
+        matched = VLLM_EPOCH.fullmatch(head)
+        if matched is None:
+            return None
+        try:
+            epoch = float(matched[1])
+            if not math.isfinite(epoch):
+                return None
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if not ISO_INSTANT.match(head):
         return None
     stamp = parse_timestamp(head)
@@ -147,6 +163,9 @@ def line_timestamp(line: str) -> datetime | None:
     The latter is taken as UTC of the current year (the harness runs with
     TZ=UTC containers); a run spanning New Year would need the launch date.
     """
+    if line.startswith(VLLM_EPOCH_MARKER):
+        # A malformed marker cannot fall back to the old whole-second stamp.
+        return precise_stamp(line)
     stamp = parse_timestamp(line.split()[0])
     if stamp is not None:
         return stamp
@@ -175,6 +194,7 @@ class Snapshot:
     # after a request that started in the same second.
     second_precision: bool = False
     preceded_by: datetime | None = None
+    provenance: dict[str, str] = field(default_factory=dict)
 
 
 def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
@@ -193,11 +213,38 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             try:
                 payload = json.loads(line.split(SGLANG_STATS, 1)[1].strip())
                 stamp = datetime.fromtimestamp(float(payload["epoch"]), tz=timezone.utc)
+                metrics = payload["metrics"]
+                if not isinstance(metrics, dict):
+                    raise ValueError("metrics is not an object")
+                for key, value in metrics.items():
+                    if key != "dropped_observations":
+                        kind, name, labels, metric_field = json.loads(key)
+                        if not (
+                            isinstance(kind, str)
+                            and isinstance(name, str)
+                            and isinstance(labels, list)
+                            and isinstance(metric_field, str)
+                        ):
+                            raise ValueError("invalid KVCR metric key")
+                    if (
+                        not isinstance(value, (int, float))
+                        or isinstance(value, bool)
+                        or not math.isfinite(value)
+                    ):
+                        raise ValueError("invalid KVCR metric value")
             except (ValueError, KeyError, TypeError):
                 errors.append(f"line {number}: unparsable SGLang KVCR stats payload")
                 continue
             snapshots.append(
-                Snapshot(stamp, number, sglang_metrics(payload, page_bytes))
+                Snapshot(
+                    stamp,
+                    number,
+                    sglang_metrics(payload, page_bytes),
+                    provenance={
+                        TIER_READ_BYTES: "derived",
+                        TIER_WRITE_BYTES: "measured:local_fill",
+                    },
+                )
             )
             continue
         if "KV Transfer metrics:" not in line:
@@ -207,6 +254,11 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             errors.append(f"line {number}: metric line without a parseable timestamp")
             continue
         payload = line.split("KV Transfer metrics:", 1)[1].strip()
+        # A decoder with only NixlConnector reports human-readable transfer
+        # summaries, not KVCR counters. It needs its own transport validator;
+        # those lines must not count as KVCR observations or parse failures.
+        if payload.startswith("Num successful transfers="):
+            continue
         values: dict[str, int | float] = {}
         if CONNECTOR_DICT.search(payload):
             # MultiConnector: one Python dict repr per connector,
@@ -217,10 +269,23 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
                 try:
                     block = ast.literal_eval(found.group(2))
                 except (ValueError, SyntaxError):
+                    if "vllm:" in found.group(2):
+                        errors.append(
+                            f"line {number}: unparsable required per-connector metrics"
+                        )
                     continue
                 if isinstance(block, dict):
                     parsed += 1
                     for name, value in block.items():
+                        if str(name).startswith("vllm:") and (
+                            not isinstance(value, (int, float))
+                            or isinstance(value, bool)
+                            or not math.isfinite(value)
+                        ):
+                            errors.append(
+                                f"line {number}: invalid per-connector metric {name}"
+                            )
+                            continue
                         if isinstance(value, (int, float)) and not isinstance(
                             value, bool
                         ):
@@ -237,7 +302,20 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
             if not values or len(values) != payload.count("="):
                 errors.append(f"line {number}: incomplete metric parsing")
                 continue
-        snapshots.append(Snapshot(stamp, number, values, precise is None, last_precise))
+        snapshots.append(
+            Snapshot(
+                stamp,
+                number,
+                values,
+                precise is None,
+                last_precise,
+                {
+                    name: "measured"
+                    for name in (TIER_READ_BYTES, TIER_WRITE_BYTES)
+                    if name in values
+                },
+            )
+        )
     return snapshots, errors
 
 
@@ -250,6 +328,26 @@ class Window:
     first_after_end: bool
     peer_failures: list[dict[str, Any]]
     parse_errors: list[str]
+    provenance: dict[str, str] = field(default_factory=dict)
+
+    def health_errors(self) -> list[str]:
+        """Missing or damaged evidence cannot establish an observed zero."""
+        errors = list(self.parse_errors)
+        if self.samples < 1:
+            errors.append("no complete telemetry samples")
+        if not any(name.startswith("vllm:kvcr_") for name in self.totals):
+            errors.append("required KVCR metric family was not observed")
+        dropped = self.get("_dropped_observations")
+        if dropped != 0:
+            errors.append(f"dropped telemetry observations={dropped}")
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            for value in self.totals.values()
+        ):
+            errors.append("invalid telemetry numeric value")
+        return errors
 
     def get(self, name: str, default: int | float = 0) -> int | float:
         return self.totals.get(name, default)
@@ -299,6 +397,7 @@ def window(
     interval containing the request has been flushed by the engine.
     """
     totals: dict[str, int | float] = {}
+    provenance: dict[str, str] = {}
     failures = []
     count = 0
     flushed = False
@@ -309,6 +408,9 @@ def window(
             flushed = True
             continue
         count += 1
+        for name, source in snapshot.provenance.items():
+            prior = provenance.get(name, source)
+            provenance[name] = source if prior == source else "mixed"
         for name, value in snapshot.metrics.items():
             if name.startswith(f"vllm:{STATE}:"):
                 totals[name] = value  # gauge: keep the latest sample
@@ -322,7 +424,7 @@ def window(
                 failures.append({"metric": name, "value": value, "line": snapshot.line})
     if errors:
         totals["_parse_errors"] = len(errors)
-    return Window(totals, count, flushed, failures, list(errors))
+    return Window(totals, count, flushed, failures, list(errors), provenance)
 
 
 def read_window(log: Path, start: datetime, end: datetime | None = None) -> Window:

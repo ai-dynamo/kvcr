@@ -92,6 +92,33 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def stop_owned(name, process, outcomes):
+    outcome = {"name": name, "pid": process.pid}
+    started = time.monotonic()
+    try:
+        stop_process(process)
+        outcome["exit_code"] = process.returncode
+    except BaseException as error:
+        outcome["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        outcome["duration_seconds"] = time.monotonic() - started
+        outcomes.append(outcome)
+
+
+def write_cleanup(output, outcomes):
+    write_json(
+        output / "cleanup.json",
+        {
+            "status": "FAIL" if any("error" in item for item in outcomes) else "PASS",
+            "owned_processes": outcomes,
+            "duration_seconds": sum(
+                item.get("duration_seconds", 0) for item in outcomes
+            ),
+        },
+    )
+
+
 def serving_env(discovery_dir):
     env = {
         **os.environ,
@@ -163,6 +190,58 @@ def kvcr_telemetry_ok(worker_log):
     return None
 
 
+def worker_arguments(args):
+    """Keep the API model name stable when loading a resolved HF snapshot."""
+    return [
+        "--model",
+        str(args.model_path) if args.model_path else args.model,
+        "--served-model-name",
+        args.model,
+        "--tensor-parallel-size",
+        "1",
+        "--data-parallel-size",
+        "2",
+        "--block-size",
+        str(BLOCK_SIZE),
+        "--max-model-len",
+        "8192",
+        "--enable-prefix-caching",
+        "--disable-hybrid-kv-cache-manager",
+        "--enforce-eager",
+        "--gpu-memory-utilization",
+        "0.5",
+        "--kv-transfer-config",
+        json.dumps(TRANSFER_CONFIG),
+        "--kv-events-config",
+        json.dumps(EVENTS_CONFIG),
+    ]
+
+
+def start_recorded_process(name, command, env, log, output):
+    process = subprocess.Popen(
+        command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+    )
+    try:
+        write_json(
+            output / f"{name}.launch.json",
+            {
+                "command": command,
+                "pid": process.pid,
+                "environment": {
+                    key: value
+                    for key, value in env.items()
+                    if key.startswith(("DYN_", "VLLM_", "CUDA_", "UCX_"))
+                },
+            },
+        )
+    except BaseException:
+        # Never orphan a process if recording its ownership fails.
+        outcomes = []
+        stop_owned(name, process, outcomes)
+        raise
+    return process
+
+
 def run(args):
     import torch
 
@@ -172,6 +251,9 @@ def run(args):
     output = args.output_dir
     processes = []
     with contextlib.ExitStack() as resources:
+        cleanup = []
+        # Registered first so the report is written after all worker callbacks.
+        resources.callback(write_cleanup, output, cleanup)
         discovery = resources.enter_context(
             tempfile.TemporaryDirectory(prefix="kvcr-e2e-")
         )
@@ -179,15 +261,15 @@ def run(args):
 
         def start(name, module, arguments):
             log = resources.enter_context((output / f"{name}.log").open("wb"))
-            process = subprocess.Popen(
+            process = start_recorded_process(
+                name,
                 [sys.executable, "-m", module, *arguments],
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+                env,
+                log,
+                output,
             )
             processes.append((name, process))
-            resources.callback(stop_process, process)
+            resources.callback(stop_owned, name, process, cleanup)
             print(f"Started {name} (PID {process.pid})", flush=True)
 
         start(
@@ -198,27 +280,7 @@ def run(args):
         start(
             "worker",
             "dynamo.vllm",
-            [
-                "--model",
-                args.model,
-                "--tensor-parallel-size",
-                "1",
-                "--data-parallel-size",
-                "2",
-                "--block-size",
-                str(BLOCK_SIZE),
-                "--max-model-len",
-                "8192",
-                "--enable-prefix-caching",
-                "--disable-hybrid-kv-cache-manager",
-                "--enforce-eager",
-                "--gpu-memory-utilization",
-                "0.5",
-                "--kv-transfer-config",
-                json.dumps(TRANSFER_CONFIG),
-                "--kv-events-config",
-                json.dumps(EVENTS_CONFIG),
-            ],
+            worker_arguments(args),
         )
         base_url = f"http://127.0.0.1:{args.port}"
 
@@ -276,7 +338,16 @@ def run(args):
         )
         write_json(
             output / "result.json",
-            {"status": "success", "cached_tokens": cached, "metrics": metrics},
+            {
+                "status": "success",
+                "cached_tokens": cached,
+                "metrics": metrics,
+                "model": args.model,
+                "model_path": str(args.model_path),
+                "engine": "vllm",
+                "topology": "peer-transfer",
+                "mode": "native",
+            },
         )
         print(
             f"Source transfer: success (count={metrics['transfer/success']:g})\n"
@@ -286,19 +357,30 @@ def run(args):
     print("KVCR peer-transfer validation: PASSED", flush=True)
 
 
-def main():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--model-path", type=Path)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--offload-wait", type=int, default=15)
     parser.add_argument("--output-dir", type=Path, default=Path("e2e-artifacts"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.model_path is not None:
+        args.model_path = args.model_path.resolve()
+        if not args.model_path.is_dir():
+            parser.error("--model-path must be an existing snapshot directory")
+    return args
+
+
+def main():
+    args = arguments()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if image := os.environ.get("KVCR_TEST_IMAGE"):
         print(f"Test image: {image}", flush=True)
     print(f"Test model: {args.model}", flush=True)
+    previous = signal.signal(signal.SIGTERM, terminate)
     try:
         run(args)
     except Exception as error:
@@ -319,6 +401,13 @@ def main():
                     file=sys.stderr,
                 )
         raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def terminate(signum, frame):
+    # Let ExitStack stop worker process groups before the wrapper exits.
+    raise KeyboardInterrupt("smoke terminated")
 
 
 if __name__ == "__main__":
