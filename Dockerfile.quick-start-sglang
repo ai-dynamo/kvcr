@@ -49,9 +49,43 @@ RUN git init /opt/sglang-src \
  && git -C /opt/sglang-src fetch --depth 1 origin "${SGLANG_REF}" \
  && git -C /opt/sglang-src checkout --detach FETCH_HEAD \
  && test "$(git -C /opt/sglang-src rev-parse HEAD)" = "${SGLANG_REF}"
-# Install KVCR from the checkout used as the Docker build context.
-COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
-COPY src /opt/kvcr-src/src
+# Three install layers, from least to most often changed, so a KVCR commit
+# rebuilds only the last one and a new Dynamo nightly only the last two:
+#   1. the SGLang fork and its pinned stack (multi-GB; the stand-in for a base
+#      image until an upstream SGLang image carries the KVCR backend),
+#   2. Dynamo, 3. KVCR.
+# Every step installs under the same constraints, and the final pip check
+# fails on any conflict the later layers add to the SGLang layer's baseline.
+COPY <<'EOF' /opt/sglang-constraints.txt
+torch==2.14.1
+transformers==5.19.0
+flashinfer-python==0.7.2
+nvidia-cutlass-dsl==4.8.0
+sgl-deep-gemm==0.2.3
+sglang-kernel==0.4.10
+apache-tvm-ffi==0.1.11
+nixl==1.5.0
+msgspec==0.22.0
+pyzmq==27.1.0
+numpy==2.3.5
+protobuf==7.36.2
+EOF
+ENV SGLANG_BUILD_RUST_EXTS=none SGLANG_RUST_BUILD_MODE=never \
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
+RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-scm==9.2.2' 'hatchling==1.27.0' \
+ && python3 -m pip uninstall -y sglang \
+ && python3 -m pip install --no-cache-dir --no-build-isolation \
+      --constraint /opt/sglang-constraints.txt \
+      --find-links https://pypi.nvidia.com/aisimulate/ \
+      /opt/sglang-src/python 'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
+ && python3 -m pip install --no-cache-dir --no-deps \
+      --index-url https://flashinfer.ai/whl 'flashinfer-cubin==0.7.2' \
+ && python3 -m pip install --no-cache-dir --no-deps \
+      --index-url https://flashinfer.ai/whl/cu130 'flashinfer-jit-cache==0.7.2' \
+ && { python3 -m pip check || true; } | sort > /opt/sglang-pip-check-baseline.txt
+
+# Dynamo. Its build args are declared here, not at the top of the stage: a
+# changed build arg invalidates every RUN after its declaration.
 COPY --from=dynamo-wheels /wheels /tmp/dynamo-wheels
 ARG DYNAMO_FROM
 ARG DYNAMO_VERSION=nightly
@@ -85,34 +119,21 @@ else:
 print("Dynamo:", *requirements, flush=True)
 Path("/tmp/dynamo-requirements.txt").write_text("\n".join(requirements) + "\n")
 PY
-COPY <<'EOF' /opt/sglang-constraints.txt
-torch==2.14.1
-transformers==5.19.0
-flashinfer-python==0.7.2
-nvidia-cutlass-dsl==4.8.0
-sgl-deep-gemm==0.2.3
-sglang-kernel==0.4.10
-apache-tvm-ffi==0.1.11
-nixl==1.5.0
-msgspec==0.22.0
-pyzmq==27.1.0
-numpy==2.3.5
-protobuf==7.36.2
-EOF
-ENV SGLANG_BUILD_RUST_EXTS=none SGLANG_RUST_BUILD_MODE=never \
-    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
-RUN python3 -m pip install --no-cache-dir 'setuptools-rust==1.11.1' 'setuptools-scm==9.2.2' 'hatchling==1.27.0' \
- && python3 -m pip uninstall -y sglang \
- && python3 -m pip install --no-cache-dir --no-build-isolation \
+RUN python3 -m pip install --no-cache-dir \
       --constraint /opt/sglang-constraints.txt \
       --find-links https://pypi.nvidia.com/aisimulate/ \
       --find-links https://pypi.nvidia.com/aisim/ \
-      /opt/sglang-src/python /opt/kvcr-src -r /tmp/dynamo-requirements.txt \
-      'nixl[cu13]==1.5.0' 'blake3==1.0.8' \
- && python3 -m pip install --no-cache-dir --no-deps \
-      --index-url https://flashinfer.ai/whl 'flashinfer-cubin==0.7.2' \
- && python3 -m pip install --no-cache-dir --no-deps \
-      --index-url https://flashinfer.ai/whl/cu130 'flashinfer-jit-cache==0.7.2'
+      -r /tmp/dynamo-requirements.txt
+
+# KVCR from the checkout used as the Docker build context.
+COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
+COPY src /opt/kvcr-src/src
+RUN python3 -m pip install --no-cache-dir --no-build-isolation \
+      --constraint /opt/sglang-constraints.txt /opt/kvcr-src \
+ && { python3 -m pip check || true; } | sort > /tmp/pip-check.txt \
+ && if comm -13 /opt/sglang-pip-check-baseline.txt /tmp/pip-check.txt | grep .; then \
+      echo "Dynamo/KVCR introduced the dependency conflicts above" >&2; exit 1; \
+    fi
 COPY <<'EOF' /opt/sglang-router-policy.yaml
 worker_selection:
   aggregated: two-tier
