@@ -96,6 +96,8 @@ docker exec -it kvcr-quick-start bash
 
 Define the model and the two vLLM configurations. This example downloads a small model into the persistent cache on first use; `MODEL` may instead name a compatible local path mounted into the container.
 
+Keep `enable_telemetry` set to `false` with the pinned vLLM 0.34.0 image. Its KVCR adapter lacks the `kvcr_unserved_blocks` metric registration, so the engine can stop if a peer fetch leaves blocks undelivered while telemetry is enabled. See [KVCR issue #209](https://github.com/ai-dynamo/kvcr/issues/209).
+
 ```bash
 export MODEL=Qwen/Qwen3-0.6B
 
@@ -115,7 +117,7 @@ export KV_TRANSFER_CONFIG='{
         "control_advertise_host": "127.0.0.1",
         "operation_timeout_ms": 5000,
         "abandon_timeout_ms": 10000,
-        "enable_telemetry": true
+        "enable_telemetry": false
       }
     ]
   }
@@ -129,10 +131,10 @@ export KV_EVENTS_CONFIG='{
 }'
 ```
 
-Launch two data-parallel ranks with DEBUG logging to show transfer metrics even when the source rank is idle:
+Launch two data-parallel ranks.
 
 ```bash
-env -u NATS_SERVER CUDA_VISIBLE_DEVICES=0,1 VLLM_LOGGING_LEVEL=DEBUG \
+env -u NATS_SERVER CUDA_VISIBLE_DEVICES=0,1 \
   python3 -m dynamo.vllm \
   --model "$MODEL" \
   --tensor-parallel-size 1 \
@@ -211,7 +213,15 @@ The two JSON responses include these fields in one validated run:
 
 Both ranks share a worker ID. The fresh seed should report zero cached tokens; the retrieval must report a positive, block-aligned count. Values vary. If retrieval reports zero, generate a new `PREFIX` before retrying so rank 1 cannot reuse its own cached prefix.
 
-These headers constrain the KV router; they do not bypass it. For the retrieval, the router can still identify rank 0 as the source and provide its source hint to rank 1. The response is useful evidence, but terminal telemetry is the final proof. The relevant post-request `KV Transfer metrics` from that run contained:
+The routing headers select the seed and retrieval ranks. The KV router can still identify rank 0 as the source and provide its source hint to rank 1. The responses show that rank 1 reused the fresh prefix first sent to rank 0.
+
+In a normal deployment, omit the two routing headers. KVCR transfers can occur when load, availability, or routing constraints cause the KV router to select a target other than the cache-owning worker.
+
+### Optional transfer metrics
+
+Use these checks with a compatible image whose vLLM KVCR adapter registers `kvcr_unserved_blocks`. See [vLLM PR #69317](https://github.com/vllm-project/vllm/pull/69317).
+
+In Step 4, set `enable_telemetry` to `true` and add `VLLM_LOGGING_LEVEL=DEBUG` to the worker launch command so the source rank logs metrics even when idle. Repeat Step 5 with a fresh prefix. The source and destination worker logs report the transfer results, block counts, and byte counts. The validated run with telemetry enabled reported the following `KV Transfer metrics`.
 
 ```text
 source rank 0:
@@ -230,8 +240,6 @@ The exact counts may differ, but the source and destination block counts must ma
 
 Because this peer-only configuration has no KVCR-owned local tier, the same log can contain `kv_offload_tiering_cascade_job_failures` for the unused local deposit path. That counter is separate from peer delivery and does not invalidate the matching successful transfer above.
 
-The explicit rank selection is only for this deterministic mechanism test. In a normal deployment, omit the two routing headers. KVCR transfers can occur when load, availability, or routing constraints cause the KV router to select a target other than the cache-owning worker. Verify transfers using the same telemetry criteria above.
-
 ---
 
 ## Troubleshooting
@@ -239,6 +247,6 @@ The explicit rank selection is only for this deterministic mechanism test. In a 
 - **Build failure:** Check access to the public package indexes and inspect the final compatibility-check output. Keep the vLLM image and Dynamo version together.
 - **Tier initialization failure:** Check that the `kvcr` tier is registered, NIXL satisfies KVCR's supported range, and shared memory covers both host allocations and vLLM IPC. The pinned vLLM image supplies NIXL 1.5.2.
 - **No router hint or cache hit:** Use `--router-mode kv`, enable self-describing KV events, and confirm the worker advertises `router_hint` and its control endpoints. Use a fresh prefix longer than one block.
-- **Peer connection or transfer failure:** Ensure control and event ports are unique, with one control port per DP rank, and `control_advertise_host` is reachable by peers. Check terminal transfer status and destination data; a control acknowledgement alone does not prove delivery.
+- **Peer connection or transfer failure:** Ensure control and event ports are unique, with one control port per DP rank, and `control_advertise_host` is reachable by peers. When telemetry is enabled, check the final transfer result in the worker logs.
 
 For more checks, see the [developer guide](dev-guide.md#troubleshooting).
