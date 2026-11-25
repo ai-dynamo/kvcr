@@ -1,0 +1,505 @@
+{
+  "schema_version": 1,
+  "statuses": {
+    "automated": "The job is defined on main, so it runs for pull requests. The entry names the job and links a CI result.",
+    "pending": "Required, but its job is not on main yet. Has an owner or issue.",
+    "not_applicable": "The combination is unsupported or does not exist. Has a reason.",
+    "skipped": "Supported, intentionally not run per PR. Has a reason."
+  },
+  "placeholders": {
+    "any": "The row's statement holds for every value of this field. Allowed only on not_applicable and skipped rows, which never run.",
+    "none": "This field does not apply to the row. Used for the CPU checks, which have no model, mode or topology."
+  },
+  "job_sources": {
+    "main": "The job is defined on main, so it runs for pull requests.",
+    "candidate": "The job exists only on an unmerged pull request, named in `ref`."
+  },
+  "evidence_kinds": {
+    "ci": "A run started automatically by GitHub Actions. The url links the run.",
+    "manual": "A run someone did by hand. The url links where its result is recorded."
+  },
+  "modes": {
+    "guard": "KVCR service (Guard) owns the cache memory; harness `--mode guard`. Needs host kernel >= 6.5.",
+    "native": "In-process KVCR, no Guard; harness `--mode nonguard`."
+  },
+  "topologies": {
+    "agg": "One host, two GPUs, two aggregated workers.",
+    "disagg": "One host, two GPUs, two prefill workers sharing GPU 0 and one decode worker on GPU 1 (2P+1D).",
+    "cross-node": "Workers on two hosts. Not run per PR."
+  },
+  "test_cases": {
+    "lint": {
+      "summary": "ruff check src tests",
+      "gpu": false
+    },
+    "unit-tests": {
+      "summary": "pytest tests/unit",
+      "gpu": false
+    },
+    "peer-transfer": {
+      "summary": "tests/e2e/run_vllm_kvcr.py: seed rank 0, retrieve on rank 1, check cached tokens and transfer telemetry",
+      "gpu": true
+    },
+    "TC-01": {
+      "summary": "Generation correctness, KVCR store/commit, repeat is a block-aligned hit",
+      "gpu": true
+    },
+    "TC-02": {
+      "summary": "Local DRAM: full / partial / miss",
+      "gpu": true
+    },
+    "TC-03": {
+      "summary": "Concurrent hinted peer transfer; hints isolated per request",
+      "gpu": true
+    },
+    "TC-04": {
+      "summary": "Guard takeover and replacement re-attach (Guard only)",
+      "gpu": true
+    },
+    "TC-05": {
+      "summary": "Performance arms",
+      "gpu": true
+    },
+    "TC-06": {
+      "summary": "Guard recovery timing",
+      "gpu": true
+    }
+  },
+  "model_profiles": {
+    "dense": {
+      "model": "Qwen/Qwen3-0.6B",
+      "summary": "Dense transformer."
+    },
+    "mamba": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+      "summary": "Mamba hybrid."
+    },
+    "gdn": {
+      "model": "Qwen/Qwen3.5-0.8B",
+      "summary": "GDN hybrid."
+    }
+  },
+  "lanes": {
+    "cpu": {
+      "enabled": true,
+      "summary": "CPU checks on a GitHub-hosted runner; run for every PR."
+    },
+    "vllm": {
+      "enabled": true,
+      "summary": "vLLM with the KVCR offloading tier; image from Dockerfile.ci."
+    },
+    "sglang-hicache": {
+      "enabled": false,
+      "summary": "SGLang HiCache backend, built from the unmerged sgl-project/sglang#45647."
+    },
+    "sglang-linker": {
+      "enabled": false,
+      "summary": "SGLang Linker, built from the unmerged sgl-project/sglang#45650."
+    },
+    "trtllm": {
+      "enabled": false,
+      "summary": "TensorRT-LLM. No KVCR integration yet."
+    }
+  },
+  "entries": [
+    {
+      "id": "cpu-lint-unit",
+      "lane": "cpu",
+      "model_profile": "none",
+      "mode": "none",
+      "topology": "none",
+      "cases": ["lint", "unit-tests"],
+      "status": "automated",
+      "job": {
+        "workflow": ".github/workflows/ci.yml",
+        "jobs": ["lint", "unit-tests"],
+        "source": "main"
+      },
+      "evidence": [
+        {
+          "kind": "ci",
+          "checked": "2026-11-24",
+          "url": "https://github.com/ai-dynamo/kvcr/actions/workflows/ci.yml"
+        }
+      ]
+    },
+    {
+      "id": "vllm-smoke-peer-transfer",
+      "lane": "vllm",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["peer-transfer"],
+      "status": "automated",
+      "job": {
+        "workflow": ".github/workflows/vllm-e2e.yml",
+        "jobs": ["peer-transfer"],
+        "source": "main"
+      },
+      "evidence": [
+        {
+          "kind": "ci",
+          "checked": "2026-11-24",
+          "url": "https://github.com/ai-dynamo/kvcr/actions/workflows/docker-build.yml"
+        }
+      ],
+      "notes": "Smoke test that predates the TC-01..06 harness. ai-dynamo/kvcr#208 retires this job; remove this entry when that PR merges."
+    },
+    {
+      "id": "vllm-dense-agg-guard",
+      "lane": "vllm",
+      "model_profile": "dense",
+      "mode": "guard",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-dense-agg-native",
+      "lane": "vllm",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-dense-disagg-guard",
+      "lane": "vllm",
+      "model_profile": "dense",
+      "mode": "guard",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-dense-disagg-native",
+      "lane": "vllm",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-mamba-agg-guard",
+      "lane": "vllm",
+      "model_profile": "mamba",
+      "mode": "guard",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-mamba-agg-native",
+      "lane": "vllm",
+      "model_profile": "mamba",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-mamba-disagg-guard",
+      "lane": "vllm",
+      "model_profile": "mamba",
+      "mode": "guard",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-mamba-disagg-native",
+      "lane": "vllm",
+      "model_profile": "mamba",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-gdn-agg-guard",
+      "lane": "vllm",
+      "model_profile": "gdn",
+      "mode": "guard",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-gdn-agg-native",
+      "lane": "vllm",
+      "model_profile": "gdn",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-gdn-disagg-guard",
+      "lane": "vllm",
+      "model_profile": "gdn",
+      "mode": "guard",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "vllm-gdn-disagg-native",
+      "lane": "vllm",
+      "model_profile": "gdn",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "Its job is not on main yet; the vLLM CI framework is in review (ai-dynamo/kvcr#208). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-hicache-dense-agg-native",
+      "lane": "sglang-hicache",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "The lane is not on main yet; it is in progress (ai-dynamo/kvcr#207). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": "",
+      "evidence": [
+        {
+          "kind": "manual",
+          "checked": "2026-11-19",
+          "url": "https://github.com/ai-dynamo/kvcr/pull/180",
+          "note": "Qwen3-0.6B and Qwen3-8B, TC-01/02/03/05, two H100 on one host."
+        }
+      ]
+    },
+    {
+      "id": "sglang-hicache-dense-disagg-native",
+      "lane": "sglang-hicache",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "In the target plan, but not implemented: the HiCache harness adapter is aggregated only.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-hicache-mamba-agg-native",
+      "lane": "sglang-hicache",
+      "model_profile": "mamba",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "The lane is not on main yet; it is in progress (ai-dynamo/kvcr#207). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-hicache-mamba-disagg-native",
+      "lane": "sglang-hicache",
+      "model_profile": "mamba",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "In the target plan, but not implemented: the HiCache harness adapter is aggregated only.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-hicache-gdn-agg-native",
+      "lane": "sglang-hicache",
+      "model_profile": "gdn",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "The lane is not on main yet; it is in progress (ai-dynamo/kvcr#207). Job and evidence are left blank until that PR settles.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-hicache-gdn-disagg-native",
+      "lane": "sglang-hicache",
+      "model_profile": "gdn",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "In the target plan, but not implemented: the HiCache harness adapter is aggregated only.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-hicache-guard",
+      "lane": "sglang-hicache",
+      "model_profile": "any",
+      "mode": "guard",
+      "topology": "any",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "not_applicable",
+      "reason": "The HiCache integration has no Guard mode; the harness rejects `--engine sglang --mode guard`."
+    },
+    {
+      "id": "sglang-linker-dense-agg-native",
+      "lane": "sglang-linker",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "sgl-project/sglang#45650 is unmerged; the harness has no Linker path and there is no image or job. Case list is proposed, not agreed.",
+      "owner": "",
+      "issue": "",
+      "evidence": [
+        {
+          "kind": "manual",
+          "checked": "2026-11-19",
+          "url": "https://github.com/sgl-project/sglang/pull/45650",
+          "note": "Dense Qwen3-32B, TP1, two B200 nodes. Not this model and not the shared-harness cases."
+        }
+      ]
+    },
+    {
+      "id": "sglang-linker-dense-disagg-native",
+      "lane": "sglang-linker",
+      "model_profile": "dense",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "sgl-project/sglang#45650 is unmerged; the harness has no Linker path and there is no image or job. Case list is proposed, not agreed.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-linker-mamba-agg-native",
+      "lane": "sglang-linker",
+      "model_profile": "mamba",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "sgl-project/sglang#45650 is unmerged; the harness has no Linker path and there is no image or job. Case list is proposed, not agreed.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-linker-mamba-disagg-native",
+      "lane": "sglang-linker",
+      "model_profile": "mamba",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "sgl-project/sglang#45650 is unmerged; the harness has no Linker path and there is no image or job. Case list is proposed, not agreed.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-linker-gdn-agg-native",
+      "lane": "sglang-linker",
+      "model_profile": "gdn",
+      "mode": "native",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "sgl-project/sglang#45650 is unmerged; the harness has no Linker path and there is no image or job. Case list is proposed, not agreed.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-linker-gdn-disagg-native",
+      "lane": "sglang-linker",
+      "model_profile": "gdn",
+      "mode": "native",
+      "topology": "disagg",
+      "cases": ["TC-01", "TC-02", "TC-03"],
+      "status": "pending",
+      "reason": "sgl-project/sglang#45650 is unmerged; the harness has no Linker path and there is no image or job. Case list is proposed, not agreed.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "sglang-linker-dense-agg-guard",
+      "lane": "sglang-linker",
+      "model_profile": "dense",
+      "mode": "guard",
+      "topology": "agg",
+      "cases": ["TC-01", "TC-02", "TC-03", "TC-04"],
+      "status": "pending",
+      "reason": "Open decision: the target plan leaves SGLang Guard out. Confirm whether Linker supports Guard, then change this entry to not_applicable or skipped.",
+      "owner": "",
+      "issue": ""
+    },
+    {
+      "id": "trtllm",
+      "lane": "trtllm",
+      "model_profile": "any",
+      "mode": "any",
+      "topology": "any",
+      "cases": [],
+      "status": "not_applicable",
+      "reason": "KVCR has no TensorRT-LLM integration yet; future work."
+    },
+    {
+      "id": "cross-node",
+      "lane": "any",
+      "model_profile": "any",
+      "mode": "any",
+      "topology": "cross-node",
+      "cases": ["TC-03", "TC-04"],
+      "status": "skipped",
+      "reason": "Per-PR CI runs on one host; cross-node runs are left to nightly CI."
+    },
+    {
+      "id": "per-pr-perf",
+      "lane": "any",
+      "model_profile": "any",
+      "mode": "any",
+      "topology": "any",
+      "cases": ["TC-05", "TC-06"],
+      "status": "skipped",
+      "reason": "Per-PR CI is functional only; performance and recovery timing are left to nightly CI."
+    }
+  ]
+}
