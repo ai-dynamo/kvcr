@@ -349,21 +349,23 @@ uv pip install -e '.[vllm]'
 cd ..
 
 VLLM_USE_PRECOMPILED=1 \
-  uv pip install --editable ./vllm --torch-backend=auto
+  uv pip install --editable ./vllm --torch-backend=cu130
 
 uv pip install --editable ./kvcr
 ```
+
+Pin `--torch-backend` to the CUDA variant of the precompiled vLLM artifact (`cu130` on current vLLM `main`). With `auto`, a CUDA 13.2+ driver selects cu132 PyTorch, but `torchaudio==2.11.0` has no cu132 build; the cu130 wheel from PyPI is installed instead, and importing vLLM fails with `PyTorch and TorchAudio were compiled with different CUDA versions`.
 
 Precompiled vLLM artifacts must be compatible with the checkout. A customized branch may require an explicit wheel commit/variant or its documented native build. The quick start's CUDA, PyTorch, FlashInfer, and vLLM versions describe that validated environment rather than universal KVCR requirements.
 
 ### Verify a shared integration environment
 
-Run the following after Dynamo, vLLM, and KVCR are all installed. The first command should print frontend help and exit successfully; the remaining checks record import paths and native-package versions:
+Run the following after Dynamo, vLLM, and KVCR are all installed. The first command should print frontend help and exit successfully; the remaining checks record import paths and native-package versions. `-P` keeps the workspace's `vllm/` checkout directory from shadowing the editable install as a namespace package:
 
 ```bash
 python -m dynamo.frontend --help
 
-python - <<'PY'
+python -P - <<'PY'
 from pathlib import Path
 import importlib
 import importlib.metadata as metadata
