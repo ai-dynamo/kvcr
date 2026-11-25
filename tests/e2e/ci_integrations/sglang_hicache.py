@@ -15,6 +15,7 @@ from . import sglang
 INTEGRATION = "sglang-hicache"
 IMAGE_PROFILE = "sglang-hicache"
 CATALOG = sglang.E2E / "ci_profiles_sglang_hicache.json"
+SGLANG_MODE = "hicache"
 # The actual worker launch must use HiCache with the KVCR storage backend.
 KVCR_FLAGS: dict[str, str | bool] = {
     "--enable-hierarchical-cache": True,
@@ -47,10 +48,25 @@ def build_command(
     prompt_tag: str,
     gpus: list[int] | None = None,
 ) -> list[str]:
-    return sglang.build_command(profile, output, snapshot, prompt_tag, gpus)
+    return sglang.build_command(
+        profile,
+        output,
+        snapshot,
+        prompt_tag,
+        gpus,
+        extra=["--sglang-mode", SGLANG_MODE],
+    )
 
 
 def validate_result(
     profile: dict, envelope: dict, directory: Path, errors: list[str]
 ) -> None:
-    sglang.validate_result(profile, envelope, directory, errors, kvcr_flags=KVCR_FLAGS)
+    sglang.validate_result(
+        profile,
+        envelope,
+        directory,
+        errors,
+        kvcr_flags=KVCR_FLAGS,
+        native_fields={"sglang_mode": SGLANG_MODE},
+        arguments={"sglang_mode": SGLANG_MODE},
+    )

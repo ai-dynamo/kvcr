@@ -56,6 +56,7 @@ jobs:
       recipe_sha: ${{ github.sha }}
       resolved_inputs_json: ${{ steps.inputs.outputs.json }}
       sglang_hicache_inputs_json: ${{ steps.inputs.outputs.sglang_hicache_json }}
+      sglang_linker_inputs_json: ${{ steps.inputs.outputs.sglang_linker_json }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,7 +75,7 @@ jobs:
           base_name="${BASE_IMAGE%%@*}"
           if [[ "${base_name##*/}" == *:* ]]; then base_name="${base_name%:*}"; fi
           # One Dynamo release that serves every image's Python runtime.
-          profiles=vllm,sglang-hicache
+          profiles=vllm,sglang-hicache,sglang-linker
           resolved=$(python3 tests/e2e/ci_images.py --image-profile vllm \
             --source-sha "$source_sha" --recipe-sha "$GITHUB_SHA" \
             --base-image "${base_name}@${base_digest}" --dynamo-policy "$DYNAMO_POLICY" \
@@ -89,10 +90,20 @@ jobs:
             --base-image "$sglang_base" --dynamo-policy "$DYNAMO_POLICY" \
             --dynamo-profiles "$profiles" --dynamo-version "$dynamo_version" \
             --output resolved-inputs-sglang-hicache.json)
+          sglang_linker=$(python3 tests/e2e/ci_images.py --image-profile sglang-linker \
+            --source-sha "$source_sha" --recipe-sha "$GITHUB_SHA" \
+            --base-image "$sglang_base" --dynamo-policy "$DYNAMO_POLICY" \
+            --dynamo-profiles "$profiles" --dynamo-version "$dynamo_version" \
+            --output resolved-inputs-sglang-linker.json)
           # A single-line JSON output is data, never executable shell input.
-          printf 'source_sha=%s\njson=%s\nsglang_hicache_json=%s\n' "$source_sha" \
-            "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$resolved")" \
-            "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$sglang_hicache")" >> "$GITHUB_OUTPUT"
+          {
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'json=%s\n' "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$resolved")"
+            printf 'sglang_hicache_json=%s\n' \
+              "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$sglang_hicache")"
+            printf 'sglang_linker_json=%s\n' \
+              "$(jq -c 'del(.resolved_inputs_sha256)' <<< "$sglang_linker")"
+          } >> "$GITHUB_OUTPUT"
           printf 'Dynamo for every image: `ai-dynamo==%s`\n' "$dynamo_version" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -145,6 +156,31 @@ jobs:
       image_profile: ${{ needs.build-sglang-hicache.outputs.image_profile }}
       resolved_inputs_sha256: ${{ needs.build-sglang-hicache.outputs.resolved_inputs_sha256 }}
       build_manifest_artifact: ${{ needs.build-sglang-hicache.outputs.build_manifest_artifact }}
+      profile_selection: ${{ inputs.profile_selection || 'all' }}
+
+  # SGLang direct linker: diagnostic, not in ci_lanes.json or the GPU E2E
+  # verdict until its profiles qualify. A failure shows here but does not
+  # fail the gate.
+  build-sglang-linker:
+    needs: resolve
+    uses: ./.github/workflows/build-ci-image.yml
+    with:
+      image_profile: sglang-linker
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      recipe_sha: ${{ needs.resolve.outputs.recipe_sha }}
+      resolved_inputs_json: ${{ needs.resolve.outputs.sglang_linker_inputs_json }}
+
+  e2e-sglang-linker:
+    needs: build-sglang-linker
+    uses: ./.github/workflows/integration-e2e.yml
+    with:
+      integration: sglang-linker
+      image: ${{ needs.build-sglang-linker.outputs.image }}
+      source_sha: ${{ needs.build-sglang-linker.outputs.source_sha }}
+      recipe_sha: ${{ needs.build-sglang-linker.outputs.recipe_sha }}
+      image_profile: ${{ needs.build-sglang-linker.outputs.image_profile }}
+      resolved_inputs_sha256: ${{ needs.build-sglang-linker.outputs.resolved_inputs_sha256 }}
+      build_manifest_artifact: ${{ needs.build-sglang-linker.outputs.build_manifest_artifact }}
       profile_selection: ${{ inputs.profile_selection || 'all' }}
 
   gpu-verdict:

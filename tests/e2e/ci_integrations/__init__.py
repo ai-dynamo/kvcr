@@ -12,6 +12,7 @@ from types import ModuleType
 _INTEGRATIONS = {
     "vllm": "ci_integrations.vllm",
     "sglang-hicache": "ci_integrations.sglang_hicache",
+    "sglang-linker": "ci_integrations.sglang_linker",
 }
 
 

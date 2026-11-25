@@ -15,7 +15,9 @@ E2E = Path(__file__).parents[1] / "e2e"
 REPO = E2E.parents[1]
 sys.path.insert(0, str(E2E))
 
-INTEGRATIONS = ["sglang-hicache"]
+INTEGRATIONS = ["sglang-hicache", "sglang-linker"]
+# Registered in ci_lanes.json, so required by the GPU E2E verdict.
+ACTIVE = {"vllm", "sglang-hicache"}
 
 
 def _raw(integration):
@@ -146,7 +148,9 @@ def test_sglang_image_profile_binds_its_digest_pinned_recipe():
     # commit or recipe does not invalidate the cached SGLang and Dynamo layers.
     identity = recipe.index("ARG RESOLVED_INPUTS_SHA256")
     assert recipe.index("--report /opt/kvcr-install-report.json") < identity
-    for name in ("KVCR_COMMIT", "CI_RECIPE_SHA", "CI_IMAGE_PROFILE", "DYNAMO_POLICY"):
+    # CI_IMAGE_PROFILE selects the fork commit, so it is declared early; it is
+    # constant per image profile and does not change from commit to commit.
+    for name in ("KVCR_COMMIT", "CI_RECIPE_SHA", "DYNAMO_POLICY"):
         assert recipe.index(f"ARG {name}") > recipe.index("COPY src /opt/kvcr-src/src")
 
 
@@ -221,7 +225,7 @@ def test_every_active_lane_has_its_root_workflow_jobs():
     verdict = importlib.import_module("ci_verdict")
     lanes = verdict.load_lanes()
     jobs = _jobs((REPO / ".github/workflows/docker-build.yml").read_text())
-    assert set(lanes) == {"vllm", *INTEGRATIONS}
+    assert set(lanes) == ACTIVE
     gate = jobs["gpu-verdict"]["needs"].strip("[]").split(", ")
     for name, lane in lanes.items():
         build, test = jobs[lane["build_job"]], jobs[lane["test_job"]]
@@ -232,3 +236,99 @@ def test_every_active_lane_has_its_root_workflow_jobs():
         assert f"needs.{lane['build_job']}.outputs.image" in test["image"]
         if name != "vllm":
             assert test["integration"] == name
+
+
+def test_linker_lane_runs_without_gating_the_verdict():
+    jobs = _jobs((REPO / ".github/workflows/docker-build.yml").read_text())
+    gate = jobs["gpu-verdict"]["needs"].strip("[]").split(", ")
+    assert jobs["build-sglang-linker"]["image_profile"] == "sglang-linker"
+    assert jobs["e2e-sglang-linker"]["integration"] == "sglang-linker"
+    assert not {"build-sglang-linker", "e2e-sglang-linker"} & set(gate)
+
+
+@pytest.mark.parametrize(
+    ("integration", "mode"),
+    [("sglang-hicache", "hicache"), ("sglang-linker", "linker")],
+)
+def test_each_integration_selects_its_sglang_mode(integration, mode, tmp_path):
+    from ci_integrations import get_integration
+    from ci_profiles import load_catalog, select_profiles
+
+    run_phase1 = importlib.import_module("run_phase1")
+    adapter = get_integration(integration)
+    profile = select_profiles(load_catalog(integration=integration))[0]
+    command = adapter.build_command(profile, tmp_path, tmp_path, "tag")
+    assert run_phase1.arguments(command[3:]).sglang_mode == mode
+
+
+@pytest.mark.parametrize(
+    ("config", "layers"),
+    [
+        ({"num_hidden_layers": 28}, 28),
+        (
+            {
+                "num_hidden_layers": 4,
+                "hybrid_override_pattern": "M-M*",
+            },
+            1,
+        ),
+        (
+            {
+                "text_config": {
+                    "num_hidden_layers": 4,
+                    "layer_types": [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ],
+                }
+            },
+            1,
+        ),
+    ],
+)
+def test_linker_block_divisor_counts_kv_cache_layers(config, layers):
+    from types import SimpleNamespace
+
+    from phase1.stack import kv_cache_layers
+
+    def namespace(value):
+        return SimpleNamespace(
+            **{
+                key: namespace(item) if isinstance(item, dict) else item
+                for key, item in value.items()
+            }
+        )
+
+    assert kv_cache_layers(namespace(config)) == layers
+
+
+def test_linker_telemetry_keeps_raw_values_and_rejects_malformed_counters():
+    from phase1.telemetry import (
+        TIER_READ_BYTES,
+        TIER_WRITE_BYTES,
+        metric,
+        parse_log,
+    )
+
+    stamp = "2026-11-25T09:46:31.385372Z"
+    good = {
+        "kvcr_transfer_blocks[local_fill].counter": 9,
+        "kvcr_transfer_bytes[local_fill].counter": 66060288,
+        "kvcr_transfer_blocks[source_write].counter": 252,
+    }
+    line = f"{stamp} INFO KVCR telemetry rank=0 interval_s=5.0 stats="
+    snapshots, errors = parse_log(line + json.dumps(good) + "\n", 28)
+    assert errors == []
+    values = snapshots[0].metrics
+    assert values[metric("kvcr_transfer_blocks", "source_write")] == 9
+    assert values["_per_layer:" + metric("kvcr_transfer_blocks", "source_write")] == 252
+    assert values[metric("kvcr_transfer_blocks", "local_fill")] == 9
+    assert snapshots[0].provenance == {
+        TIER_READ_BYTES: "derived",
+        TIER_WRITE_BYTES: "measured:local_fill",
+    }
+    for bad in ({"kvcr_transfer_blocks[x].counter": "1"}, {"no-brackets": 1}):
+        snapshots, errors = parse_log(line + json.dumps(bad) + "\n", 28)
+        assert snapshots == [] and len(errors) == 1

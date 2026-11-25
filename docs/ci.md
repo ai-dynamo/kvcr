@@ -6,8 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 # Per-PR GPU CI and integration contract
 
 The active gate is **vLLM: 12 configurations and 42 functional cases** and
-**SGLang HiCache: 3 configurations and 9 functional cases**. SGLang Linker is an
-extension point, not a registered lane. A target-diagram row is never a passing result.
+**SGLang HiCache: 3 configurations and 9 functional cases**. SGLang Linker runs
+the same three configurations as a diagnostic lane (`build-sglang-linker`,
+`e2e-sglang-linker`) that is not in `ci_lanes.json` and cannot fail the gate.
+A target-diagram row is never a passing result.
 This document describes the executable contract; historical runs remain in their
 Actions artifacts. TC-05/06, nightly/weekly scheduling, cross-node validation and
 runner infrastructure changes are outside this per-PR gate.
@@ -126,6 +128,20 @@ where TC-02/03 peer transfer stops; they stay `pending` until a run passes.
 Telemetry comes from the backend's `KVCR L3 native stats` lines; tier read bytes
 are derived from the measured `local_fill` page size and labeled as such.
 
+### SGLang Linker (diagnostic)
+
+`sglang_linker.py` and `ci_profiles_sglang_linker.json` reuse the HiCache rows
+with `--sglang-mode linker`: GPU KV pages move to and from KVCR DRAM in the
+worker, layer by layer, TP1 only. All rows are `pending`. The image is the same
+recipe built with `CI_IMAGE_PROFILE=sglang-linker`, which selects the linker's
+SGLang and Dynamo fork commits. The linker's `KVCR telemetry` lines count
+`source_write` and delivery blocks per (page, KV layer); the harness divides
+them by the snapshot config's KV-cache layer count (all layers for dense,
+`full_attention` layers for Qwen3.5, `*` layers for Nemotron-H) and keeps the
+raw value as `_per_layer:<metric>`. `local_fill` is counted per page.
+Malformed linker counters fail the sample as for the other parsers. Add the
+lane to `ci_lanes.json` only after its profiles pass.
+
 ## Images and dependencies
 
 Image recipes remain engine-specific. Recipe-owned build canaries are passed in
@@ -226,7 +242,7 @@ Historical v1 artifacts require explicit replay mode and cannot qualify producti
 ## Dana's integration steps
 
 Status: steps 1–7 are done for HiCache (dense, Mamba and GDN rows; hybrids
-pending). Linker follows on its own branch with a non-gating lane.
+pending). Linker runs the same rows as a diagnostic lane outside the gate.
 
 1. Rebase/replay only her distinct commits onto the exact reviewed PR208 handoff
    commit. At the 2026-11-25 11:12 UTC refresh, both

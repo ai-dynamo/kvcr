@@ -50,6 +50,11 @@ NON_GUARD = "nonguard"
 VLLM = "vllm"
 SGLANG = "sglang"
 ENGINES = (VLLM, SGLANG)
+# SGLang KVCR integrations: HiCache storage backend (GPU -> host -> KVCR) or the
+# direct linker (GPU pages <-> KVCR, sgl-project/sglang#45650).
+HICACHE = "hicache"
+LINKER = "linker"
+SGLANG_MODES = (HICACHE, LINKER)
 DISABLED = "disabled"
 MODES = (GUARD, NON_GUARD)
 MIN_GUARD_KERNEL = (6, 5)
@@ -86,6 +91,18 @@ def check_port_available(port: int) -> None:
             raise ValidationError(f"required TCP port {port} is unavailable: {error}")
 
 
+def kv_cache_layers(config: Any) -> int:
+    """Number of layers with a KV cache in a Hugging Face model config."""
+    config = getattr(config, "text_config", None) or config
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        return sum(kind == "full_attention" for kind in layer_types)
+    pattern = getattr(config, "hybrid_override_pattern", None)
+    if pattern:
+        return pattern.count("*")
+    return int(config.num_hidden_layers)
+
+
 def kvcr_service_command() -> list[str]:
     """Interpreter command that starts the KVCR service.
 
@@ -116,6 +133,8 @@ class Settings:
     # backend (sgl-project/sglang#45647); KVCR runs inside the worker, so no
     # Guard, no sidecars, TC-01..03 and TC-05 only.
     engine: str = "vllm"
+    # SGLang only: "hicache" or "linker" (see SGLANG_MODES).
+    sglang_mode: str = HICACHE
     # KVCR NIXL listen ports of the SGLang workers (vLLM's tier picks its own).
     kvcr_nixl_ports: tuple[int, ...] = (18771, 18772, 18773)
     # HiCache host staging per SGLang worker, GiB.
@@ -470,6 +489,32 @@ class Stack:
         self.pool_dir = Path("/dev/shm/phase1-pool-" + uuid.uuid4().hex[:8])
         self.deadline_check: Callable[[], None] = lambda: None
         self._remote_info: dict[int, dict[str, Any]] = {}
+        self._telemetry_layers: int | None = None
+
+    @property
+    def linker(self) -> bool:
+        return self.settings.engine == SGLANG and self.settings.sglang_mode == LINKER
+
+    @property
+    def telemetry_layers(self) -> int:
+        """Divisor for KVCR block counts: the linker counts (page, KV layer) pairs.
+
+        Read from the pinned snapshot's config. Hybrid models keep KV pages only
+        for their attention layers: Qwen3.5 lists them as ``full_attention`` in
+        ``layer_types``; Nemotron-H marks them ``*`` in
+        ``hybrid_override_pattern``.
+        """
+        if not self.linker:
+            return 1
+        if self._telemetry_layers is None:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(
+                str(self.settings.model_path or self.settings.model),
+                trust_remote_code=True,
+            )
+            self._telemetry_layers = kv_cache_layers(config)
+        return self._telemetry_layers
 
     # -- preflight ---------------------------------------------------------
 
@@ -735,6 +780,9 @@ class Stack:
     def sglang_kvcr_config(self, index: int) -> dict[str, Any]:
         """``--hicache-storage-backend-extra-config`` for worker[index].
 
+        The linker reads the same flag but has its own strict option set
+        (unknown names fail startup): see sglang_linker_config.
+
         Mirrors KVCR's SGLang quick start: KVCR DRAM inside the worker, remote
         hints on, prefix keys passed to the storage layer, diagnostic telemetry
         on so the worker logs the ``KVCR L3 native stats`` lines the cases read.
@@ -757,6 +805,31 @@ class Stack:
             "operation_timeout_ms": 20000,
             "abandon_timeout_ms": 60000,
         }
+
+    def sglang_linker_config(self, index: int) -> dict[str, Any]:
+        """Direct-linker options for worker[index], as in KVCR's SGLang quick start.
+
+        kvcr_service_socket_path=None keeps KVCR in the worker (no Guard);
+        publish_inventory requires it. enable_telemetry logs the ``KVCR
+        telemetry`` lines the cases read.
+        """
+        return {
+            "publish_inventory": True,
+            "kvcr_service_socket_path": None,
+            "dram_size_gb": self.settings.pool_gb,
+            "advertise_host": self.advertise_host(),
+            "control_port": self.settings.control_ports[index],
+            "nixl_port": self.settings.kvcr_nixl_ports[index],
+            "enable_telemetry": True,
+            "startup_timeout_seconds": 300,
+            "operation_timeout_ms": 20000,
+            "abandon_timeout_ms": 60000,
+        }
+
+    def sglang_backend_config(self, index: int) -> dict[str, Any]:
+        if self.linker:
+            return self.sglang_linker_config(index)
+        return self.sglang_kvcr_config(index)
 
     def sglang_worker_command(self, index: int, *, kvcr: bool) -> list[str]:
         command = [
@@ -816,7 +889,16 @@ class Stack:
             ),
             *self.settings.extra_worker_args,
         ]
-        if kvcr:
+        if kvcr and self.linker:
+            command += [
+                # As in the quick start's linker mode.
+                "--kv-cache-dtype",
+                "bfloat16",
+                "--enable-unified-cache-external-linker",
+                "--unified-cache-external-linker-backend",
+                "kvcr",
+            ]
+        elif kvcr:
             command += [
                 "--enable-hierarchical-cache",
                 "--hicache-size",
@@ -829,8 +911,11 @@ class Stack:
                 "kvcr",
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
+            ]
+        if kvcr:
+            command += [
                 "--hicache-storage-backend-extra-config",
-                json.dumps(self.sglang_kvcr_config(index)),
+                json.dumps(self.sglang_backend_config(index)),
                 "--kv-events-config",
                 json.dumps(
                     {
@@ -1055,7 +1140,7 @@ class Stack:
             Path(env["PROMETHEUS_MULTIPROC_DIR"]).mkdir(parents=True, exist_ok=True)
             save_json(
                 self.evidence / f"{name}.kvcr-config.json",
-                self.sglang_kvcr_config(index) if kvcr else None,
+                self.sglang_backend_config(index) if kvcr else None,
             )
         else:
             save_json(

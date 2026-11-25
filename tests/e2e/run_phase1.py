@@ -60,6 +60,7 @@ from phase1.stack import (  # noqa: E402
     MODES,
     NON_GUARD,
     SGLANG,
+    SGLANG_MODES,
     Settings,
     Stack,
 )
@@ -134,6 +135,7 @@ class Runner:
             output=self.output,
             mode=args.mode,
             engine=args.engine,
+            sglang_mode=args.sglang_mode,
             sglang_verify_bytes=args.sglang_verify_bytes,
             worker_env=dict(
                 item.split("=", 1) for item in args.worker_env if "=" in item
@@ -206,6 +208,7 @@ class Runner:
             },
             "worker_args": list(args.worker_arg),
             "engine": args.engine,
+            "sglang_mode": args.sglang_mode,
             "sglang_verify_bytes": args.sglang_verify_bytes,
             "worker_env": sorted(args.worker_env),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
@@ -645,6 +648,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "TC-01..03 and TC-05 only)",
     )
     parser.add_argument(
+        "--sglang-mode",
+        choices=SGLANG_MODES,
+        default=SGLANG_MODES[0],
+        help="SGLang engine: hicache = HiCache with the KVCR storage backend; "
+        "linker = KVCR direct linker (GPU KV pages to/from KVCR, TP1 only)",
+    )
+    parser.add_argument(
         "--gpus",
         default="0,1",
         help="CUDA device indices: two for --topology agg (0,1), three for disagg "
@@ -876,6 +886,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--engine sglang needs --mode nonguard (no Guard service)")
         if args.topology != "agg" or args.external_services or args.remote_worker:
             parser.error("--engine sglang supports only --topology agg on one node")
+        if args.sglang_mode == "linker" and args.sglang_verify_bytes:
+            parser.error("--sglang-verify-bytes applies only to --sglang-mode hicache")
         unsupported = {"TC-04", "TC-06"} & set(args.cases.split(","))
         if unsupported:
             parser.error(

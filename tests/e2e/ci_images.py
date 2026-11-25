@@ -34,8 +34,15 @@ IMAGE_PROFILES = {
         "canary_scripts": ["tests/e2e/check_vllm_rank_initialization.py"],
     },
     # The SGLang fork commit, its pinned stack and the import canary live in
-    # the recipe; the base image is the digest pinned there (SGLANG_IMAGE).
+    # the recipe, selected by CI_IMAGE_PROFILE; the base image is the digest
+    # pinned there (SGLANG_IMAGE).
     "sglang-hicache": {
+        "recipe": "Dockerfile.quick-start-sglang",
+        "flavor": "vllm",
+        "python_version": "3.12",
+        "base_argument": "SGLANG_IMAGE",
+    },
+    "sglang-linker": {
         "recipe": "Dockerfile.quick-start-sglang",
         "flavor": "vllm",
         "python_version": "3.12",

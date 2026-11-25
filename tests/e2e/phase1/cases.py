@@ -386,9 +386,9 @@ class Context:
         started = parse_iso(start)
         deadline = time.monotonic() + self.telemetry_timeout
         log = self.stack.workers[worker_index].log_path
-        result = read_window(log, started)
+        result = read_window(log, started, layers=self.stack.telemetry_layers)
         while time.monotonic() < deadline:
-            result = read_window(log, started)
+            result = read_window(log, started, layers=self.stack.telemetry_layers)
             if predicate(result):
                 break
             time.sleep(1)
@@ -400,11 +400,11 @@ class Context:
         log = self.stack.workers[worker_index].log_path
         deadline = time.monotonic() + self.telemetry_timeout
         while time.monotonic() < deadline:
-            current = read_window(log, started)
+            current = read_window(log, started, layers=self.stack.telemetry_layers)
             if current.samples >= 2:
                 return current
             time.sleep(1)
-        return read_window(log, started)
+        return read_window(log, started, layers=self.stack.telemetry_layers)
 
     def peer_transfer_checks(
         self,

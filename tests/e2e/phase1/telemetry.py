@@ -6,7 +6,11 @@ vLLM logs ``KV Transfer metrics:`` lines (reset-interval samples of the
 connector and KVCR counters). SGLang's KVCR HiCache backend logs
 ``KVCR L3 native stats {json}`` lines every few seconds with the same KVCR
 counters under JSON tuple keys; they are mapped onto the vLLM metric names so
-the cases read both engines through one window API.
+the cases read both engines through one window API. SGLang's KVCR direct
+linker logs ``KVCR telemetry rank=N interval_s=S stats={json}`` instead, with
+``name[label,...].kind`` keys; its transfer block counts other than
+``local_fill`` are per (page, layer) and are divided by the model's layer count
+so a block is a page as in the other modes.
 
 Each Phase 1 worker runs one data-parallel rank, so every metric line in a log
 belongs to that worker. Values are interval samples; a window sums the samples
@@ -99,6 +103,58 @@ def sglang_metrics(
                 out[f"{base}_{field}"] = value
         elif field == "value":
             out[base] = value
+    return derive_tier_bytes(out, page_bytes)
+
+
+LINKER_STATS = re.compile(r"KVCR telemetry rank=\d+ interval_s=\S+ stats=(\{.*\})")
+LINKER_KEY = re.compile(r"^(?P<name>[^\[]+)\[(?P<labels>[^\]]*)\]\.(?P<kind>\w+)$")
+
+
+def linker_metrics(
+    stats: dict, layers: int, page_bytes: dict[str, float] | None = None
+) -> dict[str, int | float]:
+    """Map one SGLang linker ``KVCR telemetry`` payload onto vLLM metric names.
+
+    Keys are ``name[label,...].kind`` (``counter``, ``gauge``, or a histogram's
+    ``count``/``sum``/``max``). The linker moves KV layer by layer: its
+    ``source_write`` and delivery block counts are pages times layers and are
+    divided by ``layers`` (the raw value is kept under ``_per_layer:<metric>``).
+    ``local_fill`` deposits whole pages and is counted per page (a CI run on
+    Qwen3-0.6B logged 9 local_fill blocks / 66060288 bytes and 252 = 9 * 28
+    source_write blocks for the same bytes).
+    """
+    out: dict[str, int | float] = {}
+    for key, value in stats.items():
+        found = LINKER_KEY.match(key)
+        if found is None:
+            raise ValueError("invalid KVCR linker metric key")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            raise ValueError("invalid KVCR linker metric value")
+        labels = [label for label in found["labels"].split(",") if label]
+        base = metric(found["name"], *labels)
+        kind = found["kind"]
+        if kind in ("count", "sum"):
+            out[f"{base}_{kind}"] = value
+        elif kind in ("counter", "gauge"):
+            if (
+                found["name"] == TRANSFER_BLOCKS
+                and labels[:1] != [LOCAL_FILL]
+                and layers > 1
+            ):
+                out[f"_per_layer:{base}"] = value
+                value = value // layers if value % layers == 0 else value / layers
+            out[base] = value
+    return derive_tier_bytes(out, page_bytes)
+
+
+def derive_tier_bytes(
+    out: dict[str, int | float], page_bytes: dict[str, float] | None
+) -> dict[str, int | float]:
+    """Add the tier read/write bytes SGLang lacks (see sglang_metrics)."""
     fill_blocks = out.get(metric(TRANSFER_BLOCKS, LOCAL_FILL), 0)
     fill_bytes = out.get(metric(TRANSFER_BYTES, LOCAL_FILL), 0)
     if page_bytes is not None and fill_blocks and fill_bytes:
@@ -197,8 +253,11 @@ class Snapshot:
     provenance: dict[str, str] = field(default_factory=dict)
 
 
-def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
-    """Return interval snapshots and parse errors for complete log lines."""
+def parse_log(text: str, layers: int = 1) -> tuple[list[Snapshot], list[str]]:
+    """Return interval snapshots and parse errors for complete log lines.
+
+    layers: the model's layer count, for SGLang linker logs (see linker_metrics).
+    """
     snapshots: list[Snapshot] = []
     errors: list[str] = []
     last_precise: datetime | None = None
@@ -240,6 +299,30 @@ def parse_log(text: str) -> tuple[list[Snapshot], list[str]]:
                     stamp,
                     number,
                     sglang_metrics(payload, page_bytes),
+                    provenance={
+                        TIER_READ_BYTES: "derived",
+                        TIER_WRITE_BYTES: "measured:local_fill",
+                    },
+                )
+            )
+            continue
+        linker = LINKER_STATS.search(line)
+        if linker is not None:
+            # SGLang linker: Dynamo's formatter stamps the line; the sample
+            # covers the interval_s seconds before it.
+            try:
+                stats = json.loads(linker.group(1))
+                if precise is None or not isinstance(stats, dict):
+                    raise ValueError("unstamped or malformed payload")
+                values = linker_metrics(stats, layers, page_bytes)
+            except ValueError:
+                errors.append(f"line {number}: unparsable SGLang linker telemetry")
+                continue
+            snapshots.append(
+                Snapshot(
+                    precise,
+                    number,
+                    values,
                     provenance={
                         TIER_READ_BYTES: "derived",
                         TIER_WRITE_BYTES: "measured:local_fill",
@@ -427,8 +510,10 @@ def window(
     return Window(totals, count, flushed, failures, list(errors), provenance)
 
 
-def read_window(log: Path, start: datetime, end: datetime | None = None) -> Window:
-    snapshots, errors = parse_log(log.read_text(errors="replace"))
+def read_window(
+    log: Path, start: datetime, end: datetime | None = None, *, layers: int = 1
+) -> Window:
+    snapshots, errors = parse_log(log.read_text(errors="replace"), layers)
     return window(snapshots, errors, start, end)
 
 
