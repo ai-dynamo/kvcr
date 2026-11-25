@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "integrations": {
+    "vllm": {"build_job": "build", "test_job": "e2e"}
+  }
+}
