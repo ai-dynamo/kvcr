@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Request advice and independent prefetch/move hint execution."""
 
-import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -194,8 +193,8 @@ def test_fetch_hint_without_request_id_is_accepted(monkeypatch):
     assert not kvcr._core._independent_hint_handler._received
 
 
-_KEY = BlockKey(b"full-key-with-group")
-_TAIL_KEY = BlockKey(b"tail-piece-key")
+_KEY = _key(123) + b"full-key-with-group"
+_TAIL_KEY = _key(124) + b"tail-piece-key"
 
 
 def _group(**changes):
@@ -210,9 +209,7 @@ def pair(monkeypatch):
     """Two peers with reverse lookup; the source holds _KEY and both record
     hint results: admission at the source, the transfer at the target."""
     pair = _Pair()
-    pair.source.kvcr._core._key_adapter = SimpleNamespace(
-        decode_from_router={123: _KEY, 124: _TAIL_KEY}.__getitem__
-    )
+    pair.source.kvcr._core._key_adapter = _PrefixAdapter()
     pair.source.deposit(_KEY)
     pair.source_reports, pair.target_reports = (
         _record_hint_results(monkeypatch, peer.kvcr)
@@ -399,9 +396,8 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     if existing:
         handle = kvcr.deposit({_KEY: [target.ref()]}, expected_layout=layout)
         assert dict(_poll_until(kvcr, bool))[handle][_KEY].success
-    core._key_adapter = SimpleNamespace(
-        encode_to_router=lambda key: 123, decode_from_router={123: _KEY}.__getitem__
-    )
+    core._key_adapter = _PrefixAdapter()
+    assert core.resolve_hashes((123,)) == ({}, {123: "not_found"})
     action = _HintAction("nr", "kv.no_retain", "1.0", {
         "block_hashes": [123, 999, 123], "no_retain": True,
     })  # fmt: skip
@@ -426,7 +422,7 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     report = pair.target_reports.pop()
     failures = {999: "not_found"}
     if protected or not existing:
-        failures[123] = "protected" if protected else "source_not_transferable"
+        failures[123] = "protected" if protected else "not_found"
     assert report.failures == failures
     assert report.status is (
         HintStatus.FAILED if 123 in failures else HintStatus.COMPLETED
@@ -454,7 +450,6 @@ def test_independent_no_retain_controls_full_and_partial_deposits(
     "reason",
     [
         "source_has_no_managed_dram",
-        "key_adapter_unavailable",
         "self_destination",
         "destination-less hints are not currently supported",
         "no_retain is not supported by this hint",
@@ -470,8 +465,6 @@ def test_independent_hints_are_rejected_at_the_source_before_resolution(
         kvcr, results = _fetch_kvcr(monkeypatch)
     elif reason == "self_destination":
         destination = pair.source.control.endpoint
-    elif reason == "key_adapter_unavailable":
-        kvcr._core._key_adapter = None
     hint = _independent("a1", destination, [1], action_type)
     if reason.startswith("no_retain"):
         hint.payload["no_retain"] = False
@@ -520,6 +513,7 @@ def test_request_returning_to_its_sender_fails_by_incarnation(pair, incarnation)
         (None, "destination_has_no_managed_dram"),
         ({"sender_control_endpoint": None}, "invalid_request"),
         ({"groups": ()}, "invalid_request"),
+        ({"groups": (_group(block_hashes=(-1,)),)}, "invalid_request"),
         ({"groups": (_group(keys=(), block_hashes=()),)}, "invalid_request"),
         (
             {"groups": (_group(keys=(_KEY, _KEY), block_hashes=(123, 124)),)},
@@ -561,15 +555,7 @@ def test_destination_rejects_unusable_requests(pair, changes, reason, monkeypatc
     _idle(pair)
 
 
-def test_all_failed_resolution_runs_under_the_owner_lock(pair, monkeypatch):
-    source = pair.source.kvcr._core
-    owner = threading.get_ident()
-
-    def decode(block_hash):
-        assert threading.get_ident() == owner and source._state_lock._is_owned()
-        raise KeyError(block_hash)
-
-    monkeypatch.setattr(source._key_adapter, "decode_from_router", decode)
+def test_unresolved_prefetch_is_reported_without_forwarding(pair):
     _submit(pair, "kv.prefetch", hashes=(999,))
     [result] = pair.source_reports
     assert result.status is HintStatus.FAILED and result.failures == {999: "not_found"}
@@ -610,6 +596,7 @@ def test_independent_transfer_preserves_carrier_and_releases_claims(
     assert not remote._request_hints
     core = pair.target.kvcr._core
     assert core._block_record_map[_KEY].local_dram.claim_count == 0
+    assert core.resolve_hashes((123,)) == ({(("",), (16,)): {_KEY: 123}}, {})
     assert len(pair.source.agent.xfers) - before == (0 if cached else 1)
     expected = (
         (QueryStatus.MISS, None)
@@ -619,6 +606,25 @@ def test_independent_transfer_preserves_carrier_and_releases_claims(
     pair.until(lambda: pair.source.kvcr.query((_KEY,)) == [expected])
     _idle(pair)
     assert len(pair.source_reports) == len(pair.target_reports) == 1
+
+
+def test_move_target_rejects_invalidation_until_each_key_is_handed_off(pair):
+    target = pair.target.kvcr
+    pair.source.deposit(_TAIL_KEY, 1)
+    pair.target.deposit(_KEY)
+    both = _router_hint(None, (123, 124), action_type="kv.invalidate")
+    writes = len(pair.source.agent.xfers)
+    _submit(pair, "kv.move", hashes=(123, 124))
+    pair.until(lambda: len(pair.source.agent.xfers) > writes)
+    target.submit_hint(both)  # The cached hit has handed off already.
+    mixed = pair.target_reports[-1]
+    assert mixed.status is HintStatus.COMPLETED and mixed.failures == {124: "protected"}
+    pair.source.agent.state = "DONE"
+    _idle(pair)
+    assert pair.source.kvcr.query((_KEY, _TAIL_KEY)) == [_MISS, _MISS]
+    target.submit_hint(both)
+    assert pair.target_reports[-1].failures == {123: "not_found"}
+    assert target.query((_KEY, _TAIL_KEY)) == [_MISS, _MISS]
 
 
 @pytest.mark.parametrize("at_submit", [False, True])

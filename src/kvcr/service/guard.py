@@ -160,19 +160,20 @@ def _without_g3(
 
 def _with_g3(
     records: dict[BlockKey, _BlockRecord],
-    g3_records: Mapping[BlockKey, tuple[_G3Residency, int]],
+    g3_records: Mapping[BlockKey, tuple[_G3Residency, int, int | bytes | None]],
 ) -> dict[BlockKey, _BlockRecord]:
     """Put the kept half back, in place, for the primary that will open G3.
 
     A block the Guard evicted keeps its G3 residency and loses its G2 one, which
     is what a returning primary has to be told.
     """
-    for key, (g3, position) in g3_records.items():
+    for key, (g3, position, block_hash) in g3_records.items():
         record = records.get(key)
         if record is None:
-            records[key] = _BlockRecord(g3=g3, position=position)
-        else:
-            record.g3 = g3
+            record = records[key] = _BlockRecord(position=position)
+        record.g3 = g3
+        if record.block_hash is None:
+            record.block_hash = block_hash
     return records
 
 
@@ -193,7 +194,9 @@ class _RecoveryState:
         self._journal: RecoveryJournal | None = None
         self.mirror: _RecoveryMirror | None = None
         # Recovered half a Guard cannot serve; kept for the next primary, which can.
-        self._g3_records: dict[BlockKey, tuple[_G3Residency, int]] = {}
+        self._g3_records: dict[
+            BlockKey, tuple[_G3Residency, int, int | bytes | None]
+        ] = {}
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -270,7 +273,7 @@ class _RecoveryState:
     ) -> dict[BlockKey, _BlockRecord]:
         """Keep the unserved G3 half and transfer the G2 half in place."""
         self._g3_records = {
-            key: (record.g3, record.position)
+            key: (record.g3, record.position, record.block_hash)
             for key, record in records.items()
             if record.g3 is not None
         }

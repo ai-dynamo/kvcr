@@ -100,6 +100,7 @@ class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
         | None
     ) = None
     position: Annotated[int, msgspec.Meta(ge=-1)] = -1
+    block_hash: int | bytes | None = None
 
 
 _RECOVERY_ENCODER = msgspec.msgpack.Encoder()
@@ -137,6 +138,7 @@ def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
         g2=local_dram.slots if complete else None,
         g3=(disk.layout, disk.slots) if disk is not None else None,
         position=record.position,
+        block_hash=record.block_hash if complete or disk is not None else None,
     )
 
 
@@ -170,6 +172,7 @@ def _decode_recovery_record(
         ),
         g3=disk,
         position=recovered.position,
+        block_hash=recovered.block_hash,
     )
 
 

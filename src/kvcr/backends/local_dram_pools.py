@@ -264,7 +264,7 @@ class _LocalDramPools:
             return state.operations
 
     def _mark_source_pending(self, key: BlockKey) -> None:
-        if self._kvcr.framework_control is not None:
+        if self._kvcr._source_index_enabled:
             with self._source_state.lock:
                 self._source_state.index[key] = None
 
@@ -274,10 +274,13 @@ class _LocalDramPools:
         residency: _LocalDramResidency,
         refs: tuple[_TransferRef, ...] | None = None,
     ) -> None:
-        # Finishing an existing fill must not reopen a source being drained.
+        if not self._kvcr._source_index_enabled or residency.pending_labels:
+            return
+        self._kvcr._update_block_hash(key)
+        # A complete copy being drained still has an identity, but admits no readers.
         if (
-            self._kvcr.framework_control is None
-            or residency.pending_labels
+            residency.state is not _LocalDramState.READY
+            or residency.retire_on_release
             or self._kvcr._block_record_map[key].pending_invalidation
         ):
             return
@@ -289,12 +292,8 @@ class _LocalDramPools:
             )
         state = self._source_state
         with state.lock:
-            if (
-                residency.state is _LocalDramState.READY
-                and not residency.retire_on_release
-            ):
-                residency.refs = refs
-                state.index[key] = residency
+            residency.refs = refs
+            state.index[key] = residency
 
     def acquire_readers(
         self,
@@ -589,7 +588,7 @@ class _LocalDramPools:
                 raise RuntimeError(f"local DRAM source cannot retire {key!r}")
             with state.lock:
                 residency.retire_on_release = True
-                if self._kvcr.framework_control is not None:
+                if key in state.index:
                     state.index[key] = None
 
     def abandon_capacity_eviction(self, key: BlockKey) -> None:

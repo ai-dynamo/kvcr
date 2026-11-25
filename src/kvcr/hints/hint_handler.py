@@ -142,7 +142,7 @@ class _IndependentHintHandler(_HintHandler):
         self._received: deque[_KeysToFetch] = deque()
         # Layout fetches share one receipt and completion count per hint.
         self._pending_operations: dict[
-            OpHandle, tuple[_PendingHint, dict[BlockKey, int]]
+            OpHandle, tuple[_PendingHint, dict[int, BlockKey]]
         ] = {}
 
     # Source: the hint's recipient.
@@ -165,8 +165,6 @@ class _IndependentHintHandler(_HintHandler):
         core = self._core
         if core._local_dram is None:
             reason = "source_has_no_managed_dram"
-        elif core._key_adapter is None:
-            reason = "key_adapter_unavailable"
         elif isinstance(hint, _KVPrefetchHint) and hint.destination_endpoint == getattr(
             core.framework_control, "endpoint", None
         ):
@@ -180,23 +178,27 @@ class _IndependentHintHandler(_HintHandler):
                 )
             )
             return
-        with core._state_lock:
-            groups, failures = core.resolve_hashes(hint.block_hashes)
-            status = HintStatus.ACCEPTED if groups else HintStatus.FAILED
-            if isinstance(hint, _KVInvalidateHint):
-                # A resolved key without a complete READY copy, including one
-                # still filling, fails resolution as source_not_transferable.
-                by_key = {k: h for g in groups.values() for k, h in g.items()}
-                queued = set(core._invalidation_handler.submit(by_key))
-                for key, block_hash in by_key.items():
-                    if key not in queued:
-                        failures[block_hash] = "protected"
+        groups, failures = core.resolve_hashes(hint.block_hashes)
+        status = HintStatus.ACCEPTED if groups else HintStatus.FAILED
+        if isinstance(hint, _KVInvalidateHint):
+            by_hash = {h: k for group in groups.values() for k, h in group.items()}
+            ops = core._local_dram._pending_residency_ops
+            for handle, (pending, targets) in self._pending_operations.items():
+                op = ops.get(("fetch", handle))
+                if op is None or pending.receipt.action_type != "kv.move":
+                    continue
+                for h in hint.block_hashes & targets.keys():
+                    if targets[h] not in op.results:
+                        failures[h] = "protected"
+                        by_hash.pop(h, None)
+            with core._state_lock:
+                queued = set(core._invalidation_handler.submit(by_hash.values()))
                 core._drain_invalidation()
-                # Removal is queued, not finished; no later report follows.
-                status = HintStatus.COMPLETED if queued else HintStatus.FAILED
-        # Queue before reporting: a failed submission must raise before any
-        # report. One-way: a send failure is logged, not reported.
-        if groups and isinstance(hint, _KVPrefetchHint):
+            for h, key in by_hash.items():
+                if key not in queued:
+                    failures[h] = "protected"
+            status = HintStatus.COMPLETED if queued else HintStatus.FAILED
+        elif groups:
             core._progress.submit(
                 _KeysToFetch(
                     action_id=hint.action_id,
@@ -267,6 +269,7 @@ class _IndependentHintHandler(_HintHandler):
             )
             or len(set(keys)) != len(keys)
             or len(set(hashes)) != len(hashes)
+            or any(h < 0 for h in hashes)
         ):
             reason = "invalid_request"
         else:
@@ -284,7 +287,7 @@ class _IndependentHintHandler(_HintHandler):
 
         pending = _PendingHint(receipt, len(request.groups))
         for group in request.groups:
-            operation = pending, dict(zip(group.keys, group.block_hashes))
+            operation = pending, dict(zip(group.block_hashes, group.keys))
             if self._layout_sizes(group.key_layout) != group.sizes:
                 self._complete(*operation, {}, reason="incompatible_layout")
                 continue
@@ -293,6 +296,7 @@ class _IndependentHintHandler(_HintHandler):
                     group.keys,
                     expected_layout=list(group.key_layout),
                     source_endpoint=source,
+                    source_hashes=dict(zip(group.keys, group.block_hashes)),
                     move=request.move,
                 )
             except Exception as error:
@@ -333,7 +337,7 @@ class _IndependentHintHandler(_HintHandler):
     def _complete(
         self,
         pending: _PendingHint,
-        selected: dict[BlockKey, int],
+        selected: dict[int, BlockKey],
         results: dict[BlockKey, OpEntryResult],
         *,
         reason: str = "operation_failed",
@@ -349,7 +353,7 @@ class _IndependentHintHandler(_HintHandler):
         receipt = pending.receipt
         failures = receipt.failures
         assert failures is not None
-        for key, block_hash in selected.items():
+        for block_hash, key in selected.items():
             result = results.get(key)
             if result is None or not result.success:
                 failures[block_hash] = reason
