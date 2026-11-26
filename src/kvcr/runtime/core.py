@@ -23,6 +23,7 @@ from ..backends.local_dram_pools import (
     _LocalDramResidency,
     _LocalDramState,
 )
+from ..backends.unmanaged_storage import _G4
 from ..config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -230,6 +231,7 @@ class _KVCRCore:
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
+        g4_config = backend_configs.g4
         policy = bindings.policy
         if policy is None:
             policy = G3LRUPolicy() if g3_config is not None else LRUPolicy()
@@ -332,6 +334,12 @@ class _KVCRCore:
             if g3_config is not None and local_dram_config is not None
             else None
         )
+        self._g4 = (
+            _G4(g4_config, f"{self.nixl_agent_name}-g4")
+            if g4_config is not None and local_dram_config is not None
+            else None
+        )
+
         # Built after the backends so hint handlers can bind to them.
         self._independent_hint_handler = _IndependentHintHandler(self)
         self._hints_dispatcher = HintDispatcher(self)
@@ -354,6 +362,8 @@ class _KVCRCore:
             self._remote_fw_dram.initialize_progress(progress)
             if self._g3 is not None:
                 self._g3.initialize_progress(progress)
+            if self._g4 is not None:
+                self._g4.initialize_progress(progress)
 
         def close_progress() -> None:
             try:
@@ -361,6 +371,12 @@ class _KVCRCore:
                     self._g3.close_progress()
             finally:
                 self._remote_fw_dram.close_progress()
+
+            if self._g4 is not None:
+                try:
+                    self._g4.close_progress()
+                finally:
+                    pass
 
         wait_for_input = (
             _wait_for_wake
