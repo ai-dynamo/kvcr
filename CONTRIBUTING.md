@@ -47,12 +47,9 @@ uv run pytest tests/unit -q
 CI runs both checks automatically.
 
 GPU E2E tests require maintainer approval with `/ok to test <commit-sha>`
-on the PR. The Docker Build workflow builds and publishes the test image,
-then runs the two-GPU test to verify cross-rank KV cache reuse.
-
-Check the "Verify cross-rank KVCR reuse" step for results.
-Full logs and responses are available in the `kvcr-vllm-e2e-<attempt>`
-artifact.
+on the PR. The Docker Build workflow builds the image and runs the two-GPU
+vLLM model/topology/mode matrix. See [GPU CI](docs/ci.md)
+for coverage, local execution and test artifacts.
 
 ## Signing Your Work
 

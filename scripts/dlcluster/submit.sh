@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bundle the current kvcr-phase1-ci HEAD, ship it to dlcluster, submit phase1.sbatch.
+# Bundle the current HEAD, ship it to dlcluster, submit e2e.sbatch.
 #
 #   scripts/dlcluster/submit.sh [--matrix "dense hybrid"] [--cases TC-01,...] \
 #                               [--timeout 3600] [--nodelist NODE] [--partition P] [--image local/kvcr-phase1:<sha>]
@@ -40,10 +40,10 @@ esac
 repo=$(git rev-parse --show-toplevel); cd "$repo"
 git diff --quiet HEAD -- . || { echo "commit your changes first (image build needs clean source)" >&2; exit 1; }
 ref=$(git rev-parse HEAD)
-bundle="kvcr-phase1-${ref:0:12}.bundle"
+bundle="kvcr-e2e-${ref:0:12}.bundle"
 git bundle create "/tmp/$bundle" HEAD >/dev/null
-scp -q "/tmp/$bundle" scripts/dlcluster/phase1.sbatch "$HOST:~/"
+scp -q "/tmp/$bundle" scripts/dlcluster/e2e.sbatch "$HOST:~/"
 extra_q=""; for a in "${EXTRA[@]}"; do extra_q+=" $(printf %q "$a")"; done  # '&' in constraints must reach sbatch, not the remote shell
 ssh "$HOST" "mkdir -p ~/kvcr-runs && sbatch $extra_q \
   --export=ALL,KVCR_BUNDLE=\$HOME/$bundle,KVCR_REF=$ref,KVCR_MATRIX='$MATRIX',KVCR_CASES=${CASES//,/:},KVCR_TIMEOUT=$TIMEOUT,KVCR_IMAGE=$IMAGE,KVCR_EXTRA='$EXTRA_ARGS',KVCR_TOPOLOGY=$TOPOLOGY,KVCR_GPU_UTIL=$GPU_UTIL \
-  ~/phase1.sbatch"
+  ~/e2e.sbatch"

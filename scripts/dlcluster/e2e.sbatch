@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=doxu-kvcr-phase1
+#SBATCH --job-name=kvcr-e2e
 #SBATCH --partition=general
 #SBATCH --gres=gpu:H100:2
 #SBATCH --constraint="2GPU&x86_64&UB24.04"
@@ -9,7 +9,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=/home/doxu/kvcr-runs/%j.out
 #
-# KVCR test plan Phase 1 (TC-01..TC-06) on one dlcluster node with 2x H100.
+# KVCR E2E tests (TC-01..TC-06) on one dlcluster node with 2x H100.
 # submit.sh adds --exclusive for the 2-GPU request: shared 8-GPU nodes hand out
 # GPUs with other tenants' memory on them and vLLM's 0.8 utilization check then
 # fails at startup. With --gpus 1 (submit.sh) both workers share one GPU at
@@ -18,13 +18,13 @@
 # UB24.04: kernel 6.8 (Guard needs >= 6.5); the UB22.04 nodes run 5.15 and the
 # ones seen so far also cannot reach github.com for the source resolve step.
 # Inputs (env, set by submit.sh):
-#   KVCR_BUNDLE   git bundle of the kvcr-phase1-ci branch (in $HOME)
+#   KVCR_BUNDLE   git bundle of the tested revision (in $HOME)
 #   KVCR_REF      commit to check out from the bundle
 #   KVCR_MATRIX   space-separated config names to run (default: dense hybrid)
 #   KVCR_CASES    cases per run (default TC-01..TC-06)
 #   KVCR_TIMEOUT  harness timeout per run in seconds (default 3600)
 #   KVCR_IMAGE    optional existing local image to reuse instead of building
-#   KVCR_EXTRA    optional extra run_phase1.sh args for every config, e.g.
+#   KVCR_EXTRA    optional extra run_e2e.sh args for every config, e.g.
 #                 "--harness-arg=--batch-invariant"
 #   KVCR_TOPOLOGY single (default) or sidecar: kvcr_service per worker in its
 #                 own container, sharing /run/kvcr and /dev/shm/kvcr with the
@@ -64,9 +64,9 @@ docker info --format 'docker {{.ServerVersion}} driver={{.Driver}} cgroup={{.Cgr
 # exclusive) and make sure this job's own container dies with the job.
 sweep() { docker ps -aq --filter label=io.ai-dynamo.kvcr.phase1-run | xargs -r docker rm -f >/dev/null 2>&1 || true; }
 leftover=$(docker ps -q --filter label=io.ai-dynamo.kvcr.phase1-run | wc -l)
-[[ "$leftover" -eq 0 ]] || log "removing $leftover leftover phase1 container(s)"
+[[ "$leftover" -eq 0 ]] || log "removing $leftover leftover E2E container(s)"
 sweep
-trap 'log "job ending (signal/exit); removing phase1 containers"; sweep' EXIT TERM INT
+trap 'log "job ending (signal/exit); removing E2E containers"; sweep' EXIT TERM INT
 df -h /tmp /var/lib/docker /dev/shm | tee -a "$RUNS/docker.txt"
 docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}} {{.CreatedSince}}' | grep -i kvcr | tee "$RUNS/images-before.txt" || true
 
@@ -120,7 +120,7 @@ SIDECAR_ARGS=()
 
 start_sidecars() {
   local name=$1 digest=$2
-  RUNKVCR="$W/run-kvcr-$name"; SHM="/dev/shm/kvcr-phase1-$SLURM_JOB_ID-$name"
+  RUNKVCR="$W/run-kvcr-$name"; SHM="/dev/shm/kvcr-e2e-$SLURM_JOB_ID-$name"
   mkdir -p "$RUNKVCR" "$SHM/0" "$SHM/1"; chmod 1777 "$RUNKVCR" "$SHM"
   for i in 0 1; do
     docker run -d --name "kvcr-svc-$name-$i" \
@@ -148,18 +148,18 @@ start_sidecars() {
 stop_sidecars() {
   local name=$1
   docker ps -aq --filter "name=kvcr-svc-$name-" | xargs -r docker rm -f >/dev/null 2>&1 || true
-  mkdir -p "$RUNS/phase1-$name"; cp "$RUNKVCR"/kvcr-service-*.log "$RUNS/phase1-$name/" 2>/dev/null || true
+  mkdir -p "$RUNS/e2e-$name"; cp "$RUNKVCR"/kvcr-service-*.log "$RUNS/e2e-$name/" 2>/dev/null || true
   rm -rf "$SHM" 2>/dev/null || true
 }
 
 run_config() {
   local name=$1; shift
-  local out="$W/artifacts/phase1-$name"
+  local out="$W/artifacts/e2e-$name"
   SIDECAR_ARGS=()
-  if [[ "$TOPOLOGY" == sidecar ]]; then start_sidecars "$name" "kvcr-phase1-$SLURM_JOB_ID-$name"; fi
+  if [[ "$TOPOLOGY" == sidecar ]]; then start_sidecars "$name" "kvcr-e2e-$SLURM_JOB_ID-$name"; fi
   log "=== run $name ($TOPOLOGY): cases=$CASES ==="
   set +e
-  bash scripts/docker/run_phase1.sh \
+  bash scripts/docker/run_e2e.sh \
     --gpus "$GPUS" "${IMAGE_ARG[@]}" \
     --build-output "$E2E_BUILD_OUTPUT" \
     --output-dir "$out" \
@@ -169,9 +169,9 @@ run_config() {
   local rc=${PIPESTATUS[0]}
   set -e
   log "=== run $name exit=$rc ==="
-  cp -r "$out" "$RUNS/phase1-$name"
+  cp -r "$out" "$RUNS/e2e-$name"
   if [[ "$TOPOLOGY" == sidecar ]]; then stop_sidecars "$name"; fi
-  python3 - "$out/run/result.json" <<'PY' | tee "$RUNS/phase1-$name.summary.txt" || true
+  python3 - "$out/run/result.json" <<'PY' | tee "$RUNS/e2e-$name.summary.txt" || true
 import json, sys
 r = json.load(open(sys.argv[1]))
 print("status", r.get("status"), "model", r.get("model"), "error", r.get("error"))

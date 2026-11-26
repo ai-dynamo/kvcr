@@ -10,141 +10,73 @@ on:
         description: Published KVCR image reference, preferably pinned by digest
         required: true
         type: string
-      model:
-        required: false
-        type: string
-        default: Qwen/Qwen3-0.6B
   workflow_dispatch:
     inputs:
       image:
         description: Published KVCR image reference, preferably pinned by digest
         required: true
         type: string
-      model:
-        required: true
-        type: string
-        default: Qwen/Qwen3-0.6B
 
 permissions:
   contents: read
 
 jobs:
-  peer-transfer:
-    runs-on: prod-kvcr-tester-amd-gpu-2-v1
-    container:
-      image: ${{ inputs.image }}
-    timeout-minutes: 30
-    env:
-      HF_HOME: /scratch/huggingface
-      VLLM_CACHE_ROOT: /scratch/vllm
-      XDG_CACHE_HOME: /scratch/cache
+  matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      configurations: ${{ steps.matrix.outputs.configurations }}
     steps:
       - uses: actions/checkout@v4
-      - name: Show NVIDIA devices
-        run: nvidia-smi
-      - name: Verify cross-rank KVCR reuse
-        shell: bash
-        env:
-          MODEL: ${{ inputs.model }}
-          KVCR_TEST_IMAGE: ${{ inputs.image }}
-        run: |
-          set -euo pipefail
-          python3 -u tests/e2e/run_vllm_kvcr.py --model "$MODEL"
-      - name: Save serving logs and responses
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kvcr-vllm-e2e-${{ github.run_attempt }}
-          path: e2e-artifacts/
-          retention-days: 7
+      - id: matrix
+        name: Select vLLM configurations
+        run: echo "configurations=$(python3 tests/e2e/run_ci_profile.py --matrix)" >> "$GITHUB_OUTPUT"
 
-  phase1:
-    # KVCR test plan Phase 1 functional gate in Guard mode on the same image and
-    # runner, after the peer-transfer smoke test. Guard mode needs a runner kernel
-    # of 6.5 or newer; otherwise the harness reports BLOCKED and the job fails.
-    # --batch-invariant keeps the bare-engine reference deterministic so token
-    # comparison is exact. Later parts of the series extend --cases as they add
-    # cases; TC-05/06 (performance, recovery timing) stay manual until a nightly
-    # lane exists.
-    needs: peer-transfer
+  profiles:
+    name: ${{ matrix.profile }}
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.configurations) }}
+    # Each job owns two GPUs; runner capacity determines parallelism.
     runs-on: prod-kvcr-tester-amd-gpu-2-v1
     container:
       image: ${{ inputs.image }}
-    timeout-minutes: 60
+    timeout-minutes: 95
     env:
       HF_HOME: /scratch/huggingface
       VLLM_CACHE_ROOT: /scratch/vllm
       XDG_CACHE_HOME: /scratch/cache
+      KVCR_TEST_IMAGE: ${{ inputs.image }}
     steps:
       - uses: actions/checkout@v4
       - name: Show NVIDIA devices
         run: nvidia-smi
-      - name: Run Phase 1 (TC-01,TC-02,TC-03,TC-04) in Guard mode
+      - name: Run tests
         shell: bash
         env:
-          MODEL: ${{ inputs.model }}
+          PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1/run \
-            --model "$MODEL" --mode guard --batch-invariant --timeout 2400 \
-            --cases TC-01,TC-02,TC-03,TC-04
-      - name: Save Phase 1 evidence
+          exec python3 -u tests/e2e/run_ci_profile.py \
+            --profile "$PROFILE" --output-dir "artifacts/$PROFILE"
+      - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kvcr-phase1-${{ github.run_attempt }}
-          path: artifacts/phase1/
+          name: ${{ matrix.profile }}-${{ github.run_attempt }}
+          path: artifacts/${{ matrix.profile }}/
+          if-no-files-found: error
           retention-days: 14
 
-  phase1-2p1d:
-    # 2P+1D on the two-GPU runner: prefill workers 0 and 1 share GPU 0 at
-    # --gpu-memory-utilization 0.35, the decode worker has GPU 1. Functional
-    # verdicts only (Guard takeover, hinted delivery, recovery); latencies are
-    # not comparable with a dedicated-GPU layout. kvcr-service sidecars run as
-    # background processes of this step, as the harness requires for disagg.
-    # Runs after phase1: both jobs share the runner host's Hugging Face cache,
-    # and two engines fetching the same model at once fail on its blob lock.
-    needs: [peer-transfer, phase1]
-    runs-on: prod-kvcr-tester-amd-gpu-2-v1
-    container:
-      image: ${{ inputs.image }}
-    timeout-minutes: 60
-    env:
-      HF_HOME: /scratch/huggingface
-      VLLM_CACHE_ROOT: /scratch/vllm
-      XDG_CACHE_HOME: /scratch/cache
+  summary:
+    name: Complete vLLM matrix
+    if: always()
+    needs: [matrix, profiles]
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Show NVIDIA devices
-        run: nvidia-smi
-      - name: Run Phase 1 2P+1D (TC-01,TC-02,TC-03,TC-04,TC-06) with shared prefill GPU
-        shell: bash
+      - name: Require successful jobs
         env:
-          MODEL: ${{ inputs.model }}
-          DIGEST: phase1-2p1d-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          SVC=/tmp/kvcr-svc; mkdir -p "$SVC" /dev/shm/kvcr-2p1d/0 /dev/shm/kvcr-2p1d/1
-          # KVCR 0.2.0 moved the service module to kvcr.service.server; older
-          # releases expose kvcr.kvcr_service. Pick by what the image provides.
-          SERVICE_PY="import importlib.util as u, runpy; runpy.run_module('kvcr.service.server' if u.find_spec('kvcr.service') else 'kvcr.kvcr_service', run_name='__main__')"
-          for i in 0 1; do
-            python3 -c "$SERVICE_PY" --socket-path "$SVC/memory-$i.sock" \
-              --pool-dir /dev/shm/kvcr-2p1d/$i --guard-count 1 --pool-sizes-gb 2 \
-              --compatibility-digest "$DIGEST" --log-level DEBUG \
-              > "$SVC/kvcr-service-$i.log" 2>&1 &
-          done
-          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1-2p1d/run \
-            --model "$MODEL" --mode guard --batch-invariant --timeout 2400 \
-            --topology disagg --gpus 0,0,1 --gpu-memory-utilization 0.35 \
-            --external-services "$SVC" --compatibility-digest "$DIGEST" \
-            --cases TC-01,TC-02,TC-03,TC-04,TC-06
-      - name: Save 2P+1D evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kvcr-phase1-2p1d-${{ github.run_attempt }}
-          path: |
-            artifacts/phase1-2p1d/
-            /tmp/kvcr-svc/*.log
-          retention-days: 14
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+          TEST_RESULT: ${{ needs.profiles.result }}
+        run: test "$MATRIX_RESULT" = success && test "$TEST_RESULT" = success

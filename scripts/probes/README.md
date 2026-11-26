@@ -1,7 +1,7 @@
 # Bare-vLLM probes
 
 Standalone scripts run against `vllm serve` (no KVCR, no Dynamo) to establish
-engine behaviour the Phase 1 verdicts rely on. Qwen3.5-4B, `--mamba-cache-mode align`.
+engine behaviour the E2E assertions rely on. Qwen3.5-4B, `--mamba-cache-mode align`.
 
 | script | question | finding (2026-10-18/19) |
 | --- | --- | --- |

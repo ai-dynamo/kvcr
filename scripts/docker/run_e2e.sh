@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Run KVCR test plan v7 Phase 1 (TC-01..TC-04) in the built integration image
+# Run KVCR E2E tests (TC-01..TC-04) in the built integration image
 # on exactly two explicitly selected GPUs.
 #
-#   bash scripts/docker/run_phase1.sh --gpus 0,1 [--image <ref>] [--output-dir DIR]
+#   bash scripts/docker/run_e2e.sh --gpus 0,1 [--image <ref>] [--output-dir DIR]
 #        [--mode guard|nonguard] [--cases TC-01,TC-02] [--timeout SEC]
 #        [--cpus N] [--cpuset-cpus LIST] [--memory SIZE] [--hf-cache DIR]
 #
@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-parser = argparse.ArgumentParser(prog="run_phase1.sh")
+parser = argparse.ArgumentParser(prog="run_e2e.sh")
 parser.add_argument("--gpus", required=True,
                     help="one or two GPU indices or UUIDs, comma separated (one = both workers share it)")
 parser.add_argument("--image", help="image reference; default from artifacts/build")
@@ -41,7 +41,7 @@ parser.add_argument("--memory")
 parser.add_argument("--hf-cache", type=Path, help="host directory reused as HF_HOME")
 parser.add_argument("--allow-blocked", action="store_true")
 parser.add_argument("--harness-arg", action="append", default=[],
-                    help="extra run_phase1.py argument, repeatable")
+                    help="extra run_e2e.py argument, repeatable")
 parser.add_argument("--docker-arg", action="append", default=[],
                     help="extra docker run argument (e.g. --network=host, -v host:ctr), repeatable")
 parser.add_argument("--network", default="bridge", help="docker network mode")
@@ -67,7 +67,7 @@ else:
     identity = json.loads((args.build_output / "image-identity.json").read_text())
     image = identity.get("local_image_id") or identity["image_uri"]
 run_id = uuid.uuid4().hex[:12]
-output = (args.output_dir or Path("artifacts/phase1") / run_id).resolve()
+output = (args.output_dir or Path("artifacts/e2e") / run_id).resolve()
 if output.exists() and any(output.iterdir()):
     parser.error(f"output directory must be new or empty: {output}")
 output.mkdir(parents=True, exist_ok=True)
@@ -75,7 +75,7 @@ for path in (tests, output):
     if any(c in str(path) for c in ",\n\r"):
         parser.error("bind-mount paths cannot contain commas or newlines")
 
-name = f"kvcr-phase1-{run_id}"
+name = f"kvcr-e2e-{run_id}"
 limits = []
 if args.cpus:
     limits += ["--cpus", args.cpus]
@@ -87,12 +87,12 @@ mounts = [
     "--mount", f"type=bind,src={tests},dst=/kvcr-tests,readonly",
     "--mount", f"type=bind,src={output},dst=/evidence",
 ]
-env = ["--env", "HF_HOME=/tmp/phase1-hf-cache"]
+env = ["--env", "HF_HOME=/tmp/kvcr-e2e-hf-cache"]
 if args.hf_cache:
     args.hf_cache.mkdir(parents=True, exist_ok=True)
-    mounts += ["--mount", f"type=bind,src={args.hf_cache.resolve()},dst=/tmp/phase1-hf-cache"]
+    mounts += ["--mount", f"type=bind,src={args.hf_cache.resolve()},dst=/tmp/kvcr-e2e-hf-cache"]
 harness = [
-    "python3", "/kvcr-tests/run_phase1.py",
+    "python3", "/kvcr-tests/run_e2e.py",
     "--output-dir", "/evidence/run",
     "--mode", args.mode,
     "--cases", args.cases,

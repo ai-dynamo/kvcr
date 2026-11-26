@@ -15,7 +15,7 @@ LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/kvcr" \
       org.opencontainers.image.base.name="${VLLM_IMAGE}"
 
 # Recovery uses libatomic even though it is not a Python package dependency.
-RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 patch \
  && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md LICENSE /opt/kvcr-src/
@@ -122,6 +122,41 @@ Path("/opt/kvcr-build-metadata.json").write_text(json.dumps({
 print(json.dumps(packages, indent=2))
 PY
 
+# Temporary Dynamo #18840 compatibility fix; remove after a containing wheel is qualified.
+ADD --checksum=sha256:2f91a13244c0b7770d39577850d2b0e938084cb3a25eb1245a874104cb3889dc https://github.com/ai-dynamo/dynamo/compare/c683a412d756ff7e5e9dcda1ceb2789d4f473f4f...66ba12c69706a8775f48684e0a9ac4682d41ca8b.diff /tmp/dynamo-vllm-fix.diff
+RUN python3 - <<'PYCODE'
+from importlib import metadata
+import json
+from pathlib import Path
+import subprocess
+
+package = Path(metadata.distribution("ai-dynamo").locate_file("dynamo/vllm"))
+patch = Path("/tmp/dynamo-vllm-fix.diff")
+files = {"benchmark_worker.py", "instrumented_scheduler.py", "kv_groups.py"}
+production = "".join(
+    "diff --git " + section
+    for section in patch.read_text().split("diff --git ")[1:]
+    if section.splitlines()[0].split()[0]
+    in {f"a/components/src/dynamo/vllm/{name}" for name in files}
+)
+# Exclude adjacent import context changed by the November 26 nightly.
+production = production.replace(
+    "@@ -126,7 +126,15 @@\n"
+    " from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput\n"
+    " from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager\n",
+    "@@ -128,5 +128,13 @@\n",
+)
+subprocess.run(
+    ["patch", "--batch", "--forward", "--fuzz=0", "-p5", "-d", str(package)],
+    input=production, text=True, check=True,
+)
+manifest = Path("/opt/kvcr-build-metadata.json")
+record = json.loads(manifest.read_text())
+record["dynamo_vllm_fix"] = "66ba12c69706a8775f48684e0a9ac4682d41ca8b"
+manifest.write_text(json.dumps(record, indent=2) + "\n")
+patch.unlink()
+PYCODE
+
 # A successful pip install alone does not prove the base's adapter supports
 # this KVCR API. Fail the build before handing an incompatible image to E2E.
 RUN kvcr-service --help
@@ -138,7 +173,7 @@ adapter.write_text(adapter.read_text().replace(
 ))
 
 import kvcr
-import dynamo.vllm
+import dynamo.vllm.main
 from vllm.v1.kv_offload.tiering.kvcr import manager
 
 print("kvcr==" + metadata.version("kvcr"))

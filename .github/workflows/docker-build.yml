@@ -12,6 +12,7 @@ on:
       - .github/workflows/docker-build.yml
       - .github/workflows/vllm-e2e.yml
       - Dockerfile.ci
+      - uv.lock
       - pyproject.toml
       - src/**
       - tests/e2e/**
@@ -107,7 +108,7 @@ jobs:
             base_name="${base_name%:*}"
           fi
           base_image="${base_name}@${base_digest}"
-          image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}"
+          image_tag="${ECR_REGISTRY}/${ECR_REPOSITORY}:${kvcr_sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           printf 'kvcr_sha=%s\nbase_image=%s\nimage_tag=%s\n' \
             "$kvcr_sha" "$base_image" "$image_tag" >> "$GITHUB_OUTPUT"
 
@@ -160,3 +161,16 @@ jobs:
     uses: ./.github/workflows/vllm-e2e.yml
     with:
       image: ${{ needs.build.outputs.image }}
+
+  gpu-verdict:
+    name: GPU E2E verdict
+    if: always()
+    needs: [build, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require successful build and complete E2E matrix
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: test "$BUILD_RESULT" = success && test "$E2E_RESULT" = success

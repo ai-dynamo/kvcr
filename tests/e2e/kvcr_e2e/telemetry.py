@@ -8,7 +8,7 @@ connector and KVCR counters). SGLang's KVCR HiCache backend logs
 counters under JSON tuple keys; they are mapped onto the vLLM metric names so
 the cases read both engines through one window API.
 
-Each Phase 1 worker runs one data-parallel rank, so every metric line in a log
+Each harness worker runs one data-parallel rank, so every metric line in a log
 belongs to that worker. Values are interval samples; a window sums the samples
 whose timestamps fall inside [start, end]. Nothing is subtracted between lines.
 """

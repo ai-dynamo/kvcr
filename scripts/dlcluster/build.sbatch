@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=kvcr-p1-build
+#SBATCH --job-name=kvcr-e2e-build
 #SBATCH --partition=general
 #SBATCH --gres=gpu:H100:1
 #SBATCH --constraint="x86_64&UB24.04"
@@ -7,7 +7,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --output=/home/doxu/kvcr-runs/build-%j.log
-# Build the Phase 1 image for one KVCR ref and push it to ghcr (KVCR_PUSH=1).
+# Build the E2E image for one KVCR ref and push it to ghcr (KVCR_PUSH=1).
 # A 1-GPU allocation only buys a fast start on a Docker-capable UB24.04 node;
 # the build itself is CPU-only. Needs: KVCR_BUNDLE, KVCR_REF, KVCR_IMAGE_REPO,
 # ~/.ghcr-token (user luckyq, write:packages).

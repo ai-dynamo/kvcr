@@ -1,0 +1,103 @@
+{
+  "models": {
+    "dense": {
+      "id": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "launch": {
+        "max_model_len": 32000,
+        "max_tokens": 32,
+        "cpu_bytes_to_use": 2000000000,
+        "batch_invariant": true,
+        "keep_hybrid_kv_cache_manager": false,
+        "hit_block_tokens": 64,
+        "ssm_groups": 0,
+        "page_bytes": 0,
+        "tc02_shared_sections": 40,
+        "tc02_sections": 80,
+        "tc02_seed_prefix": false,
+        "g2_slots": 256,
+        "timeout": 2400,
+        "request_timeout": 120,
+        "worker_args": []
+      },
+      "gpu_memory_utilization": {
+        "agg": 0.8,
+        "disagg": 0.35
+      }
+    },
+    "mamba": {
+      "id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+      "revision": "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f",
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "cpu_bytes_to_use": 536870912,
+        "batch_invariant": false,
+        "keep_hybrid_kv_cache_manager": true,
+        "hit_block_tokens": 1024,
+        "ssm_groups": 6,
+        "page_bytes": 16777216,
+        "tc02_shared_sections": 140,
+        "tc02_sections": 200,
+        "tc02_seed_prefix": true,
+        "g2_slots": 32,
+        "timeout": 3600,
+        "request_timeout": 180,
+        "worker_args": [
+          "--dtype=bfloat16",
+          "--hf-overrides={\"head_dtype\":\"float32\"}",
+          "--max-num-seqs=4",
+          "--trust-remote-code"
+        ]
+      },
+      "gpu_memory_utilization": {
+        "agg": 0.44,
+        "disagg": 0.44
+      }
+    },
+    "gdn": {
+      "id": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "launch": {
+        "max_model_len": 8192,
+        "max_tokens": 32,
+        "cpu_bytes_to_use": 536870912,
+        "batch_invariant": false,
+        "keep_hybrid_kv_cache_manager": true,
+        "hit_block_tokens": 576,
+        "ssm_groups": 3,
+        "page_bytes": 7077888,
+        "tc02_shared_sections": 140,
+        "tc02_sections": 200,
+        "tc02_seed_prefix": true,
+        "g2_slots": 32,
+        "timeout": 3600,
+        "request_timeout": 180,
+        "worker_args": [
+          "--dtype=bfloat16",
+          "--max-num-seqs=4",
+          "--trust-remote-code"
+        ]
+      },
+      "gpu_memory_utilization": {
+        "agg": 0.38,
+        "disagg": 0.32
+      }
+    }
+  },
+  "topologies": {
+    "agg": [
+      0,
+      1
+    ],
+    "disagg": [
+      0,
+      0,
+      1
+    ]
+  },
+  "modes": [
+    "native",
+    "guard"
+  ]
+}
