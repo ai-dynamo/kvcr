@@ -16,6 +16,8 @@ Each model runs aggregated and disaggregated, in native and Guard modes:
 | `Qwen/Qwen3.5-0.8B` | Hybrid attention/GDN |
 
 Pinned model revisions and launch settings are in `tests/e2e/ci_profiles.json`.
+Nemotron uses an FP32 output head to reduce numerical sensitivity in exact
+reference comparisons; the model remains configured as BF16.
 TC-01–03 run in all 12 configurations; TC-04 runs in the six Guard configurations.
 Native means KVCR without Guard. Outputs are compared exactly with an independent
 KVCR-disabled reference.

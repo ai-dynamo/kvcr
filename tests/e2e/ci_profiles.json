@@ -45,6 +45,7 @@
         "request_timeout": 180,
         "worker_args": [
           "--dtype=bfloat16",
+          "--hf-overrides={\"head_dtype\":\"float32\"}",
           "--max-num-seqs=4",
           "--trust-remote-code"
         ]
