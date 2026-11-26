@@ -8,7 +8,7 @@ Single node (default): one pod, 2 GPUs.
 
 Two nodes (--two-node): two pods on different nodes, 1 GPU each, plus headless
 Services for DNS.
-  <run>-b   kvcr-svc-1 sidecar + node agent (tests/e2e/phase1/node_agent.py) that
+  <run>-b   kvcr-svc-1 sidecar + node agent (tests/e2e/kvcr_e2e/node_agent.py) that
             spawns worker 1 on the harness's behalf
   <run>-a   etcd sidecar (Dynamo discovery; the file store's inotify watch is
             node-local) + kvcr-svc-0 sidecar + main (frontend, state agent,
@@ -17,7 +17,7 @@ Services for DNS.
 Shared inside a pod: /run/kvcr (sockets, service logs) and /dev/shm/kvcr (pool
 files, memory-backed). Tests, evidence and the HF cache live on the RWX PVC.
 
-  scripts/k8s/phase1-pod.py --image ghcr.io/luckyq/kvcr-phase1:<sha> --tests-sha <sha> \
+  scripts/k8s/e2e-pod.py --image ghcr.io/luckyq/kvcr-phase1:<sha> --tests-sha <sha> \
       [--two-node] [--cases ...] [--model Qwen/Qwen3-0.6B] [--harness-arg ...]
       > objects.json
 """
@@ -131,7 +131,7 @@ gpus_per_pod = gpus_pod_a
 
 harness = [
     "python3",
-    f"{tests}/run_phase1.py",
+    f"{tests}/run_e2e.py",
     "--output-dir",
     f"{evidence}/run",
     "--mode",
@@ -357,7 +357,7 @@ else:
         overlay_cmd
         + "ulimit -l unlimited 2>/dev/null; ulimit -s 65536 2>/dev/null; "
         + f"cd {tests} && "
-        f"exec python3 -m phase1.node_agent --port {args.agent_port}",
+        f"exec python3 -m kvcr_e2e.node_agent --port {args.agent_port}",
     ]
     items.append(headless(f"{run_id}-b", "b", args.agent_port, "agent"))
     items.append(

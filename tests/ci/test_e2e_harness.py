@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""CPU checks of the Phase 1 harness logic; these never claim a GPU pass."""
+"""CPU checks of the E2E harness logic; these never claim a GPU pass."""
 
 import importlib.util
 import json
@@ -14,11 +14,9 @@ import pytest
 E2E = Path(__file__).parents[1] / "e2e"
 sys.path.insert(0, str(E2E))
 
-from phase1 import cases, common, perf, stack, telemetry  # noqa: E402
+from kvcr_e2e import cases, common, perf, stack, telemetry  # noqa: E402
 
-_SPEC = importlib.util.spec_from_file_location(
-    "kvcr_phase1_runner", E2E / "run_phase1.py"
-)
+_SPEC = importlib.util.spec_from_file_location("kvcr_e2e_runner", E2E / "run_e2e.py")
 assert _SPEC is not None and _SPEC.loader is not None
 runner = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(runner)

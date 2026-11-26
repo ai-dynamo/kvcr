@@ -1,11 +1,11 @@
-"""Minimal process host for the second node of a two-node Phase 1 run.
+"""Minimal process host for the second node of a two-node E2E run.
 
 The harness on node A drives node B through this HTTP agent: spawn a worker
 with a given command/env (stdout+stderr to a log file on the shared volume),
 poll liveness, send signals, probe a Unix socket (the kvcr_service sidecar).
 Stdlib only; no authentication - it is meant for a private pod network.
 
-    python3 -m phase1.node_agent --port 9800 [--bind 0.0.0.0]
+    python3 -m kvcr_e2e.node_agent --port 9800 [--bind 0.0.0.0]
 
 Endpoints (JSON bodies):
     GET  /info                      {"ip","hostname","kernel","pid"}
@@ -50,7 +50,7 @@ def local_ip() -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "kvcr-phase1-node-agent/1"
+    server_version = "kvcr-e2e-node-agent/1"
 
     def _json(self, code: int, body: dict) -> None:
         data = json.dumps(body).encode()

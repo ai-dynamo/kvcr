@@ -5,7 +5,7 @@
 # Run KVCR test plan v7 Phase 1 (TC-01..TC-04) in the built integration image
 # on exactly two explicitly selected GPUs.
 #
-#   bash scripts/docker/run_phase1.sh --gpus 0,1 [--image <ref>] [--output-dir DIR]
+#   bash scripts/docker/run_e2e.sh --gpus 0,1 [--image <ref>] [--output-dir DIR]
 #        [--mode guard|nonguard] [--cases TC-01,TC-02] [--timeout SEC]
 #        [--cpus N] [--cpuset-cpus LIST] [--memory SIZE] [--hf-cache DIR]
 #
@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-parser = argparse.ArgumentParser(prog="run_phase1.sh")
+parser = argparse.ArgumentParser(prog="run_e2e.sh")
 parser.add_argument("--gpus", required=True,
                     help="one or two GPU indices or UUIDs, comma separated (one = both workers share it)")
 parser.add_argument("--image", help="image reference; default from artifacts/build")
@@ -41,7 +41,7 @@ parser.add_argument("--memory")
 parser.add_argument("--hf-cache", type=Path, help="host directory reused as HF_HOME")
 parser.add_argument("--allow-blocked", action="store_true")
 parser.add_argument("--harness-arg", action="append", default=[],
-                    help="extra run_phase1.py argument, repeatable")
+                    help="extra run_e2e.py argument, repeatable")
 parser.add_argument("--docker-arg", action="append", default=[],
                     help="extra docker run argument (e.g. --network=host, -v host:ctr), repeatable")
 parser.add_argument("--network", default="bridge", help="docker network mode")
@@ -92,7 +92,7 @@ if args.hf_cache:
     args.hf_cache.mkdir(parents=True, exist_ok=True)
     mounts += ["--mount", f"type=bind,src={args.hf_cache.resolve()},dst=/tmp/phase1-hf-cache"]
 harness = [
-    "python3", "/kvcr-tests/run_phase1.py",
+    "python3", "/kvcr-tests/run_e2e.py",
     "--output-dir", "/evidence/run",
     "--mode", args.mode,
     "--cases", args.cases,

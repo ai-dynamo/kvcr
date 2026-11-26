@@ -179,7 +179,7 @@ def write_junit(output: Path, run: dict[str, Any]) -> None:
     cases = run.get("cases", [])
     suite = ET.Element(
         "testsuite",
-        name="kvcr-phase1",
+        name="kvcr-e2e",
         tests=str(len(cases)),
         failures=str(sum(case["status"] == FAIL for case in cases)),
         skipped=str(sum(case["status"] == BLOCKED for case in cases)),
@@ -190,7 +190,7 @@ def write_junit(output: Path, run: dict[str, Any]) -> None:
         element = ET.SubElement(
             suite,
             "testcase",
-            classname="kvcr.phase1",
+            classname="kvcr.e2e",
             name=f"{case['case']} {case['title']}",
         )
         lines = [

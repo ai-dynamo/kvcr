@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Process management for the Phase 1 stack.
+"""Process management for the E2E stack.
 
 Topology (one node, two GPUs, aggregated, TP=1):
 
@@ -141,7 +141,7 @@ class Settings:
     max_model_len: int = 32000
     gpu_memory_utilization: float = 0.8
     # Two-node run: worker index -> node-agent URL on the other node
-    # (tests/e2e/phase1/node_agent.py); that node also hosts the worker's
+    # (tests/e2e/kvcr_e2e/node_agent.py); that node also hosts the worker's
     # kvcr_service sidecar. Needs etcd_endpoints: Dynamo's file discovery
     # watches with inotify, which does not cross nodes.
     remote_workers: dict[int, str] | None = None
@@ -169,9 +169,7 @@ class Settings:
 
     def __post_init__(self) -> None:
         if not self.compatibility_digest:
-            self.compatibility_digest = (
-                f"kvcr-phase1-{self.model}-{uuid.uuid4().hex[:8]}"
-            )
+            self.compatibility_digest = f"kvcr-e2e-{self.model}-{uuid.uuid4().hex[:8]}"
 
 
 class Managed:
@@ -422,8 +420,8 @@ class Stack:
         self.worker_ids: dict[int, str] = {}
         self.retired_ids: set[str] = set()
         self.frontend: Managed | None = None
-        self.kvcr_run_dir = Path(tempfile.mkdtemp(prefix="phase1-run-"))
-        self.pool_dir = Path("/dev/shm/phase1-pool-" + uuid.uuid4().hex[:8])
+        self.kvcr_run_dir = Path(tempfile.mkdtemp(prefix="kvcr-e2e-run-"))
+        self.pool_dir = Path("/dev/shm/kvcr-e2e-pool-" + uuid.uuid4().hex[:8])
         self.deadline_check: Callable[[], None] = lambda: None
         self._remote_info: dict[int, dict[str, Any]] = {}
 
@@ -445,7 +443,9 @@ class Stack:
         save_json(self.evidence / "preflight.json", data)
         needed = max(self.settings.gpus) + 1
         if not data["cuda_available"] or data["device_count"] < needed:
-            raise BlockedError(f"Phase 1 needs {needed} usable CUDA GPU(s) on one node")
+            raise BlockedError(
+                f"E2E harness needs {needed} usable CUDA GPU(s) on one node"
+            )
         for index in sorted(set(self.settings.gpus)):
             value = torch.ones(16, device=f"cuda:{index}").sum().item()
             data["devices"].append(
@@ -512,7 +512,7 @@ class Stack:
 
     def base_env(self) -> dict[str, str]:
         if self.discovery is None:
-            self.discovery = tempfile.TemporaryDirectory(prefix="phase1-disc-")
+            self.discovery = tempfile.TemporaryDirectory(prefix="e2e-disc-")
         env = os.environ.copy()
         env.pop("NATS_SERVER", None)
         env.update(

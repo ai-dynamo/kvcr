@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Run KVCR test plan v7 Phase 1 (TC-01 -> TC-06) on one node with two GPUs.
+"""Run KVCR end-to-end correctness and performance tests (TC-01 -> TC-06).
 
 Sequence:
   1. preflight        GPUs, shared memory, kernel (Guard), ports
@@ -36,9 +36,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from phase1.cases import CASES, Context, Prompts, run_case  # noqa: E402
-from phase1.client import Client  # noqa: E402
-from phase1.common import (  # noqa: E402
+from kvcr_e2e.cases import CASES, Context, Prompts, run_case  # noqa: E402
+from kvcr_e2e.client import Client  # noqa: E402
+from kvcr_e2e.common import (  # noqa: E402
     BLOCKED,
     FAIL,
     PASS,
@@ -51,8 +51,8 @@ from phase1.common import (  # noqa: E402
     utc_now,
     write_junit,
 )
-from phase1.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
-from phase1.stack import (  # noqa: E402
+from kvcr_e2e.perf import PERF_CASES, STREAM_FIELDS  # noqa: E402
+from kvcr_e2e.stack import (  # noqa: E402
     ENGINES,
     GUARD,
     MODES,
@@ -81,7 +81,7 @@ def provenance(args: argparse.Namespace) -> dict[str, Any]:
         except importlib.metadata.PackageNotFoundError:
             versions[distribution] = None
     manifest = Path("/opt/kvcr-build/source-revisions.json")
-    package = Path(__file__).resolve().parent / "phase1"
+    package = Path(__file__).resolve().parent / "kvcr_e2e"
     digest = hashlib.sha256()
     for path in sorted(package.glob("*.py")) + [Path(__file__).resolve()]:
         digest.update(path.name.encode())
@@ -781,7 +781,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="INDEX=URL",
         help="two-node topology: run worker INDEX (and expect its kvcr_service "
         "sidecar) on "
-        "the node whose phase1.node_agent listens at URL; repeatable; requires "
+        "the node whose kvcr_e2e.node_agent listens at URL; repeatable; requires "
         "--external-services and --etcd",
     )
     parser.add_argument(

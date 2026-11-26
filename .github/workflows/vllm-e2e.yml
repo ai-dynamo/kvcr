@@ -85,7 +85,7 @@ jobs:
           MODEL: ${{ inputs.model }}
         run: |
           set -euo pipefail
-          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1/run \
+          python3 -u tests/e2e/run_e2e.py --output-dir artifacts/phase1/run \
             --model "$MODEL" --mode guard --batch-invariant --timeout 2400 \
             --cases TC-01,TC-02,TC-03,TC-04
       - name: Save Phase 1 evidence
@@ -134,7 +134,7 @@ jobs:
               --compatibility-digest "$DIGEST" --log-level DEBUG \
               > "$SVC/kvcr-service-$i.log" 2>&1 &
           done
-          python3 -u tests/e2e/run_phase1.py --output-dir artifacts/phase1-2p1d/run \
+          python3 -u tests/e2e/run_e2e.py --output-dir artifacts/phase1-2p1d/run \
             --model "$MODEL" --mode guard --batch-invariant --timeout 2400 \
             --topology disagg --gpus 0,0,1 --gpu-memory-utilization 0.35 \
             --external-services "$SVC" --compatibility-digest "$DIGEST" \

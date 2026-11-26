@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 This document maps Phase 1 of the KVCR test plan (TC-01 → TC-02 → TC-03
 same-node → TC-04 in Guard mode, plus the performance cases TC-05 and TC-06 that
 the plan places in the same round) to the runnable harness
-in [`tests/e2e/run_phase1.py`](../tests/e2e/run_phase1.py). It complements the
+in [`tests/e2e/run_e2e.py`](../tests/e2e/run_e2e.py). It complements the
 peer-reuse smoke test described in [test-plan.md](test-plan.md); it does not
 replace it.
 
@@ -93,21 +93,21 @@ the missing condition. One combination passing does not extend to another.
 Inside the integration image with two visible GPUs:
 
 ```bash
-python3 tests/e2e/run_phase1.py --output-dir artifacts/phase1/run --mode guard
+python3 tests/e2e/run_e2e.py --output-dir artifacts/phase1/run --mode guard
 ```
 
 From a host with Docker and the NVIDIA Container Toolkit, using the image
 produced by `scripts/docker/build_image.sh`:
 
 ```bash
-bash scripts/docker/run_phase1.sh --gpus 0,1
-bash scripts/docker/run_phase1.sh --gpus GPU-…,GPU-… --image <ref> \
+bash scripts/docker/run_e2e.sh --gpus 0,1
+bash scripts/docker/run_e2e.sh --gpus GPU-…,GPU-… --image <ref> \
   --cpus 32 --cpuset-cpus 0-31 --memory 96g --hf-cache /path/to/hf-cache
 ```
 
 `--cases TC-01,TC-03` selects cases; `--mode nonguard` runs the non-Guard
 compatibility path (TC-04 BLOCKED). `--harness-arg` forwards any
-`run_phase1.py` option, e.g. `--harness-arg=--batch-invariant`,
+`run_e2e.py` option, e.g. `--harness-arg=--batch-invariant`,
 `--harness-arg=--model=Qwen/Qwen3.5-4B`,
 `--harness-arg=--worker-arg=--mamba-cache-mode=align`,
 `--harness-arg=--keep-hybrid-kv-cache-manager`, `--harness-arg=--no-enforce-eager`.
@@ -127,7 +127,7 @@ vLLM helper, kvcr#159 / #160) for vLLM nightlies after the
 hash, `kv_cache_spec_kind="mamba"`), which removes the placeholder events that
 quarantined the state agent; whether the `events.py` overlay is still needed on
 such a vLLM is recorded with the run that checks it below (answer: not needed).
-(Qwen3.5-4B; the `hybrid` matrix entry of `scripts/dlcluster/phase1.sbatch`
+(Qwen3.5-4B; the `hybrid` matrix entry of `scripts/dlcluster/e2e.sbatch`
 always passes them) makes every transfer check exact: pages == hit blocks + 3
 per hit and bytes == pages * 18 MiB. Without them the checks are lower bounds.
 Negative unit tests in `tests/ci/test_phase1.py` pin the verdicts: a zero-hit
@@ -142,7 +142,7 @@ The [GPU workflow](../.github/workflows/vllm-e2e.yml) runs Phase 1 as the
 
 On dlcluster, [`scripts/dlcluster/submit.sh`](../scripts/dlcluster/submit.sh)
 bundles the committed HEAD, ships it and
-[`phase1.sbatch`](../scripts/dlcluster/phase1.sbatch) to the login node and
+[`e2e.sbatch`](../scripts/dlcluster/e2e.sbatch) to the login node and
 submits an exclusive `2GPU & x86_64 & UB24.04` H100 job that reuses or builds
 the image and runs the `dense` and `hybrid` configurations; evidence lands in
 `~/kvcr-runs/<jobid>/` and `<jobid>.tgz`. `--image local/kvcr-phase1:<sha>`
@@ -282,9 +282,9 @@ docker (`388f12b`). Guard cannot run on aws-iad-cs-002 / eos / cw-pdx-cs-001
 
 ### Kubernetes runs (2026-09-30, dynamo-aws-dev-02)
 
-`scripts/k8s/phase1-pod.py` renders the sidecar layout as a pod (two
+`scripts/k8s/e2e-pod.py` renders the sidecar layout as a pod (two
 `kvcr_service` native sidecars + main) and, with `--two-node`, two pods on two
-nodes: pod `b` runs `tests/e2e/phase1/node_agent.py` and worker 1's sidecar,
+nodes: pod `b` runs `tests/e2e/kvcr_e2e/node_agent.py` and worker 1's sidecar,
 pod `a` runs etcd (Dynamo discovery; the file store's inotify watch is
 node-local), worker 0's sidecar and the harness with
 `--remote-worker 1=http://<run>-b…:9800 --etcd http://<run>-a…:2379`.
@@ -353,7 +353,7 @@ tokens equal the reference in every request. Dense remote hit 160.8 ms vs cold
 Two harness consequences: Dynamo ea23e51 lets vLLM's logger write the
 `KV Transfer metrics` line (`(MainProcess pid=N) INFO MM-DD HH:MM:SS …`), which
 the parser now accepts next to the ISO format (`telemetry.line_timestamp`); and
-`run_phase1.py` grew `--perf-evict-filler`, `--perf-concurrency-levels` and
+`run_e2e.py` grew `--perf-evict-filler`, `--perf-concurrency-levels` and
 `--max-model-len` for the TC-05 DRAM-hit and concurrency arms (run
 `v011-dense8b-perf`, see the evidence report).
 

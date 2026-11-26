@@ -24,7 +24,7 @@
 #   KVCR_CASES    cases per run (default TC-01..TC-06)
 #   KVCR_TIMEOUT  harness timeout per run in seconds (default 3600)
 #   KVCR_IMAGE    optional existing local image to reuse instead of building
-#   KVCR_EXTRA    optional extra run_phase1.sh args for every config, e.g.
+#   KVCR_EXTRA    optional extra run_e2e.sh args for every config, e.g.
 #                 "--harness-arg=--batch-invariant"
 #   KVCR_TOPOLOGY single (default) or sidecar: kvcr_service per worker in its
 #                 own container, sharing /run/kvcr and /dev/shm/kvcr with the
@@ -159,7 +159,7 @@ run_config() {
   if [[ "$TOPOLOGY" == sidecar ]]; then start_sidecars "$name" "kvcr-phase1-$SLURM_JOB_ID-$name"; fi
   log "=== run $name ($TOPOLOGY): cases=$CASES ==="
   set +e
-  bash scripts/docker/run_phase1.sh \
+  bash scripts/docker/run_e2e.sh \
     --gpus "$GPUS" "${IMAGE_ARG[@]}" \
     --build-output "$E2E_BUILD_OUTPUT" \
     --output-dir "$out" \

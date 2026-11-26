@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Phase 1 test cases TC-01 .. TC-04 from the KVCR test plan v7.
+"""Functional test cases TC-01 .. TC-04 from the KVCR test plan v7.
 
 Each case receives the running stack, the reference token samples, and an
 evidence directory. A case records checks; the runner derives PASS/FAIL.
