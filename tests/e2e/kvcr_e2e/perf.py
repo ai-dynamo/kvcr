@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Phase 1 performance cases TC-05 and TC-06 from the KVCR test plan.
+"""Performance test cases TC-05 and TC-06 from the KVCR test plan.
 
 TC-05  Cold-path overhead and reuse latency: TTFT / TPOT / ITL / tokens/s for
        KVCR disabled (recorded in the reference phase), KVCR cold, local hit and

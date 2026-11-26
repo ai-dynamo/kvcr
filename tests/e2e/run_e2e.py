@@ -80,7 +80,9 @@ def provenance(args: argparse.Namespace) -> dict[str, Any]:
             versions[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
             versions[distribution] = None
-    manifest = Path("/opt/kvcr-build/source-revisions.json")
+    manifest = Path("/opt/kvcr-build-metadata.json")
+    if not manifest.exists():
+        manifest = Path("/opt/kvcr-build/source-revisions.json")
     package = Path(__file__).resolve().parent / "kvcr_e2e"
     digest = hashlib.sha256()
     for path in sorted(package.glob("*.py")) + [Path(__file__).resolve()]:
@@ -137,6 +139,7 @@ class Runner:
             http_port=args.http_port,
             reference_http_port=args.reference_http_port,
             pool_gb=args.pool_gb,
+            g2_slots=args.g2_slots,
             compatibility_digest=args.compatibility_digest or "",
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
@@ -173,11 +176,11 @@ class Runner:
         self.reference_cached: dict[str, list[int | None]] = {}
         self.wants_perf = bool(PERF_CASE_NAMES & set(args.cases))
         self.result: dict[str, Any] = {
-            "plan": "KVCR Test Plan v7, Phase 1 (Guard-mode critical path)",
+            "plan": "KVCR Test Plan v7, Phase 1",
             "started_at": utc_now(),
             "status": "running",
             "mode": args.mode,
-            "deployment": "aggregated",
+            "deployment": args.topology,
             "model": args.model,
             "prompt_tag": self.tag,
             "max_tokens": args.max_tokens,
@@ -199,7 +202,8 @@ class Runner:
             "worker_env": sorted(args.worker_env),
             "disable_hybrid_kv_cache_manager": not args.keep_hybrid_kv_cache_manager,
             "enforce_eager": not args.no_enforce_eager,
-            "topology": (
+            "topology": args.topology,
+            "service_topology": (
                 "two-node"
                 if args.remote_workers
                 else "sidecar"
@@ -212,7 +216,7 @@ class Runner:
             if args.external_services
             else None,
             "batch_invariant": args.batch_invariant,
-            "state_agent": not args.no_state_agent,
+            "state_agent": self.stack.uses_state_agent(),
             "selected_cases": list(args.cases),
             "cases": [],
             "reference": {},
@@ -507,6 +511,9 @@ class Runner:
                     {"case": name, "status": result.status, "error": result.error}
                 )
             )
+            for check in result.checks:
+                if not check.passed:
+                    print(f"  FAIL: {check.name}: {check.detail}", flush=True)
             if result.status == FAIL and self.args.stop_on_fail:
                 break
 
@@ -525,6 +532,7 @@ class Runner:
         except (Exception, KeyboardInterrupt) as error:
             self.result["error"] = f"{type(error).__name__}: {error}"
         finally:
+            self.cleaning_up = True
             try:
                 self.stack.cleanup()
             except Exception as error:  # noqa: BLE001
@@ -591,6 +599,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--mode", choices=MODES, default=GUARD)
+    parser.add_argument("--g2-slots", type=int, default=256)
     parser.add_argument(
         "--sglang-verify-bytes",
         action="store_true",
@@ -842,10 +851,6 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(
                 f"--engine sglang cannot run {sorted(unsupported)} (Guard cases)"
             )
-    if args.topology == "disagg" and args.external_services is None:
-        parser.error(
-            "--topology disagg needs --external-services (kvcr_service sidecars)"
-        )
     # Same index on two nodes (--remote-worker) is two GPUs, not one shared GPU.
     if (
         args.gpus[0] == args.gpus[1]
@@ -939,8 +944,16 @@ def main() -> int:
         print(f"Cannot initialize run: {error}", file=sys.stderr)
         return 1
 
+    stop_requested = False
+
     def interrupted(signum: int, _frame: Any) -> None:
-        raise KeyboardInterrupt(f"received signal {signum}")
+        nonlocal stop_requested
+        if not stop_requested:
+            stop_requested = True
+            if getattr(runner, "cleaning_up", False):
+                runner.result["error"] = f"received signal {signum} during cleanup"
+                return
+            raise KeyboardInterrupt(f"received signal {signum}")
 
     previous = {
         n: signal.signal(n, interrupted) for n in (signal.SIGINT, signal.SIGTERM)

@@ -20,6 +20,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -123,7 +124,7 @@ class Settings:
     # Extra environment for every worker process (engine experiments).
     worker_env: dict[str, str] = field(default_factory=dict)
     # "agg": two decode workers, worker 0 KVCR source, worker 1 target.
-    # "disagg": 2P+1D on three GPUs: workers 0/1 are prefill workers (KVCR
+    # "disagg": 2P+1D: workers 0/1 are prefill workers (KVCR
     # source/target, the P->D hop uses NixlConnector), worker 2 is the single
     # decode worker. Requests pin the prefill worker; the decode is shared.
     topology: str = "agg"
@@ -210,7 +211,6 @@ class Managed:
 
     def stop(self, grace: float = 20) -> dict[str, Any]:
         outcome: dict[str, Any] = {"name": self.name, "pid": self.process.pid}
-        self.stopped = True
         self.signal_group(signal.SIGTERM)
         try:
             self.process.wait(timeout=grace)
@@ -223,6 +223,7 @@ class Managed:
             outcome["exit_code"] = self.process.returncode
         except subprocess.TimeoutExpired:
             outcome["error"] = "process did not exit"
+        self.stopped = "error" not in outcome
         self._log.close()
         return outcome
 
@@ -303,7 +304,6 @@ class RemoteManaged:
             "pid": self.pid,
             "remote": self.agent_url,
         }
-        self.stopped = True
         self.signal_group(signal.SIGTERM)
         try:
             self.process.wait(timeout=grace)
@@ -314,6 +314,7 @@ class RemoteManaged:
             outcome["exit_code"] = self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             outcome["error"] = "process did not exit"
+        self.stopped = "error" not in outcome
         return outcome
 
     def log_text(self) -> str:
@@ -413,6 +414,7 @@ class Stack:
         self.evidence = evidence
         self.evidence.mkdir(parents=True, exist_ok=True)
         self.children: list[Managed] = []
+        self.stop_history: list[dict[str, Any]] = []
         self.discovery: tempfile.TemporaryDirectory | None = None
         self.services: dict[int, Managed] = {}
         self.state_agent: Managed | None = None
@@ -998,7 +1000,7 @@ class Stack:
         else:
             save_json(
                 self.evidence / f"{name}.kv-transfer-config.json",
-                self.transfer_config(index) if kvcr else None,
+                self.kv_transfer_config(index, kvcr=kvcr),
             )
         agent = self.remote_agent(index)
         if agent is not None:
@@ -1088,6 +1090,7 @@ class Stack:
         router choose; when it keeps choosing a known worker, candidates from
         the discovery store are confirmed with a pinned probe instead.
         """
+        discovery_id = uuid.uuid4().hex
         known = {wid for i, wid in self.worker_ids.items() if i != index}
         known |= self.retired_ids
         errors = 0
@@ -1112,7 +1115,7 @@ class Stack:
                     else {}
                 )
             probe = client.completion(
-                f"probe-w{index}-{attempt:02d}",
+                f"probe-w{index}-{discovery_id}-{attempt:02d}",
                 f"identity probe {uuid.uuid4().hex}",
                 max_tokens=1,
                 extra_fields=["worker_id"],
@@ -1137,12 +1140,12 @@ class Stack:
     def kill_worker(self, index: int) -> dict[str, Any]:
         worker = self.workers.pop(index)
         killed_at = utc_now()
-        worker.stopped = True
         worker.signal_group(signal.SIGKILL)
         try:
             worker.process.wait(timeout=30)
         except subprocess.TimeoutExpired as error:
             raise ValidationError(f"worker {index} survived SIGKILL") from error
+        worker.stopped = True
         retired = self.worker_ids.pop(index, None)
         if retired is not None:
             self.retired_ids.add(retired)
@@ -1176,27 +1179,40 @@ class Stack:
         targets = list(children) or list(reversed(self.children))
         for child in targets:
             if not child.stopped:
-                outcomes.append(child.stop())
+                try:
+                    outcome = child.stop()
+                except Exception as error:
+                    outcome = {"name": child.name, "error": str(error)}
+                outcomes.append(outcome)
+                self.stop_history.append(outcome)
+        if any("error" in outcome for outcome in outcomes):
+            raise ValidationError("owned process stop did not finish")
         return outcomes
 
     def cleanup(self) -> dict[str, Any]:
-        outcomes = self.stop()
-        self.reset_discovery()
+        errors = []
+        try:
+            self.stop()
+        except ValidationError as error:
+            errors.append(str(error))
+        try:
+            self.reset_discovery()
+        except OSError as error:
+            errors.append(str(error))
         removed = []
         for path in (self.kvcr_run_dir, self.pool_dir):
-            if path.exists():
-                for item in sorted(path.rglob("*"), reverse=True):
-                    try:
-                        item.unlink() if not item.is_dir() else item.rmdir()
-                    except OSError:
-                        pass
-                try:
-                    path.rmdir()
-                    removed.append(str(path))
-                except OSError:
-                    pass
-        report = {"owned_processes": outcomes, "removed_paths": removed}
+            try:
+                if path.exists():
+                    shutil.rmtree(path)
+                removed.append(str(path))
+            except OSError as error:
+                errors.append(str(error))
+        report = {
+            "owned_processes": self.stop_history,
+            "removed_paths": removed,
+            "errors": errors,
+        }
         save_json(self.evidence / "cleanup.json", report)
-        if any("error" in outcome for outcome in outcomes):
+        if errors or any("error" in outcome for outcome in self.stop_history):
             raise ValidationError("owned process cleanup did not finish")
         return report

@@ -1,42 +1,58 @@
 # Two-GPU vLLM CI
 
-`docker-build.yml` builds the integration image (`Dockerfile.ci`: the selected vLLM
-image plus Dynamo wheels and KVCR from the tested commit), publishes it to ECR and
-calls `vllm-e2e.yml` with the image pinned by digest. That workflow runs two jobs on
-the two-GPU runner:
+`docker-build.yml` builds `Dockerfile.ci` from the selected vLLM image, installs
+Dynamo and KVCR from the tested commit, publishes to ECR, and passes the image
+by digest to `vllm-e2e.yml`. Manual builds can select the base image, Dynamo
+version and KVCR ref. A newer run on the same branch cancels the older run.
 
-| Job | What it verifies |
+## Coverage
+
+Each model runs aggregated and disaggregated, in native and Guard modes:
+
+| Model | Architecture |
 | --- | --- |
-| `peer-transfer` | `tests/e2e/run_vllm_kvcr.py`: data-parallel 2, seed rank 0, retrieve on rank 1; positive cached tokens and successful transfer / `remote_deliver` telemetry |
-| `phase1` | `tests/e2e/run_e2e.py --mode guard --cases TC-01,TC-02,TC-03,TC-04`: KVCR-disabled reference engine, then Guard-mode TC-01 (store/commit/reuse), TC-02 (local DRAM flow incl. partial prefix), TC-03 (hinted peer transfer), TC-04 (Guard takeover and replacement) with token comparison and telemetry reconciliation on every request |
-| `phase1-2p1d` | `run_e2e.py --topology disagg --gpus 0,0,1 --gpu-memory-utilization 0.35 --cases TC-01,TC-02,TC-03,TC-04,TC-06`: 2P+1D on two GPUs, prefill workers share GPU 0, decode on GPU 1, `kvcr-service` sidecars as background processes of the step; functional verdicts only, latencies are not comparable with a dedicated-GPU layout |
+| `Qwen/Qwen3-0.6B` | Dense attention |
+| `nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16` | Hybrid attention/Mamba |
+| `Qwen/Qwen3.5-0.8B` | Hybrid attention/GDN |
 
-Guard mode needs a runner kernel of 6.5 or newer (`SO_PEERPIDFD`); otherwise the
-harness reports BLOCKED and the job fails. TC-05 (performance arms) and TC-06
-(Guard recovery timing) are not in the gate; run them manually or in a nightly
-lane with `--cases TC-05,TC-06`.
+Pinned model revisions and launch settings are in `tests/e2e/ci_profiles.json`.
+TC-01–03 run in all 12 configurations; TC-04 runs in the six Guard configurations.
+Native means KVCR without Guard. Outputs are compared exactly with an independent
+KVCR-disabled reference.
 
-## Running the same checks on a cluster
+| Case | Checks |
+| --- | --- |
+| TC-01 | Cold output, KVCR commit and warm reuse. |
+| TC-02 | Prefix delivery, misses and release; partial-hit assertions apply when the reference engine supports that reuse. |
+| TC-03 | Hinted peer transfer with source/target KVCR telemetry, plus a separate cold request to check hint isolation. |
+| TC-04 | Guard takeover after worker death, preserved-prefix transfer, replacement attachment and cache-hit/output checks. |
 
-Inside any image that has KVCR, vLLM, Dynamo and NIXL installed, with two visible
-GPUs:
+## Execution
+
+Each job owns two GPUs, with TP=1/DP=1 per worker. Aggregated workers use GPUs
+`0,1`; disaggregated uses two prefill workers on GPU `0` and a decoder on GPU `1`.
+Jobs run independently: a failure does not cancel the other configurations.
+Available runner capacity determines parallelism. Guard requires Linux 6.5+.
+
+The profile runner prefetches the pinned model into the standard Hugging Face
+cache before starting workers. CI uses `/scratch/huggingface`. The harness
+manages its workers, services and temporary directories.
+
+Inside the integration image with two visible GPUs:
 
 ```bash
-python3 tests/e2e/run_e2e.py --output-dir artifacts/phase1/run --mode guard \
-  --cases TC-01,TC-02,TC-03,TC-04
+python3 -u tests/e2e/run_ci_profile.py \
+  --profile vllm-mamba-disagg-guard --output-dir artifacts/mamba-disagg-guard
 ```
 
-`scripts/docker/run_e2e.sh --gpus 0,1 --image <ref>` wraps the same run in a
-container with the shared-memory and GPU settings the harness needs;
-`scripts/k8s/e2e-pod.py` and `scripts/dlcluster/` cover Kubernetes and Slurm.
-See `docs/test-plan-phase1.md` for every flag and the hybrid-model geometry.
+Add `--dry-run` to print the command without running tests, or `--gpus` to override
+local placement. Use a fresh output directory for each run. Add model settings in
+`ci_profiles.json`; test assertions live in
+[`kvcr_e2e/cases.py`](../tests/e2e/kvcr_e2e/cases.py).
 
-## Evidence
+## Results
 
-`artifacts/phase1/run/` holds `result.json` (per-case checks, measurements,
-limitations), `junit.xml`, `provenance.json` (package versions, harness digest,
-image source revisions when present), `reference/` and `requests/` (every
-request and response), and `stack/` (launch commands and logs of the frontend,
-workers, `kvcr_service` instances and the state agent). A failed check names the
-request stage and the metric values it compared; the matching request/response
-files and worker logs are in the same tree.
+Failed, blocked or missing cases fail CI. Each `<profile>-<attempt>` artifact
+contains `run/result.json`, `run/junit.xml`, `run/provenance.json`, reference and
+request/response records, and `run/stack/` launch commands, logs and cleanup
+records. Model download output is in `prefetch.log`.

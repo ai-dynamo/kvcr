@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Render Kubernetes objects that run KVCR test plan Phase 1 in the sidecar layout.
+"""Render Kubernetes objects that run KVCR E2E tests in the sidecar layout.
 
 Single node (default): one pod, 2 GPUs.
   kvcr-svc-0 / kvcr-svc-1   KVCR service (kvcr.service.server on 0.2.0, else
                             kvcr.kvcr_service), own the DRAM pools (native sidecars)
-  main                      vLLM workers + Dynamo frontend + the Phase 1 harness
+  main                      vLLM workers + Dynamo frontend + the E2E harness
 
 Two nodes (--two-node): two pods on different nodes, 1 GPU each, plus headless
 Services for DNS.
@@ -105,7 +105,7 @@ for item in args.extra_env:
         p.error(f"--extra-env expects KEY=VALUE, got {item!r}")
     extra_env.append({"name": key, "value": value})
 
-run_id = args.name or f"kvcr-phase1-{time.strftime('%m%d-%H%M')}"
+run_id = args.name or f"kvcr-e2e-{time.strftime('%m%d-%H%M')}"
 ns = args.namespace
 digest = f"{run_id}-{args.tests_sha}"
 tests = "/cache/doxu-kvcr/tests/tests/e2e"
